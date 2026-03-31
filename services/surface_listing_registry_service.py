@@ -55,6 +55,35 @@ def _best_status(current: Optional[str], candidate: str) -> str:
     return current if current_rank > candidate_rank else candidate
 
 
+def _dedupe_codes(*groups: Any) -> list[str]:
+    seen: set[str] = set()
+    codes: list[str] = []
+    for group in groups:
+        for item in group or []:
+            code = str(item or "").strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            codes.append(code)
+    return codes
+
+
+def _channel_blockers(variant: Any, channel: str) -> list[str]:
+    return _dedupe_codes(
+        getattr(variant, "blockers", {}).get(channel),
+        getattr(getattr(variant, "discovery", None), "blockers", None),
+        getattr(getattr(variant, "checkout", None), "blockers", None),
+    )
+
+
+def _channel_warnings(variant: Any, channel: str) -> list[str]:
+    return _dedupe_codes(
+        getattr(variant, "warnings", {}).get(channel),
+        getattr(getattr(variant, "discovery", None), "warnings", None),
+        getattr(getattr(variant, "checkout", None), "warnings", None),
+    )
+
+
 async def _upsert_listing_state(
     *,
     listing_id: str,
@@ -150,6 +179,8 @@ async def persist_channel_export(
             )
             ready = variant.channel_coverage.get(report.channel) == "ready"
             offer = ready_offer_map.get(f"{product.product_id}::{variant.variant_id}")
+            blocker_codes = _channel_blockers(variant, report.channel)
+            warning_codes = _channel_warnings(variant, report.channel)
             metadata = {
                 "channel": report.channel,
                 "product_id": product.product_id,
@@ -157,8 +188,8 @@ async def persist_channel_export(
                 "platform": platform,
                 "availability": (offer or {}).get("availability") or variant.inventory.get("availability"),
                 "readiness_status": variant.channel_coverage.get(report.channel),
-                "readiness_blockers": variant.blockers.get(report.channel) or [],
-                "readiness_warnings": variant.warnings.get(report.channel) or [],
+                "readiness_blockers": blocker_codes,
+                "readiness_warnings": warning_codes,
                 "offer_id": (offer or {}).get("offer_id"),
                 "export_version": report.export_version,
                 "generated_at": report.generated_at,
@@ -207,8 +238,6 @@ async def persist_channel_export(
                 exported += 1
                 continue
 
-            blocker_codes = list(variant.blockers.get(report.channel) or [])
-            warning_codes = list(variant.warnings.get(report.channel) or [])
             error_code = blocker_codes[0] if blocker_codes else "variant_not_ready"
             error_message = ", ".join(blocker_codes or warning_codes or [error_code])[:1024]
             error_id = _error_id(listing_id, error_code)

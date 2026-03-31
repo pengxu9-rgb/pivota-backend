@@ -11,6 +11,23 @@ from db.database import database
 from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
 
 
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except Exception:
+            pass
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
 def _supported_indexed_statuses() -> tuple[str, ...]:
     return ("exported", "indexed", "tradeable")
 
@@ -54,7 +71,7 @@ async def _fetch_click_rows(merchant_id: str, surface: Optional[str]) -> List[Di
     if surface:
         query = query.where(surface_click_events.c.surface == surface)
     rows = await database.fetch_all(query)
-    return [dict(row) for row in rows]
+    return [_row_to_dict(row) for row in rows or []]
 
 
 async def _fetch_edge_rows(merchant_id: str, surface: Optional[str]) -> List[Dict[str, Any]]:
@@ -62,7 +79,7 @@ async def _fetch_edge_rows(merchant_id: str, surface: Optional[str]) -> List[Dic
     if surface:
         query = query.where(commerce_attribution_edges.c.surface == surface)
     rows = await database.fetch_all(query)
-    return [dict(row) for row in rows]
+    return [_row_to_dict(row) for row in rows or []]
 
 
 async def get_merchant_commerce_funnel(

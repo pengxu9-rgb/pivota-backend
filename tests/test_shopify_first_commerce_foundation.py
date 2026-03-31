@@ -174,6 +174,8 @@ async def test_persist_channel_export_records_ready_and_blocked(monkeypatch: pyt
     import services.surface_listing_registry_service as module
 
     executed = []
+    state_updates = []
+    event_calls = []
 
     class FakeDB:
         async def fetch_one(self, query):
@@ -183,7 +185,17 @@ async def test_persist_channel_export_records_ready_and_blocked(monkeypatch: pyt
             executed.append(query)
             return None
 
+    async def fake_record_commerce_event_best_effort(**kwargs):
+        event_calls.append(kwargs)
+        return {"interaction_id": f"int_{kwargs['event_type']}"}
+
+    async def fake_upsert_listing_state(**kwargs):
+        state_updates.append(kwargs)
+        return None
+
     monkeypatch.setattr(module, "database", FakeDB())
+    monkeypatch.setattr(module, "record_commerce_event_best_effort", fake_record_commerce_event_best_effort)
+    monkeypatch.setattr(module, "_upsert_listing_state", fake_upsert_listing_state)
 
     snapshot = MerchantReadinessSnapshot(
         merchant_id="merch_1",
@@ -209,10 +221,16 @@ async def test_persist_channel_export_records_ready_and_blocked(monkeypatch: pyt
                     ReadyVariant(
                         variant_id="var_blocked",
                         title="Blocked",
-                        discovery=CapabilityStatus(capability="discovery", status="blocked", score=0),
-                        checkout=CapabilityStatus(capability="checkout", status="blocked", score=0),
+                        discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                        checkout=CapabilityStatus(
+                            capability="checkout",
+                            status="blocked",
+                            score=0,
+                            blockers=["out_of_stock", "missing_price"],
+                            warnings=["inventory_stale"],
+                        ),
                         channel_coverage={"ucp": "blocked"},
-                        blockers={"ucp": ["missing_price"]},
+                        blockers={},
                         warnings={},
                     ),
                 ],
@@ -237,7 +255,19 @@ async def test_persist_channel_export_records_ready_and_blocked(monkeypatch: pyt
     result = await module.persist_channel_export(snapshot, report)
 
     assert result == {"exported": 1, "blocked": 1, "errors": 0}
-    assert len(executed) == 4
+    assert len(executed) == 2
+    assert len(state_updates) == 2
+
+    ready_state = next(item for item in state_updates if item["status"] == "exported")
+    blocked_state = next(item for item in state_updates if item["status"] == "blocked")
+    assert ready_state["metadata"]["readiness_blockers"] == []
+    assert blocked_state["metadata"]["readiness_blockers"] == ["out_of_stock", "missing_price"]
+    assert blocked_state["metadata"]["readiness_warnings"] == ["inventory_stale"]
+    assert blocked_state["metadata"]["offer_id"] is None
+
+    blocked_event = next(item for item in event_calls if item["event_type"] == "listing.blocked")
+    assert blocked_event["metadata"]["error_code"] == "out_of_stock"
+    assert blocked_event["metadata"]["error_message"] == "out_of_stock, missing_price"
 
 
 @pytest.mark.asyncio
@@ -373,6 +403,24 @@ async def test_get_merchant_commerce_funnel_groups_click_aliases_into_catalog_fa
     assert slices[short_product_id]["listing_status_breakdown_by_surface"] == {
         "default": {"indexed": 1},
     }
+
+
+async def test_fetch_click_rows_supports_row_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.merchant_commerce_funnel_service as module
+
+    class FakeRow:
+        def __init__(self, payload):
+            self._mapping = payload
+
+    class FakeDB:
+        async def fetch_all(self, query):
+            return [FakeRow({"click_id": "clk_1", "surface": "ucp"})]
+
+    monkeypatch.setattr(module, "database", FakeDB())
+
+    rows = await module._fetch_click_rows("merch_1", "ucp")
+
+    assert rows == [{"click_id": "clk_1", "surface": "ucp"}]
 
 
 def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.MonkeyPatch) -> None:

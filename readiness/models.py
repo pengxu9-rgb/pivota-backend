@@ -224,6 +224,13 @@ class ProductReadinessQueueItem(BaseModel):
     priority_reason: Optional[str] = None
     recommended_action_id: Optional[str] = None
     recommended_action_type: Optional[str] = None
+    content_gap_codes: List[str] = Field(default_factory=list)
+    missing_attribute_labels: List[str] = Field(default_factory=list)
+    title_health: Optional[str] = None
+    suggested_title_preview: Optional[str] = None
+    suggestion_language: Optional[str] = None
+    suggestion_confidence: Optional[float] = None
+    suggestion_rationale: Optional[str] = None
     content_quality_score: Optional[float] = None
     model_readiness_score: Optional[float] = None
     conversion_potential_score: Optional[float] = None
@@ -357,6 +364,7 @@ class SourceDataLaneNextProduct(BaseModel):
 class SourceDataLaneSummary(BaseModel):
     reason_code: str
     label: str
+    reason_codes: List[str] = Field(default_factory=list)
     affected_products: int = 0
     affected_variants: int = 0
     blocked_products: int = 0

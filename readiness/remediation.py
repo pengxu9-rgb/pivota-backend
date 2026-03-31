@@ -31,13 +31,7 @@ from readiness.summary import (
     get_readiness_optimization_context,
 )
 from services.product_enrichment_ai import (
-    build_context_from_standard_product,
-    classify_audience_tags,
-    classify_topic_tags,
-    classify_usage_scenarios,
-    compute_auto_confidence,
-    generate_bullets,
-    generate_summary,
+    generate_enrichment_draft,
 )
 from services.product_enrichment_pipeline import run_enrichment_for_product
 from services.product_quality_service import build_quality_payload, preview_quality
@@ -76,6 +70,18 @@ _SOURCE_DATA_TRIAGE_REASON_DEFS: dict[str, dict[str, str]] = {
         "label": "Missing primary image",
         "scope": "product",
     },
+    "shipping_delivery_completeness": {
+        "label": "Shipping / delivery completeness",
+        "scope": "product",
+    },
+    "trust_support_policy_completeness": {
+        "label": "Trust / support policy completeness",
+        "scope": "product",
+    },
+    "product_fit_composition_completeness": {
+        "label": "Product fit / composition completeness",
+        "scope": "product",
+    },
 }
 _SOURCE_DATA_DECISION_STATES: dict[str, set[str]] = {
     "out_of_stock": {
@@ -88,6 +94,24 @@ _SOURCE_DATA_DECISION_STATES: dict[str, set[str]] = {
     },
     "missing_primary_image": {
         "image_fix_saved",
+    },
+    "shipping_delivery_completeness": {
+        "pending_review",
+        "merchant_fix_in_progress",
+        "waiting_on_platform_or_policy",
+        "not_applicable",
+    },
+    "trust_support_policy_completeness": {
+        "pending_review",
+        "merchant_fix_in_progress",
+        "waiting_on_platform_or_policy",
+        "not_applicable",
+    },
+    "product_fit_composition_completeness": {
+        "pending_review",
+        "merchant_fix_in_progress",
+        "waiting_on_platform_or_policy",
+        "not_applicable",
     },
 }
 
@@ -124,26 +148,33 @@ def _default_disclaimer(context_text: str) -> str:
     return "本产品为日常消费品，不提供任何医疗或金融收益承诺。"
 
 
-def _generated_enrichment(product: StandardProduct) -> dict[str, Any]:
-    context = build_context_from_standard_product(product)
-    summary = generate_summary(context)
-    bullets = generate_bullets(context)
-    usage_scenarios = classify_usage_scenarios(context)
-    audience_tags = classify_audience_tags(context)
-    topic_tags = classify_topic_tags(context)
-    auto_confidence = compute_auto_confidence(summary, bullets, context)
-
-    return {
-        "title_override": context.title,
-        "summary_short": summary,
-        "bullet_points": bullets,
-        "usage_scenarios": usage_scenarios,
-        "audience_tags": audience_tags,
-        "topic_tags": topic_tags,
-        "regulatory_disclaimer_local": _default_disclaimer(context.title),
+def _generated_enrichment(product: StandardProduct) -> tuple[dict[str, Any], dict[str, Any]]:
+    draft, title_suggestion = generate_enrichment_draft(
+        product,
+        preferred_language="en",
+    )
+    generated = {
+        "title_override": draft.get("title_override"),
+        "summary_short": draft.get("summary_short"),
+        "bullet_points": draft.get("bullet_points"),
+        "usage_scenarios": draft.get("usage_scenarios"),
+        "audience_tags": draft.get("audience_tags"),
+        "topic_tags": draft.get("topic_tags"),
+        "regulatory_disclaimer_local": _default_disclaimer(product.title),
         "extra_images": None,
-        "llm_readability_score": auto_confidence,
+        "llm_readability_score": draft.get("llm_readability_score"),
         "llm_safety_flags": None,
+    }
+    return generated, {
+        "title_health": title_suggestion.title_health,
+        "suggested_title_preview": title_suggestion.suggested_title,
+        "suggestion_language": title_suggestion.suggestion_language,
+        "suggestion_confidence": title_suggestion.suggestion_confidence,
+        "suggestion_rationale": title_suggestion.suggestion_rationale,
+        "facts_used": title_suggestion.facts_used,
+        "missing_attribute_labels": title_suggestion.missing_attribute_labels,
+        "content_gap_codes": title_suggestion.content_gap_codes,
+        "skipped_reason": title_suggestion.skipped_reason,
     }
 
 
@@ -418,12 +449,14 @@ async def preview_remediation_action(
     candidate_patches: list[dict[str, Any]] = []
     warnings: list[str] = []
     expected_impact: dict[str, Any] = {"targets": []}
+    generated_content_context: list[dict[str, Any]] = []
 
     for target in action.targets:
         platform, platform_product_id, product, enrichment = await _load_product_target(merchant_id, target)
-        generated = _generated_enrichment(product)
+        generated, suggestion_context = _generated_enrichment(product)
         current_preview = preview_quality(build_quality_payload(product, enrichment))
         expected_preview = preview_quality(build_quality_payload(product, generated))
+        product_candidate_count = 0
 
         for field_name, after_value in generated.items():
             before_value = enrichment.get(field_name)
@@ -448,6 +481,24 @@ async def preview_remediation_action(
                 requires_approval=True,
             )
             candidate_patches.append(candidate.model_dump())
+            product_candidate_count += 1
+
+        generated_content_context.append(
+            {
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+                "product_title": product.title,
+                "title_health": suggestion_context.get("title_health"),
+                "suggested_title_preview": suggestion_context.get("suggested_title_preview"),
+                "suggestion_language": suggestion_context.get("suggestion_language"),
+                "suggestion_confidence": suggestion_context.get("suggestion_confidence"),
+                "suggestion_rationale": suggestion_context.get("suggestion_rationale"),
+                "facts_used": suggestion_context.get("facts_used") or {},
+                "missing_attribute_labels": suggestion_context.get("missing_attribute_labels") or [],
+                "content_gap_codes": suggestion_context.get("content_gap_codes") or [],
+                "skipped_reason": suggestion_context.get("skipped_reason"),
+            }
+        )
 
         expected_impact["targets"].append(
             {
@@ -467,13 +518,14 @@ async def preview_remediation_action(
                 },
             }
         )
-        if not candidate_patches:
+        if product_candidate_count <= 0:
             warnings.append("No field-level changes were generated for this product.")
 
     return {
         "action": action.model_dump(),
         "candidate_patches": candidate_patches,
         "expected_impact": expected_impact,
+        "generated_content_context": generated_content_context,
         "requires_approval": True,
         "warnings": warnings,
     }

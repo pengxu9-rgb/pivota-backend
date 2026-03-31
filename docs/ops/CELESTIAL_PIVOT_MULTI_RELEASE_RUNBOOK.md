@@ -444,6 +444,171 @@ Operator checks:
 2. Validate payment-intent fetch does not mint a second order and only reflects the existing checkout action.
 3. Validate refund and return actions append ledger events and do not break merchant authorization boundaries.
 
+## Real Click Order Funnel Seed
+Use this when the goal is to move the merchant commerce funnel off `clicked_exposure=0` and `ordered_conversion=0` with one real attributed sample, without doing real paid/refund yet.
+
+Why this is separate from readiness payment signoff:
+- readiness-owned checkout/session scripts prove payment and merchant write-back convergence
+- they do not automatically create a real public click attribution edge for the merchant funnel
+- this run must start from `POST /api/links/resolve`, then carry the same `pvt_*` values into `POST /agent/v2/commerce/checkouts`
+
+Operator script:
+- [smoke_real_click_order_funnel_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/scripts/smoke_real_click_order_funnel_signoff.py)
+
+Default target:
+- API base: `https://api.pivota.cc`
+- merchant: `merch_efbc46b4619cfbdf`
+- click surface: `ucp`
+- analytics read: merchant total by default
+
+Required auth:
+- internal readiness key for `GET /internal/readiness/merchants/{merchant_id}/report` and `/exports/{surface}`
+- agent API key for `POST /agent/v2/commerce/checkouts` and `GET /agent/v2/commerce/checkouts/{checkout_id}/status`
+- merchant JWT for `GET /merchant/analytics/commerce-funnel`, `/issues`, `/commerce-interactions/{interaction_id}`
+
+Execution:
+```bash
+python3 scripts/smoke_real_click_order_funnel_signoff.py \
+  --base-url https://api.pivota.cc \
+  --merchant-id merch_efbc46b4619cfbdf \
+  --surface ucp \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --agent-api-key "$SHOP_GATEWAY_AGENT_API_KEY" \
+  --merchant-jwt "$MERCHANT_JWT" \
+  --output-json output/click-order-funnel-signoff/click-order-funnel-signoff.json \
+  --output-md output/click-order-funnel-signoff/click-order-funnel-signoff.md
+```
+
+Current prod status as of `2026-03-30T13:26:59Z`:
+- the default command above is now valid on prod for this merchant
+- the script now defaults the `/api/links/resolve` `skuId` candidate to the selected readiness `variant_id`, so operators do not need to pass `--sku-id` for normal `sku`-scoped rules
+- prod now has a published `market=US`, `tool=ucp`, `scope=sku` outbound rule set covering all current `ucp/exported` variants for this merchant
+- rule-set rollout artifacts:
+  - [summary.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/summary.json)
+  - [ucp-sku-rules.csv](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/ucp-sku-rules.csv)
+  - [import-response.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/import-response.json)
+  - [publish-response.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/publish-response.json)
+- rollout summary:
+  - `created = 2098`
+  - `updated = 0`
+  - `published = 2098`
+  - storefront domain = `jwx893-fz.myshopify.com`
+
+Observed default prod rerun on `2026-03-30T13:25:40Z`:
+```bash
+python3 scripts/smoke_real_click_order_funnel_signoff.py \
+  --base-url https://api.pivota.cc \
+  --merchant-id merch_efbc46b4619cfbdf \
+  --surface ucp \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --agent-api-key "$SHOP_GATEWAY_AGENT_API_KEY" \
+  --merchant-jwt "$MERCHANT_JWT" \
+  --run-id prod-default-ucp-20260330T132540Z \
+  --output-json output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.json \
+  --output-md output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.md
+```
+
+Observed default prod outcome on `2026-03-30T13:25:40Z`:
+- evidence:
+  - [click-order-funnel-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.md)
+  - [click-order-funnel-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.json)
+- verdict:
+  - `overall_ok = true`
+  - `resolve_ok = true`
+  - `click_ok = true`
+  - `order_ok = true`
+  - `issues_ok = true`
+  - `trace_ok = true`
+- emitted ids:
+  - `click_id = clk_6b3619f8d5f44a3a905f0760`
+  - `interaction_id = int_3a3062b605155a5ce39c2951`
+  - `checkout_id = ORD_34142F2F5B423A8D`
+  - `order_id = ORD_34142F2F5B423A8D`
+- funnel delta:
+  - `clicked_exposure += 1`
+  - `ordered_conversion += 1`
+  - `refunded_orders += 0`
+- runtime note:
+  - `readiness_export_full` still timed out after `30s`
+  - the script recovered via `summary_only=true` export sample + full readiness report fallback
+  - `commerce_checkout_create_attempt_1` returned `503`
+  - the script retry logic succeeded on `commerce_checkout_create_attempt_2`
+
+Historical pre-rule-set override rerun on `2026-03-30T13:04:16Z`:
+```bash
+python3 scripts/smoke_real_click_order_funnel_signoff.py \
+  --base-url https://api.pivota.cc \
+  --merchant-id merch_efbc46b4619cfbdf \
+  --surface ucp \
+  --tool truthfulness_canary_20260330t104628z-c5ebe982 \
+  --sku-id 52438737846600 \
+  --product-id 9886500749640 \
+  --variant-id 52438737846600 \
+  --brand Winona \
+  --category Serum \
+  --title "Winona Soothing Repair Serum" \
+  --unit-price 29 \
+  --currency EUR \
+  --internal-key "$READINESS_INTERNAL_API_KEY" \
+  --agent-api-key "$SHOP_GATEWAY_AGENT_API_KEY" \
+  --merchant-jwt "$MERCHANT_JWT" \
+  --run-id prod-sku-override-20260330T130416Z \
+  --output-json output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.json \
+  --output-md output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.md
+```
+
+Historical pre-rule-set outcome on `2026-03-30T13:04:16Z`:
+- evidence:
+  - [click-order-funnel-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.md)
+  - [click-order-funnel-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.json)
+- verdict:
+  - `overall_ok = true`
+  - `resolve_ok = true`
+  - `click_ok = true`
+  - `order_ok = true`
+  - `issues_ok = true`
+  - `trace_ok = true`
+- emitted ids:
+  - `click_id = clk_45ba77dd2db34aee90a19104`
+  - `interaction_id = int_a1d97479aafbdca6cd0fbe6c`
+  - `checkout_id = ORD_4C458E850DFA9EA4`
+  - `order_id = ORD_4C458E850DFA9EA4`
+- funnel delta:
+  - `clicked_exposure += 1`
+  - `ordered_conversion += 1`
+  - `refunded_orders += 0`
+- runtime note:
+  - `commerce_checkout_create_attempt_1` returned `503`
+  - the script retry logic succeeded on `commerce_checkout_create_attempt_2`
+
+What the script does:
+1. Calls `/health` and saves the active build/deployment evidence from the live API runtime.
+2. Calls merchant `/analytics/readiness-state` plus internal readiness report/export to confirm the merchant still has at least one ready offer.
+   If the full readiness export is unavailable or too slow, the script falls back to `summary_only=true` export samples plus the full readiness report to recover one ready product/variant automatically.
+3. Resolves a real outbound redirect via `/api/links/resolve`, carrying `merchantId`, `surface`, and stable canonical `pvt_product_id` / `pvt_variant_id`.
+4. Optionally records `/api/links/impression`, then performs one real `GET /r?token=...` click with redirects disabled so the click row is written but the script stays local.
+5. Derives the `interaction_id` from that new `click_id` and reuses it in `POST /agent/v2/commerce/checkouts`.
+   This keeps `surface.click`, `checkout.created`, and `order.created` on the same interaction trace instead of splitting them across multiple ids.
+6. Polls merchant funnel + trace until `clicked_exposure` and `ordered_conversion` both increase by at least `1`, while `refunded_orders` stays `0`.
+7. Verifies the new interaction is not sampled under `TRACE_BROKEN` or `UNATTRIBUTED_ORDER`.
+
+Expected round-1 output:
+- one real `click_id`
+- one real `interaction_id`
+- one `checkout_id` / `order_id`
+- one captured `payment_action`
+- funnel delta:
+  - `clicked_exposure += 1`
+  - `ordered_conversion += 1`
+  - `refunded_orders += 0`
+
+Round-2 handoff:
+- preserve the emitted `order_id`, `checkout_id`, `click_id`, `interaction_id`, and `payment_action`
+- if the next run switches to real paid/refund, continue from this sample or rerun the same script path and then finish:
+  - paid-state convergence
+  - `POST /agent/v2/commerce/checkouts/{checkout_id}/refunds`
+  - post-refund funnel verification
+
 ## Follow-On Phase Status
 Current follow-on status as of `2026-03-30 UTC`:
 

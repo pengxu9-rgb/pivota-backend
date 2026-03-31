@@ -25,12 +25,8 @@ from models.standard_product import StandardProduct
 from services.product_quality_service import build_quality_payload, full_quality_eval
 from services.product_enrichment_ai import (
   build_context_from_standard_product,
-  generate_summary,
-  generate_bullets,
-  classify_usage_scenarios,
-  classify_audience_tags,
-  classify_topic_tags,
   compute_auto_confidence,
+  generate_enrichment_draft,
 )
 from utils.event_publisher import publish_custom_event
 
@@ -108,12 +104,19 @@ async def run_enrichment_for_product(
   context = build_context_from_standard_product(product)
 
   # 3) Generate enrichment fields
-  summary = generate_summary(context)
-  bullets = generate_bullets(context)
-  usage_scenarios = classify_usage_scenarios(context)
-  audience_tags = classify_audience_tags(context)
-  topic_tags = classify_topic_tags(context)
-  auto_confidence = compute_auto_confidence(summary, bullets, context)
+  generated_draft, _title_suggestion = generate_enrichment_draft(
+    product,
+    preferred_language="en",
+  )
+  summary = str(generated_draft.get("summary_short") or "")
+  bullets = list(generated_draft.get("bullet_points") or [])
+  usage_scenarios = list(generated_draft.get("usage_scenarios") or [])
+  audience_tags = list(generated_draft.get("audience_tags") or [])
+  topic_tags = list(generated_draft.get("topic_tags") or [])
+  auto_confidence = max(
+    compute_auto_confidence(summary, bullets, context),
+    float(generated_draft.get("llm_readability_score") or 0.0),
+  )
 
   # 4) Compliance guard (very lightweight)
   compliance = _simple_compliance_check(
@@ -190,7 +193,7 @@ async def run_enrichment_for_product(
     default_disclaimer = "本产品为日常消费品，不提供任何医疗或金融收益承诺。"
 
   enrichment_data: Dict[str, Any] = {
-    "title_override": _merge_field("title_override", context.title),
+    "title_override": _merge_field("title_override", generated_draft.get("title_override")),
     "summary_short": _merge_field("summary_short", summary),
     "bullet_points": _merge_field("bullet_points", bullets),
     "usage_scenarios": _merge_field("usage_scenarios", usage_scenarios),

@@ -163,6 +163,24 @@ async def test_compute_merchant_commerce_readiness_state_blocks_execute_without_
     assert readiness["active_psp"] is None
 
 
+async def test_fetch_click_rows_supports_row_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.merchant_commerce_readiness_service as module
+
+    class FakeRow:
+        def __init__(self, payload):
+            self._mapping = payload
+
+    class FakeDB:
+        async def fetch_all(self, query):
+            return [FakeRow({"click_id": "clk_1", "impression_count": 1})]
+
+    monkeypatch.setattr(module, "database", FakeDB())
+
+    rows = await module._fetch_click_rows("merch_1")
+
+    assert rows == [{"click_id": "clk_1", "impression_count": 1}]
+
+
 def test_merchant_analytics_routes_expose_readiness_issues_and_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.merchant_analytics_routes as module
 

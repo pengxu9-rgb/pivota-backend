@@ -18,6 +18,23 @@ READY = "ready"
 BLOCKED = "blocked"
 
 
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except Exception:
+            pass
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
 def _normalize_timestamp(value: Any) -> Optional[datetime]:
     if value is None:
         return None
@@ -46,7 +63,7 @@ async def _fetch_active_psps(merchant_id: str) -> List[Dict[str, Any]]:
         """,
         {"merchant_id": merchant_id},
     )
-    return [dict(row) for row in rows or []]
+    return [_row_to_dict(row) for row in rows or []]
 
 
 async def _fetch_listing_rows(merchant_id: str) -> List[Dict[str, Any]]:
@@ -57,14 +74,14 @@ async def _fetch_click_rows(merchant_id: str) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         select(surface_click_events).where(surface_click_events.c.merchant_id == merchant_id)
     )
-    return [dict(row) for row in rows]
+    return [_row_to_dict(row) for row in rows or []]
 
 
 async def _fetch_edge_rows(merchant_id: str) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         select(commerce_attribution_edges).where(commerce_attribution_edges.c.merchant_id == merchant_id)
     )
-    return [dict(row) for row in rows]
+    return [_row_to_dict(row) for row in rows or []]
 
 
 def _status(blockers: List[str]) -> str:
@@ -209,4 +226,4 @@ async def upsert_merchant_commerce_readiness_state(merchant_id: str) -> Dict[str
     row = await database.fetch_one(
         select(merchant_commerce_readiness_state).where(merchant_commerce_readiness_state.c.merchant_id == merchant_id)
     )
-    return dict(row) if row else values
+    return _row_to_dict(row) if row else values

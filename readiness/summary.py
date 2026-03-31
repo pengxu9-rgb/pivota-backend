@@ -9,11 +9,13 @@ import time
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import quote, urlparse
 
+from db.catalog import catalog_field_facts
 from db.database import database
 from db.product_enrichment import get_enrichments_for_products
 from db.product_quality_backfill_jobs import get_active_quality_backfill_job
 from db.products import products_cache
 from db.readiness_source_data_decisions import list_source_data_decisions
+from models.standard_product import StandardProduct
 from readiness.flags import (
     readiness_alpha_merchant_id,
     readiness_real_merchant_alpha_enabled,
@@ -38,7 +40,9 @@ from readiness.models import (
     SourceDataLaneSummary,
 )
 from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
-from services.merchant_store_service import get_merchant_active_stores
+from services.catalog_sync_service import make_catalog_product_key
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from services.product_enrichment_ai import generate_title_suggestion
 from services.product_exposure_service import (
     AGENT_PUSH_STATUS_EXCLUDED,
     build_agent_push_projection_from_ready_product,
@@ -107,7 +111,14 @@ _BUCKET_DEFINITIONS: dict[str, dict[str, str]] = {
         "fix_surface": "policy",
         "scope": "merchant",
         "impact": "full_agent_commerce",
-        "direct_target": "/dashboard/integrations",
+        "direct_target": "/dashboard/product-optimization?focus=shipping_delivery_completeness",
+    },
+    "trust_support_setup": {
+        "label": "Trust / support setup",
+        "fix_surface": "policy",
+        "scope": "merchant",
+        "impact": "discovery_only",
+        "direct_target": "/dashboard/product-optimization?focus=trust_support_policy_completeness",
     },
     "checkout_payment_setup": {
         "label": "Checkout / payment setup",
@@ -150,6 +161,13 @@ _CODE_TO_BUCKET = {
     "missing_shipping_profile": "shipping_returns_setup",
     "merchant_shipping_policy_missing": "shipping_returns_setup",
     "merchant_return_policy_missing": "shipping_returns_setup",
+    "merchant_shipping_destinations_missing": "shipping_returns_setup",
+    "merchant_shipping_sla_missing": "shipping_returns_setup",
+    "merchant_delivery_costs_missing": "shipping_returns_setup",
+    "merchant_return_window_missing": "shipping_returns_setup",
+    "merchant_warranty_policy_missing": "trust_support_setup",
+    "merchant_authenticity_guarantee_missing": "trust_support_setup",
+    "merchant_customer_support_contact_missing": "trust_support_setup",
     "merchant_checkout_capability_missing": "checkout_payment_setup",
     "checkout_stub_missing": "checkout_payment_setup",
     "payment_execution_stubbed": "checkout_payment_setup",
@@ -167,6 +185,13 @@ _CODE_TO_BUCKET = {
 _EXECUTABLE_PRODUCT_CONTENT_REASON_CODES = {
     "missing_title",
     "missing_description",
+    "generic_low_information_title",
+    "missing_audience_signal",
+    "missing_color_signal",
+    "missing_feature_signal",
+    "missing_size_guidance",
+    "missing_material_or_ingredient_info",
+    "missing_usage_scenario",
 }
 
 _CATALOG_REVIEW_REASON_CODES = {
@@ -190,6 +215,18 @@ _SOURCE_DATA_LANE_DEFS: dict[str, dict[str, str]] = {
         "label": "Missing primary image",
         "scope": "product",
     },
+    "shipping_delivery_completeness": {
+        "label": "Shipping / delivery completeness",
+        "scope": "product",
+    },
+    "trust_support_policy_completeness": {
+        "label": "Trust / support policy completeness",
+        "scope": "product",
+    },
+    "product_fit_composition_completeness": {
+        "label": "Product fit / composition completeness",
+        "scope": "product",
+    },
 }
 
 _SOURCE_DATA_LANE_STATE_LABELS: dict[str, list[tuple[str, str]]] = {
@@ -207,6 +244,21 @@ _SOURCE_DATA_LANE_STATE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("hero_image_missing", "Hero image still missing"),
         ("image_visible_now", "Primary image visible now"),
     ],
+    "shipping_delivery_completeness": [
+        ("policy_facts_missing", "Shipping facts still missing"),
+        ("policy_facts_partial", "Some shipping facts visible"),
+        ("policy_facts_visible_now", "Shipping facts visible now"),
+    ],
+    "trust_support_policy_completeness": [
+        ("trust_facts_missing", "Trust facts still missing"),
+        ("trust_facts_partial", "Some trust facts visible"),
+        ("trust_facts_visible_now", "Trust facts visible now"),
+    ],
+    "product_fit_composition_completeness": [
+        ("product_guidance_missing", "Product guidance still missing"),
+        ("product_guidance_partial", "Some product guidance visible"),
+        ("product_guidance_visible_now", "Product guidance visible now"),
+    ],
 }
 
 _OUT_OF_STOCK_DECISION_LABELS: dict[str, str] = {
@@ -223,6 +275,43 @@ _SOURCE_DATA_DECISION_LABELS: dict[str, dict[str, str]] = {
     "missing_primary_image": {
         "image_fix_saved": "Saved for image repair",
     },
+    "shipping_delivery_completeness": {
+        "pending_review": "Pending review",
+        "merchant_fix_in_progress": "Fix in progress",
+        "waiting_on_platform_or_policy": "Waiting on platform or policy",
+        "not_applicable": "Not applicable",
+    },
+    "trust_support_policy_completeness": {
+        "pending_review": "Pending review",
+        "merchant_fix_in_progress": "Fix in progress",
+        "waiting_on_platform_or_policy": "Waiting on platform or policy",
+        "not_applicable": "Not applicable",
+    },
+    "product_fit_composition_completeness": {
+        "pending_review": "Pending review",
+        "merchant_fix_in_progress": "Fix in progress",
+        "waiting_on_platform_or_policy": "Waiting on platform or policy",
+        "not_applicable": "Not applicable",
+    },
+}
+
+_CATALOG_HEALTH_LANE_REASON_CODES: dict[str, list[str]] = {
+    "shipping_delivery_completeness": [
+        "merchant_shipping_destinations_missing",
+        "merchant_shipping_sla_missing",
+        "merchant_delivery_costs_missing",
+        "merchant_return_window_missing",
+    ],
+    "trust_support_policy_completeness": [
+        "merchant_warranty_policy_missing",
+        "merchant_authenticity_guarantee_missing",
+        "merchant_customer_support_contact_missing",
+    ],
+    "product_fit_composition_completeness": [
+        "product_size_guidance_missing",
+        "product_material_or_ingredient_info_missing",
+        "product_usage_scenario_missing",
+    ],
 }
 
 
@@ -255,6 +344,374 @@ def _coerce_inventory_quantity(value: Any) -> Optional[int]:
         return int(value)
     except Exception:
         return None
+
+
+def _normalize_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _normalized_lower(value: Any) -> str:
+    return _normalize_text(value).lower()
+
+
+def _dedupe_strings(values: Iterable[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_text(value)
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(normalized)
+    return deduped
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item or "").strip() for item in value if str(item or "").strip()]
+    if isinstance(value, tuple):
+        return [str(item or "").strip() for item in value if str(item or "").strip()]
+    if isinstance(value, str):
+        normalized = _normalize_text(value)
+        return [normalized] if normalized else []
+    return []
+
+
+def _value_present(value: Any) -> bool:
+    if value in (None, "", [], {}):
+        return False
+    if isinstance(value, str):
+        return bool(_normalize_text(value))
+    if isinstance(value, (list, tuple, set)):
+        return any(_value_present(item) for item in value)
+    if isinstance(value, dict):
+        return any(_value_present(item) for item in value.values())
+    return True
+
+
+def _find_nested_value(payload: Any, *key_candidates: str) -> Any:
+    normalized_candidates = {str(key or "").strip().lower() for key in key_candidates if str(key or "").strip()}
+    if not normalized_candidates:
+        return None
+
+    stack = [payload]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if str(key or "").strip().lower() in normalized_candidates and _value_present(value):
+                    return value
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append(value)
+        elif isinstance(current, (list, tuple)):
+            for value in current:
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append(value)
+    return None
+
+
+def _current_product_to_standard_product(
+    current_product: dict[str, Any],
+    *,
+    merchant_id: str,
+    platform: str,
+    product_id: str,
+) -> Optional[StandardProduct]:
+    payload = dict(current_product or {})
+    if not payload:
+        return None
+    payload.setdefault("id", payload.get("product_id") or product_id)
+    payload.setdefault("product_id", payload.get("id") or product_id)
+    payload.setdefault("merchant_id", merchant_id)
+    payload.setdefault("platform", platform)
+    payload.setdefault("title", payload.get("title") or "")
+    payload["price"] = _coerce_price_value(payload.get("price")) or 0.0
+    payload["compare_at_price"] = _coerce_price_value(payload.get("compare_at_price"))
+    payload["inventory_quantity"] = _coerce_inventory_quantity(payload.get("inventory_quantity")) or 0
+    try:
+        return StandardProduct.model_validate(payload)
+    except Exception:
+        return None
+
+
+def _snapshot_product_to_current_product(snapshot_product: Any, *, merchant_id: str) -> dict[str, Any]:
+    variants: list[dict[str, Any]] = []
+    for variant in snapshot_product.variants or []:
+        variants.append(
+            {
+                "id": variant.variant_id,
+                "variant_id": variant.variant_id,
+                "title": variant.title,
+                "sku": variant.sku,
+                "price": _coerce_price_value((variant.price or {}).get("amount")),
+                "currency": str((variant.price or {}).get("currency") or "").strip() or "USD",
+                "inventory_quantity": _coerce_inventory_quantity((variant.inventory or {}).get("quantity")) or 0,
+                "image_url": (variant.price or {}).get("image_url"),
+                "visible_option_labels": list(variant.visible_option_labels or []),
+                "platform_metadata": {},
+            }
+        )
+
+    first_variant = variants[0] if variants else {}
+    return {
+        "id": snapshot_product.product_id,
+        "product_id": snapshot_product.product_id,
+        "merchant_id": merchant_id,
+        "platform": snapshot_product.platform or "unknown",
+        "title": snapshot_product.title,
+        "description": snapshot_product.description,
+        "description_text": snapshot_product.description,
+        "vendor": snapshot_product.brand,
+        "product_type": snapshot_product.category,
+        "visible_attributes": snapshot_product.visible_attributes,
+        "ingredient_ids": list(snapshot_product.ingredient_ids or []),
+        "price": first_variant.get("price") or 0.0,
+        "currency": first_variant.get("currency") or "USD",
+        "inventory_quantity": first_variant.get("inventory_quantity") or 0,
+        "image_url": snapshot_product.default_image_url,
+        "variants": variants,
+        "platform_metadata": {},
+    }
+
+
+def _catalog_health_language(store_context: dict[str, Any], current_product: dict[str, Any]) -> str:
+    locale = (
+        _find_nested_value(current_product, "locale", "language", "shop_locale")
+        or _find_nested_value(store_context, "locale", "language", "portal_language", "shop_locale")
+    )
+    locale_norm = _normalized_lower(locale)
+    if locale_norm:
+        return locale_norm.split("-")[0]
+
+    country = _normalized_lower(_find_nested_value(store_context, "country", "country_code"))
+    if country in {"cn", "zh"}:
+        return "zh"
+    if country == "jp":
+        return "ja"
+    if country == "kr":
+        return "ko"
+    if country in {"fr", "de", "es", "pt", "it"}:
+        return country
+    return "en"
+
+
+def _description_text(current_product: dict[str, Any], parsed_product: Optional[StandardProduct]) -> str:
+    if parsed_product and parsed_product.description_text:
+        return parsed_product.description_text
+    return _normalize_text(
+        current_product.get("description_text")
+        or current_product.get("description")
+        or ""
+    )
+
+
+def _product_family(parsed_product: Optional[StandardProduct], current_product: dict[str, Any]) -> str:
+    blob = " ".join(
+        [
+            _normalize_text(getattr(parsed_product, "product_type", None) if parsed_product else ""),
+            _normalize_text(getattr(parsed_product, "title", None) if parsed_product else current_product.get("title")),
+            _normalize_text(" ".join(getattr(parsed_product, "tags", []) or []) if parsed_product else ""),
+            _normalize_text(current_product.get("product_type")),
+        ]
+    ).lower()
+    if any(term in blob for term in ("serum", "cream", "cleanser", "moisturizer", "skincare", "lipstick", "foundation", "spf", "mask")):
+        return "beauty"
+    if any(term in blob for term in ("shoe", "sneaker", "boot", "shirt", "dress", "jacket", "hoodie", "pant", "sock", "apparel", "footwear")):
+        return "apparel_footwear"
+    return "generic"
+
+
+def _catalog_health_field_fact_values(field_facts: dict[str, dict[str, Any]], family: str, key: str) -> list[str]:
+    family_payload = field_facts.get(family, {}) if isinstance(field_facts, dict) else {}
+    return _coerce_string_list(family_payload.get(key))
+
+
+def _has_size_guidance(parsed_product: Optional[StandardProduct], current_product: dict[str, Any]) -> bool:
+    if _value_present(_find_nested_value(current_product, "size_guide", "size_chart", "sizing", "fit_notes", "measurements")):
+        return True
+    if parsed_product:
+        for variant in parsed_product.variants or []:
+            if any("size" in _normalized_lower(name) for name in ((variant.options or {}).keys() if isinstance(variant.options, dict) else [])):
+                return True
+            if any(str(label or "").lower().startswith("size_") for label in (variant.visible_option_labels or [])):
+                return True
+    description_blob = _description_text(current_product, parsed_product).lower()
+    return any(term in description_blob for term in ("true to size", "size guide", "size chart", "fit note", "sizing advice"))
+
+
+def _has_material_or_ingredient_info(
+    parsed_product: Optional[StandardProduct],
+    current_product: dict[str, Any],
+    *,
+    family: str,
+    field_facts: dict[str, dict[str, Any]],
+) -> bool:
+    if family == "beauty":
+        if parsed_product and parsed_product.ingredient_ids:
+            return True
+        if _catalog_health_field_fact_values(field_facts, "beauty_knowledge", "ingredient_ids"):
+            return True
+        if _value_present(_find_nested_value(current_product, "ingredient_ids", "reviewed_ingredient_ids", "canonical_ingredient_ids", "active_ingredients")):
+            return True
+        description_blob = _description_text(current_product, parsed_product).lower()
+        return any(term in description_blob for term in ("ingredient", "retinol", "vitamin c", "hyaluronic"))
+
+    if _value_present(_find_nested_value(current_product, "material", "materials", "composition", "fabric", "specifications", "specs")):
+        return True
+    description_blob = _description_text(current_product, parsed_product).lower()
+    return any(term in description_blob for term in ("cotton", "leather", "polyester", "nylon", "wool", "silk", "material"))
+
+
+def _has_usage_guidance(
+    parsed_product: Optional[StandardProduct],
+    current_product: dict[str, Any],
+    *,
+    field_facts: dict[str, dict[str, Any]],
+) -> bool:
+    if _value_present(_find_nested_value(current_product, "usage", "usage_scenarios", "use_cases", "how_to_use", "ideal_for", "compatible_with")):
+        return True
+    if _catalog_health_field_fact_values(field_facts, "beauty_knowledge", "how_to_use"):
+        return True
+    description_blob = _description_text(current_product, parsed_product).lower()
+    return any(
+        term in description_blob
+        for term in ("ideal for", "best for", "suitable for", "designed for", "perfect for", "how to use", "use for")
+    )
+
+
+def _merchant_policy_missing_codes(store_context: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not _value_present(_find_nested_value(store_context, "shipping_destinations", "shipping_countries", "supported_countries", "ships_to", "destinations")):
+        missing.append("merchant_shipping_destinations_missing")
+    if not _value_present(_find_nested_value(store_context, "shipping_sla", "average_shipping_time", "shipping_time", "delivery_time", "delivery_sla")):
+        missing.append("merchant_shipping_sla_missing")
+    if not _value_present(_find_nested_value(store_context, "free_shipping", "shipping_costs", "duties_included", "taxes_included", "shipping_cost_summary", "delivery_costs")):
+        missing.append("merchant_delivery_costs_missing")
+    if not _value_present(_find_nested_value(store_context, "return_window", "return_window_days", "returns_window", "return_days")):
+        missing.append("merchant_return_window_missing")
+    if not _value_present(_find_nested_value(store_context, "warranty_policy", "warranty_summary", "after_sales_policy", "after_sales")):
+        missing.append("merchant_warranty_policy_missing")
+    if not _value_present(_find_nested_value(store_context, "authenticity_guarantee", "genuine_guarantee", "official_guarantee", "authenticity")):
+        missing.append("merchant_authenticity_guarantee_missing")
+    if not _value_present(_find_nested_value(store_context, "support_email", "support_phone", "contact_method", "contact_url", "customer_service", "support_contact")):
+        missing.append("merchant_customer_support_contact_missing")
+    return missing
+
+
+def _product_completeness_missing_codes(
+    parsed_product: Optional[StandardProduct],
+    current_product: dict[str, Any],
+    *,
+    field_facts: dict[str, dict[str, Any]],
+) -> list[str]:
+    family = _product_family(parsed_product, current_product)
+    missing: list[str] = []
+    if family == "apparel_footwear" and not _has_size_guidance(parsed_product, current_product):
+        missing.append("product_size_guidance_missing")
+    if not _has_material_or_ingredient_info(
+        parsed_product,
+        current_product,
+        family=family,
+        field_facts=field_facts,
+    ):
+        missing.append("product_material_or_ingredient_info_missing")
+    if not _has_usage_guidance(parsed_product, current_product, field_facts=field_facts):
+        missing.append("product_usage_scenario_missing")
+    return missing
+
+
+def _lane_reason_codes_for_product(
+    parsed_product: Optional[StandardProduct],
+    current_product: dict[str, Any],
+    *,
+    store_context: dict[str, Any],
+    field_facts: dict[str, dict[str, Any]],
+) -> dict[str, list[str]]:
+    merchant_missing = _merchant_policy_missing_codes(store_context)
+    product_missing = _product_completeness_missing_codes(
+        parsed_product,
+        current_product,
+        field_facts=field_facts,
+    )
+    return {
+        "shipping_delivery_completeness": [
+            code for code in merchant_missing if code in _CATALOG_HEALTH_LANE_REASON_CODES["shipping_delivery_completeness"]
+        ],
+        "trust_support_policy_completeness": [
+            code for code in merchant_missing if code in _CATALOG_HEALTH_LANE_REASON_CODES["trust_support_policy_completeness"]
+        ],
+        "product_fit_composition_completeness": [
+            code for code in product_missing if code in _CATALOG_HEALTH_LANE_REASON_CODES["product_fit_composition_completeness"]
+        ],
+    }
+
+
+def _lane_state_for_reason_codes(lane_code: str, present_reason_codes: list[str]) -> Optional[str]:
+    total = len(_CATALOG_HEALTH_LANE_REASON_CODES.get(lane_code, []))
+    present = len(present_reason_codes)
+    if present <= 0 or total <= 0:
+        return None
+    if lane_code == "shipping_delivery_completeness":
+        return "policy_facts_missing" if present >= total else "policy_facts_partial"
+    if lane_code == "trust_support_policy_completeness":
+        return "trust_facts_missing" if present >= total else "trust_facts_partial"
+    return "product_guidance_missing" if present >= total else "product_guidance_partial"
+
+
+async def _load_store_context(merchant_id: str) -> dict[str, Any]:
+    if not getattr(database, "is_connected", False):
+        return {}
+    try:
+        store = await get_primary_store(merchant_id)
+    except Exception:
+        logger.warning("Failed to load primary store context for merchant=%s", merchant_id, exc_info=True)
+        return {}
+    return dict(store or {})
+
+
+async def _load_catalog_field_facts_for_product_keys(
+    merchant_id: str,
+    product_keys: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict[str, dict[str, Any]]]:
+    if not product_keys:
+        return {}
+    if not getattr(database, "is_connected", False):
+        return {}
+    entity_ids = {
+        make_catalog_product_key(merchant_id, platform, product_id): (platform, product_id)
+        for platform, product_id in product_keys
+    }
+    query = (
+        catalog_field_facts.select()
+        .where(catalog_field_facts.c.entity_type == "product")
+        .where(catalog_field_facts.c.entity_id.in_(list(entity_ids.keys())))
+    )
+    try:
+        rows = await database.fetch_all(query)
+    except Exception:
+        logger.warning("Failed to load catalog field facts for merchant=%s", merchant_id, exc_info=True)
+        return {}
+
+    facts_by_key: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    for row in rows or []:
+        payload = dict(row)
+        product_key = entity_ids.get(str(payload.get("entity_id") or ""))
+        if product_key is None:
+            continue
+        family = str(payload.get("field_family") or "").strip()
+        field_key = str(payload.get("field_key") or "").strip()
+        if not family or not field_key:
+            continue
+        facts_by_key.setdefault(product_key, {}).setdefault(family, {})[field_key] = payload.get("value_json")
+    return facts_by_key
 
 
 def _snapshot_variant_agent_push_projection(variant: Any) -> dict[str, Any]:
@@ -543,11 +1000,29 @@ def _humanize_code(code: str) -> str:
         "missing_shipping_profile": "Missing shipping setup",
         "merchant_shipping_policy_missing": "Shipping policy missing",
         "merchant_return_policy_missing": "Returns policy missing",
+        "merchant_shipping_destinations_missing": "Shipping destinations missing",
+        "merchant_shipping_sla_missing": "Shipping timing missing",
+        "merchant_delivery_costs_missing": "Shipping / duty details missing",
+        "merchant_return_window_missing": "Return window missing",
+        "merchant_warranty_policy_missing": "Warranty policy missing",
+        "merchant_authenticity_guarantee_missing": "Authenticity guarantee missing",
+        "merchant_customer_support_contact_missing": "Customer support contact missing",
         "merchant_checkout_capability_missing": "Checkout not connected",
         "merchant_writeback_unavailable": "Order sync unavailable",
         "reviews_summary_unavailable": "Reviews summary unavailable",
         "cross_merchant_review_group_unresolved": "Cross-merchant review grouping incomplete",
         "review_coverage_partial": "Review coverage partial",
+        "generic_low_information_title": "Low-information title",
+        "missing_category_signal": "Style / product type missing",
+        "missing_audience_signal": "Audience / gender missing",
+        "missing_color_signal": "Color missing",
+        "missing_feature_signal": "Key feature missing",
+        "missing_size_guidance": "Size guidance missing",
+        "missing_material_or_ingredient_info": "Material / ingredient info missing",
+        "missing_usage_scenario": "Usage scenario missing",
+        "product_size_guidance_missing": "Size guidance missing",
+        "product_material_or_ingredient_info_missing": "Material / ingredient info missing",
+        "product_usage_scenario_missing": "Usage scenario missing",
     }
     if code in labels:
         return labels[code]
@@ -847,7 +1322,7 @@ def _store_optimization_payload(
 
 
 def _severity_for_bucket(bucket_code: str, affected_count: int) -> str:
-    if bucket_code in {"checkout_payment_setup", "shipping_returns_setup", "order_sync_operations"}:
+    if bucket_code in {"checkout_payment_setup", "shipping_returns_setup", "trust_support_setup", "order_sync_operations"}:
         return "high"
     if affected_count >= 25:
         return "high"
@@ -1253,6 +1728,160 @@ async def _apply_quality_projection(
         return product_queue, QualityCoverageSummary()
 
 
+def _content_gap_priority_weight(code: str) -> int:
+    return {
+        "generic_low_information_title": 6,
+        "missing_size_guidance": 5,
+        "missing_material_or_ingredient_info": 5,
+        "missing_usage_scenario": 4,
+        "missing_feature_signal": 3,
+        "missing_color_signal": 2,
+        "missing_audience_signal": 2,
+        "missing_category_signal": 2,
+    }.get(code, 1)
+
+
+def _title_primary_action(item: ProductReadinessQueueItem) -> str:
+    if item.title_health == "rewrite_candidate":
+        return "Review the suggested richer title and refresh the enrichment draft for this product."
+    if item.title_health == "needs_more_facts":
+        return "Add the missing product facts before generating a fuller market-facing title."
+    if item.title_health == "generic_low_information":
+        return "Expand the product title with style, audience, color, feature, and size signals."
+    return item.primary_action or "Review this product and improve its catalog content."
+
+
+def _queue_item_has_workspace_signal(item: ProductReadinessQueueItem) -> bool:
+    if int(item.blocked_variant_count or 0) > 0 or int(item.excluded_variant_count or 0) > 0:
+        return True
+    if item.recommended_action_type == "run_product_enrichment":
+        return True
+    if item.title_health and item.title_health != "healthy":
+        return True
+    return bool(item.content_gap_codes)
+
+
+def _is_content_only_opportunity(item: ProductReadinessQueueItem) -> bool:
+    return (
+        int(item.blocked_variant_count or 0) <= 0
+        and int(item.excluded_variant_count or 0) <= 0
+        and _queue_item_has_workspace_signal(item)
+    )
+
+
+async def _apply_catalog_health_projection(
+    merchant_id: str,
+    *,
+    snapshot_products: list[Any],
+    product_queue: list[ProductReadinessQueueItem],
+) -> list[ProductReadinessQueueItem]:
+    if not product_queue:
+        return product_queue
+
+    snapshot_products_by_key: dict[tuple[str, str], Any] = {}
+    for product in snapshot_products:
+        key = make_product_key(product.platform or "unknown", product.product_id)
+        if key is not None:
+            snapshot_products_by_key[key] = product
+
+    product_keys = [
+        key
+        for key in (
+            make_product_key(item.platform, item.platform_product_id or item.product_id)
+            for item in product_queue
+        )
+        if key is not None
+    ]
+    cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
+    field_facts_by_key = await _load_catalog_field_facts_for_product_keys(merchant_id, product_keys)
+    store_context = await _load_store_context(merchant_id)
+
+    for item in product_queue:
+        product_key = make_product_key(item.platform, item.platform_product_id or item.product_id)
+        if product_key is None:
+            continue
+        current_product = _current_product_data(cache_rows_by_key.get(product_key))
+        if not current_product:
+            snapshot_product = snapshot_products_by_key.get(product_key)
+            if snapshot_product is not None:
+                current_product = _snapshot_product_to_current_product(
+                    snapshot_product,
+                    merchant_id=merchant_id,
+                )
+        parsed_product = _current_product_to_standard_product(
+            current_product,
+            merchant_id=merchant_id,
+            platform=item.platform,
+            product_id=item.platform_product_id or item.product_id,
+        )
+        if parsed_product is None:
+            continue
+
+        suggestion_language = _catalog_health_language(store_context, current_product)
+        title_suggestion = generate_title_suggestion(
+            parsed_product,
+            preferred_language=suggestion_language,
+        )
+        item.content_gap_codes = _dedupe_codes(item.content_gap_codes, title_suggestion.content_gap_codes)
+        item.missing_attribute_labels = _dedupe_strings(
+            [*(item.missing_attribute_labels or []), *(title_suggestion.missing_attribute_labels or [])]
+        )
+        item.title_health = title_suggestion.title_health
+        item.suggested_title_preview = title_suggestion.suggested_title
+        item.suggestion_language = title_suggestion.suggestion_language
+        item.suggestion_confidence = title_suggestion.suggestion_confidence
+        item.suggestion_rationale = title_suggestion.suggestion_rationale
+
+        issue_map: dict[str, ProductQueueIssue] = {
+            issue.code: issue for issue in (item.top_issues or [])
+        }
+        content_issue_count = max(
+            1,
+            int(item.ready_variant_count or 0)
+            + int(item.blocked_variant_count or 0)
+            + int(item.excluded_variant_count or 0),
+        )
+        for code in item.content_gap_codes:
+            issue_map.setdefault(
+                code,
+                ProductQueueIssue(
+                    code=code,
+                    label=_humanize_code(code),
+                    impact="discovery_only",
+                    affected_variant_count=content_issue_count,
+                ),
+            )
+        item.top_issues = sorted(
+            issue_map.values(),
+            key=lambda issue: (
+                -_content_gap_priority_weight(issue.code),
+                -int(issue.affected_variant_count or 0),
+                issue.label.lower(),
+            ),
+        )[:3]
+
+        if _is_content_only_opportunity(item):
+            item.fix_surface = "product_content"
+            item.fixability = "merchant_fixable"
+            item.impact = "discovery_only"
+            item.recommended_action_type = "run_product_enrichment"
+            item.primary_action = _title_primary_action(item)
+            item.priority_reason = (
+                item.suggestion_rationale
+                or "Improving this title and the missing product facts can increase how reliably agents retrieve and present this item."
+            )
+            item.priority_score = max(
+                float(item.priority_score or 0.0),
+                _product_priority_score(
+                    blocked_variant_count=0,
+                    impact="discovery_only",
+                    fix_surface="product_content",
+                    affected_variant_count=len(item.content_gap_codes) or 1,
+                ),
+            )
+    return product_queue
+
+
 async def _build_source_data_lanes(
     merchant_id: str,
     *,
@@ -1274,6 +1903,8 @@ async def _build_source_data_lanes(
         if key is not None
     ]
     cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
+    field_facts_by_key = await _load_catalog_field_facts_for_product_keys(merchant_id, product_keys)
+    store_context = await _load_store_context(merchant_id)
     decisions_by_reason_key: dict[str, dict[str, dict[str, Any]]] = {}
     for reason_code in _SOURCE_DATA_DECISION_LABELS:
         decisions_by_reason_key[reason_code] = await list_source_data_decisions(
@@ -1292,6 +1923,7 @@ async def _build_source_data_lanes(
             "next_product": None,
             "state_counts": Counter(),
             "decision_counts": Counter(),
+            "reason_codes": set(),
         }
         for reason_code, definition in _SOURCE_DATA_LANE_DEFS.items()
     }
@@ -1304,9 +1936,27 @@ async def _build_source_data_lanes(
         if snapshot_product is None:
             continue
         current_product = _current_product_data(cache_rows_by_key.get(product_key))
+        if not current_product:
+            current_product = _snapshot_product_to_current_product(
+                snapshot_product,
+                merchant_id=merchant_id,
+            )
+        parsed_product = _current_product_to_standard_product(
+            current_product,
+            merchant_id=merchant_id,
+            platform=item.platform,
+            product_id=item.platform_product_id or item.product_id,
+        )
+        field_facts = field_facts_by_key.get(product_key, {})
+        lane_reason_codes = _lane_reason_codes_for_product(
+            parsed_product,
+            current_product,
+            store_context=store_context,
+            field_facts=field_facts,
+        )
         decisions_key = f"{product_key[0]}|{product_key[1]}"
 
-        for reason_code in _SOURCE_DATA_LANE_DEFS:
+        for reason_code in ("missing_price", "out_of_stock", "missing_primary_image"):
             lane = lane_stats[reason_code]
             sample_variant_id: Optional[str] = None
             affected_variants = 0
@@ -1382,6 +2032,7 @@ async def _build_source_data_lanes(
             lane["affected_variants"] += affected_variants
             lane["blocked_products"] += 1 if int(item.blocked_variant_count or 0) > 0 else 0
             lane["excluded_products"] += 1 if int(item.excluded_variant_count or 0) > 0 else 0
+            lane["reason_codes"].add(reason_code)
             if lane["next_product"] is None:
                 lane["next_product"] = SourceDataLaneNextProduct(
                     platform=item.platform,
@@ -1396,6 +2047,51 @@ async def _build_source_data_lanes(
             if queue_state_key:
                 lane["state_counts"][queue_state_key] += 1
 
+        for lane_code in _CATALOG_HEALTH_LANE_REASON_CODES:
+            present_reason_codes = lane_reason_codes.get(lane_code) or []
+            if not present_reason_codes:
+                continue
+            lane = lane_stats[lane_code]
+            affected_variants = max(
+                1,
+                int(item.ready_variant_count or 0)
+                + int(item.blocked_variant_count or 0)
+                + int(item.excluded_variant_count or 0),
+            )
+            queue_state_key = _lane_state_for_reason_codes(lane_code, present_reason_codes)
+            persisted_decision = str(
+                (
+                    decisions_by_reason_key
+                    .get(lane_code, {})
+                    .get(decisions_key, {})
+                    .get("decision_state")
+                )
+                or ""
+            ).strip()
+            effective_decision = persisted_decision or "pending_review"
+
+            lane["affected_products"] += 1
+            lane["affected_variants"] += affected_variants
+            lane["blocked_products"] += 1 if int(item.blocked_variant_count or 0) > 0 else 0
+            lane["excluded_products"] += 1 if int(item.excluded_variant_count or 0) > 0 else 0
+            lane["reason_codes"].update(present_reason_codes)
+            lane["decision_counts"][effective_decision] += 1
+            if lane["next_product"] is None:
+                sample_variant_id = None
+                if snapshot_product.variants:
+                    sample_variant_id = str((snapshot_product.variants[0].variant_id or "")).strip() or None
+                lane["next_product"] = SourceDataLaneNextProduct(
+                    platform=item.platform,
+                    platform_product_id=item.platform_product_id or item.product_id or "",
+                    product_id=item.product_id,
+                    title=item.title,
+                    blocked_variant_count=int(item.blocked_variant_count or 0),
+                    excluded_variant_count=int(item.excluded_variant_count or 0),
+                    sample_variant_id=sample_variant_id,
+                )
+            if queue_state_key:
+                lane["state_counts"][queue_state_key] += 1
+
     summaries: list[SourceDataLaneSummary] = []
     for reason_code, definition in _SOURCE_DATA_LANE_DEFS.items():
         lane = lane_stats[reason_code]
@@ -1403,6 +2099,11 @@ async def _build_source_data_lanes(
             SourceDataLaneSummary(
                 reason_code=reason_code,
                 label=definition["label"],
+                reason_codes=sorted(
+                    list(lane["reason_codes"])
+                    or list(_CATALOG_HEALTH_LANE_REASON_CODES.get(reason_code, []))
+                    or [reason_code]
+                ),
                 affected_products=int(lane["affected_products"]),
                 affected_variants=int(lane["affected_variants"]),
                 blocked_products=int(lane["blocked_products"]),
@@ -1487,7 +2188,12 @@ def build_lane_delta(
     )
 
 
-def _build_issue_buckets(snapshot: MerchantReadinessSnapshot) -> list[ReadinessIssueBucket]:
+def _build_issue_buckets(
+    snapshot: MerchantReadinessSnapshot,
+    *,
+    product_queue: Optional[list[ProductReadinessQueueItem]] = None,
+    source_data_lanes: Optional[list[SourceDataLaneSummary]] = None,
+) -> list[ReadinessIssueBucket]:
     bucket_reason_counts: dict[str, Counter[str]] = {}
     bucket_affected_counts: Counter[str] = Counter()
 
@@ -1500,12 +2206,32 @@ def _build_issue_buckets(snapshot: MerchantReadinessSnapshot) -> list[ReadinessI
         bucket = _bucket_code_for_reason(code)
         bucket_reason_counts.setdefault(bucket, Counter())[code] += 1
 
-    for product in snapshot.products:
-        issue_counts = _product_issue_counts(product, snapshot.channel)
-        for code, count in issue_counts.items():
-            bucket = _bucket_code_for_reason(code)
-            bucket_reason_counts.setdefault(bucket, Counter())[code] += count
-            bucket_affected_counts[bucket] += count
+    if product_queue is None:
+        for product in snapshot.products:
+            issue_counts = _product_issue_counts(product, snapshot.channel)
+            for code, count in issue_counts.items():
+                bucket = _bucket_code_for_reason(code)
+                bucket_reason_counts.setdefault(bucket, Counter())[code] += count
+                bucket_affected_counts[bucket] += count
+    else:
+        for item in product_queue:
+            for issue in item.top_issues or []:
+                bucket = _bucket_code_for_reason(issue.code)
+                bucket_reason_counts.setdefault(bucket, Counter())[issue.code] += int(issue.affected_variant_count or 0) or 1
+                bucket_affected_counts[bucket] += int(issue.affected_variant_count or 0) or 1
+            for code in item.content_gap_codes or []:
+                bucket = _bucket_code_for_reason(code)
+                bucket_reason_counts.setdefault(bucket, Counter())[code] += 1
+                bucket_affected_counts[bucket] += 1
+
+    for lane in source_data_lanes or []:
+        if int(lane.affected_products or 0) <= 0:
+            continue
+        reason_codes = list(lane.reason_codes or []) or [lane.reason_code]
+        bucket = _bucket_code_for_reason(reason_codes[0])
+        bucket_affected_counts[bucket] += int(lane.affected_products or 0)
+        for code in reason_codes:
+            bucket_reason_counts.setdefault(bucket, Counter())[code] += 1
 
     buckets: list[ReadinessIssueBucket] = []
     for bucket_code, reason_counts in bucket_reason_counts.items():
@@ -1555,6 +2281,9 @@ def _build_merchant_actions(summary: ReadinessSummary, issue_buckets: list[Readi
         if bucket.fix_surface == "integrations":
             label = "Review integrations"
             description = f"{bucket.label} is blocking checkout or order sync for this merchant."
+        elif bucket.code == "trust_support_setup":
+            label = "Review trust and support info"
+            description = "Add warranty, authenticity, and customer support details so agents can represent this merchant more safely."
         elif bucket.fix_surface == "policy":
             label = "Review shipping and returns setup"
             description = "Complete shipping and returns setup before enabling agent commerce."
@@ -2026,8 +2755,6 @@ async def get_readiness_optimization_context(
         )
 
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
-    issue_buckets = _build_issue_buckets(snapshot)
-    merchant_actions = _build_merchant_actions(summary, issue_buckets)
     store_domains_by_platform = await _load_store_domains_by_platform(merchant_id)
     full_product_queue = [
         _product_queue_item(
@@ -2047,23 +2774,35 @@ async def get_readiness_optimization_context(
         snapshot_products=snapshot.products,
         product_queue=full_product_queue,
     )
-    product_queue = [
-        item
-        for item in full_product_queue
-        if int(item.blocked_variant_count or 0) > 0 or int(item.excluded_variant_count or 0) > 0
-    ]
-    content_opportunity_count = max(0, len(full_product_queue) - len(product_queue))
-    product_queue.sort(
-        key=lambda item: (
-            -item.priority_score,
-            -item.blocked_variant_count,
-            item.title.lower(),
-        )
+    full_product_queue = await _apply_catalog_health_projection(
+        merchant_id,
+        snapshot_products=snapshot.products,
+        product_queue=full_product_queue,
     )
     source_data_lanes = await _build_source_data_lanes(
         merchant_id,
         snapshot_products=snapshot.products,
-        product_queue=product_queue,
+        product_queue=full_product_queue,
+    )
+    issue_buckets = _build_issue_buckets(
+        snapshot,
+        product_queue=full_product_queue,
+        source_data_lanes=source_data_lanes,
+    )
+    merchant_actions = _build_merchant_actions(summary, issue_buckets)
+    product_queue = [
+        item
+        for item in full_product_queue
+        if _queue_item_has_workspace_signal(item)
+    ]
+    content_opportunity_count = sum(1 for item in product_queue if _is_content_only_opportunity(item))
+    product_queue.sort(
+        key=lambda item: (
+            _is_content_only_opportunity(item),
+            -item.priority_score,
+            -item.blocked_variant_count,
+            item.title.lower(),
+        )
     )
     snapshot_id = _build_snapshot_id(snapshot)
     plan = OptimizationPlan(

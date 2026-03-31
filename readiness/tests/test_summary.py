@@ -32,9 +32,17 @@ def _reset_optimization_cache(monkeypatch):
     async def _no_stores(*_args, **_kwargs):
         return []
 
+    async def _no_store_context(*_args, **_kwargs):
+        return {}
+
+    async def _no_field_facts(*_args, **_kwargs):
+        return {}
+
     monkeypatch.setattr("readiness.summary.list_source_data_decisions", _no_decisions)
     monkeypatch.setattr("readiness.summary._load_cache_rows_for_product_keys", _no_cache_rows)
     monkeypatch.setattr("readiness.summary.get_merchant_active_stores", _no_stores)
+    monkeypatch.setattr("readiness.summary._load_store_context", _no_store_context)
+    monkeypatch.setattr("readiness.summary._load_catalog_field_facts_for_product_keys", _no_field_facts)
 
 
 def _snapshot(
@@ -278,6 +286,9 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
         "missing_price",
         "out_of_stock",
         "missing_primary_image",
+        "shipping_delivery_completeness",
+        "trust_support_policy_completeness",
+        "product_fit_composition_completeness",
     }
     lanes_by_code = {lane.reason_code: lane for lane in payload.source_data_lanes}
     assert lanes_by_code["missing_price"].affected_products == 1
@@ -285,6 +296,9 @@ async def test_build_readiness_optimization_returns_issue_buckets_and_product_qu
     assert lanes_by_code["out_of_stock"].affected_products == 1
     assert lanes_by_code["out_of_stock"].affected_variants == 1
     assert lanes_by_code["missing_primary_image"].affected_products == 0
+    assert lanes_by_code["shipping_delivery_completeness"].affected_products == 1
+    assert lanes_by_code["trust_support_policy_completeness"].affected_products == 1
+    assert lanes_by_code["product_fit_composition_completeness"].affected_products == 1
     assert payload.agent_push_summary.eligible_products == 1
     assert payload.agent_push_summary.excluded_variants == 1
 
@@ -744,5 +758,222 @@ async def test_build_readiness_optimization_filters_content_only_queue_items(mon
 
     payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
 
-    assert [item.product_id for item in payload.product_queue] == ["prod_blocked"]
+    assert [item.product_id for item in payload.product_queue] == ["prod_blocked", "prod_content_only"]
     assert payload.content_opportunity_count == 1
+
+
+@pytest.mark.asyncio
+async def test_build_readiness_optimization_surfaces_title_suggestion_for_generic_title(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=82,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="ready",
+                    ready_variant_count=1,
+                    blocked_variant_count=0,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_air",
+                    platform="shopify",
+                    title="Air Max Special Edition",
+                    brand="Nike",
+                    category="Sneakers",
+                    default_image_url="https://example.com/air.jpg",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_air_42",
+                            title="Black / White / 42",
+                            price={"amount": 129, "currency": "USD"},
+                            inventory={"quantity": 4, "availability": "in_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": []},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                            channel_coverage={"ucp": "ready"},
+                        ),
+                        ReadyVariant(
+                            variant_id="var_air_45",
+                            title="Black / White / 45",
+                            price={"amount": 129, "currency": "USD"},
+                            inventory={"quantity": 3, "availability": "in_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": []},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                            channel_coverage={"ucp": "ready"},
+                        ),
+                    ],
+                )
+            ],
+        )
+
+    async def fake_load_cache_rows(_merchant_id: str, product_keys):
+        assert product_keys == [("shopify", "prod_air")]
+        return {
+            ("shopify", "prod_air"): {
+                "product_data": {
+                    "id": "prod_air",
+                    "product_id": "prod_air",
+                    "merchant_id": "merch_efbc46b4619cfbdf",
+                    "platform": "shopify",
+                    "title": "Air Max Special Edition",
+                    "description": "Breathable running sneakers with Max Air cushioning for daily commuting and training.",
+                    "vendor": "Nike",
+                    "product_type": "Sneakers",
+                    "tags": ["men", "air cushion", "breathable"],
+                    "price": 129.0,
+                    "currency": "USD",
+                    "inventory_quantity": 7,
+                    "image_url": "https://example.com/air.jpg",
+                    "variants": [
+                        {
+                            "id": "var_air_42",
+                            "variant_id": "var_air_42",
+                            "title": "Black / White / 42",
+                            "price": 129.0,
+                            "currency": "USD",
+                            "inventory_quantity": 4,
+                            "options": {"Color": "Black / White", "Size": "42"},
+                        },
+                        {
+                            "id": "var_air_45",
+                            "variant_id": "var_air_45",
+                            "title": "Black / White / 45",
+                            "price": 129.0,
+                            "currency": "USD",
+                            "inventory_quantity": 3,
+                            "options": {"Color": "Black / White", "Size": "45"},
+                        },
+                    ],
+                }
+            }
+        }
+
+    async def fake_store_context(_merchant_id: str):
+        return {"country": "US"}
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    monkeypatch.setattr("readiness.summary._load_cache_rows_for_product_keys", fake_load_cache_rows)
+    monkeypatch.setattr("readiness.summary._load_store_context", fake_store_context)
+
+    payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+
+    assert [item.product_id for item in payload.product_queue] == ["prod_air"]
+    queue_item = payload.product_queue[0]
+    assert queue_item.title_health == "rewrite_candidate"
+    assert queue_item.recommended_action_type == "run_product_enrichment"
+    assert queue_item.suggestion_language == "en"
+    assert queue_item.suggested_title_preview == "Nike Air Max Sneakers Men's Black/White air-cushion, breathable Sizes 42-45"
+    assert "generic_low_information_title" in queue_item.content_gap_codes
+    assert "Material / ingredient info" in queue_item.missing_attribute_labels
+
+
+@pytest.mark.asyncio
+async def test_build_readiness_optimization_hydrates_catalog_health_decision_counts(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=70,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="ready",
+                    ready_variant_count=1,
+                    blocked_variant_count=0,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_policy",
+                    platform="shopify",
+                    title="Policy Heavy Product",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_policy",
+                            title="Default",
+                            price={"amount": 30, "currency": "USD"},
+                            inventory={"quantity": 5, "availability": "in_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": []},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                            channel_coverage={"ucp": "ready"},
+                        )
+                    ],
+                )
+            ],
+        )
+
+    async def fake_list_source_data_decisions(_merchant_id: str, *, reason_code: str | None = None, product_keys=None):
+        if reason_code == "shipping_delivery_completeness":
+            return {
+                "shopify|prod_policy": {
+                    "decision_state": "merchant_fix_in_progress",
+                }
+            }
+        return {}
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    monkeypatch.setattr("readiness.summary.list_source_data_decisions", fake_list_source_data_decisions)
+
+    payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+
+    lanes_by_code = {lane.reason_code: lane for lane in payload.source_data_lanes}
+    shipping_lane = lanes_by_code["shipping_delivery_completeness"]
+    assert shipping_lane.affected_products == 1
+    assert shipping_lane.reason_codes == [
+        "merchant_delivery_costs_missing",
+        "merchant_return_window_missing",
+        "merchant_shipping_destinations_missing",
+        "merchant_shipping_sla_missing",
+    ]
+    assert {
+        item.key: item.count
+        for item in shipping_lane.decision_counts
+    }["merchant_fix_in_progress"] == 1

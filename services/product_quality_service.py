@@ -217,7 +217,9 @@ def build_quality_payload(
     enrichment = enrichment or {}
 
     if isinstance(product, StandardProduct):
-        product_data: Dict[str, Any] = product.dict()
+        product_data: Dict[str, Any] = (
+            product.model_dump() if hasattr(product, "model_dump") else product.dict()
+        )
         title = product.title
         description = product.description_text or product.description or ""
         price_value = product.price

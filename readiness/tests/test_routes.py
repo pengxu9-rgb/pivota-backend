@@ -234,6 +234,13 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
                         "impact": "full_agent_commerce",
                         "priority_score": 157,
                         "priority_reason": "Fixing this product can unlock checkout for blocked variants.",
+                        "content_gap_codes": ["generic_low_information_title", "missing_size_guidance"],
+                        "missing_attribute_labels": ["Size guidance", "Material / ingredient info"],
+                        "title_health": "rewrite_candidate",
+                        "suggested_title_preview": "Nike Air Max Sneakers Men's Black/White air-cushion, breathable Sizes 42-45",
+                        "suggestion_language": "en",
+                        "suggestion_confidence": 0.77,
+                        "suggestion_rationale": "Suggested title uses verified product facts and keeps missing facts out of the copy.",
                     }
                 ],
                 "last_generated_at": "2026-03-18T00:00:00Z",
@@ -269,6 +276,8 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
     assert body["data"]["readiness_summary"]["tier"] == "yellow"
     assert body["data"]["issue_buckets"][0]["code"] == "price_currency"
     assert body["data"]["product_queue"][0]["platform"] == "shopify"
+    assert body["data"]["product_queue"][0]["title_health"] == "rewrite_candidate"
+    assert body["data"]["product_queue"][0]["suggestion_language"] == "en"
 
 
 def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
