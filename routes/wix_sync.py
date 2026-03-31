@@ -9,96 +9,152 @@ import uuid
 
 router = APIRouter()
 
+_PLATFORM_LABELS = {
+    "wix": "Wix",
+    "woocommerce": "WooCommerce",
+    "bigcommerce": "BigCommerce",
+}
+
+
+async def _sync_connected_platform_products(
+    *,
+    platform: str,
+    store_id: Optional[str],
+    current_user: dict,
+):
+    platform_label = _PLATFORM_LABELS.get(platform, platform.title())
+
+    if current_user["role"] not in ["merchant", "employee", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id and current_user["role"] == "merchant":
+        raise HTTPException(status_code=400, detail="Merchant ID not found")
+
+    if store_id:
+        store_query = """
+            SELECT * FROM merchant_stores
+            WHERE store_id = :store_id AND platform = :platform
+        """
+        store = await database.fetch_one(
+            store_query,
+            {"store_id": store_id, "platform": platform},
+        )
+    elif merchant_id:
+        store_query = """
+            SELECT * FROM merchant_stores
+            WHERE merchant_id = :merchant_id AND platform = :platform
+            LIMIT 1
+        """
+        store = await database.fetch_one(
+            store_query,
+            {"merchant_id": merchant_id, "platform": platform},
+        )
+    else:
+        store_query = """
+            SELECT * FROM merchant_stores
+            WHERE platform = :platform
+            LIMIT 1
+        """
+        store = await database.fetch_one(store_query, {"platform": platform})
+
+    if not store:
+        raise HTTPException(status_code=404, detail=f"{platform_label} store not found")
+
+    store_dict = dict(store)
+    merchant_id = store_dict.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Merchant ID not found in store record")
+
+    from routes.product_sync import sync_products, SyncRequest
+    from fastapi import BackgroundTasks
+
+    sync_request = SyncRequest(
+        merchant_id=merchant_id,
+        force_refresh=True,
+        limit=250,
+        platform=platform,
+    )
+
+    sync_result = await sync_products(
+        request=sync_request,
+        background_tasks=BackgroundTasks(),
+        current_user=current_user,
+    )
+
+    if sync_result.status != "success":
+        raise HTTPException(
+            status_code=400,
+            detail=f"{platform_label} sync failed: {sync_result.message}",
+        )
+
+    return {
+        "status": "success",
+        "message": sync_result.message,
+        "store_id": store_dict["store_id"],
+        "store_name": store_dict["name"],
+        "product_count": sync_result.products_synced,
+        "platform": sync_result.platform,
+        "synced_at": sync_result.sync_time,
+    }
+
+
 @router.post("/merchant/integrations/wix/sync")
 async def sync_wix_products(
     store_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
     """Sync products from Wix store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
     try:
-        # Get merchant_id
-        merchant_id = current_user.get("merchant_id")
-        if not merchant_id and current_user["role"] == "merchant":
-            raise HTTPException(status_code=400, detail="Merchant ID not found")
-        
-        # Get Wix store
-        if store_id:
-            store_query = """
-                SELECT * FROM merchant_stores
-                WHERE store_id = :store_id AND platform = 'wix'
-            """
-            store = await database.fetch_one(store_query, {"store_id": store_id})
-        else:
-            # Get first Wix store for this merchant
-            if merchant_id:
-                store_query = """
-                    SELECT * FROM merchant_stores
-                    WHERE merchant_id = :merchant_id AND platform = 'wix'
-                    LIMIT 1
-                """
-                store = await database.fetch_one(store_query, {"merchant_id": merchant_id})
-            else:
-                # For employee, get any Wix store
-                store_query = """
-                    SELECT * FROM merchant_stores
-                    WHERE platform = 'wix'
-                    LIMIT 1
-                """
-                store = await database.fetch_one(store_query)
-        
-        if not store:
-            raise HTTPException(status_code=404, detail="Wix store not found")
-        
-        # Convert Row to dict
-        store_dict = dict(store)
-        
-        # Get merchant_id for cache query
-        merchant_id = store_dict.get("merchant_id")
-        if not merchant_id:
-            raise HTTPException(status_code=400, detail="Merchant ID not found in store record")
-        
-        # 调用真正的产品同步（和 Shopify 一样，走 Universal Sync）
-        from routes.product_sync import sync_products, SyncRequest
-        from fastapi import BackgroundTasks
-        
-        sync_request = SyncRequest(
-            merchant_id=merchant_id,
-            force_refresh=True,  # 强制刷新
-            limit=250,
-            platform="wix"  # 明确指定同步 Wix
-        )
-        
-        # 执行真正的同步
-        sync_result = await sync_products(
-            request=sync_request,
-            background_tasks=BackgroundTasks(),
+        return await _sync_connected_platform_products(
+            platform="wix",
+            store_id=store_id,
             current_user=current_user,
         )
-
-        if sync_result.status != "success":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Wix sync failed: {sync_result.message}",
-            )
-        
-        return {
-            "status": "success",
-            "message": sync_result.message,
-            "store_id": store_dict["store_id"],
-            "store_name": store_dict["name"],
-            "product_count": sync_result.products_synced,
-            "platform": sync_result.platform,
-            "synced_at": sync_result.sync_time,
-        }
-    
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error syncing Wix products: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
+
+
+@router.post("/merchant/integrations/woocommerce/sync")
+async def sync_woocommerce_products(
+    store_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Sync products from WooCommerce store"""
+    try:
+        return await _sync_connected_platform_products(
+            platform="woocommerce",
+            store_id=store_id,
+            current_user=current_user,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error syncing WooCommerce products: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
+
+
+@router.post("/merchant/integrations/bigcommerce/sync")
+async def sync_bigcommerce_products(
+    store_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Sync products from BigCommerce store"""
+    try:
+        return await _sync_connected_platform_products(
+            platform="bigcommerce",
+            store_id=store_id,
+            current_user=current_user,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error syncing BigCommerce products: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to sync products: {str(e)}")
+
 
 @router.post("/integrations/wix/connect-sync")
 async def connect_wix_store_sync(

@@ -11,6 +11,11 @@ import httpx
 import json
 import logging
 from datetime import datetime
+from adapters.bigcommerce_adapter import (
+    build_bigcommerce_headers,
+    normalize_bigcommerce_store_hash,
+)
+from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mcp", tags=["mcp-e2e-test"])
@@ -28,6 +33,45 @@ class MCPTestResponse(BaseModel):
     timestamp: str
     tests: List[MCPTestResult]
     summary: Dict[str, int]
+
+
+def _extract_woocommerce_credentials(api_key: str) -> tuple[str, str]:
+    raw = str(api_key or "").strip()
+    if not raw:
+        return "", ""
+    try:
+        if raw.startswith("{"):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return (
+                    str(parsed.get("consumer_key") or "").strip(),
+                    str(parsed.get("consumer_secret") or "").strip(),
+                )
+    except Exception:
+        pass
+    if ":" in raw:
+        consumer_key, consumer_secret = raw.split(":", 1)
+        return consumer_key.strip(), consumer_secret.strip()
+    return raw, ""
+
+
+def _extract_bigcommerce_credentials(domain: str, api_key: str) -> tuple[str, str, str]:
+    raw = str(api_key or "").strip()
+    access_token = raw
+    client_id = ""
+    store_hash = normalize_bigcommerce_store_hash(domain)
+    try:
+        if raw.startswith("{"):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                access_token = str(parsed.get("access_token") or "").strip()
+                client_id = str(parsed.get("client_id") or "").strip()
+                store_hash = normalize_bigcommerce_store_hash(
+                    parsed.get("store_hash") or domain
+                )
+    except Exception:
+        pass
+    return store_hash, access_token, client_id
 
 @router.post("/test/{merchant_id}", response_model=MCPTestResponse)
 async def run_mcp_e2e_test(
@@ -282,12 +326,14 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
         
         elif platform == "woocommerce":
             try:
-                creds = api_key.split(":", 1) if ":" in api_key else [api_key, ""]
-                consumer_key, consumer_secret = (creds[0], creds[1]) if len(creds) == 2 else (api_key, "")
+                consumer_key, consumer_secret = _extract_woocommerce_credentials(api_key)
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
-                        f"{domain.rstrip('/')}/wp-json/wc/v3/system_status",
-                        auth=(consumer_key, consumer_secret)
+                        f"{normalize_woocommerce_store_url(domain)}/wp-json/wc/v3/system_status",
+                        params={
+                            "consumer_key": consumer_key,
+                            "consumer_secret": consumer_secret,
+                        },
                     )
                     return {
                         "platform": "WooCommerce",
@@ -307,10 +353,11 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
         
         elif platform == "bigcommerce":
             try:
+                store_hash, access_token, client_id = _extract_bigcommerce_credentials(domain, api_key)
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
-                        f"https://api.bigcommerce.com/stores/{domain}/v3/catalog/summary",
-                        headers={"X-Auth-Token": api_key}
+                        f"https://api.bigcommerce.com/stores/{store_hash}/v2/store",
+                        headers=build_bigcommerce_headers(access_token, client_id),
                     )
                     return {
                         "platform": "BigCommerce",
@@ -599,12 +646,14 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
     
     elif platform == "woocommerce":
         try:
-            creds = api_key.split(":", 1) if ":" in api_key else [api_key, ""]
-            consumer_key, consumer_secret = (creds[0], creds[1]) if len(creds) == 2 else (api_key, "")
+            consumer_key, consumer_secret = _extract_woocommerce_credentials(api_key)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
-                    f"{domain.rstrip('/')}/wp-json/wc/v3/system_status",
-                    auth=(consumer_key, consumer_secret)
+                    f"{normalize_woocommerce_store_url(domain)}/wp-json/wc/v3/system_status",
+                    params={
+                        "consumer_key": consumer_key,
+                        "consumer_secret": consumer_secret,
+                    },
                 )
                 status = "success" if resp.status_code == 200 else "warning"
                 return {"platform": "WooCommerce", "name": name, "domain": domain, "status": status, "message": f"HTTP {resp.status_code}"}
@@ -613,10 +662,11 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
     
     elif platform == "bigcommerce":
         try:
+            store_hash, access_token, client_id = _extract_bigcommerce_credentials(domain, api_key)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
-                    f"https://api.bigcommerce.com/stores/{domain}/v3/catalog/summary",
-                    headers={"X-Auth-Token": api_key}
+                    f"https://api.bigcommerce.com/stores/{store_hash}/v2/store",
+                    headers=build_bigcommerce_headers(access_token, client_id),
                 )
                 status = "success" if resp.status_code == 200 else "warning"
                 return {"platform": "BigCommerce", "name": name, "domain": domain, "status": status, "message": f"HTTP {resp.status_code}"}

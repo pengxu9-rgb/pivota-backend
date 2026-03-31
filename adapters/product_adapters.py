@@ -12,6 +12,11 @@ import time
 import re
 from urllib.parse import urlparse, parse_qs
 
+from adapters.bigcommerce_adapter import (
+    build_bigcommerce_headers,
+    normalize_bigcommerce_store_hash,
+)
+from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 
 logger = logging.getLogger(__name__)
@@ -100,6 +105,50 @@ async def _fetch_shop_currency(
     currency = (shop.get("currency") if isinstance(shop, dict) else None) or ""
     cur = str(currency).strip().upper()
     return cur or None
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _parse_platform_datetime(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _split_tags(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        values = raw
+    else:
+        values = str(raw or "").split(",")
+    tags: List[str] = []
+    for item in values:
+        if isinstance(item, dict):
+            candidate = str(item.get("name") or item.get("label") or "").strip()
+        else:
+            candidate = str(item or "").strip()
+        if candidate and candidate not in tags:
+            tags.append(candidate)
+    return tags
 
 
 class ShopifyProductAdapter:
@@ -726,7 +775,293 @@ class WixProductAdapter:
 
 
 class WooCommerceProductAdapter:
-    """WooCommerce 产品适配器：WooCommerce API → StandardProduct（待实现）"""
+    """WooCommerce 产品适配器：WooCommerce API → StandardProduct"""
+
+    @staticmethod
+    def _variation_inventory(raw_variation: Dict[str, Any]) -> int:
+        quantity = _as_int(raw_variation.get("stock_quantity"))
+        manage_stock = bool(raw_variation.get("manage_stock"))
+        stock_status = str(raw_variation.get("stock_status") or "").strip().lower()
+        if quantity > 0:
+            return quantity
+        if stock_status == "instock" and not manage_stock:
+            return 1
+        return 0
+
+    @staticmethod
+    def _variation_title(raw_variation: Dict[str, Any], options: Dict[str, str]) -> str:
+        if options:
+            return " / ".join(value for value in options.values() if value)
+        explicit = str(raw_variation.get("name") or "").strip()
+        if explicit:
+            return explicit
+        variation_id = str(raw_variation.get("id") or "").strip()
+        return variation_id or "Variation"
+
+    @staticmethod
+    def _convert_variation(
+        raw_variation: Dict[str, Any],
+        default_image_url: Optional[str] = None,
+    ) -> StandardProductVariant:
+        option_values: Dict[str, str] = {}
+        for attribute in raw_variation.get("attributes") or []:
+            if not isinstance(attribute, dict):
+                continue
+            option_name = str(
+                attribute.get("name")
+                or attribute.get("slug")
+                or attribute.get("id")
+                or ""
+            ).strip()
+            option_value = str(attribute.get("option") or "").strip()
+            if option_name and option_value:
+                option_values[option_name] = option_value
+
+        price = _as_float(
+            raw_variation.get("price")
+            or raw_variation.get("sale_price")
+            or raw_variation.get("regular_price")
+        )
+        regular_price = _as_float(raw_variation.get("regular_price"))
+        compare_at = regular_price if regular_price > price > 0 else None
+        image_payload = raw_variation.get("image") or {}
+        image_url = (
+            image_payload.get("src")
+            if isinstance(image_payload, dict)
+            else None
+        ) or default_image_url
+
+        return StandardProductVariant(
+            id=str(raw_variation.get("id")),
+            title=WooCommerceProductAdapter._variation_title(raw_variation, option_values),
+            sku=str(raw_variation.get("sku") or "").strip() or None,
+            price=price,
+            compare_at_price=compare_at,
+            inventory_quantity=WooCommerceProductAdapter._variation_inventory(raw_variation),
+            options=option_values or None,
+            image_url=image_url,
+            platform_metadata={
+                "status": raw_variation.get("status"),
+                "stock_status": raw_variation.get("stock_status"),
+            },
+        )
+
+    @staticmethod
+    async def _fetch_variations(
+        *,
+        client: httpx.AsyncClient,
+        store_url: str,
+        consumer_key: str,
+        consumer_secret: str,
+        product_id: str,
+    ) -> List[Dict[str, Any]]:
+        variations: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            response = await client.get(
+                f"{store_url}/wp-json/wc/v3/products/{product_id}/variations",
+                params={
+                    "consumer_key": consumer_key,
+                    "consumer_secret": consumer_secret,
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    "WooCommerce variations fetch failed for product %s: %s",
+                    product_id,
+                    response.status_code,
+                )
+                break
+
+            batch = response.json() or []
+            if not isinstance(batch, list) or not batch:
+                break
+
+            variations.extend([item for item in batch if isinstance(item, dict)])
+            total_pages = _as_int(response.headers.get("X-WP-TotalPages"))
+            if total_pages and page >= total_pages:
+                break
+            if len(batch) < 100:
+                break
+            page += 1
+
+        return variations
+
+    @staticmethod
+    def _convert_product(
+        raw_product: Dict[str, Any],
+        merchant_id: str,
+        variations: Optional[List[Dict[str, Any]]] = None,
+    ) -> StandardProduct:
+        image_urls = [
+            str(item.get("src") or "").strip()
+            for item in raw_product.get("images") or []
+            if isinstance(item, dict) and str(item.get("src") or "").strip()
+        ]
+        default_image_url = image_urls[0] if image_urls else None
+
+        variation_models: List[StandardProductVariant] = []
+        for raw_variation in variations or []:
+            try:
+                variation_models.append(
+                    WooCommerceProductAdapter._convert_variation(
+                        raw_variation,
+                        default_image_url=default_image_url,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Skipping WooCommerce variation: %s", exc)
+
+        default_price = _as_float(
+            raw_product.get("price")
+            or raw_product.get("sale_price")
+            or raw_product.get("regular_price")
+        )
+        if variation_models:
+            sellable_prices = [variant.price for variant in variation_models if variant.price > 0]
+            if sellable_prices:
+                default_price = min(sellable_prices)
+
+        regular_price = _as_float(raw_product.get("regular_price"))
+        compare_at = regular_price if regular_price > default_price > 0 else None
+        inventory_quantity = _as_int(raw_product.get("stock_quantity"))
+        manage_stock = bool(raw_product.get("manage_stock"))
+        stock_status = str(raw_product.get("stock_status") or "").strip().lower()
+        if variation_models:
+            inventory_quantity = sum(max(variant.inventory_quantity, 0) for variant in variation_models)
+        elif inventory_quantity <= 0 and stock_status == "instock" and not manage_stock:
+            inventory_quantity = 1
+
+        status_raw = str(raw_product.get("status") or "").strip().lower()
+        if status_raw == "publish":
+            status = ProductStatus.ACTIVE
+        elif status_raw in {"trash", "private"}:
+            status = ProductStatus.ARCHIVED
+        else:
+            status = ProductStatus.DRAFT
+
+        is_catalog_visible = str(raw_product.get("catalog_visibility") or "").strip().lower() != "hidden"
+        has_sellable_variant = any(
+            variant.price > 0 and variant.inventory_quantity > 0
+            for variant in variation_models
+        )
+        is_orderable = bool(
+            status == ProductStatus.ACTIVE
+            and default_price > 0
+            and is_catalog_visible
+            and (
+                has_sellable_variant
+                or inventory_quantity > 0
+                or (stock_status == "instock" and not manage_stock)
+            )
+        )
+
+        product = StandardProduct(
+            id=str(raw_product.get("id")),
+            platform="woocommerce",
+            merchant_id=merchant_id,
+            title=str(raw_product.get("name") or "Untitled").strip() or "Untitled",
+            description=str(
+                raw_product.get("description")
+                or raw_product.get("short_description")
+                or ""
+            ),
+            product_type=str(raw_product.get("type") or "").strip() or None,
+            tags=_split_tags(raw_product.get("tags")),
+            price=default_price,
+            compare_at_price=compare_at,
+            currency="USD",
+            inventory_quantity=inventory_quantity,
+            sku=(
+                str(raw_product.get("sku") or "").strip()
+                or next((variant.sku for variant in variation_models if variant.sku), None)
+            ),
+            image_url=default_image_url,
+            images=image_urls,
+            variants=variation_models,
+            status=status,
+            created_at=_parse_platform_datetime(
+                raw_product.get("date_created_gmt") or raw_product.get("date_created")
+            ),
+            updated_at=_parse_platform_datetime(
+                raw_product.get("date_modified_gmt") or raw_product.get("date_modified")
+            ),
+            in_stock=is_orderable,
+            orderable=is_orderable,
+            platform_metadata={
+                "catalog_visibility": raw_product.get("catalog_visibility"),
+                "permalink": raw_product.get("permalink"),
+                "slug": raw_product.get("slug"),
+                "stock_status": raw_product.get("stock_status"),
+                "type": raw_product.get("type"),
+            },
+        )
+
+        from models.standard_product import validate_orderable
+
+        orderable, validation = validate_orderable(product)
+        product.orderable = orderable
+        product.orderable_validation = validation
+        return product
+
+    @staticmethod
+    async def fetch_product_by_id(
+        *,
+        store_url: str,
+        consumer_key: str,
+        consumer_secret: str,
+        merchant_id: str,
+        product_id: str,
+    ) -> Tuple[Optional[StandardProduct], Optional[str]]:
+        store_url = normalize_woocommerce_store_url(store_url)
+        product_id_str = str(product_id or "").strip()
+        if not store_url or not consumer_key or not consumer_secret or not product_id_str:
+            return None, "Missing WooCommerce store/product credentials"
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(
+                    f"{store_url}/wp-json/wc/v3/products/{product_id_str}",
+                    params={
+                        "consumer_key": consumer_key,
+                        "consumer_secret": consumer_secret,
+                    },
+                )
+                if response.status_code == 404:
+                    return None, "NOT_FOUND"
+                if response.status_code != 200:
+                    return None, f"WooCommerce API error: {response.status_code} - {response.text[:200]}"
+
+                raw_product = response.json() or {}
+                variations: List[Dict[str, Any]] = []
+                if (
+                    isinstance(raw_product, dict)
+                    and str(raw_product.get("type") or "").strip().lower() == "variable"
+                    and raw_product.get("variations")
+                ):
+                    variations = await WooCommerceProductAdapter._fetch_variations(
+                        client=client,
+                        store_url=store_url,
+                        consumer_key=consumer_key,
+                        consumer_secret=consumer_secret,
+                        product_id=product_id_str,
+                    )
+
+            if not isinstance(raw_product, dict):
+                return None, "Invalid WooCommerce response: missing product"
+
+            return (
+                WooCommerceProductAdapter._convert_product(
+                    raw_product,
+                    merchant_id=merchant_id,
+                    variations=variations,
+                ),
+                None,
+            )
+        except Exception as exc:
+            return None, f"Failed to fetch WooCommerce product: {str(exc)}"
     
     @staticmethod
     async def fetch_products(
@@ -738,9 +1073,346 @@ class WooCommerceProductAdapter:
         page_token: Optional[str] = None
     ) -> Tuple[List[StandardProduct], Optional[str], Optional[str]]:
         """实时从 WooCommerce 拉取产品"""
-        # TODO: 实现 WooCommerce API 调用
-        logger.warning("WooCommerce adapter not yet implemented")
-        return [], None, "WooCommerce adapter not yet implemented"
+        normalized_store_url = normalize_woocommerce_store_url(store_url)
+        if not normalized_store_url or not consumer_key or not consumer_secret:
+            return [], None, "WooCommerce credentials incomplete"
+
+        page = max(_as_int(page_token, 1), 1)
+        per_page = max(1, min(limit, 100))
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(
+                    f"{normalized_store_url}/wp-json/wc/v3/products",
+                    params={
+                        "consumer_key": consumer_key,
+                        "consumer_secret": consumer_secret,
+                        "per_page": per_page,
+                        "page": page,
+                    },
+                )
+
+                if response.status_code != 200:
+                    error_msg = f"WooCommerce API error: {response.status_code} - {response.text[:200]}"
+                    logger.error(error_msg)
+                    return [], None, error_msg
+
+                raw_products = response.json() or []
+                if not isinstance(raw_products, list):
+                    return [], None, "Invalid WooCommerce response: missing products list"
+
+                standard_products: List[StandardProduct] = []
+                for raw_product in raw_products:
+                    if not isinstance(raw_product, dict):
+                        continue
+                    variations: List[Dict[str, Any]] = []
+                    if (
+                        str(raw_product.get("type") or "").strip().lower() == "variable"
+                        and raw_product.get("variations")
+                    ):
+                        variations = await WooCommerceProductAdapter._fetch_variations(
+                            client=client,
+                            store_url=normalized_store_url,
+                            consumer_key=consumer_key,
+                            consumer_secret=consumer_secret,
+                            product_id=str(raw_product.get("id")),
+                        )
+                    try:
+                        standard_products.append(
+                            WooCommerceProductAdapter._convert_product(
+                                raw_product,
+                                merchant_id=merchant_id,
+                                variations=variations,
+                            )
+                        )
+                    except Exception as product_error:
+                        logger.error("Error converting WooCommerce product: %s", product_error)
+
+                total_pages = _as_int(response.headers.get("X-WP-TotalPages"))
+                next_page_token = None
+                if total_pages and page < total_pages:
+                    next_page_token = str(page + 1)
+                elif len(raw_products) == per_page and raw_products:
+                    next_page_token = str(page + 1)
+
+                return standard_products, next_page_token, None
+        except Exception as exc:
+            error_msg = f"Error fetching WooCommerce products: {str(exc)}"
+            logger.error(error_msg)
+            return [], None, error_msg
+
+
+class BigCommerceProductAdapter:
+    """BigCommerce 产品适配器：BigCommerce API → StandardProduct"""
+
+    @staticmethod
+    def _image_urls(raw_product: Dict[str, Any]) -> List[str]:
+        urls: List[str] = []
+        for image in raw_product.get("images") or []:
+            if not isinstance(image, dict):
+                continue
+            url = (
+                image.get("url_standard")
+                or image.get("url_zoom")
+                or image.get("url_thumbnail")
+            )
+            candidate = str(url or "").strip()
+            if candidate and candidate not in urls:
+                urls.append(candidate)
+        return urls
+
+    @staticmethod
+    def _variant_inventory(raw_variant: Dict[str, Any]) -> int:
+        quantity = _as_int(raw_variant.get("inventory_level"))
+        inventory_tracking = str(raw_variant.get("inventory_tracking") or "").strip().lower()
+        if quantity > 0:
+            return quantity
+        if inventory_tracking in {"", "none"}:
+            return 1
+        return 0
+
+    @staticmethod
+    def _convert_variant(
+        raw_variant: Dict[str, Any],
+        default_image_url: Optional[str] = None,
+    ) -> StandardProductVariant:
+        option_values: Dict[str, str] = {}
+        for option in raw_variant.get("option_values") or []:
+            if not isinstance(option, dict):
+                continue
+            option_name = str(
+                option.get("option_display_name")
+                or option.get("display_name")
+                or option.get("option_name")
+                or ""
+            ).strip()
+            option_value = str(
+                option.get("label")
+                or option.get("option_value")
+                or option.get("value")
+                or ""
+            ).strip()
+            if option_name and option_value:
+                option_values[option_name] = option_value
+
+        price = _as_float(raw_variant.get("calculated_price") or raw_variant.get("price"))
+        retail_price = _as_float(raw_variant.get("retail_price"))
+        compare_at = retail_price if retail_price > price > 0 else None
+        title = " / ".join(value for value in option_values.values() if value)
+        if not title:
+            title = str(raw_variant.get("sku") or raw_variant.get("id") or "Variant").strip()
+
+        return StandardProductVariant(
+            id=str(raw_variant.get("id")),
+            title=title,
+            sku=str(raw_variant.get("sku") or "").strip() or None,
+            price=price,
+            compare_at_price=compare_at,
+            inventory_quantity=BigCommerceProductAdapter._variant_inventory(raw_variant),
+            options=option_values or None,
+            image_url=str(raw_variant.get("image_url") or "").strip() or default_image_url,
+            platform_metadata={
+                "inventory_tracking": raw_variant.get("inventory_tracking"),
+                "is_visible": raw_variant.get("is_visible"),
+            },
+        )
+
+    @staticmethod
+    def _convert_product(raw_product: Dict[str, Any], merchant_id: str) -> StandardProduct:
+        image_urls = BigCommerceProductAdapter._image_urls(raw_product)
+        default_image_url = image_urls[0] if image_urls else None
+
+        variants: List[StandardProductVariant] = []
+        for raw_variant in raw_product.get("variants") or []:
+            if not isinstance(raw_variant, dict):
+                continue
+            try:
+                variants.append(
+                    BigCommerceProductAdapter._convert_variant(
+                        raw_variant,
+                        default_image_url=default_image_url,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Skipping BigCommerce variant: %s", exc)
+
+        default_price = _as_float(
+            raw_product.get("price")
+            or raw_product.get("sale_price")
+            or raw_product.get("retail_price")
+        )
+        if variants:
+            sellable_prices = [variant.price for variant in variants if variant.price > 0]
+            if sellable_prices:
+                default_price = min(sellable_prices)
+
+        retail_price = _as_float(raw_product.get("retail_price"))
+        compare_at = retail_price if retail_price > default_price > 0 else None
+        inventory_quantity = _as_int(raw_product.get("inventory_level"))
+        inventory_tracking = str(raw_product.get("inventory_tracking") or "").strip().lower()
+        if variants:
+            inventory_quantity = sum(max(variant.inventory_quantity, 0) for variant in variants)
+        elif inventory_quantity <= 0 and inventory_tracking in {"", "none"}:
+            inventory_quantity = 1
+
+        is_visible = bool(raw_product.get("is_visible", True))
+        availability = str(raw_product.get("availability") or "").strip().lower()
+        has_sellable_variant = any(
+            variant.price > 0 and variant.inventory_quantity > 0
+            for variant in variants
+        )
+        is_orderable = bool(
+            is_visible
+            and availability != "disabled"
+            and default_price > 0
+            and (
+                has_sellable_variant
+                or inventory_quantity > 0
+                or inventory_tracking in {"", "none"}
+            )
+        )
+
+        tags = _split_tags(raw_product.get("keywords"))
+        status = ProductStatus.ACTIVE if is_visible else ProductStatus.DRAFT
+
+        product = StandardProduct(
+            id=str(raw_product.get("id")),
+            platform="bigcommerce",
+            merchant_id=merchant_id,
+            title=str(raw_product.get("name") or "Untitled").strip() or "Untitled",
+            description=str(raw_product.get("description") or ""),
+            vendor=str(raw_product.get("brand_name") or "").strip() or None,
+            product_type=str(raw_product.get("type") or "").strip() or None,
+            tags=tags,
+            price=default_price,
+            compare_at_price=compare_at,
+            currency="USD",
+            inventory_quantity=inventory_quantity,
+            sku=(
+                str(raw_product.get("sku") or "").strip()
+                or next((variant.sku for variant in variants if variant.sku), None)
+            ),
+            image_url=default_image_url,
+            images=image_urls,
+            variants=variants,
+            status=status,
+            created_at=_parse_platform_datetime(raw_product.get("date_created")),
+            updated_at=_parse_platform_datetime(raw_product.get("date_modified")),
+            in_stock=is_orderable,
+            orderable=is_orderable,
+            platform_metadata={
+                "availability": raw_product.get("availability"),
+                "custom_url": raw_product.get("custom_url"),
+                "inventory_tracking": raw_product.get("inventory_tracking"),
+                "is_visible": raw_product.get("is_visible"),
+            },
+        )
+
+        from models.standard_product import validate_orderable
+
+        orderable, validation = validate_orderable(product)
+        product.orderable = orderable
+        product.orderable_validation = validation
+        return product
+
+    @staticmethod
+    async def fetch_product_by_id(
+        *,
+        store_hash: str,
+        access_token: str,
+        client_id: Optional[str],
+        merchant_id: str,
+        product_id: str,
+    ) -> Tuple[Optional[StandardProduct], Optional[str]]:
+        normalized_store_hash = normalize_bigcommerce_store_hash(store_hash)
+        product_id_str = str(product_id or "").strip()
+        if not normalized_store_hash or not access_token or not product_id_str:
+            return None, "Missing BigCommerce store/product credentials"
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"https://api.bigcommerce.com/stores/{normalized_store_hash}/v3/catalog/products/{product_id_str}",
+                    params={"include": "images,variants"},
+                    headers=build_bigcommerce_headers(access_token, client_id),
+                )
+
+            if response.status_code == 404:
+                return None, "NOT_FOUND"
+            if response.status_code != 200:
+                return None, f"BigCommerce API error: {response.status_code} - {response.text[:200]}"
+
+            payload = response.json() or {}
+            raw_product = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(raw_product, dict):
+                return None, "Invalid BigCommerce response: missing product"
+
+            return BigCommerceProductAdapter._convert_product(raw_product, merchant_id), None
+        except Exception as exc:
+            return None, f"Failed to fetch BigCommerce product: {str(exc)}"
+
+    @staticmethod
+    async def fetch_products(
+        store_hash: str,
+        access_token: str,
+        client_id: Optional[str],
+        merchant_id: str,
+        limit: int = 50,
+        page_token: Optional[str] = None,
+    ) -> Tuple[List[StandardProduct], Optional[str], Optional[str]]:
+        normalized_store_hash = normalize_bigcommerce_store_hash(store_hash)
+        if not normalized_store_hash or not access_token:
+            return [], None, "BigCommerce credentials incomplete"
+
+        page = max(_as_int(page_token, 1), 1)
+        per_page = max(1, min(limit, 250))
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"https://api.bigcommerce.com/stores/{normalized_store_hash}/v3/catalog/products",
+                    params={
+                        "page": page,
+                        "limit": per_page,
+                        "include": "images,variants",
+                    },
+                    headers=build_bigcommerce_headers(access_token, client_id),
+                )
+
+            if response.status_code != 200:
+                error_msg = f"BigCommerce API error: {response.status_code} - {response.text[:200]}"
+                logger.error(error_msg)
+                return [], None, error_msg
+
+            payload = response.json() or {}
+            raw_products = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(raw_products, list):
+                return [], None, "Invalid BigCommerce response: missing products list"
+
+            standard_products: List[StandardProduct] = []
+            for raw_product in raw_products:
+                if not isinstance(raw_product, dict):
+                    continue
+                try:
+                    standard_products.append(
+                        BigCommerceProductAdapter._convert_product(raw_product, merchant_id)
+                    )
+                except Exception as product_error:
+                    logger.error("Error converting BigCommerce product: %s", product_error)
+
+            meta = payload.get("meta") if isinstance(payload, dict) else {}
+            pagination = meta.get("pagination") if isinstance(meta, dict) else {}
+            current_page = _as_int(pagination.get("current_page"), page)
+            total_pages = _as_int(pagination.get("total_pages"))
+            next_page_token = None
+            if total_pages and current_page < total_pages:
+                next_page_token = str(current_page + 1)
+
+            return standard_products, next_page_token, None
+        except Exception as exc:
+            error_msg = f"Error fetching BigCommerce products: {str(exc)}"
+            logger.error(error_msg)
+            return [], None, error_msg
 
 
 # 适配器工厂
@@ -748,6 +1420,7 @@ PLATFORM_ADAPTERS = {
     "shopify": ShopifyProductAdapter,
     "wix": WixProductAdapter,
     "woocommerce": WooCommerceProductAdapter,
+    "bigcommerce": BigCommerceProductAdapter,
 }
 
 
@@ -763,7 +1436,7 @@ async def fetch_merchant_products(
     
     Args:
         merchant_id: 商户 ID
-        platform: shopify, wix, woocommerce
+        platform: shopify, wix, woocommerce, bigcommerce
         credentials: 平台凭证（不同平台字段不同）
         limit: 返回产品数量
     
@@ -802,6 +1475,15 @@ async def fetch_merchant_products(
             merchant_id=merchant_id,
             limit=limit,
             page_token=page_token
+        )
+    elif platform == "bigcommerce":
+        return await adapter_class.fetch_products(
+            store_hash=credentials.get("store_hash"),
+            access_token=credentials.get("access_token"),
+            client_id=credentials.get("client_id"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
         )
     else:
         return [], None, f"Platform {platform} not implemented"

@@ -31,6 +31,8 @@ def parse_api_key(api_key: str) -> str:
             parsed = json.loads(api_key)
             if isinstance(parsed, dict):
                 token = parsed.get("access_token") or parsed.get("token")
+                if not token:
+                    token = parsed.get("consumer_key")
                 if isinstance(token, str) and token.strip():
                     # Do not log secrets (tokens).
                     logger.info("Parsed JSON format token from merchant_stores.api_key")

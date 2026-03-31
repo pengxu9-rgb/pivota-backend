@@ -14,7 +14,13 @@ import time
 import json
 
 from models.standard_product import ProductListResponse
-from adapters.product_adapters import fetch_merchant_products
+from adapters.bigcommerce_adapter import normalize_bigcommerce_store_hash
+from adapters.product_adapters import (
+    BigCommerceProductAdapter,
+    WooCommerceProductAdapter,
+    fetch_merchant_products,
+)
+from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import (
     get_cached_products, upsert_product_cache, mark_cache_accessed,
@@ -26,6 +32,52 @@ import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products", tags=["products"])
+
+
+def _parse_woocommerce_credentials(raw_value: Optional[str]) -> Dict[str, str]:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return {"consumer_key": "", "consumer_secret": ""}
+    try:
+        if raw.startswith("{"):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {
+                    "consumer_key": str(parsed.get("consumer_key") or "").strip(),
+                    "consumer_secret": str(parsed.get("consumer_secret") or "").strip(),
+                }
+    except Exception:
+        pass
+    if ":" in raw:
+        consumer_key, consumer_secret = raw.split(":", 1)
+        return {
+            "consumer_key": consumer_key.strip(),
+            "consumer_secret": consumer_secret.strip(),
+        }
+    return {"consumer_key": raw, "consumer_secret": ""}
+
+
+def _parse_bigcommerce_credentials(raw_value: Optional[str], domain: Optional[str]) -> Dict[str, str]:
+    raw = str(raw_value or "").strip()
+    credentials = {
+        "store_hash": normalize_bigcommerce_store_hash(domain),
+        "access_token": raw,
+        "client_id": "",
+    }
+    if not raw:
+        return credentials
+    try:
+        if raw.startswith("{"):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                credentials["store_hash"] = normalize_bigcommerce_store_hash(
+                    parsed.get("store_hash") or domain
+                )
+                credentials["access_token"] = str(parsed.get("access_token") or "").strip()
+                credentials["client_id"] = str(parsed.get("client_id") or "").strip()
+    except Exception:
+        pass
+    return credentials
 
 
 @router.get("/{merchant_id}", response_model=ProductListResponse)
@@ -166,7 +218,26 @@ async def get_merchant_products_realtime(
         credentials = {"site_id": site_id, "api_key": api_key}
     
     elif platform == "woocommerce":
-        raise HTTPException(status_code=501, detail="WooCommerce platform not yet implemented")
+        raw_credentials = _parse_woocommerce_credentials(
+            (store_info or {}).get("api_key_raw") or (store_info or {}).get("api_key")
+        )
+        store_url = normalize_woocommerce_store_url((store_info or {}).get("domain"))
+        if not store_url or not raw_credentials["consumer_key"] or not raw_credentials["consumer_secret"]:
+            raise HTTPException(status_code=400, detail="WooCommerce credentials not found.")
+        credentials = {
+            "store_url": store_url,
+            "consumer_key": raw_credentials["consumer_key"],
+            "consumer_secret": raw_credentials["consumer_secret"],
+        }
+
+    elif platform == "bigcommerce":
+        raw_credentials = _parse_bigcommerce_credentials(
+            (store_info or {}).get("api_key_raw") or (store_info or {}).get("api_key"),
+            (store_info or {}).get("domain"),
+        )
+        if not raw_credentials["store_hash"] or not raw_credentials["access_token"]:
+            raise HTTPException(status_code=400, detail="BigCommerce credentials not found.")
+        credentials = raw_credentials
     
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported platform: {platform}")
@@ -308,6 +379,68 @@ async def get_single_product_realtime(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to fetch product: {str(e)}")
     
+    elif platform == "woocommerce":
+        store_url = normalize_woocommerce_store_url(store_info.get("domain"))
+        credentials = _parse_woocommerce_credentials(
+            store_info.get("api_key_raw") or store_info.get("api_key")
+        )
+        if not store_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Store configuration incomplete - missing domain",
+                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+            )
+        if not credentials["consumer_key"] or not credentials["consumer_secret"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Store configuration incomplete - missing credentials",
+                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+            )
+
+        standard_product, error = await WooCommerceProductAdapter.fetch_product_by_id(
+            store_url=store_url,
+            consumer_key=credentials["consumer_key"],
+            consumer_secret=credentials["consumer_secret"],
+            merchant_id=merchant_id,
+            product_id=product_id,
+        )
+        if error == "NOT_FOUND":
+            raise HTTPException(status_code=404, detail="Product not found")
+        if error:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch product: {error}")
+        return {"status": "success", "product": standard_product.dict()}
+
+    elif platform == "bigcommerce":
+        credentials = _parse_bigcommerce_credentials(
+            store_info.get("api_key_raw") or store_info.get("api_key"),
+            store_info.get("domain"),
+        )
+        if not credentials["store_hash"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Store configuration incomplete - missing domain",
+                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+            )
+        if not credentials["access_token"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Store configuration incomplete - missing credentials",
+                headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+            )
+
+        standard_product, error = await BigCommerceProductAdapter.fetch_product_by_id(
+            store_hash=credentials["store_hash"],
+            access_token=credentials["access_token"],
+            client_id=credentials["client_id"],
+            merchant_id=merchant_id,
+            product_id=product_id,
+        )
+        if error == "NOT_FOUND":
+            raise HTTPException(status_code=404, detail="Product not found")
+        if error:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch product: {error}")
+        return {"status": "success", "product": standard_product.dict()}
+
     else:
         raise HTTPException(status_code=501, detail=f"Platform {platform} not yet implemented for single product fetch")
 
