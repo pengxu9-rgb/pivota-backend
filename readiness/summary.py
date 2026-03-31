@@ -4,9 +4,10 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
+import re
 import time
 from typing import Any, Dict, Iterable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from db.database import database
 from db.product_enrichment import get_enrichments_for_products
@@ -881,12 +882,53 @@ def _variant_impact(variant: Any) -> str:
     return "discovery_only"
 
 
+_WIX_SITE_ID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
 def _normalize_store_domain(domain: Optional[str]) -> str:
     normalized = str(domain or "").strip()
     if not normalized:
         return ""
-    normalized = normalized.replace("https://", "").replace("http://", "")
-    return normalized.strip().strip("/")
+    if "://" not in normalized:
+        normalized = f"https://{normalized}"
+    parsed = urlparse(normalized)
+    host = parsed.netloc or parsed.path
+    return str(host or "").strip().strip("/")
+
+
+def _normalize_store_base_url(domain: Optional[str]) -> str:
+    normalized = str(domain or "").strip()
+    if not normalized:
+        return ""
+    if "://" not in normalized:
+        normalized = f"https://{normalized}"
+    parsed = urlparse(normalized)
+    host = parsed.netloc or parsed.path
+    if not host:
+        return ""
+    path = parsed.path if parsed.netloc else ""
+    normalized_path = path.rstrip("/")
+    return f"https://{host}{normalized_path}"
+
+
+def _extract_wix_site_id(domain: Optional[str]) -> str:
+    normalized = str(domain or "").strip()
+    if not normalized:
+        return ""
+    return normalized if _WIX_SITE_ID_PATTERN.fullmatch(normalized) else ""
+
+
+def _normalize_bigcommerce_admin_origin(domain: Optional[str]) -> str:
+    normalized_domain = _normalize_store_domain(domain)
+    if not normalized_domain:
+        return ""
+    if normalized_domain.endswith(".mybigcommerce.com"):
+        return f"https://{normalized_domain}"
+    if "." not in normalized_domain:
+        return f"https://{normalized_domain}.mybigcommerce.com"
+    return ""
 
 
 def _build_platform_admin_url(
@@ -905,6 +947,34 @@ def _build_platform_admin_url(
         if not domain:
             return None
         return f"https://{domain}/admin/products/{quote(normalized_product_id, safe='')}"
+
+    if normalized_platform == "woocommerce":
+        base_url = _normalize_store_base_url((store_domains_by_platform or {}).get(normalized_platform))
+        if not base_url:
+            return None
+        return (
+            f"{base_url}/wp-admin/post.php?"
+            f"post={quote(normalized_product_id, safe='')}&action=edit"
+        )
+
+    if normalized_platform == "wix":
+        site_id = _extract_wix_site_id((store_domains_by_platform or {}).get(normalized_platform))
+        if not site_id:
+            return None
+        return (
+            "https://manage.wix.com/dashboard/"
+            f"{quote(site_id, safe='')}/store/products/product/{quote(normalized_product_id, safe='')}"
+        )
+
+    if normalized_platform == "bigcommerce":
+        admin_origin = _normalize_bigcommerce_admin_origin(
+            (store_domains_by_platform or {}).get(normalized_platform)
+        )
+        if not admin_origin:
+            return None
+        return (
+            f"{admin_origin}/manage/products/{quote(normalized_product_id, safe='')}/edit"
+        )
 
     return None
 

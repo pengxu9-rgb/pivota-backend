@@ -11,6 +11,7 @@ from readiness.models import (
     ReadyVariant,
 )
 from readiness.summary import (
+    _build_platform_admin_url,
     build_readiness_optimization,
     build_readiness_summary,
     reset_readiness_optimization_cache_observability,
@@ -113,6 +114,49 @@ def test_summarize_readiness_snapshot_red_when_checkout_blocked():
 
     assert summary.tier == "red"
     assert summary.top_blockers == ["merchant_checkout_capability_missing"]
+
+
+def test_build_platform_admin_url_supports_additional_store_platforms():
+    assert _build_platform_admin_url(
+        platform="woocommerce",
+        platform_product_id="prod_42",
+        store_domains_by_platform={
+            "woocommerce": "https://catalog.alpha.test/store",
+        },
+    ) == "https://catalog.alpha.test/store/wp-admin/post.php?post=prod_42&action=edit"
+
+    assert _build_platform_admin_url(
+        platform="wix",
+        platform_product_id="00000000-1111-2222-3333-444444444444",
+        store_domains_by_platform={
+            "wix": "d96ead0c-3448-94f5-3d48-56f91ad87768",
+        },
+    ) == (
+        "https://manage.wix.com/dashboard/"
+        "d96ead0c-3448-94f5-3d48-56f91ad87768/store/products/product/"
+        "00000000-1111-2222-3333-444444444444"
+    )
+
+    assert _build_platform_admin_url(
+        platform="bigcommerce",
+        platform_product_id="77",
+        store_domains_by_platform={
+            "bigcommerce": "abc123.mybigcommerce.com",
+        },
+    ) == "https://abc123.mybigcommerce.com/manage/products/77/edit"
+
+
+def test_build_platform_admin_url_skips_untrusted_wix_identifier():
+    assert (
+        _build_platform_admin_url(
+            platform="wix",
+            platform_product_id="prod_1",
+            store_domains_by_platform={
+                "wix": "peng652.wixsite.com/aydan-1",
+            },
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
