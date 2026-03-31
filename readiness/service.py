@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2012,6 +2013,132 @@ async def _create_shopify_order_for_checkout(
     }
 
 
+def _extract_linked_merchant_order(order_row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not order_row:
+        return None
+
+    metadata = order_row.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    merchant_order = metadata.get("merchant_order")
+    if isinstance(merchant_order, dict):
+        platform_order_id = str(merchant_order.get("platform_order_id") or "").strip()
+        if platform_order_id:
+            payload = dict(merchant_order)
+            payload["platform_order_id"] = platform_order_id
+            return payload
+
+    shopify_order_id = str(order_row.get("shopify_order_id") or "").strip()
+    if shopify_order_id:
+        return {
+            "platform": "shopify",
+            "platform_order_id": shopify_order_id,
+        }
+    return None
+
+
+async def _write_back_order_for_checkout(
+    *,
+    merchant_id: str,
+    checkout: CheckoutSessionRecord,
+    order_id: str,
+    order_row: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    linked_order = _extract_linked_merchant_order(order_row)
+    if linked_order:
+        return {"ok": True, "linked_order": linked_order}
+
+    payload = checkout.session_payload or {}
+    merchant_connection = payload.get("merchant_connection") or {}
+    store_payload = merchant_connection.get("store") or {}
+    platform = str(store_payload.get("platform") or "").strip().lower()
+
+    if platform in {"", "shopify"}:
+        shopify_conn = merchant_connection.get("shopify") or {}
+        store_info = None
+        if not shopify_conn or not shopify_conn.get("shop_domain"):
+            try:
+                store_info = await get_primary_store(merchant_id)
+            except Exception:
+                store_info = None
+        shop_domain = str(
+            shopify_conn.get("shop_domain")
+            or ((store_info or {}).get("domain"))
+            or ""
+        ).strip()
+        access_token = str(shopify_conn.get("access_token") or "").strip()
+        if not access_token and shop_domain:
+            try:
+                access_token, _ = await resolve_shopify_admin_access_token(
+                    shop_domain=shop_domain,
+                    api_key_raw=((store_info or {}).get("api_key_raw") or (store_info or {}).get("api_key")),
+                    store_id=str((store_info or {}).get("store_id") or "").strip() or None,
+                )
+                access_token = str(access_token or "").strip()
+            except Exception:
+                access_token = ""
+        if not shop_domain or not access_token:
+            try:
+                shopify_cfg = await _get_shopify_config_for_merchant(merchant_id)
+            except Exception:
+                shopify_cfg = {}
+            shop_domain = str(shop_domain or shopify_cfg.get("shop_domain") or "").strip()
+            access_token = str(access_token or shopify_cfg.get("access_token") or "").strip()
+        if not shop_domain or not access_token:
+            return {
+                "ok": False,
+                "code": "shopify_configuration_missing",
+                "platform": "shopify",
+            }
+
+        writeback = await _create_shopify_order_for_checkout(
+            checkout=checkout,
+            shop_domain=shop_domain,
+            access_token=access_token,
+        )
+        if not writeback.get("ok"):
+            return {
+                **writeback,
+                "platform": "shopify",
+            }
+
+        await update_fulfillment_info(
+            order_id=order_id,
+            shopify_order_id=writeback.get("shopify_order_id"),
+            fulfillment_status="processing",
+        )
+        return {
+            "ok": True,
+            "linked_order": {
+                "platform": "shopify",
+                "platform_order_id": str(writeback.get("shopify_order_id") or "").strip(),
+                "platform_order_name": writeback.get("shopify_order_name"),
+                "platform_order_url": writeback.get("shopify_order_url"),
+                "store_id": str(store_payload.get("store_id") or "").strip() or None,
+                "domain": shop_domain,
+            },
+        }
+
+    from routes.order_routes import sync_order_to_connected_store
+
+    writeback_ok = await sync_order_to_connected_store(order_id)
+    refreshed_order = await get_order(order_id)
+    linked_order = _extract_linked_merchant_order(refreshed_order)
+    if not writeback_ok or not linked_order:
+        return {
+            "ok": False,
+            "code": "merchant_order_create_failed",
+            "platform": platform or None,
+        }
+    return {"ok": True, "linked_order": linked_order}
+
+
 async def advance_order_sync(
     merchant_id: str,
     checkout_id: str,
@@ -2080,7 +2207,8 @@ async def advance_order_sync(
         order_id = checkout.order_id
 
     order_row = await get_order(order_id)
-    if order_row and order_row.get("shopify_order_id"):
+    linked_order = _extract_linked_merchant_order(order_row)
+    if order_row and linked_order:
         reconciled = await _reconcile_checkout_state_from_order(
             journal=journal,
             checkout=checkout,
@@ -2096,7 +2224,7 @@ async def advance_order_sync(
             await journal.append_event(
                 checkout_id=checkout_id,
                 event_type="order_forwarded_to_merchant",
-                event_payload={"shopify_order_id": order_row.get("shopify_order_id")},
+                event_payload=linked_order,
             )
         if "state_synced" not in event_types:
             await journal.append_event(
@@ -2107,66 +2235,34 @@ async def advance_order_sync(
         updated = await journal.update_checkout_session(checkout_id, status="state_synced")
         return {"checkout": updated, "events": await journal.list_events(checkout_id), "replayed": replay}
 
-    dataset = await load_merchant_source_dataset(merchant_id)
-    merchant_connection = dataset.merchant_connection or {}
-    shopify_conn = merchant_connection.get("shopify") or {}
-    shop_domain = str(shopify_conn.get("shop_domain") or "").strip()
-    access_token = str(shopify_conn.get("access_token") or "").strip()
-    if not shop_domain or not access_token:
-        await journal.append_event(
-            checkout_id=checkout_id,
-            event_type="merchant_writeback_failed",
-            event_payload={"code": "shopify_configuration_missing"},
-        )
-        updated = await journal.update_checkout_session(checkout_id, status="failed")
-        return {"checkout": updated, "events": await journal.list_events(checkout_id), "replayed": "merchant_writeback_failed" in event_types}
-
-    writeback = await _create_shopify_order_for_checkout(
+    writeback = await _write_back_order_for_checkout(
+        merchant_id=merchant_id,
         checkout=checkout,
-        shop_domain=shop_domain,
-        access_token=access_token,
+        order_id=order_id,
+        order_row=order_row,
     )
-    if not writeback.get("ok"):
+    linked_order = writeback.get("linked_order")
+    if not writeback.get("ok") or not linked_order:
         await journal.append_event(
             checkout_id=checkout_id,
             event_type="merchant_writeback_failed",
-            event_payload=writeback,
+            event_payload={
+                **writeback,
+                "platform": str(writeback.get("platform") or ((((payload.get("merchant_connection") or {}).get("store") or {}).get("platform")) or "")).strip() or None,
+            },
         )
         updated = await journal.update_checkout_session(checkout_id, status="failed")
         return {"checkout": updated, "events": await journal.list_events(checkout_id), "replayed": "merchant_writeback_failed" in event_types}
-
-    await update_fulfillment_info(
-        order_id=order_id,
-        shopify_order_id=writeback.get("shopify_order_id"),
-        fulfillment_status="processing",
-    )
     await journal.append_event(
         checkout_id=checkout_id,
         event_type="order_forwarded_to_merchant",
-        event_payload=writeback,
+        event_payload=linked_order,
     )
     await journal.update_checkout_session(
         checkout_id,
         status="forwarded",
-        session_payload_patch={"merchant_order": writeback},
+        session_payload_patch={"merchant_order": linked_order},
     )
-
-    payment_capabilities = dataset.payment_capabilities or {}
-    external_payment_ref = payload.get("payment_reference")
-    if external_payment_ref:
-        try:
-            await ensure_external_payment_transaction_best_effort(
-                shop_domain=shop_domain,
-                access_token=access_token,
-                shopify_order_id=str(writeback.get("shopify_order_id")),
-                psp_used=payment_capabilities.get("psp_provider"),
-                external_payment_ref=external_payment_ref,
-                amount=float(((payload.get("price") or {}).get("amount")) or 0) * int(checkout.quantity or 1),
-                currency=str(((payload.get("price") or {}).get("currency")) or "USD"),
-                pivota_order_id=order_id,
-            )
-        except Exception:
-            logger.warning("Shopify transaction sync failed for checkout=%s", checkout_id, exc_info=True)
 
     await journal.append_event(
         checkout_id=checkout_id,
