@@ -204,7 +204,8 @@ async def _fetch_employee_merchant_analytics(merchant_id: str) -> Dict[str, Any]
             COALESCE(SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_all_time,
             SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_all_time,
             COALESCE(AVG(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE NULL END), 0) as avg_order_value_all_time,
-            COUNT(DISTINCT customer_email) as total_customers,
+            COUNT(DISTINCT customer_email) as total_customers_all_time,
+            COUNT(DISTINCT CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN customer_email END) as total_customers_last_30_days,
             SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
             COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END), 0) as gmv_last_30_days,
             SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_last_30_days,
@@ -267,7 +268,12 @@ async def _fetch_employee_merchant_analytics(merchant_id: str) -> Dict[str, Any]
     analytics_payload = {
         "total_orders": orders_last_30,
         "total_revenue": confirmed_revenue_last_30,
-        "total_customers": _to_int(analytics["total_customers"]) if analytics else 0,
+        "total_customers": _to_int(analytics["total_customers_last_30_days"]) if analytics else 0,
+        "customer_breakdown": {
+            "last_30_days": _to_int(analytics["total_customers_last_30_days"]) if analytics else 0,
+            "all_time": _to_int(analytics["total_customers_all_time"]) if analytics else 0,
+        },
+        "all_time_customers": _to_int(analytics["total_customers_all_time"]) if analytics else 0,
         "total_products": _to_int(products_count["count"]) if products_count else 0,
         "average_order_value": average_order_value,
         "order_growth": round(order_growth, 1),

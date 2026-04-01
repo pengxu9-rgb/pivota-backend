@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+import json
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
 from db.merchant_commerce_readiness import merchant_commerce_readiness_state
 from db.merchant_onboarding import get_merchant_onboarding
+from db.orders import orders
 from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
 from services.merchant_psp_config_service import evaluate_psp_readiness
 from services.merchant_store_service import get_primary_store
@@ -17,6 +19,16 @@ from services.merchant_store_service import get_primary_store
 READY = "ready"
 BLOCKED = "blocked"
 _SUPPORTED_COMMERCE_PLATFORMS = {"shopify", "wix", "woocommerce", "bigcommerce"}
+_PAID_PAYMENT_STATUSES = {
+    "paid",
+    "completed",
+    "succeeded",
+    "success",
+    "settled",
+    "partially_refunded",
+    "refunded",
+}
+_PAID_ORDER_STATUSES = {"paid", "completed", "fulfilled"}
 
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
@@ -53,6 +65,38 @@ def _normalize_timestamp(value: Any) -> Optional[datetime]:
         return None
 
 
+def _normalize_jsonish(value: Any) -> Any:
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return value
+        if (raw.startswith("{") and raw.endswith("}")) or (raw.startswith("[") and raw.endswith("]")):
+            try:
+                return json.loads(raw)
+            except Exception:
+                return value
+    return value
+
+
+def _normalize_readiness_state_payload(values: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(values)
+    for field in (
+        "foundation_blockers",
+        "discover_blockers",
+        "signals_blockers",
+        "execute_blockers",
+        "metadata",
+    ):
+        payload[field] = _normalize_jsonish(payload.get(field))
+    return payload
+
+
+def _is_paid_order(row: Dict[str, Any]) -> bool:
+    payment_status = str(row.get("payment_status") or "").strip().lower()
+    status = str(row.get("status") or "").strip().lower()
+    return payment_status in _PAID_PAYMENT_STATUSES or status in _PAID_ORDER_STATUSES
+
+
 async def _fetch_active_psps(merchant_id: str) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
@@ -81,6 +125,19 @@ async def _fetch_click_rows(merchant_id: str) -> List[Dict[str, Any]]:
 async def _fetch_edge_rows(merchant_id: str) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         select(commerce_attribution_edges).where(commerce_attribution_edges.c.merchant_id == merchant_id)
+    )
+    return [_row_to_dict(row) for row in rows or []]
+
+
+async def _fetch_order_rows(merchant_id: str, order_ids: List[str]) -> List[Dict[str, Any]]:
+    normalized_order_ids = [order_id for order_id in {str(value or "").strip() for value in order_ids} if order_id]
+    if not normalized_order_ids:
+        return []
+    rows = await database.fetch_all(
+        select(orders.c.order_id, orders.c.status, orders.c.payment_status)
+        .where(orders.c.merchant_id == merchant_id)
+        .where(orders.c.order_id.in_(normalized_order_ids))
+        .where(or_(orders.c.is_deleted.is_(None), orders.c.is_deleted.is_(False)))
     )
     return [_row_to_dict(row) for row in rows or []]
 
@@ -143,6 +200,17 @@ async def compute_merchant_commerce_readiness_state(merchant_id: str) -> Dict[st
         {str(row.get("click_id") or "").strip() for row in click_rows if int(row.get("click_count") or 0) > 0 and str(row.get("click_id") or "").strip()}
     )
     unattributed_orders = sum(1 for row in edge_rows if not str(row.get("click_id") or "").strip())
+    order_rows = await _fetch_order_rows(
+        merchant_id,
+        [str(row.get("order_id") or "").strip() for row in edge_rows],
+    )
+    paid_conversion = len(
+        {
+            str(row.get("order_id") or "").strip()
+            for row in order_rows
+            if str(row.get("order_id") or "").strip() and _is_paid_order(row)
+        }
+    )
     listing_status_breakdown = dict(Counter(str(row.get("status") or "unknown") for row in listing_rows))
 
     foundation_blockers: List[str] = []
@@ -205,6 +273,8 @@ async def compute_merchant_commerce_readiness_state(merchant_id: str) -> Dict[st
             "surfaced_exposure": surfaced_exposure,
             "clicked_exposure": clicked_exposure,
             "ordered_conversion": len({row.get("order_id") for row in edge_rows if row.get("order_id")}),
+            "attributed_orders": len({row.get("order_id") for row in edge_rows if row.get("order_id")}),
+            "paid_conversion": paid_conversion,
             "live_psp_candidates": psp_readiness,
         },
     }
@@ -227,4 +297,4 @@ async def upsert_merchant_commerce_readiness_state(merchant_id: str) -> Dict[str
     row = await database.fetch_one(
         select(merchant_commerce_readiness_state).where(merchant_commerce_readiness_state.c.merchant_id == merchant_id)
     )
-    return _row_to_dict(row) if row else values
+    return _normalize_readiness_state_payload(_row_to_dict(row) if row else values)

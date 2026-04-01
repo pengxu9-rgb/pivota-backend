@@ -4,10 +4,11 @@ from collections import Counter, defaultdict
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
+from db.orders import orders
 from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
 from services.traffic_taxonomy_service import taxonomy_from_row
 
@@ -52,6 +53,29 @@ def _normalize_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+_PAID_PAYMENT_STATUSES = {
+    "paid",
+    "completed",
+    "succeeded",
+    "success",
+    "settled",
+    "partially_refunded",
+    "refunded",
+}
+
+_PAID_ORDER_STATUSES = {
+    "paid",
+    "completed",
+    "fulfilled",
+}
+
+
+def _is_paid_order(row: Dict[str, Any]) -> bool:
+    payment_status = _normalize_text(row.get("payment_status")).lower()
+    status = _normalize_text(row.get("status")).lower()
+    return payment_status in _PAID_PAYMENT_STATUSES or status in _PAID_ORDER_STATUSES
+
+
 def _listing_key_aliases(row: Dict[str, Any], *, key_field: str) -> set[str]:
     aliases: set[str] = set()
     key = _normalize_text(row.get(key_field))
@@ -94,6 +118,20 @@ async def _fetch_edge_rows(merchant_id: str, surface: Optional[str]) -> List[Dic
     query = select(commerce_attribution_edges).where(commerce_attribution_edges.c.merchant_id == merchant_id)
     if surface:
         query = query.where(commerce_attribution_edges.c.surface == surface)
+    rows = await database.fetch_all(query)
+    return [_row_to_dict(row) for row in rows or []]
+
+
+async def _fetch_order_rows(merchant_id: str, order_ids: List[str]) -> List[Dict[str, Any]]:
+    normalized_order_ids = [order_id for order_id in {_normalize_text(value) for value in order_ids} if order_id]
+    if not normalized_order_ids:
+        return []
+    query = (
+        select(orders.c.order_id, orders.c.status, orders.c.payment_status)
+        .where(orders.c.merchant_id == merchant_id)
+        .where(orders.c.order_id.in_(normalized_order_ids))
+        .where(or_(orders.c.is_deleted.is_(None), orders.c.is_deleted.is_(False)))
+    )
     rows = await database.fetch_all(query)
     return [_row_to_dict(row) for row in rows or []]
 
@@ -153,13 +191,29 @@ async def get_merchant_commerce_funnel(
 
     filtered_click_rows = [row for row in click_rows if _matches_filters(row)]
     filtered_edge_rows = [row for row in edge_rows if _matches_filters(row)]
+    order_rows = await _fetch_order_rows(
+        merchant_id,
+        [_normalize_text(row.get("order_id")) for row in filtered_edge_rows],
+    )
+    paid_order_ids = {
+        _normalize_text(row.get("order_id"))
+        for row in order_rows
+        if _normalize_text(row.get("order_id")) and _is_paid_order(row)
+    }
 
     indexed_statuses = set(_supported_indexed_statuses())
     indexed_rows = [row for row in listing_rows if str(row.get("status") or "").strip().lower() in indexed_statuses]
     surfaced_exposure = len({row.get("click_id") for row in filtered_click_rows if row.get("click_id") and int(row.get("impression_count") or 0) > 0})
-    clicked_exposure = len({row.get("click_id") for row in filtered_click_rows if row.get("click_id")})
+    clicked_exposure = len(
+        {
+            row.get("click_id")
+            for row in filtered_click_rows
+            if row.get("click_id") and int(row.get("click_count") or 0) > 0
+        }
+    )
     total_click_events = sum(int(row.get("click_count") or 0) for row in filtered_click_rows)
     ordered_conversion = len({row.get("order_id") for row in filtered_edge_rows if row.get("order_id")})
+    paid_conversion = len(paid_order_ids)
     refunded_orders = len({row.get("order_id") for row in filtered_edge_rows if row.get("latest_refund_id")})
     refunded_amount = str(sum(Decimal(str(row.get("refunded_amount") or "0")) for row in filtered_edge_rows))
     listing_status_breakdown = dict(Counter(str(row.get("status") or "unknown") for row in listing_rows))
@@ -180,10 +234,13 @@ async def get_merchant_commerce_funnel(
         "clicked_exposure": clicked_exposure,
         "clicked_events_total": total_click_events,
         "ordered_conversion": ordered_conversion,
+        "attributed_orders": ordered_conversion,
+        "paid_conversion": paid_conversion,
         "refunded_orders": refunded_orders,
         "refunded_amount": refunded_amount,
         "clicked_rate": (clicked_exposure / clicked_rate_denominator) if clicked_rate_denominator else 0,
         "ordered_rate": (ordered_conversion / ordered_rate_denominator) if ordered_rate_denominator else 0,
+        "paid_order_rate": (paid_conversion / ordered_rate_denominator) if ordered_rate_denominator else 0,
         "listing_rows_total": len(listing_rows),
         "listing_status_breakdown": listing_status_breakdown,
         "listing_status_breakdown_rows": listing_status_breakdown,
@@ -206,10 +263,13 @@ async def get_merchant_commerce_funnel(
                 "clicked_exposure": 0,
                 "clicked_events_total": 0,
                 "ordered_conversion": 0,
+                "attributed_orders": 0,
+                "paid_conversion": 0,
                 "refunded_orders": 0,
                 "refunded_amount": Decimal("0"),
                 "clicked_rate": 0,
                 "ordered_rate": 0,
+                "paid_order_rate": 0,
                 "listing_rows_total": 0,
                 "listing_status_breakdown_rows": defaultdict(int),
                 "listing_status_breakdown_by_surface": defaultdict(lambda: defaultdict(int)),
@@ -217,6 +277,7 @@ async def get_merchant_commerce_funnel(
                 "_surfaced_click_ids": set(),
                 "_click_ids": set(),
                 "_order_ids": set(),
+                "_paid_order_ids": set(),
                 "_refunded_order_ids": set(),
             }
         )
@@ -256,7 +317,7 @@ async def get_merchant_commerce_funnel(
             if click_id and int(row.get("impression_count") or 0) > 0 and click_id not in bucket["_surfaced_click_ids"]:
                 bucket["_surfaced_click_ids"].add(click_id)
                 bucket["surfaced_exposure"] += 1
-            if click_id and click_id not in bucket["_click_ids"]:
+            if click_id and int(row.get("click_count") or 0) > 0 and click_id not in bucket["_click_ids"]:
                 bucket["_click_ids"].add(click_id)
                 bucket["clicked_exposure"] += 1
             bucket["clicked_events_total"] += int(row.get("click_count") or 0)
@@ -271,6 +332,10 @@ async def get_merchant_commerce_funnel(
             if order_id and order_id not in bucket["_order_ids"]:
                 bucket["_order_ids"].add(order_id)
                 bucket["ordered_conversion"] += 1
+                bucket["attributed_orders"] += 1
+            if order_id and order_id in paid_order_ids and order_id not in bucket["_paid_order_ids"]:
+                bucket["_paid_order_ids"].add(order_id)
+                bucket["paid_conversion"] += 1
             if row.get("latest_refund_id") and order_id and order_id not in bucket["_refunded_order_ids"]:
                 bucket["_refunded_order_ids"].add(order_id)
                 bucket["refunded_orders"] += 1
@@ -286,6 +351,11 @@ async def get_merchant_commerce_funnel(
                 ),
                 "ordered_rate": (
                     value["ordered_conversion"] / value["clicked_exposure"]
+                    if value["clicked_exposure"]
+                    else 0
+                ),
+                "paid_order_rate": (
+                    value["paid_conversion"] / value["clicked_exposure"]
                     if value["clicked_exposure"]
                     else 0
                 ),
@@ -308,16 +378,20 @@ async def get_merchant_commerce_funnel(
                 "clicked_exposure": 0,
                 "clicked_events_total": 0,
                 "ordered_conversion": 0,
+                "attributed_orders": 0,
+                "paid_conversion": 0,
                 "refunded_orders": 0,
                 "refunded_amount": Decimal("0"),
                 "clicked_rate": 0,
                 "ordered_rate": 0,
+                "paid_order_rate": 0,
                 "listing_rows_total": 0,
                 "listing_status_breakdown_rows": {},
                 "listing_status_breakdown_by_surface": {},
                 "_surfaced_click_ids": set(),
                 "_click_ids": set(),
                 "_order_ids": set(),
+                "_paid_order_ids": set(),
                 "_refunded_order_ids": set(),
             }
         )
@@ -330,7 +404,7 @@ async def get_merchant_commerce_funnel(
             if click_id and int(row.get("impression_count") or 0) > 0 and click_id not in bucket["_surfaced_click_ids"]:
                 bucket["_surfaced_click_ids"].add(click_id)
                 bucket["surfaced_exposure"] += 1
-            if click_id and click_id not in bucket["_click_ids"]:
+            if click_id and int(row.get("click_count") or 0) > 0 and click_id not in bucket["_click_ids"]:
                 bucket["_click_ids"].add(click_id)
                 bucket["clicked_exposure"] += 1
             bucket["clicked_events_total"] += int(row.get("click_count") or 0)
@@ -343,6 +417,10 @@ async def get_merchant_commerce_funnel(
             if order_id and order_id not in bucket["_order_ids"]:
                 bucket["_order_ids"].add(order_id)
                 bucket["ordered_conversion"] += 1
+                bucket["attributed_orders"] += 1
+            if order_id and order_id in paid_order_ids and order_id not in bucket["_paid_order_ids"]:
+                bucket["_paid_order_ids"].add(order_id)
+                bucket["paid_conversion"] += 1
             if row.get("latest_refund_id") and order_id and order_id not in bucket["_refunded_order_ids"]:
                 bucket["_refunded_order_ids"].add(order_id)
                 bucket["refunded_orders"] += 1
@@ -358,6 +436,11 @@ async def get_merchant_commerce_funnel(
                 ),
                 "ordered_rate": (
                     value["ordered_conversion"] / value["clicked_exposure"]
+                    if value["clicked_exposure"]
+                    else 0
+                ),
+                "paid_order_rate": (
+                    value["paid_conversion"] / value["clicked_exposure"]
                     if value["clicked_exposure"]
                     else 0
                 ),

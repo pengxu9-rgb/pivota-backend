@@ -24,6 +24,10 @@ async def test_compute_merchant_commerce_readiness_state_marks_supported_platfor
     async def fake_fetch_edge_rows(_merchant_id: str):
         return [{"order_id": "ord_1", "click_id": "clk_1"}]
 
+    async def fake_fetch_order_rows(_merchant_id: str, order_ids: list[str]):
+        assert order_ids == ["ord_1"]
+        return [{"order_id": "ord_1", "payment_status": "paid", "status": "pending"}]
+
     async def fake_fetch_active_psps(_merchant_id: str):
         return [
             {
@@ -43,6 +47,7 @@ async def test_compute_merchant_commerce_readiness_state_marks_supported_platfor
     monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
     monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
     monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_order_rows", fake_fetch_order_rows)
     monkeypatch.setattr(module, "_fetch_active_psps", fake_fetch_active_psps)
 
     readiness = await module.compute_merchant_commerce_readiness_state("merch_1")
@@ -52,6 +57,7 @@ async def test_compute_merchant_commerce_readiness_state_marks_supported_platfor
     assert readiness["signals_status"] == "ready"
     assert readiness["execute_status"] == "ready"
     assert readiness["surfaced_exposure_supported"] is True
+    assert readiness["metadata"]["paid_conversion"] == 1
 
 
 @pytest.mark.asyncio
@@ -77,6 +83,10 @@ async def test_compute_merchant_commerce_readiness_state_marks_woocommerce_and_b
     async def fake_fetch_edge_rows(_merchant_id: str):
         return [{"order_id": "ord_1", "click_id": "clk_1"}]
 
+    async def fake_fetch_order_rows(_merchant_id: str, order_ids: list[str]):
+        assert order_ids == ["ord_1"]
+        return [{"order_id": "ord_1", "payment_status": "paid", "status": "pending"}]
+
     async def fake_fetch_active_psps(_merchant_id: str):
         return [
             {
@@ -96,6 +106,7 @@ async def test_compute_merchant_commerce_readiness_state_marks_woocommerce_and_b
     monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
     monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
     monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_order_rows", fake_fetch_order_rows)
     monkeypatch.setattr(module, "_fetch_active_psps", fake_fetch_active_psps)
 
     readiness = await module.compute_merchant_commerce_readiness_state("merch_1")
@@ -105,6 +116,7 @@ async def test_compute_merchant_commerce_readiness_state_marks_woocommerce_and_b
     assert readiness["signals_status"] == "ready"
     assert readiness["execute_status"] == "ready"
     assert readiness["surfaced_exposure_supported"] is True
+    assert readiness["metadata"]["paid_conversion"] == 1
 
 
 @pytest.mark.asyncio
@@ -134,6 +146,10 @@ async def test_compute_merchant_commerce_readiness_state_uses_catalog_fallback_f
     async def fake_fetch_edge_rows(_merchant_id: str):
         return []
 
+    async def fake_fetch_order_rows(_merchant_id: str, order_ids: list[str]):
+        assert order_ids == []
+        return []
+
     async def fake_fetch_active_psps(_merchant_id: str):
         return [
             {
@@ -153,6 +169,7 @@ async def test_compute_merchant_commerce_readiness_state_uses_catalog_fallback_f
     monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
     monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
     monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_order_rows", fake_fetch_order_rows)
     monkeypatch.setattr(module, "_fetch_active_psps", fake_fetch_active_psps)
 
     readiness = await module.compute_merchant_commerce_readiness_state("merch_1")
@@ -185,6 +202,10 @@ async def test_compute_merchant_commerce_readiness_state_blocks_execute_without_
     async def fake_fetch_edge_rows(_merchant_id: str):
         return []
 
+    async def fake_fetch_order_rows(_merchant_id: str, order_ids: list[str]):
+        assert order_ids == []
+        return []
+
     async def fake_fetch_active_psps(_merchant_id: str):
         return [
             {
@@ -204,6 +225,7 @@ async def test_compute_merchant_commerce_readiness_state_blocks_execute_without_
     monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
     monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
     monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_order_rows", fake_fetch_order_rows)
     monkeypatch.setattr(module, "_fetch_active_psps", fake_fetch_active_psps)
 
     readiness = await module.compute_merchant_commerce_readiness_state("merch_1")
@@ -232,6 +254,26 @@ async def test_fetch_click_rows_supports_row_mapping(monkeypatch: pytest.MonkeyP
     rows = await module._fetch_click_rows("merch_1")
 
     assert rows == [{"click_id": "clk_1", "impression_count": 1}]
+
+
+def test_normalize_readiness_state_payload_parses_json_strings() -> None:
+    import services.merchant_commerce_readiness_service as module
+
+    payload = module._normalize_readiness_state_payload(
+        {
+            "foundation_blockers": '["missing_store_connection"]',
+            "discover_blockers": "[]",
+            "signals_blockers": '["missing_surface_impressions"]',
+            "execute_blockers": "[]",
+            "metadata": '{"clicked_exposure":2,"paid_conversion":1}',
+        }
+    )
+
+    assert payload["foundation_blockers"] == ["missing_store_connection"]
+    assert payload["discover_blockers"] == []
+    assert payload["signals_blockers"] == ["missing_surface_impressions"]
+    assert payload["execute_blockers"] == []
+    assert payload["metadata"] == {"clicked_exposure": 2, "paid_conversion": 1}
 
 
 def test_merchant_analytics_routes_expose_readiness_issues_and_trace(monkeypatch: pytest.MonkeyPatch) -> None:

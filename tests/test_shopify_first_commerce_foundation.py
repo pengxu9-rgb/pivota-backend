@@ -292,6 +292,7 @@ async def test_get_merchant_commerce_funnel_summary(monkeypatch: pytest.MonkeyPa
 
     async def fake_fetch_click_rows(merchant_id: str, surface: str | None):
         return [
+            {"click_id": "clk_shadow", "click_count": 0, "canonical_product_id": "cp_1", "canonical_variant_id": "cv_1", "surface": "ucp"},
             {"click_id": "clk_1", "click_count": 2, "canonical_product_id": "cp_1", "canonical_variant_id": "cv_1", "surface": "ucp"},
         ]
 
@@ -307,9 +308,15 @@ async def test_get_merchant_commerce_funnel_summary(monkeypatch: pytest.MonkeyPa
             }
         ]
 
+    async def fake_fetch_order_rows(merchant_id: str, order_ids: list[str]):
+        assert merchant_id == "merch_1"
+        assert order_ids == ["ORD_1"]
+        return [{"order_id": "ORD_1", "payment_status": "paid", "status": "pending"}]
+
     monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
     monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
     monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_order_rows", fake_fetch_order_rows)
 
     funnel = await module.get_merchant_commerce_funnel(
         merchant_id="merch_1",
@@ -321,6 +328,8 @@ async def test_get_merchant_commerce_funnel_summary(monkeypatch: pytest.MonkeyPa
     assert funnel["summary"]["clicked_exposure"] == 1
     assert funnel["summary"]["clicked_events_total"] == 2
     assert funnel["summary"]["ordered_conversion"] == 1
+    assert funnel["summary"]["paid_conversion"] == 1
+    assert funnel["summary"]["paid_order_rate"] == 1
     assert funnel["summary"]["refunded_orders"] == 1
     assert funnel["summary"]["refunded_amount"] == "1.00"
 
@@ -380,9 +389,13 @@ async def test_get_merchant_commerce_funnel_groups_click_aliases_into_catalog_fa
             }
         ]
 
+    async def fake_fetch_order_rows(merchant_id: str, order_ids: list[str]):
+        return [{"order_id": "ORD_1", "payment_status": "paid", "status": "pending"}]
+
     monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
     monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
     monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_order_rows", fake_fetch_order_rows)
 
     funnel = await module.get_merchant_commerce_funnel(
         merchant_id="merch_1",
@@ -392,6 +405,7 @@ async def test_get_merchant_commerce_funnel_groups_click_aliases_into_catalog_fa
     assert funnel["summary"]["surfaced_exposure"] == 1
     assert funnel["summary"]["clicked_exposure"] == 1
     assert funnel["summary"]["ordered_conversion"] == 1
+    assert funnel["summary"]["paid_conversion"] == 1
     assert len(funnel["slices"]) == 1
     assert funnel["slices"][0]["key"] == short_product_id
     assert funnel["slices"][0]["indexed_exposure"] == 1
@@ -479,9 +493,13 @@ async def test_get_merchant_commerce_funnel_supports_taxonomy_grouping_and_filte
             }
         ]
 
+    async def fake_fetch_order_rows(merchant_id: str, order_ids: list[str]):
+        return [{"order_id": "ORD_1", "payment_status": "paid", "status": "pending"}]
+
     monkeypatch.setattr(module, "_fetch_listing_rows", fake_fetch_listing_rows)
     monkeypatch.setattr(module, "_fetch_click_rows", fake_fetch_click_rows)
     monkeypatch.setattr(module, "_fetch_edge_rows", fake_fetch_edge_rows)
+    monkeypatch.setattr(module, "_fetch_order_rows", fake_fetch_order_rows)
 
     funnel = await module.get_merchant_commerce_funnel(
         merchant_id="merch_1",
@@ -492,10 +510,12 @@ async def test_get_merchant_commerce_funnel_supports_taxonomy_grouping_and_filte
 
     assert funnel["summary"]["clicked_exposure"] == 1
     assert funnel["summary"]["ordered_conversion"] == 1
+    assert funnel["summary"]["paid_conversion"] == 1
     assert funnel["applied_filters"]["protocol_name"] == "mcp"
     assert funnel["slices"][0]["key"] == "partner-foo"
     assert funnel["slices"][0]["clicked_exposure"] == 1
     assert funnel["slices"][0]["ordered_conversion"] == 1
+    assert funnel["slices"][0]["paid_conversion"] == 1
 
 
 def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.MonkeyPatch) -> None:
