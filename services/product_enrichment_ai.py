@@ -502,7 +502,11 @@ def generate_title_suggestion(
   missing_labels = _dedupe_strings(missing_labels)
   content_gap_codes = _dedupe_strings(content_gap_codes)
 
-  if deterministic_title and deterministic_title.lower() != _normalize_text(context.title).lower():
+  if (
+    low_information
+    and deterministic_title
+    and deterministic_title.lower() != _normalize_text(context.title).lower()
+  ):
     polished = _bounded_title_polish(deterministic_title, suggestion_language)
     trusted_slot_count = sum(
       1

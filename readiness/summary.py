@@ -1839,7 +1839,7 @@ def _queue_item_has_workspace_signal(item: ProductReadinessQueueItem) -> bool:
         return True
     if item.title_health and item.title_health != "healthy":
         return True
-    return bool(item.content_gap_codes)
+    return False
 
 
 def _is_content_only_opportunity(item: ProductReadinessQueueItem) -> bool:

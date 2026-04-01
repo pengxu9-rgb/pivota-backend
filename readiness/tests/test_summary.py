@@ -900,6 +900,133 @@ async def test_build_readiness_optimization_surfaces_title_suggestion_for_generi
 
 
 @pytest.mark.asyncio
+async def test_build_readiness_optimization_skips_healthy_title_only_content_queue_items(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp"):
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=82,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="ready",
+                    ready_variant_count=1,
+                    blocked_variant_count=0,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_air",
+                    platform="shopify",
+                    title="Nike Air Max Sneakers Men's Black/White air-cushion, breathable Sizes 42-45",
+                    brand="Nike",
+                    category="Sneakers",
+                    default_image_url="https://example.com/air.jpg",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_air_42",
+                            title="Black / White / 42",
+                            price={"amount": 129, "currency": "USD"},
+                            inventory={"quantity": 4, "availability": "in_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": []},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                            channel_coverage={"ucp": "ready"},
+                        ),
+                        ReadyVariant(
+                            variant_id="var_air_45",
+                            title="Black / White / 45",
+                            price={"amount": 129, "currency": "USD"},
+                            inventory={"quantity": 3, "availability": "in_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": []},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(capability="checkout", status="ready", score=100),
+                            channel_coverage={"ucp": "ready"},
+                        ),
+                    ],
+                )
+            ],
+        )
+
+    async def fake_load_cache_rows(_merchant_id: str, product_keys):
+        assert product_keys == [("shopify", "prod_air")]
+        return {
+            ("shopify", "prod_air"): {
+                "product_data": {
+                    "id": "prod_air",
+                    "product_id": "prod_air",
+                    "merchant_id": "merch_efbc46b4619cfbdf",
+                    "platform": "shopify",
+                    "title": "Nike Air Max Sneakers Men's Black/White air-cushion, breathable Sizes 42-45",
+                    "description": "Breathable running sneakers with Max Air cushioning for daily commuting and training.",
+                    "vendor": "Nike",
+                    "product_type": "Sneakers",
+                    "tags": ["men", "air cushion", "breathable"],
+                    "price": 129.0,
+                    "currency": "USD",
+                    "inventory_quantity": 7,
+                    "image_url": "https://example.com/air.jpg",
+                    "variants": [
+                        {
+                            "id": "var_air_42",
+                            "variant_id": "var_air_42",
+                            "title": "Black / White / 42",
+                            "price": 129.0,
+                            "currency": "USD",
+                            "inventory_quantity": 4,
+                            "options": {"Color": "Black / White", "Size": "42"},
+                        },
+                        {
+                            "id": "var_air_45",
+                            "variant_id": "var_air_45",
+                            "title": "Black / White / 45",
+                            "price": 129.0,
+                            "currency": "USD",
+                            "inventory_quantity": 3,
+                            "options": {"Color": "Black / White", "Size": "45"},
+                        },
+                    ],
+                }
+            }
+        }
+
+    async def fake_store_context(_merchant_id: str):
+        return {"country": "US"}
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+    monkeypatch.setattr("readiness.summary._load_cache_rows_for_product_keys", fake_load_cache_rows)
+    monkeypatch.setattr("readiness.summary._load_store_context", fake_store_context)
+
+    payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
+
+    assert payload.product_queue == []
+    assert payload.content_opportunity_count == 0
+
+
+@pytest.mark.asyncio
 async def test_build_readiness_optimization_hydrates_catalog_health_decision_counts(monkeypatch):
     monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
     monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
