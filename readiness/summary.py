@@ -9,12 +9,14 @@ import time
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import quote, urlparse
 
+from sqlalchemy import func, select
+
 from db.catalog import catalog_field_facts
 from db.database import database
 from db.product_enrichment import get_enrichments_for_products
 from db.product_quality_backfill_jobs import get_active_quality_backfill_job
 from db.products import products_cache
-from db.readiness_source_data_decisions import list_source_data_decisions
+from db.readiness_source_data_decisions import list_source_data_decisions_by_reason_codes
 from models.standard_product import StandardProduct
 from readiness.flags import (
     readiness_alpha_merchant_id,
@@ -62,7 +64,7 @@ logger = logging.getLogger(__name__)
 _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
 _PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
 _PLAN_TTL_HOURS = 6
-_OPTIMIZATION_CACHE_TTL_SECONDS = 60.0
+_OPTIMIZATION_CACHE_TTL_SECONDS = 300.0
 
 
 _OPTIMIZATION_CACHE: dict[
@@ -1640,14 +1642,34 @@ async def _load_cache_rows_for_product_keys(
         return {}
 
     platforms = sorted({platform for platform, _ in product_keys})
+    platform_product_ids = sorted(
+        {platform_product_id for _, platform_product_id in product_keys if platform_product_id}
+    )
     product_key_set = set(product_keys)
 
-    query = (
-        products_cache.select()
+    ranked = (
+        select(
+            products_cache,
+            func.row_number().over(
+                partition_by=[
+                    products_cache.c.merchant_id,
+                    products_cache.c.platform,
+                    products_cache.c.platform_product_id,
+                ],
+                order_by=[
+                    products_cache.c.cached_at.desc(),
+                    products_cache.c.id.desc(),
+                ],
+            ).label("row_num"),
+        )
         .where(products_cache.c.merchant_id == merchant_id)
         .where(products_cache.c.platform.in_(platforms))
+        .where(products_cache.c.platform_product_id.in_(platform_product_ids))
         .where(products_cache.c.expires_at > datetime.now())
-        .order_by(products_cache.c.cached_at.desc())
+    )
+    ranked_subquery = ranked.subquery("ranked_products_cache")
+    query = select(*[col for col in ranked_subquery.c if col.key != "row_num"]).where(
+        ranked_subquery.c.row_num == 1
     )
     rows = await database.fetch_all(query)
 
@@ -1661,11 +1683,67 @@ async def _load_cache_rows_for_product_keys(
     return cache_rows_by_key
 
 
+def _snapshot_products_by_key(snapshot_products: list[Any]) -> dict[tuple[str, str], Any]:
+    products_by_key: dict[tuple[str, str], Any] = {}
+    for product in snapshot_products:
+        key = make_product_key(product.platform or "unknown", product.product_id)
+        if key is not None:
+            products_by_key[key] = product
+    return products_by_key
+
+
+async def _build_catalog_projection_context(
+    merchant_id: str,
+    *,
+    snapshot_products: list[Any],
+    include_field_facts: bool = False,
+) -> dict[str, Any]:
+    snapshot_products_by_key = _snapshot_products_by_key(snapshot_products)
+    product_keys = list(snapshot_products_by_key.keys())
+    cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
+    store_context = await _load_store_context(merchant_id)
+    field_facts_by_key = (
+        await _load_catalog_field_facts_for_product_keys(merchant_id, product_keys)
+        if include_field_facts
+        else {}
+    )
+
+    current_products_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    parsed_products_by_key: dict[tuple[str, str], StandardProduct] = {}
+    for product_key, snapshot_product in snapshot_products_by_key.items():
+        current_product = _current_product_data(cache_rows_by_key.get(product_key))
+        if not current_product:
+            current_product = _snapshot_product_to_current_product(
+                snapshot_product,
+                merchant_id=merchant_id,
+            )
+        current_products_by_key[product_key] = current_product
+        parsed_product = _current_product_to_standard_product(
+            current_product,
+            merchant_id=merchant_id,
+            platform=product_key[0],
+            product_id=product_key[1],
+        )
+        if parsed_product is not None:
+            parsed_products_by_key[product_key] = parsed_product
+
+    return {
+        "product_keys": product_keys,
+        "snapshot_products_by_key": snapshot_products_by_key,
+        "cache_rows_by_key": cache_rows_by_key,
+        "current_products_by_key": current_products_by_key,
+        "parsed_products_by_key": parsed_products_by_key,
+        "store_context": store_context,
+        "field_facts_by_key": field_facts_by_key,
+    }
+
+
 async def _apply_quality_projection(
     merchant_id: str,
     *,
     snapshot_products: list[Any],
     product_queue: list[ProductReadinessQueueItem],
+    cache_rows_by_key: Optional[Dict[tuple[str, str], Dict[str, Any]]] = None,
 ) -> tuple[list[ProductReadinessQueueItem], QualityCoverageSummary]:
     try:
         product_keys = [
@@ -1679,7 +1757,10 @@ async def _apply_quality_projection(
         if not product_keys:
             return product_queue, QualityCoverageSummary()
 
-        cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
+        cache_rows_by_key = cache_rows_by_key or await _load_cache_rows_for_product_keys(
+            merchant_id,
+            product_keys,
+        )
         latest_quality_rows = await fetch_latest_quality_rows(
             merchant_id,
             platforms=sorted({platform for platform, _ in product_keys}),
@@ -1770,50 +1851,21 @@ def _is_content_only_opportunity(item: ProductReadinessQueueItem) -> bool:
 
 
 async def _apply_catalog_health_projection(
-    merchant_id: str,
     *,
-    snapshot_products: list[Any],
     product_queue: list[ProductReadinessQueueItem],
+    current_products_by_key: dict[tuple[str, str], dict[str, Any]],
+    parsed_products_by_key: dict[tuple[str, str], StandardProduct],
+    store_context: dict[str, Any],
 ) -> list[ProductReadinessQueueItem]:
     if not product_queue:
         return product_queue
-
-    snapshot_products_by_key: dict[tuple[str, str], Any] = {}
-    for product in snapshot_products:
-        key = make_product_key(product.platform or "unknown", product.product_id)
-        if key is not None:
-            snapshot_products_by_key[key] = product
-
-    product_keys = [
-        key
-        for key in (
-            make_product_key(item.platform, item.platform_product_id or item.product_id)
-            for item in product_queue
-        )
-        if key is not None
-    ]
-    cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
-    field_facts_by_key = await _load_catalog_field_facts_for_product_keys(merchant_id, product_keys)
-    store_context = await _load_store_context(merchant_id)
 
     for item in product_queue:
         product_key = make_product_key(item.platform, item.platform_product_id or item.product_id)
         if product_key is None:
             continue
-        current_product = _current_product_data(cache_rows_by_key.get(product_key))
-        if not current_product:
-            snapshot_product = snapshot_products_by_key.get(product_key)
-            if snapshot_product is not None:
-                current_product = _snapshot_product_to_current_product(
-                    snapshot_product,
-                    merchant_id=merchant_id,
-                )
-        parsed_product = _current_product_to_standard_product(
-            current_product,
-            merchant_id=merchant_id,
-            platform=item.platform,
-            product_id=item.platform_product_id or item.product_id,
-        )
+        current_product = current_products_by_key.get(product_key, {})
+        parsed_product = parsed_products_by_key.get(product_key)
         if parsed_product is None:
             continue
 
@@ -1885,15 +1937,13 @@ async def _apply_catalog_health_projection(
 async def _build_source_data_lanes(
     merchant_id: str,
     *,
-    snapshot_products: list[Any],
     product_queue: list[ProductReadinessQueueItem],
+    snapshot_products_by_key: dict[tuple[str, str], Any],
+    current_products_by_key: dict[tuple[str, str], dict[str, Any]],
+    parsed_products_by_key: dict[tuple[str, str], StandardProduct],
+    field_facts_by_key: dict[tuple[str, str], dict[str, dict[str, Any]]],
+    store_context: dict[str, Any],
 ) -> list[SourceDataLaneSummary]:
-    snapshot_products_by_key: dict[tuple[str, str], Any] = {}
-    for product in snapshot_products:
-        key = make_product_key(product.platform or "unknown", product.product_id)
-        if key is not None:
-            snapshot_products_by_key[key] = product
-
     product_keys = [
         key
         for key in (
@@ -1902,16 +1952,11 @@ async def _build_source_data_lanes(
         )
         if key is not None
     ]
-    cache_rows_by_key = await _load_cache_rows_for_product_keys(merchant_id, product_keys)
-    field_facts_by_key = await _load_catalog_field_facts_for_product_keys(merchant_id, product_keys)
-    store_context = await _load_store_context(merchant_id)
-    decisions_by_reason_key: dict[str, dict[str, dict[str, Any]]] = {}
-    for reason_code in _SOURCE_DATA_DECISION_LABELS:
-        decisions_by_reason_key[reason_code] = await list_source_data_decisions(
-            merchant_id,
-            reason_code=reason_code,
-            product_keys=product_keys,
-        )
+    decisions_by_reason_key = await list_source_data_decisions_by_reason_codes(
+        merchant_id,
+        reason_codes=_SOURCE_DATA_DECISION_LABELS.keys(),
+        product_keys=product_keys,
+    )
 
     lane_stats: dict[str, dict[str, Any]] = {
         reason_code: {
@@ -1935,18 +1980,8 @@ async def _build_source_data_lanes(
         snapshot_product = snapshot_products_by_key.get(product_key)
         if snapshot_product is None:
             continue
-        current_product = _current_product_data(cache_rows_by_key.get(product_key))
-        if not current_product:
-            current_product = _snapshot_product_to_current_product(
-                snapshot_product,
-                merchant_id=merchant_id,
-            )
-        parsed_product = _current_product_to_standard_product(
-            current_product,
-            merchant_id=merchant_id,
-            platform=item.platform,
-            product_id=item.platform_product_id or item.product_id,
-        )
+        current_product = current_products_by_key.get(product_key, {})
+        parsed_product = parsed_products_by_key.get(product_key)
         field_facts = field_facts_by_key.get(product_key, {})
         lane_reason_codes = _lane_reason_codes_for_product(
             parsed_product,
@@ -2769,20 +2804,31 @@ async def get_readiness_optimization_context(
         product_queue=full_product_queue,
         checked_at=snapshot.generated_at,
     )
+    catalog_projection_context = await _build_catalog_projection_context(
+        merchant_id,
+        snapshot_products=snapshot.products,
+        include_field_facts=True,
+    )
     full_product_queue, quality_coverage = await _apply_quality_projection(
         merchant_id,
         snapshot_products=snapshot.products,
         product_queue=full_product_queue,
+        cache_rows_by_key=catalog_projection_context["cache_rows_by_key"],
     )
     full_product_queue = await _apply_catalog_health_projection(
-        merchant_id,
-        snapshot_products=snapshot.products,
         product_queue=full_product_queue,
+        current_products_by_key=catalog_projection_context["current_products_by_key"],
+        parsed_products_by_key=catalog_projection_context["parsed_products_by_key"],
+        store_context=catalog_projection_context["store_context"],
     )
     source_data_lanes = await _build_source_data_lanes(
         merchant_id,
-        snapshot_products=snapshot.products,
         product_queue=full_product_queue,
+        snapshot_products_by_key=catalog_projection_context["snapshot_products_by_key"],
+        current_products_by_key=catalog_projection_context["current_products_by_key"],
+        parsed_products_by_key=catalog_projection_context["parsed_products_by_key"],
+        field_facts_by_key=catalog_projection_context["field_facts_by_key"],
+        store_context=catalog_projection_context["store_context"],
     )
     issue_buckets = _build_issue_buckets(
         snapshot,

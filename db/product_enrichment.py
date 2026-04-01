@@ -148,6 +148,7 @@ async def get_enrichments_for_products(
         if str(platform or "").strip() and str(platform_product_id or "").strip()
     }
     platforms = sorted({platform for platform, _ in keys})
+    platform_product_ids = sorted({platform_product_id for _, platform_product_id in keys})
 
     query = product_enrichment.select().where(
         (product_enrichment.c.merchant_id == merchant_id)
@@ -155,6 +156,8 @@ async def get_enrichments_for_products(
     )
     if platforms:
         query = query.where(product_enrichment.c.platform.in_(platforms))
+    if platform_product_ids:
+        query = query.where(product_enrichment.c.platform_product_id.in_(platform_product_ids))
 
     rows = await database.fetch_all(query)
     enrichments: Dict[Tuple[str, str], Dict[str, Any]] = {}

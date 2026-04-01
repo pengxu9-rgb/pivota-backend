@@ -38,7 +38,7 @@ def _reset_optimization_cache(monkeypatch):
     async def _no_field_facts(*_args, **_kwargs):
         return {}
 
-    monkeypatch.setattr("readiness.summary.list_source_data_decisions", _no_decisions)
+    monkeypatch.setattr("readiness.summary.list_source_data_decisions_by_reason_codes", _no_decisions)
     monkeypatch.setattr("readiness.summary._load_cache_rows_for_product_keys", _no_cache_rows)
     monkeypatch.setattr("readiness.summary.get_merchant_active_stores", _no_stores)
     monkeypatch.setattr("readiness.summary._load_store_context", _no_store_context)
@@ -551,14 +551,18 @@ async def test_build_readiness_optimization_includes_saved_source_data_progress(
             ],
         )
 
-    async def fake_list_source_data_decisions(_merchant_id: str, *, reason_code: str | None = None, product_keys=None):
-        if reason_code == "missing_price":
-            return {"shopify|prod_saved": {"decision_state": "pricing_fix_saved"}}
-        if reason_code == "missing_primary_image":
-            return {"shopify|prod_saved": {"decision_state": "image_fix_saved"}}
-        if reason_code == "out_of_stock":
-            return {"shopify|prod_saved": {"decision_state": "restock_planned"}}
-        return {}
+    async def fake_list_source_data_decisions(_merchant_id: str, *, reason_codes=None, product_keys=None):
+        return {
+            "missing_price": {
+                "shopify|prod_saved": {"decision_state": "pricing_fix_saved"}
+            },
+            "missing_primary_image": {
+                "shopify|prod_saved": {"decision_state": "image_fix_saved"}
+            },
+            "out_of_stock": {
+                "shopify|prod_saved": {"decision_state": "restock_planned"}
+            },
+        }
 
     async def fake_load_cache_rows(_merchant_id: str, product_keys):
         return {
@@ -583,7 +587,7 @@ async def test_build_readiness_optimization_includes_saved_source_data_progress(
         }
 
     monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
-    monkeypatch.setattr("readiness.summary.list_source_data_decisions", fake_list_source_data_decisions)
+    monkeypatch.setattr("readiness.summary.list_source_data_decisions_by_reason_codes", fake_list_source_data_decisions)
     monkeypatch.setattr("readiness.summary._load_cache_rows_for_product_keys", fake_load_cache_rows)
 
     payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
@@ -651,7 +655,7 @@ async def test_build_readiness_optimization_projects_quality_coverage(monkeypatc
             ],
         )
 
-    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue):
+    async def fake_apply_quality_projection(_merchant_id: str, *, snapshot_products, product_queue, cache_rows_by_key=None):
         product_queue[0].content_quality_score = 83.0
         product_queue[0].model_readiness_score = 71.0
         product_queue[0].quality_source = "preview"
@@ -950,17 +954,17 @@ async def test_build_readiness_optimization_hydrates_catalog_health_decision_cou
             ],
         )
 
-    async def fake_list_source_data_decisions(_merchant_id: str, *, reason_code: str | None = None, product_keys=None):
-        if reason_code == "shipping_delivery_completeness":
-            return {
+    async def fake_list_source_data_decisions(_merchant_id: str, *, reason_codes=None, product_keys=None):
+        return {
+            "shipping_delivery_completeness": {
                 "shopify|prod_policy": {
                     "decision_state": "merchant_fix_in_progress",
                 }
             }
-        return {}
+        }
 
     monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
-    monkeypatch.setattr("readiness.summary.list_source_data_decisions", fake_list_source_data_decisions)
+    monkeypatch.setattr("readiness.summary.list_source_data_decisions_by_reason_codes", fake_list_source_data_decisions)
 
     payload = await build_readiness_optimization("merch_efbc46b4619cfbdf")
 

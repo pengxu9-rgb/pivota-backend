@@ -41,29 +41,69 @@ async def list_source_data_decisions(
     reason_code: Optional[str] = None,
     product_keys: Optional[Iterable[tuple[str, str]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
+    decisions_by_reason = await list_source_data_decisions_by_reason_codes(
+        merchant_id,
+        reason_codes=[reason_code] if reason_code else None,
+        product_keys=product_keys,
+    )
+    if reason_code:
+        return decisions_by_reason.get(str(reason_code or "").strip(), {})
+
+    flattened: Dict[str, Dict[str, Any]] = {}
+    for decisions in decisions_by_reason.values():
+        flattened.update(decisions)
+    return flattened
+
+
+async def list_source_data_decisions_by_reason_codes(
+    merchant_id: str,
+    *,
+    reason_codes: Optional[Iterable[str]] = None,
+    product_keys: Optional[Iterable[tuple[str, str]]] = None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
     await ensure_source_data_decisions_table()
 
     clauses = ["merchant_id = :merchant_id"]
     values: Dict[str, Any] = {"merchant_id": merchant_id}
 
-    if reason_code:
-        clauses.append("reason_code = :reason_code")
-        values["reason_code"] = reason_code
+    normalized_reason_codes = [
+        str(code or "").strip()
+        for code in (reason_codes or [])
+        if str(code or "").strip()
+    ]
+    if normalized_reason_codes:
+        reason_clauses: list[str] = []
+        for index, code in enumerate(normalized_reason_codes):
+            key = f"reason_code_{index}"
+            reason_clauses.append(f"reason_code = :{key}")
+            values[key] = code
+        clauses.append(f"({' OR '.join(reason_clauses)})")
 
     normalized_keys = [
         (str(platform or "").strip().lower(), str(platform_product_id or "").strip())
         for platform, platform_product_id in (product_keys or [])
         if str(platform_product_id or "").strip()
     ]
+    normalized_key_set = set(normalized_keys)
     if normalized_keys:
-        pair_clauses: list[str] = []
-        for index, (platform, platform_product_id) in enumerate(normalized_keys):
-            pair_clauses.append(
-                f"(platform = :platform_{index} AND platform_product_id = :platform_product_id_{index})"
-            )
-            values[f"platform_{index}"] = platform
-            values[f"platform_product_id_{index}"] = platform_product_id
-        clauses.append(f"({' OR '.join(pair_clauses)})")
+        normalized_platforms = sorted({platform for platform, _ in normalized_keys if platform})
+        normalized_product_ids = sorted(
+            {platform_product_id for _, platform_product_id in normalized_keys if platform_product_id}
+        )
+        if normalized_platforms:
+            platform_clauses: list[str] = []
+            for index, platform in enumerate(normalized_platforms):
+                key = f"platform_{index}"
+                platform_clauses.append(f"platform = :{key}")
+                values[key] = platform
+            clauses.append(f"({' OR '.join(platform_clauses)})")
+        if normalized_product_ids:
+            product_id_clauses: list[str] = []
+            for index, platform_product_id in enumerate(normalized_product_ids):
+                key = f"platform_product_id_{index}"
+                product_id_clauses.append(f"platform_product_id = :{key}")
+                values[key] = platform_product_id
+            clauses.append(f"({' OR '.join(product_id_clauses)})")
 
     query = f"""
         SELECT merchant_id, reason_code, platform, platform_product_id, decision_state, created_at, updated_at
@@ -71,7 +111,16 @@ async def list_source_data_decisions(
         WHERE {' AND '.join(clauses)}
     """
     rows = await database.fetch_all(query, values)
-    return {_decision_key(row["platform"], row["platform_product_id"]): dict(row) for row in rows}
+    decisions_by_reason: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for row in rows:
+        platform = str(row["platform"] or "").strip().lower()
+        platform_product_id = str(row["platform_product_id"] or "").strip()
+        key_tuple = (platform, platform_product_id)
+        if normalized_key_set and key_tuple not in normalized_key_set:
+            continue
+        reason = str(row["reason_code"] or "").strip()
+        decisions_by_reason.setdefault(reason, {})[_decision_key(platform, platform_product_id)] = dict(row)
+    return decisions_by_reason
 
 
 async def upsert_source_data_decision(
