@@ -97,6 +97,7 @@ _OPTIMIZATION_CACHE_METRICS: dict[str, int] = {
     "background_refresh_successes": 0,
     "background_refresh_failures": 0,
     "warmup_scheduled": 0,
+    "coalesced_waits": 0,
     "invalidations": 0,
     "invalidated_entries": 0,
 }
@@ -1311,6 +1312,7 @@ def get_readiness_optimization_cache_metrics() -> dict[str, Any]:
         "background_refresh_successes": _OPTIMIZATION_CACHE_METRICS["background_refresh_successes"],
         "background_refresh_failures": _OPTIMIZATION_CACHE_METRICS["background_refresh_failures"],
         "warmup_scheduled": _OPTIMIZATION_CACHE_METRICS["warmup_scheduled"],
+        "coalesced_waits": _OPTIMIZATION_CACHE_METRICS["coalesced_waits"],
         "invalidations": _OPTIMIZATION_CACHE_METRICS["invalidations"],
         "invalidated_entries": _OPTIMIZATION_CACHE_METRICS["invalidated_entries"],
         "total_requests": total_requests,
@@ -1390,6 +1392,17 @@ def _optimization_cache_entry(
     ]
 ]:
     return _OPTIMIZATION_CACHE.get(_optimization_cache_key(merchant_id, channel))
+
+
+def _optimization_refresh_task(
+    merchant_id: str,
+    *,
+    channel: str,
+) -> Optional[asyncio.Task[None]]:
+    task = _OPTIMIZATION_REFRESH_TASKS.get(_optimization_cache_key(merchant_id, channel))
+    if task is not None and not task.done():
+        return task
+    return None
 
 
 async def _load_readiness_snapshot_or_summary(
@@ -3397,6 +3410,19 @@ async def get_readiness_optimization_context(
             snapshot.model_copy(deep=True) if snapshot is not None else None,
             dict(aux_context or {}),
         )
+
+    inflight_task = _optimization_refresh_task(merchant_id, channel=channel)
+    if inflight_task is not None and not force_refresh:
+        _OPTIMIZATION_CACHE_METRICS["coalesced_waits"] += 1
+        await inflight_task
+        cache_entry = _optimization_cache_entry(merchant_id, channel=channel)
+        if cache_entry is not None:
+            _cached_at, payload, snapshot, aux_context = cache_entry
+            return (
+                payload.model_copy(deep=True),
+                snapshot.model_copy(deep=True) if snapshot is not None else None,
+                dict(aux_context or {}),
+            )
 
     _OPTIMIZATION_CACHE_METRICS["misses"] += 1
     return await _build_and_store_readiness_optimization_context(

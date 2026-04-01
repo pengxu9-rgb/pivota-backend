@@ -675,6 +675,96 @@ async def test_schedule_readiness_optimization_warmup_primes_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_build_readiness_optimization_coalesces_inflight_warmup(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    build_count = {"value": 0}
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp", force_refresh: bool = False):
+        build_count["value"] += 1
+        started.set()
+        await release.wait()
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=77,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="partial",
+                    ready_variant_count=0,
+                    blocked_variant_count=1,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=[
+                ReadyProduct(
+                    product_id="prod_1",
+                    platform="shopify",
+                    title="Alpha Product",
+                    variants=[
+                        ReadyVariant(
+                            variant_id="var_1",
+                            title="Default",
+                            price={"amount": None, "currency": "USD"},
+                            inventory={"quantity": 0, "availability": "out_of_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": ["missing_price"]},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(
+                                capability="checkout",
+                                status="blocked",
+                                score=40,
+                                blockers=["missing_price"],
+                            ),
+                            channel_coverage={"ucp": "blocked"},
+                        )
+                    ],
+                )
+            ],
+        )
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+
+    assert schedule_readiness_optimization_warmup("merch_efbc46b4619cfbdf") is True
+    await started.wait()
+
+    build_task = asyncio.create_task(
+        build_readiness_optimization(
+            "merch_efbc46b4619cfbdf",
+            queue_mode="page",
+            page=1,
+            page_size=50,
+        )
+    )
+    await asyncio.sleep(0)
+    assert build_count["value"] == 1
+
+    release.set()
+    payload = await build_task
+
+    assert payload.plan.snapshot_id.startswith("rdsnap_")
+    assert build_count["value"] == 1
+
+
+@pytest.mark.asyncio
 async def test_build_readiness_optimization_uses_truthful_action_mapping(monkeypatch):
     monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
     monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
