@@ -252,6 +252,7 @@ def _merge_cached_products_with_live_overlay(
 
 class ShopifyLiveMerchantSource:
     async def load(self, merchant_id: str) -> MerchantSourceDataset:
+        overall_started = datetime.now(timezone.utc)
         alpha_merchant_id = readiness_alpha_merchant_id()
         if merchant_id != alpha_merchant_id:
             raise KeyError(
@@ -336,8 +337,15 @@ class ShopifyLiveMerchantSource:
 
         live_overlay_needed = bool(shopify_connected and (not products or _cached_rows_need_live_overlay(cached_rows, reference_time)))
         live_fetch_error: Optional[str] = None
+        live_overlay_started_at: Optional[datetime] = None
+        live_overlay_elapsed_ms: Optional[float] = None
         if live_overlay_needed:
+            live_overlay_started_at = datetime.now(timezone.utc)
             live_products, live_error = await _fetch_live_products(merchant_id, shop_domain, access_token)
+            live_overlay_elapsed_ms = round(
+                (datetime.now(timezone.utc) - live_overlay_started_at).total_seconds() * 1000.0,
+                2,
+            )
             if live_products:
                 used_live_overlay = True
                 now_iso = _iso(reference_time)
@@ -418,6 +426,7 @@ class ShopifyLiveMerchantSource:
         }
         review_warnings: List[str] = []
         review_audit_notes: List[str] = []
+        review_started_at = datetime.now(timezone.utc)
         if products:
             product_review_summaries, review_diagnostics, review_warnings, review_audit_notes = await load_product_review_summaries(
                 merchant_id=merchant_id,
@@ -484,6 +493,18 @@ class ShopifyLiveMerchantSource:
             [
                 "Real-merchant alpha is restricted to one Shopify merchant.",
             ]
+        )
+
+        logger.info(
+            "shopify_live_readiness_dataset merchant=%s product_count=%s cached_rows=%s live_overlay_needed=%s live_overlay_used=%s live_overlay_ms=%s review_summary_ms=%.2f total_ms=%.2f",
+            merchant_id,
+            len(products),
+            len(cached_rows),
+            live_overlay_needed,
+            used_live_overlay,
+            live_overlay_elapsed_ms,
+            round((datetime.now(timezone.utc) - review_started_at).total_seconds() * 1000.0, 2),
+            round((datetime.now(timezone.utc) - overall_started).total_seconds() * 1000.0, 2),
         )
 
         return MerchantSourceDataset(

@@ -12,7 +12,15 @@ from middleware.error_handler import ErrorHandlerMiddleware
 from readiness.flags import DEFAULT_ALPHA_MERCHANT_ID
 from readiness.models import MerchantReadinessOptimizationPayload
 from readiness.order_sync import InMemoryReadinessJournal
+from readiness.service import reset_readiness_snapshot_cache_observability
+from readiness.summary import reset_readiness_optimization_cache_observability
 from readiness.tests.conftest import build_live_shopify_products, build_review_summaries, load_real_merchant_fixture
+
+
+@pytest.fixture(autouse=True)
+def _reset_readiness_caches():
+    reset_readiness_snapshot_cache_observability()
+    reset_readiness_optimization_cache_observability()
 
 
 def _install_live_source_mocks(monkeypatch, *, psp_enabled: bool):
@@ -148,9 +156,33 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
 
     from readiness import summary as readiness_summary
 
-    async def fake_build_readiness_optimization(merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        merchant_id: str,
+        *,
+        force_refresh: bool = False,
+        channel: str = "ucp",
+        queue_mode: str = "full",
+        page: int = 1,
+        page_size: int = 50,
+        search: str | None = None,
+        issue_bucket: str | None = None,
+        push_status: str = "all",
+        blocked_only: bool = False,
+        low_quality_only: bool = False,
+        sort_by: str = "default",
+    ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert force_refresh is False
         assert channel == "ucp"
+        assert queue_mode == "full"
+        assert page == 1
+        assert page_size == 50
+        assert search is None
+        assert issue_bucket is None
+        assert push_status == "all"
+        assert blocked_only is False
+        assert low_quality_only is False
+        assert sort_by == "default"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -243,6 +275,20 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
                         "suggestion_rationale": "Suggested title uses verified product facts and keeps missing facts out of the copy.",
                     }
                 ],
+                "product_queue_page": {
+                    "page": 1,
+                    "page_size": 1,
+                    "total_items": 1,
+                    "total_pages": 1,
+                    "has_next": False,
+                    "has_prev": False,
+                    "applied_filters": {
+                        "push_status": "all",
+                        "blocked_only": False,
+                        "low_quality_only": False,
+                        "sort_by": "default",
+                    },
+                },
                 "last_generated_at": "2026-03-18T00:00:00Z",
             }
         )
@@ -276,6 +322,7 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
     assert body["data"]["readiness_summary"]["tier"] == "yellow"
     assert body["data"]["issue_buckets"][0]["code"] == "price_currency"
     assert body["data"]["product_queue"][0]["platform"] == "shopify"
+    assert body["data"]["product_queue_page"]["total_items"] == 1
     assert body["data"]["product_queue"][0]["title_health"] == "rewrite_candidate"
     assert body["data"]["product_queue"][0]["suggestion_language"] == "en"
 
@@ -283,8 +330,32 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
 def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
     from routes import merchant_api_extensions as merchant_api_extensions
 
-    async def fake_build_readiness_optimization(merchant_id: str, *, channel: str = "ucp"):
+    async def fake_build_readiness_optimization(
+        merchant_id: str,
+        *,
+        force_refresh: bool = False,
+        channel: str = "ucp",
+        queue_mode: str = "full",
+        page: int = 1,
+        page_size: int = 50,
+        search: str | None = None,
+        issue_bucket: str | None = None,
+        push_status: str = "all",
+        blocked_only: bool = False,
+        low_quality_only: bool = False,
+        sort_by: str = "default",
+    ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert force_refresh is True
+        assert queue_mode == "full"
+        assert page == 1
+        assert page_size == 50
+        assert search is None
+        assert issue_bucket is None
+        assert push_status == "all"
+        assert blocked_only is False
+        assert low_quality_only is False
+        assert sort_by == "default"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -345,6 +416,113 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
     assert body["meta"]["scope"] == "merchant"
     assert body["meta"]["reason"] == "manual"
     assert body["meta"]["refresh_state"] == "fresh"
+
+
+def test_merchant_readiness_optimization_route_forwards_page_params(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+
+    async def fake_build_readiness_optimization(
+        merchant_id: str,
+        *,
+        force_refresh: bool = False,
+        channel: str = "ucp",
+        queue_mode: str = "full",
+        page: int = 1,
+        page_size: int = 50,
+        search: str | None = None,
+        issue_bucket: str | None = None,
+        push_status: str = "all",
+        blocked_only: bool = False,
+        low_quality_only: bool = False,
+        sort_by: str = "default",
+    ):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert force_refresh is False
+        assert queue_mode == "page"
+        assert page == 2
+        assert page_size == 25
+        assert search == "air"
+        assert issue_bucket == "catalog_content"
+        assert push_status == "excluded"
+        assert blocked_only is True
+        assert low_quality_only is True
+        assert sort_by == "cq_desc"
+        return MerchantReadinessOptimizationPayload.model_validate(
+            {
+                "plan": {
+                    "plan_id": "rdplan_page",
+                    "snapshot_id": "rdsnap_page",
+                    "workspace_version": "agent_commerce_optimization.v1",
+                    "priority_policy_version": "merchant_readiness_priority.v1",
+                    "refresh_state": "fresh",
+                    "generated_at": "2026-03-18T00:00:00Z",
+                    "expires_at": "2026-03-18T06:00:00Z",
+                    "can_apply_actions": True,
+                    "last_successful_rescore_at": "2026-03-18T00:00:00Z",
+                },
+                "score_bundle": {"readiness_score": 77},
+                "readiness_summary": {
+                    "tier": "yellow",
+                    "label": "Needs Attention",
+                    "assessment_state": "assessed",
+                    "score": 77,
+                    "ready_variant_count": 3,
+                    "blocked_variant_count": 1,
+                },
+                "product_queue": [],
+                "product_queue_page": {
+                    "page": 2,
+                    "page_size": 25,
+                    "total_items": 25,
+                    "total_pages": 1,
+                    "has_next": False,
+                    "has_prev": True,
+                    "applied_filters": {
+                        "search": "air",
+                        "issue_bucket": "catalog_content",
+                        "push_status": "excluded",
+                        "blocked_only": True,
+                        "low_quality_only": True,
+                        "sort_by": "cq_desc",
+                    },
+                },
+            }
+        )
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    monkeypatch.setattr(merchant_api_extensions, "build_readiness_optimization", fake_build_readiness_optimization)
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.get(
+        "/merchant/readiness/optimization",
+        params={
+            "queue_mode": "page",
+            "page": 2,
+            "page_size": 25,
+            "search": "air",
+            "issue_bucket": "catalog_content",
+            "push_status": "excluded",
+            "blocked_only": "true",
+            "low_quality_only": "true",
+            "sort_by": "cq_desc",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["data"]["plan"]["plan_id"] == "rdplan_page"
+    assert body["data"]["product_queue_page"]["page"] == 2
 
 
 def test_merchant_readiness_action_preview_route_returns_preview(monkeypatch):

@@ -10,6 +10,7 @@ from readiness.models import (
     ReadyProduct,
     ReadyVariant,
 )
+from readiness.service import reset_readiness_snapshot_cache_observability
 from readiness.summary import (
     _build_platform_admin_url,
     build_readiness_optimization,
@@ -22,6 +23,7 @@ from readiness.summary import (
 @pytest.fixture(autouse=True)
 def _reset_optimization_cache(monkeypatch):
     reset_readiness_optimization_cache_observability()
+    reset_readiness_snapshot_cache_observability()
 
     async def _no_decisions(*_args, **_kwargs):
         return {}
@@ -381,6 +383,112 @@ async def test_build_readiness_optimization_adds_platform_admin_url_for_shopify(
     lanes_by_code = {lane.reason_code: lane for lane in payload.source_data_lanes}
     assert lanes_by_code["missing_price"].next_product.platform_admin_url == expected_url
     assert lanes_by_code["out_of_stock"].next_product.platform_admin_url == expected_url
+
+
+@pytest.mark.asyncio
+async def test_build_readiness_optimization_page_mode_returns_filtered_slice(monkeypatch):
+    monkeypatch.setenv("FEATURE_READINESS_AUDIT", "true")
+    monkeypatch.setenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "true")
+    monkeypatch.setenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+
+    async def fake_build_snapshot(_merchant_id: str, *, channel: str = "ucp", force_refresh: bool = False):
+        assert force_refresh is False
+        products = []
+        for product_id, title in (
+            ("prod_alpha", "Alpha Product"),
+            ("prod_bravo", "Bravo Product"),
+            ("prod_charlie", "Charlie Product"),
+        ):
+            products.append(
+                ReadyProduct(
+                    product_id=product_id,
+                    platform="shopify",
+                    title=title,
+                    variants=[
+                        ReadyVariant(
+                            variant_id=f"{product_id}_var",
+                            title="Default",
+                            price={"amount": None, "currency": "USD"},
+                            inventory={"quantity": 0, "availability": "out_of_stock"},
+                            freshness={},
+                            provenance=[],
+                            source_of_truth={},
+                            blockers={"discovery": [], "checkout": ["missing_price"]},
+                            warnings={"discovery": [], "checkout": []},
+                            discovery=CapabilityStatus(capability="discovery", status="ready", score=100),
+                            checkout=CapabilityStatus(
+                                capability="checkout",
+                                status="blocked",
+                                score=40,
+                                blockers=["missing_price"],
+                            ),
+                            channel_coverage={"ucp": "blocked"},
+                        )
+                    ],
+                )
+            )
+
+        return MerchantReadinessSnapshot(
+            merchant_id="merch_efbc46b4619cfbdf",
+            merchant_name="Alpha Merchant",
+            channel=channel,
+            generated_at="2026-03-18T00:00:00Z",
+            merchant_alpha_mode="real_merchant_alpha",
+            readiness_score=77,
+            domain_scores={},
+            capability_status={},
+            blockers=[],
+            warnings=[],
+            merchant_capabilities=[],
+            channel_coverage=[
+                ChannelCoverageStatus(
+                    channel="ucp",
+                    status="partial",
+                    ready_variant_count=0,
+                    blocked_variant_count=3,
+                )
+            ],
+            source_of_truth={},
+            stubbed_capabilities=[],
+            audit_notes=[],
+            products=products,
+        )
+
+    monkeypatch.setattr("readiness.summary.build_readiness_snapshot", fake_build_snapshot)
+
+    payload = await build_readiness_optimization(
+        "merch_efbc46b4619cfbdf",
+        queue_mode="page",
+        page=2,
+        page_size=1,
+    )
+
+    assert payload.product_queue_page is not None
+    assert payload.product_queue_page.total_items == 3
+    assert payload.product_queue_page.page == 2
+    assert payload.product_queue_page.page_size == 1
+    assert payload.product_queue_page.total_pages == 3
+    assert len(payload.product_queue) == 1
+    assert payload.product_queue[0].product_id == "prod_bravo"
+
+    filtered = await build_readiness_optimization(
+        "merch_efbc46b4619cfbdf",
+        queue_mode="page",
+        page=1,
+        page_size=50,
+        search="charlie",
+    )
+    assert filtered.product_queue_page is not None
+    assert filtered.product_queue_page.total_items == 1
+    assert filtered.product_queue[0].product_id == "prod_charlie"
+
+    summary_only = await build_readiness_optimization(
+        "merch_efbc46b4619cfbdf",
+        queue_mode="none",
+    )
+    assert summary_only.product_queue == []
+    assert summary_only.product_queue_page is not None
+    assert summary_only.product_queue_page.total_items == 3
 
 
 @pytest.mark.asyncio

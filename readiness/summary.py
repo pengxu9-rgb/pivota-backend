@@ -29,6 +29,8 @@ from readiness.models import (
     MerchantReadinessOptimizationPayload,
     MerchantReadinessSnapshot,
     OptimizationPlan,
+    ProductQueueAppliedFilters,
+    ProductQueuePage,
     ProductQueueIssue,
     ProductReadinessQueueItem,
     QualityCoverageSummary,
@@ -41,7 +43,11 @@ from readiness.models import (
     SourceDataLaneStateCount,
     SourceDataLaneSummary,
 )
-from readiness.service import UnsupportedMerchantError, build_readiness_snapshot
+from readiness.service import (
+    UnsupportedMerchantError,
+    build_readiness_snapshot,
+    invalidate_readiness_snapshot_cache,
+)
 from services.catalog_sync_service import make_catalog_product_key
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from services.product_enrichment_ai import generate_title_suggestion
@@ -65,6 +71,8 @@ _WORKSPACE_VERSION = "agent_commerce_optimization.v1"
 _PRIORITY_POLICY_VERSION = "merchant_readiness_priority.v1"
 _PLAN_TTL_HOURS = 6
 _OPTIMIZATION_CACHE_TTL_SECONDS = 300.0
+_DEFAULT_QUEUE_PAGE_SIZE = 50
+_MAX_QUEUE_PAGE_SIZE = 100
 
 
 _OPTIMIZATION_CACHE: dict[
@@ -73,6 +81,7 @@ _OPTIMIZATION_CACHE: dict[
         float,
         MerchantReadinessOptimizationPayload,
         Optional[MerchantReadinessSnapshot],
+        dict[str, Any],
     ],
 ] = {}
 _OPTIMIZATION_CACHE_METRICS: dict[str, int] = {
@@ -1230,6 +1239,7 @@ def invalidate_readiness_optimization_cache(
     if keys_to_drop:
         _OPTIMIZATION_CACHE_METRICS["invalidations"] += 1
         _OPTIMIZATION_CACHE_METRICS["invalidated_entries"] += len(keys_to_drop)
+    invalidate_readiness_snapshot_cache(merchant_id, channel=channel)
     return len(keys_to_drop)
 
 
@@ -1244,7 +1254,7 @@ def get_readiness_optimization_cache_metrics() -> dict[str, Any]:
     hit_rate = (_OPTIMIZATION_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
     now_mono = time.monotonic()
     entries = []
-    for key, (cached_at, payload, _snapshot) in sorted(_OPTIMIZATION_CACHE.items()):
+    for key, (cached_at, payload, _snapshot, _aux) in sorted(_OPTIMIZATION_CACHE.items()):
         merchant_id, cached_channel = key.split("|", 1)
         age_seconds = max(0.0, now_mono - cached_at)
         entries.append(
@@ -1282,7 +1292,7 @@ def _cached_optimization_payload(
     context = _cached_optimization_context(merchant_id, channel=channel)
     if context is None:
         return None
-    payload, _snapshot = context
+    payload, _snapshot, _aux = context
     return payload
 
 
@@ -1290,20 +1300,24 @@ def _cached_optimization_context(
     merchant_id: str,
     *,
     channel: str,
-) -> Optional[tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot]]]:
+) -> Optional[tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot], dict[str, Any]]]:
     cache_key = _optimization_cache_key(merchant_id, channel)
     entry = _OPTIMIZATION_CACHE.get(cache_key)
     if not entry:
         _OPTIMIZATION_CACHE_METRICS["misses"] += 1
         return None
-    cached_at, payload, snapshot = entry
+    cached_at, payload, snapshot, aux_context = entry
     if time.monotonic() - cached_at > _OPTIMIZATION_CACHE_TTL_SECONDS:
         _OPTIMIZATION_CACHE.pop(cache_key, None)
         _OPTIMIZATION_CACHE_METRICS["misses"] += 1
         _OPTIMIZATION_CACHE_METRICS["expired"] += 1
         return None
     _OPTIMIZATION_CACHE_METRICS["hits"] += 1
-    return payload.model_copy(deep=True), snapshot.model_copy(deep=True) if snapshot is not None else None
+    return (
+        payload.model_copy(deep=True),
+        snapshot.model_copy(deep=True) if snapshot is not None else None,
+        aux_context,
+    )
 
 
 def _store_optimization_payload(
@@ -1312,15 +1326,167 @@ def _store_optimization_payload(
     channel: str,
     payload: MerchantReadinessOptimizationPayload,
     snapshot: Optional[MerchantReadinessSnapshot] = None,
+    aux_context: Optional[dict[str, Any]] = None,
 ) -> MerchantReadinessOptimizationPayload:
     cache_key = _optimization_cache_key(merchant_id, channel)
     _OPTIMIZATION_CACHE[cache_key] = (
         time.monotonic(),
         payload.model_copy(deep=True),
         snapshot.model_copy(deep=True) if snapshot is not None else None,
+        dict(aux_context or {}),
     )
     _OPTIMIZATION_CACHE_METRICS["stores"] += 1
     return payload
+
+
+def _normalize_queue_mode(value: Optional[str]) -> str:
+    normalized = str(value or "full").strip().lower()
+    if normalized in {"full", "page", "none"}:
+        return normalized
+    return "full"
+
+
+def _normalize_sort_by(value: Optional[str]) -> str:
+    normalized = str(value or "default").strip().lower()
+    if normalized in {"default", "cq_desc", "mr_desc"}:
+        return normalized
+    return "default"
+
+
+def _normalize_push_status(value: Optional[str]) -> str:
+    normalized = str(value or "all").strip().lower()
+    if normalized in {"all", "eligible", "excluded"}:
+        return normalized
+    return "all"
+
+
+def _normalize_page(value: Optional[int]) -> int:
+    try:
+        return max(1, int(value or 1))
+    except Exception:
+        return 1
+
+
+def _normalize_page_size(value: Optional[int]) -> int:
+    try:
+        normalized = int(value or _DEFAULT_QUEUE_PAGE_SIZE)
+    except Exception:
+        normalized = _DEFAULT_QUEUE_PAGE_SIZE
+    return max(1, min(_MAX_QUEUE_PAGE_SIZE, normalized))
+
+
+def _queue_item_matches_search(item: ProductReadinessQueueItem, query: str) -> bool:
+    normalized_query = _normalized_lower(query)
+    if not normalized_query:
+        return True
+    haystacks = [
+        item.title,
+        item.brand,
+        item.category,
+        item.platform_product_id,
+        item.product_id,
+    ]
+    return any(normalized_query in _normalized_lower(value) for value in haystacks if value)
+
+
+def _queue_item_matches_issue_bucket(
+    item: ProductReadinessQueueItem,
+    issue_bucket: Optional[str],
+) -> bool:
+    normalized_bucket = str(issue_bucket or "").strip()
+    if not normalized_bucket or normalized_bucket == "all":
+        return True
+
+    if any(_bucket_code_for_reason(issue.code) == normalized_bucket for issue in (item.top_issues or [])):
+        return True
+    return any(_bucket_code_for_reason(code) == normalized_bucket for code in (item.content_gap_codes or []))
+
+
+def _filter_product_queue_items(
+    product_queue: list[ProductReadinessQueueItem],
+    *,
+    search: Optional[str],
+    issue_bucket: Optional[str],
+    push_status: str,
+    blocked_only: bool,
+    low_quality_only: bool,
+) -> list[ProductReadinessQueueItem]:
+    filtered: list[ProductReadinessQueueItem] = []
+    for item in product_queue:
+        if search and not _queue_item_matches_search(item, search):
+            continue
+        if not _queue_item_matches_issue_bucket(item, issue_bucket):
+            continue
+        if blocked_only and int(item.blocked_variant_count or 0) <= 0:
+            continue
+        if push_status == "excluded" and item.agent_push_status != AGENT_PUSH_STATUS_EXCLUDED:
+            continue
+        if push_status == "eligible" and item.agent_push_status == AGENT_PUSH_STATUS_EXCLUDED:
+            continue
+        if low_quality_only:
+            score = item.content_quality_score
+            if not isinstance(score, (int, float)) or float(score) >= 60.0:
+                continue
+        filtered.append(item)
+    return filtered
+
+
+def _sort_product_queue_items(
+    product_queue: list[ProductReadinessQueueItem],
+    *,
+    sort_by: str,
+) -> list[ProductReadinessQueueItem]:
+    if sort_by == "cq_desc":
+        return sorted(
+            product_queue,
+            key=lambda item: (
+                -(float(item.content_quality_score) if isinstance(item.content_quality_score, (int, float)) else -1.0),
+                -float(item.priority_score or 0.0),
+                item.title.lower(),
+            ),
+        )
+    if sort_by == "mr_desc":
+        return sorted(
+            product_queue,
+            key=lambda item: (
+                -(float(item.model_readiness_score) if isinstance(item.model_readiness_score, (int, float)) else -1.0),
+                -float(item.priority_score or 0.0),
+                item.title.lower(),
+            ),
+        )
+    return list(product_queue)
+
+
+def _build_product_queue_page(
+    *,
+    total_items: int,
+    page: int,
+    page_size: int,
+    search: Optional[str],
+    issue_bucket: Optional[str],
+    push_status: str,
+    blocked_only: bool,
+    low_quality_only: bool,
+    sort_by: str,
+) -> ProductQueuePage:
+    total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items else 0
+    normalized_page = min(page, total_pages) if total_pages > 0 else 1
+    return ProductQueuePage(
+        page=normalized_page,
+        page_size=page_size,
+        total_items=total_items,
+        total_pages=total_pages,
+        has_next=total_pages > 0 and normalized_page < total_pages,
+        has_prev=normalized_page > 1 and total_pages > 0,
+        applied_filters=ProductQueueAppliedFilters(
+            search=_normalize_text(search) or None,
+            issue_bucket=str(issue_bucket or "").strip() or None,
+            push_status=push_status,
+            blocked_only=bool(blocked_only),
+            low_quality_only=bool(low_quality_only),
+            sort_by=sort_by,
+        ),
+    )
 
 
 def _severity_for_bucket(bucket_code: str, affected_count: int) -> str:
@@ -1856,6 +2022,8 @@ async def _apply_catalog_health_projection(
     current_products_by_key: dict[tuple[str, str], dict[str, Any]],
     parsed_products_by_key: dict[tuple[str, str], StandardProduct],
     store_context: dict[str, Any],
+    include_title_preview: bool = True,
+    target_product_keys: Optional[set[tuple[str, str]]] = None,
 ) -> list[ProductReadinessQueueItem]:
     if not product_queue:
         return product_queue
@@ -1863,6 +2031,8 @@ async def _apply_catalog_health_projection(
     for item in product_queue:
         product_key = make_product_key(item.platform, item.platform_product_id or item.product_id)
         if product_key is None:
+            continue
+        if target_product_keys is not None and product_key not in target_product_keys:
             continue
         current_product = current_products_by_key.get(product_key, {})
         parsed_product = parsed_products_by_key.get(product_key)
@@ -1879,7 +2049,7 @@ async def _apply_catalog_health_projection(
             [*(item.missing_attribute_labels or []), *(title_suggestion.missing_attribute_labels or [])]
         )
         item.title_health = title_suggestion.title_health
-        item.suggested_title_preview = title_suggestion.suggested_title
+        item.suggested_title_preview = title_suggestion.suggested_title if include_title_preview else None
         item.suggestion_language = title_suggestion.suggestion_language
         item.suggestion_confidence = title_suggestion.suggestion_confidence
         item.suggestion_rationale = title_suggestion.suggestion_rationale
@@ -2746,18 +2916,141 @@ async def build_readiness_summary(
     return summarize_readiness_snapshot(snapshot, channel=channel)
 
 
+async def _render_readiness_optimization_payload(
+    payload: MerchantReadinessOptimizationPayload,
+    *,
+    aux_context: Optional[dict[str, Any]],
+    queue_mode: str,
+    page: int,
+    page_size: int,
+    search: Optional[str],
+    issue_bucket: Optional[str],
+    push_status: str,
+    blocked_only: bool,
+    low_quality_only: bool,
+    sort_by: str,
+) -> MerchantReadinessOptimizationPayload:
+    queue_mode = _normalize_queue_mode(queue_mode)
+    page = _normalize_page(page)
+    page_size = _normalize_page_size(page_size)
+    push_status = _normalize_push_status(push_status)
+    sort_by = _normalize_sort_by(sort_by)
+
+    filtered_queue = _filter_product_queue_items(
+        payload.product_queue,
+        search=search,
+        issue_bucket=issue_bucket,
+        push_status=push_status,
+        blocked_only=blocked_only,
+        low_quality_only=low_quality_only,
+    )
+    filtered_queue = _sort_product_queue_items(filtered_queue, sort_by=sort_by)
+
+    applied_filters = ProductQueueAppliedFilters(
+        search=_normalize_text(search) or None,
+        issue_bucket=str(issue_bucket or "").strip() or None,
+        push_status=push_status,
+        blocked_only=bool(blocked_only),
+        low_quality_only=bool(low_quality_only),
+        sort_by=sort_by,
+    )
+
+    if queue_mode == "full":
+        total_items = len(filtered_queue)
+        payload.product_queue = filtered_queue
+        payload.product_queue_page = ProductQueuePage(
+            page=1,
+            page_size=total_items,
+            total_items=total_items,
+            total_pages=1 if total_items > 0 else 0,
+            has_next=False,
+            has_prev=False,
+            applied_filters=applied_filters,
+        )
+    else:
+        page_meta = _build_product_queue_page(
+            total_items=len(filtered_queue),
+            page=page,
+            page_size=page_size,
+            search=search,
+            issue_bucket=issue_bucket,
+            push_status=push_status,
+            blocked_only=blocked_only,
+            low_quality_only=low_quality_only,
+            sort_by=sort_by,
+        )
+        page_meta.applied_filters = applied_filters
+        payload.product_queue_page = page_meta
+        if queue_mode == "none":
+            payload.product_queue = []
+        else:
+            start = (page_meta.page - 1) * page_meta.page_size
+            end = start + page_meta.page_size
+            payload.product_queue = filtered_queue[start:end]
+
+    if payload.product_queue and aux_context:
+        page_started = time.perf_counter()
+        target_product_keys = {
+            key
+            for key in (
+                make_product_key(item.platform, item.platform_product_id or item.product_id)
+                for item in payload.product_queue
+            )
+            if key is not None
+        }
+        await _apply_catalog_health_projection(
+            product_queue=payload.product_queue,
+            current_products_by_key=aux_context.get("current_products_by_key", {}),
+            parsed_products_by_key=aux_context.get("parsed_products_by_key", {}),
+            store_context=aux_context.get("store_context", {}),
+            include_title_preview=True,
+            target_product_keys=target_product_keys,
+        )
+        logger.info(
+            "readiness_optimization_page_materialization queue_mode=%s page=%s page_size=%s returned_items=%s catalog_health_projection_ms=%.2f",
+            queue_mode,
+            payload.product_queue_page.page if payload.product_queue_page else 1,
+            payload.product_queue_page.page_size if payload.product_queue_page else len(payload.product_queue),
+            len(payload.product_queue),
+            round((time.perf_counter() - page_started) * 1000.0, 2),
+        )
+
+    return payload
+
+
 async def build_readiness_optimization(
     merchant_id: str,
     *,
     force_refresh: bool = False,
     channel: str = "ucp",
+    queue_mode: str = "full",
+    page: int = 1,
+    page_size: int = _DEFAULT_QUEUE_PAGE_SIZE,
+    search: Optional[str] = None,
+    issue_bucket: Optional[str] = None,
+    push_status: str = "all",
+    blocked_only: bool = False,
+    low_quality_only: bool = False,
+    sort_by: str = "default",
 ) -> MerchantReadinessOptimizationPayload:
-    payload, _snapshot = await get_readiness_optimization_context(
+    payload, _snapshot, aux_context = await get_readiness_optimization_context(
         merchant_id,
         channel=channel,
         force_refresh=force_refresh,
     )
-    return payload
+    return await _render_readiness_optimization_payload(
+        payload,
+        aux_context=aux_context,
+        queue_mode=queue_mode,
+        page=page,
+        page_size=page_size,
+        search=search,
+        issue_bucket=issue_bucket,
+        push_status=push_status,
+        blocked_only=blocked_only,
+        low_quality_only=low_quality_only,
+        sort_by=sort_by,
+    )
 
 
 async def get_readiness_optimization_context(
@@ -2765,7 +3058,7 @@ async def get_readiness_optimization_context(
     *,
     force_refresh: bool = False,
     channel: str = "ucp",
-) -> tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot]]:
+) -> tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot], dict[str, Any]]:
     if force_refresh:
         invalidate_readiness_optimization_cache(merchant_id, channel=channel)
         _OPTIMIZATION_CACHE_METRICS["refreshes"] += 1
@@ -2787,10 +3080,17 @@ async def get_readiness_optimization_context(
                 )
             ),
             None,
+            {},
         )
 
+    overall_started = time.perf_counter()
+    stage_timings_ms: dict[str, float] = {}
     summary = summarize_readiness_snapshot(snapshot, channel=channel)
+    stage_started = time.perf_counter()
     store_domains_by_platform = await _load_store_domains_by_platform(merchant_id)
+    stage_timings_ms["store_domains"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
+
+    stage_started = time.perf_counter()
     full_product_queue = [
         _product_queue_item(
             product,
@@ -2799,28 +3099,44 @@ async def get_readiness_optimization_context(
         )
         for product in snapshot.products
     ]
+    stage_timings_ms["queue_base"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
+
+    stage_started = time.perf_counter()
     full_product_queue, agent_push_summary = _apply_agent_push_projection(
         snapshot_products=snapshot.products,
         product_queue=full_product_queue,
         checked_at=snapshot.generated_at,
     )
+    stage_timings_ms["agent_push_projection"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
+
+    stage_started = time.perf_counter()
     catalog_projection_context = await _build_catalog_projection_context(
         merchant_id,
         snapshot_products=snapshot.products,
         include_field_facts=True,
     )
+    stage_timings_ms["projection_context"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
+
+    stage_started = time.perf_counter()
     full_product_queue, quality_coverage = await _apply_quality_projection(
         merchant_id,
         snapshot_products=snapshot.products,
         product_queue=full_product_queue,
         cache_rows_by_key=catalog_projection_context["cache_rows_by_key"],
     )
+    stage_timings_ms["quality_projection"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
+
+    stage_started = time.perf_counter()
     full_product_queue = await _apply_catalog_health_projection(
         product_queue=full_product_queue,
         current_products_by_key=catalog_projection_context["current_products_by_key"],
         parsed_products_by_key=catalog_projection_context["parsed_products_by_key"],
         store_context=catalog_projection_context["store_context"],
+        include_title_preview=False,
     )
+    stage_timings_ms["catalog_health_projection"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
+
+    stage_started = time.perf_counter()
     source_data_lanes = await _build_source_data_lanes(
         merchant_id,
         product_queue=full_product_queue,
@@ -2830,12 +3146,16 @@ async def get_readiness_optimization_context(
         field_facts_by_key=catalog_projection_context["field_facts_by_key"],
         store_context=catalog_projection_context["store_context"],
     )
+    stage_timings_ms["source_data_lanes"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
+
+    stage_started = time.perf_counter()
     issue_buckets = _build_issue_buckets(
         snapshot,
         product_queue=full_product_queue,
         source_data_lanes=source_data_lanes,
     )
     merchant_actions = _build_merchant_actions(summary, issue_buckets)
+    stage_timings_ms["bucket_and_action_build"] = round((time.perf_counter() - stage_started) * 1000.0, 2)
     product_queue = [
         item
         for item in full_product_queue
@@ -2873,6 +3193,7 @@ async def get_readiness_optimization_context(
         merchant_id,
         channel=channel,
         snapshot=snapshot,
+        aux_context=catalog_projection_context,
         payload=MerchantReadinessOptimizationPayload(
             plan=plan,
             score_bundle=ScoreBundle(readiness_score=summary.score),
@@ -2887,4 +3208,17 @@ async def get_readiness_optimization_context(
             last_generated_at=summary.generated_at,
         ),
     )
-    return payload, snapshot
+    logger.info(
+        "readiness_optimization_profile merchant=%s channel=%s cache_hit=%s projection_context_ms=%s quality_projection_ms=%s catalog_health_projection_ms=%s source_data_lanes_ms=%s total_ms=%.2f queue_total=%s content_opportunities=%s",
+        merchant_id,
+        channel,
+        False,
+        stage_timings_ms.get("projection_context"),
+        stage_timings_ms.get("quality_projection"),
+        stage_timings_ms.get("catalog_health_projection"),
+        stage_timings_ms.get("source_data_lanes"),
+        round((time.perf_counter() - overall_started) * 1000.0, 2),
+        len(payload.product_queue),
+        payload.content_opportunity_count,
+    )
+    return payload, snapshot, catalog_projection_context

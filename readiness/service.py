@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -38,9 +39,95 @@ from services.shopify_transactions_service import (
 
 logger = logging.getLogger(__name__)
 
+_SNAPSHOT_CACHE_TTL_SECONDS = 300.0
+_SNAPSHOT_CACHE: dict[str, tuple[float, MerchantReadinessSnapshot]] = {}
+_SNAPSHOT_CACHE_METRICS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "stores": 0,
+    "expired": 0,
+    "refreshes": 0,
+    "invalidations": 0,
+    "invalidated_entries": 0,
+}
+
 
 class UnsupportedMerchantError(KeyError):
     pass
+
+
+def _snapshot_cache_key(merchant_id: str, channel: str) -> str:
+    return f"{merchant_id}|{channel}"
+
+
+def invalidate_readiness_snapshot_cache(
+    merchant_id: Optional[str] = None,
+    *,
+    channel: Optional[str] = None,
+) -> int:
+    if merchant_id is None and channel is None:
+        removed = len(_SNAPSHOT_CACHE)
+        _SNAPSHOT_CACHE.clear()
+        if removed:
+            _SNAPSHOT_CACHE_METRICS["invalidations"] += 1
+            _SNAPSHOT_CACHE_METRICS["invalidated_entries"] += removed
+        return removed
+
+    keys_to_drop: List[str] = []
+    for key in list(_SNAPSHOT_CACHE.keys()):
+        cached_merchant_id, cached_channel = key.split("|", 1)
+        if merchant_id is not None and cached_merchant_id != merchant_id:
+            continue
+        if channel is not None and cached_channel != channel:
+            continue
+        keys_to_drop.append(key)
+
+    for key in keys_to_drop:
+        _SNAPSHOT_CACHE.pop(key, None)
+
+    if keys_to_drop:
+        _SNAPSHOT_CACHE_METRICS["invalidations"] += 1
+        _SNAPSHOT_CACHE_METRICS["invalidated_entries"] += len(keys_to_drop)
+    return len(keys_to_drop)
+
+
+def get_readiness_snapshot_cache_metrics() -> Dict[str, Any]:
+    total_requests = _SNAPSHOT_CACHE_METRICS["hits"] + _SNAPSHOT_CACHE_METRICS["misses"]
+    hit_rate = (_SNAPSHOT_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
+    now_mono = time.monotonic()
+    active_keys: List[Dict[str, Any]] = []
+    for key, (cached_at, snapshot) in sorted(_SNAPSHOT_CACHE.items()):
+        merchant_id, cached_channel = key.split("|", 1)
+        age_seconds = max(0.0, now_mono - cached_at)
+        active_keys.append(
+            {
+                "merchant_id": merchant_id,
+                "channel": cached_channel,
+                "generated_at": snapshot.generated_at,
+                "age_seconds": round(age_seconds, 3),
+                "expires_in_seconds": round(max(0.0, _SNAPSHOT_CACHE_TTL_SECONDS - age_seconds), 3),
+            }
+        )
+    return {
+        "hits": _SNAPSHOT_CACHE_METRICS["hits"],
+        "misses": _SNAPSHOT_CACHE_METRICS["misses"],
+        "stores": _SNAPSHOT_CACHE_METRICS["stores"],
+        "expired": _SNAPSHOT_CACHE_METRICS["expired"],
+        "refreshes": _SNAPSHOT_CACHE_METRICS["refreshes"],
+        "invalidations": _SNAPSHOT_CACHE_METRICS["invalidations"],
+        "invalidated_entries": _SNAPSHOT_CACHE_METRICS["invalidated_entries"],
+        "total_requests": total_requests,
+        "hit_rate": round(hit_rate, 2),
+        "entries": len(_SNAPSHOT_CACHE),
+        "ttl_seconds": _SNAPSHOT_CACHE_TTL_SECONDS,
+        "active_keys": active_keys,
+    }
+
+
+def reset_readiness_snapshot_cache_observability() -> None:
+    _SNAPSHOT_CACHE.clear()
+    for key in list(_SNAPSHOT_CACHE_METRICS.keys()):
+        _SNAPSHOT_CACHE_METRICS[key] = 0
 
 
 def _utc_now_iso() -> str:
@@ -597,12 +684,55 @@ def build_export_summary_response(
     }
 
 
-async def build_readiness_snapshot(merchant_id: str, channel: str = "ucp") -> MerchantReadinessSnapshot:
+async def build_readiness_snapshot(
+    merchant_id: str,
+    channel: str = "ucp",
+    *,
+    force_refresh: bool = False,
+) -> MerchantReadinessSnapshot:
+    cache_key = _snapshot_cache_key(merchant_id, channel)
+    if force_refresh:
+        invalidate_readiness_snapshot_cache(merchant_id, channel=channel)
+        _SNAPSHOT_CACHE_METRICS["refreshes"] += 1
+
+    cached_entry = _SNAPSHOT_CACHE.get(cache_key)
+    if cached_entry is not None:
+        cached_at, cached_snapshot = cached_entry
+        if time.monotonic() - cached_at <= _SNAPSHOT_CACHE_TTL_SECONDS:
+            _SNAPSHOT_CACHE_METRICS["hits"] += 1
+            return cached_snapshot.model_copy(deep=True)
+        _SNAPSHOT_CACHE.pop(cache_key, None)
+        _SNAPSHOT_CACHE_METRICS["expired"] += 1
+
+    _SNAPSHOT_CACHE_METRICS["misses"] += 1
+    overall_started = time.perf_counter()
+    dataset_started = time.perf_counter()
     try:
         dataset = await load_merchant_source_dataset(merchant_id)
     except KeyError as exc:
         raise UnsupportedMerchantError(merchant_id) from exc
-    return build_merchant_snapshot(dataset, channel=channel)
+    dataset_elapsed_ms = round((time.perf_counter() - dataset_started) * 1000.0, 2)
+
+    snapshot_started = time.perf_counter()
+    snapshot = build_merchant_snapshot(dataset, channel=channel)
+    snapshot_elapsed_ms = round((time.perf_counter() - snapshot_started) * 1000.0, 2)
+
+    _SNAPSHOT_CACHE[cache_key] = (
+        time.monotonic(),
+        snapshot.model_copy(deep=True),
+    )
+    _SNAPSHOT_CACHE_METRICS["stores"] += 1
+    logger.info(
+        "readiness_snapshot_profile merchant=%s channel=%s cache_hit=%s source_dataset_load_ms=%.2f snapshot_build_ms=%.2f total_ms=%.2f product_count=%s",
+        merchant_id,
+        channel,
+        False,
+        dataset_elapsed_ms,
+        snapshot_elapsed_ms,
+        round((time.perf_counter() - overall_started) * 1000.0, 2),
+        len(snapshot.products),
+    )
+    return snapshot.model_copy(deep=True)
 
 
 async def build_channel_export(merchant_id: str, channel: str = "ucp") -> ChannelReadinessReport:

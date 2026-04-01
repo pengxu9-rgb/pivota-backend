@@ -395,6 +395,25 @@ class SourceDataTriagePayload(BaseModel):
     total_rows: int = 0
 
 
+class ProductQueueAppliedFilters(BaseModel):
+    search: Optional[str] = None
+    issue_bucket: Optional[str] = None
+    push_status: str = "all"
+    blocked_only: bool = False
+    low_quality_only: bool = False
+    sort_by: str = "default"
+
+
+class ProductQueuePage(BaseModel):
+    page: int = 1
+    page_size: int = 50
+    total_items: int = 0
+    total_pages: int = 0
+    has_next: bool = False
+    has_prev: bool = False
+    applied_filters: ProductQueueAppliedFilters = Field(default_factory=ProductQueueAppliedFilters)
+
+
 class MerchantReadinessOptimizationPayload(BaseModel):
     plan: OptimizationPlan
     score_bundle: ScoreBundle = Field(default_factory=ScoreBundle)
@@ -402,6 +421,7 @@ class MerchantReadinessOptimizationPayload(BaseModel):
     issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
+    product_queue_page: Optional[ProductQueuePage] = None
     content_opportunity_count: int = 0
     source_data_lanes: List[SourceDataLaneSummary] = Field(default_factory=list)
     quality_coverage: QualityCoverageSummary = Field(default_factory=QualityCoverageSummary)

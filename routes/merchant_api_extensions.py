@@ -1,5 +1,5 @@
 """Extended Merchant API Routes for Dashboard Features"""
-from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Response
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Query, Response
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
@@ -59,6 +59,15 @@ class RefundRequest(BaseModel):
 class ReadinessRefreshRequest(BaseModel):
     scope: str = "merchant"
     reason: str = "manual"
+    queue_mode: str = "full"
+    page: int = 1
+    page_size: int = 50
+    search: Optional[str] = None
+    issue_bucket: Optional[str] = None
+    push_status: str = "all"
+    blocked_only: bool = False
+    low_quality_only: bool = False
+    sort_by: str = "default"
 
 
 class ReadinessActionPreviewRequest(BaseModel):
@@ -820,7 +829,18 @@ async def get_dashboard_readiness(current_user: dict = Depends(get_current_user)
 
 
 @router.get("/merchant/readiness/optimization")
-async def get_readiness_optimization(current_user: dict = Depends(get_current_user)):
+async def get_readiness_optimization(
+    queue_mode: str = Query("full"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    issue_bucket: Optional[str] = Query(None),
+    push_status: str = Query("all"),
+    blocked_only: bool = Query(False),
+    low_quality_only: bool = Query(False),
+    sort_by: str = Query("default"),
+    current_user: dict = Depends(get_current_user),
+):
     """Get merchant-safe readiness optimization payload for the product optimization workspace."""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -828,10 +848,36 @@ async def get_readiness_optimization(current_user: dict = Depends(get_current_us
     merchant_id = await get_merchant_id_from_user(current_user)
 
     try:
-        payload = await build_readiness_optimization(merchant_id)
+        started_at = time.perf_counter()
+        payload = await build_readiness_optimization(
+            merchant_id,
+            queue_mode=queue_mode,
+            page=page,
+            page_size=page_size,
+            search=search,
+            issue_bucket=issue_bucket,
+            push_status=push_status,
+            blocked_only=blocked_only,
+            low_quality_only=low_quality_only,
+            sort_by=sort_by,
+        )
+        serialization_started = time.perf_counter()
+        payload_data = payload.model_dump()
+        serialization_ms = round((time.perf_counter() - serialization_started) * 1000.0, 2)
+        logger.info(
+            "merchant_readiness_optimization_route merchant=%s queue_mode=%s page=%s page_size=%s build_and_page_ms=%.2f serialization_ms=%.2f returned_items=%s total_items=%s",
+            merchant_id,
+            queue_mode,
+            page,
+            page_size,
+            round((serialization_started - started_at) * 1000.0, 2),
+            serialization_ms,
+            len(payload_data.get("product_queue") or []),
+            ((payload_data.get("product_queue_page") or {}).get("total_items") if isinstance(payload_data, dict) else None),
+        )
         return {
             "status": "success",
-            "data": payload.model_dump(),
+            "data": payload_data,
         }
     except Exception as e:
         logger.error(f"❌ Readiness optimization error for merchant {merchant_id}: {e}")
@@ -850,13 +896,28 @@ async def refresh_readiness_optimization(
     merchant_id = await get_merchant_id_from_user(current_user)
 
     try:
-        payload = await build_readiness_optimization(merchant_id)
+        payload = await build_readiness_optimization(
+            merchant_id,
+            force_refresh=True,
+            queue_mode=body.queue_mode,
+            page=body.page,
+            page_size=body.page_size,
+            search=body.search,
+            issue_bucket=body.issue_bucket,
+            push_status=body.push_status,
+            blocked_only=body.blocked_only,
+            low_quality_only=body.low_quality_only,
+            sort_by=body.sort_by,
+        )
         return {
             "status": "success",
             "data": payload.model_dump(),
             "meta": {
                 "scope": body.scope,
                 "reason": body.reason,
+                "queue_mode": body.queue_mode,
+                "page": body.page,
+                "page_size": body.page_size,
                 "refresh_state": payload.plan.refresh_state,
                 "plan_id": payload.plan.plan_id,
                 "snapshot_id": payload.plan.snapshot_id,

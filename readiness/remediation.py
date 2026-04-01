@@ -184,10 +184,11 @@ async def _latest_plan_or_raise(
     channel: str,
     plan_id: str,
 ) -> MerchantReadinessOptimizationPayload:
-    payload, _snapshot = await get_readiness_optimization_context(
+    context = await get_readiness_optimization_context(
         merchant_id,
         channel=channel,
     )
+    payload = context[0]
     if payload.plan.plan_id != plan_id:
         raise PlanSupersededError(
             current_plan_id=payload.plan.plan_id,
@@ -202,10 +203,12 @@ async def _latest_context_or_raise(
     channel: str,
     plan_id: str,
 ) -> tuple[MerchantReadinessOptimizationPayload, Any]:
-    payload, snapshot = await get_readiness_optimization_context(
+    context = await get_readiness_optimization_context(
         merchant_id,
         channel=channel,
     )
+    payload = context[0]
+    snapshot = context[1] if len(context) > 1 else None
     if payload.plan.plan_id != plan_id:
         raise PlanSupersededError(
             current_plan_id=payload.plan.plan_id,
@@ -1442,11 +1445,12 @@ async def run_remediation_action(
                 }
             )
 
-    after_payload, _after_snapshot = await get_readiness_optimization_context(
+    after_context = await get_readiness_optimization_context(
         merchant_id,
         channel=channel,
         force_refresh=True,
     )
+    after_payload = after_context[0]
     verification = VerificationResult(
         verification_id=f"rdverify_{job.job_id[-12:]}",
         action_id=action.action_id,
