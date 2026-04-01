@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -84,12 +85,18 @@ _OPTIMIZATION_CACHE: dict[
         dict[str, Any],
     ],
 ] = {}
+_OPTIMIZATION_REFRESH_TASKS: dict[str, asyncio.Task[None]] = {}
 _OPTIMIZATION_CACHE_METRICS: dict[str, int] = {
     "hits": 0,
     "misses": 0,
     "stores": 0,
     "expired": 0,
+    "stale_served": 0,
     "refreshes": 0,
+    "background_refreshes": 0,
+    "background_refresh_successes": 0,
+    "background_refresh_failures": 0,
+    "warmup_scheduled": 0,
     "invalidations": 0,
     "invalidated_entries": 0,
 }
@@ -1216,6 +1223,20 @@ def invalidate_readiness_optimization_cache(
     *,
     channel: Optional[str] = None,
 ) -> int:
+    task_keys_to_cancel: list[str] = []
+    for key in list(_OPTIMIZATION_REFRESH_TASKS.keys()):
+        cached_merchant_id, cached_channel = key.split("|", 1)
+        if merchant_id is not None and cached_merchant_id != merchant_id:
+            continue
+        if channel is not None and cached_channel != channel:
+            continue
+        task_keys_to_cancel.append(key)
+
+    for key in task_keys_to_cancel:
+        task = _OPTIMIZATION_REFRESH_TASKS.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
     if merchant_id is None and channel is None:
         removed = len(_OPTIMIZATION_CACHE)
         _OPTIMIZATION_CACHE.clear()
@@ -1245,13 +1266,24 @@ def invalidate_readiness_optimization_cache(
 
 def reset_readiness_optimization_cache_observability() -> None:
     _OPTIMIZATION_CACHE.clear()
+    for key in list(_OPTIMIZATION_REFRESH_TASKS.keys()):
+        task = _OPTIMIZATION_REFRESH_TASKS.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
     for key in list(_OPTIMIZATION_CACHE_METRICS.keys()):
         _OPTIMIZATION_CACHE_METRICS[key] = 0
 
 
 def get_readiness_optimization_cache_metrics() -> dict[str, Any]:
-    total_requests = _OPTIMIZATION_CACHE_METRICS["hits"] + _OPTIMIZATION_CACHE_METRICS["misses"]
+    total_requests = (
+        _OPTIMIZATION_CACHE_METRICS["hits"]
+        + _OPTIMIZATION_CACHE_METRICS["misses"]
+        + _OPTIMIZATION_CACHE_METRICS["stale_served"]
+    )
     hit_rate = (_OPTIMIZATION_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
+    stale_hit_rate = (
+        _OPTIMIZATION_CACHE_METRICS["stale_served"] / total_requests * 100.0
+    ) if total_requests else 0.0
     now_mono = time.monotonic()
     entries = []
     for key, (cached_at, payload, _snapshot, _aux) in sorted(_OPTIMIZATION_CACHE.items()):
@@ -1273,12 +1305,19 @@ def get_readiness_optimization_cache_metrics() -> dict[str, Any]:
         "misses": _OPTIMIZATION_CACHE_METRICS["misses"],
         "stores": _OPTIMIZATION_CACHE_METRICS["stores"],
         "expired": _OPTIMIZATION_CACHE_METRICS["expired"],
+        "stale_served": _OPTIMIZATION_CACHE_METRICS["stale_served"],
         "refreshes": _OPTIMIZATION_CACHE_METRICS["refreshes"],
+        "background_refreshes": _OPTIMIZATION_CACHE_METRICS["background_refreshes"],
+        "background_refresh_successes": _OPTIMIZATION_CACHE_METRICS["background_refresh_successes"],
+        "background_refresh_failures": _OPTIMIZATION_CACHE_METRICS["background_refresh_failures"],
+        "warmup_scheduled": _OPTIMIZATION_CACHE_METRICS["warmup_scheduled"],
         "invalidations": _OPTIMIZATION_CACHE_METRICS["invalidations"],
         "invalidated_entries": _OPTIMIZATION_CACHE_METRICS["invalidated_entries"],
         "total_requests": total_requests,
         "hit_rate": round(hit_rate, 2),
+        "stale_hit_rate": round(stale_hit_rate, 2),
         "entries": len(_OPTIMIZATION_CACHE),
+        "refresh_tasks": sum(1 for task in _OPTIMIZATION_REFRESH_TASKS.values() if not task.done()),
         "ttl_seconds": _OPTIMIZATION_CACHE_TTL_SECONDS,
         "active_keys": entries,
     }
@@ -1308,7 +1347,6 @@ def _cached_optimization_context(
         return None
     cached_at, payload, snapshot, aux_context = entry
     if time.monotonic() - cached_at > _OPTIMIZATION_CACHE_TTL_SECONDS:
-        _OPTIMIZATION_CACHE.pop(cache_key, None)
         _OPTIMIZATION_CACHE_METRICS["misses"] += 1
         _OPTIMIZATION_CACHE_METRICS["expired"] += 1
         return None
@@ -1337,6 +1375,69 @@ def _store_optimization_payload(
     )
     _OPTIMIZATION_CACHE_METRICS["stores"] += 1
     return payload
+
+
+def _optimization_cache_entry(
+    merchant_id: str,
+    *,
+    channel: str,
+) -> Optional[
+    tuple[
+        float,
+        MerchantReadinessOptimizationPayload,
+        Optional[MerchantReadinessSnapshot],
+        dict[str, Any],
+    ]
+]:
+    return _OPTIMIZATION_CACHE.get(_optimization_cache_key(merchant_id, channel))
+
+
+async def _load_readiness_snapshot_or_summary(
+    merchant_id: str,
+    *,
+    channel: str,
+    force_snapshot_refresh: bool = False,
+) -> tuple[Optional[MerchantReadinessSnapshot], Optional[ReadinessSummary]]:
+    if not readiness_router_enabled():
+        return None, _fallback_summary(
+            assessment_state="disabled",
+            blocker="readiness_assessment_disabled",
+            channel=channel,
+        )
+
+    if merchant_id != "synthetic-demo-merchant":
+        alpha_merchant_id = readiness_alpha_merchant_id()
+        if not readiness_real_merchant_alpha_enabled() or merchant_id != alpha_merchant_id:
+            return None, _fallback_summary(
+                assessment_state="not_assessed",
+                blocker="merchant_not_assessed_for_readiness_alpha",
+                channel=channel,
+            )
+
+    try:
+        if force_snapshot_refresh:
+            return (
+                await build_readiness_snapshot(
+                    merchant_id,
+                    channel=channel,
+                    force_refresh=True,
+                ),
+                None,
+            )
+        return await build_readiness_snapshot(merchant_id, channel=channel), None
+    except UnsupportedMerchantError:
+        return None, _fallback_summary(
+            assessment_state="not_assessed",
+            blocker="merchant_not_assessed_for_readiness_alpha",
+            channel=channel,
+        )
+    except Exception:
+        return None, _fallback_summary(
+            assessment_state="assessed",
+            blocker="readiness_summary_unavailable",
+            channel=channel,
+            merchant_alpha_mode="assessment_error",
+        )
 
 
 def _normalize_queue_mode(value: Optional[str]) -> str:
@@ -2862,44 +2963,6 @@ def _fallback_optimization_payload(summary: ReadinessSummary) -> MerchantReadine
     )
 
 
-async def _load_readiness_snapshot_or_summary(
-    merchant_id: str,
-    *,
-    channel: str,
-) -> tuple[Optional[MerchantReadinessSnapshot], Optional[ReadinessSummary]]:
-    if not readiness_router_enabled():
-        return None, _fallback_summary(
-            assessment_state="disabled",
-            blocker="readiness_assessment_disabled",
-            channel=channel,
-        )
-
-    if merchant_id != "synthetic-demo-merchant":
-        alpha_merchant_id = readiness_alpha_merchant_id()
-        if not readiness_real_merchant_alpha_enabled() or merchant_id != alpha_merchant_id:
-            return None, _fallback_summary(
-                assessment_state="not_assessed",
-                blocker="merchant_not_assessed_for_readiness_alpha",
-                channel=channel,
-            )
-
-    try:
-        return await build_readiness_snapshot(merchant_id, channel=channel), None
-    except UnsupportedMerchantError:
-        return None, _fallback_summary(
-            assessment_state="not_assessed",
-            blocker="merchant_not_assessed_for_readiness_alpha",
-            channel=channel,
-        )
-    except Exception:
-        return None, _fallback_summary(
-            assessment_state="assessed",
-            blocker="readiness_summary_unavailable",
-            channel=channel,
-            merchant_alpha_mode="assessment_error",
-        )
-
-
 async def build_readiness_summary(
     merchant_id: str,
     *,
@@ -3053,21 +3116,17 @@ async def build_readiness_optimization(
     )
 
 
-async def get_readiness_optimization_context(
+async def _build_and_store_readiness_optimization_context(
     merchant_id: str,
     *,
-    force_refresh: bool = False,
-    channel: str = "ucp",
+    channel: str,
+    force_snapshot_refresh: bool = False,
 ) -> tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot], dict[str, Any]]:
-    if force_refresh:
-        invalidate_readiness_optimization_cache(merchant_id, channel=channel)
-        _OPTIMIZATION_CACHE_METRICS["refreshes"] += 1
-
-    cached_context = _cached_optimization_context(merchant_id, channel=channel)
-    if cached_context is not None:
-        return cached_context
-
-    snapshot, fallback = await _load_readiness_snapshot_or_summary(merchant_id, channel=channel)
+    snapshot, fallback = await _load_readiness_snapshot_or_summary(
+        merchant_id,
+        channel=channel,
+        force_snapshot_refresh=force_snapshot_refresh,
+    )
     if fallback is not None or snapshot is None:
         return (
             _fallback_optimization_payload(
@@ -3222,3 +3281,126 @@ async def get_readiness_optimization_context(
         payload.content_opportunity_count,
     )
     return payload, snapshot, catalog_projection_context
+
+
+async def _refresh_optimization_cache_entry(
+    merchant_id: str,
+    *,
+    channel: str,
+    cache_key: str,
+    reason: str,
+) -> None:
+    try:
+        await _build_and_store_readiness_optimization_context(
+            merchant_id,
+            channel=channel,
+            force_snapshot_refresh=True,
+        )
+        _OPTIMIZATION_CACHE_METRICS["background_refresh_successes"] += 1
+        logger.info(
+            "readiness_optimization_background_refresh merchant=%s channel=%s reason=%s status=success",
+            merchant_id,
+            channel,
+            reason,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _OPTIMIZATION_CACHE_METRICS["background_refresh_failures"] += 1
+        logger.warning(
+            "readiness_optimization_background_refresh merchant=%s channel=%s reason=%s status=failed error=%s",
+            merchant_id,
+            channel,
+            reason,
+            str(exc)[:200],
+        )
+    finally:
+        task = _OPTIMIZATION_REFRESH_TASKS.get(cache_key)
+        if task is asyncio.current_task():
+            _OPTIMIZATION_REFRESH_TASKS.pop(cache_key, None)
+
+
+def _schedule_optimization_refresh(
+    merchant_id: str,
+    *,
+    channel: str,
+    reason: str,
+) -> bool:
+    cache_key = _optimization_cache_key(merchant_id, channel)
+    existing_task = _OPTIMIZATION_REFRESH_TASKS.get(cache_key)
+    if existing_task is not None and not existing_task.done():
+        return False
+
+    task = asyncio.create_task(
+        _refresh_optimization_cache_entry(
+            merchant_id,
+            channel=channel,
+            cache_key=cache_key,
+            reason=reason,
+        )
+    )
+    _OPTIMIZATION_REFRESH_TASKS[cache_key] = task
+    _OPTIMIZATION_CACHE_METRICS["background_refreshes"] += 1
+    return True
+
+
+def schedule_readiness_optimization_warmup(
+    merchant_id: str,
+    *,
+    channel: str = "ucp",
+) -> bool:
+    cache_entry = _optimization_cache_entry(merchant_id, channel=channel)
+    if cache_entry is not None:
+        cached_at, _payload, _snapshot, _aux_context = cache_entry
+        if time.monotonic() - cached_at <= _OPTIMIZATION_CACHE_TTL_SECONDS:
+            return False
+    scheduled = _schedule_optimization_refresh(
+        merchant_id,
+        channel=channel,
+        reason="warmup",
+    )
+    if scheduled:
+        _OPTIMIZATION_CACHE_METRICS["warmup_scheduled"] += 1
+    return scheduled
+
+
+async def get_readiness_optimization_context(
+    merchant_id: str,
+    *,
+    force_refresh: bool = False,
+    channel: str = "ucp",
+) -> tuple[MerchantReadinessOptimizationPayload, Optional[MerchantReadinessSnapshot], dict[str, Any]]:
+    if force_refresh:
+        invalidate_readiness_optimization_cache(merchant_id, channel=channel)
+        _OPTIMIZATION_CACHE_METRICS["refreshes"] += 1
+
+    cache_entry = _optimization_cache_entry(merchant_id, channel=channel)
+    if cache_entry is not None:
+        cached_at, payload, snapshot, aux_context = cache_entry
+        age_seconds = time.monotonic() - cached_at
+        if age_seconds <= _OPTIMIZATION_CACHE_TTL_SECONDS:
+            _OPTIMIZATION_CACHE_METRICS["hits"] += 1
+            return (
+                payload.model_copy(deep=True),
+                snapshot.model_copy(deep=True) if snapshot is not None else None,
+                dict(aux_context or {}),
+            )
+        _OPTIMIZATION_CACHE_METRICS["expired"] += 1
+        _OPTIMIZATION_CACHE_METRICS["stale_served"] += 1
+        _schedule_optimization_refresh(
+            merchant_id,
+            channel=channel,
+            reason="ttl_expired",
+        )
+        return (
+            payload.model_copy(deep=True),
+            snapshot.model_copy(deep=True) if snapshot is not None else None,
+            dict(aux_context or {}),
+        )
+
+    _OPTIMIZATION_CACHE_METRICS["misses"] += 1
+    return await _build_and_store_readiness_optimization_context(
+        merchant_id,
+        channel=channel,
+        force_snapshot_refresh=force_refresh,
+    )

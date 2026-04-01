@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -41,12 +42,17 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_CACHE_TTL_SECONDS = 300.0
 _SNAPSHOT_CACHE: dict[str, tuple[float, MerchantReadinessSnapshot]] = {}
+_SNAPSHOT_REFRESH_TASKS: dict[str, asyncio.Task[None]] = {}
 _SNAPSHOT_CACHE_METRICS: dict[str, int] = {
     "hits": 0,
     "misses": 0,
     "stores": 0,
     "expired": 0,
+    "stale_served": 0,
     "refreshes": 0,
+    "background_refreshes": 0,
+    "background_refresh_successes": 0,
+    "background_refresh_failures": 0,
     "invalidations": 0,
     "invalidated_entries": 0,
 }
@@ -65,6 +71,20 @@ def invalidate_readiness_snapshot_cache(
     *,
     channel: Optional[str] = None,
 ) -> int:
+    task_keys_to_cancel: List[str] = []
+    for key in list(_SNAPSHOT_REFRESH_TASKS.keys()):
+        cached_merchant_id, cached_channel = key.split("|", 1)
+        if merchant_id is not None and cached_merchant_id != merchant_id:
+            continue
+        if channel is not None and cached_channel != channel:
+            continue
+        task_keys_to_cancel.append(key)
+
+    for key in task_keys_to_cancel:
+        task = _SNAPSHOT_REFRESH_TASKS.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
     if merchant_id is None and channel is None:
         removed = len(_SNAPSHOT_CACHE)
         _SNAPSHOT_CACHE.clear()
@@ -92,8 +112,15 @@ def invalidate_readiness_snapshot_cache(
 
 
 def get_readiness_snapshot_cache_metrics() -> Dict[str, Any]:
-    total_requests = _SNAPSHOT_CACHE_METRICS["hits"] + _SNAPSHOT_CACHE_METRICS["misses"]
+    total_requests = (
+        _SNAPSHOT_CACHE_METRICS["hits"]
+        + _SNAPSHOT_CACHE_METRICS["misses"]
+        + _SNAPSHOT_CACHE_METRICS["stale_served"]
+    )
     hit_rate = (_SNAPSHOT_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
+    stale_hit_rate = (
+        _SNAPSHOT_CACHE_METRICS["stale_served"] / total_requests * 100.0
+    ) if total_requests else 0.0
     now_mono = time.monotonic()
     active_keys: List[Dict[str, Any]] = []
     for key, (cached_at, snapshot) in sorted(_SNAPSHOT_CACHE.items()):
@@ -113,12 +140,18 @@ def get_readiness_snapshot_cache_metrics() -> Dict[str, Any]:
         "misses": _SNAPSHOT_CACHE_METRICS["misses"],
         "stores": _SNAPSHOT_CACHE_METRICS["stores"],
         "expired": _SNAPSHOT_CACHE_METRICS["expired"],
+        "stale_served": _SNAPSHOT_CACHE_METRICS["stale_served"],
         "refreshes": _SNAPSHOT_CACHE_METRICS["refreshes"],
+        "background_refreshes": _SNAPSHOT_CACHE_METRICS["background_refreshes"],
+        "background_refresh_successes": _SNAPSHOT_CACHE_METRICS["background_refresh_successes"],
+        "background_refresh_failures": _SNAPSHOT_CACHE_METRICS["background_refresh_failures"],
         "invalidations": _SNAPSHOT_CACHE_METRICS["invalidations"],
         "invalidated_entries": _SNAPSHOT_CACHE_METRICS["invalidated_entries"],
         "total_requests": total_requests,
         "hit_rate": round(hit_rate, 2),
+        "stale_hit_rate": round(stale_hit_rate, 2),
         "entries": len(_SNAPSHOT_CACHE),
+        "refresh_tasks": sum(1 for task in _SNAPSHOT_REFRESH_TASKS.values() if not task.done()),
         "ttl_seconds": _SNAPSHOT_CACHE_TTL_SECONDS,
         "active_keys": active_keys,
     }
@@ -126,8 +159,113 @@ def get_readiness_snapshot_cache_metrics() -> Dict[str, Any]:
 
 def reset_readiness_snapshot_cache_observability() -> None:
     _SNAPSHOT_CACHE.clear()
+    for key in list(_SNAPSHOT_REFRESH_TASKS.keys()):
+        task = _SNAPSHOT_REFRESH_TASKS.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
     for key in list(_SNAPSHOT_CACHE_METRICS.keys()):
         _SNAPSHOT_CACHE_METRICS[key] = 0
+
+
+def _store_snapshot_cache_entry(cache_key: str, snapshot: MerchantReadinessSnapshot) -> None:
+    _SNAPSHOT_CACHE[cache_key] = (
+        time.monotonic(),
+        snapshot.model_copy(deep=True),
+    )
+    _SNAPSHOT_CACHE_METRICS["stores"] += 1
+
+
+async def _compute_readiness_snapshot(
+    merchant_id: str,
+    *,
+    channel: str,
+    cache_hit: bool,
+) -> MerchantReadinessSnapshot:
+    overall_started = time.perf_counter()
+    dataset_started = time.perf_counter()
+    try:
+        dataset = await load_merchant_source_dataset(merchant_id)
+    except KeyError as exc:
+        raise UnsupportedMerchantError(merchant_id) from exc
+    dataset_elapsed_ms = round((time.perf_counter() - dataset_started) * 1000.0, 2)
+
+    snapshot_started = time.perf_counter()
+    snapshot = build_merchant_snapshot(dataset, channel=channel)
+    snapshot_elapsed_ms = round((time.perf_counter() - snapshot_started) * 1000.0, 2)
+
+    logger.info(
+        "readiness_snapshot_profile merchant=%s channel=%s cache_hit=%s source_dataset_load_ms=%.2f snapshot_build_ms=%.2f total_ms=%.2f product_count=%s",
+        merchant_id,
+        channel,
+        cache_hit,
+        dataset_elapsed_ms,
+        snapshot_elapsed_ms,
+        round((time.perf_counter() - overall_started) * 1000.0, 2),
+        len(snapshot.products),
+    )
+    return snapshot
+
+
+async def _refresh_snapshot_cache_entry(
+    merchant_id: str,
+    *,
+    channel: str,
+    cache_key: str,
+    reason: str,
+) -> None:
+    try:
+        snapshot = await _compute_readiness_snapshot(
+            merchant_id,
+            channel=channel,
+            cache_hit=False,
+        )
+        _store_snapshot_cache_entry(cache_key, snapshot)
+        _SNAPSHOT_CACHE_METRICS["background_refresh_successes"] += 1
+        logger.info(
+            "readiness_snapshot_background_refresh merchant=%s channel=%s reason=%s status=success",
+            merchant_id,
+            channel,
+            reason,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _SNAPSHOT_CACHE_METRICS["background_refresh_failures"] += 1
+        logger.warning(
+            "readiness_snapshot_background_refresh merchant=%s channel=%s reason=%s status=failed error=%s",
+            merchant_id,
+            channel,
+            reason,
+            str(exc)[:200],
+        )
+    finally:
+        task = _SNAPSHOT_REFRESH_TASKS.get(cache_key)
+        if task is asyncio.current_task():
+            _SNAPSHOT_REFRESH_TASKS.pop(cache_key, None)
+
+
+def _schedule_snapshot_refresh(
+    merchant_id: str,
+    *,
+    channel: str,
+    cache_key: str,
+    reason: str,
+) -> bool:
+    existing_task = _SNAPSHOT_REFRESH_TASKS.get(cache_key)
+    if existing_task is not None and not existing_task.done():
+        return False
+
+    task = asyncio.create_task(
+        _refresh_snapshot_cache_entry(
+            merchant_id,
+            channel=channel,
+            cache_key=cache_key,
+            reason=reason,
+        )
+    )
+    _SNAPSHOT_REFRESH_TASKS[cache_key] = task
+    _SNAPSHOT_CACHE_METRICS["background_refreshes"] += 1
+    return True
 
 
 def _utc_now_iso() -> str:
@@ -698,40 +836,27 @@ async def build_readiness_snapshot(
     cached_entry = _SNAPSHOT_CACHE.get(cache_key)
     if cached_entry is not None:
         cached_at, cached_snapshot = cached_entry
-        if time.monotonic() - cached_at <= _SNAPSHOT_CACHE_TTL_SECONDS:
+        age_seconds = time.monotonic() - cached_at
+        if age_seconds <= _SNAPSHOT_CACHE_TTL_SECONDS:
             _SNAPSHOT_CACHE_METRICS["hits"] += 1
             return cached_snapshot.model_copy(deep=True)
-        _SNAPSHOT_CACHE.pop(cache_key, None)
         _SNAPSHOT_CACHE_METRICS["expired"] += 1
+        _SNAPSHOT_CACHE_METRICS["stale_served"] += 1
+        _schedule_snapshot_refresh(
+            merchant_id,
+            channel=channel,
+            cache_key=cache_key,
+            reason="ttl_expired",
+        )
+        return cached_snapshot.model_copy(deep=True)
 
     _SNAPSHOT_CACHE_METRICS["misses"] += 1
-    overall_started = time.perf_counter()
-    dataset_started = time.perf_counter()
-    try:
-        dataset = await load_merchant_source_dataset(merchant_id)
-    except KeyError as exc:
-        raise UnsupportedMerchantError(merchant_id) from exc
-    dataset_elapsed_ms = round((time.perf_counter() - dataset_started) * 1000.0, 2)
-
-    snapshot_started = time.perf_counter()
-    snapshot = build_merchant_snapshot(dataset, channel=channel)
-    snapshot_elapsed_ms = round((time.perf_counter() - snapshot_started) * 1000.0, 2)
-
-    _SNAPSHOT_CACHE[cache_key] = (
-        time.monotonic(),
-        snapshot.model_copy(deep=True),
-    )
-    _SNAPSHOT_CACHE_METRICS["stores"] += 1
-    logger.info(
-        "readiness_snapshot_profile merchant=%s channel=%s cache_hit=%s source_dataset_load_ms=%.2f snapshot_build_ms=%.2f total_ms=%.2f product_count=%s",
+    snapshot = await _compute_readiness_snapshot(
         merchant_id,
-        channel,
-        False,
-        dataset_elapsed_ms,
-        snapshot_elapsed_ms,
-        round((time.perf_counter() - overall_started) * 1000.0, 2),
-        len(snapshot.products),
+        channel=channel,
+        cache_hit=False,
     )
+    _store_snapshot_cache_entry(cache_key, snapshot)
     return snapshot.model_copy(deep=True)
 
 

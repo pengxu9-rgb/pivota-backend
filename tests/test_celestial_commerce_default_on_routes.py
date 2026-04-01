@@ -297,10 +297,17 @@ def test_merchant_analytics_routes_expose_readiness_issues_and_trace(monkeypatch
         assert merchant_id == "merch_1"
         return {"merchant_id": "merch_1", "execute_status": "ready"}
 
+    warmups = []
+
+    def fake_warmup(merchant_id: str, *, channel: str = "ucp"):
+        warmups.append((merchant_id, channel))
+        return True
+
     app.dependency_overrides[module._get_principal] = fake_principal
     monkeypatch.setattr(module, "build_merchant_commerce_funnel_issues", fake_issues)
     monkeypatch.setattr(module, "trace_interaction", fake_trace)
     monkeypatch.setattr(module, "upsert_merchant_commerce_readiness_state", fake_readiness)
+    monkeypatch.setattr(module, "schedule_readiness_optimization_warmup", fake_warmup)
 
     client = TestClient(app)
 
@@ -314,6 +321,7 @@ def test_merchant_analytics_routes_expose_readiness_issues_and_trace(monkeypatch
     assert trace_response.json()["interaction"]["interaction_id"] == "int_1"
     assert readiness_response.status_code == 200
     assert readiness_response.json()["execute_status"] == "ready"
+    assert warmups == [("merch_1", "ucp")]
 
 
 def test_agent_commerce_checkout_route_returns_public_checkout_contract(monkeypatch: pytest.MonkeyPatch) -> None:

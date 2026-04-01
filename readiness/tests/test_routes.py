@@ -979,6 +979,52 @@ def test_merchant_readiness_source_data_decision_routes_persist_and_delete(monke
     assert delete_response.json()["data"]["deleted"] is True
 
 
+def test_merchant_dashboard_readiness_schedules_optimization_warmup(monkeypatch):
+    from routes import merchant_api_extensions as merchant_api_extensions
+    from readiness.models import ReadinessSummary
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return DEFAULT_ALPHA_MERCHANT_ID
+
+    async def fake_build_readiness_summary(merchant_id: str, *, channel: str = "ucp"):
+        assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
+        assert channel == "ucp"
+        return ReadinessSummary(
+            tier="yellow",
+            label="Needs Attention",
+            assessment_state="assessed",
+            assessment_scope="one_merchant_alpha",
+            channel="ucp",
+            score=77,
+            ready_variant_count=3,
+            blocked_variant_count=1,
+        )
+
+    warmups: list[tuple[str, str]] = []
+
+    def fake_warmup(merchant_id: str, *, channel: str = "ucp"):
+        warmups.append((merchant_id, channel))
+        return True
+
+    monkeypatch.setattr(merchant_api_extensions, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(merchant_api_extensions, "build_readiness_summary", fake_build_readiness_summary)
+    monkeypatch.setattr(merchant_api_extensions, "schedule_readiness_optimization_warmup", fake_warmup)
+
+    app = FastAPI()
+    app.include_router(merchant_api_extensions.router)
+
+    async def fake_current_user():
+        return {"role": "merchant", "user_id": "merchant_user"}
+
+    app.dependency_overrides[merchant_api_extensions.get_current_user] = fake_current_user
+    route_client = TestClient(app)
+
+    response = route_client.get("/merchant/dashboard/readiness")
+    assert response.status_code == 200
+    assert response.json()["data"]["score"] == 77
+    assert warmups == [(DEFAULT_ALPHA_MERCHANT_ID, "ucp")]
+
+
 def test_checkout_blocked_when_capability_missing(monkeypatch):
     client = _build_test_client(monkeypatch, psp_enabled=False)
 

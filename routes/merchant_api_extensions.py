@@ -44,7 +44,11 @@ from readiness.remediation import (
     run_remediation_action,
     upsert_source_data_decision_state,
 )
-from readiness.summary import build_readiness_optimization, build_readiness_summary
+from readiness.summary import (
+    build_readiness_optimization,
+    build_readiness_summary,
+    schedule_readiness_optimization_warmup,
+)
 
 router = APIRouter()
 
@@ -819,6 +823,7 @@ async def get_dashboard_readiness(current_user: dict = Depends(get_current_user)
 
     try:
         summary = await build_readiness_summary(merchant_id)
+        schedule_readiness_optimization_warmup(merchant_id)
         return {
             "status": "success",
             "data": summary.model_dump(),

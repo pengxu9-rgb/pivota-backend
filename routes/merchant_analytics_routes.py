@@ -18,6 +18,7 @@ import httpx
 
 from db.database import database
 from db.orders import orders
+from readiness.summary import schedule_readiness_optimization_warmup
 from services.commerce_interaction_service import trace_interaction
 from services.merchant_commerce_diagnostics_service import build_merchant_commerce_funnel_issues
 from services.merchant_commerce_funnel_service import (
@@ -153,7 +154,9 @@ async def get_commerce_readiness_state(
     merchant_id = principal.get("merchant_id")
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Missing merchant_id")
-    return await upsert_merchant_commerce_readiness_state(str(merchant_id))
+    payload = await upsert_merchant_commerce_readiness_state(str(merchant_id))
+    schedule_readiness_optimization_warmup(str(merchant_id))
+    return payload
 
 
 @router.get("/analytics/debug/query")
