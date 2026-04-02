@@ -51,6 +51,19 @@ def _json_sortable(value: Any) -> str:
     return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
 
 
+def _normalize_provider_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return dict(parsed)
+        except Exception:
+            return value
+    return value
+
+
 async def _run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
@@ -94,10 +107,11 @@ async def _run(args: argparse.Namespace) -> int:
         for row in rows:
             scanned += 1
             payload = dict(row)
+            provider_config = _normalize_provider_config(payload.get("provider_config"))
 
             provider = str(payload.get("provider") or "").strip().lower()
             raw_environment = str(payload.get("environment") or "").strip().lower() or "unknown"
-            repaired_provider_config = payload.get("provider_config")
+            repaired_provider_config = provider_config
             normalized_preview = build_provider_connect_record(
                 provider,
                 api_key=payload.get("api_key") or "",
@@ -110,7 +124,7 @@ async def _run(args: argparse.Namespace) -> int:
 
             if provider == "stripe" and raw_environment != normalized_preview["environment"]:
                 repaired_provider_config = build_stripe_connect_provider_config(
-                    existing_provider_config=payload.get("provider_config"),
+                    existing_provider_config=provider_config,
                     previous_api_key=payload.get("api_key"),
                     previous_account_id=payload.get("account_id"),
                     previous_environment=payload.get("environment"),
@@ -165,7 +179,7 @@ async def _run(args: argparse.Namespace) -> int:
 
             row_changed = (
                 str(payload.get("environment") or "") != str(normalized["environment"])
-                or _json_sortable(payload.get("provider_config")) != _json_sortable(normalized["provider_config"])
+                or _json_sortable(provider_config) != _json_sortable(normalized["provider_config"])
                 or bool(drift_reasons)
                 or str(payload.get("validation_status") or "unknown") != str(repaired_validation_status)
                 or str(payload.get("validation_error") or "") != str(repaired_validation_error or "")

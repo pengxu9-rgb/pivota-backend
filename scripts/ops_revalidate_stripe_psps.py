@@ -200,10 +200,7 @@ async def _fetch_candidate_rows(args: argparse.Namespace) -> List[Dict[str, Any]
         "status = 'active'",
         "LOWER(provider) = :provider",
     ]
-    params: Dict[str, Any] = {
-        "provider": provider,
-        "limit": args.limit,
-    }
+    params: Dict[str, Any] = {"provider": provider}
 
     if merchant_ids:
         merchant_clause, merchant_params = _build_in_clause("merchant_id", merchant_ids)
@@ -217,6 +214,8 @@ async def _fetch_candidate_rows(args: argparse.Namespace) -> List[Dict[str, Any]
 
     where_clause = f"WHERE {' AND '.join(conditions)}"
     limit_clause = "" if psp_ids else "LIMIT :limit"
+    if not psp_ids:
+        params["limit"] = args.limit
 
     rows = await database.fetch_all(
         f"""
