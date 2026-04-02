@@ -37,7 +37,11 @@ from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_payment_initiation_service import build_payment_action
-from services.merchant_psp_config_service import build_runtime_adapter_kwargs
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    fetch_active_runtime_merchant_psp,
+    infer_runtime_provider,
+)
 from services.promotions_service import list_promotions, PromotionStatus
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
@@ -156,31 +160,10 @@ def _finalize_order_psp_used(psp_used: Optional[str], fallback_provider: Optiona
 async def _resolve_active_order_psp(
     merchant_id: str, provider_hint: Optional[str]
 ) -> Tuple[str, str]:
-    psp_row = None
-    if provider_hint:
-        psp_row = await database.fetch_one(
-            """
-            SELECT provider, psp_id FROM merchant_psps
-            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
-            ORDER BY connected_at DESC
-            LIMIT 1
-            """,
-            {
-                "merchant_id": merchant_id,
-                "provider": provider_hint,
-            },
-        )
-
-    if not psp_row:
-        psp_row = await database.fetch_one(
-            """
-            SELECT provider, psp_id FROM merchant_psps
-            WHERE merchant_id = :merchant_id AND status = 'active'
-            ORDER BY connected_at DESC
-            LIMIT 1
-            """,
-            {"merchant_id": merchant_id},
-        )
+    psp_row = await fetch_active_runtime_merchant_psp(
+        merchant_id=merchant_id,
+        provider=provider_hint,
+    )
 
     if not psp_row:
         raise HTTPException(
@@ -201,31 +184,16 @@ async def _resolve_active_order_psp(
 async def _resolve_order_psp_adapter(order: Dict[str, Any]) -> Tuple[str, Any]:
     merchant_id = str(order.get("merchant_id") or "").strip()
     order_psp_id = str(order.get("psp_id") or "").strip()
-    provider_hint = str(order.get("psp_used") or "").strip().lower() or None
-
-    psp_row = None
-    if merchant_id and order_psp_id:
-        psp_row = await database.fetch_one(
-            """
-            SELECT provider, api_key, account_id, secret_key, environment, provider_config
-            FROM merchant_psps
-            WHERE merchant_id = :merchant_id AND psp_id = :psp_id
-            LIMIT 1
-            """,
-            {"merchant_id": merchant_id, "psp_id": order_psp_id},
-        )
-
-    if not psp_row and merchant_id and provider_hint:
-        psp_row = await database.fetch_one(
-            """
-            SELECT provider, api_key, account_id, secret_key, environment, provider_config
-            FROM merchant_psps
-            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
-            ORDER BY connected_at DESC
-            LIMIT 1
-            """,
-            {"merchant_id": merchant_id, "provider": provider_hint},
-        )
+    provider_hint = infer_runtime_provider(
+        psp_used=order.get("psp_used"),
+        psp_id=order_psp_id,
+        payment_reference=order.get("payment_intent_id"),
+    )
+    psp_row = await fetch_active_runtime_merchant_psp(
+        merchant_id=merchant_id,
+        provider=provider_hint,
+        psp_id=order_psp_id,
+    )
 
     if not psp_row:
         raise ValueError("Canonical merchant_psps configuration is missing for this order")
@@ -241,6 +209,7 @@ async def _resolve_order_psp_adapter(order: Dict[str, Any]) -> Tuple[str, Any]:
         api_key,
         **build_runtime_adapter_kwargs(
             provider,
+            api_key=api_key,
             account_id=row_dict.get("account_id"),
             provider_config=row_dict.get("provider_config"),
             environment=row_dict.get("environment"),
@@ -944,11 +913,6 @@ async def check_inventory_availability(
     返回: (是否有库存, 库存详情)
     """
     try:
-        merchant = await get_merchant_onboarding(merchant_id)
-        if not merchant or not True:
-            # 如果未连接 MCP，默认允许订单
-            return True, {"message": "MCP not connected, skipping inventory check"}
-        
         # 获取主店铺信息（Shopify/Wix/...），用于后续判断
         store_info = await get_primary_store(merchant_id)
         if not store_info:
@@ -956,7 +920,7 @@ async def check_inventory_availability(
 
         if store_info.get("platform") != "shopify":
             # 非 Shopify 平台，暂不检查库存
-            return True, {"message": f"Platform {merchant.get('mcp_platform')} inventory check not implemented"}
+            return True, {"message": f"Platform {store_info.get('platform')} inventory check not implemented"}
         
         shop_domain = store_info.get("domain")
         access_token, _ = await resolve_shopify_admin_access_token(
@@ -1114,29 +1078,6 @@ async def create_new_order(
         merchant = await get_merchant_onboarding(order_request.merchant_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        
-        if not merchant.get("psp_connected"):
-            # 从 merchant_psps 回退推断 PSP 连接
-            try:
-                psp_row = await database.fetch_one(
-                    """
-                    SELECT provider FROM merchant_psps
-                    WHERE merchant_id = :merchant_id
-                    ORDER BY connected_at DESC
-                    LIMIT 1
-                    """,
-                {"merchant_id": order_request.merchant_id}
-                )
-            except Exception:
-                psp_row = None
-            if psp_row:
-                merchant["psp_connected"] = True
-                merchant["psp_type"] = psp_row["provider"]
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Merchant has not connected PSP. Cannot process payments."
-                )
 
         # Quote-first enforcement (PCS v0.2-a): dual guard to prevent bypass.
         from services.quote_first_enforcement import should_require_quote_for_order_create
@@ -1842,23 +1783,6 @@ async def confirm_payment(
     
     # 获取商户信息
     merchant = await get_merchant_onboarding(order["merchant_id"])
-    # 如果标志未更新，尝试从 merchant_psps 推断
-    if not merchant.get("psp_connected") or not merchant.get("psp_type"):
-        try:
-            psp_row = await database.fetch_one(
-                """
-                SELECT provider FROM merchant_psps
-                WHERE merchant_id = :merchant_id
-                ORDER BY connected_at DESC
-                LIMIT 1
-                """,
-                {"merchant_id": order["merchant_id"]}
-            )
-            if psp_row:
-                merchant["psp_connected"] = True
-                merchant["psp_type"] = merchant.get("psp_type") or psp_row["provider"]
-        except Exception:
-            pass
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
@@ -2423,11 +2347,6 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             bool(str(order.get("customer_email") or "").strip()),
         )
 
-        merchant = await get_merchant_onboarding(order["merchant_id"])
-        if not merchant:
-            logger.error("[Shopify] Merchant %s not found", order["merchant_id"])
-            return False
-
         from services.shopify_graphql_client import shopify_admin_graphql
         from db.orders import update_order as update_order_row
 
@@ -2593,7 +2512,11 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
         # the email is generated. We embed a best-effort external transaction during order creation
         # to keep the email accurate. We still run a post-create reconciliation (transactions API)
         # afterwards for idempotency / late-binding payment refs.
-        psp_used_for_txn = str(order.get("psp_used") or merchant.get("psp_type") or "").strip().lower() or None
+        psp_used_for_txn = infer_runtime_provider(
+            psp_used=order.get("psp_used"),
+            psp_id=order.get("psp_id"),
+            payment_reference=order.get("payment_intent_id"),
+        )
         external_payment_ref = str(order.get("payment_intent_id") or "").strip() or None
         currency_code = str(order.get("currency") or "").strip().upper() or "USD"
         try:
@@ -2675,7 +2598,11 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
 
             # Best-effort reconciliation: record external PSP payment as a Shopify transaction.
             try:
-                psp_used = order.get("psp_used") or merchant.get("psp_type") or None
+                psp_used = infer_runtime_provider(
+                    psp_used=order.get("psp_used"),
+                    psp_id=order.get("psp_id"),
+                    payment_reference=order.get("payment_intent_id"),
+                )
                 payment_ref = order.get("payment_intent_id") or None
                 await ensure_external_payment_transaction_best_effort(
                     shop_domain=shop_domain,

@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from utils.auth import get_current_user
 from db.database import database
+from services.merchant_psp_config_service import persist_canonical_merchant_psp
 import uuid
 import json
 
@@ -229,114 +230,62 @@ async def setup_merchant_psp(
         
         # Check if PSP already exists
         existing = await database.fetch_one(
-            """SELECT psp_id FROM merchant_psps 
+            """SELECT psp_id, merchant_id, provider, name, api_key, account_id, secret_key,
+                      capabilities, status, connected_at, environment, provider_config,
+                      validation_status, validation_error, last_validated_at
+               FROM merchant_psps
                WHERE merchant_id = :merchant_id AND provider = :provider""",
             {"merchant_id": request.merchant_id, "provider": request.psp_type}
         )
         
-        if existing:
-            # Update existing PSP
-            update_query = """UPDATE merchant_psps 
-                   SET api_key = :api_key, status = :status, connected_at = :connected_at"""
-            params = {
-                "api_key": api_key if not setup_later else "pending_setup",
-                "status": "pending" if setup_later else "active",
-                "connected_at": datetime.now(),
-                "psp_id": existing["psp_id"]
-            }
-            
-            # Add secret_key for PayPal
-            if request.secret_key:
-                update_query += ", secret_key = :secret_key"
-                params["secret_key"] = request.secret_key
-                
-            update_query += " WHERE psp_id = :psp_id"
-            
-            await database.execute(update_query, params)
-            psp_id = existing["psp_id"]
+        # Determine capabilities based on PSP type
+        capabilities = {
+            "stripe": ["payments", "refunds", "subscriptions", "payouts"],
+            "adyen": ["payments", "refunds", "payouts", "risk_management"],
+            "paypal": ["payments", "refunds", "payouts"],
+            "square": ["payments", "refunds", "inventory"],
+        }.get(request.psp_type, ["payments"])
+
+        # Normalise / validate account_id by PSP type.
+        # Important: do NOT auto-generate acct_* for Adyen, since Adyen requires
+        # the real merchantAccount string.
+        raw_account_id = (request.account_id or "").strip()
+        if request.psp_type == "adyen":
+            if not raw_account_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Adyen requires merchantAccount (account_id)",
+                )
+            account_id = raw_account_id
+        elif request.psp_type == "checkout":
+            if not raw_account_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Checkout.com requires processing_channel_id (account_id)",
+                )
+            account_id = raw_account_id
         else:
-            # Create new PSP connection
-            psp_id = f"psp_{request.psp_type}_{uuid.uuid4().hex[:8]}"
+            # Stripe/others: keep provided account_id if present; otherwise NULL.
+            account_id = raw_account_id or None
 
-            # Determine capabilities based on PSP type
-            capabilities = {
-                "stripe": ["payments", "refunds", "subscriptions", "payouts"],
-                "adyen": ["payments", "refunds", "payouts", "risk_management"],
-                "paypal": ["payments", "refunds", "payouts"],
-                "square": ["payments", "refunds", "inventory"],
-            }.get(request.psp_type, ["payments"])
-
-            # Normalise / validate account_id by PSP type.
-            # Important: do NOT auto-generate acct_* for Adyen, since Adyen requires
-            # the real merchantAccount string.
-            raw_account_id = (request.account_id or "").strip()
-            if request.psp_type == "adyen":
-                if not raw_account_id:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Adyen requires merchantAccount (account_id)",
-                    )
-                account_id = raw_account_id
-            elif request.psp_type == "checkout":
-                if not raw_account_id:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Checkout.com requires processing_channel_id (account_id)",
-                    )
-                account_id = raw_account_id
-            else:
-                # Stripe/others: keep provided account_id if present; otherwise NULL.
-                account_id = raw_account_id or None
-
-            # Build insert query and params
-            insert_cols = [
-                "psp_id",
-                "merchant_id",
-                "provider",
-                "name",
-                "api_key",
-                "account_id",
-                "capabilities",
-                "status",
-                "connected_at",
-            ]
-            insert_values = [
-                ":psp_id",
-                ":merchant_id",
-                ":provider",
-                ":name",
-                ":api_key",
-                ":account_id",
-                ":capabilities",
-                ":status",
-                ":connected_at",
-            ]
-            params = {
-                "psp_id": psp_id,
-                "merchant_id": request.merchant_id,
-                "provider": request.psp_type,
-                "name": f"{request.psp_type.capitalize()} Account",
-                # When onboarding chooses "Other" and wants to configure later, we
-                # store a placeholder and mark as pending so it doesn't show as connected.
-                "api_key": api_key if not setup_later else "pending_setup",
-                "account_id": account_id,
-                "capabilities": ",".join(capabilities),
-                "status": "pending" if setup_later else "active",
-                "connected_at": datetime.now(),
-            }
-            
-            # Add secret_key for PayPal
-            if request.secret_key:
-                insert_cols.append("secret_key")
-                insert_values.append(":secret_key")
-                params["secret_key"] = request.secret_key
-            
-            await database.execute(
-                f"""INSERT INTO merchant_psps 
-                   ({', '.join(insert_cols)})
-                   VALUES ({', '.join(insert_values)})""",
-                params
-            )
+        api_key_value = api_key if not setup_later else "pending_setup"
+        persisted = await persist_canonical_merchant_psp(
+            merchant_id=request.merchant_id,
+            provider=request.psp_type,
+            api_key=api_key_value,
+            account_id=account_id,
+            secret_key=request.secret_key,
+            environment="test" if request.test_mode else "live",
+            provider_config=None,
+            name=f"{request.psp_type.capitalize()} Account",
+            capabilities=capabilities,
+            status="pending" if setup_later else "active",
+            connected_at=datetime.now(),
+            psp_id=(dict(existing)["psp_id"] if existing else f"psp_{request.psp_type}_{uuid.uuid4().hex[:8]}"),
+            existing_row=dict(existing) if existing else None,
+            stripe_mode="payment_intent",
+        )
+        psp_id = persisted["psp_id"]
         
         return {
             "status": "success",

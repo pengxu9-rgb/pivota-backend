@@ -436,22 +436,11 @@ async def sync_psp_data(
     Manually trigger PSP data synchronization
     """
     try:
-        # In a real implementation, this would trigger a background job
-        # to fetch latest data from the PSP's API
-        
-        # For now, we'll just update the last_synced timestamp
-        await database.execute(
-            """
-            UPDATE merchant_psps 
-            SET connected_at = NOW()
-            WHERE provider = :psp_id AND status = 'active'
-            """,
-            {"psp_id": psp_id}
-        )
-        
         return {
             "status": "success",
-            "message": f"Sync triggered for {psp_id}",
+            "message": f"Sync requested for {psp_id}",
+            "mode": "read_only",
+            "detail": "PSP overview sync no longer mutates merchant_psps. Use canonical validation/provision flows for runtime changes.",
             "synced_at": datetime.utcnow().isoformat()
         }
         

@@ -9,11 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from adapters.psp_adapter import PSPAdapter, get_psp_adapter, PaymentIntent
-from db.merchant_onboarding import get_merchant_onboarding
 from db.database import database
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     evaluate_psp_readiness,
+    fetch_active_merchant_psps,
 )
 from utils.logger import logger
 import hashlib
@@ -56,24 +56,15 @@ class MultiPSPOrchestrator:
         """
         Load all PSP configurations for this merchant.
 
-        New behavior:
-        - Primary source of truth is merchant_psps (one row per PSP).
-        - merchant_onboarding.psp_* fields are kept only as a legacy fallback
-          for very old merchants that don't have merchant_psps records yet.
+        Source of truth is merchant_psps only. Legacy onboarding PSP fields are
+        no longer consulted at runtime because they can drift away from the
+        canonical PSP identity, environment, and webhook state.
         """
         self.psp_configs = []
 
-        # 1) Preferred source: merchant_psps table
         try:
-            psps = await database.fetch_all(
-                """
-                SELECT provider, api_key, account_id, secret_key, status, connected_at,
-                       environment, provider_config, validation_status, validation_error
-                FROM merchant_psps
-                WHERE merchant_id = :merchant_id AND status = 'active'
-                ORDER BY connected_at ASC
-                """,
-                {"merchant_id": self.merchant_id},
+            psps = await fetch_active_merchant_psps(
+                merchant_id=self.merchant_id,
             )
         except Exception as e:
             logger.error(f"Failed to load merchant_psps for {self.merchant_id}: {e}")
@@ -121,50 +112,6 @@ class MultiPSPOrchestrator:
                     readiness_blockers=list(readiness.get("readiness_blockers") or []),
                 )
             )
-
-        # 2) Legacy fallback: use merchant_onboarding.psp_* fields
-        if not self.psp_configs and not canonical_only:
-            merchant = await get_merchant_onboarding(self.merchant_id)
-            if not merchant:
-                raise ValueError(f"Merchant {self.merchant_id} not found")
-
-            if merchant.get("psp_connected"):
-                primary_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-                if primary_key:
-                    self.psp_configs.append(
-                        PSPConfig(
-                            psp_type=merchant.get("psp_type", "stripe"),
-                            api_key=primary_key,
-                            priority=1,
-                            is_active=True,
-                            merchant_account=merchant.get("adyen_merchant_account"),
-                            environment="unknown",
-                            provider_config={},
-                            validation_status="unknown",
-                            validation_error=None,
-                            live_charge_ready=False,
-                            readiness_blockers=["Processor validation has not been run", "Environment is unknown"],
-                        )
-                    )
-
-            backup_psps = merchant.get("backup_psps", [])
-            for i, backup in enumerate(backup_psps, start=2):
-                if backup.get("is_active"):
-                    self.psp_configs.append(
-                        PSPConfig(
-                            psp_type=backup["psp_type"],
-                            api_key=backup["api_key"],
-                            priority=i,
-                            is_active=True,
-                            merchant_account=backup.get("merchant_account"),
-                            environment="unknown",
-                            provider_config={},
-                            validation_status="unknown",
-                            validation_error=None,
-                            live_charge_ready=False,
-                            readiness_blockers=["Processor validation has not been run", "Environment is unknown"],
-                        )
-                    )
 
         # Sort by priority so failover order is deterministic
         self.psp_configs.sort(key=lambda x: x.priority)
@@ -311,6 +258,7 @@ class MultiPSPOrchestrator:
                     config.api_key,
                     **build_runtime_adapter_kwargs(
                         config.psp_type,
+                        api_key=config.api_key,
                         account_id=config.account_id,
                         provider_config=config.provider_config,
                         environment=config.environment,

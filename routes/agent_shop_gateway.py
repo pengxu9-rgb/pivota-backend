@@ -2076,7 +2076,10 @@ SHOPPING_MULTI_SOURCES = {
 
 
 def _normalize_surface_source(source: Optional[str]) -> str:
-    return _bootstrap_normalize_surface_source(source)
+    normalized = _bootstrap_normalize_surface_source(source)
+    if normalized in {"creator", "creator-agent-ui", "creator-category-service"}:
+        return "creator-agent"
+    return normalized
 
 
 def _is_shopping_multi_source(source: Optional[str]) -> bool:
@@ -2687,7 +2690,7 @@ class UserIntent(BaseModel):
 class RequestMetadata(BaseModel):
     creator_id: Optional[str] = Field(None, alias="creatorId", description="Creator id for contextual recommendations")
     creator_name: Optional[str] = Field(None, alias="creatorName", description="Human friendly creator name")
-    source: Optional[str] = Field(None, description="Calling surface (e.g. creator-agent-ui)")
+    source: Optional[str] = Field(None, description="Calling surface (e.g. creator_agent)")
     trace_id: Optional[str] = Field(None, alias="traceId", description="Optional trace id for observability")
     commerce_surface: Optional[str] = Field(
         None,
@@ -6561,11 +6564,11 @@ async def _handle_find_products_multi(
         and request_metadata.get("_pivot_shadow_schedule_suppressed")
     )
 
-    # Creator surfaces (creator-agent UI + creator category service) are
+    # Creator surfaces are
     # allowed to use a broader cross-merchant pool and slightly more
     # permissive visibility rules (do not drop products solely because
     # orderable is false).
-    is_creator_surface = source_normalized in {"creator-agent-ui", "creator-category-service"}
+    is_creator_surface = source_normalized == "creator-agent"
     is_shopping_surface = _is_shopping_multi_source(source_normalized)
     force_cache_only = _resolve_multi_force_cache_only(source_normalized, is_creator_surface)
     base_merchant_fanout_enabled = _resolve_multi_base_merchant_fanout(
@@ -10233,7 +10236,7 @@ async def _handle_find_similar_products(
           "strategy": "auto",
           "user": { "id": "user_789" }
         },
-        "metadata": { "creator_id": "creator_456", "source": "creator-agent-ui" }
+        "metadata": { "creator_id": "creator_456", "source": "creator_agent" }
       }'
     """
     bt = background_tasks or BackgroundTasks()
@@ -10370,7 +10373,9 @@ async def _handle_find_similar_products(
     base_is_toy_context = _is_toy_context_blob(base_blob_ascii)
     base_is_underwear_like = _is_underwear_like_blob(base_blob_ascii)
     exclude_underwear_candidates = bool(
-        source == "creator-agent-ui" and base_is_toy_context and not base_is_underwear_like
+        _normalize_surface_source(source) == "creator-agent"
+        and base_is_toy_context
+        and not base_is_underwear_like
     )
 
     # Decide strategy

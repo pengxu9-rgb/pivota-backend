@@ -5,24 +5,22 @@ import pytest
 async def test_resolve_refund_adapter_prefers_canonical_merchant_psps(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.refund_api as module
 
-    queries = []
+    calls = []
 
-    async def fake_fetch_one(query: str, values=None):
-        queries.append(" ".join(query.split()))
-        if "FROM merchant_psps" in query:
-            return {
-                "psp_id": "psp_checkout_live",
-                "provider": "checkout",
-                "runtime_secret_key": "sk_live_checkout",
-                "environment": "live",
-                "provider_config": {
-                    "processing_channel_id": "pc_live_123",
-                    "public_key": "pk_live_123",
-                },
-            }
-        return None
+    async def fake_fetch_active_runtime_merchant_psp(**kwargs):
+        calls.append(kwargs)
+        return {
+            "psp_id": "psp_checkout_live",
+            "provider": "checkout",
+            "runtime_secret_key": "sk_live_checkout",
+            "environment": "live",
+            "provider_config": {
+                "processing_channel_id": "pc_live_123",
+                "public_key": "pk_live_123",
+            },
+        }
 
-    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(module, "fetch_active_runtime_merchant_psp", fake_fetch_active_runtime_merchant_psp)
 
     psp_type, psp_key, adapter_kwargs = await module._resolve_refund_adapter(
         {
@@ -31,11 +29,6 @@ async def test_resolve_refund_adapter_prefers_canonical_merchant_psps(monkeypatc
             "psp_used": "checkout",
             "payment_intent_id": "pay_123",
         },
-        {
-            "merchant_id": "merch_1",
-            "psp_type": "stripe",
-            "psp_sandbox_key": "sk_legacy",
-        },
     )
 
     assert psp_type == "checkout"
@@ -43,4 +36,29 @@ async def test_resolve_refund_adapter_prefers_canonical_merchant_psps(monkeypatc
     assert adapter_kwargs["environment"] == "live"
     assert adapter_kwargs["processing_channel_id"] == "pc_live_123"
     assert adapter_kwargs["public_key"] == "pk_live_123"
-    assert any("FROM merchant_psps" in query for query in queries)
+    assert calls == [
+        {
+            "merchant_id": "merch_1",
+            "provider": "checkout",
+            "psp_id": "psp_checkout_live",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_refund_adapter_rejects_legacy_psp_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.refund_api as module
+
+    async def fake_fetch_active_runtime_merchant_psp(**kwargs):
+        return None
+
+    monkeypatch.setattr(module, "fetch_active_runtime_merchant_psp", fake_fetch_active_runtime_merchant_psp)
+
+    with pytest.raises(ValueError, match="Canonical merchant_psps configuration is missing for stripe refunds"):
+        await module._resolve_refund_adapter(
+            {
+                "merchant_id": "merch_1",
+                "psp_used": "stripe",
+                "payment_intent_id": "pi_123",
+            }
+        )
