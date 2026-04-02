@@ -1277,6 +1277,8 @@ async def test_psp_connection(
 
             stripe_sdk.api_key = api_key
             account_id = provider_summary.get("account_id")
+            if not provider_summary.get("public_key_present"):
+                raise ValueError("Stripe public key is missing")
             if account_id:
                 stripe_sdk.Balance.retrieve(stripe_account=account_id)
             else:

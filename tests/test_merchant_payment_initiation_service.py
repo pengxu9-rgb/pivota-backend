@@ -2,6 +2,8 @@ from decimal import Decimal
 
 import pytest
 
+from services import merchant_payment_initiation_service as payment_module
+
 
 class _FakePaymentIntent:
     def __init__(self, *, payment_id: str, psp_type: str, client_secret: str):
@@ -138,3 +140,20 @@ async def test_initiate_merchant_payment_uses_preferred_order_for_fallback(monke
     assert result["success"] is True
     assert result["psp_used"] == "checkout"
     assert result["payment_action"]["type"] == "checkout_session"
+
+
+def test_build_payment_action_includes_stripe_public_key() -> None:
+    payment_intent = _FakePaymentIntent(
+        payment_id="pi_test_public_key",
+        psp_type="stripe",
+        client_secret="pi_test_secret_123",
+    )
+    payment_intent.raw_response = {
+        "public_key": "pk_live_backend_contract",
+        "environment": "live",
+    }
+
+    action = payment_module.build_payment_action(payment_intent, psp_used="stripe")
+
+    assert action["type"] == "stripe_client_secret"
+    assert action["public_key"] == "pk_live_backend_contract"

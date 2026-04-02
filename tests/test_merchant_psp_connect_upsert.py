@@ -117,13 +117,14 @@ def test_connect_psp_forces_stripe_payment_intent_mode(monkeypatch) -> None:
             "api_key": "sk_live_replacement_key",
             "environment": "live",
             "mode": "checkout_session",
+            "public_key": "pk_live_connect_key",
         },
     )
 
     assert response.status_code == 200
     assert executed
     insert_values = next(values for query, values in executed if query.startswith("INSERT INTO merchant_psps"))
-    assert insert_values["provider_config"] == '{"mode": "payment_intent"}'
+    assert insert_values["provider_config"] == '{"mode": "payment_intent", "public_key": "pk_live_connect_key"}'
 
 
 def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> None:
@@ -179,6 +180,58 @@ def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> No
     assert provider_config["mode"] == "payment_intent"
     assert provider_config["webhook_endpoint_id"] == "we_existing"
     assert provider_config["webhook_endpoint_secret"] == "whsec_existing"
+
+
+def test_connect_psp_preserves_existing_stripe_public_key(monkeypatch) -> None:
+    client, module = _build_client()
+    executed = []
+
+    async def fake_get_merchant_id_from_user(current_user):
+        return "merch_test_connect"
+
+    async def fake_fetch_all(query, values=None):
+        return [
+            {
+                "psp_id": "psp_stripe_existing",
+                "status": "active",
+                "connected_at": None,
+                "provider_config": {
+                    "mode": "payment_intent",
+                    "public_key": "pk_live_existing",
+                },
+                "account_id": None,
+                "environment": "live",
+            }
+        ]
+
+    async def fake_execute(query, values=None):
+        executed.append((" ".join(query.split()), dict(values or {})))
+
+    @asynccontextmanager
+    async def fake_transaction():
+        yield
+
+    monkeypatch.setattr(module, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module.database, "transaction", lambda: fake_transaction())
+
+    response = client.post(
+        "/merchant/integrations/psp/connect",
+        json={
+            "provider": "stripe",
+            "api_key": "sk_live_replacement_key",
+            "environment": "live",
+        },
+    )
+
+    assert response.status_code == 200
+    update_values = next(
+        values for query, values in executed if query.startswith("UPDATE merchant_psps SET merchant_id = :merchant_id")
+    )
+    provider_config = json.loads(update_values["provider_config"])
+    assert provider_config["mode"] == "payment_intent"
+    assert provider_config["public_key"] == "pk_live_existing"
 
 
 def test_get_order_detail_uses_order_total_refunded_when_record_lacks_get(monkeypatch) -> None:

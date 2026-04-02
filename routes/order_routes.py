@@ -153,6 +153,32 @@ def _finalize_order_psp_used(psp_used: Optional[str], fallback_provider: Optiona
     return value or "unknown"
 
 
+def _coerce_metadata_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    token = str(value or "").strip().lower()
+    if token in {"1", "true", "yes", "y", "on"}:
+        return True
+    if token in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _resolve_order_live_readiness_requirement(metadata: Optional[Dict[str, Any]]) -> bool:
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    explicit = _coerce_metadata_bool(metadata_dict.get("enforce_live_readiness"))
+    if explicit is not None:
+        return explicit
+    allow_test = _coerce_metadata_bool(
+        metadata_dict.get("allow_test_psp_surfaces")
+        or metadata_dict.get("test_psp_surfaces")
+        or metadata_dict.get("allow_test_processors")
+    )
+    if allow_test is True:
+        return False
+    return True
+
+
 async def _resolve_active_order_psp(
     merchant_id: str, provider_hint: Optional[str]
 ) -> Tuple[str, str]:
@@ -1615,6 +1641,7 @@ async def create_new_order(
             psp_mode = None
             if (order_request.preferred_psp or "").lower() == "stripe_checkout":
                 psp_mode = "stripe_checkout"
+            enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
 
             success, payment_intent, error, psp_used = await create_payment_with_failover(
                 merchant_id=order_request.merchant_id,
@@ -1641,7 +1668,7 @@ async def create_new_order(
                 },
                 preferred_psps=preferred_psps,
                 canonical_psp_required=True,
-                enforce_live_readiness=True,
+                enforce_live_readiness=enforce_live_readiness,
             )
             response_ms = int((time.monotonic() - start_ts) * 1000)
 

@@ -17,6 +17,26 @@ def test_finalize_order_psp_used_uses_safe_fallback() -> None:
     assert module._finalize_order_psp_used("", None) == "unknown"
 
 
+def test_resolve_order_live_readiness_requirement_defaults_to_true() -> None:
+    import routes.order_routes as module
+
+    assert module._resolve_order_live_readiness_requirement(None) is True
+    assert module._resolve_order_live_readiness_requirement({}) is True
+
+
+def test_resolve_order_live_readiness_requirement_honors_explicit_test_override() -> None:
+    import routes.order_routes as module
+
+    assert (
+        module._resolve_order_live_readiness_requirement({"enforce_live_readiness": False})
+        is False
+    )
+    assert (
+        module._resolve_order_live_readiness_requirement({"allow_test_psp_surfaces": True})
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_resolve_active_order_psp_falls_back_to_first_active(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.order_routes as module

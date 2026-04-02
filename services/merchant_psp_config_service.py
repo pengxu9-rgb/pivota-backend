@@ -84,11 +84,20 @@ def normalize_provider_config(
         mode = str(config.get("mode") or "payment_intent").strip().lower()
         if mode not in {"payment_intent", "checkout_session"}:
             mode = "payment_intent"
+        public_key = str(
+            config.get("public_key")
+            or config.get("publicKey")
+            or config.get("publishable_key")
+            or config.get("publishableKey")
+            or ""
+        ).strip()
         normalized = {
             "mode": mode,
         }
         if account_value:
             normalized["account_id"] = account_value
+        if public_key:
+            normalized["public_key"] = public_key
         webhook_endpoint_id = str(config.get("webhook_endpoint_id") or "").strip()
         webhook_endpoint_secret = str(config.get("webhook_endpoint_secret") or "").strip()
         webhook_url = str(config.get("webhook_url") or "").strip()
@@ -156,6 +165,8 @@ def build_provider_summary(
         return {
             "mode": config.get("mode") or "payment_intent",
             "account_id": config.get("account_id"),
+            "public_key": config.get("public_key"),
+            "public_key_present": bool(config.get("public_key")),
             "environment": env_value,
             "webhook_endpoint_id": config.get("webhook_endpoint_id"),
             "webhook_ready": bool(
@@ -239,6 +250,7 @@ def build_runtime_adapter_kwargs(
         kwargs: Dict[str, Any] = {
             "mode": config.get("mode") or "payment_intent",
             "environment": env_value,
+            "public_key": config.get("public_key"),
         }
         if config.get("account_id"):
             kwargs["account_id"] = config["account_id"]
@@ -312,6 +324,8 @@ def evaluate_psp_readiness(
         mode = str(summary.get("mode") or "").strip().lower() or "payment_intent"
         if mode not in {"payment_intent", "checkout_session"}:
             add_blocker("Stripe mode is invalid")
+        if mode == "payment_intent" and not summary.get("public_key_present"):
+            add_blocker("Stripe public key is missing")
         if env_value == "live" and not summary.get("webhook_ready"):
             add_blocker("Stripe webhook endpoint is not configured")
         if error_text:

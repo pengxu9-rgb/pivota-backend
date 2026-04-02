@@ -94,6 +94,7 @@ def build_payment_action(payment_intent: Any, *, psp_used: str) -> Dict[str, Any
         return {
             "type": "stripe_client_secret",
             "client_secret": client_secret,
+            "public_key": raw.get("public_key"),
             "raw": raw,
         }
 

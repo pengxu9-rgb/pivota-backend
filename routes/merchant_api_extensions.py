@@ -1928,6 +1928,15 @@ async def connect_psp(
         # Merchant-facing Stripe setup is always stored as PaymentIntent.
         # Stripe Checkout remains an internal/runtime override, not a merchant config choice.
         provider_config["mode"] = "payment_intent"
+        public_key = str(
+            psp_data.get("public_key")
+            or psp_data.get("publishable_key")
+            or existing_provider_config.get("public_key")
+            or existing_provider_config.get("publishable_key")
+            or ""
+        ).strip()
+        if public_key:
+            provider_config["public_key"] = public_key
         for key in ("webhook_endpoint_id", "webhook_endpoint_secret", "webhook_url"):
             value = str(existing_provider_config.get(key) or "").strip()
             if value:

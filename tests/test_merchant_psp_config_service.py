@@ -67,6 +67,7 @@ def test_evaluate_psp_readiness_marks_live_valid_stripe_as_ready() -> None:
         api_key="sk_live_123",
         provider_config={
             "mode": "payment_intent",
+            "public_key": "pk_live_123",
             "webhook_endpoint_id": "we_123",
             "webhook_endpoint_secret": "whsec_123",
         },
@@ -83,7 +84,7 @@ def test_evaluate_psp_readiness_blocks_live_stripe_without_webhook_endpoint() ->
         "stripe",
         status="active",
         api_key="sk_live_123",
-        provider_config={"mode": "payment_intent"},
+        provider_config={"mode": "payment_intent", "public_key": "pk_live_123"},
         environment="live",
         validation_status="valid",
     )
@@ -114,6 +115,7 @@ def test_build_provider_connect_record_preserves_stripe_webhook_fields() -> None
         api_key="sk_live_123",
         provider_config={
             "mode": "payment_intent",
+            "public_key": "pk_live_123",
             "webhook_endpoint_id": "we_123",
             "webhook_endpoint_secret": "whsec_123",
             "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_123",
@@ -122,6 +124,36 @@ def test_build_provider_connect_record_preserves_stripe_webhook_fields() -> None
         validation_status="valid",
     )
 
+    assert record["provider_config"]["public_key"] == "pk_live_123"
     assert record["provider_config"]["webhook_endpoint_id"] == "we_123"
     assert record["provider_config"]["webhook_endpoint_secret"] == "whsec_123"
     assert record["provider_summary"]["webhook_ready"] is True
+
+
+def test_build_runtime_adapter_kwargs_stripe_exposes_public_key() -> None:
+    kwargs = build_runtime_adapter_kwargs(
+        "stripe",
+        provider_config={"mode": "payment_intent", "public_key": "pk_live_123"},
+        environment="live",
+    )
+
+    assert kwargs["mode"] == "payment_intent"
+    assert kwargs["public_key"] == "pk_live_123"
+
+
+def test_evaluate_psp_readiness_blocks_live_stripe_without_public_key() -> None:
+    readiness = evaluate_psp_readiness(
+        "stripe",
+        status="active",
+        api_key="sk_live_123",
+        provider_config={
+            "mode": "payment_intent",
+            "webhook_endpoint_id": "we_123",
+            "webhook_endpoint_secret": "whsec_123",
+        },
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert readiness["live_charge_ready"] is False
+    assert "Stripe public key is missing" in readiness["readiness_blockers"]
