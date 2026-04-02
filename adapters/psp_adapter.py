@@ -3,12 +3,31 @@ PSP (Payment Service Provider) 适配器
 支持多个支付提供商的统一接口
 """
 
+import asyncio
+import os
 from typing import Dict, Any, Optional, Tuple
 from decimal import Decimal
 from abc import ABC, abstractmethod
 import stripe
 import httpx
 from config.settings import settings
+
+
+_STRIPE_REQUEST_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("STRIPE_REQUEST_TIMEOUT_SECONDS", "20") or "20"),
+)
+_STRIPE_CONNECT_TIMEOUT_SECONDS = max(
+    1.0,
+    min(
+        float(os.getenv("STRIPE_CONNECT_TIMEOUT_SECONDS", "5") or "5"),
+        _STRIPE_REQUEST_TIMEOUT_SECONDS,
+    ),
+)
+_STRIPE_MAX_NETWORK_RETRIES = max(
+    0,
+    int(os.getenv("STRIPE_MAX_NETWORK_RETRIES", "1") or "1"),
+)
 
 
 class PaymentIntent:
@@ -98,7 +117,17 @@ class StripeAdapter(PSPAdapter):
         self.mode = mode if mode in {"payment_intent", "checkout_session"} else "payment_intent"
         self.environment = (environment or "").strip().lower() or None
         self.public_key = str(public_key or "").strip() or None
-        stripe.api_key = api_key
+        self._client = stripe.StripeClient(
+            api_key,
+            stripe_account=account_id,
+            max_network_retries=_STRIPE_MAX_NETWORK_RETRIES,
+            http_client=stripe.RequestsClient(
+                timeout=(
+                    _STRIPE_CONNECT_TIMEOUT_SECONDS,
+                    _STRIPE_REQUEST_TIMEOUT_SECONDS,
+                )
+            ),
+        )
     
     async def create_payment_intent(
         self,
@@ -116,34 +145,35 @@ class StripeAdapter(PSPAdapter):
         try:
             psp_mode = (metadata.get("psp_mode") or "").lower()
             stripe_mode = "checkout_session" if psp_mode == "stripe_checkout" else self.mode
-            request_kwargs: Dict[str, Any] = {}
-            if self.account_id:
-                request_kwargs["stripe_account"] = self.account_id
+            request_options = None
 
             # Agent / Checkout 场景：返回可跳转的支付链接
             if stripe_mode == "checkout_session":
-                session = stripe.checkout.Session.create(
-                    mode="payment",
-                    line_items=[
-                        {
-                            "quantity": 1,
-                            "price_data": {
-                                "currency": currency.lower(),
-                                "unit_amount": int(amount * 100),
-                                "product_data": {
-                                    # 尽量给一个可读名称，避免为空
-                                    "name": metadata.get("description")
-                                    or metadata.get("order_id")
-                                    or "Order",
+                session = await asyncio.to_thread(
+                    self._client.v1.checkout.sessions.create,
+                    {
+                        "mode": "payment",
+                        "line_items": [
+                            {
+                                "quantity": 1,
+                                "price_data": {
+                                    "currency": currency.lower(),
+                                    "unit_amount": int(amount * 100),
+                                    "product_data": {
+                                        # 尽量给一个可读名称，避免为空
+                                        "name": metadata.get("description")
+                                        or metadata.get("order_id")
+                                        or "Order",
+                                    },
                                 },
                             },
-                        }
-                    ],
-                    success_url="https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
-                    cancel_url="https://merchant.pivota.cc/payment/cancel",
-                    metadata=metadata,
-                    payment_intent_data={"metadata": metadata},
-                    **request_kwargs,
+                        ],
+                        "success_url": "https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
+                        "cancel_url": "https://merchant.pivota.cc/payment/cancel",
+                        "metadata": metadata,
+                        "payment_intent_data": {"metadata": metadata},
+                    },
+                    request_options,
                 )
 
                 return (
@@ -163,15 +193,18 @@ class StripeAdapter(PSPAdapter):
             )
 
             # 默认：PaymentIntent + client_secret（传统前端使用）
-            payment_intent = stripe.PaymentIntent.create(
-                amount=int(amount * 100),  # Stripe 使用分为单位
-                currency=currency.lower(),
-                metadata=metadata,
-                automatic_payment_methods={
-                    "enabled": True,
-                    "allow_redirects": "never"  # 避免测试环境强依赖 return_url
+            payment_intent = await asyncio.to_thread(
+                self._client.v1.payment_intents.create,
+                {
+                    "amount": int(amount * 100),  # Stripe 使用分为单位
+                    "currency": currency.lower(),
+                    "metadata": metadata,
+                    "automatic_payment_methods": {
+                        "enabled": True,
+                        "allow_redirects": "never",  # 避免测试环境强依赖 return_url
+                    },
                 },
-                **request_kwargs,
+                request_options,
             )
 
             return (
@@ -209,9 +242,12 @@ class StripeAdapter(PSPAdapter):
     ) -> Tuple[bool, str, Optional[str]]:
         """确认 Stripe 支付"""
         try:
-            payment_intent = stripe.PaymentIntent.confirm(
+            payment_intent = await asyncio.to_thread(
+                self._client.v1.payment_intents.confirm,
                 payment_intent_id,
-                payment_method=payment_method_id
+                {
+                    "payment_method": payment_method_id,
+                },
             )
             return True, payment_intent.status, None
         except Exception as e:
@@ -224,7 +260,10 @@ class StripeAdapter(PSPAdapter):
     ) -> Tuple[bool, str, Optional[str]]:
         """查询 Stripe 支付状态"""
         try:
-            payment_intent = stripe.PaymentIntent.retrieve(payment_intent_id)
+            payment_intent = await asyncio.to_thread(
+                self._client.v1.payment_intents.retrieve,
+                payment_intent_id,
+            )
             return True, payment_intent.status, None
         except Exception as e:
             # Fall back to generic exception to avoid dependency on stripe.error namespace
@@ -254,10 +293,15 @@ class StripeAdapter(PSPAdapter):
                 else:
                     refund_data["metadata"] = {"reason": reason_norm}
 
+            request_options = None
             if idempotency_key:
-                refund = stripe.Refund.create(**refund_data, idempotency_key=str(idempotency_key))
-            else:
-                refund = stripe.Refund.create(**refund_data)
+                request_options = {"idempotency_key": str(idempotency_key)}
+
+            refund = await asyncio.to_thread(
+                self._client.v1.refunds.create,
+                refund_data,
+                request_options,
+            )
             return True, refund.id, None
         except Exception as e:
             # Fall back to generic exception to avoid dependency on stripe.error namespace

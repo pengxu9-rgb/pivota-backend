@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -289,6 +290,93 @@ async def test_contract_agent_payments_response_shape(
     assert isinstance(body.get("amount"), float)
     assert isinstance(body.get("currency"), str)
     assert isinstance(body.get("psp_used"), str)
+    assert body.get("payment_action", {}).get("type") == "stripe_client_secret"
     # 兼容性：保留已有顶层字段语义
     assert isinstance(body.get("created_at"), str)
     datetime.fromisoformat(body["created_at"])
+
+
+@pytest.mark.asyncio
+async def test_contract_agent_payments_times_out_with_structured_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mvp.events as mvp_events
+    import mvp.governance as mvp_governance
+    import routes.agent_payment_sdk as payment_module
+    from db.database import database as database_obj
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+
+    async def noop_log_agent_request(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "merchant_id": "m_contract",
+            "payment_status": "unpaid",
+            "total": 10.0,
+            "currency": "USD",
+            "shipping_address": {
+                "country": "US",
+                "postal_code": "94107",
+                "city": "SF",
+                "state": "CA",
+            },
+            "metadata": {},
+        }
+
+    async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+        return {"merchant_id": merchant_id, "psp_connected": True}
+
+    async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
+        return "stripe", {
+            "route_id": "route_contract",
+            "psp_priority": [{"psp": "stripe", "priority": 1}],
+        }
+
+    async def fake_fetch_one(query: Any, values: Dict[str, Any] | None = None):
+        return None
+
+    async def fake_execute(query: Any, values: Dict[str, Any] | None = None):
+        return None
+
+    async def fake_create_payment_with_failover(*args: Any, **kwargs: Any):
+        await asyncio.sleep(0.05)
+        return True, None, None, "stripe"
+
+    class _Decision:
+        decision = "allow"
+        reason_codes = []
+        required_scopes = []
+        risk_tier = "low"
+
+    monkeypatch.setattr(payment_module, "log_agent_request", noop_log_agent_request)
+    monkeypatch.setattr(payment_module, "get_order", fake_get_order)
+    monkeypatch.setattr(payment_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(payment_module.PaymentRoutingService, "select_psp", fake_select_psp)
+    monkeypatch.setattr(payment_module, "create_payment_with_failover", fake_create_payment_with_failover)
+    monkeypatch.setattr(payment_module, "AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(database_obj, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(database_obj, "execute", fake_execute)
+    monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+    monkeypatch.setattr(mvp_governance.governance, "evaluate", lambda *_a, **_k: _Decision())
+    monkeypatch.setattr(mvp_governance.governance, "record_audit_event", lambda **_: None)
+
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/agent/v1/payments",
+                json={
+                    "order_id": "ord_contract_timeout",
+                    "payment_method": {"type": "card", "token": "tok_contract"},
+                    "idempotency_key": "idem_contract_timeout",
+                },
+            )
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+    assert resp.status_code == 504
+    assert resp.json()["detail"]["error"] == "UPSTREAM_TIMEOUT"
