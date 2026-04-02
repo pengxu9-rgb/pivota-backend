@@ -34,8 +34,7 @@ KNOWN_INTERNAL_SOURCES = {
     "shopping-agent-web",
     "aurora",
     "aurora-chatbox",
-    "creator-agent-ui",
-    "creator-category-service",
+    "creator-agent",
 }
 
 KNOWN_SYSTEM_SOURCES = {
@@ -128,7 +127,10 @@ def normalize_source_channel(value: Any) -> str:
     token = _clean_text(value, lower=True)
     if not token:
         return UNKNOWN_TOKEN
-    return token.replace("_", "-")
+    normalized = token.replace("_", "-")
+    if normalized in {"creator", "creator-agent-ui", "creator-category-service"}:
+        return "creator-agent"
+    return normalized
 
 
 def normalize_query_source(value: Any) -> str:

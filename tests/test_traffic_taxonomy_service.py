@@ -68,3 +68,17 @@ def test_attach_traffic_taxonomy_writes_nested_and_top_level_fields() -> None:
     assert metadata["protocol_name"] == "rest"
     assert metadata["commerce_surface"] == "agent_api"
     assert metadata["source"] == "legacy"
+
+
+def test_build_traffic_taxonomy_normalizes_creator_source_aliases() -> None:
+    from services.traffic_taxonomy_service import build_traffic_taxonomy
+
+    taxonomy = build_traffic_taxonomy(
+        {"source": "creator-agent-ui"},
+        default_query_source="catalog_search",
+        default_protocol_name="rest",
+        default_commerce_surface="agent_api",
+    )
+
+    assert taxonomy["source_channel"] == "creator-agent"
+    assert taxonomy["source_family"] == "internal"
