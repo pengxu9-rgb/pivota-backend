@@ -19,6 +19,26 @@ from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_tra
 logger = logging.getLogger(__name__)
 
 
+def _restore_request_body(request: Request, raw_body: bytes) -> None:
+    """
+    Re-inject a consumed request body for downstream handlers.
+
+    BaseHTTPMiddleware creates a new request flow for the inner app. If we read
+    the body here for telemetry, downstream Pydantic/body parsing can block on a
+    drained receive channel unless we provide the bytes again.
+    """
+    delivered = False
+
+    async def _receive() -> dict:
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        delivered = True
+        return {"type": "http.request", "body": raw_body, "more_body": False}
+
+    request._receive = _receive
+
+
 async def _insert_usage_log(payload):
     try:
         await database.execute(
@@ -102,6 +122,7 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
         if "application/json" in str(request.headers.get("content-type") or "").lower():
             try:
                 raw_body = await request.body()
+                _restore_request_body(request, raw_body)
                 if raw_body:
                     parsed = json.loads(raw_body.decode("utf-8"))
                     if isinstance(parsed, dict):
