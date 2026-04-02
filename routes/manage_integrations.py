@@ -354,9 +354,17 @@ async def update_psp(
 
         name_value = psp_data.get("name") if "name" in psp_data else psp_row.get("name")
         provider_config_value = psp_row.get("provider_config")
-        if provider == "stripe" and "public_key" in psp_data:
+        if provider == "stripe" and any(
+            key in psp_data for key in ("public_key", "publicKey", "publishable_key", "publishableKey")
+        ):
             provider_config_dict = dict(provider_config_value or {}) if isinstance(provider_config_value, dict) else {}
-            public_key_value = str(psp_data.get("public_key") or "").strip()
+            public_key_value = str(
+                psp_data.get("public_key")
+                or psp_data.get("publicKey")
+                or psp_data.get("publishable_key")
+                or psp_data.get("publishableKey")
+                or ""
+            ).strip()
             if public_key_value:
                 provider_config_dict["public_key"] = public_key_value
             else:
@@ -421,4 +429,3 @@ async def cleanup_integrations(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup: {str(e)}")
-

@@ -465,7 +465,13 @@ async def admin_connect_psp(
             "client_key": client_key,
         }
     elif provider == "stripe":
-        public_key = str(payload.get("public_key") or "").strip()
+        public_key = str(
+            payload.get("public_key")
+            or payload.get("publicKey")
+            or payload.get("publishable_key")
+            or payload.get("publishableKey")
+            or ""
+        ).strip()
         if public_key:
             provider_config = {
                 "public_key": public_key,

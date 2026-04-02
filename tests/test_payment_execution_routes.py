@@ -100,6 +100,7 @@ async def test_execute_payment_returns_unified_action(monkeypatch: pytest.Monkey
                     "environment": "live",
                     "provider_config": {
                         "mode": "payment_intent",
+                        "public_key": "pk_live_test",
                         "webhook_endpoint_id": "we_live_test",
                         "webhook_endpoint_secret": "whsec_live_test",
                     },
@@ -180,6 +181,7 @@ async def test_execute_payment_emits_completed_only_for_terminal_success(
                     "environment": "live",
                     "provider_config": {
                         "mode": "payment_intent",
+                        "public_key": "pk_live_terminal",
                         "webhook_endpoint_id": "we_live_terminal",
                         "webhook_endpoint_secret": "whsec_live_terminal",
                     },
@@ -283,6 +285,7 @@ async def test_execute_payment_failure_reports_last_attempted_supported_processo
                     "environment": "live",
                     "provider_config": {
                         "mode": "payment_intent",
+                        "public_key": "pk_live_failure",
                         "webhook_endpoint_id": "we_live_failure",
                         "webhook_endpoint_secret": "whsec_live_failure",
                     },
@@ -537,6 +540,7 @@ async def test_execute_internal_order_backed_canary_creates_real_order_before_in
                     "environment": "live",
                     "provider_config": {
                         "mode": "payment_intent",
+                        "public_key": "pk_live_canary",
                         "webhook_endpoint_id": "we_live_canary",
                         "webhook_endpoint_secret": "whsec_live_canary",
                     },

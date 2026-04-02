@@ -104,6 +104,24 @@ def test_build_provider_connect_record_prefers_key_environment_over_explicit_liv
     assert record["environment"] == "test"
 
 
+def test_build_provider_connect_record_accepts_publishable_key_alias_for_stripe() -> None:
+    record = build_provider_connect_record(
+        "stripe",
+        api_key="sk_live_123",
+        provider_config={
+            "mode": "payment_intent",
+            "publishable_key": "pk_live_alias_123",
+            "webhook_endpoint_id": "we_123",
+            "webhook_endpoint_secret": "whsec_123",
+        },
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert record["provider_config"]["public_key"] == "pk_live_alias_123"
+    assert record["provider_summary"]["public_key_present"] is True
+
+
 def test_infer_runtime_provider_prefers_explicit_psp_used() -> None:
     provider = infer_runtime_provider(
         psp_used="checkout",

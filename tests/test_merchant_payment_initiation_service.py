@@ -161,3 +161,21 @@ def test_build_payment_action_includes_stripe_public_key() -> None:
 
     assert action["type"] == "stripe_client_secret"
     assert action["public_key"] == "pk_live_123"
+
+
+def test_build_payment_action_accepts_publishable_key_alias() -> None:
+    from services.merchant_payment_initiation_service import build_payment_action
+
+    intent = _FakePaymentIntent(
+        payment_id="pi_live_alias",
+        psp_type="stripe",
+        client_secret="pi_live_alias_secret",
+    )
+    intent.raw_response = {
+        "publishable_key": "pk_live_alias_123",
+    }
+
+    action = build_payment_action(intent, psp_used="stripe")
+
+    assert action["type"] == "stripe_client_secret"
+    assert action["public_key"] == "pk_live_alias_123"
