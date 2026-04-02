@@ -353,6 +353,15 @@ async def update_psp(
             raise HTTPException(status_code=400, detail="status must be active or inactive")
 
         name_value = psp_data.get("name") if "name" in psp_data else psp_row.get("name")
+        provider_config_value = psp_row.get("provider_config")
+        if provider == "stripe" and "public_key" in psp_data:
+            provider_config_dict = dict(provider_config_value or {}) if isinstance(provider_config_value, dict) else {}
+            public_key_value = str(psp_data.get("public_key") or "").strip()
+            if public_key_value:
+                provider_config_dict["public_key"] = public_key_value
+            else:
+                provider_config_dict.pop("public_key", None)
+            provider_config_value = provider_config_dict
 
         async with database.transaction():
             await persist_canonical_merchant_psp(
@@ -362,7 +371,7 @@ async def update_psp(
                 account_id=psp_row.get("account_id"),
                 secret_key=psp_row.get("secret_key"),
                 environment=psp_row.get("environment"),
-                provider_config=psp_row.get("provider_config"),
+                provider_config=provider_config_value,
                 name=name_value,
                 capabilities=psp_row.get("capabilities"),
                 status=status_value,
@@ -412,5 +421,4 @@ async def cleanup_integrations(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup: {str(e)}")
-
 

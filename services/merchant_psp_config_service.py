@@ -119,11 +119,14 @@ def normalize_provider_config(
         mode = str(config.get("mode") or "payment_intent").strip().lower()
         if mode not in {"payment_intent", "checkout_session"}:
             mode = "payment_intent"
+        public_key = str(config.get("public_key") or config.get("publicKey") or "").strip()
         normalized = {
             "mode": mode,
         }
         if account_value:
             normalized["account_id"] = account_value
+        if public_key:
+            normalized["public_key"] = public_key
         webhook_endpoint_id = str(config.get("webhook_endpoint_id") or "").strip()
         webhook_endpoint_secret = str(config.get("webhook_endpoint_secret") or "").strip()
         webhook_url = str(config.get("webhook_url") or "").strip()
@@ -191,6 +194,7 @@ def build_provider_summary(
         return {
             "mode": config.get("mode") or "payment_intent",
             "account_id": config.get("account_id"),
+            "public_key_present": bool(config.get("public_key")),
             "environment": env_value,
             "webhook_endpoint_id": config.get("webhook_endpoint_id"),
             "webhook_ready": bool(
@@ -249,12 +253,14 @@ def build_stripe_connect_provider_config(
     next_account_id: Optional[str] = None,
     next_environment: Optional[str] = None,
     mode: str = "payment_intent",
+    public_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     mode_value = str(mode or "payment_intent").strip().lower()
     if mode_value not in {"payment_intent", "checkout_session"}:
         mode_value = "payment_intent"
 
     config: Dict[str, Any] = {"mode": mode_value}
+    public_key_value = str(public_key or "").strip()
     reset_webhook_config = should_reset_stripe_webhook_config(
         previous_api_key=previous_api_key,
         previous_account_id=previous_account_id,
@@ -263,6 +269,8 @@ def build_stripe_connect_provider_config(
         next_account_id=next_account_id,
         next_environment=next_environment,
     )
+    if public_key_value:
+        config["public_key"] = public_key_value
     if reset_webhook_config:
         return config
 
@@ -276,6 +284,10 @@ def build_stripe_connect_provider_config(
         value = str(existing.get(key) or "").strip()
         if value:
             config[key] = value
+    if not public_key_value:
+        existing_public_key = str(existing.get("public_key") or "").strip()
+        if existing_public_key:
+            config["public_key"] = existing_public_key
     return config
 
 
@@ -341,6 +353,8 @@ def build_runtime_adapter_kwargs(
         }
         if config.get("account_id"):
             kwargs["account_id"] = config["account_id"]
+        if config.get("public_key"):
+            kwargs["public_key"] = config["public_key"]
         return kwargs
 
     if provider_norm == "adyen":
@@ -411,6 +425,8 @@ def evaluate_psp_readiness(
         mode = str(summary.get("mode") or "").strip().lower() or "payment_intent"
         if mode not in {"payment_intent", "checkout_session"}:
             add_blocker("Stripe mode is invalid")
+        if mode == "payment_intent" and not summary.get("public_key_present"):
+            add_blocker("Stripe public key is missing")
         if env_value == "live" and not summary.get("webhook_ready"):
             add_blocker("Stripe webhook endpoint is not configured")
         if error_text:
@@ -661,6 +677,7 @@ async def persist_canonical_merchant_psp(
 
     next_provider_config = provider_config
     if provider_norm == "stripe":
+        requested_provider_config = _as_dict(provider_config)
         next_provider_config = build_stripe_connect_provider_config(
             existing_provider_config=existing_provider_config,
             previous_api_key=canonical_existing.get("api_key") if canonical_existing else None,
@@ -670,6 +687,7 @@ async def persist_canonical_merchant_psp(
             next_account_id=account_value,
             next_environment=requested_environment,
             mode=stripe_mode,
+            public_key=requested_provider_config.get("public_key") or requested_provider_config.get("publicKey"),
         )
     elif next_provider_config is None and canonical_existing:
         next_provider_config = existing_provider_config

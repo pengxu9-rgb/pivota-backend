@@ -1910,6 +1910,12 @@ async def connect_psp(
             "merchant_account": merchant_account,
             "client_key": client_key,
         }
+    elif provider == "stripe":
+        public_key = str(psp_data.get("public_key") or "").strip()
+        if public_key:
+            provider_config = {
+                "public_key": public_key,
+            }
     elif provider == "checkout":
         processing_channel_id = str(psp_data.get("processing_channel_id") or account_id or "").strip()
         public_key = str(psp_data.get("public_key") or "").strip()

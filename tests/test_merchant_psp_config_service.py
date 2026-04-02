@@ -126,6 +126,7 @@ def test_evaluate_psp_readiness_marks_live_valid_stripe_as_ready() -> None:
         api_key="sk_live_123",
         provider_config={
             "mode": "payment_intent",
+            "public_key": "pk_live_123",
             "webhook_endpoint_id": "we_123",
             "webhook_endpoint_secret": "whsec_123",
         },
@@ -142,7 +143,7 @@ def test_evaluate_psp_readiness_blocks_live_stripe_without_webhook_endpoint() ->
         "stripe",
         status="active",
         api_key="sk_live_123",
-        provider_config={"mode": "payment_intent"},
+        provider_config={"mode": "payment_intent", "public_key": "pk_live_123"},
         environment="live",
         validation_status="valid",
     )
@@ -174,6 +175,7 @@ def test_evaluate_psp_readiness_blocks_mismatched_live_flag_with_test_stripe_key
         api_key="sk_test_123",
         provider_config={
             "mode": "payment_intent",
+            "public_key": "pk_test_123",
             "webhook_endpoint_id": "we_123",
             "webhook_endpoint_secret": "whsec_123",
         },
@@ -192,6 +194,7 @@ def test_build_provider_connect_record_preserves_stripe_webhook_fields() -> None
         api_key="sk_live_123",
         provider_config={
             "mode": "payment_intent",
+            "public_key": "pk_live_123",
             "webhook_endpoint_id": "we_123",
             "webhook_endpoint_secret": "whsec_123",
             "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_123",
@@ -202,6 +205,7 @@ def test_build_provider_connect_record_preserves_stripe_webhook_fields() -> None
 
     assert record["provider_config"]["webhook_endpoint_id"] == "we_123"
     assert record["provider_config"]["webhook_endpoint_secret"] == "whsec_123"
+    assert record["provider_summary"]["public_key_present"] is True
     assert record["provider_summary"]["webhook_ready"] is True
 
 
@@ -218,6 +222,7 @@ def test_build_stripe_connect_provider_config_preserves_webhook_when_identity_ma
     config = build_stripe_connect_provider_config(
         existing_provider_config={
             "mode": "payment_intent",
+            "public_key": "pk_live_existing",
             "webhook_endpoint_id": "we_existing",
             "webhook_endpoint_secret": "whsec_existing",
             "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_existing",
@@ -232,12 +237,14 @@ def test_build_stripe_connect_provider_config_preserves_webhook_when_identity_ma
 
     assert config["webhook_endpoint_id"] == "we_existing"
     assert config["webhook_endpoint_secret"] == "whsec_existing"
+    assert config["public_key"] == "pk_live_existing"
 
 
 def test_build_stripe_connect_provider_config_clears_webhook_when_identity_changes() -> None:
     config = build_stripe_connect_provider_config(
         existing_provider_config={
             "mode": "payment_intent",
+            "public_key": "pk_test_existing",
             "webhook_endpoint_id": "we_existing",
             "webhook_endpoint_secret": "whsec_existing",
             "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_existing",
@@ -251,6 +258,45 @@ def test_build_stripe_connect_provider_config_clears_webhook_when_identity_chang
     )
 
     assert config == {"mode": "payment_intent"}
+
+
+def test_evaluate_psp_readiness_blocks_missing_stripe_public_key() -> None:
+    readiness = evaluate_psp_readiness(
+        "stripe",
+        status="active",
+        api_key="sk_live_123",
+        provider_config={
+            "mode": "payment_intent",
+            "webhook_endpoint_id": "we_123",
+            "webhook_endpoint_secret": "whsec_123",
+        },
+        environment="live",
+        validation_status="valid",
+    )
+
+    assert readiness["live_charge_ready"] is False
+    assert "Stripe public key is missing" in readiness["readiness_blockers"]
+
+
+def test_build_stripe_connect_provider_config_replaces_public_key_without_resetting_webhook() -> None:
+    config = build_stripe_connect_provider_config(
+        existing_provider_config={
+            "mode": "payment_intent",
+            "public_key": "pk_live_old",
+            "webhook_endpoint_id": "we_existing",
+            "webhook_endpoint_secret": "whsec_existing",
+        },
+        previous_api_key="sk_live_same",
+        previous_account_id="acct_same",
+        previous_environment="live",
+        next_api_key="sk_live_same",
+        next_account_id="acct_same",
+        next_environment="live",
+        public_key="pk_live_new",
+    )
+
+    assert config["public_key"] == "pk_live_new"
+    assert config["webhook_endpoint_id"] == "we_existing"
 
 
 def test_fetch_active_runtime_merchant_psp_uses_database_override() -> None:

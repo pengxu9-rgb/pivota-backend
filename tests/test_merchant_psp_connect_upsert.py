@@ -117,6 +117,7 @@ def test_connect_psp_forces_stripe_payment_intent_mode(monkeypatch) -> None:
         json={
             "provider": "stripe",
             "api_key": "sk_live_replacement_key",
+            "public_key": "pk_live_replacement_key",
             "environment": "live",
             "mode": "checkout_session",
         },
@@ -125,7 +126,7 @@ def test_connect_psp_forces_stripe_payment_intent_mode(monkeypatch) -> None:
     assert response.status_code == 200
     assert executed
     insert_values = next(values for query, values in executed if query.startswith("INSERT INTO merchant_psps"))
-    assert insert_values["provider_config"] == '{"mode": "payment_intent"}'
+    assert insert_values["provider_config"] == '{"mode": "payment_intent", "public_key": "pk_live_replacement_key"}'
 
 
 def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> None:
@@ -143,6 +144,7 @@ def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> No
                 "connected_at": None,
                 "provider_config": {
                     "mode": "payment_intent",
+                    "public_key": "pk_live_existing",
                     "webhook_endpoint_id": "we_existing",
                     "webhook_endpoint_secret": "whsec_existing",
                     "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_existing",
@@ -180,6 +182,7 @@ def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> No
     )
     provider_config = json.loads(update_values["provider_config"])
     assert provider_config["mode"] == "payment_intent"
+    assert provider_config["public_key"] == "pk_live_existing"
     assert provider_config["webhook_endpoint_id"] == "we_existing"
     assert provider_config["webhook_endpoint_secret"] == "whsec_existing"
 
@@ -199,6 +202,7 @@ def test_connect_psp_clears_existing_stripe_webhook_fields_when_key_changes(monk
                 "connected_at": None,
                 "provider_config": {
                     "mode": "payment_intent",
+                    "public_key": "pk_test_existing",
                     "webhook_endpoint_id": "we_existing",
                     "webhook_endpoint_secret": "whsec_existing",
                     "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_existing",
@@ -226,6 +230,7 @@ def test_connect_psp_clears_existing_stripe_webhook_fields_when_key_changes(monk
         json={
             "provider": "stripe",
             "api_key": "sk_live_replacement_key",
+            "public_key": "pk_live_replacement_key",
             "account_id": "acct_live_new",
             "environment": "live",
         },
@@ -238,6 +243,7 @@ def test_connect_psp_clears_existing_stripe_webhook_fields_when_key_changes(monk
     provider_config = json.loads(update_values["provider_config"])
     assert provider_config["mode"] == "payment_intent"
     assert provider_config["account_id"] == "acct_live_new"
+    assert provider_config["public_key"] == "pk_live_replacement_key"
     assert "webhook_endpoint_id" not in provider_config
     assert "webhook_endpoint_secret" not in provider_config
 

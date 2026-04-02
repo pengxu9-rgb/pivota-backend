@@ -1275,6 +1275,9 @@ async def test_psp_connection(
         if provider == "stripe":
             import stripe as stripe_sdk
 
+            stripe_mode = str(provider_summary.get("mode") or "payment_intent").strip().lower()
+            if stripe_mode == "payment_intent" and not provider_summary.get("public_key_present"):
+                raise ValueError("Stripe public key is missing")
             stripe_sdk.api_key = api_key
             account_id = provider_summary.get("account_id")
             if account_id:

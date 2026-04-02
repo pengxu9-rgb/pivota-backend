@@ -37,6 +37,7 @@ python3 scripts/backfill_canonical_merchant_psps.py \
 Expected drift buckets:
 - `environment_mismatch`
 - `stripe_live_missing_webhook`
+- `stripe_missing_public_key`
 - `duplicate_active_provider`
 - `valid_but_not_live_ready`
 
