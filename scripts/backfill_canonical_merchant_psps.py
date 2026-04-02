@@ -23,8 +23,22 @@ def _parse_args() -> argparse.Namespace:
         description="Audit or repair canonical merchant_psps drift for active PSP rows."
     )
     parser.add_argument("--merchant-id", help="Restrict the backfill to a single merchant_id.")
+    parser.add_argument("--psp-id", help="Restrict the backfill to a single psp_id.")
+    parser.add_argument(
+        "--provider",
+        help="Restrict the backfill to a single provider, e.g. stripe/adyen/checkout.",
+    )
     parser.add_argument("--limit", type=int, default=500, help="Maximum PSP rows to inspect.")
     parser.add_argument("--apply", action="store_true", help="Persist the normalized values.")
+    parser.add_argument(
+        "--only-drifted",
+        action="store_true",
+        help="Only emit rows that actually drift from canonical truth.",
+    )
+    parser.add_argument(
+        "--output",
+        help="Optional path to write a JSON report containing summary and row details.",
+    )
     parser.add_argument(
         "--include-inactive",
         action="store_true",
@@ -45,6 +59,12 @@ async def _run(args: argparse.Namespace) -> int:
         if args.merchant_id:
             conditions.append("merchant_id = :merchant_id")
             values["merchant_id"] = args.merchant_id
+        if args.psp_id:
+            conditions.append("psp_id = :psp_id")
+            values["psp_id"] = args.psp_id
+        if args.provider:
+            conditions.append("LOWER(provider) = :provider")
+            values["provider"] = str(args.provider).strip().lower()
         if not args.include_inactive:
             conditions.append("status = 'active'")
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
@@ -70,6 +90,7 @@ async def _run(args: argparse.Namespace) -> int:
         changed = 0
         scanned = 0
         reasons_counter: Counter[str] = Counter()
+        row_reports: List[Dict[str, Any]] = []
         for row in rows:
             scanned += 1
             payload = dict(row)
@@ -153,26 +174,25 @@ async def _run(args: argparse.Namespace) -> int:
             for reason in drift_reasons:
                 reasons_counter[reason] += 1
 
-            print(
-                json.dumps(
-                    {
-                        "psp_id": payload.get("psp_id"),
-                        "merchant_id": payload.get("merchant_id"),
-                        "provider": provider,
-                        "raw_environment": raw_environment,
-                        "environment": normalized["environment"],
-                        "validation_status": str(payload.get("validation_status") or "unknown").strip().lower() or "unknown",
-                        "normalized_validation_status": repaired_validation_status,
-                        "live_charge_ready": readiness["live_charge_ready"],
-                        "webhook_ready": normalized["provider_summary"].get("webhook_ready"),
-                        "readiness_blockers": readiness["readiness_blockers"],
-                        "duplicate_active_count": active_counter[(payload.get("merchant_id"), provider)],
-                        "drift_reasons": drift_reasons,
-                        "changed": row_changed,
-                    },
-                    ensure_ascii=True,
-                )
-            )
+            row_report = {
+                "psp_id": payload.get("psp_id"),
+                "merchant_id": payload.get("merchant_id"),
+                "provider": provider,
+                "raw_environment": raw_environment,
+                "environment": normalized["environment"],
+                "validation_status": str(payload.get("validation_status") or "unknown").strip().lower() or "unknown",
+                "normalized_validation_status": repaired_validation_status,
+                "live_charge_ready": readiness["live_charge_ready"],
+                "webhook_ready": normalized["provider_summary"].get("webhook_ready"),
+                "readiness_blockers": readiness["readiness_blockers"],
+                "duplicate_active_count": active_counter[(payload.get("merchant_id"), provider)],
+                "drift_reasons": drift_reasons,
+                "changed": row_changed,
+            }
+            row_reports.append(row_report)
+
+            if not args.only_drifted or row_changed:
+                print(json.dumps(row_report, ensure_ascii=True))
 
             if row_changed:
                 changed += 1
@@ -197,19 +217,31 @@ async def _run(args: argparse.Namespace) -> int:
                         },
                     )
 
-        print(
-            json.dumps(
-                {
-                    "status": "success",
-                    "scanned": scanned,
-                    "changed": changed,
-                    "applied": bool(args.apply),
-                    "active_only": not args.include_inactive,
-                    "drift_counts": dict(reasons_counter),
-                },
-                ensure_ascii=True,
+        summary = {
+            "status": "success",
+            "scanned": scanned,
+            "changed": changed,
+            "applied": bool(args.apply),
+            "active_only": not args.include_inactive,
+            "provider": str(args.provider or "").strip().lower() or None,
+            "merchant_id": args.merchant_id or None,
+            "psp_id": args.psp_id or None,
+            "drift_counts": dict(reasons_counter),
+        }
+
+        print(json.dumps(summary, ensure_ascii=True))
+
+        if args.output:
+            output_payload = {
+                "summary": summary,
+                "rows": [row for row in row_reports if (row.get("changed") or not args.only_drifted)],
+            }
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(output_payload, ensure_ascii=True, indent=2),
+                encoding="utf-8",
             )
-        )
         return 0
     finally:
         await database.disconnect()
