@@ -35,11 +35,6 @@ import subprocess
 import os
 from pathlib import Path
 
-
-INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
-    os.getenv("ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES", "false").lower() == "true"
-)
-
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
 
@@ -105,15 +100,12 @@ from routes.admin_catalog_debug import router as admin_catalog_debug_router
 from routes.merchant_analytics_routes import router as merchant_analytics_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
-from routes.debug_integrations import router as debug_integrations_router
 from routes.direct_db_check import router as direct_db_check_router
-from routes.init_merchant_data import router as init_merchant_data_router
 from routes.cleanup_test_data import router as cleanup_test_data_router
 from routes.manage_integrations import router as manage_integrations_router
 from routes.psp_metrics import router as psp_metrics_router
 from routes.wix_sync import router as wix_sync_router
 from routes.fix_duplicate_stores import router as fix_duplicate_stores_router
-from routes.cleanup_all_duplicates import router as cleanup_all_duplicates_router
 from routes.admin_cleanup import router as admin_cleanup_router
 from routes.init_orders_table import router as init_orders_router
 from routes.employee_dashboard_routes import router as employee_dashboard_router
@@ -124,15 +116,11 @@ from routes.agent_sdk_ready import router as agent_sdk_router
 from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.fix_agents_table import router as fix_agents_router
-from routes.debug_psp_insert import router as debug_psp_router
-from routes.debug_psp_validation import router as debug_psp_validation_router
 from routes.admin_migrations import router as admin_migrations_router
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
 from routes.admin_fix_merchant import router as admin_fix_router
-from routes.admin_fix_psp_id import router as admin_fix_psp_id_router
-from routes.admin_debug_psp_metrics import router as admin_debug_psp_metrics_router
 from routes.simple_test_orders import router as simple_test_orders_router
 from routes.migrate_employees_password import router as migrate_employees_password_router
 from routes.debug_product_sync import router as debug_product_sync_router
@@ -183,10 +171,7 @@ from routes.admin_amazon_orders import router as admin_amazon_orders_router
 from routes.admin_amazon_fulfillment import router as admin_amazon_fulfillment_router
 from routes.products_cache_maintenance import router as products_cache_maintenance_router
 from routes.mcp_e2e_test import router as mcp_e2e_test_router
-from routes.admin_recover_psps import router as admin_recover_psps_router
 from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_router
-from routes.admin_fix_order_psp import router as admin_fix_order_psp_router
-from routes.admin_debug_psp import router as admin_debug_psp_router
 from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
 from routes.employee_agent_mgmt import router as employee_agent_mgmt_router
 from routes.employee_products import router as employee_products_router
@@ -274,7 +259,6 @@ if DEBUG_MODE:
     from routes.debug_usage_logs import router as debug_usage_logs_router
     from routes.debug_query_analytics import router as debug_query_analytics_router
     from routes.debug_orders_agent import router as debug_orders_agent_router
-from routes.simulate_payments import router as simulate_payments_router
 from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 from routes.agent_shop_gateway import router as agent_shop_gateway_router
@@ -440,9 +424,6 @@ def _is_route_mounted(path: str, method: str) -> bool:
 
 
 def _guard_legacy_psp_maintenance_routes() -> None:
-    if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
-        return
-
     forbidden_paths = {
         "/debug/insert-adyen",
         "/debug/check-psps",
@@ -462,9 +443,7 @@ def _guard_legacy_psp_maintenance_routes() -> None:
     )
     if mounted:
         raise RuntimeError(
-            "Legacy PSP maintenance routes are mounted without "
-            "ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES=true:\n- "
-            + "\n- ".join(mounted)
+            "Legacy PSP maintenance routes must not be mounted:\n- " + "\n- ".join(mounted)
         )
 
 
@@ -688,9 +667,6 @@ app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
-if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
-    app.include_router(debug_psp_router)  # Debug PSP insert
-    app.include_router(debug_psp_validation_router)  # Debug PSP validation
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(admin_api_router)  # Admin API endpoints
@@ -717,12 +693,7 @@ else:
     logger.info("⏭️  Readiness audit / UCP thin-slice router disabled")
 app.include_router(products_cache_maintenance_router)  # Products cache maintenance
 app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
-if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
-    app.include_router(admin_recover_psps_router)  # Admin PSP recovery
 app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
-if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
-    app.include_router(admin_fix_order_psp_router)
-    app.include_router(admin_debug_psp_router)  # Admin debug PSP data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
 # Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
 app.include_router(employee_agent_mgmt_router)
@@ -790,15 +761,12 @@ app.include_router(admin_catalog_debug_router)  # Internal catalog debug
 app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
 app.include_router(payout_router)  # Payout management
-app.include_router(debug_integrations_router)  # Debug integrations
 app.include_router(direct_db_check_router)  # Direct DB check
-app.include_router(init_merchant_data_router)  # Initialize merchant data
 app.include_router(cleanup_test_data_router)  # Cleanup test data
 app.include_router(manage_integrations_router)  # Manage integrations (delete/update)
 app.include_router(psp_metrics_router)  # Real PSP metrics
 app.include_router(wix_sync_router)  # Wix product sync
 app.include_router(fix_duplicate_stores_router)  # Fix duplicate stores
-app.include_router(cleanup_all_duplicates_router)  # Cleanup all duplicates
 app.include_router(admin_cleanup_router)  # Admin cleanup (no auth)
 app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
@@ -821,9 +789,6 @@ app.include_router(agent_payment_router)  # Agent payment SDK endpoints
 app.include_router(agent_products_router)  # Agent product browsing
 app.include_router(psp_overview_router)  # PSP overview and metrics
 app.include_router(admin_fix_router)  # Admin fix utilities
-if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
-    app.include_router(admin_fix_psp_id_router)  # Admin fix PSP ID
-    app.include_router(admin_debug_psp_metrics_router)  # Admin debug PSP metrics
 app.include_router(merchant_store_connections_router)  # Merchant store connections (Shopify, Wix)
 app.include_router(ops_shopify_integration_router)  # Internal ops: Shopify integration verify/report
 app.include_router(ops_pcs_reducer_router)  # Internal ops: PCS reducer replay
@@ -899,8 +864,6 @@ if DEBUG_MODE:
     app.include_router(debug_usage_logs_router)  # Debug usage logs
     app.include_router(debug_query_analytics_router)  # Debug query analytics
     app.include_router(debug_orders_agent_router)  # Debug orders by agent
-if INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED:
-    app.include_router(simulate_payments_router)  # Simulate payments for testing
 app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
 app.include_router(prometheus_metrics_router)  # /metrics (Prometheus scrape)
 app.include_router(shopify_setup_router)  # Shopify setup endpoints

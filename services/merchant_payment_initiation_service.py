@@ -232,6 +232,7 @@ async def initiate_merchant_payment(
                     api_key,
                     **build_runtime_adapter_kwargs(
                         provider,
+                        api_key=api_key,
                         account_id=candidate.get("account_id"),
                         provider_config=candidate.get("provider_config"),
                         environment=candidate.get("environment"),

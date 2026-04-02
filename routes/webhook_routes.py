@@ -537,12 +537,10 @@ async def handle_stripe_webhook(
 
                     if not skip_platform_order_creation:
                         # 触发 Shopify 订单创建
-                        from routes.merchant_onboarding_routes import get_merchant_onboarding
                         from routes.order_routes import create_shopify_order
 
-                        merchant = await get_merchant_onboarding(merchant_id)
                         store_info = await get_primary_store(merchant_id)
-                        if merchant and store_info and store_info.get("platform") == "shopify":
+                        if store_info and store_info.get("platform") == "shopify":
                             logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
                             try:
                                 success = await create_shopify_order(order_id)

@@ -12,7 +12,11 @@ from databases import Database
 from db.orders import get_order, update_order
 from db.database import database as db
 from adapters.psp_adapter import get_psp_adapter
-from services.merchant_psp_config_service import build_runtime_adapter_kwargs
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    fetch_active_runtime_merchant_psp,
+    infer_runtime_provider,
+)
 from utils.logger import logger
 from config.settings import settings
 
@@ -239,22 +243,11 @@ class RefundService:
         """Process refund with payment service provider"""
         try:
             # Resolve PSP type for this order (prefer the PSP that actually processed it).
-            order_psp_type = str(order.get("psp_used") or "").strip().lower() or None
-            if not order_psp_type:
-                psp_id = str(order.get("psp_id") or "").strip().lower()
-                if psp_id.startswith("psp_stripe"):
-                    order_psp_type = "stripe"
-                elif psp_id.startswith("psp_adyen"):
-                    order_psp_type = "adyen"
-                elif psp_id.startswith("psp_checkout"):
-                    order_psp_type = "checkout"
-                elif psp_id.startswith("psp_paypal"):
-                    order_psp_type = "paypal"
-
-            if not order_psp_type:
-                payment_intent_id_guess = str(order.get("payment_intent_id") or "")
-                if payment_intent_id_guess.startswith("pi_"):
-                    order_psp_type = "stripe"
+            order_psp_type = infer_runtime_provider(
+                psp_used=order.get("psp_used"),
+                psp_id=order.get("psp_id"),
+                payment_reference=order.get("payment_intent_id"),
+            )
 
             psp_type = order_psp_type or "stripe"
             merchant_id = str(order.get("merchant_id") or "")
@@ -262,39 +255,25 @@ class RefundService:
             psp_key: Optional[str] = None
             adapter_kwargs: Dict[str, Any] = {}
 
-            merchant_psp_row = None
             order_psp_id = str(order.get("psp_id") or "").strip()
             if merchant_id:
                 try:
-                    if order_psp_id:
-                        merchant_psp_row = await self.db.fetch_one(
-                            """
-                            SELECT provider, api_key, account_id, secret_key, environment, provider_config
-                            FROM merchant_psps
-                            WHERE merchant_id = :merchant_id AND psp_id = :psp_id
-                            LIMIT 1
-                            """,
-                            {"merchant_id": merchant_id, "psp_id": order_psp_id},
-                        )
-                    if not merchant_psp_row:
-                        merchant_psp_row = await self.db.fetch_one(
-                            """
-                            SELECT provider, api_key, account_id, secret_key, environment, provider_config
-                            FROM merchant_psps
-                            WHERE merchant_id = :merchant_id AND provider = :provider AND status = 'active'
-                            ORDER BY connected_at DESC NULLS LAST
-                            LIMIT 1
-                            """,
-                            {"merchant_id": merchant_id, "provider": psp_type},
-                        )
+                    merchant_psp_row = await fetch_active_runtime_merchant_psp(
+                        merchant_id=merchant_id,
+                        provider=psp_type,
+                        psp_id=order_psp_id,
+                        database_override=self.db,
+                    )
                 except Exception as exc:
                     logger.warning(f"Canonical merchant_psps lookup failed for refund {refund_id}: {exc}")
+                    merchant_psp_row = None
 
             if merchant_psp_row:
                 row_dict = dict(merchant_psp_row)
-                psp_key = row_dict.get("api_key")
+                psp_key = row_dict.get("runtime_secret_key") or row_dict.get("api_key")
                 adapter_kwargs = build_runtime_adapter_kwargs(
                     psp_type,
+                    api_key=psp_key,
                     account_id=row_dict.get("account_id"),
                     provider_config=row_dict.get("provider_config"),
                     environment=row_dict.get("environment"),

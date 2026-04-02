@@ -12,6 +12,7 @@ CANONICAL_RUNTIME_FILES = [
     "routes/order_routes.py",
     "routes/payment_execution_routes.py",
     "routes/merchant_dashboard_routes.py",
+    "routes/refund_api.py",
     "services/refund_service.py",
     "services/merchant_payment_initiation_service.py",
     "adapters/multi_psp_orchestrator.py",
@@ -21,10 +22,15 @@ CANONICAL_RUNTIME_FILES = [
 
 LEGACY_PATTERNS = {
     "merchant_onboarding_fallback": [
-        "get_merchant_onboarding",
-        "psp_sandbox_key",
+        "merchant.get(\"psp_connected\")",
+        "merchant.get('psp_connected')",
         "merchant.get(\"psp_type\")",
         "merchant.get('psp_type')",
+        "psp_sandbox_key",
+        "merchant.get(\"psp_key\")",
+        "merchant.get('psp_key')",
+        "merchant.get(\"backup_psps\")",
+        "merchant.get('backup_psps')",
     ],
     "legacy_routing_table": [
         "payment_router_config",
@@ -38,6 +44,9 @@ LEGACY_PATTERNS = {
 }
 
 PSP_DEBUG_ROUTERS = [
+    "debug_integrations_router",
+    "init_merchant_data_router",
+    "cleanup_all_duplicates_router",
     "debug_psp_router",
     "debug_psp_validation_router",
     "admin_recover_psps_router",
@@ -104,9 +113,7 @@ def _scan_main_router_surface() -> Dict[str, object]:
                         "code": line.strip(),
                     }
                 )
-    gated = "ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES" in main_path.read_text(encoding="utf-8")
     return {
-        "maintenance_gate_present": gated,
         "mounted_debug_routers": mounted,
     }
 

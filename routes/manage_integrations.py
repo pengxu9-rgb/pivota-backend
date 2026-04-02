@@ -3,6 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Dict, Any
 from db.database import database
 from utils.auth import get_current_user
+from services.merchant_psp_config_service import (
+    persist_canonical_merchant_psp,
+)
 import json
 import httpx
 
@@ -321,37 +324,53 @@ async def update_psp(
     
     try:
         # Verify ownership
-        check_query = "SELECT psp_id FROM merchant_psps WHERE psp_id = :psp_id AND merchant_id = :merchant_id"
+        check_query = """
+            SELECT psp_id, provider, name, api_key, account_id, secret_key, environment,
+                   provider_config, capabilities, status, connected_at, validation_status,
+                   validation_error, last_validated_at
+            FROM merchant_psps
+            WHERE psp_id = :psp_id AND merchant_id = :merchant_id
+        """
         psp = await database.fetch_one(check_query, {"psp_id": psp_id, "merchant_id": merchant_id})
         
         if not psp:
             raise HTTPException(status_code=404, detail="PSP not found or not owned by this merchant")
-        
-        # Build update query dynamically
-        update_fields = []
-        values = {"psp_id": psp_id, "merchant_id": merchant_id}
-        
-        if "api_key" in psp_data:
-            update_fields.append("api_key = :api_key")
-            values["api_key"] = psp_data["api_key"]
-        
-        if "status" in psp_data:
-            update_fields.append("status = :status")
-            values["status"] = psp_data["status"]
-        
-        if "name" in psp_data:
-            update_fields.append("name = :name")
-            values["name"] = psp_data["name"]
-        
-        if not update_fields:
+
+        psp_row = dict(psp)
+        provider = str(psp_row.get("provider") or "").strip().lower()
+
+        if "api_key" not in psp_data and "status" not in psp_data and "name" not in psp_data:
             raise HTTPException(status_code=400, detail="No fields to update")
-        
-        update_query = f"""
-            UPDATE merchant_psps 
-            SET {", ".join(update_fields)}
-            WHERE psp_id = :psp_id AND merchant_id = :merchant_id
-        """
-        await database.execute(update_query, values)
+
+        api_key = str(psp_data.get("api_key") if "api_key" in psp_data else psp_row.get("api_key") or "").strip()
+        if not api_key:
+            raise HTTPException(status_code=400, detail="api_key cannot be empty")
+
+        status_value = str(
+            psp_data.get("status") if "status" in psp_data else psp_row.get("status") or "active"
+        ).strip().lower()
+        if status_value not in {"active", "inactive"}:
+            raise HTTPException(status_code=400, detail="status must be active or inactive")
+
+        name_value = psp_data.get("name") if "name" in psp_data else psp_row.get("name")
+
+        async with database.transaction():
+            await persist_canonical_merchant_psp(
+                merchant_id=merchant_id,
+                provider=provider,
+                api_key=api_key,
+                account_id=psp_row.get("account_id"),
+                secret_key=psp_row.get("secret_key"),
+                environment=psp_row.get("environment"),
+                provider_config=psp_row.get("provider_config"),
+                name=name_value,
+                capabilities=psp_row.get("capabilities"),
+                status=status_value,
+                connected_at=psp_row.get("connected_at"),
+                psp_id=psp_id,
+                existing_row=psp_row,
+                stripe_mode="payment_intent",
+            )
         
         return {
             "status": "success",
@@ -393,10 +412,5 @@ async def cleanup_integrations(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup: {str(e)}")
-
-
-
-
-
 
 

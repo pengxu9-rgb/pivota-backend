@@ -10,20 +10,22 @@ from typing import Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime
 
-from db.database import database
 from db.orders import get_order, update_order_status
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from utils.auth import require_admin
 from adapters.psp_adapter import get_psp_adapter
-from config.settings import settings
 from utils.logger import logger
 from services.shopify_transactions_service import (
     ensure_external_refund_transaction_best_effort,
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.merchant_webhook_service import emit_merchant_webhook_event
-from services.merchant_psp_config_service import build_runtime_adapter_kwargs
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    fetch_active_runtime_merchant_psp,
+    infer_runtime_provider,
+)
 from services.psp_payment_finalizer import finalize_refund_success
 
 
@@ -39,56 +41,19 @@ class RefundRequest(BaseModel):
     idempotency_key: Optional[str] = None  # Best-effort duplicate protection
 
 
-async def _resolve_refund_adapter(order: Dict[str, Any], merchant: Dict[str, Any]) -> tuple[str, str, Dict[str, Any]]:
-    order_psp_type = str(order.get("psp_used") or "").strip().lower() or None
-    if not order_psp_type:
-        psp_id = str(order.get("psp_id") or "").strip().lower()
-        if psp_id.startswith("psp_stripe"):
-            order_psp_type = "stripe"
-        elif psp_id.startswith("psp_adyen"):
-            order_psp_type = "adyen"
-        elif psp_id.startswith("psp_checkout"):
-            order_psp_type = "checkout"
-
-    if not order_psp_type:
-        payment_intent_id = str(order.get("payment_intent_id") or "")
-        if payment_intent_id.startswith("pi_"):
-            order_psp_type = "stripe"
-        elif payment_intent_id.startswith("chk_") or payment_intent_id.startswith("pay_"):
-            order_psp_type = "checkout"
-
-    canonical_row = None
+async def _resolve_refund_adapter(order: Dict[str, Any]) -> tuple[str, str, Dict[str, Any]]:
+    order_psp_type = infer_runtime_provider(
+        psp_used=order.get("psp_used"),
+        psp_id=order.get("psp_id"),
+        payment_reference=order.get("payment_intent_id"),
+    )
     merchant_id = str(order.get("merchant_id") or "")
     order_psp_id = str(order.get("psp_id") or "").strip()
-
-    if order_psp_id:
-        canonical_row = await database.fetch_one(
-            """
-            SELECT *,
-                   COALESCE(secret_key, api_key) AS runtime_secret_key
-            FROM merchant_psps
-            WHERE merchant_id = :merchant_id
-              AND psp_id = :psp_id
-              AND status = 'active'
-            LIMIT 1
-            """,
-            {"merchant_id": merchant_id, "psp_id": order_psp_id},
-        )
-
-    if canonical_row is None and order_psp_type:
-        canonical_row = await database.fetch_one(
-            """
-            SELECT *,
-                   COALESCE(secret_key, api_key) AS runtime_secret_key
-            FROM merchant_psps
-            WHERE merchant_id = :merchant_id
-              AND LOWER(provider) = :provider
-              AND status = 'active'
-            ORDER BY connected_at DESC NULLS LAST, created_at DESC NULLS LAST
-            LIMIT 1
-            """,
-            {"merchant_id": merchant_id, "provider": order_psp_type},
-        )
+    canonical_row = await fetch_active_runtime_merchant_psp(
+        merchant_id=merchant_id,
+        provider=order_psp_type,
+        psp_id=order_psp_id,
+    )
 
     if canonical_row is not None:
         canonical = dict(canonical_row)
@@ -100,6 +65,7 @@ async def _resolve_refund_adapter(order: Dict[str, Any], merchant: Dict[str, Any
                 psp_key,
                 build_runtime_adapter_kwargs(
                     psp_type,
+                    api_key=psp_key,
                     account_id=canonical.get("account_id"),
                     provider_config=canonical.get("provider_config"),
                     environment=canonical.get("environment"),
@@ -107,24 +73,11 @@ async def _resolve_refund_adapter(order: Dict[str, Any], merchant: Dict[str, Any
                 ),
             )
 
-    if order_psp_type in {"stripe", "adyen", "checkout"}:
+    if order_psp_type in {"stripe", "adyen", "checkout", "paypal"}:
         raise ValueError(
             f"Canonical merchant_psps configuration is missing for {order_psp_type} refunds"
         )
-
-    merchant_psp_type = str(merchant.get("psp_type") or "").strip().lower() or None
-    psp_type = order_psp_type or merchant_psp_type or "stripe"
-    psp_key = None
-    if merchant_psp_type and merchant_psp_type == psp_type:
-        psp_key = merchant.get("psp_sandbox_key") or merchant.get("psp_key")
-    if not psp_key:
-        if psp_type == "stripe":
-            psp_key = settings.stripe_secret_key
-        elif psp_type == "adyen":
-            psp_key = settings.adyen_api_key
-        else:
-            psp_key = settings.checkout_secret_key
-    return psp_type, psp_key, {}
+    raise ValueError("Canonical merchant_psps configuration is missing for this refund")
 
 
 @router.post("/{order_id}/refund")
@@ -277,10 +230,10 @@ async def process_refund(
         except Exception:
             pass
 
-        psp_type, psp_key, adapter_kwargs = await _resolve_refund_adapter(order, merchant)
+        psp_type, psp_key, adapter_kwargs = await _resolve_refund_adapter(order)
         
         if not psp_key:
-            raise ValueError(f"No PSP key found for merchant {merchant['merchant_id']}")
+            raise ValueError(f"No PSP key found for merchant {order['merchant_id']}")
         
         psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
         

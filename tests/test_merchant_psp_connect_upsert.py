@@ -41,6 +41,7 @@ def test_connect_psp_reuses_existing_provider_row(monkeypatch) -> None:
                 "provider_config": None,
                 "account_id": None,
                 "environment": "unknown",
+                "api_key": "sk_live_existing_key",
             },
             {
                 "psp_id": "psp_stripe_old",
@@ -49,6 +50,7 @@ def test_connect_psp_reuses_existing_provider_row(monkeypatch) -> None:
                 "provider_config": None,
                 "account_id": None,
                 "environment": "unknown",
+                "api_key": "sk_live_old_key",
             },
         ]
 
@@ -147,6 +149,63 @@ def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> No
                 },
                 "account_id": None,
                 "environment": "live",
+                "api_key": "sk_live_existing_key",
+            }
+        ]
+
+    async def fake_execute(query, values=None):
+        executed.append((" ".join(query.split()), dict(values or {})))
+
+    @asynccontextmanager
+    async def fake_transaction():
+        yield
+
+    monkeypatch.setattr(module, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module.database, "transaction", lambda: fake_transaction())
+
+    response = client.post(
+        "/merchant/integrations/psp/connect",
+        json={
+            "provider": "stripe",
+            "api_key": "sk_live_existing_key",
+            "environment": "live",
+        },
+    )
+
+    assert response.status_code == 200
+    update_values = next(
+        values for query, values in executed if query.startswith("UPDATE merchant_psps SET merchant_id = :merchant_id")
+    )
+    provider_config = json.loads(update_values["provider_config"])
+    assert provider_config["mode"] == "payment_intent"
+    assert provider_config["webhook_endpoint_id"] == "we_existing"
+    assert provider_config["webhook_endpoint_secret"] == "whsec_existing"
+
+
+def test_connect_psp_clears_existing_stripe_webhook_fields_when_key_changes(monkeypatch) -> None:
+    client, module = _build_client()
+    executed = []
+
+    async def fake_get_merchant_id_from_user(current_user):
+        return "merch_test_connect"
+
+    async def fake_fetch_all(query, values=None):
+        return [
+            {
+                "psp_id": "psp_stripe_existing",
+                "status": "active",
+                "connected_at": None,
+                "provider_config": {
+                    "mode": "payment_intent",
+                    "webhook_endpoint_id": "we_existing",
+                    "webhook_endpoint_secret": "whsec_existing",
+                    "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_existing",
+                },
+                "account_id": "acct_old",
+                "environment": "test",
+                "api_key": "sk_test_existing_key",
             }
         ]
 
@@ -167,6 +226,7 @@ def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> No
         json={
             "provider": "stripe",
             "api_key": "sk_live_replacement_key",
+            "account_id": "acct_live_new",
             "environment": "live",
         },
     )
@@ -177,8 +237,9 @@ def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> No
     )
     provider_config = json.loads(update_values["provider_config"])
     assert provider_config["mode"] == "payment_intent"
-    assert provider_config["webhook_endpoint_id"] == "we_existing"
-    assert provider_config["webhook_endpoint_secret"] == "whsec_existing"
+    assert provider_config["account_id"] == "acct_live_new"
+    assert "webhook_endpoint_id" not in provider_config
+    assert "webhook_endpoint_secret" not in provider_config
 
 
 def test_get_order_detail_uses_order_total_refunded_when_record_lacks_get(monkeypatch) -> None:

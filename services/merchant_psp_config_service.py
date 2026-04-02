@@ -8,7 +8,12 @@ paths stop reinterpreting merchant_psps rows differently in each route.
 from __future__ import annotations
 
 import json
+import secrets
+import string
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from db.database import database
 
 
 SUPPORTED_CANONICAL_PSPS = {"stripe", "adyen", "checkout"}
@@ -29,34 +34,64 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     return {}
 
 
-def normalize_psp_environment(provider: str, api_key: Optional[str], environment: Optional[str]) -> str:
-    env = str(environment or "").strip().lower()
-    if env in {"live", "test"}:
-        return env
+def _json_sortable(value: Any) -> str:
+    return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
 
+
+def _generate_psp_id(provider: str) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    suffix = "".join(secrets.choice(alphabet) for _ in range(12))
+    return f"psp_{provider}_{suffix}"
+
+
+def default_capabilities_for_provider(provider: str) -> List[str]:
+    provider_norm = str(provider or "").strip().lower()
+    if provider_norm == "stripe":
+        return ["payments", "refunds", "payouts", "subscriptions"]
+    if provider_norm == "adyen":
+        return ["payments", "refunds", "payouts"]
+    if provider_norm == "checkout":
+        return ["payments", "refunds"]
+    if provider_norm == "paypal":
+        return ["payments", "refunds", "payouts"]
+    return ["payments"]
+
+
+def normalize_psp_environment(provider: str, api_key: Optional[str], environment: Optional[str]) -> str:
     key = str(api_key or "").strip().lower()
     provider_norm = str(provider or "").strip().lower()
+    env = str(environment or "").strip().lower()
+    derived_env = "unknown"
 
     if provider_norm == "stripe":
         if key.startswith("sk_live_") or key.startswith("pk_live_"):
-            return "live"
-        if key.startswith("sk_test_") or key.startswith("pk_test_"):
-            return "test"
+            derived_env = "live"
+        elif key.startswith("sk_test_") or key.startswith("pk_test_"):
+            derived_env = "test"
     elif provider_norm == "checkout":
         if key.startswith("sk_live_") or key.startswith("pk_live_"):
-            return "live"
-        if (
+            derived_env = "live"
+        elif (
             key.startswith("sk_test_")
             or key.startswith("pk_test_")
             or key.startswith("sk_sbox_")
             or key.startswith("pk_sbox_")
         ):
-            return "test"
+            derived_env = "test"
     elif provider_norm == "adyen":
         if key.startswith("live_"):
-            return "live"
-        if key.startswith("test_"):
-            return "test"
+            derived_env = "live"
+        elif key.startswith("test_"):
+            derived_env = "test"
+
+    # Secret-key prefixes are a stronger signal than any persisted environment
+    # flag. This prevents rows marked "live" from still routing through test
+    # credentials after a partial or stale portal update.
+    if derived_env in {"live", "test"}:
+        return derived_env
+
+    if env in {"live", "test"}:
+        return env
 
     return "unknown"
 
@@ -181,6 +216,69 @@ def build_provider_summary(
     }
 
 
+def should_reset_stripe_webhook_config(
+    *,
+    previous_api_key: Optional[str] = None,
+    previous_account_id: Optional[str] = None,
+    previous_environment: Optional[str] = None,
+    next_api_key: Optional[str] = None,
+    next_account_id: Optional[str] = None,
+    next_environment: Optional[str] = None,
+) -> bool:
+    previous_key = str(previous_api_key or "").strip()
+    next_key = str(next_api_key or "").strip()
+    previous_account = str(previous_account_id or "").strip()
+    next_account = str(next_account_id or "").strip()
+    previous_env = normalize_psp_environment("stripe", previous_api_key, previous_environment)
+    next_env = normalize_psp_environment("stripe", next_api_key, next_environment)
+
+    return bool(
+        ((previous_key or next_key) and previous_key != next_key)
+        or previous_env != next_env
+        or ((previous_account or next_account) and previous_account != next_account)
+    )
+
+
+def build_stripe_connect_provider_config(
+    *,
+    existing_provider_config: Optional[Any] = None,
+    previous_api_key: Optional[str] = None,
+    previous_account_id: Optional[str] = None,
+    previous_environment: Optional[str] = None,
+    next_api_key: Optional[str] = None,
+    next_account_id: Optional[str] = None,
+    next_environment: Optional[str] = None,
+    mode: str = "payment_intent",
+) -> Dict[str, Any]:
+    mode_value = str(mode or "payment_intent").strip().lower()
+    if mode_value not in {"payment_intent", "checkout_session"}:
+        mode_value = "payment_intent"
+
+    config: Dict[str, Any] = {"mode": mode_value}
+    reset_webhook_config = should_reset_stripe_webhook_config(
+        previous_api_key=previous_api_key,
+        previous_account_id=previous_account_id,
+        previous_environment=previous_environment,
+        next_api_key=next_api_key,
+        next_account_id=next_account_id,
+        next_environment=next_environment,
+    )
+    if reset_webhook_config:
+        return config
+
+    existing = normalize_provider_config(
+        "stripe",
+        account_id=previous_account_id,
+        provider_config=existing_provider_config,
+        environment=previous_environment,
+    )
+    for key in ("webhook_endpoint_id", "webhook_endpoint_secret", "webhook_url"):
+        value = str(existing.get(key) or "").strip()
+        if value:
+            config[key] = value
+    return config
+
+
 def build_provider_connect_record(
     provider: str,
     *,
@@ -221,6 +319,7 @@ def build_provider_connect_record(
 def build_runtime_adapter_kwargs(
     provider: str,
     *,
+    api_key: Optional[str] = None,
     account_id: Optional[str] = None,
     provider_config: Optional[Any] = None,
     environment: Optional[str] = None,
@@ -233,7 +332,7 @@ def build_runtime_adapter_kwargs(
         provider_config=provider_config,
         environment=environment,
     )
-    env_value = normalize_psp_environment(provider_norm, None, environment)
+    env_value = normalize_psp_environment(provider_norm, api_key or secret_key, environment)
 
     if provider_norm == "stripe":
         kwargs: Dict[str, Any] = {
@@ -358,3 +457,403 @@ def parse_capabilities(raw: Any) -> List[str]:
     if isinstance(raw, str):
         return [item.strip() for item in raw.split(",") if item.strip()]
     return []
+
+
+def infer_runtime_provider(
+    *,
+    psp_used: Optional[str] = None,
+    psp_id: Optional[str] = None,
+    payment_reference: Optional[str] = None,
+    fallback_provider: Optional[str] = None,
+) -> Optional[str]:
+    supported_runtime_providers = SUPPORTED_CANONICAL_PSPS | {"paypal"}
+
+    provider_value = str(psp_used or "").strip().lower()
+    if provider_value in supported_runtime_providers:
+        return provider_value
+
+    psp_id_value = str(psp_id or "").strip().lower()
+    if psp_id_value.startswith("psp_stripe"):
+        return "stripe"
+    if psp_id_value.startswith("psp_adyen"):
+        return "adyen"
+    if psp_id_value.startswith("psp_checkout"):
+        return "checkout"
+    if psp_id_value.startswith("psp_paypal"):
+        return "paypal"
+
+    payment_reference_value = str(payment_reference or "").strip().lower()
+    if payment_reference_value.startswith("pi_"):
+        return "stripe"
+    if payment_reference_value.startswith("chk_") or payment_reference_value.startswith("pay_"):
+        return "checkout"
+
+    fallback_value = str(fallback_provider or "").strip().lower()
+    if fallback_value in supported_runtime_providers:
+        return fallback_value
+    return None
+
+
+async def fetch_active_merchant_psps(
+    *,
+    merchant_id: str,
+    provider: Optional[str] = None,
+    database_override: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    merchant_value = str(merchant_id or "").strip()
+    if not merchant_value:
+        return []
+    db_client = database_override or database
+
+    params: Dict[str, Any] = {"merchant_id": merchant_value}
+    provider_clause = ""
+    provider_value = str(provider or "").strip().lower()
+    if provider_value:
+        provider_clause = "AND provider = :provider"
+        params["provider"] = provider_value
+
+    rows = await db_client.fetch_all(
+        f"""
+        SELECT psp_id, merchant_id, provider, name, api_key, account_id, secret_key,
+               capabilities, status, connected_at, environment, provider_config,
+               validation_status, validation_error, last_validated_at,
+               COALESCE(secret_key, api_key) AS runtime_secret_key
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id
+          AND status = 'active'
+          {provider_clause}
+        ORDER BY connected_at DESC NULLS LAST, psp_id ASC
+        """,
+        params,
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def fetch_active_runtime_merchant_psp(
+    *,
+    merchant_id: str,
+    provider: Optional[str] = None,
+    psp_id: Optional[str] = None,
+    database_override: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    merchant_value = str(merchant_id or "").strip()
+    if not merchant_value:
+        return None
+    db_client = database_override or database
+
+    psp_id_value = str(psp_id or "").strip()
+    if psp_id_value:
+        row = await db_client.fetch_one(
+            """
+            SELECT psp_id, merchant_id, provider, name, api_key, account_id, secret_key,
+                   capabilities, status, connected_at, environment, provider_config,
+                   validation_status, validation_error, last_validated_at,
+                   COALESCE(secret_key, api_key) AS runtime_secret_key
+            FROM merchant_psps
+            WHERE merchant_id = :merchant_id
+              AND psp_id = :psp_id
+              AND status = 'active'
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_value,
+                "psp_id": psp_id_value,
+            },
+        )
+        if row:
+            return dict(row)
+
+    rows = await fetch_active_merchant_psps(
+        merchant_id=merchant_value,
+        provider=provider,
+        database_override=db_client,
+    )
+    return rows[0] if rows else None
+
+
+async def fetch_canonical_merchant_psp(
+    *,
+    merchant_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    psp_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if psp_id:
+        row = await database.fetch_one(
+            """
+            SELECT psp_id, merchant_id, provider, name, api_key, account_id, secret_key,
+                   capabilities, status, connected_at, environment, provider_config,
+                   validation_status, validation_error, last_validated_at
+            FROM merchant_psps
+            WHERE psp_id = :psp_id
+            """,
+            {"psp_id": psp_id},
+        )
+        if not row:
+            return None
+        payload = dict(row)
+        if merchant_id and str(payload.get("merchant_id") or "").strip() != str(merchant_id).strip():
+            return None
+        if provider and str(payload.get("provider") or "").strip().lower() != str(provider).strip().lower():
+            return None
+        return payload
+
+    merchant_value = str(merchant_id or "").strip()
+    provider_value = str(provider or "").strip().lower()
+    if not merchant_value or not provider_value:
+        return None
+
+    rows = await database.fetch_all(
+        """
+        SELECT psp_id, merchant_id, provider, name, api_key, account_id, secret_key,
+               capabilities, status, connected_at, environment, provider_config,
+               validation_status, validation_error, last_validated_at
+        FROM merchant_psps
+        WHERE merchant_id = :merchant_id
+          AND provider = :provider
+        ORDER BY
+            CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+            connected_at DESC NULLS LAST,
+            psp_id ASC
+        """,
+        {"merchant_id": merchant_value, "provider": provider_value},
+    )
+    if not rows:
+        return None
+    return dict(rows[0])
+
+
+async def persist_canonical_merchant_psp(
+    *,
+    merchant_id: str,
+    provider: str,
+    api_key: str,
+    account_id: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    environment: Optional[str] = None,
+    provider_config: Optional[Any] = None,
+    name: Optional[str] = None,
+    capabilities: Optional[Any] = None,
+    status: str = "active",
+    connected_at: Optional[datetime] = None,
+    psp_id: Optional[str] = None,
+    existing_row: Optional[Dict[str, Any]] = None,
+    validation_status: Optional[str] = None,
+    validation_error: Optional[str] = None,
+    stripe_mode: str = "payment_intent",
+) -> Dict[str, Any]:
+    merchant_value = str(merchant_id or "").strip()
+    provider_norm = str(provider or "").strip().lower()
+    api_key_value = str(api_key or "").strip()
+    account_value = str(account_id or "").strip() or None
+    requested_environment = str(environment or "").strip().lower() or None
+    status_value = str(status or "active").strip().lower() or "active"
+
+    canonical_existing = (
+        dict(existing_row)
+        if existing_row
+        else await fetch_canonical_merchant_psp(
+            merchant_id=merchant_value,
+            provider=provider_norm,
+            psp_id=psp_id,
+        )
+    )
+    existing_provider_config = _as_dict(canonical_existing.get("provider_config")) if canonical_existing else {}
+
+    next_provider_config = provider_config
+    if provider_norm == "stripe":
+        next_provider_config = build_stripe_connect_provider_config(
+            existing_provider_config=existing_provider_config,
+            previous_api_key=canonical_existing.get("api_key") if canonical_existing else None,
+            previous_account_id=canonical_existing.get("account_id") if canonical_existing else None,
+            previous_environment=canonical_existing.get("environment") if canonical_existing else None,
+            next_api_key=api_key_value,
+            next_account_id=account_value,
+            next_environment=requested_environment,
+            mode=stripe_mode,
+        )
+    elif next_provider_config is None and canonical_existing:
+        next_provider_config = existing_provider_config
+
+    record = build_provider_connect_record(
+        provider_norm,
+        api_key=api_key_value,
+        account_id=account_value,
+        provider_config=next_provider_config,
+        environment=requested_environment,
+        validation_status=validation_status or "unknown",
+        validation_error=validation_error,
+    )
+
+    previous_record = (
+        build_provider_connect_record(
+            provider_norm,
+            api_key=str(canonical_existing.get("api_key") or "").strip(),
+            account_id=canonical_existing.get("account_id"),
+            provider_config=canonical_existing.get("provider_config"),
+            environment=canonical_existing.get("environment"),
+            validation_status=canonical_existing.get("validation_status"),
+            validation_error=canonical_existing.get("validation_error"),
+        )
+        if canonical_existing
+        else None
+    )
+    truth_changed = (
+        previous_record is None
+        or str(canonical_existing.get("api_key") or "").strip() != api_key_value
+        or str(canonical_existing.get("account_id") or "").strip() != str(account_value or "").strip()
+        or str(previous_record.get("environment") or "") != str(record.get("environment") or "")
+        or _json_sortable(previous_record.get("provider_config")) != _json_sortable(record.get("provider_config"))
+    )
+
+    if truth_changed:
+        final_validation_status = normalize_validation_status(validation_status or "unknown")
+        final_validation_error = validation_error
+        last_validated_at_value = None
+    else:
+        final_validation_status = normalize_validation_status(
+            canonical_existing.get("validation_status") if canonical_existing else validation_status
+        )
+        final_validation_error = (
+            canonical_existing.get("validation_error") if canonical_existing else validation_error
+        )
+        last_validated_at_value = canonical_existing.get("last_validated_at") if canonical_existing else None
+
+    capabilities_list = parse_capabilities(
+        capabilities if capabilities is not None else canonical_existing.get("capabilities") if canonical_existing else None
+    )
+    if not capabilities_list:
+        capabilities_list = default_capabilities_for_provider(provider_norm)
+
+    connected_at_value = (
+        connected_at
+        or (canonical_existing.get("connected_at") if canonical_existing else None)
+        or datetime.now()
+    )
+    psp_id_value = (
+        str(psp_id or "").strip()
+        or (str(canonical_existing.get("psp_id") or "").strip() if canonical_existing else "")
+        or _generate_psp_id(provider_norm)
+    )
+    name_value = (
+        str(name or "").strip()
+        or (str(canonical_existing.get("name") or "").strip() if canonical_existing else "")
+        or f"{provider_norm.capitalize()} Account"
+    )
+    secret_value = (
+        secret_key
+        if secret_key is not None
+        else (canonical_existing.get("secret_key") if canonical_existing else None)
+    )
+
+    params = {
+        "psp_id": psp_id_value,
+        "merchant_id": merchant_value,
+        "provider": provider_norm,
+        "name": name_value,
+        "api_key": api_key_value,
+        "account_id": account_value,
+        "capabilities": ",".join(capabilities_list),
+        "status": status_value,
+        "connected_at": connected_at_value,
+        "secret_key": secret_value,
+        "environment": record["environment"],
+        "provider_config": json.dumps(record["provider_config"] or {}),
+        "validation_status": final_validation_status,
+        "validation_error": final_validation_error,
+        "last_validated_at": last_validated_at_value,
+    }
+
+    if status_value == "active":
+        await database.execute(
+            """
+            UPDATE merchant_psps
+            SET status = 'inactive'
+            WHERE merchant_id = :merchant_id
+              AND provider = :provider
+              AND status = 'active'
+              AND psp_id != :psp_id
+            """,
+            {
+                "merchant_id": merchant_value,
+                "provider": provider_norm,
+                "psp_id": psp_id_value,
+            },
+        )
+
+    if canonical_existing:
+        await database.execute(
+            """
+            UPDATE merchant_psps
+            SET merchant_id = :merchant_id,
+                provider = :provider,
+                name = :name,
+                api_key = :api_key,
+                account_id = :account_id,
+                capabilities = :capabilities,
+                status = :status,
+                connected_at = :connected_at,
+                secret_key = :secret_key,
+                environment = :environment,
+                provider_config = CAST(:provider_config AS JSONB),
+                validation_status = :validation_status,
+                validation_error = :validation_error,
+                last_validated_at = :last_validated_at
+            WHERE psp_id = :psp_id
+            """,
+            params,
+        )
+    else:
+        await database.execute(
+            """
+            INSERT INTO merchant_psps (
+                psp_id,
+                merchant_id,
+                provider,
+                name,
+                api_key,
+                account_id,
+                capabilities,
+                status,
+                connected_at,
+                secret_key,
+                environment,
+                provider_config,
+                validation_status,
+                validation_error,
+                last_validated_at
+            )
+            VALUES (
+                :psp_id,
+                :merchant_id,
+                :provider,
+                :name,
+                :api_key,
+                :account_id,
+                :capabilities,
+                :status,
+                :connected_at,
+                :secret_key,
+                :environment,
+                CAST(:provider_config AS JSONB),
+                :validation_status,
+                :validation_error,
+                :last_validated_at
+            )
+            """,
+            params,
+        )
+
+    return {
+        "psp_id": psp_id_value,
+        "record": {
+            **record,
+            "validation_status": final_validation_status,
+            "validation_error": final_validation_error,
+        },
+        "reused_existing": bool(canonical_existing),
+        "name": name_value,
+        "status": status_value,
+        "capabilities": capabilities_list,
+        "connected_at": connected_at_value,
+        "truth_changed": truth_changed,
+    }

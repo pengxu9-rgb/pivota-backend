@@ -1314,6 +1314,7 @@ async def test_psp_connection(
                 api_key,
                 **build_runtime_adapter_kwargs(
                     provider,
+                    api_key=api_key,
                     account_id=psp_row.get("account_id"),
                     provider_config=psp_row.get("provider_config"),
                     environment=provider_summary.get("environment"),

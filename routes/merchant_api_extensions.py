@@ -24,7 +24,7 @@ import hashlib
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_psp_config_service import (
     SUPPORTED_CANONICAL_PSPS,
-    build_provider_connect_record,
+    persist_canonical_merchant_psp,
 )
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
@@ -1541,45 +1541,9 @@ async def connect_psp(
     secret_key = str(psp_data.get("secret_key") or "").strip() or None
     account_id = str(psp_data.get("account_id") or "").strip() or None
     environment = str(psp_data.get("environment") or "").strip().lower() or None
-    provider_config: Dict[str, Any] = {}
+    provider_config: Optional[Dict[str, Any]] = None
 
-    existing_rows = await database.fetch_all(
-        """
-        SELECT psp_id, status, connected_at, provider_config, account_id, environment
-        FROM merchant_psps
-        WHERE merchant_id = :merchant_id
-          AND provider = :provider
-        ORDER BY
-            CASE WHEN status = 'active' THEN 0 ELSE 1 END,
-            connected_at DESC NULLS LAST,
-            psp_id ASC
-        """,
-        {"merchant_id": merchant_id, "provider": provider},
-    )
-    canonical_existing = dict(existing_rows[0]) if existing_rows else None
-
-    existing_provider_config: Dict[str, Any] = {}
-    if canonical_existing:
-        raw_provider_config = canonical_existing.get("provider_config")
-        if isinstance(raw_provider_config, dict):
-            existing_provider_config = dict(raw_provider_config)
-        elif isinstance(raw_provider_config, str):
-            try:
-                parsed_provider_config = json.loads(raw_provider_config)
-                if isinstance(parsed_provider_config, dict):
-                    existing_provider_config = dict(parsed_provider_config)
-            except Exception:
-                existing_provider_config = {}
-
-    if provider == "stripe":
-        # Merchant-facing Stripe setup is always stored as PaymentIntent.
-        # Stripe Checkout remains an internal/runtime override, not a merchant config choice.
-        provider_config["mode"] = "payment_intent"
-        for key in ("webhook_endpoint_id", "webhook_endpoint_secret", "webhook_url"):
-            value = str(existing_provider_config.get(key) or "").strip()
-            if value:
-                provider_config[key] = value
-    elif provider == "adyen":
+    if provider == "adyen":
         merchant_account = str(psp_data.get("merchant_account") or account_id or "").strip()
         client_key = str(psp_data.get("client_key") or "").strip()
         if not merchant_account:
@@ -1605,142 +1569,25 @@ async def connect_psp(
             "processing_channel_id": processing_channel_id,
             "public_key": public_key,
         }
-
-    record = build_provider_connect_record(
-        provider,
-        api_key=api_key,
-        account_id=account_id,
-        provider_config=provider_config,
-        environment=environment,
-        validation_status="unknown",
-        validation_error=None,
-    )
-
-    # Save to database
-    psp_id = (
-        canonical_existing["psp_id"]
-        if canonical_existing and canonical_existing.get("psp_id")
-        else f"psp_{provider}_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    )
     capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen", "checkout"] else ["card"]
-    connected_at = datetime.now()
-    
-    new_psp = {
-        "id": psp_id,
-        "provider": provider,
-        "name": f"{provider.capitalize()} Account",
-        "status": "active",
-        "connected_at": connected_at.isoformat() + "Z",
-        "account_id": account_id,
-        "capabilities": capabilities,
-        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****",
-        "environment": record["environment"],
-        "provider_summary": record["provider_summary"],
-        "validation_status": record["validation_status"],
-        "validation_error": record["validation_error"],
-        "reused_existing": bool(canonical_existing),
-    }
     
     try:
         # Use transaction to ensure data is committed
         async with database.transaction():
-            params = {
-                "psp_id": psp_id,
-                "merchant_id": merchant_id,
-                "provider": provider,
-                "name": f"{provider.capitalize()} Account",
-                "api_key": api_key,
-                "account_id": account_id,
-                "capabilities": ','.join(capabilities),
-                "status": 'active',
-                "connected_at": connected_at,
-                "secret_key": secret_key,
-                "environment": record["environment"],
-                "provider_config": json.dumps(record["provider_config"]),
-                "validation_status": record["validation_status"],
-                "validation_error": record["validation_error"],
-                "last_validated_at": None,
-            }
-
-            await database.execute(
-                """
-                UPDATE merchant_psps
-                SET status = 'inactive'
-                WHERE merchant_id = :merchant_id
-                  AND provider = :provider
-                  AND status = 'active'
-                  AND psp_id != :psp_id
-                """,
-                {
-                    "merchant_id": merchant_id,
-                    "provider": provider,
-                    "psp_id": psp_id,
-                },
+            persisted = await persist_canonical_merchant_psp(
+                merchant_id=merchant_id,
+                provider=provider,
+                api_key=api_key,
+                account_id=account_id,
+                secret_key=secret_key,
+                environment=environment,
+                provider_config=provider_config,
+                name=f"{provider.capitalize()} Account",
+                capabilities=capabilities,
+                status="active",
+                stripe_mode="payment_intent",
             )
-
-            if canonical_existing:
-                await database.execute(
-                    """
-                    UPDATE merchant_psps
-                    SET merchant_id = :merchant_id,
-                        provider = :provider,
-                        name = :name,
-                        api_key = :api_key,
-                        account_id = :account_id,
-                        capabilities = :capabilities,
-                        status = :status,
-                        connected_at = :connected_at,
-                        secret_key = :secret_key,
-                        environment = :environment,
-                        provider_config = CAST(:provider_config AS JSONB),
-                        validation_status = :validation_status,
-                        validation_error = :validation_error,
-                        last_validated_at = :last_validated_at
-                    WHERE psp_id = :psp_id
-                    """,
-                    params,
-                )
-            else:
-                base_cols = [
-                    "psp_id",
-                    "merchant_id",
-                    "provider",
-                    "name",
-                    "api_key",
-                    "account_id",
-                    "capabilities",
-                    "status",
-                    "connected_at",
-                    "secret_key",
-                    "environment",
-                    "provider_config",
-                    "validation_status",
-                    "validation_error",
-                    "last_validated_at",
-                ]
-                base_vals = [
-                    ":psp_id",
-                    ":merchant_id",
-                    ":provider",
-                    ":name",
-                    ":api_key",
-                    ":account_id",
-                    ":capabilities",
-                    ":status",
-                    ":connected_at",
-                    ":secret_key",
-                    ":environment",
-                    "CAST(:provider_config AS JSONB)",
-                    ":validation_status",
-                    ":validation_error",
-                    ":last_validated_at",
-                ]
-                query = f"""
-                    INSERT INTO merchant_psps ({', '.join(base_cols)})
-                    VALUES ({', '.join(base_vals)})
-                """
-                await database.execute(query, params)
-            print(f"✅ PSP saved to DB: {psp_id} for merchant {merchant_id}")
+            print(f"✅ PSP saved to DB: {persisted['psp_id']} for merchant {merchant_id}")
 
             # Also set flags on merchant_onboarding for dashboard compatibility
             await database.execute(
@@ -1764,11 +1611,35 @@ async def connect_psp(
         # Return error instead of success if save fails
         raise HTTPException(status_code=500, detail=f"Failed to save PSP: {str(e)}")
     
+    connected_at_value = persisted["connected_at"]
+    if isinstance(connected_at_value, datetime):
+        connected_at_display = connected_at_value.isoformat()
+        if connected_at_value.tzinfo is None:
+            connected_at_display += "Z"
+    else:
+        connected_at_display = str(connected_at_value)
+
+    new_psp = {
+        "id": persisted["psp_id"],
+        "provider": provider,
+        "name": persisted["name"],
+        "status": persisted["status"],
+        "connected_at": connected_at_display,
+        "account_id": account_id,
+        "capabilities": persisted["capabilities"],
+        "api_key_last4": api_key[-4:] if len(api_key) >= 4 else "****",
+        "environment": persisted["record"]["environment"],
+        "provider_summary": persisted["record"]["provider_summary"],
+        "validation_status": persisted["record"]["validation_status"],
+        "validation_error": persisted["record"]["validation_error"],
+        "reused_existing": persisted["reused_existing"],
+    }
+
     return {
         "status": "success",
         "message": (
             f"{provider.capitalize()} settings updated successfully"
-            if canonical_existing
+            if persisted["reused_existing"]
             else f"{provider.capitalize()} connected successfully"
         ),
         "data": new_psp

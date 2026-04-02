@@ -12,8 +12,13 @@ from db.database import database, transactions
 from sqlalchemy import func, select, desc, and_
 import os
 import logging
+import json
 
 from pydantic import BaseModel
+from services.merchant_psp_config_service import (
+    default_capabilities_for_provider,
+    persist_canonical_merchant_psp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +399,7 @@ async def admin_connect_psp(
     psp_id = payload.get("psp_id")
     secret_key = payload.get("secret_key")
     name = payload.get("name") or f"{provider.capitalize()} Account"
+    requested_environment = payload.get("environment")
     
     if provider not in ("stripe", "adyen", "checkout", "paypal"):
         raise HTTPException(status_code=400, detail="Unsupported provider. Use stripe/adyen/checkout/paypal")
@@ -412,35 +418,61 @@ async def admin_connect_psp(
     if provider == "adyen" and not account_id:
         raise HTTPException(status_code=400, detail="Adyen requires merchantAccount in account_id field")
 
-    # If updating existing PSP (has psp_id but no merchant_id)
-    if psp_id and not merchant_id:
-        # Fetch merchant_id from existing record
-        existing = await database.fetch_one(
-            "SELECT merchant_id, provider FROM merchant_psps WHERE psp_id = :psp_id",
-            {"psp_id": psp_id}
-        )
-        if not existing:
-            raise HTTPException(status_code=404, detail="PSP not found")
-        merchant_id = existing["merchant_id"]
-        provider = existing["provider"]  # Keep original provider
-    
     if not merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    # Generate psp_id if creating new
-    if not psp_id:
-        psp_id = f"psp_{provider}_{datetime.now().strftime('%H%M%S%f')}"
-    
-    # Define default capabilities per PSP
-    DEFAULT_CAPABILITIES = {
-        "stripe": ["payments", "refunds", "payouts", "subscriptions"],
-        "adyen": ["payments", "refunds", "payouts"],
-        "checkout": ["payments", "refunds"],
-        "paypal": ["payments", "refunds", "payouts"]
-    }
-    
-    capabilities = payload.get("capabilities") or DEFAULT_CAPABILITIES.get(provider, ["payments"])
-    
+    canonical_existing = None
+    if psp_id:
+        existing = await database.fetch_one(
+            """
+            SELECT psp_id, merchant_id, provider, api_key, account_id, environment, provider_config
+            FROM merchant_psps
+            WHERE psp_id = :psp_id
+            """,
+            {"psp_id": psp_id},
+        )
+        if existing:
+            canonical_existing = dict(existing)
+            merchant_id = canonical_existing["merchant_id"]
+            provider = canonical_existing["provider"]
+    else:
+        existing_rows = await database.fetch_all(
+            """
+            SELECT psp_id, merchant_id, provider, api_key, account_id, environment, provider_config, status, connected_at
+            FROM merchant_psps
+            WHERE merchant_id = :merchant_id
+              AND provider = :provider
+            ORDER BY
+                CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+                connected_at DESC NULLS LAST,
+                psp_id ASC
+            """,
+            {"merchant_id": merchant_id, "provider": provider},
+        )
+        canonical_existing = dict(existing_rows[0]) if existing_rows else None
+        if canonical_existing and canonical_existing.get("psp_id"):
+            psp_id = canonical_existing["psp_id"]
+
+    capabilities = payload.get("capabilities") or default_capabilities_for_provider(provider)
+
+    provider_config: Optional[Dict[str, Any]] = None
+    if provider == "adyen":
+        client_key = str(payload.get("client_key") or "").strip()
+        if not client_key:
+            raise HTTPException(status_code=400, detail="Adyen requires client_key")
+        provider_config = {
+            "merchant_account": account_id,
+            "client_key": client_key,
+        }
+    elif provider == "checkout":
+        public_key = str(payload.get("public_key") or "").strip()
+        if not public_key:
+            raise HTTPException(status_code=400, detail="Checkout.com requires public_key")
+        provider_config = {
+            "processing_channel_id": account_id,
+            "public_key": public_key,
+        }
+
     try:
         logger.info(f"💾 Saving {provider} PSP for merchant {merchant_id}")
         logger.info(f"   API Key length: {len(api_key)}")
@@ -449,46 +481,23 @@ async def admin_connect_psp(
         
         # Use transaction to ensure data is committed
         async with database.transaction():
-            # Build dynamic query to handle secret_key
-            base_cols = ["psp_id", "merchant_id", "provider", "name", "api_key", "account_id", "capabilities", "status", "connected_at"]
-            base_vals = [":psp_id", ":merchant_id", ":provider", ":name", ":api_key", ":account_id", ":capabilities", ":status", ":connected_at"]
-            params = {
-                "psp_id": psp_id,
-                "merchant_id": merchant_id,
-                "provider": provider,
-                "name": name,
-                "api_key": api_key,
-                "account_id": account_id or None,
-                "capabilities": ",".join(capabilities),
-                "status": "active",
-                "connected_at": datetime.now(),
-            }
-            
-            update_set_parts = [
-                "api_key = EXCLUDED.api_key",
-                "account_id = EXCLUDED.account_id",
-                "name = EXCLUDED.name",
-                "status = EXCLUDED.status"
-            ]
-            
-            # Add secret_key if provided
-            if secret_key:
-                base_cols.append("secret_key")
-                base_vals.append(":secret_key")
-                params["secret_key"] = secret_key
-                update_set_parts.append("secret_key = EXCLUDED.secret_key")
-                logger.info(f"   Including secret_key in database insert")
-            
-            query_str = f"""
-                INSERT INTO merchant_psps ({', '.join(base_cols)})
-                VALUES ({', '.join(base_vals)})
-                ON CONFLICT (psp_id) DO UPDATE SET
-                    {', '.join(update_set_parts)}
-            """
-            
-            logger.info(f"   Executing UPSERT query in transaction...")
-            await database.execute(query_str, params)
-            logger.info(f"✅ PSP UPSERT executed: {psp_id}")
+            persisted = await persist_canonical_merchant_psp(
+                merchant_id=merchant_id,
+                provider=provider,
+                api_key=api_key,
+                account_id=account_id or None,
+                secret_key=secret_key,
+                environment=requested_environment,
+                provider_config=provider_config,
+                name=name,
+                capabilities=capabilities,
+                status="active",
+                psp_id=psp_id,
+                existing_row=canonical_existing,
+                stripe_mode="payment_intent",
+            )
+            psp_id = persisted["psp_id"]
+            logger.info(f"✅ PSP canonical save executed: {psp_id}")
             
             # Verify the save within the same transaction
             verify = await database.fetch_one(

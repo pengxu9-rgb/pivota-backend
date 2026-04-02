@@ -19,7 +19,10 @@ from db.database import database
 from db.orders import create_order, update_order, update_payment_info
 from db.merchant_onboarding import get_merchant_by_api_key, get_merchant_onboarding
 from services.merchant_payment_initiation_service import initiate_merchant_payment
-from services.merchant_psp_config_service import evaluate_psp_readiness
+from services.merchant_psp_config_service import (
+    evaluate_psp_readiness,
+    fetch_active_merchant_psps,
+)
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.payment_routing_service import PaymentRoutingService
 
@@ -130,18 +133,9 @@ async def _load_canary_merchant(merchant_id: str) -> Dict[str, Any]:
 
 
 async def _load_active_merchant_psps(merchant_id: str) -> List[Dict[str, Any]]:
-    rows = await database.fetch_all(
-        """
-        SELECT psp_id, provider, api_key, secret_key, account_id, status, connected_at,
-               environment, provider_config, validation_status, validation_error, last_validated_at
-        FROM merchant_psps
-        WHERE merchant_id = :merchant_id
-          AND status = 'active'
-        ORDER BY connected_at DESC NULLS LAST, psp_id ASC
-        """,
-        {"merchant_id": merchant_id},
+    return await fetch_active_merchant_psps(
+        merchant_id=merchant_id,
     )
-    return [dict(row) for row in rows or []]
 
 
 def _normalize_priority_list(route_config: Dict[str, Any]) -> List[str]:
