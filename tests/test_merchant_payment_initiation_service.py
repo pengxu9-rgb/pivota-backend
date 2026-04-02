@@ -5,17 +5,27 @@ import pytest
 
 
 class _FakePaymentIntent:
-    def __init__(self, *, payment_id: str, psp_type: str, client_secret: str, public_key: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        payment_id: str,
+        psp_type: str,
+        client_secret: str,
+        public_key: Optional[str] = None,
+        stripe_account: Optional[str] = None,
+    ):
         self.id = payment_id
         self.psp_type = psp_type
         self.client_secret = client_secret
         self.public_key = public_key
+        self.stripe_account = stripe_account
         self.redirect_url = None
         self.status = "requires_action"
         self.raw_response = {
             "clientKey": "test_client_key",
             "environment": "test",
             **({"public_key": public_key} if public_key else {}),
+            **({"stripe_account": stripe_account} if stripe_account else {}),
         }
 
 
@@ -179,3 +189,21 @@ def test_build_payment_action_accepts_publishable_key_alias() -> None:
 
     assert action["type"] == "stripe_client_secret"
     assert action["public_key"] == "pk_live_alias_123"
+
+
+def test_build_payment_action_includes_stripe_account() -> None:
+    from services.merchant_payment_initiation_service import build_payment_action
+
+    action = build_payment_action(
+        _FakePaymentIntent(
+            payment_id="pi_live_connect",
+            psp_type="stripe",
+            client_secret="pi_live_connect_secret",
+            public_key="pk_live_connect",
+            stripe_account="acct_live_connect_123",
+        ),
+        psp_used="stripe",
+    )
+
+    assert action["type"] == "stripe_client_secret"
+    assert action["stripe_account"] == "acct_live_connect_123"

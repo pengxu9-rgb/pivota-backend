@@ -42,6 +42,18 @@ def _extract_payment_public_key(payment_intent: Any, raw: Dict[str, Any]) -> Opt
     return value or None
 
 
+def _extract_payment_stripe_account(payment_intent: Any, raw: Dict[str, Any]) -> Optional[str]:
+    value = str(
+        getattr(payment_intent, "stripe_account", None)
+        or raw.get("stripe_account")
+        or raw.get("stripeAccount")
+        or raw.get("account_id")
+        or raw.get("accountId")
+        or ""
+    ).strip()
+    return value or None
+
+
 def _apply_candidate_preference(
     candidates: List[Dict[str, Any]],
     preferred_psps: Optional[List[str]],
@@ -104,10 +116,12 @@ def build_payment_action(payment_intent: Any, *, psp_used: str) -> Dict[str, Any
         }
 
     if payment_type == "stripe" and client_secret:
+        stripe_account = _extract_payment_stripe_account(payment_intent, raw)
         return {
             "type": "stripe_client_secret",
             "client_secret": client_secret,
             "public_key": public_key,
+            "stripe_account": stripe_account,
             "raw": raw,
         }
 
@@ -195,6 +209,7 @@ def build_payment_initiation_result(
         "requires_customer_action": requires_customer_action,
         "payment_action": payment_action,
         "public_key": _extract_payment_public_key(payment_intent, raw),
+        "stripe_account": _extract_payment_stripe_account(payment_intent, raw),
         "error_message": error,
     }
 
