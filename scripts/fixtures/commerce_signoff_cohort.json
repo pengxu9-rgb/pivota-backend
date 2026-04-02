@@ -1,0 +1,76 @@
+{
+  "cohort_name": "prod_phase_a_candidate_cohort_20260329",
+  "min_enabled_cases": 1,
+  "target_enabled_cases": 5,
+  "required_semantic_classes": [
+    "beauty"
+  ],
+  "required_platform_counts": {},
+  "required_ready_domains": [],
+  "target_semantic_classes": [
+    "beauty",
+    "generic_default",
+    "fragrance"
+  ],
+  "target_platform_counts": {
+    "shopify": 3,
+    "wix": 2
+  },
+  "target_ready_domains": [
+    "foundation",
+    "discover",
+    "signals",
+    "execute"
+  ],
+  "cases": [
+    {
+      "case_id": "chydan_beauty_primary",
+      "merchant_id": "merch_efbc46b4619cfbdf",
+      "label": "Chydan primary beauty merchant",
+      "semantic_class": "beauty",
+      "query": "winona soothing repair serum",
+      "payment_preferred_provider": "stripe",
+      "payment_currency": "USD",
+      "enabled": true,
+      "notes": "Current production merchant with real products_cache payloads, catalog rows, and active PSPs."
+    },
+    {
+      "case_id": "testlab_generic_ready",
+      "merchant_id": "merch_7298c977f20c8f1a",
+      "label": "testlab generic ready merchant",
+      "semantic_class": "generic_default",
+      "query": "AeroFlex Joggers",
+      "payment_preferred_provider": "stripe",
+      "payment_currency": "USD",
+      "enabled": true,
+      "notes": "Production generic merchant with live-ready Stripe, products_cache payloads, catalog rows, and direct signoff evidence."
+    },
+    {
+      "case_id": "chydanlab_generic_pending",
+      "merchant_id": "merch_5beef99b41d8f492",
+      "label": "chydanlab generic candidate",
+      "semantic_class": "generic_default",
+      "enabled": false,
+      "skip_reason": "missing_products_cache_live_payload",
+      "notes": "Aspirational Phase A generic slot. Not part of the current environment minimum gate."
+    },
+    {
+      "case_id": "mycoffeeshop_generic_pending",
+      "merchant_id": "merch_ffb91fce312f8e8c",
+      "label": "mycoffeeshop generic candidate",
+      "semantic_class": "generic_default",
+      "enabled": false,
+      "skip_reason": "missing_products_cache_live_payload",
+      "notes": "Aspirational Phase A generic slot. Not part of the current environment minimum gate."
+    },
+    {
+      "case_id": "fragrance_slot_pending",
+      "merchant_id": "merch_0291f1e1a3be9e3e",
+      "label": "Fragrance coverage slot",
+      "semantic_class": "fragrance",
+      "enabled": false,
+      "skip_reason": "no_live_fragrance_merchant_available",
+      "notes": "Aspirational Phase A fragrance slot. Not part of the current environment minimum gate."
+    }
+  ]
+}

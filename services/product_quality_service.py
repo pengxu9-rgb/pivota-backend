@@ -217,7 +217,9 @@ def build_quality_payload(
     enrichment = enrichment or {}
 
     if isinstance(product, StandardProduct):
-        product_data: Dict[str, Any] = product.dict()
+        product_data: Dict[str, Any] = (
+            product.model_dump() if hasattr(product, "model_dump") else product.dict()
+        )
         title = product.title
         description = product.description_text or product.description or ""
         price_value = product.price
@@ -336,6 +338,7 @@ async def fetch_latest_quality_rows(
 ) -> Dict[ProductKey, Dict[str, Any]]:
     platform_values = sorted({_as_text(platform) for platform in (platforms or []) if _as_text(platform)})
     key_filter = {key for key in (product_keys or []) if key and key[0] and key[1]}
+    product_ids = sorted({key[1] for key in key_filter if key[1]})
 
     ranked = (
         select(
@@ -356,6 +359,8 @@ async def fetch_latest_quality_rows(
     )
     if platform_values:
         ranked = ranked.where(product_quality_snapshot.c.platform.in_(platform_values))
+    if product_ids:
+        ranked = ranked.where(product_quality_snapshot.c.platform_product_id.in_(product_ids))
 
     ranked_subquery = ranked.subquery("ranked_quality")
     query = select(*[col for col in ranked_subquery.c if col.key != "row_num"]).where(ranked_subquery.c.row_num == 1)

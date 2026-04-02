@@ -15,6 +15,16 @@ from sqlalchemy import and_, desc, func, or_, select
 
 from db.database import database
 from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_PROMPT_CLUSTER,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    apply_pvt_params,
+    materialize_attribution_context,
+    record_surface_event,
+)
 
 
 DEFAULT_UTM_TEMPLATE = "utm_source=pivota&utm_medium={{tool}}&utm_campaign={{market}}"
@@ -411,25 +421,49 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
         **({ "scope_id": matched_scope_id } if matched_scope_id else {}),
         **({ "rule_id": str(matched.get("id")) } if matched.get("id") else {}),
     }
+    attribution = materialize_attribution_context(
+        {
+            **context,
+            **candidates,
+        },
+        default_surface=str(context.get("surface") or tool or ""),
+        merchant_id=str(context.get("merchantId") or context.get("merchant_id") or "").strip() or None,
+    )
     dest_with_utm = apply_utm(dest, utm_template, tokens)
+    dest_with_tracking = apply_pvt_params(dest_with_utm, attribution)
 
-    if not await _is_domain_allowed(market=market, destination_url=dest_with_utm):
+    if not await _is_domain_allowed(market=market, destination_url=dest_with_tracking):
         raise ValueError("DOMAIN_NOT_ALLOWED")
 
     token_payload = {
         "market": market,
         "tool": tool,
         "ruleId": matched.get("id"),
-        "dest": dest_with_utm,
+        "dest": dest_with_tracking,
         "ctx": {
             **({ "jobId": str(context.get("jobId")) } if context.get("jobId") else {}),
             **({ "sessionId": str(context.get("sessionId")) } if context.get("sessionId") else {}),
+            **({ "merchantId": str(context.get("merchantId") or context.get("merchant_id")) } if (context.get("merchantId") or context.get("merchant_id")) else {}),
             **({ "skuId": sku_id } if sku_id else {}),
             **({ "brand": brand } if brand else {}),
             **({ "category": category } if category else {}),
             **({ "area": str(context.get("area")) } if context.get("area") else {}),
             **({ "kind": str(context.get("kind")) } if context.get("kind") else {}),
             **({ "scope": matched_scope } if matched_scope else {}),
+            **({ PVT_SURFACE: attribution.get(PVT_SURFACE) } if attribution.get(PVT_SURFACE) else {}),
+            **({ PVT_CLICK_ID: attribution.get(PVT_CLICK_ID) } if attribution.get(PVT_CLICK_ID) else {}),
+            **({ PVT_PRODUCT_ID: attribution.get(PVT_PRODUCT_ID) } if attribution.get(PVT_PRODUCT_ID) else {}),
+            **({ PVT_VARIANT_ID: attribution.get(PVT_VARIANT_ID) } if attribution.get(PVT_VARIANT_ID) else {}),
+            **({ PVT_PROMPT_CLUSTER: attribution.get(PVT_PROMPT_CLUSTER) } if attribution.get(PVT_PROMPT_CLUSTER) else {}),
+            **({ "source_channel": attribution.get("source_channel") } if attribution.get("source_channel") else {}),
+            **({ "source_family": attribution.get("source_family") } if attribution.get("source_family") else {}),
+            **({ "query_source": attribution.get("query_source") } if attribution.get("query_source") else {}),
+            **({ "agent_id": attribution.get("agent_id") } if attribution.get("agent_id") else {}),
+            **({ "protocol_name": attribution.get("protocol_name") } if attribution.get("protocol_name") else {}),
+            **({ "commerce_surface": attribution.get("commerce_surface") } if attribution.get("commerce_surface") else {}),
+            **({ "llm_provider": attribution.get("llm_provider") } if attribution.get("llm_provider") else {}),
+            **({ "llm_model": attribution.get("llm_model") } if attribution.get("llm_model") else {}),
+            **({ "caller_id": attribution.get("caller_id") } if attribution.get("caller_id") else {}),
         },
     }
 
@@ -438,7 +472,7 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
     redirect_url = f"{base}/r?token={token}"
 
     return ResolvedLink(
-        destination_url=dest_with_utm,
+        destination_url=dest_with_tracking,
         redirect_url=redirect_url,
         purchase_enabled=purchase_enabled,
         purchase_enabled_override=purchase_override,
@@ -482,6 +516,17 @@ async def log_outbound_event(*, token_payload: Dict[str, Any], request_meta: Dic
         await database.execute(outbound_click_events.insert(), row)
     except Exception:
         # Best-effort: never break redirect or callers.
+        pass
+    try:
+        await record_surface_event(
+            token_payload={
+                **token_payload,
+                "dest_domain": url_domain(dest) or None,
+            },
+            request_meta=request_meta,
+            event_type=event_type,
+        )
+    except Exception:
         return
 
 

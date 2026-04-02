@@ -12,12 +12,30 @@ from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MERCHANT_PORTAL_PREFERENCES: Dict[str, bool] = {
+SUPPORTED_PORTAL_LANGUAGES = (
+    "en",
+    "zh-CN",
+    "ja-JP",
+    "ko-KR",
+    "fr-FR",
+    "de-DE",
+)
+DEFAULT_PORTAL_LANGUAGE = "en"
+
+DEFAULT_MERCHANT_PORTAL_PREFERENCES: Dict[str, Any] = {
     "email_orders": True,
     "email_payments": True,
     "email_inventory": False,
     "email_weekly": False,
+    "portal_language": DEFAULT_PORTAL_LANGUAGE,
 }
+
+
+def normalize_portal_language(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if candidate in SUPPORTED_PORTAL_LANGUAGES:
+        return candidate
+    return DEFAULT_PORTAL_LANGUAGE
 
 merchant_portal_preferences = Table(
     "merchant_portal_preferences",
@@ -27,6 +45,7 @@ merchant_portal_preferences = Table(
     Column("email_payments", Boolean, nullable=False, default=True),
     Column("email_inventory", Boolean, nullable=False, default=False),
     Column("email_weekly", Boolean, nullable=False, default=False),
+    Column("portal_language", String(16), nullable=False, default=DEFAULT_PORTAL_LANGUAGE),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now(), nullable=False),
 )
@@ -53,6 +72,7 @@ async def ensure_merchant_portal_preferences_table() -> None:
                   email_payments BOOLEAN NOT NULL DEFAULT TRUE,
                   email_inventory BOOLEAN NOT NULL DEFAULT FALSE,
                   email_weekly BOOLEAN NOT NULL DEFAULT FALSE,
+                  portal_language VARCHAR(16) NOT NULL DEFAULT 'en',
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -61,6 +81,7 @@ async def ensure_merchant_portal_preferences_table() -> None:
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS email_payments BOOLEAN NOT NULL DEFAULT TRUE;",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS email_inventory BOOLEAN NOT NULL DEFAULT FALSE;",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS email_weekly BOOLEAN NOT NULL DEFAULT FALSE;",
+                "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS portal_language VARCHAR(16) NOT NULL DEFAULT 'en';",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
             ]
@@ -93,6 +114,7 @@ async def get_merchant_portal_preferences(merchant_id: str) -> Dict[str, Any]:
         "email_payments": bool(payload.get("email_payments")),
         "email_inventory": bool(payload.get("email_inventory")),
         "email_weekly": bool(payload.get("email_weekly")),
+        "portal_language": normalize_portal_language(payload.get("portal_language")),
         "created_at": payload.get("created_at"),
         "updated_at": payload.get("updated_at"),
     }
@@ -103,16 +125,56 @@ async def upsert_merchant_portal_preferences(
     preferences: Dict[str, Any],
 ) -> Dict[str, Any]:
     await ensure_merchant_portal_preferences_table()
-    merged = {
-        **DEFAULT_MERCHANT_PORTAL_PREFERENCES,
-        **{key: bool(value) for key, value in preferences.items() if key in DEFAULT_MERCHANT_PORTAL_PREFERENCES},
-    }
 
     existing = await database.fetch_one(
         merchant_portal_preferences.select().where(
             merchant_portal_preferences.c.merchant_id == merchant_id
         )
     )
+
+    existing_payload = dict(existing) if existing else {}
+    merged = {
+        "email_orders": bool(
+            preferences.get(
+                "email_orders",
+                existing_payload.get(
+                    "email_orders", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_orders"]
+                ),
+            )
+        ),
+        "email_payments": bool(
+            preferences.get(
+                "email_payments",
+                existing_payload.get(
+                    "email_payments", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_payments"]
+                ),
+            )
+        ),
+        "email_inventory": bool(
+            preferences.get(
+                "email_inventory",
+                existing_payload.get(
+                    "email_inventory", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_inventory"]
+                ),
+            )
+        ),
+        "email_weekly": bool(
+            preferences.get(
+                "email_weekly",
+                existing_payload.get(
+                    "email_weekly", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_weekly"]
+                ),
+            )
+        ),
+        "portal_language": normalize_portal_language(
+            preferences.get(
+                "portal_language",
+                existing_payload.get(
+                    "portal_language", DEFAULT_MERCHANT_PORTAL_PREFERENCES["portal_language"]
+                ),
+            )
+        ),
+    }
 
     if existing:
         await database.execute(

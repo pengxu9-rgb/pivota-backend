@@ -36,8 +36,19 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from config.settings import resolve_public_api_base_url
 from db.database import database
+from models.catalog import PivotQueryRequest, PivotResultItem
 from models.reviews_refs import SkuRef as ReviewsSkuRef
+from services.beauty_external_ranking import (
+    BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
+    build_external_seed_filter_product as _shared_build_external_seed_filter_product,
+    normalize_external_seed_product_type as _shared_normalize_external_seed_product_type,
+    normalize_external_seed_structured_ingredient_ids as _shared_normalize_external_seed_structured_ingredient_ids,
+    rank_external_seed_rows,
+)
 from services.product_query_service import get_products_hybrid
+from services.external_seed_search import fetch_external_seed_rows
+from services.pivot_query_service import search_pivot_catalog
+from services.query_semantic_class import classify_query_semantic_class
 from services.similarity_service import (
     SimilarityService,
     SimilarityStrategy,
@@ -64,11 +75,14 @@ from services.product_exposure_service import (
     pick_first_eligible_variant_from_standard_product,
 )
 from observability.reliability_metrics import (
+    record_catalog_pivot_shadow_compare,
     record_catalog_search,
     record_catalog_upstream_fallback,
+    record_traffic_taxonomy,
     record_catalog_upstream_timeout,
     set_catalog_upstream_circuit,
 )
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 def _resolve_default_agent_api_base() -> str:
     configured = str(os.getenv("AGENT_API_BASE", "") or "").strip().rstrip("/")
@@ -137,6 +151,22 @@ def _bootstrap_env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _bootstrap_normalize_surface_source(source: Optional[str]) -> str:
+    return str(source or "").strip().lower().replace("_", "-")
+
+
+def _bootstrap_env_csv_set(name: str, default: set[str]) -> set[str]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return {item for item in default if str(item or "").strip()}
+    values: set[str] = set()
+    for part in raw.split(","):
+        token = _bootstrap_normalize_surface_source(part)
+        if token:
+            values.add(token)
+    return values
+
+
 _UPSTREAM_HTTP_MAX_CONNECTIONS = _bootstrap_env_int(
     "AGENT_SHOP_UPSTREAM_CLIENT_MAX_CONNECTIONS",
     256,
@@ -169,6 +199,43 @@ _UPSTREAM_HTTP_WARMUP_TIMEOUT_SECONDS = _bootstrap_env_float(
     min_value=0.2,
     max_value=10.0,
 )
+PIVOT_MULTI_SHADOW_ENABLED = _bootstrap_env_bool(
+    "AGENT_SHOP_PIVOT_MULTI_SHADOW_ENABLED",
+    False,
+)
+PIVOT_MULTI_SERVE_ENABLED = _bootstrap_env_bool(
+    "AGENT_SHOP_PIVOT_MULTI_SERVE_ENABLED",
+    False,
+)
+PIVOT_MULTI_LIMIT_MULTIPLIER = _bootstrap_env_int(
+    "AGENT_SHOP_PIVOT_MULTI_LIMIT_MULTIPLIER",
+    4,
+    min_value=1,
+    max_value=8,
+)
+PIVOT_MULTI_SERVE_MAX_PAGE = _bootstrap_env_int(
+    "AGENT_SHOP_PIVOT_MULTI_SERVE_MAX_PAGE",
+    1,
+    min_value=1,
+    max_value=10,
+)
+PIVOT_MULTI_SHADOW_SOURCE_ALLOWLIST = _bootstrap_env_csv_set(
+    "AGENT_SHOP_PIVOT_MULTI_SHADOW_SOURCE_ALLOWLIST",
+    {"shopping_agent", "shopping-agent-ui", "shopping-agent-web", "aurora", "aurora-chatbox"},
+)
+PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST = _bootstrap_env_csv_set(
+    "AGENT_SHOP_PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST",
+    {"shopping_agent"},
+)
+PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = _bootstrap_env_bool(
+    "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL",
+    True,
+)
+PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES = _bootstrap_env_bool(
+    "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES",
+    True,
+)
+PIVOT_MULTI_BAD_PRICE_DELTA_RATIO_THRESHOLD = 0.20
 
 _SHARED_UPSTREAM_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 _SHARED_UPSTREAM_HTTP_CLIENT_LOCK = asyncio.Lock()
@@ -470,55 +537,7 @@ def _clamp_search_limit(raw_limit: Any, *, fallback: int = 20) -> int:
 
 
 def _classify_query_semantic_class(query: Optional[str]) -> str:
-    q = str(query or "").strip().lower()
-    if not q:
-        return "default"
-    q_compact = re.sub(r"[^a-z0-9]+", "", q)
-    if (
-        "fragrance free" in q
-        or "fragrance-free" in q
-        or "free fragrance" in q
-        or "sin fragancia" in q
-    ):
-        return "beauty"
-    if re.search(
-        r"\b(perfume|perfumes|fragrance|fragrances|parfum|parfums|cologne|eau de parfum|eau de toilette|body mist)\b",
-        q,
-    ):
-        return "fragrance"
-    if any(
-        token in q_compact
-        for token in (
-            "perfume",
-            "perfumes",
-            "fragrance",
-            "fragrances",
-            "parfum",
-            "parfums",
-            "cologne",
-            "bodymist",
-            "eaudeparfum",
-            "eaudetoilette",
-            "edp",
-            "edt",
-        )
-    ):
-        return "fragrance"
-    if re.search(
-        r"\b(lingerie|underwear|bra|panties|panty|briefs|thong|lencer[ií]a|ropa interior)\b",
-        q,
-    ):
-        return "lingerie"
-    if re.search(
-        r"\b("
-        r"beauty|skincare|skin care|cosmetic|cosmetics|makeup|"
-        r"serum|toner|moisturizer|moisturiser|cleanser|"
-        r"foundation|lipstick|blush|gloss"
-        r")\b",
-        q,
-    ):
-        return "beauty"
-    return "default"
+    return classify_query_semantic_class(query)
 
 
 def _build_fragrance_semantic_retry_query(query: Optional[str]) -> Optional[str]:
@@ -600,6 +619,30 @@ def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
 
 _BUDGET_FX_CACHE_TTL_SECONDS = 900.0
 _BUDGET_FX_RATE_CACHE: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str], float]] = {}
+_DEFAULT_BUDGET_FX_USD_RATES: Dict[str, float] = {
+    "USD": 1.0,
+    "EUR": 1.09,
+    "GBP": 1.27,
+    "CNY": 0.14,
+    "JPY": 0.0067,
+}
+_BUDGET_FX_LATEST_FALLBACK_ENABLED = _env_bool(
+    "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED",
+    True,
+)
+_BUDGET_FX_STATIC_FALLBACK_ENABLED = _env_bool(
+    "AGENT_SHOP_BUDGET_FX_STATIC_FALLBACK_ENABLED",
+    True,
+)
+_BUDGET_FX_LATEST_BASE_URL = str(
+    os.getenv("AGENT_SHOP_BUDGET_FX_LATEST_BASE_URL", "https://api.exchangerate.host") or ""
+).strip().rstrip("/")
+_BUDGET_FX_LATEST_TIMEOUT_SECONDS = _env_float(
+    "AGENT_SHOP_BUDGET_FX_LATEST_TIMEOUT_SECONDS",
+    1.5,
+    min_value=0.2,
+    max_value=10.0,
+)
 
 
 def _parse_budget_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
@@ -614,6 +657,36 @@ def _parse_budget_fx_rates_payload(raw_rates: Any) -> Dict[str, Any]:
     return {}
 
 
+def _load_budget_fx_usd_rates() -> Dict[str, float]:
+    raw = str(os.getenv("AGENT_SHOP_BUDGET_FX_USD_RATES", "") or "").strip()
+    if not raw:
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    if not isinstance(parsed, dict):
+        return dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    normalized = dict(_DEFAULT_BUDGET_FX_USD_RATES)
+    for key, value in parsed.items():
+        currency = str(key or "").strip().upper()
+        try:
+            rate = float(value)
+        except Exception:
+            continue
+        if currency and rate > 0:
+            normalized[currency] = rate
+    return normalized
+
+
+_BUDGET_FX_USD_RATES = _load_budget_fx_usd_rates()
+_BUDGET_FX_STATIC_SOURCE = (
+    "env_usd_base_rates"
+    if str(os.getenv("AGENT_SHOP_BUDGET_FX_USD_RATES", "") or "").strip()
+    else "static_default"
+)
+
+
 def _coerce_budget_fx_snapshot(snapshot: Any) -> Dict[str, Any]:
     if isinstance(snapshot, dict):
         return snapshot
@@ -621,6 +694,86 @@ def _coerce_budget_fx_snapshot(snapshot: Any) -> Dict[str, Any]:
         return dict(snapshot or {})
     except Exception:
         return {}
+
+
+async def _lookup_budget_fx_latest_rate(
+    from_currency: Optional[str],
+    to_currency: Optional[str],
+) -> Tuple[Optional[float], Optional[str]]:
+    if not _BUDGET_FX_LATEST_FALLBACK_ENABLED:
+        return None, None
+
+    source_currency = str(from_currency or "").strip().upper()
+    target_currency = str(to_currency or "").strip().upper()
+    if not source_currency or not target_currency:
+        return None, None
+
+    base_url = _BUDGET_FX_LATEST_BASE_URL
+    if not base_url:
+        return None, None
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=_build_request_timeout(_BUDGET_FX_LATEST_TIMEOUT_SECONDS)
+        ) as client:
+            response = await client.get(
+                f"{base_url}/latest",
+                params={
+                    "base": source_currency,
+                    "symbols": target_currency,
+                },
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        logger.info(
+            "multi.budget_fx.latest_lookup.failed",
+            extra={
+                "event": "multi.budget_fx.latest_lookup.failed",
+                "from_currency": source_currency,
+                "to_currency": target_currency,
+                "error": str(exc),
+            },
+        )
+        return None, None
+
+    rates = payload.get("rates") if isinstance(payload, dict) else None
+    if not isinstance(rates, dict):
+        return None, None
+
+    raw_rate = rates.get(target_currency)
+    try:
+        if raw_rate is not None and float(raw_rate) > 0:
+            return float(raw_rate), "latest_rate_api"
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _lookup_budget_fx_static_rate(
+    from_currency: Optional[str],
+    to_currency: Optional[str],
+) -> Tuple[Optional[float], Optional[str]]:
+    if not _BUDGET_FX_STATIC_FALLBACK_ENABLED:
+        return None, None
+    source_currency = str(from_currency or "").strip().upper()
+    target_currency = str(to_currency or "").strip().upper()
+    if not source_currency or not target_currency:
+        return None, None
+    if source_currency == target_currency:
+        return 1.0, "same_currency"
+    source_rate = _BUDGET_FX_USD_RATES.get(source_currency)
+    target_rate = _BUDGET_FX_USD_RATES.get(target_currency)
+    try:
+        if source_rate is not None and target_rate is not None:
+            source_rate = float(source_rate)
+            target_rate = float(target_rate)
+            if source_rate > 0 and target_rate > 0:
+                return source_rate / target_rate, _BUDGET_FX_STATIC_SOURCE
+    except Exception:
+        return None, None
+    return None, None
 
 
 async def _lookup_budget_fx_rate(
@@ -672,6 +825,30 @@ async def _lookup_budget_fx_rate(
             rate = 1.0 / float(reverse_value)
             _BUDGET_FX_RATE_CACHE[cache_key] = (rate, "x402_snapshot_reverse", now)
             return rate, "x402_snapshot_reverse"
+    except Exception:
+        pass
+
+    latest_rate, latest_source = await _lookup_budget_fx_latest_rate(
+        source_currency,
+        target_currency,
+    )
+    try:
+        if latest_rate is not None and float(latest_rate) > 0:
+            rate = float(latest_rate)
+            _BUDGET_FX_RATE_CACHE[cache_key] = (rate, latest_source, now)
+            return rate, latest_source
+    except Exception:
+        pass
+
+    static_rate, static_source = _lookup_budget_fx_static_rate(
+        source_currency,
+        target_currency,
+    )
+    try:
+        if static_rate is not None and float(static_rate) > 0:
+            rate = float(static_rate)
+            _BUDGET_FX_RATE_CACHE[cache_key] = (rate, static_source, now)
+            return rate, static_source
     except Exception:
         pass
 
@@ -1516,6 +1693,28 @@ def _normalize_gateway_route_health(
         if route_health.get("final_returned_count") is not None
         else md.get("final_returned_count")
     )
+    route_health["pivot_shadow_scheduled"] = bool(
+        route_health.get("pivot_shadow_scheduled")
+        if route_health.get("pivot_shadow_scheduled") is not None
+        else md.get("pivot_shadow_scheduled")
+    )
+    route_health["pivot_shadow_mode"] = (
+        str(route_health.get("pivot_shadow_mode") or md.get("pivot_shadow_mode") or "").strip()
+        or None
+    )
+    derived_rollout_mode = (
+        str(route_health.get("pivot_rollout_mode") or md.get("pivot_rollout_mode") or "").strip().lower()
+    )
+    if not derived_rollout_mode:
+        derived_rollout_mode = "shadow" if route_health["pivot_shadow_scheduled"] else "legacy"
+    route_health["pivot_rollout_mode"] = derived_rollout_mode
+    route_health["pivot_rollout_guard_passed"] = bool(
+        route_health.get("pivot_rollout_guard_passed")
+        if route_health.get("pivot_rollout_guard_passed") is not None
+        else md.get("pivot_rollout_guard_passed")
+        if md.get("pivot_rollout_guard_passed") is not None
+        else route_health["pivot_rollout_mode"] in {"shadow", "serve"}
+    )
 
     md["orchestrator_path"] = route_health["orchestrator_path"]
     md["decision_node"] = route_health["decision_node"]
@@ -1553,6 +1752,10 @@ def _normalize_gateway_route_health(
     md["fallback_attempt_count"] = route_health["fallback_attempt_count"]
     md["selected_fallback_attempt"] = route_health["selected_fallback_attempt"]
     md["final_returned_count"] = route_health["final_returned_count"]
+    md["pivot_shadow_scheduled"] = route_health["pivot_shadow_scheduled"]
+    md["pivot_shadow_mode"] = route_health["pivot_shadow_mode"]
+    md["pivot_rollout_mode"] = route_health["pivot_rollout_mode"]
+    md["pivot_rollout_guard_passed"] = route_health["pivot_rollout_guard_passed"]
     if search_decision is not None:
         search_decision["query_semantic_class"] = route_health["query_semantic_class"]
         search_decision["domain_filter_dropped_external"] = route_health[
@@ -1560,6 +1763,30 @@ def _normalize_gateway_route_health(
         ]
         md["search_decision"] = search_decision
     md["route_health"] = route_health
+    return md
+
+
+def _apply_pivot_rollout_metadata(
+    metadata: Optional[Dict[str, Any]],
+    *,
+    pivot_shadow_scheduled: bool,
+) -> Dict[str, Any]:
+    md = dict(metadata) if isinstance(metadata, dict) else {}
+    query_source = str(md.get("query_source") or "").strip()
+    rollout_mode = str(md.get("pivot_rollout_mode") or "").strip().lower()
+
+    if query_source == "pivot_semantic_core_multi" or rollout_mode == "serve":
+        md["pivot_shadow_scheduled"] = False
+        md.pop("pivot_shadow_mode", None)
+        md["pivot_rollout_mode"] = "serve"
+        md["pivot_rollout_guard_passed"] = True
+        return md
+
+    md["pivot_shadow_scheduled"] = pivot_shadow_scheduled
+    if pivot_shadow_scheduled:
+        md["pivot_shadow_mode"] = "background_compare"
+    md["pivot_rollout_mode"] = "shadow" if pivot_shadow_scheduled else "legacy"
+    md["pivot_rollout_guard_passed"] = bool(pivot_shadow_scheduled)
     return md
 
 
@@ -1849,7 +2076,7 @@ SHOPPING_MULTI_SOURCES = {
 
 
 def _normalize_surface_source(source: Optional[str]) -> str:
-    normalized = str(source or "").strip().lower().replace("_", "-")
+    normalized = _bootstrap_normalize_surface_source(source)
     if normalized in {"creator", "creator-agent-ui", "creator-category-service"}:
         return "creator-agent"
     return normalized
@@ -1868,6 +2095,78 @@ def _is_shopping_multi_source(source: Optional[str]) -> bool:
     if "aurora" in normalized:
         return True
     return False
+
+
+def _normalize_gateway_request_metadata(
+    *,
+    metadata: Optional[Dict[str, Any]],
+    payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    normalized_metadata: Dict[str, Any] = dict(metadata or {})
+    payload_dict = payload if isinstance(payload, dict) else {}
+    payload_metadata = payload_dict.get("metadata") if isinstance(payload_dict.get("metadata"), dict) else {}
+
+    if not normalized_metadata.get("creator_id"):
+        for key in ("creatorId", "creator_id"):
+            if key in payload_dict and payload_dict.get(key):
+                normalized_metadata["creator_id"] = payload_dict.get(key)
+                break
+    if not normalized_metadata.get("creator_name"):
+        for key in ("creatorName", "creator_name"):
+            if key in payload_dict and payload_dict.get(key):
+                normalized_metadata["creator_name"] = payload_dict.get(key)
+                break
+    if not normalized_metadata.get("source") and payload_metadata.get("source"):
+        normalized_metadata["source"] = payload_metadata.get("source")
+    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
+        for key in ("trace_id", "traceId"):
+            if payload_metadata.get(key):
+                normalized_metadata[key] = payload_metadata.get(key)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for key in ("page_request_id", "pageRequestId"):
+            if payload_metadata.get(key):
+                normalized_metadata[key] = payload_metadata.get(key)
+                break
+    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
+        for key in ("page_request_id", "pageRequestId"):
+            if payload_dict.get(key):
+                normalized_metadata[key] = payload_dict.get(key)
+                break
+
+    query_source = str(
+        normalized_metadata.get("query_source")
+        or payload_metadata.get("query_source")
+        or payload_dict.get("query_source")
+        or ""
+    ).strip() or None
+    commerce_surface = str(
+        normalized_metadata.get("commerce_surface")
+        or payload_metadata.get("commerce_surface")
+        or payload_dict.get("commerce_surface")
+        or payload_metadata.get("surface")
+        or payload_dict.get("surface")
+        or ""
+    ).strip() or None
+    taxonomy = build_traffic_taxonomy(
+        normalized_metadata,
+        metadata=payload_metadata,
+        default_source_channel=str(
+            normalized_metadata.get("source")
+            or payload_metadata.get("source")
+            or ""
+        ).strip()
+        or None,
+        default_query_source=query_source,
+        default_protocol_name=str(
+            normalized_metadata.get("protocol_name")
+            or payload_metadata.get("protocol_name")
+            or "rest"
+        ).strip()
+        or "rest",
+        default_commerce_surface=commerce_surface,
+    )
+    return attach_traffic_taxonomy(normalized_metadata, taxonomy)
 
 
 def _catalog_rel_v2_enabled() -> bool:
@@ -2225,6 +2524,129 @@ def _resolve_multi_base_merchant_fanout(source: Optional[str], is_creator_surfac
     if _is_shopping_multi_source(source):
         return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING
     return MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT_DEFAULT
+
+
+_GENERIC_DEFAULT_PRECISION_GATE_SOURCES = {
+    "shopping-agent-ui",
+    "shopping-agent-web",
+}
+_GENERIC_DEFAULT_PRECISION_IGNORED_QUERY_TOKENS = {
+    "black",
+    "white",
+    "beige",
+    "brown",
+    "camel",
+    "gray",
+    "grey",
+    "green",
+    "navy",
+    "neutral",
+    "pink",
+    "red",
+    "silver",
+    "tan",
+    "vintage",
+    "warm",
+}
+_GENERIC_DEFAULT_PRECISION_MIN_COVERAGE = 0.6
+_GENERIC_DEFAULT_PRECISION_MIN_MATCHES = 2
+
+
+def _normalize_generic_precision_token(value: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _strip_accents(str(value or "").lower())).strip()
+
+
+def _generic_precision_token_variants(token: str) -> set[str]:
+    normalized = _normalize_generic_precision_token(token)
+    if not normalized:
+        return set()
+    variants = {normalized}
+    if len(normalized) > 4 and normalized.endswith("ies"):
+        variants.add(normalized[:-3] + "y")
+    if len(normalized) > 4 and normalized.endswith("es"):
+        variants.add(normalized[:-2])
+    if len(normalized) > 3 and normalized.endswith("s"):
+        variants.add(normalized[:-1])
+    return {item for item in variants if item}
+
+
+def _default_query_precision_terms(query: Optional[str]) -> list[str]:
+    deduped: list[str] = []
+    for raw_token in re.split(r"[^a-z0-9]+", _strip_accents(str(query or "").lower())):
+        token = _normalize_generic_precision_token(raw_token)
+        if (
+            not token
+            or len(token) <= 2
+            or token.isdigit()
+            or token in _GENERIC_DEFAULT_PRECISION_IGNORED_QUERY_TOKENS
+        ):
+            continue
+        if token not in deduped:
+            deduped.append(token)
+    return deduped
+
+
+def _candidate_generic_precision_terms(product: StandardProduct) -> set[str]:
+    candidate_terms: set[str] = set()
+    raw_terms: list[str] = []
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(product.title or "").lower())))
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(product.product_type or "").lower())))
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(getattr(product, "vendor", "") or "").lower())))
+    raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(getattr(product, "sku", "") or "").lower())))
+    for tag in getattr(product, "tags", None) or []:
+        raw_terms.extend(re.split(r"[^a-z0-9]+", _strip_accents(str(tag or "").lower())))
+    for raw_term in raw_terms:
+        for variant in _generic_precision_token_variants(raw_term):
+            if len(variant) > 2:
+                candidate_terms.add(variant)
+    return candidate_terms
+
+
+def _evaluate_generic_default_precision_gate(
+    *,
+    query: Optional[str],
+    product: StandardProduct,
+) -> Dict[str, Any]:
+    query_terms = _default_query_precision_terms(query)
+    if len(query_terms) < 2:
+        return {
+            "applied": False,
+            "passed": True,
+            "matched_terms": [],
+            "coverage_ratio": 1.0,
+            "required_matches": 0,
+        }
+
+    candidate_terms = _candidate_generic_precision_terms(product)
+    matched_terms = [
+        term
+        for term in query_terms
+        if _generic_precision_token_variants(term) & candidate_terms
+    ]
+    coverage_ratio = len(matched_terms) / float(len(query_terms)) if query_terms else 1.0
+    query_compact = _normalize_generic_precision_token(query)
+    candidate_compact = _normalize_generic_precision_token(
+        " ".join(
+            [
+                str(product.title or ""),
+                str(product.product_type or ""),
+                " ".join(str(tag or "") for tag in (getattr(product, "tags", None) or [])),
+            ]
+        )
+    )
+    exact_phrase_match = bool(query_compact and len(query_compact) >= 8 and query_compact in candidate_compact)
+    passed = exact_phrase_match or (
+        len(matched_terms) >= min(_GENERIC_DEFAULT_PRECISION_MIN_MATCHES, len(query_terms))
+        and coverage_ratio >= _GENERIC_DEFAULT_PRECISION_MIN_COVERAGE
+    )
+    return {
+        "applied": True,
+        "passed": passed,
+        "matched_terms": matched_terms,
+        "coverage_ratio": round(coverage_ratio, 4),
+        "required_matches": min(_GENERIC_DEFAULT_PRECISION_MIN_MATCHES, len(query_terms)),
+        "exact_phrase_match": exact_phrase_match,
+    }
 
 
 class SearchFilters(BaseModel):
@@ -4312,6 +4734,937 @@ def _standard_to_shop_product(p: StandardProduct) -> Dict[str, Any]:
     return base
 
 
+def _pivot_primary_offer(item: PivotResultItem) -> Optional[Any]:
+    if not item.offers:
+        return None
+    for offer in item.offers:
+        if offer.catalog_track == "internal_merchant":
+            return offer
+    return item.offers[0]
+
+
+def _pivot_price_value(offer: Any) -> Optional[Any]:
+    if offer is None:
+        return None
+    pricing = getattr(offer, "pricing", None)
+    if pricing is None:
+        return None
+    return (
+        pricing.estimated_best_price
+        or pricing.merchant_effective_price
+        or pricing.list_price
+    )
+
+
+def _pivot_market_from_payload(
+    payload: FindProductsMultiPayload,
+    request_metadata: Optional[Dict[str, Any]],
+) -> str:
+    raw_locale = ""
+    if isinstance(request_metadata, dict):
+        raw_locale = str(
+            request_metadata.get("locale")
+            or request_metadata.get("market")
+            or ""
+        ).strip()
+    if not raw_locale:
+        try:
+            raw_locale = str(getattr(payload, "locale", "") or "").strip()
+        except Exception:
+            raw_locale = ""
+    if not raw_locale:
+        return "US"
+    token = raw_locale.replace("_", "-").split("-")[-1].strip().upper()
+    return token if len(token) == 2 else "US"
+
+
+def _pivot_multi_source_allowed(source_normalized: str, allowed_sources: set[str]) -> bool:
+    if not allowed_sources:
+        return False
+    source_normalized = _normalize_surface_source(source_normalized)
+    if not source_normalized:
+        return False
+    normalized_allowed_sources = {
+        _normalize_surface_source(item)
+        for item in allowed_sources
+        if _normalize_surface_source(item)
+    }
+    if source_normalized in normalized_allowed_sources:
+        return True
+    if _is_shopping_multi_source(source_normalized):
+        for allowed in normalized_allowed_sources:
+            if allowed.endswith("*") and source_normalized.startswith(allowed[:-1]):
+                return True
+    return False
+
+
+def _pivot_multi_rollout_allowed(
+    *,
+    source_normalized: str,
+    page: int,
+    mode: str,
+) -> bool:
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode == "shadow":
+        return _pivot_multi_source_allowed(
+            source_normalized,
+            PIVOT_MULTI_SHADOW_SOURCE_ALLOWLIST,
+        )
+    if normalized_mode == "serve":
+        if page > PIVOT_MULTI_SERVE_MAX_PAGE:
+            return False
+        return _pivot_multi_source_allowed(
+            source_normalized,
+            PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST,
+        )
+    return False
+
+
+def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for item in items:
+        primary_offer = _pivot_primary_offer(item)
+        product_id = (
+            item.product.source_product_id
+            or item.product.product_key
+            or (primary_offer.offer_id if primary_offer else None)
+            or item.sku.sku_key
+        )
+        if not product_id:
+            continue
+
+        group = grouped.get(product_id)
+        if group is None:
+            image_url = item.product.image_url
+            if not image_url and primary_offer:
+                image_url = None
+            best_deal_payload: Optional[Dict[str, Any]] = None
+            if primary_offer:
+                merchant_price = getattr(primary_offer.pricing, "merchant_effective_price", None)
+                estimated_price = getattr(primary_offer.pricing, "estimated_best_price", None)
+                if primary_offer.incentives or (
+                    estimated_price is not None
+                    and merchant_price is not None
+                    and estimated_price < merchant_price
+                ):
+                    best_deal_payload = {
+                        "estimated_best_price": estimated_price,
+                        "incentives": [incentive.model_dump() for incentive in primary_offer.incentives],
+                        "source": "pivot_incentive_graph",
+                    }
+            group = {
+                "id": product_id,
+                "product_id": product_id,
+                "merchant_id": item.merchant.merchant_id,
+                "merchant_name": item.merchant.merchant_name,
+                "title": item.product.title,
+                "description": item.product.description or "",
+                "price": _pivot_price_value(primary_offer),
+                "currency": getattr(primary_offer.pricing, "currency", None) if primary_offer else None,
+                "image_url": image_url,
+                "product_type": item.product.product_type,
+                "inventory_quantity": 0,
+                "sku": item.sku.sku,
+                "platform": item.merchant.primary_platform,
+                "catalog_track": item.catalog_track,
+                "truth_tier": item.truth_tier,
+                "readiness_tier": item.readiness_tier,
+                "canonical_url": item.product.canonical_url,
+                "visible_attributes": item.sku.visible_attributes or {},
+                "visible_option_labels": list(item.sku.visible_option_labels or []),
+                "ingredient_ids": list(item.sku.ingredient_ids or []),
+                "variants": [],
+            }
+            if best_deal_payload:
+                group["best_deal"] = best_deal_payload
+            if item.verticals.get("beauty"):
+                group["beauty"] = item.verticals.get("beauty")
+            grouped[product_id] = group
+
+        availability = getattr(primary_offer, "availability", None) if primary_offer else None
+        inventory_quantity = getattr(primary_offer, "inventory_quantity", None) if primary_offer else None
+        if isinstance(inventory_quantity, int) and inventory_quantity > 0:
+            group["inventory_quantity"] = int(group.get("inventory_quantity") or 0) + inventory_quantity
+
+        variant_id = item.sku.source_variant_id or item.sku.sku_key or item.sku.sku or product_id
+        variant = {
+            "variant_id": variant_id,
+            "id": variant_id,
+            "title": item.sku.title or item.product.title,
+            "price": _pivot_price_value(primary_offer),
+            "compare_at_price": getattr(primary_offer.pricing, "list_price", None) if primary_offer else None,
+            "sku": item.sku.sku,
+            "inventory_quantity": inventory_quantity,
+            "options": {
+                "visible_attributes": item.sku.visible_attributes or {},
+                "visible_option_labels": item.sku.visible_option_labels or [],
+            },
+            "image_url": item.product.image_url,
+            "availability": availability,
+        }
+
+        existing_variant_ids = {
+            str(v.get("variant_id") or v.get("id") or "")
+            for v in group["variants"]
+            if isinstance(v, dict)
+        }
+        if str(variant_id) not in existing_variant_ids:
+            group["variants"].append(variant)
+
+    return list(grouped.values())
+
+
+def _normalize_pivot_multi_visible_attributes(product: Any) -> Dict[str, List[str]]:
+    if not isinstance(product, dict):
+        return {}
+    raw = product.get("visible_attributes") or {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized: Dict[str, List[str]] = {}
+    for bucket, values in raw.items():
+        bucket_name = str(bucket or "").strip()
+        if not bucket_name:
+            continue
+        items = values if isinstance(values, list) else [values] if isinstance(values, str) else []
+        deduped: List[str] = []
+        for value in items:
+            label = str(value or "").strip()
+            if label and label not in deduped:
+                deduped.append(label)
+        if deduped:
+            normalized[bucket_name] = deduped
+    return normalized
+
+
+def _normalize_pivot_multi_ingredient_ids(product: Any) -> List[str]:
+    if not isinstance(product, dict):
+        return []
+    ingredient_ids = product.get("ingredient_ids") or []
+    if isinstance(ingredient_ids, str):
+        ingredient_ids = [ingredient_ids]
+    deduped: List[str] = []
+    for value in ingredient_ids if isinstance(ingredient_ids, list) else []:
+        normalized = _normalize_serving_token(str(value or "").replace("_", " "))
+        if not normalized:
+            continue
+        canonical = _SKINCARE_INGREDIENT_CANONICAL_ALIASES.get(
+            normalized.replace("_", " "),
+            normalized,
+        )
+        if canonical not in deduped:
+            deduped.append(canonical)
+    return deduped
+
+
+def _collect_pivot_multi_visible_option_labels(product: Any) -> List[str]:
+    if not isinstance(product, dict):
+        return []
+    deduped: List[str] = []
+    for label in product.get("visible_option_labels") or []:
+        normalized = _normalize_serving_token(label)
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    for variant in product.get("variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        for label in (variant.get("options") or {}).get("visible_option_labels", []) or []:
+            normalized = _normalize_serving_token(label)
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+    return deduped
+
+
+def _pivot_multi_search_text_blob(product: Any) -> str:
+    if not isinstance(product, dict):
+        return ""
+    parts: List[str] = [
+        str(product.get("title") or ""),
+        str(product.get("description") or ""),
+        str(product.get("product_type") or ""),
+        str(product.get("sku") or ""),
+    ]
+    visible_attributes = product.get("visible_attributes")
+    if isinstance(visible_attributes, dict):
+        for values in visible_attributes.values():
+            if isinstance(values, list):
+                parts.extend(str(value or "") for value in values)
+            elif isinstance(values, str):
+                parts.append(values)
+    ingredient_ids = product.get("ingredient_ids")
+    if isinstance(ingredient_ids, list):
+        parts.extend(str(value or "") for value in ingredient_ids)
+    elif isinstance(ingredient_ids, str):
+        parts.append(ingredient_ids)
+    for variant in product.get("variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        parts.append(str(variant.get("title") or ""))
+        parts.append(str(variant.get("sku") or ""))
+        options = variant.get("options") or {}
+        if isinstance(options, dict):
+            for option_name, option_value in options.items():
+                parts.append(str(option_name or ""))
+                if isinstance(option_value, list):
+                    parts.extend(str(value or "") for value in option_value)
+                else:
+                    parts.append(str(option_value or ""))
+    return " ".join(part.lower() for part in parts if str(part or "").strip()).strip()
+
+
+def _ingredient_alias_matches_text(text: Optional[str], ingredient_id: Optional[str]) -> bool:
+    return any(
+        _normalized_intent_term_match(text, alias)
+        for alias in _skincare_ingredient_alias_terms(ingredient_id)
+    )
+
+
+def _pivot_multi_product_signatures(product: Any) -> set[str]:
+    if not isinstance(product, dict):
+        return set()
+    merchant_id = str(product.get("merchant_id") or "").strip().lower()
+    product_id = str(product.get("product_id") or product.get("id") or "").strip().lower()
+    canonical_url = str(product.get("canonical_url") or "").strip().lower()
+    title = _normalize_offer_title(str(product.get("title") or ""))
+    signatures: set[str] = set()
+    if merchant_id and product_id:
+        signatures.add(f"{merchant_id}::{product_id}")
+    if canonical_url:
+        signatures.add(f"url::{canonical_url}")
+    if title:
+        signatures.add(f"title::{title}")
+        if merchant_id:
+            signatures.add(f"{merchant_id}::title::{title}")
+    return signatures
+
+
+def _pivot_multi_group_counts(result: Optional[Dict[str, Any]]) -> tuple[int, int]:
+    products = result.get("products") if isinstance(result, dict) else None
+    if not isinstance(products, list):
+        return 0, 0
+    internal_count = 0
+    external_count = 0
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        track = str(product.get("catalog_track") or "").strip().lower()
+        if track == "internal_merchant":
+            internal_count += 1
+        elif track == "external_referral":
+            external_count += 1
+    return internal_count, external_count
+
+
+def _pivot_multi_share(count: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    try:
+        return max(0.0, min(1.0, float(count) / float(total)))
+    except Exception:
+        return 0.0
+
+
+def _pivot_multi_page_bucket(page: int) -> str:
+    try:
+        normalized_page = max(1, int(page))
+    except Exception:
+        normalized_page = 1
+    if normalized_page <= 1:
+        return "page_1"
+    if normalized_page <= 3:
+        return "page_2_3"
+    return "page_4_plus"
+
+
+def _pivot_multi_product_best_price(product: Any) -> Optional[float]:
+    if not isinstance(product, dict):
+        return None
+
+    candidates: List[Any] = []
+    best_deal = product.get("best_deal")
+    if isinstance(best_deal, dict):
+        candidates.append(best_deal.get("estimated_best_price"))
+        candidates.append(best_deal.get("merchant_effective_price"))
+    candidates.append(product.get("price"))
+
+    for variant in product.get("variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        candidates.append(variant.get("price"))
+        candidates.append(variant.get("compare_at_price"))
+
+    for candidate in candidates:
+        try:
+            if candidate is None or candidate == "":
+                continue
+            return float(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def _build_pivot_multi_shadow_diff_summary(
+    served_result: Optional[Dict[str, Any]],
+    pivot_result: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    served_products = served_result.get("products") if isinstance(served_result, dict) else None
+    pivot_products = pivot_result.get("products") if isinstance(pivot_result, dict) else None
+    served_products = served_products if isinstance(served_products, list) else []
+    pivot_products = pivot_products if isinstance(pivot_products, list) else []
+
+    served_signatures = [
+        signatures
+        for signatures in (_pivot_multi_product_signatures(product) for product in served_products)
+        if signatures
+    ]
+    pivot_signatures = [
+        signatures
+        for signatures in (_pivot_multi_product_signatures(product) for product in pivot_products)
+        if signatures
+    ]
+    matched_pivot_indexes: set[int] = set()
+    overlap_count = 0
+    for served_signature_set in served_signatures:
+        for pivot_idx, pivot_signature_set in enumerate(pivot_signatures):
+            if pivot_idx in matched_pivot_indexes:
+                continue
+            if served_signature_set.intersection(pivot_signature_set):
+                matched_pivot_indexes.add(pivot_idx)
+                overlap_count += 1
+                break
+    if not served_signatures and not pivot_signatures:
+        overlap_ratio = 1.0
+        top1_same = True
+    else:
+        overlap_ratio = (
+            round(overlap_count / max(1, len(served_signatures)), 4)
+            if served_signatures
+            else 0.0
+        )
+        top1_same = bool(
+            served_signatures
+            and pivot_signatures
+            and served_signatures[0].intersection(pivot_signatures[0])
+        )
+    served_internal_count, served_external_count = _pivot_multi_group_counts(served_result)
+    pivot_internal_count, pivot_external_count = _pivot_multi_group_counts(pivot_result)
+
+    served_metadata = served_result.get("metadata") if isinstance(served_result, dict) else None
+    served_metadata = served_metadata if isinstance(served_metadata, dict) else {}
+    pivot_metadata = pivot_result.get("metadata") if isinstance(pivot_result, dict) else None
+    pivot_metadata = pivot_metadata if isinstance(pivot_metadata, dict) else {}
+
+    served_top_price = _pivot_multi_product_best_price(served_products[0]) if served_products else None
+    pivot_top_price = _pivot_multi_product_best_price(pivot_products[0]) if pivot_products else None
+    estimated_price_delta_ratio: Optional[float] = None
+    if served_top_price and served_top_price > 0 and pivot_top_price is not None:
+        estimated_price_delta_ratio = round((pivot_top_price - served_top_price) / served_top_price, 4)
+
+    served_returned_count = len(served_products)
+    pivot_returned_count = len(pivot_products)
+    no_result_mismatch = bool((served_returned_count == 0) != (pivot_returned_count == 0))
+    internal_share_delta = round(
+        _pivot_multi_share(pivot_internal_count, pivot_returned_count)
+        - _pivot_multi_share(served_internal_count, served_returned_count),
+        4,
+    )
+    external_share_delta = round(
+        _pivot_multi_share(pivot_external_count, pivot_returned_count)
+        - _pivot_multi_share(served_external_count, served_returned_count),
+        4,
+    )
+    returned_count_delta = pivot_returned_count - served_returned_count
+    bad_price_anomaly = bool(
+        estimated_price_delta_ratio is not None
+        and abs(estimated_price_delta_ratio) >= PIVOT_MULTI_BAD_PRICE_DELTA_RATIO_THRESHOLD
+    )
+
+    return {
+        "pivot_shadow_attempted": True,
+        "served_query_source": str(served_metadata.get("query_source") or "unknown"),
+        "served_returned_count": served_returned_count,
+        "pivot_shadow_returned_count": pivot_returned_count,
+        "pivot_shadow_overlap_count": overlap_count,
+        "pivot_shadow_overlap_ratio": overlap_ratio,
+        "pivot_shadow_top1_same": top1_same,
+        "served_internal_count": served_internal_count,
+        "served_external_count": served_external_count,
+        "pivot_shadow_internal_count": pivot_internal_count,
+        "pivot_shadow_external_count": pivot_external_count,
+        "pivot_shadow_returned_count_delta": returned_count_delta,
+        "pivot_shadow_internal_share_delta": internal_share_delta,
+        "pivot_shadow_external_share_delta": external_share_delta,
+        "pivot_shadow_no_result_mismatch": no_result_mismatch,
+        "pivot_shadow_served_top_price": served_top_price,
+        "pivot_shadow_top_price": pivot_top_price,
+        "pivot_shadow_estimated_price_delta_ratio": estimated_price_delta_ratio,
+        "pivot_shadow_bad_price_anomaly": bad_price_anomaly,
+        "pivot_shadow_query_source": str(
+            pivot_metadata.get("query_source") or "pivot_semantic_core_multi"
+        ),
+    }
+
+
+async def _handle_find_products_multi_via_pivot(
+    payload: FindProductsMultiPayload,
+    request_metadata: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    filters = payload.search
+    query = str(filters.query or "").strip()
+    if not query:
+        return None
+
+    page = filters.page or 1
+    limit = _clamp_search_limit(filters.limit, fallback=20)
+    raw_limit = min(max(limit * page * PIVOT_MULTI_LIMIT_MULTIPLIER, limit), 100)
+
+    q_ascii = _strip_accents(query.lower())
+    query_semantic_class = _classify_query_semantic_class(q_ascii or query.lower())
+    active_visible_category_intents = []
+    for group in [
+        {
+            "label": "serum",
+            "query_terms": ["serum", "serums"],
+            "product_terms": ["serum", "serums"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
+        },
+        {
+            "label": "moisturizer",
+            "query_terms": ["moisturizer", "moisturizers", "moisturiser", "moisturisers"],
+            "product_terms": ["moisturizer", "moisturizers", "moisturiser", "moisturisers"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
+        },
+        {
+            "label": "cleanser",
+            "query_terms": ["cleanser", "cleansers"],
+            "product_terms": ["cleanser", "cleansers"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
+        },
+        {
+            "label": "toner",
+            "query_terms": ["toner", "toners"],
+            "product_terms": ["toner", "toners"],
+            "semantic_classes": ["beauty"],
+            "visible_attribute_bucket": "product_category",
+        },
+        {
+            "label": "foundation",
+            "query_terms": ["foundation", "foundations"],
+            "product_terms": ["foundation", "foundations"],
+            "semantic_classes": ["beauty"],
+        },
+        {
+            "label": "lipstick",
+            "query_terms": ["lipstick", "lipsticks"],
+            "product_terms": ["lipstick", "lipsticks"],
+            "semantic_classes": ["beauty"],
+        },
+        {
+            "label": "blush",
+            "query_terms": ["blush", "blushes"],
+            "product_terms": ["blush", "blushes"],
+            "semantic_classes": ["beauty"],
+        },
+        {
+            "label": "gloss",
+            "query_terms": ["gloss", "glosses", "lip gloss", "lip glosses"],
+            "product_terms": ["gloss", "glosses", "lip gloss", "lip glosses"],
+            "semantic_classes": ["beauty"],
+        },
+    ]:
+        if not _normalized_intent_terms_match(q_ascii, list(group["query_terms"])):
+            continue
+        allowed_semantic_classes = {
+            str(item)
+            for item in (group.get("semantic_classes") or [])
+            if item
+        }
+        if allowed_semantic_classes and query_semantic_class not in allowed_semantic_classes:
+            continue
+        active_visible_category_intents.append(group)
+    active_visible_category_labels = [
+        str(group["label"]) for group in active_visible_category_intents
+    ]
+    active_visible_attribute_intents = []
+    for group in [
+        {
+            "label": "fragrance_free",
+            "query_terms": [
+                "fragrance free",
+                "fragrance-free",
+                "free fragrance",
+                "sin fragancia",
+            ],
+            "product_terms": [
+                "fragrance free",
+                "fragrance-free",
+                "free fragrance",
+                "without fragrance",
+                "no fragrance",
+                "sin fragancia",
+            ],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
+            "visible_attribute_bucket": "formula_constraint",
+        },
+        {
+            "label": "sensitive_skin",
+            "query_terms": ["sensitive skin", "sensitive-skin"],
+            "product_terms": ["sensitive skin", "sensitive-skin"],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
+            "visible_attribute_bucket": "skin_concern",
+        },
+        {
+            "label": "hydrating",
+            "query_terms": ["hydrating", "hydrate", "hydration"],
+            "product_terms": ["hydrating", "hydrate", "hydration"],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
+            "visible_attribute_bucket": "skin_concern",
+        },
+        {
+            "label": "brightening",
+            "query_terms": ["brightening", "brighten"],
+            "product_terms": ["brightening", "brighten"],
+            "semantic_classes": ["beauty"],
+            "category_labels": ["serum"],
+            "visible_attribute_bucket": "skin_concern",
+        },
+    ]:
+        if not _normalized_intent_terms_match(q_ascii, list(group["query_terms"])):
+            continue
+        allowed_semantic_classes = {
+            str(item)
+            for item in (group.get("semantic_classes") or [])
+            if item
+        }
+        if allowed_semantic_classes and query_semantic_class not in allowed_semantic_classes:
+            continue
+        allowed_category_labels = {
+            str(item)
+            for item in (group.get("category_labels") or [])
+            if item
+        }
+        if allowed_category_labels and not any(
+            label in allowed_category_labels for label in active_visible_category_labels
+        ):
+            continue
+        active_visible_attribute_intents.append(group)
+    active_visible_option_intents = [
+        *_extract_visible_size_option_intents(q_ascii),
+        *_extract_visible_color_option_intents(
+            q_ascii,
+            active_category_labels=active_visible_category_labels,
+        ),
+        *_extract_visible_shade_option_intents(
+            q_ascii,
+            active_category_labels=active_visible_category_labels,
+        ),
+    ]
+    active_visible_option_labels = [
+        str(group["label"]) for group in active_visible_option_intents
+    ]
+    cosmetic_shade_category_intents = [
+        label
+        for label in active_visible_category_labels
+        if label in _COSMETIC_SHADE_CATEGORY_LABELS
+    ]
+    requires_explicit_shade_query = bool(cosmetic_shade_category_intents)
+    has_active_shade_option_intent = any(
+        label.startswith("shade_") for label in active_visible_option_labels
+    )
+    active_unsupported_beauty_category_labels = [
+        str(group["label"])
+        for group in [
+            {"label": "skincare", "query_terms": ["skincare", "skin care", "skin-care"]},
+            {"label": "cosmetics", "query_terms": ["cosmetics", "makeup", "make-up"]},
+        ]
+        if _normalized_intent_terms_match(q_ascii, list(group["query_terms"]))
+    ]
+    active_ingredient_intents = _extract_skin_care_ingredient_intents(
+        q_ascii,
+        query_semantic_class=query_semantic_class,
+    )
+
+    pivot_result = await search_pivot_catalog(
+        PivotQueryRequest(
+            query=query,
+            merchant_id=None,
+            market=_pivot_market_from_payload(payload, request_metadata),
+            limit=raw_limit,
+            include_external=PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL,
+            include_incentives=PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES,
+            payment_context=None,
+        )
+    )
+
+    products = _pivot_items_to_multi_products(pivot_result.items)
+
+    if products and (
+        active_visible_category_intents
+        or active_visible_attribute_intents
+        or active_visible_option_intents
+        or active_ingredient_intents
+    ):
+        filtered_products = []
+        for product in products:
+            visible_attributes = _normalize_pivot_multi_visible_attributes(product)
+            visible_option_labels = _collect_pivot_multi_visible_option_labels(product)
+            ingredient_ids = _normalize_pivot_multi_ingredient_ids(product)
+            visible_text_blob = _pivot_multi_search_text_blob(product)
+            visible_category_blob = visible_text_blob
+            visible_attribute_blob = visible_text_blob
+
+            matched_visible_category_labels = []
+            for group in active_visible_category_intents:
+                label = str(group["label"])
+                visible_attribute_bucket = str(
+                    group.get("visible_attribute_bucket") or ""
+                ).strip()
+                matched = False
+                if visible_attribute_bucket:
+                    matched = _product_visible_attribute_label_matches(
+                        visible_attributes,
+                        bucket=visible_attribute_bucket,
+                        label=label,
+                    )
+                if not matched:
+                    matched = _normalized_intent_terms_match(
+                        visible_category_blob,
+                        list(group["product_terms"]),
+                    )
+                if matched:
+                    matched_visible_category_labels.append(label)
+            if active_visible_category_intents and not matched_visible_category_labels:
+                continue
+
+            matched_visible_attribute_labels = []
+            for group in active_visible_attribute_intents:
+                label = str(group["label"])
+                visible_attribute_bucket = str(
+                    group.get("visible_attribute_bucket") or ""
+                ).strip()
+                matched = False
+                if visible_attribute_bucket:
+                    matched = _product_visible_attribute_label_matches(
+                        visible_attributes,
+                        bucket=visible_attribute_bucket,
+                        label=label,
+                    )
+                if not matched:
+                    matched = _normalized_intent_terms_match(
+                        visible_attribute_blob,
+                        list(group["product_terms"]),
+                    )
+                if matched:
+                    matched_visible_attribute_labels.append(label)
+            if active_visible_attribute_intents and (
+                len(matched_visible_attribute_labels)
+                < len(active_visible_attribute_intents)
+            ):
+                continue
+
+            matched_visible_option_labels = []
+            for group in active_visible_option_intents:
+                label = str(group["label"])
+                if label in visible_option_labels:
+                    matched_visible_option_labels.append(label)
+            if active_visible_option_intents and (
+                len(matched_visible_option_labels) < len(active_visible_option_intents)
+            ):
+                continue
+
+            if active_ingredient_intents:
+                product_skin_care_categories = {
+                    label
+                    for label in visible_attributes.get("product_category", [])
+                    if label in _SKINCARE_INGREDIENT_CATEGORY_LABELS
+                }
+                for label in _SKINCARE_INGREDIENT_CATEGORY_LABELS:
+                    if _normalized_intent_term_match(visible_category_blob, label):
+                        product_skin_care_categories.add(label)
+                if not product_skin_care_categories:
+                    continue
+                matched_ingredient_ids = []
+                for group in active_ingredient_intents:
+                    ingredient_id = str(group.get("ingredient_id") or "").strip()
+                    if ingredient_id and (
+                        ingredient_id in ingredient_ids
+                        or _ingredient_alias_matches_text(visible_text_blob, ingredient_id)
+                    ):
+                        matched_ingredient_ids.append(ingredient_id)
+                if len(matched_ingredient_ids) < len(active_ingredient_intents):
+                    continue
+
+            filtered_products.append(product)
+        products = filtered_products
+
+    category = str(filters.category or "").strip().lower()
+    if category:
+        products = [
+            product
+            for product in products
+            if category in str(product.get("product_type") or "").lower()
+        ]
+
+    if filters.price_min is not None:
+        products = [
+            product
+            for product in products
+            if product.get("price") is not None and float(product["price"]) >= float(filters.price_min)
+        ]
+    if filters.price_max is not None:
+        products = [
+            product
+            for product in products
+            if product.get("price") is not None and float(product["price"]) <= float(filters.price_max)
+        ]
+    if bool(filters.in_stock_only):
+        products = [
+            product
+            for product in products
+            if int(product.get("inventory_quantity") or 0) > 0
+        ]
+
+    total = len(products)
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    page_items = products[start_idx:end_idx]
+    if not page_items:
+        return None
+
+    internal_count = sum(1 for item in pivot_result.items if item.catalog_track == "internal_merchant")
+    external_count = sum(1 for item in pivot_result.items if item.catalog_track == "external_referral")
+    return {
+        "products": page_items,
+        "total": total,
+        "page": page,
+        "page_size": len(page_items),
+        "reply": None,
+        "metadata": {
+            "query_source": "pivot_semantic_core_multi",
+            "query_semantic_class": query_semantic_class,
+            "fetched_at": datetime.utcnow().isoformat(),
+            "pivot_rollout_mode": "serve",
+            "pivot_rollout_guard_passed": True,
+            "pivot_include_external": PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL,
+            "pivot_include_incentives": PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES,
+            "pivot_internal_item_count": internal_count,
+            "pivot_external_item_count": external_count,
+            "pivot_total_items": int(pivot_result.total or len(pivot_result.items)),
+            "primary_path_used": "pivot_semantic_core_multi",
+            "fallback_triggered": False,
+            "fallback_reason": None,
+            "external_seed_executed": external_count > 0,
+            "external_seed_rows_built": external_count,
+            "internal_raw_count": internal_count,
+            "external_raw_count": external_count,
+            "merged_pre_limit_count": total,
+            "final_returned_count": len(page_items),
+        },
+    }
+
+
+async def _shadow_find_products_multi_via_pivot(
+    payload: FindProductsMultiPayload,
+    request_metadata: Optional[Dict[str, Any]],
+    served_result: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        result = await _handle_find_products_multi_via_pivot(payload, request_metadata)
+        diff_summary = (
+            _build_pivot_multi_shadow_diff_summary(served_result, result)
+            if isinstance(served_result, dict)
+            else None
+        )
+        if diff_summary:
+            source_normalized = _normalize_surface_source((request_metadata or {}).get("source"))
+            query_semantic_class = str(
+                ((served_result or {}).get("metadata") or {}).get("query_semantic_class")
+                or _classify_query_semantic_class(payload.search.query)
+                or "default"
+            ).strip().lower() or "default"
+            record_catalog_pivot_shadow_compare(
+                source=source_normalized or "unknown",
+                page_bucket=_pivot_multi_page_bucket(payload.search.page or 1),
+                query_semantic_class=query_semantic_class,
+                served_path=str(diff_summary.get("served_query_source") or "unknown"),
+                shadow_path=str(diff_summary.get("pivot_shadow_query_source") or "pivot_semantic_core_multi"),
+                top1_same=bool(diff_summary.get("pivot_shadow_top1_same")),
+                overlap_ratio=float(diff_summary.get("pivot_shadow_overlap_ratio") or 0.0),
+                returned_count_delta=int(diff_summary.get("pivot_shadow_returned_count_delta") or 0),
+                internal_share_delta=float(diff_summary.get("pivot_shadow_internal_share_delta") or 0.0),
+                external_share_delta=float(diff_summary.get("pivot_shadow_external_share_delta") or 0.0),
+                no_result_mismatch=bool(diff_summary.get("pivot_shadow_no_result_mismatch")),
+                estimated_price_delta_ratio=diff_summary.get("pivot_shadow_estimated_price_delta_ratio"),
+                bad_price_anomaly=bool(diff_summary.get("pivot_shadow_bad_price_anomaly")),
+            )
+        logger.info(
+            "pivot.multi.shadow.diff" if diff_summary else "pivot.multi.shadow.result",
+            extra={
+                "query": str(payload.search.query or "").strip(),
+                "served": bool(result and result.get("products")),
+                "returned_count": len((result or {}).get("products") or []),
+                "metadata": (result or {}).get("metadata") or {},
+                "diff_summary": diff_summary or {},
+            },
+        )
+    except Exception as exc:  # pragma: no cover - observational path
+        logger.info(
+            "pivot.multi.shadow.failed",
+            extra={
+                "query": str(payload.search.query or "").strip(),
+                "error": str(exc),
+            },
+        )
+
+
+def _maybe_schedule_pivot_multi_shadow_compare(
+    *,
+    payload: FindProductsMultiPayload,
+    request_metadata: Optional[Dict[str, Any]],
+    background_tasks: BackgroundTasks,
+    served_result: Optional[Dict[str, Any]],
+    source_normalized: str,
+    page: int,
+    dedup_cache_hit: bool = False,
+    dedup_inflight_joined: bool = False,
+) -> bool:
+    if not PIVOT_MULTI_SHADOW_ENABLED:
+        return False
+    if dedup_cache_hit or dedup_inflight_joined:
+        return False
+    if not str(payload.search.query or "").strip():
+        return False
+    if not _pivot_multi_rollout_allowed(
+        source_normalized=source_normalized,
+        page=page,
+        mode="shadow",
+    ):
+        return False
+    if not isinstance(served_result, dict):
+        return False
+    served_products = served_result.get("products")
+    if not isinstance(served_products, list):
+        return False
+    served_metadata = served_result.get("metadata")
+    served_metadata = served_metadata if isinstance(served_metadata, dict) else {}
+    if str(served_metadata.get("query_source") or "").strip() == "pivot_semantic_core_multi":
+        return False
+
+    background_tasks.add_task(
+        _shadow_find_products_multi_via_pivot,
+        payload.model_copy(deep=True),
+        dict(request_metadata or {}),
+        copy.deepcopy(served_result),
+    )
+    return True
+
+
 def _stable_external_product_id(url: str) -> str:
     u = str(url or "").strip()
     if not u:
@@ -4528,118 +5881,14 @@ def _normalize_external_seed_structured_ingredient_ids(
     row: Dict[str, Any],
     seed_data: Dict[str, Any],
 ) -> List[str]:
-    snapshot = _ensure_seed_data_obj(seed_data.get("snapshot"))
-    deduped: List[str] = []
-
-    def add_raw(raw: Any) -> None:
-        if raw is None:
-            return
-        if isinstance(raw, dict):
-            for key in (
-                "ingredient_ids",
-                "ingredientIds",
-                "reviewed_ingredient_ids",
-                "reviewedIngredientIds",
-                "canonical_ingredient_ids",
-                "canonicalIngredientIds",
-                "platform_metadata",
-                "platformMetadata",
-                "beauty_meta",
-                "beautyMeta",
-            ):
-                if key in raw:
-                    add_raw(raw.get(key))
-            return
-        if isinstance(raw, str):
-            parsed = None
-            stripped = raw.strip()
-            if not stripped:
-                return
-            if stripped.startswith("[") or stripped.startswith("{"):
-                try:
-                    parsed = json.loads(stripped)
-                except Exception:
-                    parsed = None
-            if parsed is not None:
-                add_raw(parsed)
-                return
-            values = [value.strip() for value in re.split(r"[;,|]", stripped) if value.strip()]
-        elif isinstance(raw, (list, tuple, set)):
-            values = list(raw)
-        else:
-            values = [raw]
-
-        for value in values:
-            normalized = _normalize_serving_token(str(value or "").replace("_", " "))
-            if not normalized:
-                continue
-            canonical = _SKINCARE_INGREDIENT_CANONICAL_ALIASES.get(
-                normalized.replace("_", " "),
-                normalized,
-            )
-            if canonical not in deduped:
-                deduped.append(canonical)
-
-    for candidate in (
-        row.get("reviewed_ingredient_ids"),
-        row.get("canonical_ingredient_ids"),
-        row.get("ingredient_ids"),
-        row.get("platform_metadata"),
-        seed_data.get("reviewed_ingredient_ids"),
-        seed_data.get("canonical_ingredient_ids"),
-        seed_data.get("ingredient_ids"),
-        seed_data.get("platform_metadata"),
-        snapshot.get("reviewed_ingredient_ids"),
-        snapshot.get("canonical_ingredient_ids"),
-        snapshot.get("ingredient_ids"),
-        snapshot.get("platform_metadata"),
-    ):
-        add_raw(candidate)
-
-    return deduped
+    return _shared_normalize_external_seed_structured_ingredient_ids(row, seed_data)
 
 
 def _normalize_external_seed_product_type(
     row: Dict[str, Any],
     seed_data: Dict[str, Any],
 ) -> str:
-    snapshot = _ensure_seed_data_obj(seed_data.get("snapshot"))
-    for candidate in (
-        row.get("category"),
-        seed_data.get("category"),
-        snapshot.get("category"),
-        seed_data.get("product_type"),
-        snapshot.get("product_type"),
-        seed_data.get("productType"),
-        snapshot.get("productType"),
-    ):
-        text = str(candidate or "").strip()
-        if text and text.lower() != "external":
-            return text
-    fallback_blob = " ".join(
-        str(candidate or "").strip()
-        for candidate in (
-            row.get("title"),
-            row.get("canonical_url"),
-            row.get("destination_url"),
-            seed_data.get("title"),
-            snapshot.get("title"),
-            snapshot.get("canonical_url"),
-            snapshot.get("destination_url"),
-        )
-        if str(candidate or "").strip()
-    )
-    for label, pattern in _EXTERNAL_SEED_SKINCARE_CATEGORY_PATTERNS:
-        if pattern.search(fallback_blob):
-            return label.title()
-    return ""
-
-
-def _build_external_seed_visible_attributes(product_type: Optional[str]) -> Dict[str, List[str]]:
-    normalized = str(product_type or "").strip().lower()
-    if normalized in _SKINCARE_INGREDIENT_CATEGORY_LABELS:
-        return {"product_category": [normalized]}
-    return {}
+    return _shared_normalize_external_seed_product_type(row, seed_data)
 
 
 def _build_external_seed_filter_product(
@@ -4648,66 +5897,10 @@ def _build_external_seed_filter_product(
     seed_data: Dict[str, Any],
     external_product: Dict[str, Any],
 ) -> StandardProduct:
-    title = str(external_product.get("title") or "External product").strip() or "External product"
-    try:
-        price = float(external_product.get("price") or 0)
-    except Exception:
-        price = 0.0
-    currency = str(external_product.get("currency") or "USD").strip().upper() or "USD"
-    in_stock = external_product.get("in_stock")
-    inventory_quantity = 999 if in_stock is not False else 0
-    ingredient_ids = _normalize_external_seed_structured_ingredient_ids(row, seed_data)
-    product_type = _normalize_external_seed_product_type(row, seed_data)
-    visible_attributes = _build_external_seed_visible_attributes(product_type)
-    variants: List[StandardProductVariant] = []
-
-    for idx, variant in enumerate(_normalize_seed_variants(seed_data)):
-        if not isinstance(variant, dict):
-            continue
-        price_payload = variant.get("price") if isinstance(variant.get("price"), dict) else {}
-        variant_price = price_payload.get("price_amount") if isinstance(price_payload, dict) else variant.get("price")
-        try:
-            normalized_variant_price = float(variant_price or price or 0)
-        except Exception:
-            normalized_variant_price = price
-        availability = str(variant.get("availability") or "").strip().lower()
-        variant_inventory = 999 if availability not in {"out_of_stock", "outofstock", "sold_out"} else 0
-        variant_id = str(variant.get("variant_id") or variant.get("id") or f"seed_variant_{idx + 1}")
-        variants.append(
-            StandardProductVariant(
-                id=variant_id,
-                variant_id=variant_id,
-                title=str(variant.get("title") or f"Variant {idx + 1}"),
-                price=normalized_variant_price,
-                inventory_quantity=variant_inventory,
-                options=variant.get("options") or {},
-                image_url=variant.get("image_url"),
-            )
-        )
-
-    return StandardProduct(
-        id=str(external_product.get("product_id") or external_product.get("id") or ""),
-        product_id=str(external_product.get("product_id") or external_product.get("id") or ""),
-        platform="external",
-        merchant_id="external_seed",
-        title=title,
-        description=str(external_product.get("description") or ""),
-        product_type=product_type or None,
-        visible_attributes=visible_attributes or None,
-        ingredient_ids=ingredient_ids,
-        price=price,
-        currency=currency,
-        inventory_quantity=inventory_quantity,
-        image_url=external_product.get("image_url"),
-        variants=variants,
-        status=ProductStatus.ACTIVE,
-        in_stock=bool(in_stock) if in_stock is not None else None,
-        platform_metadata={
-            "external_seed_id": external_product.get("external_seed_id"),
-            "canonical_url": row.get("canonical_url") or seed_data.get("canonical_url"),
-            "destination_url": row.get("destination_url") or seed_data.get("destination_url"),
-            **({"reviewed_ingredient_ids": ingredient_ids} if ingredient_ids else {}),
-        },
+    return _shared_build_external_seed_filter_product(
+        row=row,
+        seed_data=seed_data,
+        external_product=external_product,
     )
 
 
@@ -4770,6 +5963,22 @@ def _external_seed_to_shop_product(
     if isinstance(availability, str):
         in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
 
+    filter_product = _build_external_seed_filter_product(
+        row=row,
+        seed_data=seed_data,
+        external_product={
+            "id": external_product_id,
+            "product_id": external_product_id,
+            "title": title,
+            "description": seed_data.get("description") or "",
+            "price": price_amount or 0,
+            "currency": price_currency,
+            "image_url": image_url,
+            "in_stock": in_stock,
+            "external_seed_id": row.get("id"),
+        },
+    )
+
     product: Dict[str, Any] = {
         "id": external_product_id,
         "product_id": external_product_id,
@@ -4795,6 +6004,7 @@ def _external_seed_to_shop_product(
         "attached_variant_id": row.get("attached_variant_id") or seed_data.get("attached_variant_id"),
         "source": "external_seed",
         "orderable": False,
+        "visible_attributes": dict(filter_product.visible_attributes or {}),
     }
     if ingredient_ids:
         product["ingredient_ids"] = list(ingredient_ids)
@@ -5349,6 +6559,10 @@ async def _handle_find_products_multi(
         except Exception:
             upstream_fallback_hop = 0
         semantic_retry_attempted = bool(request_metadata.get("semantic_retry_attempted") or False)
+    pivot_shadow_schedule_suppressed = bool(
+        isinstance(request_metadata, dict)
+        and request_metadata.get("_pivot_shadow_schedule_suppressed")
+    )
 
     # Creator surfaces are
     # allowed to use a broader cross-merchant pool and slightly more
@@ -5368,6 +6582,39 @@ async def _handle_find_products_multi(
     strict_serving_mode = bool(commerce_surface_explicit)
     page = filters.page or 1
     limit = _clamp_search_limit(filters.limit, fallback=20)
+
+    if (
+        not pivot_shadow_schedule_suppressed
+        and
+        PIVOT_MULTI_SHADOW_ENABLED
+        and str(filters.query or "").strip()
+        and _pivot_multi_rollout_allowed(
+            source_normalized=source_normalized,
+            page=page,
+            mode="shadow",
+        )
+    ):
+        background_tasks.add_task(
+            _shadow_find_products_multi_via_pivot,
+            payload.model_copy(deep=True),
+            dict(request_metadata or {}),
+        )
+
+    if (
+        PIVOT_MULTI_SERVE_ENABLED
+        and str(filters.query or "").strip()
+        and _pivot_multi_rollout_allowed(
+            source_normalized=source_normalized,
+            page=page,
+            mode="serve",
+        )
+    ):
+        pivot_result = await _handle_find_products_multi_via_pivot(
+            payload,
+            request_metadata,
+        )
+        if pivot_result:
+            return pivot_result
 
     should_try_upstream = (
         is_shopping_surface
@@ -6382,6 +7629,20 @@ async def _handle_find_products_multi(
         query_semantic_class=query_semantic_class,
     )
     active_ingredient_labels = [str(group["ingredient_id"]) for group in active_ingredient_intents]
+    non_strict_beauty_text_recall_enabled = query_semantic_class == "beauty" and not strict_serving_mode
+    expanded_shopping_beauty_prefetch = False
+    generic_default_precision_gate_enabled = bool(
+        not strict_serving_mode
+        and query_semantic_class == "default"
+        and source_normalized in _GENERIC_DEFAULT_PRECISION_GATE_SOURCES
+        and not active_visible_category_intents
+        and not active_visible_attribute_intents
+        and not active_visible_option_intents
+        and not active_ingredient_intents
+    )
+    semantic_external_seed_fallback_allowed = bool(
+        strict_serving_mode or query_semantic_class in {"beauty", "fragrance"}
+    )
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -6681,6 +7942,14 @@ async def _handle_find_products_multi(
 
     external_seed_wrappers: list[dict[str, Any]] = []
     strict_external_output_by_product_id: Dict[str, Dict[str, Any]] = {}
+    external_seed_query_timeout = False
+    external_seed_rows_fetched = 0
+    external_seed_brand_strict_rows = 0
+    external_seed_brand_relevant_rows = 0
+    external_seed_broad_fallback_used = False
+    external_seed_broad_scope_rows = 0
+    external_seed_ranked_count = 0
+    external_seed_skip_reason: Optional[str] = None
     budget_fx_applied = False
     budget_fx_rate: Optional[float] = None
     budget_fx_source: Optional[str] = None
@@ -6743,44 +8012,75 @@ async def _handle_find_products_multi(
             if shopping_seed_cap <= 0:
                 shopping_seed_cap = 200
             seed_limit = min(seed_limit, shopping_seed_cap)
-        seed_params: Dict[str, Any] = {"limit": seed_limit}
-        seed_where = "status = 'active'"
-        if q_lower:
-            terms = seed_query_terms or [q_lower]
-            where_clauses: List[str] = []
-            for idx, term in enumerate(terms[:8]):
-                key = f"like_{idx}"
-                seed_params[key] = f"%{term.lower()}%"
-                clause = (
-                    "("
-                    "LOWER(COALESCE(title,'')) LIKE :" + key
-                    + " OR LOWER(COALESCE(domain,'')) LIKE :" + key
-                    + " OR LOWER(COALESCE(canonical_url,'')) LIKE :" + key
-                    + " OR LOWER(COALESCE(destination_url,'')) LIKE :" + key
-                )
-                seed_text_scan_enabled = True
-                if seed_text_scan_enabled:
-                    clause += " OR LOWER(CAST(seed_data AS TEXT)) LIKE :" + key
-                clause += ")"
-                where_clauses.append(clause)
-            if where_clauses:
-                seed_where += " AND (" + " OR ".join(where_clauses) + ")"
-
         seed_rows: List[Any] = []
-        if seed_limit > 0:
-            seed_rows = await asyncio.wait_for(
-                database.fetch_all(
-                    f"""
-                    SELECT *
-                    FROM external_product_seeds
-                    WHERE {seed_where}
-                    ORDER BY updated_at DESC, created_at DESC
-                    LIMIT :limit
-                    """,
-                    seed_params,
+        ranked_seed_candidates = []
+        if not semantic_external_seed_fallback_allowed:
+            external_seed_skip_reason = "semantic_class_blocked"
+        elif seed_limit > 0:
+            stage_a_timeout_seconds = max(
+                0.05,
+                min(
+                    float(MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS or 1.6),
+                    0.9,
                 ),
-                timeout=MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS,
             )
+            stage_a_result = await fetch_external_seed_rows(
+                database=database,
+                market=None,
+                query=q_ascii or q_lower,
+                limit=seed_limit,
+                offset=0,
+                include_seed_data_text_match=False,
+                only_unattached=False,
+                query_timeout_seconds=stage_a_timeout_seconds,
+                required_terms=None,
+                prefer_terms=seed_query_terms or None,
+                scope="default",
+                use_required_terms_filter=False,
+                include_total_count=False,
+            )
+            seed_rows = stage_a_result.get("rows") or []
+            external_seed_query_timeout = bool(stage_a_result.get("query_timeout") or False)
+            external_seed_rows_fetched = len(seed_rows)
+            external_seed_brand_relevant_rows = len(seed_rows)
+
+            if (
+                not seed_rows
+                and bool(q_lower)
+                and bool(MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN)
+            ):
+                external_seed_broad_fallback_used = True
+                stage_b_result = await fetch_external_seed_rows(
+                    database=database,
+                    market=None,
+                    query=q_ascii or q_lower,
+                    limit=seed_limit,
+                    offset=0,
+                    include_seed_data_text_match=True,
+                    only_unattached=False,
+                    query_timeout_seconds=float(MULTI_SEARCH_SEED_QUERY_TIMEOUT_SECONDS or 1.6),
+                    required_terms=None,
+                    prefer_terms=seed_query_terms or None,
+                    scope="default",
+                    use_required_terms_filter=False,
+                    include_total_count=False,
+                )
+                stage_b_rows = stage_b_result.get("rows") or []
+                external_seed_query_timeout = bool(
+                    external_seed_query_timeout or stage_b_result.get("query_timeout") or False
+                )
+                external_seed_broad_scope_rows = len(stage_b_rows)
+                if stage_b_rows:
+                    seed_rows = stage_b_rows
+                    external_seed_rows_fetched = len(seed_rows)
+                    external_seed_brand_relevant_rows = len(seed_rows)
+
+            ranked_seed_candidates = rank_external_seed_rows(
+                seed_rows,
+                query=q_ascii or q_lower,
+                limit=seed_limit,
+            )
+            external_seed_ranked_count = len(ranked_seed_candidates)
 
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
@@ -6791,47 +8091,24 @@ async def _handle_find_products_multi(
             else None
         )
         shopping_seed_target = max(1, limit * max(page, 1))
-        for row in seed_rows:
+        for candidate in ranked_seed_candidates:
             if seed_build_deadline is not None and time.perf_counter() >= seed_build_deadline:
                 break
-            row_dict = dict(row) if isinstance(row, dict) else {}
-            seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
-            dest = row_dict.get("destination_url") or seed_data.get("destination_url")
+            row_dict = dict(candidate.row or {})
+            seed_data = dict(candidate.seed_data or {})
+            dest = candidate.destination_url or row_dict.get("destination_url") or seed_data.get("destination_url")
             if not isinstance(dest, str) or not dest.startswith(("http://", "https://")):
                 continue
 
-            canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or dest
-            external_id = seed_data.get("external_product_id") or _stable_external_product_id(canonical_url or dest)
+            canonical_url = candidate.canonical_url or row_dict.get("canonical_url") or seed_data.get("canonical_url") or dest
+            external_id = candidate.external_product_id or seed_data.get("external_product_id") or _stable_external_product_id(canonical_url or dest)
             if not external_id or external_id in seen_external_ids:
                 continue
 
-            title = row_dict.get("title") or seed_data.get("title") or ""
-            domain = row_dict.get("domain") or seed_data.get("domain") or ""
-            brand = seed_data.get("brand") or seed_data.get("merchant_display_name") or ""
-            blob = " ".join([title, str(brand or ""), domain, canonical_url or "", dest]).lower().strip()
-            blob_ascii = _strip_accents(blob)
-            blob_compact = re.sub(r"[^a-z0-9]+", "", blob_ascii)
-
-            if q_lower:
-                if q_lower in blob:
-                    score = 0.85
-                elif seed_query_terms and any(t in blob for t in seed_query_terms):
-                    score = 0.75
-                elif q_compact and q_compact in blob_compact:
-                    score = 0.7
-                elif seed_query_compacts and any(t in blob_compact for t in seed_query_compacts):
-                    score = 0.65
-                elif _fuzzy_token_match(seed_query_terms or q_tokens, _tokenize(blob_ascii), max_dist=1):
-                    score = 0.6
-                else:
-                    # Recall-first: keep low-confidence external seeds for downstream rerank.
-                    score = 0.12
-            else:
-                score = 0.15
-
-            price_amount = row_dict.get("price_amount") or seed_data.get("price_amount")
+            price_amount = candidate.price_amount if candidate.price_amount is not None else row_dict.get("price_amount") or seed_data.get("price_amount")
             price_currency = str(
-                row_dict.get("price_currency")
+                candidate.price_currency
+                or row_dict.get("price_currency")
                 or seed_data.get("price_currency")
                 or "USD"
             ).upper()
@@ -6857,7 +8134,7 @@ async def _handle_find_products_multi(
                     budget_diagnostics.get("budget_candidate_currency") or budget_fx_candidate_currency or ""
                 ).upper() or budget_fx_candidate_currency
 
-            availability = row_dict.get("availability") or seed_data.get("availability") or "unknown"
+            availability = candidate.availability or row_dict.get("availability") or seed_data.get("availability") or "unknown"
             if filters.in_stock_only and isinstance(availability, str):
                 if availability.lower() in {"out_of_stock", "outofstock", "sold_out"}:
                     continue
@@ -6893,17 +8170,31 @@ async def _handle_find_products_multi(
                 seed_data=seed_data,
                 redirect_url=redirect_url,
             )
-            filter_product = _build_external_seed_filter_product(
-                row=row_dict,
-                seed_data=seed_data,
-                external_product=product,
-            )
+            product["visible_attributes"] = dict(candidate.filter_product.visible_attributes or {})
+            product["ingredient_ids"] = list(candidate.filter_product.ingredient_ids or [])
+            product["candidate_source"] = "external_seed"
+            product["ranking_audit_version"] = BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
+            product["ranking_features"] = dict(candidate.ranking_features or {})
+            product["ranking_score_breakdown"] = dict(candidate.ranking_score_breakdown or {})
+            filter_product = candidate.filter_product
             external_seed_wrappers.append(
                 {
                     "product": product,
                     "filter_product": filter_product,
                     "merchant_name": product.get("merchant_name"),
-                    "relevance_score": score,
+                    "relevance_score": candidate.candidate_score,
+                    "candidate_score": candidate.candidate_score,
+                    "source_boost": candidate.source_boost,
+                    "quality_penalties": dict(
+                        (candidate.ranking_score_breakdown or {}).get("quality_penalties") or {}
+                    ),
+                    "quality_penalties_total": candidate.quality_penalties_total,
+                    "price_tie_break": candidate.price_amount,
+                    "source_order": candidate.source_order,
+                    "candidate_source": "external_seed",
+                    "ranking_audit_version": BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
+                    "ranking_features": dict(candidate.ranking_features or {}),
+                    "ranking_score_breakdown": dict(candidate.ranking_score_breakdown or {}),
                 }
             )
             seen_external_ids.add(external_id)
@@ -6913,9 +8204,13 @@ async def _handle_find_products_multi(
         logger.info("multi.external_seeds.failed", extra={"error": str(e)})
 
     try:
-        prefetched_external_seed_wrappers = await _build_prefetched_external_seed_wrappers(
-            request_metadata
-        )
+        prefetched_external_seed_wrappers = []
+        if semantic_external_seed_fallback_allowed:
+            prefetched_external_seed_wrappers = await _build_prefetched_external_seed_wrappers(
+                request_metadata
+            )
+        elif external_seed_skip_reason is None:
+            external_seed_skip_reason = "semantic_class_blocked"
         if prefetched_external_seed_wrappers:
             existing_external_product_ids = {
                 str(
@@ -6931,7 +8226,9 @@ async def _handle_find_products_multi(
                 if isinstance(wrapper, dict)
             }
             for wrapper in prefetched_external_seed_wrappers:
-                product_payload = wrapper.get("product") if isinstance(wrapper, dict) else {}
+                wrapper_payload = dict(wrapper) if isinstance(wrapper, dict) else {}
+                wrapper_payload.setdefault("candidate_source", "external_seed")
+                product_payload = wrapper_payload.get("product") if isinstance(wrapper_payload, dict) else {}
                 product_id = str(
                     (product_payload or {}).get("product_id")
                     or (product_payload or {}).get("id")
@@ -6941,7 +8238,7 @@ async def _handle_find_products_multi(
                     continue
                 if product_id:
                     existing_external_product_ids.add(product_id)
-                external_seed_wrappers.append(wrapper)
+                external_seed_wrappers.append(wrapper_payload)
     except Exception as e:
         logger.info("multi.external_seeds.prefetch.failed", extra={"error": str(e)})
 
@@ -6981,6 +8278,8 @@ async def _handle_find_products_multi(
                     "budget_fx_source": budget_fx_source,
                     "budget_fx_candidate_currency": budget_fx_candidate_currency,
                     "budget_fx_unresolved": budget_fx_unresolved,
+                    "external_seed_executed": False,
+                    "external_seed_skip_reason": external_seed_skip_reason,
                     "fetched_at": datetime.utcnow().isoformat(),
                     "merchants_searched": 0,
                     **(
@@ -7315,8 +8614,17 @@ async def _handle_find_products_multi(
         and q
         and merchant_map
     ):
-        if strict_serving_mode:
+        if (
+            strict_serving_mode
+            or active_visible_category_intents
+            or active_visible_attribute_intents
+            or active_visible_option_intents
+            or active_ingredient_intents
+            or active_unsupported_beauty_category_labels
+            or query_semantic_class == "beauty"
+        ):
             merchant_ids_for_search = list(merchant_map.keys())
+            expanded_shopping_beauty_prefetch = not strict_serving_mode
         else:
             merchant_ids_for_search = list(merchant_map.keys())[
                 : max(1, int(MULTI_SEARCH_SHOPPING_FAST_MERCHANT_SEED_LIMIT))
@@ -7440,7 +8748,11 @@ async def _handle_find_products_multi(
     # Recall boost: when the user asks a specific query (e.g. a character name),
     # searching only a small "top-N" slice per merchant can miss relevant items.
     # Pull additional candidates directly from products_cache using cheap text matching.
-    if merchant_map and (not is_shopping_surface or MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST):
+    if merchant_map and (
+        not is_shopping_surface
+        or MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST
+        or (non_strict_beauty_text_recall_enabled and q and not merchant_products)
+    ):
         try:
             anchor_terms: List[str] = []
             if "labubu" in q_ascii:
@@ -7542,6 +8854,7 @@ async def _handle_find_products_multi(
             )
 
     strict_live_query_fallback_used = False
+    beauty_live_query_fallback_used = False
     if (
         strict_serving_mode
         and is_shopping_surface
@@ -7595,6 +8908,61 @@ async def _handle_find_products_multi(
                 _append_merchant_candidate(prod, name, mid)
 
     if (
+        not strict_serving_mode
+        and non_strict_beauty_text_recall_enabled
+        and is_shopping_surface
+        and q
+        and merchant_map
+        and not merchant_products
+    ):
+        beauty_live_query_fallback_used = True
+        fallback_merchant_items = list(merchant_map.items())
+        if max_merchants_to_scan > 0 and len(fallback_merchant_items) > max_merchants_to_scan:
+            fallback_merchant_items = fallback_merchant_items[:max_merchants_to_scan]
+        merchants_scanned = max(merchants_scanned, len(fallback_merchant_items))
+        semaphore = asyncio.Semaphore(max(1, MULTI_SEARCH_MERCHANT_CONCURRENCY))
+
+        async def _fetch_beauty_query_fallback_candidates(
+            mid: str,
+            name: str,
+        ) -> list[tuple[StandardProduct, str, str]]:
+            async with semaphore:
+                try:
+                    products, _source, _error = await asyncio.wait_for(
+                        get_products_hybrid(
+                            merchant_id=mid,
+                            limit=per_merchant_limit,
+                            agent_id="shopping_ai_multi_beauty_query_fallback",
+                            background_tasks=background_tasks,
+                            force_cache_only=force_cache_only,
+                        ),
+                        timeout=MULTI_SEARCH_MERCHANT_FETCH_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    return []
+
+                shop_currency = _get_cached_merchant_shopify_currency(mid)
+                out: list[tuple[StandardProduct, str, str]] = []
+                for p in products:
+                    if shop_currency and (p.platform or "").lower() == "shopify":
+                        p.currency = shop_currency
+                    out.append((p, name, mid))
+                return out
+
+        gathered = await asyncio.gather(
+            *[
+                _fetch_beauty_query_fallback_candidates(mid, name)
+                for mid, name in fallback_merchant_items
+            ],
+            return_exceptions=True,
+        )
+        for chunk in gathered:
+            if not isinstance(chunk, list):
+                continue
+            for prod, name, mid in chunk:
+                _append_merchant_candidate(prod, name, mid)
+
+    if (
         strict_serving_mode
         and commerce_surface == "agent_api"
         and active_ingredient_intents
@@ -7626,13 +8994,25 @@ async def _handle_find_products_multi(
         "precision_passed_external_seed": 0,
     }
     ingredient_rejected_reason_summary: Dict[str, int] = {}
+    non_strict_beauty_text_recall_used = False
+    generic_default_precision_filtered_count = 0
+    beauty_pet_noise_filtered_count = 0
+    beauty_apparel_noise_filtered_count = 0
 
     for product, merchant_name in merchant_products:
-        if active_unsupported_beauty_category_labels and not (
-            active_visible_category_intents or active_ingredient_intents
+        if (
+            strict_serving_mode
+            and active_unsupported_beauty_category_labels
+            and not (
+                active_visible_category_intents or active_ingredient_intents
+            )
         ):
             continue
-        if requires_explicit_shade_query and not has_active_shade_option_intent:
+        if (
+            strict_serving_mode
+            and requires_explicit_shade_query
+            and not has_active_shade_option_intent
+        ):
             continue
         # Visibility: only surface sellable products to the agent front-end.
         if not _is_product_sellable(product):
@@ -7716,12 +9096,31 @@ async def _handle_find_products_multi(
             "kitten",
             "kittens",
         ]
+        beauty_apparel_noise_markers = [
+            "sleepwear",
+            "nightdress",
+            "nightgown",
+            "lingerie",
+            "underwear",
+            "bralette",
+            "bra",
+            "panties",
+            "panty",
+            "briefs",
+            "thong",
+            "deep v",
+            "deep-v",
+            "robe",
+            "slip dress",
+            "slipdress",
+        ]
         pet_accessory_blob = " ".join(
             [
                 (product.title or "").lower(),
                 (product.product_type or "").lower(),
             ]
         ).strip()
+        beauty_text_blob = blob_for_filters if non_strict_beauty_text_recall_enabled else pet_accessory_blob
         visible_attribute_blob = " ".join(
             [
                 (product.title or "").lower(),
@@ -7729,6 +9128,8 @@ async def _handle_find_products_multi(
                 " ".join(str(tag).lower() for tag in (getattr(product, "tags", None) or []) if tag),
             ]
         ).strip()
+        if non_strict_beauty_text_recall_enabled:
+            visible_attribute_blob = beauty_text_blob
         product_visible_attributes = _normalize_product_visible_attributes(product)
         product_ingredient_ids = _normalize_product_ingredient_ids(product)
         structured_visible_option_labels = _collect_product_visible_option_labels(product)
@@ -7753,27 +9154,45 @@ async def _handle_find_products_multi(
 
         if pet_accessory_intent_query and not has_pet_accessory_marker:
             continue
+        if query_semantic_class == "beauty" and not pet_accessory_intent_query and has_pet_subject_marker:
+            beauty_pet_noise_filtered_count += 1
+            continue
+        if (
+            query_semantic_class == "beauty"
+            and any(tok in blob_for_filters_ascii for tok in beauty_apparel_noise_markers)
+        ):
+            beauty_apparel_noise_filtered_count += 1
+            continue
 
         matched_visible_category_labels = []
         for group in active_visible_category_intents:
             label = str(group["label"])
             visible_attribute_bucket = str(group.get("visible_attribute_bucket") or "").strip()
+            structured_match = False
             matched = False
             if visible_attribute_bucket:
-                matched = _product_visible_attribute_label_matches(
+                structured_match = _product_visible_attribute_label_matches(
                     product_visible_attributes,
                     bucket=visible_attribute_bucket,
                     label=label,
                 )
-                if matched:
+                matched = structured_match
+                if structured_match:
                     _record_matched_visible_attribute(
                         matched_visible_attributes,
                         bucket=visible_attribute_bucket,
                         label=label,
                     )
-            else:
-                matched = _normalized_intent_terms_match(visible_category_blob, list(group["product_terms"]))
+                if (
+                    not matched
+                    and non_strict_beauty_text_recall_enabled
+                ):
+                    matched = _normalized_intent_terms_match(beauty_text_blob, list(group["product_terms"]))
+            elif not matched:
+                matched = _normalized_intent_terms_match(pet_accessory_blob, list(group["product_terms"]))
             if matched:
+                if matched and not structured_match and non_strict_beauty_text_recall_enabled:
+                    non_strict_beauty_text_recall_used = True
                 matched_visible_category_labels.append(label)
         if active_visible_category_intents and not matched_visible_category_labels:
             continue
@@ -7781,22 +9200,31 @@ async def _handle_find_products_multi(
         for group in active_visible_attribute_intents:
             label = str(group["label"])
             visible_attribute_bucket = str(group.get("visible_attribute_bucket") or "").strip()
+            structured_match = False
             matched = False
             if visible_attribute_bucket:
-                matched = _product_visible_attribute_label_matches(
+                structured_match = _product_visible_attribute_label_matches(
                     product_visible_attributes,
                     bucket=visible_attribute_bucket,
                     label=label,
                 )
-                if matched:
+                matched = structured_match
+                if structured_match:
                     _record_matched_visible_attribute(
                         matched_visible_attributes,
                         bucket=visible_attribute_bucket,
                         label=label,
                     )
-            else:
+                if (
+                    not matched
+                    and non_strict_beauty_text_recall_enabled
+                ):
+                    matched = _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
+            elif not matched:
                 matched = _normalized_intent_terms_match(visible_attribute_blob, list(group["product_terms"]))
             if matched:
+                if matched and not structured_match and non_strict_beauty_text_recall_enabled:
+                    non_strict_beauty_text_recall_used = True
                 matched_visible_attribute_labels.append(label)
         if active_visible_attribute_intents and (
             len(matched_visible_attribute_labels) < len(active_visible_attribute_intents)
@@ -7827,11 +9255,26 @@ async def _handle_find_products_multi(
                 for label in product_visible_attributes.get("product_category", [])
                 if label in _SKINCARE_INGREDIENT_CATEGORY_LABELS
             }
+            category_anchor_blob = beauty_text_blob if non_strict_beauty_text_recall_enabled else pet_accessory_blob
+            if not product_skin_care_categories:
+                for label in _SKINCARE_INGREDIENT_CATEGORY_LABELS:
+                    if _normalized_intent_term_match(category_anchor_blob, label):
+                        product_skin_care_categories.add(label)
             if not product_skin_care_categories:
                 continue
             for group in active_ingredient_intents:
                 ingredient_id = str(group.get("ingredient_id") or "").strip()
-                if ingredient_id and ingredient_id in product_ingredient_ids:
+                if not ingredient_id:
+                    continue
+                matched = ingredient_id in product_ingredient_ids
+                if (
+                    not matched
+                    and non_strict_beauty_text_recall_enabled
+                    and _ingredient_alias_matches_text(beauty_text_blob, ingredient_id)
+                ):
+                    matched = True
+                    non_strict_beauty_text_recall_used = True
+                if matched:
                     matched_ingredient_ids.append(ingredient_id)
                     matched_ingredient_labels.append(str(group.get("display_name") or ingredient_id))
             if len(matched_ingredient_ids) < len(active_ingredient_intents):
@@ -7840,20 +9283,21 @@ async def _handle_find_products_multi(
             ingredient_candidate_breakdown[
                 "eligible_external_seed" if candidate_source == "external_seed" else "eligible_internal"
             ] += 1
-            precision_eval = _evaluate_strict_ingredient_candidate_precision(
-                product,
-                product_visible_attributes=product_visible_attributes,
-                active_ingredient_intents=active_ingredient_intents,
-                candidate_source=candidate_source,
-            )
-            if not precision_eval.get("passed"):
-                rejected_reason = str(
-                    (precision_eval.get("summary") or {}).get("rejected_reason") or "precision_rejected"
-                ).strip() or "precision_rejected"
-                ingredient_rejected_reason_summary[rejected_reason] = (
-                    ingredient_rejected_reason_summary.get(rejected_reason, 0) + 1
+            if strict_serving_mode:
+                precision_eval = _evaluate_strict_ingredient_candidate_precision(
+                    product,
+                    product_visible_attributes=product_visible_attributes,
+                    active_ingredient_intents=active_ingredient_intents,
+                    candidate_source=candidate_source,
                 )
-                continue
+                if not precision_eval.get("passed"):
+                    rejected_reason = str(
+                        (precision_eval.get("summary") or {}).get("rejected_reason") or "precision_rejected"
+                    ).strip() or "precision_rejected"
+                    ingredient_rejected_reason_summary[rejected_reason] = (
+                        ingredient_rejected_reason_summary.get(rejected_reason, 0) + 1
+                    )
+                    continue
             ingredient_candidate_breakdown["precision_passed_total"] += 1
             ingredient_candidate_breakdown[
                 "precision_passed_external_seed"
@@ -7923,6 +9367,15 @@ async def _handle_find_products_multi(
         # products whose text contains those markers (best-effort).
         if beauty_exclude_tags and query_semantic_class != "fragrance":
             if any(tag in blob_for_filters_ascii for tag in beauty_exclude_tags):
+                continue
+
+        if generic_default_precision_gate_enabled:
+            precision_eval = _evaluate_generic_default_precision_gate(
+                query=q_ascii,
+                product=product,
+            )
+            if precision_eval.get("applied") and not precision_eval.get("passed"):
+                generic_default_precision_filtered_count += 1
                 continue
 
         if only_skirts:
@@ -8149,7 +9602,12 @@ async def _handle_find_products_multi(
                 "product": product,
                 "merchant_name": merchant_name,
                 "relevance_score": relevance_score,
+                "candidate_score": relevance_score,
                 "candidate_source": candidate_source,
+                "source_boost": 0.08 if candidate_source != "external_seed" else 0.0,
+                "quality_penalties": {},
+                "quality_penalties_total": 0.0,
+                "price_tie_break": getattr(product, "price", None),
                 "is_toy_like": is_toy_like if toys_intent_query else False,
                 "matched_visible_category_labels": list(matched_visible_category_labels),
                 "matched_visible_attribute_labels": list(matched_visible_attribute_labels),
@@ -8179,11 +9637,40 @@ async def _handle_find_products_multi(
         toy_candidates = [p for p in filtered_products if p.get("is_toy_like")]
         filtered_products = toy_candidates if toy_candidates else []
 
-    # Sort by relevance
+    def _candidate_sort_key(item: Dict[str, Any]) -> tuple[float, int, float]:
+        try:
+            candidate_score = float(
+                item.get("candidate_score")
+                if item.get("candidate_score") is not None
+                else item.get("relevance_score") or 0.0
+            )
+        except Exception:
+            candidate_score = 0.0
+        try:
+            source_boost = float(item.get("source_boost") or 0.0)
+        except Exception:
+            source_boost = 0.0
+        raw_source_order = item.get("source_order")
+        try:
+            source_order = int(raw_source_order) if raw_source_order is not None else 999999
+        except Exception:
+            source_order = 999999
+        price_tie_break = item.get("price_tie_break")
+        try:
+            normalized_price = float(price_tie_break) if price_tie_break is not None else 999999.0
+        except Exception:
+            normalized_price = 999999.0
+        return (-(candidate_score + source_boost), source_order, normalized_price)
+
+    # Sort by canonical ranking contract.
     filtered_products.sort(
-        key=lambda p: p.get("relevance_score", 0), reverse=True
+        key=_candidate_sort_key
     )
 
+    external_filtered_count = sum(
+        1 for item in filtered_products if item.get("candidate_source") == "external_seed"
+    )
+    internal_filtered_count = max(0, len(filtered_products) - external_filtered_count)
     total = len(filtered_products)
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
@@ -8513,6 +10000,7 @@ async def _handle_find_products_multi(
         )
     if (
         not out_products
+        and strict_serving_mode
         and active_unsupported_beauty_category_labels
         and not (active_visible_category_intents or active_ingredient_intents)
     ):
@@ -8520,7 +10008,12 @@ async def _handle_find_products_multi(
             f"I couldn’t find an eligible {active_unsupported_beauty_category_labels[0]} match for that query right now. "
             "I’m only showing products whose visible catalog labels support the requested beauty category."
         )
-    if not out_products and requires_explicit_shade_query and not has_active_shade_option_intent:
+    if (
+        not out_products
+        and strict_serving_mode
+        and requires_explicit_shade_query
+        and not has_active_shade_option_intent
+    ):
         descriptor = cosmetic_shade_category_intents[0] if cosmetic_shade_category_intents else "cosmetic product"
         reply_text = reply_text or (
             f"I couldn’t find an eligible {descriptor} shade match for that query right now. "
@@ -8615,7 +10108,85 @@ async def _handle_find_products_multi(
                 "shopping_recall_boost_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_RECALL_BOOST
                 ),
+                "non_strict_beauty_text_recall_enabled": non_strict_beauty_text_recall_enabled,
+                "non_strict_beauty_text_recall_used": non_strict_beauty_text_recall_used,
+                "expanded_shopping_beauty_prefetch": expanded_shopping_beauty_prefetch,
+                "beauty_live_query_fallback_used": beauty_live_query_fallback_used,
                 "strict_live_query_fallback_used": strict_live_query_fallback_used,
+                "generic_default_precision_gate_enabled": generic_default_precision_gate_enabled,
+                "generic_default_precision_filtered_count": generic_default_precision_filtered_count,
+                "beauty_pet_noise_filtered_count": beauty_pet_noise_filtered_count,
+                "beauty_apparel_noise_filtered_count": beauty_apparel_noise_filtered_count,
+                "external_seed_query_timeout": external_seed_query_timeout,
+                "external_seed_rows_fetched": external_seed_rows_fetched,
+                "external_seed_ranked_count": external_seed_ranked_count,
+                "external_seed_brand_strict_rows": external_seed_brand_strict_rows,
+                "external_seed_brand_relevant_rows": external_seed_brand_relevant_rows,
+                "external_seed_broad_fallback_used": external_seed_broad_fallback_used,
+                "external_seed_broad_scope_rows": external_seed_broad_scope_rows,
+                "external_seed_executed": bool(external_seed_rows_fetched or external_filtered_count),
+                "external_seed_skip_reason": external_seed_skip_reason,
+                "external_seed_cache_hit": False,
+                "external_seed_rows_built": len(external_seed_wrappers),
+                "external_seed_returned_count": external_filtered_count,
+                "ranking_audit_version": (
+                    BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
+                    if external_seed_wrappers or external_seed_rows_fetched
+                    else None
+                ),
+                "internal_raw_count": internal_filtered_count,
+                "external_raw_count": external_filtered_count,
+                "merged_pre_limit_count": total,
+                "primary_quality_gate_passed": bool(total > 0),
+                "primary_quality_score": None,
+                "low_quality_nonempty_detected": False,
+                "supplement_attempted": False,
+                "supplement_skip_reason": None,
+                "retry_attempt_count": 0,
+                "fallback_attempt_count": 0,
+                "selected_fallback_attempt": 0,
+                "final_returned_count": len(out_products),
+                "route_health": {
+                    "external_seed_executed": bool(external_seed_rows_fetched or external_filtered_count),
+                    "external_seed_skip_reason": external_seed_skip_reason,
+                    "external_seed_cache_hit": False,
+                    "external_seed_query_timeout": external_seed_query_timeout,
+                    "external_seed_rows_fetched": external_seed_rows_fetched,
+                    "external_seed_ranked_count": external_seed_ranked_count,
+                    "external_seed_rows_built": len(external_seed_wrappers),
+                    "external_seed_brand_strict_rows": external_seed_brand_strict_rows,
+                    "external_seed_brand_relevant_rows": external_seed_brand_relevant_rows,
+                    "external_seed_broad_fallback_used": external_seed_broad_fallback_used,
+                    "external_seed_broad_scope_rows": external_seed_broad_scope_rows,
+                    "ranking_audit_version": (
+                        BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION
+                        if external_seed_wrappers or external_seed_rows_fetched
+                        else None
+                    ),
+                    "internal_raw_count": internal_filtered_count,
+                    "external_raw_count": external_filtered_count,
+                    "merged_pre_limit_count": total,
+                    "primary_quality_gate_passed": bool(total > 0),
+                    "primary_quality_score": None,
+                    "low_quality_nonempty_detected": False,
+                    "supplement_attempted": False,
+                    "supplement_skip_reason": None,
+                    "retry_attempt_count": 0,
+                    "fallback_attempt_count": 0,
+                    "selected_fallback_attempt": 0,
+                    "final_returned_count": len(out_products),
+                },
+                "source_breakdown": {
+                    "internal_count": internal_filtered_count,
+                    "external_seed_count": external_filtered_count,
+                    "strategy_applied": (
+                        "strict_ingredient_mixed_parity"
+                        if active_ingredient_intents and commerce_surface == "agent_api"
+                        else "strict_serving_mode"
+                        if strict_serving_mode
+                        else "cache_multi_intent"
+                    ),
+                },
                 **(
                     {
                         "ingredient_precision_mode": "precision_first_v1",
@@ -8628,20 +10199,6 @@ async def _handle_find_products_multi(
                 ),
                 "shopping_sku_json_scan_enabled": bool(
                     is_shopping_surface and MULTI_SEARCH_SHOPPING_ENABLE_SKU_JSON_SCAN
-                ),
-                **(
-                    {
-                        "source_breakdown": {
-                            **strict_source_breakdown,
-                            "strategy_applied": (
-                                "strict_ingredient_mixed_parity"
-                                if active_ingredient_intents and commerce_surface == "agent_api"
-                                else "strict_serving_mode"
-                            ),
-                        }
-                    }
-                    if strict_serving_mode
-                    else {}
                 ),
                 **(
                     {
@@ -9175,40 +10732,16 @@ async def create_creator_task(
       - GET  /agent/shop/v1/creator/tasks/{task_id} -> status + result/error
     """
     operation = (request.operation or "").strip()
-    normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
-    payload_metadata = request.payload.get("metadata") if isinstance(request.payload, dict) else None
-    if not isinstance(payload_metadata, dict):
-        payload_metadata = {}
-    if not normalized_metadata.get("creator_id"):
-        for k in ("creatorId", "creator_id"):
-            if k in request.payload:
-                normalized_metadata["creator_id"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("creator_name"):
-        for k in ("creatorName", "creator_name"):
-            if k in request.payload:
-                normalized_metadata["creator_name"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("source"):
-        for k in ("source",):
-            if payload_metadata.get(k):
-                normalized_metadata["source"] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
-        for k in ("trace_id", "traceId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if k in request.payload and request.payload.get(k):
-                normalized_metadata[k] = request.payload.get(k)
-                break
+    normalized_metadata = _normalize_gateway_request_metadata(
+        metadata=request.metadata,
+        payload=request.payload,
+    )
+    try:
+        http_request.state.traffic_taxonomy = dict(normalized_metadata.get("traffic") or {})
+    except Exception:
+        pass
+    if isinstance(normalized_metadata.get("traffic"), dict):
+        record_traffic_taxonomy(stage="gateway_request", taxonomy=normalized_metadata["traffic"])
 
     # For now we support async tasks for the heavy operations only.
     if operation == "find_products_multi":
@@ -9547,8 +11080,43 @@ async def _proxy_agent_api(
         raise HTTPException(status_code=502, detail="Invalid JSON from agent API")
 
 
-async def _handle_create_order(order: OrderPayloadBody, *, checkout_token: Optional[str]) -> Dict[str, Any]:
+async def _handle_create_order(
+    order: OrderPayloadBody,
+    *,
+    checkout_token: Optional[str],
+    request_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Proxy create_order to Agent API (/agent/v1/orders/create)."""
+    order_metadata = dict(order.metadata or {})
+    request_taxonomy = build_traffic_taxonomy(
+        request_metadata or {},
+        metadata=order_metadata,
+        default_source_channel=str(
+            order_metadata.get("source")
+            or (request_metadata or {}).get("source")
+            or ""
+        ).strip()
+        or None,
+        default_query_source=str(
+            order_metadata.get("query_source")
+            or (request_metadata or {}).get("query_source")
+            or ""
+        ).strip()
+        or None,
+        default_protocol_name=str(
+            order_metadata.get("protocol_name")
+            or (request_metadata or {}).get("protocol_name")
+            or "rest"
+        ).strip()
+        or "rest",
+        default_commerce_surface=str(
+            order_metadata.get("commerce_surface")
+            or (request_metadata or {}).get("commerce_surface")
+            or "agent_api"
+        ).strip()
+        or "agent_api",
+    )
+    order_metadata = attach_traffic_taxonomy(order_metadata, request_taxonomy)
     body = {
         "merchant_id": order.merchant_id,
         "customer_email": order.customer_email,
@@ -9558,7 +11126,7 @@ async def _handle_create_order(order: OrderPayloadBody, *, checkout_token: Optio
         **({"quote_id": order.quote_id} if order.quote_id else {}),
         **({"discount_codes": order.discount_codes} if isinstance(order.discount_codes, list) else {}),
         **({"selected_delivery_option": order.selected_delivery_option} if isinstance(order.selected_delivery_option, dict) else {}),
-        **({"metadata": order.metadata} if isinstance(order.metadata, dict) else {}),
+        **({"metadata": order_metadata} if order_metadata else {}),
         **({"idempotency_key": order.idempotency_key} if order.idempotency_key else {}),
         "items": [
             {
@@ -9650,38 +11218,10 @@ async def invoke_shop_operation(
     checkout_token = (http_request.headers.get("x-checkout-token") or "").strip() or None
 
     # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
-    normalized_metadata: Dict[str, Any] = dict(request.metadata or {})
-    payload_metadata = request.payload.get("metadata") if isinstance(request.payload, dict) else None
-    if not isinstance(payload_metadata, dict):
-        payload_metadata = {}
-    if not normalized_metadata.get("creator_id"):
-        for k in ("creatorId", "creator_id"):
-            if k in request.payload:
-                normalized_metadata["creator_id"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("creator_name"):
-        for k in ("creatorName", "creator_name"):
-            if k in request.payload:
-                normalized_metadata["creator_name"] = request.payload.get(k)
-                break
-    if not normalized_metadata.get("source"):
-        if payload_metadata.get("source"):
-            normalized_metadata["source"] = payload_metadata.get("source")
-    if not normalized_metadata.get("trace_id") and not normalized_metadata.get("traceId"):
-        for k in ("trace_id", "traceId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if payload_metadata.get(k):
-                normalized_metadata[k] = payload_metadata.get(k)
-                break
-    if not normalized_metadata.get("page_request_id") and not normalized_metadata.get("pageRequestId"):
-        for k in ("page_request_id", "pageRequestId"):
-            if k in request.payload and request.payload.get(k):
-                normalized_metadata[k] = request.payload.get(k)
-                break
+    normalized_metadata = _normalize_gateway_request_metadata(
+        metadata=request.metadata,
+        payload=request.payload,
+    )
 
     if operation == "find_products":
         normalized_find_products = _normalize_find_products_payload(request.payload)
@@ -9705,11 +11245,35 @@ async def invoke_shop_operation(
         multi_payload = FindProductsMultiPayload(
             **_normalize_find_products_multi_payload(request.payload)
         )
-        return await _handle_find_products_multi(
+        multi_request_metadata = dict(normalized_metadata)
+        multi_request_metadata["_pivot_shadow_schedule_suppressed"] = True
+        result = await _handle_find_products_multi(
             multi_payload,
-            normalized_metadata,
+            multi_request_metadata,
             background_tasks,
         )
+        if isinstance(result, dict):
+            response_metadata = result.get("metadata")
+            if not isinstance(response_metadata, dict):
+                response_metadata = {}
+            pivot_shadow_scheduled = _maybe_schedule_pivot_multi_shadow_compare(
+                payload=multi_payload,
+                request_metadata=normalized_metadata,
+                background_tasks=background_tasks,
+                served_result=result,
+                source_normalized=_normalize_surface_source(normalized_metadata.get("source")),
+                page=multi_payload.search.page or 1,
+            )
+            response_metadata = _apply_pivot_rollout_metadata(
+                response_metadata,
+                pivot_shadow_scheduled=pivot_shadow_scheduled,
+            )
+            response_metadata = _normalize_gateway_route_health(
+                response_metadata,
+                default_decision_node=str(response_metadata.get("query_source") or "cache_multi_intent"),
+            )
+            result["metadata"] = response_metadata
+        return result
 
     if operation == "get_product_detail":
         payload = GetProductDetailPayload(**request.payload)
@@ -10210,7 +11774,11 @@ async def invoke_shop_operation(
 
     if operation == "create_order":
         payload = CreateOrderPayload(**request.payload)
-        return await _handle_create_order(payload.order, checkout_token=checkout_token)
+        return await _handle_create_order(
+            payload.order,
+            checkout_token=checkout_token,
+            request_metadata=normalized_metadata,
+        )
 
     if operation == "find_products_multi":
         started = time.time()
@@ -10232,6 +11800,8 @@ async def invoke_shop_operation(
         dedup_inflight_joined = False
         dedup_key: Optional[str] = None
         try:
+            multi_request_metadata = dict(normalized_metadata)
+            multi_request_metadata["_pivot_shadow_schedule_suppressed"] = True
             if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and is_shopping_surface:
                 if MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED:
                     dedup_key = _build_multi_page_request_dedup_key(
@@ -10253,7 +11823,7 @@ async def invoke_shop_operation(
                             task = asyncio.create_task(
                                 _handle_find_products_multi(
                                     payload,
-                                    normalized_metadata,
+                                    multi_request_metadata,
                                     background_tasks,
                                 )
                             )
@@ -10267,7 +11837,7 @@ async def invoke_shop_operation(
                 else:
                     result = await _handle_find_products_multi(
                         payload,
-                        normalized_metadata,
+                        multi_request_metadata,
                         background_tasks,
                     )
             else:
@@ -10293,7 +11863,7 @@ async def invoke_shop_operation(
                     session_id=session_id,
                     payload_hash=payload_hash,
                     coro_factory=lambda: _handle_find_products_multi(
-                        payload, normalized_metadata, background_tasks
+                        payload, multi_request_metadata, background_tasks
                     ),
                 )
                 if INVOKE_SHORT_WAIT_SECONDS > 0:
@@ -10326,6 +11896,20 @@ async def invoke_shop_operation(
                     response_metadata["page_request_dedup_enabled"] = True
                     response_metadata["page_request_dedup_cache_hit"] = dedup_cache_hit
                     response_metadata["page_request_dedup_inflight_joined"] = dedup_inflight_joined
+                pivot_shadow_scheduled = _maybe_schedule_pivot_multi_shadow_compare(
+                    payload=payload,
+                    request_metadata=normalized_metadata,
+                    background_tasks=background_tasks,
+                    served_result=result,
+                    source_normalized=source_normalized,
+                    page=payload.search.page or 1,
+                    dedup_cache_hit=dedup_cache_hit,
+                    dedup_inflight_joined=dedup_inflight_joined,
+                )
+                response_metadata = _apply_pivot_rollout_metadata(
+                    response_metadata,
+                    pivot_shadow_scheduled=pivot_shadow_scheduled,
+                )
                 response_metadata.setdefault("query_semantic_class", query_semantic_class)
                 response_metadata = _normalize_gateway_route_health(
                     response_metadata,

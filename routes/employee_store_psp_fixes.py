@@ -314,7 +314,7 @@ async def sync_merchant_products(
     if current_user["role"] not in ["employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if platform not in ["shopify", "wix"]:
+    if platform not in ["shopify", "wix", "woocommerce", "bigcommerce"]:
         raise HTTPException(status_code=400, detail="Invalid platform")
     
     try:
@@ -357,7 +357,8 @@ async def sync_merchant_products(
         sync_request = SyncRequest(
             merchant_id=request.merchant_id,
             force_refresh=False,
-            limit=250
+            limit=250,
+            platform=platform,
         )
         
         # Call real sync

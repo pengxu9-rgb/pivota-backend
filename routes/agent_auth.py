@@ -72,6 +72,20 @@ def _is_internal_trusted_api_key(api_key: Optional[str]) -> bool:
     return False
 
 
+def _build_internal_trusted_agent(api_key: str) -> Dict[str, Any]:
+    key_hash = hashlib.sha256(str(api_key or "").encode("utf-8")).hexdigest()[:16]
+    return {
+        "agent_id": f"agent_internal_trusted_{key_hash}",
+        "agent_name": "Internal Trusted Agent",
+        "allowed_merchants": None,
+        "is_active": True,
+        "metadata": {
+            "auth_source": "internal_trusted_key",
+            "api_key_hash": key_hash,
+        },
+    }
+
+
 class AgentContext:
     """Agent 请求上下文"""
     def __init__(self, agent: Dict[str, Any], request: Request):
@@ -215,7 +229,26 @@ async def get_agent_context(
         except Exception:
             pass
         return context
-    
+
+    internal_trusted_api_key = _is_internal_trusted_api_key(api_key)
+    if internal_trusted_api_key:
+        agent = _build_internal_trusted_agent(api_key)
+        context = AgentContext(agent, request)
+        try:
+            request.state.agent_id = context.agent_id
+            request.state.agent_auth_lookup_ms = 0
+            request.state.agent_auth_cache_hit = False
+            request.state.agent_auth_source = "internal_trusted_key"
+            request.state.agent_auth_total_ms = 0
+            request.state.agent_rate_limit_check_ms = 0
+            request.state.agent_daily_quota_check_ms = 0
+            request.state.agent_internal_trusted_key = True
+            request.state.agent_dependency_total_ms = max(0, int((time.perf_counter() - dep_started) * 1000))
+        except Exception:
+            pass
+        logger.info(f"Internal trusted agent authenticated for {request.url.path}")
+        return context
+
     # 2. 验证 API Key 格式（支持 ak_live_ 前缀）
     # 严格校验：ak_<64hex> 或 ak_live_<64hex>
     import re
@@ -224,8 +257,6 @@ async def get_agent_context(
             status_code=401,
             detail="Invalid API Key format"
         )
-    
-    internal_trusted_api_key = _is_internal_trusted_api_key(api_key)
 
     # 3. 查找 Agent
     auth_started = time.perf_counter()
@@ -267,56 +298,48 @@ async def get_agent_context(
         request.state.agent_id = agent["agent_id"]
     except Exception:
         pass
-    
-    # 5. 检查速率限制（内部 trusted key 走服务间链路，跳过此路径）
-    if not internal_trusted_api_key:
-        rate_started = time.perf_counter()
-        rate_ok, current, limit = await check_rate_limit(
-            agent["agent_id"],
-            rate_limit=agent.get("rate_limit"),
-        )
-        try:
-            request.state.agent_rate_limit_check_ms = max(0, int((time.perf_counter() - rate_started) * 1000))
-        except Exception:
-            pass
-        if not rate_ok:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limit exceeded: {current}/{limit} requests per minute",
-                headers={
-                    "X-RateLimit-Limit": str(limit),
-                    "X-RateLimit-Remaining": str(max(0, limit - current)),
-                    "X-RateLimit-Reset": str(int(time.time()) + 60)
-                }
-            )
 
-        # 6. 检查每日配额
-        quota_started = time.perf_counter()
-        quota_ok, used, quota = await check_daily_quota(
-            agent["agent_id"],
-            daily_quota=agent.get("daily_quota"),
+    # 5. 检查速率限制
+    rate_started = time.perf_counter()
+    rate_ok, current, limit = await check_rate_limit(
+        agent["agent_id"],
+        rate_limit=agent.get("rate_limit"),
+    )
+    try:
+        request.state.agent_rate_limit_check_ms = max(0, int((time.perf_counter() - rate_started) * 1000))
+    except Exception:
+        pass
+    if not rate_ok:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: {current}/{limit} requests per minute",
+            headers={
+                "X-RateLimit-Limit": str(limit),
+                "X-RateLimit-Remaining": str(max(0, limit - current)),
+                "X-RateLimit-Reset": str(int(time.time()) + 60)
+            }
         )
-        try:
-            request.state.agent_daily_quota_check_ms = max(0, int((time.perf_counter() - quota_started) * 1000))
-        except Exception:
-            pass
-        if not quota_ok:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Daily quota exceeded: {used}/{quota} requests",
-                headers={
-                    "X-Quota-Limit": str(quota),
-                    "X-Quota-Remaining": str(max(0, quota - used)),
-                    "X-Quota-Reset": "00:00 UTC"
-                }
-            )
-    else:
-        try:
-            request.state.agent_rate_limit_check_ms = 0
-            request.state.agent_daily_quota_check_ms = 0
-            request.state.agent_internal_trusted_key = True
-        except Exception:
-            pass
+
+    # 6. 检查每日配额
+    quota_started = time.perf_counter()
+    quota_ok, used, quota = await check_daily_quota(
+        agent["agent_id"],
+        daily_quota=agent.get("daily_quota"),
+    )
+    try:
+        request.state.agent_daily_quota_check_ms = max(0, int((time.perf_counter() - quota_started) * 1000))
+    except Exception:
+        pass
+    if not quota_ok:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily quota exceeded: {used}/{quota} requests",
+            headers={
+                "X-Quota-Limit": str(quota),
+                "X-Quota-Remaining": str(max(0, quota - used)),
+                "X-Quota-Reset": "00:00 UTC"
+            }
+        )
     
     # 7. 创建上下文
     context = AgentContext(agent, request)

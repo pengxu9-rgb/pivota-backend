@@ -1,7 +1,7 @@
 """Merchant Dashboard API Routes"""
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime, timedelta
 from decimal import Decimal
 import logging
@@ -19,6 +19,7 @@ from db.database import database
 from db.merchant_onboarding import merchant_onboarding
 from db.merchant_portal_preferences import (
     DEFAULT_MERCHANT_PORTAL_PREFERENCES,
+    DEFAULT_PORTAL_LANGUAGE,
     get_merchant_portal_preferences,
     upsert_merchant_portal_preferences,
 )
@@ -58,6 +59,25 @@ def _stripe_webhook_target_url(psp_id: str) -> str:
     return f"{resolve_public_api_base_url().rstrip('/')}/webhooks/stripe/{psp_id}"
 
 
+def _stripe_object_field(obj: Any, field: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(field)
+    try:
+        getter = getattr(obj, "get", None)
+    except Exception:
+        getter = None
+    if callable(getter):
+        try:
+            return getter(field)
+        except Exception:
+            pass
+    try:
+        return obj[field]  # type: ignore[index]
+    except Exception:
+        pass
+    return getattr(obj, field, None)
+
+
 async def _ensure_stripe_webhook_endpoint(
     *,
     psp_id: str,
@@ -79,8 +99,10 @@ async def _ensure_stripe_webhook_endpoint(
     if existing_endpoint_id and existing_secret:
         try:
             endpoint = stripe_sdk.WebhookEndpoint.retrieve(existing_endpoint_id, **stripe_kwargs)
-            endpoint_url = str(endpoint.get("url") or "").strip()
-            enabled_events = sorted(str(item).strip() for item in endpoint.get("enabled_events") or [])
+            endpoint_url = str(_stripe_object_field(endpoint, "url") or "").strip()
+            enabled_events = sorted(
+                str(item).strip() for item in (_stripe_object_field(endpoint, "enabled_events") or [])
+            )
             if endpoint_url != desired_url or enabled_events != sorted(desired_events):
                 stripe_sdk.WebhookEndpoint.modify(
                     existing_endpoint_id,
@@ -102,8 +124,8 @@ async def _ensure_stripe_webhook_endpoint(
         metadata={"psp_id": psp_id, "environment": environment},
         **stripe_kwargs,
     )
-    created_secret = str(created.get("secret") or "").strip()
-    created_id = str(created.get("id") or "").strip()
+    created_secret = str(_stripe_object_field(created, "secret") or "").strip()
+    created_id = str(_stripe_object_field(created, "id") or "").strip()
     if not created_secret or not created_id:
         raise ValueError("Stripe webhook endpoint creation did not return endpoint credentials")
 
@@ -114,10 +136,13 @@ async def _ensure_stripe_webhook_endpoint(
 
 
 class MerchantPortalPreferencesRequest(BaseModel):
-    email_orders: bool = True
-    email_payments: bool = True
-    email_inventory: bool = False
-    email_weekly: bool = False
+    email_orders: Optional[bool] = None
+    email_payments: Optional[bool] = None
+    email_inventory: Optional[bool] = None
+    email_weekly: Optional[bool] = None
+    portal_language: Optional[
+        Literal["en", "zh-CN", "ja-JP", "ko-KR", "fr-FR", "de-DE"]
+    ] = None
 
 
 class MerchantWebhookConfigRequest(BaseModel):
@@ -396,7 +421,7 @@ async def execute_merchant_order_backed_canary(
 
 @router.get("/merchant/settings/preferences")
 async def get_merchant_settings_preferences(current_user: dict = Depends(get_current_user)):
-    """Get merchant portal notification preferences."""
+    """Get merchant portal notification preferences and portal language."""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Merchant access only")
 
@@ -413,6 +438,7 @@ async def get_merchant_settings_preferences(current_user: dict = Depends(get_cur
             "email_payments": preferences.get("email_payments", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_payments"]),
             "email_inventory": preferences.get("email_inventory", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_inventory"]),
             "email_weekly": preferences.get("email_weekly", DEFAULT_MERCHANT_PORTAL_PREFERENCES["email_weekly"]),
+            "portal_language": preferences.get("portal_language", DEFAULT_PORTAL_LANGUAGE),
             "updated_at": preferences.get("updated_at"),
         },
     }
@@ -423,7 +449,7 @@ async def update_merchant_settings_preferences(
     payload: MerchantPortalPreferencesRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Persist merchant portal notification preferences."""
+    """Persist merchant portal notification preferences and portal language."""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Merchant access only")
 
@@ -433,12 +459,7 @@ async def update_merchant_settings_preferences(
 
     preferences = await upsert_merchant_portal_preferences(
         merchant_id,
-        {
-            "email_orders": payload.email_orders,
-            "email_payments": payload.email_payments,
-            "email_inventory": payload.email_inventory,
-            "email_weekly": payload.email_weekly,
-        },
+        payload.model_dump(exclude_none=True),
     )
     return {
         "status": "success",
@@ -448,6 +469,7 @@ async def update_merchant_settings_preferences(
             "email_payments": preferences["email_payments"],
             "email_inventory": preferences["email_inventory"],
             "email_weekly": preferences["email_weekly"],
+            "portal_language": preferences.get("portal_language", DEFAULT_PORTAL_LANGUAGE),
             "updated_at": preferences.get("updated_at"),
         },
     }
@@ -795,7 +817,8 @@ async def get_merchant_analytics(
                 COALESCE(SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_all_time,
                 SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_all_time,
                 COALESCE(AVG(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE NULL END), 0) as avg_order_value_all_time,
-                COUNT(DISTINCT customer_email) as total_customers,
+                COUNT(DISTINCT customer_email) as total_customers_all_time,
+                COUNT(DISTINCT CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN customer_email END) as total_customers_last_30_days,
                 SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
                 COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END), 0) as gmv_last_30_days,
                 SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_last_30_days,
@@ -879,7 +902,8 @@ async def get_merchant_analytics(
 
         total_orders = _to_int(analytics["orders_last_30_days"]) if analytics else 0
         paid_orders = _to_int(analytics["paid_orders_last_30_days"]) if analytics else 0
-        total_customers = _to_int(analytics["total_customers"]) if analytics else 0
+        total_customers = _to_int(analytics["total_customers_last_30_days"]) if analytics else 0
+        total_customers_all_time = _to_int(analytics["total_customers_all_time"]) if analytics else 0
         gmv = float(analytics["gmv_last_30_days"] or 0) if analytics else 0.0
         confirmed_revenue = float(analytics["confirmed_revenue_last_30_days"] or 0) if analytics else 0.0
         
@@ -900,6 +924,11 @@ async def get_merchant_analytics(
             "total_orders": total_orders,
             "total_revenue": confirmed_revenue,
             "total_customers": total_customers,
+            "customer_breakdown": {
+                "last_30_days": total_customers,
+                "all_time": total_customers_all_time,
+            },
+            "all_time_customers": total_customers_all_time,
             "average_order_value": average_order_value,
             "order_growth": round(order_growth, 1),
             "revenue_growth": round(revenue_growth, 1),

@@ -83,7 +83,7 @@ async def test_mcp_connection(
         # Simulate MCP connection test
         if platform:
             # Test specific platform
-            if platform not in ["shopify", "wix"]:
+            if platform not in ["shopify", "wix", "woocommerce", "bigcommerce"]:
                 raise HTTPException(status_code=400, detail="Invalid platform")
             
             # Check if platform has stores
@@ -95,13 +95,19 @@ async def test_mcp_connection(
             
             has_connections = stores and stores["total"] > 0
             
+            api_version_by_platform = {
+                "shopify": "2024-01",
+                "wix": "v1",
+                "woocommerce": "wc/v3",
+                "bigcommerce": "v3",
+            }
             return {
                 "status": "success",
                 "test_result": {
                     "platform": platform,
                     "connected": has_connections,
                     "response_time": random.randint(50, 200),  # ms
-                    "api_version": "2024-01" if platform == "shopify" else "v1",
+                    "api_version": api_version_by_platform.get(platform, "unknown"),
                     "active_stores": stores["total"] if stores else 0,
                     "message": f"Successfully connected to {platform.upper()} MCP" if has_connections else f"No active {platform} stores found"
                 }
@@ -397,7 +403,6 @@ async def get_mcp_logs(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get MCP logs: {str(e)}")
-
 
 
 

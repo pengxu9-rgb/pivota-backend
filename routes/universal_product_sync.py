@@ -10,9 +10,12 @@ from datetime import datetime
 import httpx
 import json
 import logging
+from adapters.bigcommerce_adapter import normalize_bigcommerce_store_hash
+from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
 from db.products import delete_missing_products_from_cache
+from services.catalog_sync_service import ingest_standard_products
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 
 logger = logging.getLogger(__name__)
@@ -137,6 +140,7 @@ async def universal_product_sync(
         # 4.1 Paginate through all pages (Shopify limit=250/page). Guard with max_pages.
         synced_count = 0
         synced_platform_ids = set()
+        catalog_payloads = []
         page_token: Optional[str] = None
         max_pages = 20  # safety guard: 20 * 250 = 5000 items
         pages = 0
@@ -174,6 +178,7 @@ async def universal_product_sync(
                             ttl_seconds=604800  # 7 days
                         )
                         synced_platform_ids.add(str(product.id))
+                        catalog_payloads.append(product_data)
                         synced_count += 1
                     except Exception as e:
                         logger.error(f"Failed to cache product {product.id}: {e}")
@@ -201,6 +206,23 @@ async def universal_product_sync(
                 f"Failed to cleanup stale products after sync for "
                 f"merchant={request.merchant_id}, platform={platform}: {cleanup_error}"
             )
+
+        if catalog_payloads:
+            try:
+                await ingest_standard_products(
+                    merchant_id=request.merchant_id,
+                    platform=platform,
+                    product_payloads=catalog_payloads,
+                    source_system="universal_product_sync",
+                    source_ref=f"universal_product_sync:{request.merchant_id}:{platform}",
+                )
+            except Exception as catalog_error:
+                logger.error(
+                    "Failed canonical catalog ingest after universal sync merchant=%s platform=%s err=%s",
+                    request.merchant_id,
+                    platform,
+                    catalog_error,
+                )
 
         # 6. Update store sync status
         await update_sync_status(store_info.get("store_id"), synced_count)
@@ -342,28 +364,31 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
     
     elif platform == "woocommerce":
         # WooCommerce needs both consumer key and secret
-        store_url = store_info.get("domain")
+        store_url = normalize_woocommerce_store_url(store_info.get("domain"))
         api_key_data = store_info.get("api_key")
         
         if store_url and api_key_data:
-            # Check if api_key contains JSON with both keys
             try:
-                if api_key_data.startswith("{"):
+                if isinstance(api_key_data, str) and api_key_data.strip().startswith("{"):
                     credentials = json.loads(api_key_data)
                     return {
                         "store_url": store_url,
                         "consumer_key": credentials.get("consumer_key", ""),
                         "consumer_secret": credentials.get("consumer_secret", "")
                     }
-                else:
-                    # Legacy format - just consumer key
+                if isinstance(api_key_data, str) and ":" in api_key_data:
+                    consumer_key, consumer_secret = api_key_data.split(":", 1)
                     return {
                         "store_url": store_url,
-                        "consumer_key": api_key_data,
-                        "consumer_secret": ""
+                        "consumer_key": consumer_key,
+                        "consumer_secret": consumer_secret
                     }
+                return {
+                    "store_url": store_url,
+                    "consumer_key": api_key_data,
+                    "consumer_secret": ""
+                }
             except json.JSONDecodeError:
-                # Fallback to treating it as consumer key only
                 return {
                     "store_url": store_url,
                     "consumer_key": api_key_data,
@@ -399,25 +424,29 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
     
     elif platform == "bigcommerce":
         # BigCommerce uses store hash and access token
-        store_hash = store_info.get("domain")
+        domain = store_info.get("domain")
         api_key_data = store_info.get("api_key")
         
-        if store_hash and api_key_data:
+        if domain and api_key_data:
             try:
-                if api_key_data.startswith("{"):
+                if isinstance(api_key_data, str) and api_key_data.strip().startswith("{"):
                     credentials = json.loads(api_key_data)
+                    store_hash = normalize_bigcommerce_store_hash(
+                        credentials.get("store_hash") or domain
+                    )
                     return {
                         "store_hash": store_hash,
                         "access_token": credentials.get("access_token", ""),
                         "client_id": credentials.get("client_id", "")
                     }
-                else:
-                    return {
-                        "store_hash": store_hash,
-                        "access_token": api_key_data,
-                        "client_id": ""
-                    }
+                store_hash = normalize_bigcommerce_store_hash(domain)
+                return {
+                    "store_hash": store_hash,
+                    "access_token": api_key_data,
+                    "client_id": ""
+                }
             except json.JSONDecodeError:
+                store_hash = normalize_bigcommerce_store_hash(domain)
                 return {
                     "store_hash": store_hash,
                     "access_token": api_key_data,

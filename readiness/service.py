@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -24,6 +27,7 @@ from readiness.sources import load_merchant_source_dataset, supported_merchant_i
 from readiness.sync_audit import build_order_sync_audit_snapshot
 from services.refund_service import refund_service
 from services.merchant_store_service import get_primary_store
+from services.surface_listing_registry_service import persist_channel_export
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.shopify_returns_service import (
     probe_shopify_return_eligibility_best_effort,
@@ -36,9 +40,232 @@ from services.shopify_transactions_service import (
 
 logger = logging.getLogger(__name__)
 
+_SNAPSHOT_CACHE_TTL_SECONDS = 300.0
+_SNAPSHOT_CACHE: dict[str, tuple[float, MerchantReadinessSnapshot]] = {}
+_SNAPSHOT_REFRESH_TASKS: dict[str, asyncio.Task[None]] = {}
+_SNAPSHOT_CACHE_METRICS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "stores": 0,
+    "expired": 0,
+    "stale_served": 0,
+    "refreshes": 0,
+    "background_refreshes": 0,
+    "background_refresh_successes": 0,
+    "background_refresh_failures": 0,
+    "invalidations": 0,
+    "invalidated_entries": 0,
+}
+
 
 class UnsupportedMerchantError(KeyError):
     pass
+
+
+def _snapshot_cache_key(merchant_id: str, channel: str) -> str:
+    return f"{merchant_id}|{channel}"
+
+
+def invalidate_readiness_snapshot_cache(
+    merchant_id: Optional[str] = None,
+    *,
+    channel: Optional[str] = None,
+) -> int:
+    task_keys_to_cancel: List[str] = []
+    for key in list(_SNAPSHOT_REFRESH_TASKS.keys()):
+        cached_merchant_id, cached_channel = key.split("|", 1)
+        if merchant_id is not None and cached_merchant_id != merchant_id:
+            continue
+        if channel is not None and cached_channel != channel:
+            continue
+        task_keys_to_cancel.append(key)
+
+    for key in task_keys_to_cancel:
+        task = _SNAPSHOT_REFRESH_TASKS.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    if merchant_id is None and channel is None:
+        removed = len(_SNAPSHOT_CACHE)
+        _SNAPSHOT_CACHE.clear()
+        if removed:
+            _SNAPSHOT_CACHE_METRICS["invalidations"] += 1
+            _SNAPSHOT_CACHE_METRICS["invalidated_entries"] += removed
+        return removed
+
+    keys_to_drop: List[str] = []
+    for key in list(_SNAPSHOT_CACHE.keys()):
+        cached_merchant_id, cached_channel = key.split("|", 1)
+        if merchant_id is not None and cached_merchant_id != merchant_id:
+            continue
+        if channel is not None and cached_channel != channel:
+            continue
+        keys_to_drop.append(key)
+
+    for key in keys_to_drop:
+        _SNAPSHOT_CACHE.pop(key, None)
+
+    if keys_to_drop:
+        _SNAPSHOT_CACHE_METRICS["invalidations"] += 1
+        _SNAPSHOT_CACHE_METRICS["invalidated_entries"] += len(keys_to_drop)
+    return len(keys_to_drop)
+
+
+def get_readiness_snapshot_cache_metrics() -> Dict[str, Any]:
+    total_requests = (
+        _SNAPSHOT_CACHE_METRICS["hits"]
+        + _SNAPSHOT_CACHE_METRICS["misses"]
+        + _SNAPSHOT_CACHE_METRICS["stale_served"]
+    )
+    hit_rate = (_SNAPSHOT_CACHE_METRICS["hits"] / total_requests * 100.0) if total_requests else 0.0
+    stale_hit_rate = (
+        _SNAPSHOT_CACHE_METRICS["stale_served"] / total_requests * 100.0
+    ) if total_requests else 0.0
+    now_mono = time.monotonic()
+    active_keys: List[Dict[str, Any]] = []
+    for key, (cached_at, snapshot) in sorted(_SNAPSHOT_CACHE.items()):
+        merchant_id, cached_channel = key.split("|", 1)
+        age_seconds = max(0.0, now_mono - cached_at)
+        active_keys.append(
+            {
+                "merchant_id": merchant_id,
+                "channel": cached_channel,
+                "generated_at": snapshot.generated_at,
+                "age_seconds": round(age_seconds, 3),
+                "expires_in_seconds": round(max(0.0, _SNAPSHOT_CACHE_TTL_SECONDS - age_seconds), 3),
+            }
+        )
+    return {
+        "hits": _SNAPSHOT_CACHE_METRICS["hits"],
+        "misses": _SNAPSHOT_CACHE_METRICS["misses"],
+        "stores": _SNAPSHOT_CACHE_METRICS["stores"],
+        "expired": _SNAPSHOT_CACHE_METRICS["expired"],
+        "stale_served": _SNAPSHOT_CACHE_METRICS["stale_served"],
+        "refreshes": _SNAPSHOT_CACHE_METRICS["refreshes"],
+        "background_refreshes": _SNAPSHOT_CACHE_METRICS["background_refreshes"],
+        "background_refresh_successes": _SNAPSHOT_CACHE_METRICS["background_refresh_successes"],
+        "background_refresh_failures": _SNAPSHOT_CACHE_METRICS["background_refresh_failures"],
+        "invalidations": _SNAPSHOT_CACHE_METRICS["invalidations"],
+        "invalidated_entries": _SNAPSHOT_CACHE_METRICS["invalidated_entries"],
+        "total_requests": total_requests,
+        "hit_rate": round(hit_rate, 2),
+        "stale_hit_rate": round(stale_hit_rate, 2),
+        "entries": len(_SNAPSHOT_CACHE),
+        "refresh_tasks": sum(1 for task in _SNAPSHOT_REFRESH_TASKS.values() if not task.done()),
+        "ttl_seconds": _SNAPSHOT_CACHE_TTL_SECONDS,
+        "active_keys": active_keys,
+    }
+
+
+def reset_readiness_snapshot_cache_observability() -> None:
+    _SNAPSHOT_CACHE.clear()
+    for key in list(_SNAPSHOT_REFRESH_TASKS.keys()):
+        task = _SNAPSHOT_REFRESH_TASKS.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+    for key in list(_SNAPSHOT_CACHE_METRICS.keys()):
+        _SNAPSHOT_CACHE_METRICS[key] = 0
+
+
+def _store_snapshot_cache_entry(cache_key: str, snapshot: MerchantReadinessSnapshot) -> None:
+    _SNAPSHOT_CACHE[cache_key] = (
+        time.monotonic(),
+        snapshot.model_copy(deep=True),
+    )
+    _SNAPSHOT_CACHE_METRICS["stores"] += 1
+
+
+async def _compute_readiness_snapshot(
+    merchant_id: str,
+    *,
+    channel: str,
+    cache_hit: bool,
+) -> MerchantReadinessSnapshot:
+    overall_started = time.perf_counter()
+    dataset_started = time.perf_counter()
+    try:
+        dataset = await load_merchant_source_dataset(merchant_id)
+    except KeyError as exc:
+        raise UnsupportedMerchantError(merchant_id) from exc
+    dataset_elapsed_ms = round((time.perf_counter() - dataset_started) * 1000.0, 2)
+
+    snapshot_started = time.perf_counter()
+    snapshot = build_merchant_snapshot(dataset, channel=channel)
+    snapshot_elapsed_ms = round((time.perf_counter() - snapshot_started) * 1000.0, 2)
+
+    logger.info(
+        "readiness_snapshot_profile merchant=%s channel=%s cache_hit=%s source_dataset_load_ms=%.2f snapshot_build_ms=%.2f total_ms=%.2f product_count=%s",
+        merchant_id,
+        channel,
+        cache_hit,
+        dataset_elapsed_ms,
+        snapshot_elapsed_ms,
+        round((time.perf_counter() - overall_started) * 1000.0, 2),
+        len(snapshot.products),
+    )
+    return snapshot
+
+
+async def _refresh_snapshot_cache_entry(
+    merchant_id: str,
+    *,
+    channel: str,
+    cache_key: str,
+    reason: str,
+) -> None:
+    try:
+        snapshot = await _compute_readiness_snapshot(
+            merchant_id,
+            channel=channel,
+            cache_hit=False,
+        )
+        _store_snapshot_cache_entry(cache_key, snapshot)
+        _SNAPSHOT_CACHE_METRICS["background_refresh_successes"] += 1
+        logger.info(
+            "readiness_snapshot_background_refresh merchant=%s channel=%s reason=%s status=success",
+            merchant_id,
+            channel,
+            reason,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _SNAPSHOT_CACHE_METRICS["background_refresh_failures"] += 1
+        logger.warning(
+            "readiness_snapshot_background_refresh merchant=%s channel=%s reason=%s status=failed error=%s",
+            merchant_id,
+            channel,
+            reason,
+            str(exc)[:200],
+        )
+    finally:
+        task = _SNAPSHOT_REFRESH_TASKS.get(cache_key)
+        if task is asyncio.current_task():
+            _SNAPSHOT_REFRESH_TASKS.pop(cache_key, None)
+
+
+def _schedule_snapshot_refresh(
+    merchant_id: str,
+    *,
+    channel: str,
+    cache_key: str,
+    reason: str,
+) -> bool:
+    existing_task = _SNAPSHOT_REFRESH_TASKS.get(cache_key)
+    if existing_task is not None and not existing_task.done():
+        return False
+
+    task = asyncio.create_task(
+        _refresh_snapshot_cache_entry(
+            merchant_id,
+            channel=channel,
+            cache_key=cache_key,
+            reason=reason,
+        )
+    )
+    _SNAPSHOT_REFRESH_TASKS[cache_key] = task
+    _SNAPSHOT_CACHE_METRICS["background_refreshes"] += 1
+    return True
 
 
 def _utc_now_iso() -> str:
@@ -595,23 +822,66 @@ def build_export_summary_response(
     }
 
 
-async def build_readiness_snapshot(merchant_id: str, channel: str = "ucp") -> MerchantReadinessSnapshot:
-    try:
-        dataset = await load_merchant_source_dataset(merchant_id)
-    except KeyError as exc:
-        raise UnsupportedMerchantError(merchant_id) from exc
-    return build_merchant_snapshot(dataset, channel=channel)
+async def build_readiness_snapshot(
+    merchant_id: str,
+    channel: str = "ucp",
+    *,
+    force_refresh: bool = False,
+) -> MerchantReadinessSnapshot:
+    cache_key = _snapshot_cache_key(merchant_id, channel)
+    if force_refresh:
+        invalidate_readiness_snapshot_cache(merchant_id, channel=channel)
+        _SNAPSHOT_CACHE_METRICS["refreshes"] += 1
+
+    cached_entry = _SNAPSHOT_CACHE.get(cache_key)
+    if cached_entry is not None:
+        cached_at, cached_snapshot = cached_entry
+        age_seconds = time.monotonic() - cached_at
+        if age_seconds <= _SNAPSHOT_CACHE_TTL_SECONDS:
+            _SNAPSHOT_CACHE_METRICS["hits"] += 1
+            return cached_snapshot.model_copy(deep=True)
+        _SNAPSHOT_CACHE_METRICS["expired"] += 1
+        _SNAPSHOT_CACHE_METRICS["stale_served"] += 1
+        _schedule_snapshot_refresh(
+            merchant_id,
+            channel=channel,
+            cache_key=cache_key,
+            reason="ttl_expired",
+        )
+        return cached_snapshot.model_copy(deep=True)
+
+    _SNAPSHOT_CACHE_METRICS["misses"] += 1
+    snapshot = await _compute_readiness_snapshot(
+        merchant_id,
+        channel=channel,
+        cache_hit=False,
+    )
+    _store_snapshot_cache_entry(cache_key, snapshot)
+    return snapshot.model_copy(deep=True)
 
 
 async def build_channel_export(merchant_id: str, channel: str = "ucp") -> ChannelReadinessReport:
     snapshot = await build_readiness_snapshot(merchant_id, channel=channel)
+    report: ChannelReadinessReport
     if channel == "ucp":
-        return build_ucp_export(snapshot)
-    if channel == "acp":
-        return build_acp_export(snapshot)
-    if channel not in {"ucp", "acp"}:
+        report = build_ucp_export(snapshot)
+    elif channel == "acp":
+        report = build_acp_export(snapshot)
+    elif channel not in {"ucp", "acp"}:
         raise ValueError(f"Unsupported channel export: {channel}")
-    raise ValueError(f"Unsupported channel export: {channel}")
+    else:
+        raise ValueError(f"Unsupported channel export: {channel}")
+
+    try:
+        await persist_channel_export(snapshot, report)
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist surface listing registry for merchant=%s channel=%s: %s",
+            merchant_id,
+            channel,
+            exc,
+        )
+    return report
 
 
 def supported_merchants() -> list[str]:
@@ -1998,6 +2268,132 @@ async def _create_shopify_order_for_checkout(
     }
 
 
+def _extract_linked_merchant_order(order_row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not order_row:
+        return None
+
+    metadata = order_row.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    merchant_order = metadata.get("merchant_order")
+    if isinstance(merchant_order, dict):
+        platform_order_id = str(merchant_order.get("platform_order_id") or "").strip()
+        if platform_order_id:
+            payload = dict(merchant_order)
+            payload["platform_order_id"] = platform_order_id
+            return payload
+
+    shopify_order_id = str(order_row.get("shopify_order_id") or "").strip()
+    if shopify_order_id:
+        return {
+            "platform": "shopify",
+            "platform_order_id": shopify_order_id,
+        }
+    return None
+
+
+async def _write_back_order_for_checkout(
+    *,
+    merchant_id: str,
+    checkout: CheckoutSessionRecord,
+    order_id: str,
+    order_row: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    linked_order = _extract_linked_merchant_order(order_row)
+    if linked_order:
+        return {"ok": True, "linked_order": linked_order}
+
+    payload = checkout.session_payload or {}
+    merchant_connection = payload.get("merchant_connection") or {}
+    store_payload = merchant_connection.get("store") or {}
+    platform = str(store_payload.get("platform") or "").strip().lower()
+
+    if platform in {"", "shopify"}:
+        shopify_conn = merchant_connection.get("shopify") or {}
+        store_info = None
+        if not shopify_conn or not shopify_conn.get("shop_domain"):
+            try:
+                store_info = await get_primary_store(merchant_id)
+            except Exception:
+                store_info = None
+        shop_domain = str(
+            shopify_conn.get("shop_domain")
+            or ((store_info or {}).get("domain"))
+            or ""
+        ).strip()
+        access_token = str(shopify_conn.get("access_token") or "").strip()
+        if not access_token and shop_domain:
+            try:
+                access_token, _ = await resolve_shopify_admin_access_token(
+                    shop_domain=shop_domain,
+                    api_key_raw=((store_info or {}).get("api_key_raw") or (store_info or {}).get("api_key")),
+                    store_id=str((store_info or {}).get("store_id") or "").strip() or None,
+                )
+                access_token = str(access_token or "").strip()
+            except Exception:
+                access_token = ""
+        if not shop_domain or not access_token:
+            try:
+                shopify_cfg = await _get_shopify_config_for_merchant(merchant_id)
+            except Exception:
+                shopify_cfg = {}
+            shop_domain = str(shop_domain or shopify_cfg.get("shop_domain") or "").strip()
+            access_token = str(access_token or shopify_cfg.get("access_token") or "").strip()
+        if not shop_domain or not access_token:
+            return {
+                "ok": False,
+                "code": "shopify_configuration_missing",
+                "platform": "shopify",
+            }
+
+        writeback = await _create_shopify_order_for_checkout(
+            checkout=checkout,
+            shop_domain=shop_domain,
+            access_token=access_token,
+        )
+        if not writeback.get("ok"):
+            return {
+                **writeback,
+                "platform": "shopify",
+            }
+
+        await update_fulfillment_info(
+            order_id=order_id,
+            shopify_order_id=writeback.get("shopify_order_id"),
+            fulfillment_status="processing",
+        )
+        return {
+            "ok": True,
+            "linked_order": {
+                "platform": "shopify",
+                "platform_order_id": str(writeback.get("shopify_order_id") or "").strip(),
+                "platform_order_name": writeback.get("shopify_order_name"),
+                "platform_order_url": writeback.get("shopify_order_url"),
+                "store_id": str(store_payload.get("store_id") or "").strip() or None,
+                "domain": shop_domain,
+            },
+        }
+
+    from routes.order_routes import sync_order_to_connected_store
+
+    writeback_ok = await sync_order_to_connected_store(order_id)
+    refreshed_order = await get_order(order_id)
+    linked_order = _extract_linked_merchant_order(refreshed_order)
+    if not writeback_ok or not linked_order:
+        return {
+            "ok": False,
+            "code": "merchant_order_create_failed",
+            "platform": platform or None,
+        }
+    return {"ok": True, "linked_order": linked_order}
+
+
 async def advance_order_sync(
     merchant_id: str,
     checkout_id: str,
@@ -2066,7 +2462,8 @@ async def advance_order_sync(
         order_id = checkout.order_id
 
     order_row = await get_order(order_id)
-    if order_row and order_row.get("shopify_order_id"):
+    linked_order = _extract_linked_merchant_order(order_row)
+    if order_row and linked_order:
         reconciled = await _reconcile_checkout_state_from_order(
             journal=journal,
             checkout=checkout,
@@ -2082,7 +2479,7 @@ async def advance_order_sync(
             await journal.append_event(
                 checkout_id=checkout_id,
                 event_type="order_forwarded_to_merchant",
-                event_payload={"shopify_order_id": order_row.get("shopify_order_id")},
+                event_payload=linked_order,
             )
         if "state_synced" not in event_types:
             await journal.append_event(
@@ -2093,66 +2490,34 @@ async def advance_order_sync(
         updated = await journal.update_checkout_session(checkout_id, status="state_synced")
         return {"checkout": updated, "events": await journal.list_events(checkout_id), "replayed": replay}
 
-    dataset = await load_merchant_source_dataset(merchant_id)
-    merchant_connection = dataset.merchant_connection or {}
-    shopify_conn = merchant_connection.get("shopify") or {}
-    shop_domain = str(shopify_conn.get("shop_domain") or "").strip()
-    access_token = str(shopify_conn.get("access_token") or "").strip()
-    if not shop_domain or not access_token:
-        await journal.append_event(
-            checkout_id=checkout_id,
-            event_type="merchant_writeback_failed",
-            event_payload={"code": "shopify_configuration_missing"},
-        )
-        updated = await journal.update_checkout_session(checkout_id, status="failed")
-        return {"checkout": updated, "events": await journal.list_events(checkout_id), "replayed": "merchant_writeback_failed" in event_types}
-
-    writeback = await _create_shopify_order_for_checkout(
+    writeback = await _write_back_order_for_checkout(
+        merchant_id=merchant_id,
         checkout=checkout,
-        shop_domain=shop_domain,
-        access_token=access_token,
+        order_id=order_id,
+        order_row=order_row,
     )
-    if not writeback.get("ok"):
+    linked_order = writeback.get("linked_order")
+    if not writeback.get("ok") or not linked_order:
         await journal.append_event(
             checkout_id=checkout_id,
             event_type="merchant_writeback_failed",
-            event_payload=writeback,
+            event_payload={
+                **writeback,
+                "platform": str(writeback.get("platform") or ((((payload.get("merchant_connection") or {}).get("store") or {}).get("platform")) or "")).strip() or None,
+            },
         )
         updated = await journal.update_checkout_session(checkout_id, status="failed")
         return {"checkout": updated, "events": await journal.list_events(checkout_id), "replayed": "merchant_writeback_failed" in event_types}
-
-    await update_fulfillment_info(
-        order_id=order_id,
-        shopify_order_id=writeback.get("shopify_order_id"),
-        fulfillment_status="processing",
-    )
     await journal.append_event(
         checkout_id=checkout_id,
         event_type="order_forwarded_to_merchant",
-        event_payload=writeback,
+        event_payload=linked_order,
     )
     await journal.update_checkout_session(
         checkout_id,
         status="forwarded",
-        session_payload_patch={"merchant_order": writeback},
+        session_payload_patch={"merchant_order": linked_order},
     )
-
-    payment_capabilities = dataset.payment_capabilities or {}
-    external_payment_ref = payload.get("payment_reference")
-    if external_payment_ref:
-        try:
-            await ensure_external_payment_transaction_best_effort(
-                shop_domain=shop_domain,
-                access_token=access_token,
-                shopify_order_id=str(writeback.get("shopify_order_id")),
-                psp_used=payment_capabilities.get("psp_provider"),
-                external_payment_ref=external_payment_ref,
-                amount=float(((payload.get("price") or {}).get("amount")) or 0) * int(checkout.quantity or 1),
-                currency=str(((payload.get("price") or {}).get("currency")) or "USD"),
-                pivota_order_id=order_id,
-            )
-        except Exception:
-            logger.warning("Shopify transaction sync failed for checkout=%s", checkout_id, exc_info=True)
 
     await journal.append_event(
         checkout_id=checkout_id,

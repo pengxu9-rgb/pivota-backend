@@ -15,6 +15,7 @@ from models.standard_product import StandardProduct, StandardProductVariant
 from readiness.flags import readiness_alpha_merchant_id
 from readiness.models import MerchantSourceDataset
 from readiness.reviews import load_product_review_summaries
+from services.canonical_commerce_service import load_canonical_cache_rows
 from services.merchant_store_service import get_primary_store
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,17 @@ async def _fetch_active_psp_config(merchant_id: str) -> Optional[Dict[str, Any]]
     except Exception:
         logger.warning("PSP capability lookup failed for merchant=%s", merchant_id, exc_info=True)
         return None
+
+
+async def _load_runtime_cache_rows(merchant_id: str) -> List[Dict[str, Any]]:
+    canonical_rows = await load_canonical_cache_rows(
+        merchant_id=merchant_id,
+        platform="shopify",
+        include_expired=True,
+    )
+    if canonical_rows:
+        return canonical_rows
+    return await get_cached_products(merchant_id=merchant_id, platform="shopify", include_expired=True)
 
 
 async def _fetch_live_products(merchant_id: str, shop_domain: str, access_token: str) -> Tuple[List[StandardProduct], Optional[str]]:
@@ -240,6 +252,7 @@ def _merge_cached_products_with_live_overlay(
 
 class ShopifyLiveMerchantSource:
     async def load(self, merchant_id: str) -> MerchantSourceDataset:
+        overall_started = datetime.now(timezone.utc)
         alpha_merchant_id = readiness_alpha_merchant_id()
         if merchant_id != alpha_merchant_id:
             raise KeyError(
@@ -276,7 +289,7 @@ class ShopifyLiveMerchantSource:
 
         cached_rows: List[Dict[str, Any]] = []
         try:
-            cached_rows = await get_cached_products(merchant_id=merchant_id, platform="shopify", include_expired=True)
+            cached_rows = await _load_runtime_cache_rows(merchant_id)
         except Exception:
             merchant_warnings.append("products_cache_lookup_failed")
             logger.warning("products_cache lookup failed for merchant=%s", merchant_id, exc_info=True)
@@ -324,8 +337,15 @@ class ShopifyLiveMerchantSource:
 
         live_overlay_needed = bool(shopify_connected and (not products or _cached_rows_need_live_overlay(cached_rows, reference_time)))
         live_fetch_error: Optional[str] = None
+        live_overlay_started_at: Optional[datetime] = None
+        live_overlay_elapsed_ms: Optional[float] = None
         if live_overlay_needed:
+            live_overlay_started_at = datetime.now(timezone.utc)
             live_products, live_error = await _fetch_live_products(merchant_id, shop_domain, access_token)
+            live_overlay_elapsed_ms = round(
+                (datetime.now(timezone.utc) - live_overlay_started_at).total_seconds() * 1000.0,
+                2,
+            )
             if live_products:
                 used_live_overlay = True
                 now_iso = _iso(reference_time)
@@ -406,6 +426,7 @@ class ShopifyLiveMerchantSource:
         }
         review_warnings: List[str] = []
         review_audit_notes: List[str] = []
+        review_started_at = datetime.now(timezone.utc)
         if products:
             product_review_summaries, review_diagnostics, review_warnings, review_audit_notes = await load_product_review_summaries(
                 merchant_id=merchant_id,
@@ -472,6 +493,18 @@ class ShopifyLiveMerchantSource:
             [
                 "Real-merchant alpha is restricted to one Shopify merchant.",
             ]
+        )
+
+        logger.info(
+            "shopify_live_readiness_dataset merchant=%s product_count=%s cached_rows=%s live_overlay_needed=%s live_overlay_used=%s live_overlay_ms=%s review_summary_ms=%.2f total_ms=%.2f",
+            merchant_id,
+            len(products),
+            len(cached_rows),
+            live_overlay_needed,
+            used_live_overlay,
+            live_overlay_elapsed_ms,
+            round((datetime.now(timezone.utc) - review_started_at).total_seconds() * 1000.0, 2),
+            round((datetime.now(timezone.utc) - overall_started).total_seconds() * 1000.0, 2),
         )
 
         return MerchantSourceDataset(

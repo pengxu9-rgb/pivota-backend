@@ -25,6 +25,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from db.database import database, metadata, engine
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
+import db.canonical_commerce  # noqa: F401  (register canonical commerce tables in metadata)
+import db.commerce_interactions  # noqa: F401  (register canonical interaction ledger tables in metadata)
+import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
+import db.merchant_commerce_readiness  # noqa: F401  (register merchant commerce readiness state in metadata)
+import db.surface_listing_registry  # noqa: F401  (register surface listing registry tables in metadata)
 try:
     import db.merchant_portal_preferences  # noqa: F401  (register merchant portal preferences table in metadata)
 except ModuleNotFoundError:
@@ -37,6 +42,10 @@ from pathlib import Path
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
+
+INTERNAL_PSP_MAINTENANCE_ROUTES_ENABLED = (
+    os.getenv("ENABLE_INTERNAL_PSP_MAINTENANCE_ROUTES", "false").lower() == "true"
+)
 
 
 def _guard_single_order_routes_py() -> None:
@@ -91,6 +100,7 @@ from routes.agent_metrics_routes import router as agent_metrics_router
 from routes.auth_routes import router as auth_router
 from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.agent_account import router as agent_account_router  # Agent account management
+from routes.agent_commerce import router as agent_commerce_router
 from routes.admin_api import router as admin_api_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
@@ -98,6 +108,8 @@ from routes.platform_onboarding_routes import router as platform_onboarding_rout
 from routes.merchant_dashboard_routes import router as merchant_dashboard_router  # Original with fallback - STABLE
 from routes.admin_catalog_debug import router as admin_catalog_debug_router
 from routes.merchant_analytics_routes import router as merchant_analytics_router
+from routes.pivot_routes import router as pivot_router
+from routes.catalog_routes import router as catalog_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
 from routes.payout_routes import router as payout_router
 from routes.direct_db_check import router as direct_db_check_router
@@ -336,7 +348,7 @@ app = FastAPI(
 
 
 @lru_cache(maxsize=1)
-def _service_version_payload() -> dict:
+def _runtime_build_payload() -> dict:
     commit_sha = (
         os.getenv("RAILWAY_GIT_COMMIT_SHA")
         or os.getenv("GIT_COMMIT_SHA")
@@ -365,53 +377,18 @@ def _service_version_payload() -> dict:
         except Exception:
             branch = None
 
-    commit_short = commit_sha[:12] if commit_sha else None
-    build_id = commit_short or f"started-{SERVICE_STARTED_AT}"
-
     return {
-        "service": SERVICE_NAME,
-        "commit": commit_short,
-        "full_sha": commit_sha,
-        "build_id": build_id,
-        "branch": branch,
-        "deployment_id": deployment_id,
-        "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
-        "started_at": SERVICE_STARTED_AT,
-    }
-
-
-@lru_cache(maxsize=1)
-def _runtime_build_payload() -> dict:
-    version = _service_version_payload()
-
-    return {
-        "service": version["service"],
-        "version": version,
-        "commit_sha": version["full_sha"],
-        "full_sha": version["full_sha"],
-        "build_id": version["build_id"],
-        "deployment_id": version["deployment_id"],
+        "service": "pivota-backend",
         "git": {
-            "commit_sha": version["full_sha"],
-            "branch": version["branch"],
+            "commit_sha": commit_sha,
+            "branch": branch,
         },
         "railway": {
-            "environment": version["environment"],
-            "deployment_id": version["deployment_id"],
+            "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
+            "deployment_id": deployment_id,
             "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
-            "service_name": os.getenv("RAILWAY_SERVICE_NAME") or None,
         },
     }
-
-
-def _service_version_headers() -> dict[str, str]:
-    version = _service_version_payload()
-    headers: dict[str, str] = {"X-Service-Build-Id": str(version["build_id"])}
-    if version["commit"]:
-        headers["X-Service-Commit"] = str(version["commit"])
-    if version["deployment_id"]:
-        headers["X-Service-Deployment-Id"] = str(version["deployment_id"])
-    return headers
 
 
 def _is_route_mounted(path: str, method: str) -> bool:
@@ -669,6 +646,7 @@ app.include_router(auth_router)  # New authentication system
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
+app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_reset_employee_router)  # Admin employee password reset
 app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplicate data
@@ -759,6 +737,8 @@ else:
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
 app.include_router(admin_catalog_debug_router)  # Internal catalog debug
 app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
+app.include_router(pivot_router)  # Pivot catalog query and quote APIs
+app.include_router(catalog_router)  # Catalog sync and webhook ingest APIs
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
 app.include_router(payout_router)  # Payout management
 app.include_router(direct_db_check_router)  # Direct DB check
@@ -1164,6 +1144,48 @@ async def startup():
                 logger.info("✅ Fixed request_id constraint in agent_usage_logs")
             except Exception as e:
                 logger.warning(f"⚠️ Could not fix request_id constraint: {e}")
+
+            for statement in (
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE agent_usage_logs ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE surface_click_events ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS commerce_surface VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS source_channel VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS source_family VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS query_source VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS agent_id VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(64)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS llm_model VARCHAR(128)",
+                "ALTER TABLE commerce_interactions ADD COLUMN IF NOT EXISTS caller_id VARCHAR(128)",
+            ):
+                try:
+                    await database.execute(statement)
+                except Exception:
+                    pass
             
             # Create agent_merchants table
             await database.execute("""
@@ -1232,19 +1254,35 @@ async def startup():
                     name VARCHAR(255) NOT NULL,
                     api_key TEXT,
                     account_id VARCHAR(255),
+                    secret_key TEXT,
+                    environment VARCHAR(20) DEFAULT 'unknown',
+                    provider_config JSONB DEFAULT '{}'::jsonb,
+                    validation_status VARCHAR(20) DEFAULT 'unknown',
+                    validation_error TEXT,
+                    last_validated_at TIMESTAMP WITH TIME ZONE,
                     capabilities TEXT,
                     status VARCHAR(50) DEFAULT 'active',
                     connected_at TIMESTAMP WITH TIME ZONE,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS secret_key TEXT")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS environment VARCHAR(20) DEFAULT 'unknown'")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown'")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS validation_error TEXT")
+            await database.execute("ALTER TABLE merchant_psps ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE")
             
             # Create indexes
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_id ON merchant_stores(merchant_id)")
             await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_merchant_id ON merchant_psps(merchant_id)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_psps_provider_status ON merchant_psps(merchant_id, provider, status)")
             
             # Create performance indexes for agent tables
             await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_agent_id_timestamp ON agent_usage_logs(agent_id, timestamp DESC)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_source_channel_timestamp ON agent_usage_logs(source_channel, timestamp DESC)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_protocol_name_timestamp ON agent_usage_logs(protocol_name, timestamp DESC)")
+            await database.execute("CREATE INDEX IF NOT EXISTS idx_agent_usage_logs_query_source_timestamp ON agent_usage_logs(query_source, timestamp DESC)")
             await database.execute("CREATE INDEX IF NOT EXISTS idx_agents_agent_id ON agents(agent_id)")
             
             logger.info("✅ Integration tables created/verified")
@@ -1542,7 +1580,6 @@ async def health_check():
 
     return JSONResponse(
         status_code=status_code,
-        headers=_service_version_headers(),
         content={
             "status": "ok" if healthy else "unhealthy",
             "timestamp": time.time(),
@@ -1550,7 +1587,6 @@ async def health_check():
             "db_ok": db_ok,
             "missing_columns": missing,
             "error": db_error,
-            "version": _service_version_payload(),
             "build": _runtime_build_payload(),
             "runtime_contracts": _runtime_contracts_payload(),
             "settings_contract": _settings_contract_payload(),
@@ -1563,14 +1599,10 @@ async def build_info():
     Deployment introspection (no secrets).
     Useful to confirm which git SHA / deployment is running in prod.
     """
-    return JSONResponse(
-        headers=_service_version_headers(),
-        content={
-            **_runtime_build_payload(),
-            "version": _service_version_payload(),
-            "timestamp": time.time(),
-        },
-    )
+    return {
+        **_runtime_build_payload(),
+        "timestamp": time.time(),
+    }
 
 # Catch-all OPTIONS to satisfy permissive CORS preflight checks (even when Access-Control-Request-Method is missing).
 @app.options("/{full_path:path}")

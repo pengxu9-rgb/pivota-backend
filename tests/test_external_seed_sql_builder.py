@@ -14,6 +14,12 @@ class _FakeDatabase:
         return []
 
 
+def test_is_missing_external_seed_table_supports_sqlite_message() -> None:
+    from services.external_seed_search import _is_missing_external_seed_table
+
+    assert _is_missing_external_seed_table(Exception("no such table: external_product_seeds"))
+
+
 @pytest.mark.asyncio
 async def test_fetch_external_seed_rows_uses_lower_like_predicates() -> None:
     from services.external_seed_search import fetch_external_seed_rows
@@ -74,7 +80,7 @@ async def test_fetch_external_seed_rows_supports_brand_terms_and_rank_ordering()
     )
 
     assert "AS brand_term_hit" in db.last_query
-    assert "ORDER BY brand_term_hit DESC, updated_at DESC, created_at DESC" in db.last_query
+    assert "ORDER BY brand_term_hit DESC, created_at DESC, id DESC" in db.last_query
     assert "required_0" not in db.last_query
     assert "prefer_0" in db.last_query
     assert "required_term_" not in db.last_query
@@ -109,3 +115,29 @@ async def test_fetch_external_seed_rows_can_disable_required_terms_filter() -> N
     assert "prefer_0" in db.last_query
     assert db.last_values.get("required_0") is None
     assert db.last_values.get("prefer_0") == "%kylie cosmetics%"
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_seed_rows_can_enable_required_terms_filter_and_skip_count() -> None:
+    from services.external_seed_search import fetch_external_seed_rows
+
+    db = _FakeDatabase()
+    result = await fetch_external_seed_rows(
+        database=db,
+        market="US",
+        query="vitamin c serum",
+        limit=5,
+        include_seed_data_text_match=False,
+        required_terms=["vitamin", "serum"],
+        prefer_terms=["vitamin serum"],
+        use_required_terms_filter=True,
+        include_total_count=False,
+        query_timeout_seconds=0.5,
+    )
+
+    assert result.get("query_timeout") is False
+    assert "required_0" in db.last_query
+    assert "required_1" in db.last_query
+    assert "COUNT(*) AS total_count" not in db.last_query
+    assert db.last_values.get("required_0") == "%vitamin%"
+    assert db.last_values.get("required_1") == "%serum%"

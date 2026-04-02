@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class CatalogSyncJobCreateRequest(BaseModel):
+    merchant_id: str
+    connector: str = "shopify"
+    mode: str = "reconcile"
+    platform: Optional[str] = "shopify"
+    force_refresh: bool = False
+    limit: int = Field(default=500, ge=1, le=5000)
+    sync_from_cache: bool = True
+    scope: Optional[Dict[str, Any]] = None
+    requested_by: Optional[str] = None
+
+
+class CatalogSyncJobResponse(BaseModel):
+    job_id: str
+    merchant_id: str
+    connector: str
+    mode: str
+    status: str
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    stats: Dict[str, Any] = Field(default_factory=dict)
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class CatalogWebhookIngestResponse(BaseModel):
+    event_id: str
+    merchant_id: str
+    connector: str
+    event_type: str
+    topic: Optional[str] = None
+    status: str
+    created_at: Optional[datetime] = None
+
+
+class PaymentIncentiveInput(BaseModel):
+    incentive_id: Optional[str] = None
+    incentive_type: str
+    funding_source: Optional[str] = None
+    payment_method_type: Optional[str] = None
+    card_network: Optional[str] = None
+    issuer_name: Optional[str] = None
+    wallet_type: Optional[str] = None
+    installment_provider: Optional[str] = None
+    label: str
+    benefit_kind: str
+    benefit_value: Optional[Decimal] = None
+    benefit_currency: Optional[str] = None
+    market: Optional[str] = None
+    eligibility_confidence: Optional[Decimal] = None
+    source_system: str = "merchant_config"
+    source_ref: Optional[str] = None
+    status: str = "active"
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    rule_scope: Dict[str, Any] = Field(default_factory=dict)
+    rule_conditions: Dict[str, Any] = Field(default_factory=dict)
+    schedule: Dict[str, Any] = Field(default_factory=dict)
+    human_rule: Optional[str] = None
+
+
+class IncentivesReconcileRequest(BaseModel):
+    source_system: str = "merchant_config"
+    payment_incentives: List[PaymentIncentiveInput] = Field(default_factory=list)
+
+
+class IncentivesReconcileResponse(BaseModel):
+    merchant_id: str
+    source_system: str
+    promotions_synced: int
+    payment_incentives_synced: int
+    offer_links_synced: int
+    reconciled_at: datetime
+
+
+class PivotPaymentContext(BaseModel):
+    payment_method_type: Optional[str] = None
+    card_network: Optional[str] = None
+    issuer_name: Optional[str] = None
+    wallet_type: Optional[str] = None
+    installment_provider: Optional[str] = None
+
+
+class PivotQueryRequest(BaseModel):
+    query: str
+    merchant_id: Optional[str] = None
+    market: str = "US"
+    limit: int = Field(default=20, ge=1, le=100)
+    include_external: bool = True
+    include_incentives: bool = True
+    payment_context: Optional[PivotPaymentContext] = None
+
+
+class PivotPricing(BaseModel):
+    currency: Optional[str] = None
+    list_price: Optional[Decimal] = None
+    merchant_effective_price: Optional[Decimal] = None
+    estimated_best_price: Optional[Decimal] = None
+    exact_quote_price: Optional[Decimal] = None
+    price_confidence: Optional[Decimal] = None
+
+
+class IncentiveNode(BaseModel):
+    incentive_id: str
+    label: str
+    incentive_type: str
+    benefit_kind: str
+    benefit_value: Optional[Decimal] = None
+    benefit_currency: Optional[str] = None
+    funding_source: Optional[str] = None
+    payment_method_type: Optional[str] = None
+    card_network: Optional[str] = None
+    issuer_name: Optional[str] = None
+    wallet_type: Optional[str] = None
+    installment_provider: Optional[str] = None
+    market: Optional[str] = None
+    eligibility_confidence: Optional[Decimal] = None
+    source_system: Optional[str] = None
+
+
+class BeautyVerticalPayload(BaseModel):
+    taxonomy: Dict[str, Any] = Field(default_factory=dict)
+    concerns: List[str] = Field(default_factory=list)
+    claims: List[str] = Field(default_factory=list)
+    routine_phase: Optional[str] = None
+    benefits: List[str] = Field(default_factory=list)
+    ingredients: List[str] = Field(default_factory=list)
+    active_ingredients: List[Dict[str, Any]] = Field(default_factory=list)
+    how_to_use: Optional[str] = None
+    usage_steps: List[str] = Field(default_factory=list)
+    shades: List[Dict[str, Any]] = Field(default_factory=list)
+    tutorials: List[Dict[str, Any]] = Field(default_factory=list)
+    compatibility_rules: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class MerchantNode(BaseModel):
+    merchant_id: Optional[str] = None
+    merchant_name: Optional[str] = None
+    primary_platform: Optional[str] = None
+
+
+class ProductNode(BaseModel):
+    product_key: Optional[str] = None
+    source_product_id: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    brand: Optional[str] = None
+    product_type: Optional[str] = None
+    category: Optional[str] = None
+    canonical_url: Optional[str] = None
+    image_url: Optional[str] = None
+
+
+class SkuNode(BaseModel):
+    sku_key: Optional[str] = None
+    source_variant_id: Optional[str] = None
+    sku: Optional[str] = None
+    barcode: Optional[str] = None
+    title: Optional[str] = None
+    visible_attributes: Dict[str, List[str]] = Field(default_factory=dict)
+    visible_option_labels: List[str] = Field(default_factory=list)
+    ingredient_ids: List[str] = Field(default_factory=list)
+
+
+class OfferNode(BaseModel):
+    offer_id: str
+    catalog_track: str
+    truth_tier: str
+    readiness_tier: str
+    offer_mode: str
+    source_system: Optional[str] = None
+    availability: Optional[str] = None
+    inventory_quantity: Optional[int] = None
+    pricing: PivotPricing = Field(default_factory=PivotPricing)
+    incentives: List[IncentiveNode] = Field(default_factory=list)
+
+
+class PivotResultItem(BaseModel):
+    merchant: MerchantNode = Field(default_factory=MerchantNode)
+    product: ProductNode = Field(default_factory=ProductNode)
+    sku: SkuNode = Field(default_factory=SkuNode)
+    offers: List[OfferNode] = Field(default_factory=list)
+    catalog_track: str
+    truth_tier: str
+    readiness_tier: str
+    freshness: Dict[str, Any] = Field(default_factory=dict)
+    source_system: Optional[str] = None
+    match_explanation: Dict[str, Any] = Field(default_factory=dict)
+    verticals: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PivotQueryResponse(BaseModel):
+    query: str
+    total: int
+    items: List[PivotResultItem] = Field(default_factory=list)
+
+
+class PivotQuoteItem(BaseModel):
+    offer_id: Optional[str] = None
+    product_key: Optional[str] = None
+    sku_key: Optional[str] = None
+    product_id: Optional[str] = None
+    variant_id: Optional[str] = None
+    quantity: int = Field(default=1, ge=1)
+
+
+class PivotQuoteRequest(BaseModel):
+    merchant_id: str
+    items: List[PivotQuoteItem]
+    payment_context: Optional[PivotPaymentContext] = None
+    discount_codes: Optional[List[str]] = None
+    customer_email: Optional[str] = None
+    shipping_address: Optional[Dict[str, Any]] = None
+    selected_delivery_option: Optional[Dict[str, Any]] = None
+
+
+class PivotQuoteResponse(BaseModel):
+    quote_id: Optional[str] = None
+    merchant_id: str
+    pricing: PivotPricing
+    incentives: List[IncentiveNode] = Field(default_factory=list)
+    quote_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PivotOffersResolveRequest(BaseModel):
+    merchant_id: Optional[str] = None
+    product_key: Optional[str] = None
+    sku_key: Optional[str] = None
+    query: Optional[str] = None
+    market: str = "US"
+    include_external: bool = True
+    payment_context: Optional[PivotPaymentContext] = None
+
+
+class PivotOffersResolveResponse(BaseModel):
+    merchant_id: Optional[str] = None
+    product_key: Optional[str] = None
+    sku_key: Optional[str] = None
+    offers: List[OfferNode] = Field(default_factory=list)
+    offers_count: int = 0

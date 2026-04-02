@@ -25,7 +25,7 @@ from models.order import (
 from db.orders import (
     create_order, get_order, get_orders_by_merchant, get_orders_by_customer,
     update_order_status, update_payment_info, mark_order_paid, 
-    update_fulfillment_info, mark_order_shipped, get_order_stats
+    update_fulfillment_info, mark_order_shipped, get_order_stats, update_order as update_order_row
 )
 from db.orders import orders as orders_table
 from db.merchant_onboarding import get_merchant_onboarding
@@ -43,6 +43,16 @@ from services.merchant_psp_config_service import (
     infer_runtime_provider,
 )
 from services.promotions_service import list_promotions, PromotionStatus
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_PROMPT_CLUSTER,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    has_attribution_signal,
+    materialize_attribution_context,
+    upsert_order_attribution_edge,
+)
 from services.quote_service import (
     QuoteError,
     QuoteService,
@@ -58,6 +68,13 @@ from services.shopify_transactions_service import (
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.merchant_webhook_service import emit_merchant_webhook_event
+from adapters.woocommerce_adapter import normalize_woocommerce_store_url
+from adapters.bigcommerce_adapter import (
+    build_bigcommerce_domain,
+    build_bigcommerce_headers,
+    normalize_bigcommerce_store_hash,
+)
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
     send_invitation_email_from_order,
@@ -68,6 +85,14 @@ from routes.reviews_invitation_issuer import (
 from services.reviews_invitation_send_jobs_service import (
     enqueue_invitation_send_job_from_order as enqueue_reviews_invitation_send_job_from_order,
 )
+
+
+def _clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 _PG_SHOPIFY_LOCK_SUPPORTED: Optional[bool] = None
@@ -208,6 +233,15 @@ def _normalize_shopify_domain(domain: str) -> str:
     return f"{d}.myshopify.com"
 
 
+def _normalize_storefront_base_url(domain: str) -> str:
+    d = (domain or "").strip()
+    if not d:
+        return ""
+    if not d.startswith(("http://", "https://")):
+        d = f"https://{d}"
+    return d.rstrip("/")
+
+
 def _shopify_order_create_lock_key(order_id: str) -> int:
     """
     Stable advisory-lock key for a given order_id.
@@ -304,6 +338,411 @@ def _build_shopify_cart_permalink_best_effort(
     return base
 
 
+def _build_woocommerce_checkout_permalink_best_effort(
+    *,
+    store_url: str,
+    items: List[OrderItem],
+) -> Optional[str]:
+    """
+    Best-effort WooCommerce hosted checkout fallback.
+
+    We only generate a URL for a single simple product because variable and multi-product
+    carts require extra form state that we do not persist in OrderItem today.
+    """
+    base = _normalize_storefront_base_url(store_url)
+    if not base:
+        return None
+
+    valid_items: List[OrderItem] = []
+    for item in items or []:
+        try:
+            qty = int(getattr(item, "quantity", 0) or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        valid_items.append(item)
+
+    if len(valid_items) != 1:
+        return None
+
+    item = valid_items[0]
+    if getattr(item, "variant_id", None):
+        return None
+
+    try:
+        product_id = str(int(str(getattr(item, "product_id", "") or "")))
+        quantity = int(getattr(item, "quantity", 0) or 0)
+    except Exception:
+        return None
+
+    if quantity <= 0:
+        return None
+
+    query = urlencode({"add-to-cart": product_id, "quantity": quantity})
+    return f"{base}/checkout/?{query}"
+
+
+def _build_bigcommerce_checkout_permalink_best_effort(
+    *,
+    store_domain: str,
+    items: List[OrderItem],
+) -> Optional[str]:
+    """
+    Best-effort BigCommerce hosted checkout fallback.
+
+    BigCommerce's storefront add-to-cart redirect is only reliable here for a single
+    product line item without option reconstruction.
+    """
+    base = _normalize_storefront_base_url(store_domain)
+    if not base:
+        return None
+
+    valid_items: List[OrderItem] = []
+    for item in items or []:
+        try:
+            qty = int(getattr(item, "quantity", 0) or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        valid_items.append(item)
+
+    if len(valid_items) != 1:
+        return None
+
+    item = valid_items[0]
+    if getattr(item, "variant_id", None):
+        return None
+
+    try:
+        product_id = str(int(str(getattr(item, "product_id", "") or "")))
+        quantity = int(getattr(item, "quantity", 0) or 0)
+    except Exception:
+        return None
+
+    if quantity <= 0:
+        return None
+
+    query = urlencode({"action": "buy", "product_id": product_id, "qty": quantity})
+    return f"{base}/cart.php?{query}"
+
+
+def _platform_order_create_lock_key(platform: str, order_id: str) -> int:
+    raw = f"pivota:{platform}_order_create:{order_id}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big", signed=True)
+
+
+def _coerce_order_metadata(order: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = (order or {}).get("metadata")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _get_linked_platform_order(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not order:
+        return None
+
+    metadata = _coerce_order_metadata(order)
+    linked = metadata.get("merchant_order")
+    if isinstance(linked, dict):
+        platform_order_id = str(linked.get("platform_order_id") or "").strip()
+        if platform_order_id:
+            linked_copy = dict(linked)
+            linked_copy["platform_order_id"] = platform_order_id
+            return linked_copy
+
+    shopify_order_id = str((order or {}).get("shopify_order_id") or "").strip()
+    if shopify_order_id:
+        return {
+            "platform": "shopify",
+            "platform_order_id": shopify_order_id,
+            "platform_order_url": None,
+        }
+    return None
+
+
+def _name_parts_from_order(order: Dict[str, Any]) -> Tuple[str, str]:
+    shipping_address = order.get("shipping_address") or {}
+    raw_name = str(shipping_address.get("name") or order.get("customer_name") or "").strip()
+    email = str(order.get("customer_email") or "").strip()
+    if not raw_name and email and "@" in email:
+        raw_name = email.split("@", 1)[0].strip()
+    if not raw_name:
+        return "Customer", ""
+    parts = [part for part in raw_name.split() if part.strip()]
+    if not parts:
+        return "Customer", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def _build_woocommerce_address(order: Dict[str, Any]) -> Dict[str, Any]:
+    shipping_address = order.get("shipping_address") or {}
+    first_name, last_name = _name_parts_from_order(order)
+    return {
+        "first_name": first_name,
+        "last_name": last_name,
+        "address_1": str(shipping_address.get("address_line1") or "").strip(),
+        "address_2": str(shipping_address.get("address_line2") or "").strip(),
+        "city": str(shipping_address.get("city") or "").strip(),
+        "state": str(shipping_address.get("state") or "").strip(),
+        "postcode": str(shipping_address.get("postal_code") or "").strip(),
+        "country": str(shipping_address.get("country") or "US").strip(),
+        "email": str(order.get("customer_email") or "").strip(),
+        "phone": str(shipping_address.get("phone") or "").strip(),
+    }
+
+
+def _build_bigcommerce_address(order: Dict[str, Any]) -> Dict[str, Any]:
+    shipping_address = order.get("shipping_address") or {}
+    first_name, last_name = _name_parts_from_order(order)
+    country = str(shipping_address.get("country") or "US").strip().upper() or "US"
+    return {
+        "first_name": first_name,
+        "last_name": last_name,
+        "street_1": str(shipping_address.get("address_line1") or "").strip(),
+        "street_2": str(shipping_address.get("address_line2") or "").strip(),
+        "city": str(shipping_address.get("city") or "").strip(),
+        "state": str(shipping_address.get("state") or "").strip(),
+        "zip": str(shipping_address.get("postal_code") or "").strip(),
+        "country": country,
+        "country_iso2": country,
+        "email": str(order.get("customer_email") or "").strip(),
+        "phone": str(shipping_address.get("phone") or "").strip(),
+    }
+
+
+def _as_order_items(raw_items: Any) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    if not isinstance(raw_items, list):
+        return items
+    for raw_item in raw_items:
+        if isinstance(raw_item, dict):
+            items.append(dict(raw_item))
+    return items
+
+
+def _merge_linked_platform_order_metadata(
+    order: Dict[str, Any],
+    *,
+    platform: str,
+    platform_order_id: str,
+    platform_order_name: Optional[str],
+    platform_order_url: Optional[str],
+    store: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = _coerce_order_metadata(order)
+    metadata["merchant_order"] = {
+        "platform": platform,
+        "platform_order_id": platform_order_id,
+        "platform_order_name": platform_order_name,
+        "platform_order_url": platform_order_url,
+        "store_id": str((store or {}).get("store_id") or "").strip() or None,
+        "domain": str((store or {}).get("domain") or "").strip() or None,
+        "linked_at": datetime.utcnow().isoformat() + "Z",
+    }
+    return metadata
+
+
+async def _candidate_platform_stores(
+    order: Dict[str, Any],
+    *,
+    platform: str,
+) -> List[Dict[str, Any]]:
+    stores = await get_merchant_active_stores(str(order.get("merchant_id") or "").strip())
+    platform_stores = [s for s in (stores or []) if str((s or {}).get("platform") or "").strip().lower() == platform]
+    if not platform_stores:
+        return []
+
+    bound_store_id = str(order.get("store_id") or "").strip() or None
+    candidates: List[Dict[str, Any]] = []
+    if bound_store_id:
+        for store in platform_stores:
+            if str((store or {}).get("store_id") or "").strip() == bound_store_id:
+                candidates.append(store)
+                break
+
+    for store in platform_stores:
+        if store not in candidates:
+            candidates.append(store)
+    return candidates
+
+
+def _parse_woocommerce_store_credentials(store: Dict[str, Any]) -> Tuple[str, str, str]:
+    credentials = dict((store or {}).get("api_credentials") or {})
+    raw_api_key = str((store or {}).get("api_key_raw") or (store or {}).get("api_key") or "").strip()
+    consumer_key = str(credentials.get("consumer_key") or "").strip()
+    consumer_secret = str(credentials.get("consumer_secret") or "").strip()
+
+    if not consumer_key and ":" in raw_api_key:
+        consumer_key = raw_api_key.split(":", 1)[0].strip()
+    if not consumer_secret and ":" in raw_api_key:
+        consumer_secret = raw_api_key.split(":", 1)[1].strip()
+
+    store_url = normalize_woocommerce_store_url((store or {}).get("domain"))
+    return store_url, consumer_key, consumer_secret
+
+
+def _parse_bigcommerce_store_credentials(store: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    credentials = dict((store or {}).get("api_credentials") or {})
+    store_hash = normalize_bigcommerce_store_hash(
+        credentials.get("store_hash") or (store or {}).get("domain")
+    )
+    access_token = str(credentials.get("access_token") or (store or {}).get("api_key") or "").strip()
+    client_id = str(credentials.get("client_id") or "").strip()
+    store_domain = str((store or {}).get("domain") or "").strip() or build_bigcommerce_domain(store_hash)
+    return store_hash, access_token, client_id, store_domain
+
+
+async def _resolve_bigcommerce_status_id(
+    *,
+    client: httpx.AsyncClient,
+    store_hash: str,
+    headers: Dict[str, str],
+) -> Optional[int]:
+    try:
+        response = await client.get(
+            f"https://api.bigcommerce.com/stores/{store_hash}/v2/order_statuses",
+            headers=headers,
+            timeout=12.0,
+        )
+    except Exception:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+
+    if not isinstance(payload, list):
+        return None
+
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        names = {
+            str(row.get("name") or "").strip().lower(),
+            str(row.get("label") or "").strip().lower(),
+            str(row.get("system_label") or "").strip().lower(),
+            str(row.get("custom_label") or "").strip().lower(),
+        }
+        if "awaiting fulfillment" in names:
+            try:
+                return int(row.get("id"))
+            except Exception:
+                return None
+    return None
+
+
+def _normalize_bigcommerce_option_value_id(raw_value: Dict[str, Any]) -> Optional[int]:
+    for key in ("id", "option_value_id", "value_id"):
+        candidate = raw_value.get(key)
+        try:
+            return int(candidate)
+        except Exception:
+            continue
+    return None
+
+
+async def _fetch_bigcommerce_variant_product_options(
+    *,
+    client: httpx.AsyncClient,
+    store_hash: str,
+    headers: Dict[str, str],
+    product_id: int,
+    variant_id: int,
+) -> List[Dict[str, int]]:
+    variant_resp = await client.get(
+        f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/variants/{variant_id}",
+        headers=headers,
+        timeout=12.0,
+    )
+    if variant_resp.status_code != 200:
+        raise ValueError(f"BigCommerce variant lookup failed: HTTP {variant_resp.status_code}")
+
+    variant_payload = variant_resp.json() or {}
+    variant = variant_payload.get("data") or {}
+    option_values = variant.get("option_values") or []
+    assignments: List[Dict[str, int]] = []
+    missing_mapping = False
+
+    for option_value in option_values:
+        if not isinstance(option_value, dict):
+            continue
+        option_id = option_value.get("option_id")
+        value_id = _normalize_bigcommerce_option_value_id(option_value)
+        try:
+            option_id_int = int(option_id)
+        except Exception:
+            option_id_int = None
+        if option_id_int is not None and value_id is not None:
+            assignments.append({"id": option_id_int, "value": value_id})
+        else:
+            missing_mapping = True
+
+    if assignments and not missing_mapping:
+        return assignments
+
+    options_resp = await client.get(
+        f"https://api.bigcommerce.com/stores/{store_hash}/v3/catalog/products/{product_id}/options",
+        headers=headers,
+        timeout=12.0,
+    )
+    if options_resp.status_code != 200:
+        raise ValueError(f"BigCommerce option lookup failed: HTTP {options_resp.status_code}")
+
+    options_payload = options_resp.json() or {}
+    options_rows = options_payload.get("data") or []
+    option_map: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for row in options_rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            option_id = int(row.get("id"))
+        except Exception:
+            continue
+        display_name = str(row.get("display_name") or row.get("name") or "").strip().lower()
+        for value_row in row.get("option_values") or []:
+            if not isinstance(value_row, dict):
+                continue
+            value_id = _normalize_bigcommerce_option_value_id(value_row)
+            label = str(value_row.get("label") or value_row.get("name") or "").strip().lower()
+            if value_id is None or not display_name or not label:
+                continue
+            option_map[(display_name, label)] = {"id": option_id, "value": value_id}
+
+    mapped_assignments: List[Dict[str, int]] = []
+    for option_value in option_values:
+        if not isinstance(option_value, dict):
+            continue
+        key = (
+            str(option_value.get("option_display_name") or option_value.get("display_name") or "").strip().lower(),
+            str(option_value.get("label") or option_value.get("option_label") or "").strip().lower(),
+        )
+        if not key[0] or not key[1]:
+            continue
+        mapped = option_map.get(key)
+        if mapped:
+            mapped_assignments.append(mapped)
+
+    if mapped_assignments:
+        return mapped_assignments
+    raise ValueError("BigCommerce variant option mapping unavailable")
+
+
 async def _get_platform_checkout_fallback_url_best_effort(
     *,
     merchant_id: str,
@@ -332,8 +771,21 @@ async def _get_platform_checkout_fallback_url_best_effort(
         )
         if url:
             return {"url": url, "platform": "shopify", "method": "cart_permalink"}
+    elif str(platform).lower() == "woocommerce":
+        url = _build_woocommerce_checkout_permalink_best_effort(
+            store_url=str(domain),
+            items=items,
+        )
+        if url:
+            return {"url": url, "platform": "woocommerce", "method": "checkout_add_to_cart"}
+    elif str(platform).lower() == "bigcommerce":
+        url = _build_bigcommerce_checkout_permalink_best_effort(
+            store_domain=str(domain),
+            items=items,
+        )
+        if url:
+            return {"url": url, "platform": "bigcommerce", "method": "cart_buy_now"}
 
-    # TODO: add platform-hosted checkout fallbacks for wix/woocommerce when needed.
     return None
 
 
@@ -951,6 +1403,33 @@ async def create_new_order(
             # 促销信息统一挂在 metadata.promotions 下
             order_metadata["promotions"] = {**existing_promos, **promo_meta}
 
+        order_taxonomy = build_traffic_taxonomy(
+            order_metadata,
+            authenticated_agent_id=_clean_text(order_metadata.get("agent_id")) if isinstance(order_metadata, dict) else None,
+            caller_id=_clean_text(order_metadata.get("caller_id")) if isinstance(order_metadata, dict) else None,
+            default_source_channel=_clean_text(order_metadata.get("source_channel") or order_metadata.get("source")),
+            default_query_source=_clean_text(order_metadata.get("query_source")),
+            default_protocol_name=_clean_text(order_metadata.get("protocol_name") or order_metadata.get("protocol")),
+            default_commerce_surface=_clean_text(order_metadata.get("commerce_surface") or order_metadata.get("surface")),
+        )
+        order_metadata = attach_traffic_taxonomy(order_metadata, order_taxonomy)
+
+        if has_attribution_signal(order_metadata):
+            attribution_context = materialize_attribution_context(
+                order_metadata,
+                default_surface=str(order_metadata.get(PVT_SURFACE) or order_metadata.get("surface") or "merchant_native"),
+                merchant_id=order_request.merchant_id,
+            )
+            for key in (
+                PVT_SURFACE,
+                PVT_CLICK_ID,
+                PVT_PRODUCT_ID,
+                PVT_VARIANT_ID,
+                PVT_PROMPT_CLUSTER,
+            ):
+                if attribution_context.get(key):
+                    order_metadata[key] = attribution_context[key]
+
         # Bind order to the current store connection (if any) so downstream Shopify sync
         # does not accidentally use a different store after a merchant connects another store.
         store_id_value: Optional[str] = None
@@ -987,6 +1466,18 @@ async def create_new_order(
             "payment_method": None
         }
         order_id = await create_order(order_data)
+        try:
+            await upsert_order_attribution_edge(
+                order_id=str(order_id),
+                merchant_id=order_request.merchant_id,
+                metadata=order_metadata,
+            )
+        except Exception as attribution_exc:
+            logger.warning(
+                "[OrderRoutes] Failed to persist commerce attribution edge for %s: %s",
+                order_id,
+                attribution_exc,
+            )
 
         try:
             await emit_merchant_webhook_event(
@@ -1076,6 +1567,17 @@ async def create_new_order(
                     "customer_email": order_request.customer_email,
                     "route_id": route_id_for_attempt,
                     "agent_id": agent_id,
+                    **(
+                        {
+                            PVT_SURFACE: order_metadata.get(PVT_SURFACE),
+                            PVT_CLICK_ID: order_metadata.get(PVT_CLICK_ID),
+                            PVT_PRODUCT_ID: order_metadata.get(PVT_PRODUCT_ID),
+                            PVT_VARIANT_ID: order_metadata.get(PVT_VARIANT_ID),
+                            PVT_PROMPT_CLUSTER: order_metadata.get(PVT_PROMPT_CLUSTER),
+                        }
+                        if has_attribution_signal(order_metadata)
+                        else {}
+                    ),
                     **({"psp_mode": psp_mode} if psp_mode else {}),
                 },
                 preferred_psps=preferred_psps,
@@ -1466,7 +1968,337 @@ async def get_merchant_order_stats(
 # Shopify 订单创建（履约集成）
 # ============================================================================
 
+async def create_woocommerce_order(order_id: str) -> bool:
+    lock_key = _platform_order_create_lock_key("woocommerce", order_id)
+    async with _pg_advisory_lock_best_effort(lock_key=lock_key) as lock_acquired:
+        if not lock_acquired:
+            logger.info("[WooCommerce] Create already in progress; skipping: order_id=%s", order_id)
+            return True
+
+        order = await get_order(order_id)
+        if not order:
+            logger.error("[WooCommerce] Order %s not found", order_id)
+            return False
+        if _get_linked_platform_order(order):
+            return True
+        if order.get("payment_status") != "paid":
+            logger.warning(
+                "[WooCommerce] Skip create (not paid): order_id=%s payment_status=%s",
+                order_id,
+                order.get("payment_status"),
+            )
+            return False
+
+        candidates = await _candidate_platform_stores(order, platform="woocommerce")
+        if not candidates:
+            await log_order_event(
+                event_type="merchant_order_failed",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={"platform": "woocommerce", "error": "active_woocommerce_store_missing"},
+            )
+            return False
+
+        order_items = _as_order_items(order.get("items"))
+        billing_address = _build_woocommerce_address(order)
+        shipping_address = dict(billing_address)
+        last_error: Optional[str] = None
+
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            for store in candidates:
+                store_url, consumer_key, consumer_secret = _parse_woocommerce_store_credentials(store)
+                if not store_url or not consumer_key or not consumer_secret:
+                    continue
+
+                line_items: List[Dict[str, Any]] = []
+                for item in order_items:
+                    try:
+                        product_id = int(str(item.get("product_id") or "").strip())
+                        quantity = int(item.get("quantity") or 0)
+                    except Exception:
+                        last_error = "WooCommerce order item is missing a numeric product_id or quantity"
+                        line_items = []
+                        break
+                    if quantity <= 0:
+                        last_error = "WooCommerce order item quantity must be > 0"
+                        line_items = []
+                        break
+                    line_item: Dict[str, Any] = {"product_id": product_id, "quantity": quantity}
+                    variant_id = str(item.get("variant_id") or "").strip()
+                    if variant_id:
+                        try:
+                            line_item["variation_id"] = int(variant_id)
+                        except Exception:
+                            last_error = "WooCommerce variation_id must be numeric"
+                            line_items = []
+                            break
+                    unit_price = item.get("unit_price")
+                    if unit_price is not None:
+                        try:
+                            total = Decimal(str(unit_price)) * Decimal(quantity)
+                            line_item["subtotal"] = str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                            line_item["total"] = line_item["subtotal"]
+                        except Exception:
+                            pass
+                    line_items.append(line_item)
+
+                if not line_items:
+                    continue
+
+                payload = {
+                    "status": "processing",
+                    "set_paid": True,
+                    "payment_method": "pivota_external",
+                    "payment_method_title": "Pivota External Payment",
+                    "customer_note": f"Pivota Order ID: {order_id}",
+                    "billing": billing_address,
+                    "shipping": shipping_address,
+                    "line_items": line_items,
+                }
+                response = await client.post(
+                    f"{store_url}/wp-json/wc/v3/orders",
+                    params={"consumer_key": consumer_key, "consumer_secret": consumer_secret},
+                    json=payload,
+                )
+                if response.status_code not in (200, 201):
+                    last_error = f"WooCommerce API error {response.status_code}: {(response.text or '')[:500]}"
+                    continue
+
+                data = response.json() or {}
+                platform_order_id = str(data.get("id") or "").strip()
+                if not platform_order_id:
+                    last_error = "WooCommerce response missing order id"
+                    continue
+
+                metadata = _merge_linked_platform_order_metadata(
+                    order,
+                    platform="woocommerce",
+                    platform_order_id=platform_order_id,
+                    platform_order_name=str(data.get("number") or platform_order_id),
+                    platform_order_url=f"{store_url}/wp-admin/post.php?post={platform_order_id}&action=edit",
+                    store=store,
+                )
+                store_id_used = str((store or {}).get("store_id") or "").strip() or None
+                await update_fulfillment_info(order_id=order_id, fulfillment_status="processing")
+                await update_order_row(
+                    order_id,
+                    {
+                        "metadata": metadata,
+                        **({"store_id": store_id_used} if store_id_used else {}),
+                    },
+                )
+                await log_order_event(
+                    event_type="merchant_order_created",
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                    metadata={
+                        "platform": "woocommerce",
+                        "platform_order_id": platform_order_id,
+                        "store_id": store_id_used,
+                        "domain": str((store or {}).get("domain") or "").strip() or None,
+                    },
+                )
+                logger.info(
+                    "[WooCommerce] ✅ Order linked: order_id=%s platform_order_id=%s store_id=%s",
+                    order_id,
+                    platform_order_id,
+                    store_id_used,
+                )
+                return True
+
+        if last_error:
+            await log_order_event(
+                event_type="merchant_order_failed",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={"platform": "woocommerce", "error": last_error},
+            )
+        return False
+
+
+async def create_bigcommerce_order(order_id: str) -> bool:
+    lock_key = _platform_order_create_lock_key("bigcommerce", order_id)
+    async with _pg_advisory_lock_best_effort(lock_key=lock_key) as lock_acquired:
+        if not lock_acquired:
+            logger.info("[BigCommerce] Create already in progress; skipping: order_id=%s", order_id)
+            return True
+
+        order = await get_order(order_id)
+        if not order:
+            logger.error("[BigCommerce] Order %s not found", order_id)
+            return False
+        if _get_linked_platform_order(order):
+            return True
+        if order.get("payment_status") != "paid":
+            logger.warning(
+                "[BigCommerce] Skip create (not paid): order_id=%s payment_status=%s",
+                order_id,
+                order.get("payment_status"),
+            )
+            return False
+
+        candidates = await _candidate_platform_stores(order, platform="bigcommerce")
+        if not candidates:
+            await log_order_event(
+                event_type="merchant_order_failed",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={"platform": "bigcommerce", "error": "active_bigcommerce_store_missing"},
+            )
+            return False
+
+        order_items = _as_order_items(order.get("items"))
+        billing_address = _build_bigcommerce_address(order)
+        shipping_address = dict(billing_address)
+        last_error: Optional[str] = None
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for store in candidates:
+                store_hash, access_token, client_id, store_domain = _parse_bigcommerce_store_credentials(store)
+                if not store_hash or not access_token:
+                    continue
+
+                headers = build_bigcommerce_headers(access_token, client_id)
+                status_id = await _resolve_bigcommerce_status_id(
+                    client=client,
+                    store_hash=store_hash,
+                    headers=headers,
+                )
+
+                products_payload: List[Dict[str, Any]] = []
+                try:
+                    for item in order_items:
+                        product_id = int(str(item.get("product_id") or "").strip())
+                        quantity = int(item.get("quantity") or 0)
+                        if quantity <= 0:
+                            raise ValueError("BigCommerce order item quantity must be > 0")
+                        line_item: Dict[str, Any] = {"product_id": product_id, "quantity": quantity}
+                        variant_id = str(item.get("variant_id") or "").strip()
+                        if variant_id:
+                            product_options = await _fetch_bigcommerce_variant_product_options(
+                                client=client,
+                                store_hash=store_hash,
+                                headers=headers,
+                                product_id=product_id,
+                                variant_id=int(variant_id),
+                            )
+                            if product_options:
+                                line_item["product_options"] = product_options
+                        products_payload.append(line_item)
+                except Exception as exc:
+                    last_error = f"BigCommerce item mapping failed: {exc}"
+                    continue
+
+                payload = {
+                    "billing_address": billing_address,
+                    "shipping_addresses": [
+                        {
+                            **shipping_address,
+                            "shipping_method": "Pivota External Shipping",
+                        }
+                    ],
+                    "products": products_payload,
+                    "customer_message": f"Pivota Order ID: {order_id}",
+                    "staff_notes": f"Pivota external payment reference: {order.get('payment_intent_id')}",
+                }
+                if status_id is not None:
+                    payload["status_id"] = status_id
+
+                response = await client.post(
+                    f"https://api.bigcommerce.com/stores/{store_hash}/v2/orders",
+                    headers=headers,
+                    json=payload,
+                )
+                if response.status_code not in (200, 201):
+                    last_error = f"BigCommerce API error {response.status_code}: {(response.text or '')[:500]}"
+                    continue
+
+                data = response.json() or {}
+                platform_order_id = str(data.get("id") or "").strip()
+                if not platform_order_id:
+                    last_error = "BigCommerce response missing order id"
+                    continue
+
+                metadata = _merge_linked_platform_order_metadata(
+                    order,
+                    platform="bigcommerce",
+                    platform_order_id=platform_order_id,
+                    platform_order_name=str(data.get("id") or platform_order_id),
+                    platform_order_url=None,
+                    store=store,
+                )
+                store_id_used = str((store or {}).get("store_id") or "").strip() or None
+                await update_fulfillment_info(order_id=order_id, fulfillment_status="processing")
+                await update_order_row(
+                    order_id,
+                    {
+                        "metadata": metadata,
+                        **({"store_id": store_id_used} if store_id_used else {}),
+                    },
+                )
+                await log_order_event(
+                    event_type="merchant_order_created",
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                    metadata={
+                        "platform": "bigcommerce",
+                        "platform_order_id": platform_order_id,
+                        "store_id": store_id_used,
+                        "domain": store_domain,
+                    },
+                )
+                logger.info(
+                    "[BigCommerce] ✅ Order linked: order_id=%s platform_order_id=%s store_id=%s",
+                    order_id,
+                    platform_order_id,
+                    store_id_used,
+                )
+                return True
+
+        if last_error:
+            await log_order_event(
+                event_type="merchant_order_failed",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={"platform": "bigcommerce", "error": last_error},
+            )
+        return False
+
+
+async def sync_order_to_connected_store(order_id: str) -> bool:
+    order = await get_order(order_id)
+    if not order:
+        return False
+    if _get_linked_platform_order(order):
+        return True
+
+    bound_store_id = str(order.get("store_id") or "").strip() or None
+    store_info = None
+    if bound_store_id:
+        store_info = await get_store_by_id(bound_store_id, merchant_id=str(order.get("merchant_id") or "").strip())
+    if not store_info:
+        store_info = await get_primary_store(str(order.get("merchant_id") or "").strip())
+    platform = str((store_info or {}).get("platform") or "").strip().lower()
+    if platform == "shopify":
+        return await _create_shopify_order_impl(order_id)
+    if platform == "woocommerce":
+        return await create_woocommerce_order(order_id)
+    if platform == "bigcommerce":
+        return await create_bigcommerce_order(order_id)
+    logger.info("[MerchantSync] No supported store connected for order_id=%s platform=%s", order_id, platform or None)
+    return False
+
+
 async def create_shopify_order(order_id: str) -> bool:
+    """
+    Legacy entrypoint retained for webhook/payment callers.
+
+    This now dispatches to the connected merchant platform instead of assuming Shopify-only.
+    """
+    return await sync_order_to_connected_store(order_id)
+
+
+async def _create_shopify_order_impl(order_id: str) -> bool:
     """
     在 Shopify 中创建订单（通知商户发货）
     

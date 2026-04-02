@@ -1,0 +1,429 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import requests
+from sqlalchemy import create_engine, text
+
+import scripts.beauty_ranking_audit as beauty_ranking_audit
+
+
+def test_raw_seed_fetch_limit_matches_gateway_shopping_seed_budget() -> None:
+    assert beauty_ranking_audit._raw_seed_fetch_limit(
+        {"source": "shopping_agent", "page": 1, "limit": 10},
+        50,
+    ) == 30
+    assert beauty_ranking_audit._raw_seed_fetch_limit(
+        {"source": "aurora", "page": 2, "limit": 15},
+        50,
+    ) == 60
+    assert beauty_ranking_audit._raw_seed_fetch_limit(
+        {"source": "merchant_api", "page": 1, "limit": 10},
+        50,
+    ) == 10
+
+
+def test_post_json_returns_error_payload_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(*args, **kwargs):
+        raise requests.ReadTimeout("gateway timed out")
+
+    monkeypatch.setattr(beauty_ranking_audit.requests, "post", fake_post)
+
+    payload = beauty_ranking_audit._post_json(
+        url="https://api.example.com/test",
+        payload={"query": "moisturizer"},
+        headers={"Authorization": "Bearer token"},
+        timeout_seconds=1.0,
+    )
+
+    assert payload["status_code"] is None
+    assert payload["request_failed"] is True
+    assert payload["request_timed_out"] is True
+    assert payload["body"]["error"] == "ReadTimeout"
+
+
+def test_build_report_sync_mode_handles_gateway_timeout_without_crashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "beauty_audit.sqlite"
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE external_product_seeds (
+                  id TEXT PRIMARY KEY,
+                  external_product_id TEXT,
+                  market TEXT,
+                  tool TEXT,
+                  utm_template TEXT,
+                  partner_type TEXT,
+                  disclosure_text TEXT,
+                  destination_url TEXT,
+                  canonical_url TEXT,
+                  domain TEXT,
+                  title TEXT,
+                  image_url TEXT,
+                  price_amount REAL,
+                  price_currency TEXT,
+                  availability TEXT,
+                  seed_data TEXT,
+                  status TEXT,
+                  notes TEXT,
+                  created_by_employee_id TEXT,
+                  attached_product_key TEXT,
+                  attached_variant_id TEXT,
+                  created_at TEXT,
+                  updated_at TEXT
+                )
+                """
+            )
+        )
+        seed_data = {
+            "title": "Acne Control Clarifying Cleanser",
+            "description": "Clarifying cleanser.",
+            "category": "Cleanser",
+            "visible_attributes": {"product_category": ["cleanser"], "skin_concern": ["acne"]},
+            "reviewed_ingredient_ids": ["salicylic_acid"],
+        }
+        conn.execute(
+            text(
+                """
+                INSERT INTO external_product_seeds (
+                  id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+                  destination_url, canonical_url, domain, title, image_url, price_amount, price_currency,
+                  availability, seed_data, status, notes, created_by_employee_id, attached_product_key,
+                  attached_variant_id, created_at, updated_at
+                ) VALUES (
+                  :id, :external_product_id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
+                  :destination_url, :canonical_url, :domain, :title, :image_url, :price_amount, :price_currency,
+                  :availability, :seed_data, :status, :notes, :created_by_employee_id, :attached_product_key,
+                  :attached_variant_id, :created_at, :updated_at
+                )
+                """
+            ),
+            {
+                "id": "seed_1",
+                "external_product_id": "ext_cleanser",
+                "market": "US",
+                "tool": None,
+                "utm_template": None,
+                "partner_type": None,
+                "disclosure_text": None,
+                "destination_url": "https://example.com/products/acne-control-clarifying-cleanser",
+                "canonical_url": "https://example.com/products/acne-control-clarifying-cleanser",
+                "domain": "example.com",
+                "title": "Acne Control Clarifying Cleanser",
+                "image_url": None,
+                "price_amount": 22.0,
+                "price_currency": "USD",
+                "availability": "in_stock",
+                "seed_data": json.dumps(seed_data),
+                "status": "active",
+                "notes": None,
+                "created_by_employee_id": None,
+                "attached_product_key": None,
+                "attached_variant_id": None,
+                "created_at": "2026-03-29T00:00:00Z",
+                "updated_at": "2026-03-29T00:00:00Z",
+            },
+        )
+    engine.dispose()
+
+    corpus_path = tmp_path / "corpus.json"
+    corpus_path.write_text(
+        json.dumps([{"query": "acne cleanser", "source": "shopping_agent", "page": 1, "limit": 5}]),
+        encoding="utf-8",
+    )
+
+    async def fail_connect():
+        raise AssertionError("async database.connect should not be called in sync mode")
+
+    async def fail_disconnect():
+        raise AssertionError("async database.disconnect should not be called in sync mode")
+
+    monkeypatch.setattr(
+        beauty_ranking_audit,
+        "database",
+        SimpleNamespace(is_connected=False, connect=fail_connect, disconnect=fail_disconnect),
+    )
+
+    def fake_post_json(**kwargs):
+        return {
+            "status_code": None,
+            "elapsed_ms": 1000.0,
+            "body": {"error": "ReadTimeout", "message": "timed out"},
+            "request_failed": True,
+            "request_timed_out": True,
+        }
+
+    monkeypatch.setattr(beauty_ranking_audit, "_post_json", fake_post_json)
+
+    args = argparse.Namespace(
+        corpus=str(corpus_path),
+        market=None,
+        limit=5,
+        base_url=None,
+        gateway_base_url="https://api.example.com",
+        pivot_base_url="https://pivot.example.com",
+        header=[],
+        gateway_header=[],
+        pivot_header=[],
+        timeout_seconds=5.0,
+        database_url=f"sqlite:///{db_path}",
+        db_mode="sync",
+        seed_fetch_mode="fast",
+        seed_stage_a_timeout_seconds=0.2,
+        seed_stage_b_timeout_seconds=0.3,
+        output_json=None,
+        output_md=None,
+    )
+
+    report = asyncio.run(beauty_ranking_audit._build_report(args))
+
+    assert report["summary"]["case_count"] == 1
+    assert report["summary"]["gateway_nonempty"] == 0
+    assert report["summary"]["pivot_nonempty"] == 0
+    assert report["cases"][0]["gateway_final_ranking"]["request_timed_out"] is True
+    assert report["cases"][0]["pivot_final_ranking"]["request_timed_out"] is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_raw_external_rows_fast_mode_skips_stage_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        calls.append(bool(kwargs.get("include_seed_data_text_match")))
+        return {
+            "rows": [],
+            "query_ms": 5,
+            "query_timeout": False,
+            "table_missing": False,
+        }
+
+    monkeypatch.setattr(
+        beauty_ranking_audit,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+
+    result = await beauty_ranking_audit._fetch_raw_external_rows(
+        query="gentle cleanser",
+        limit=5,
+        market="US",
+        stage_a_timeout_seconds=0.1,
+        stage_b_timeout_seconds=0.2,
+        seed_fetch_mode="fast",
+    )
+
+    assert calls == [False]
+    assert result["stage_b"]["executed"] is False
+    assert result["raw_rows"] == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_raw_external_rows_deep_mode_executes_stage_b_when_stage_a_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    async def fake_fetch_external_seed_rows(**kwargs):
+        include_seed_data = bool(kwargs.get("include_seed_data_text_match"))
+        calls.append(include_seed_data)
+        if not include_seed_data:
+            return {
+                "rows": [],
+                "query_ms": 5,
+                "query_timeout": False,
+                "table_missing": False,
+            }
+        return {
+            "rows": [
+                {
+                    "id": "seed_1",
+                    "external_product_id": "ext_hyaluronic",
+                    "title": "Hyaluronic Acid Hydrating Serum",
+                    "canonical_url": "https://example.com/products/hyaluronic-acid-hydrating-serum",
+                    "destination_url": "https://example.com/products/hyaluronic-acid-hydrating-serum",
+                    "domain": "example.com",
+                    "price_amount": 24.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "updated_at": "2026-03-29T00:00:00Z",
+                    "seed_data": {
+                        "title": "Hyaluronic Acid Hydrating Serum",
+                        "description": "Hydrating serum.",
+                        "category": "Serum",
+                        "visible_attributes": {"product_category": ["serum"], "skin_concern": ["hydrating"]},
+                        "reviewed_ingredient_ids": ["hyaluronic_acid"],
+                    },
+                }
+            ],
+            "query_ms": 8,
+            "query_timeout": False,
+            "table_missing": False,
+        }
+
+    monkeypatch.setattr(
+        beauty_ranking_audit,
+        "fetch_external_seed_rows",
+        fake_fetch_external_seed_rows,
+    )
+
+    result = await beauty_ranking_audit._fetch_raw_external_rows(
+        query="hyaluronic acid hydrating serum",
+        limit=5,
+        market="US",
+        stage_a_timeout_seconds=0.1,
+        stage_b_timeout_seconds=0.2,
+        seed_fetch_mode="deep",
+    )
+
+    assert calls == [False, True]
+    assert result["stage_b"]["executed"] is True
+    assert len(result["raw_rows"]) == 1
+    assert result["ranking_audit"]["ranked_candidates"][0]["title"] == "Hyaluronic Acid Hydrating Serum"
+
+
+def test_build_report_sync_mode_uses_sqlalchemy_path_without_async_database_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "beauty_audit.sqlite"
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE external_product_seeds (
+                  id TEXT PRIMARY KEY,
+                  external_product_id TEXT,
+                  market TEXT,
+                  tool TEXT,
+                  utm_template TEXT,
+                  partner_type TEXT,
+                  disclosure_text TEXT,
+                  destination_url TEXT,
+                  canonical_url TEXT,
+                  domain TEXT,
+                  title TEXT,
+                  image_url TEXT,
+                  price_amount REAL,
+                  price_currency TEXT,
+                  availability TEXT,
+                  seed_data TEXT,
+                  status TEXT,
+                  notes TEXT,
+                  created_by_employee_id TEXT,
+                  attached_product_key TEXT,
+                  attached_variant_id TEXT,
+                  created_at TEXT,
+                  updated_at TEXT
+                )
+                """
+            )
+        )
+        seed_data = {
+            "title": "Hyaluronic Acid Hydrating Serum",
+            "description": "Hydrating serum.",
+            "category": "Serum",
+            "visible_attributes": {"product_category": ["serum"], "skin_concern": ["hydrating"]},
+            "reviewed_ingredient_ids": ["hyaluronic_acid"],
+        }
+        conn.execute(
+            text(
+                """
+                INSERT INTO external_product_seeds (
+                  id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+                  destination_url, canonical_url, domain, title, image_url, price_amount, price_currency,
+                  availability, seed_data, status, notes, created_by_employee_id, attached_product_key,
+                  attached_variant_id, created_at, updated_at
+                ) VALUES (
+                  :id, :external_product_id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
+                  :destination_url, :canonical_url, :domain, :title, :image_url, :price_amount, :price_currency,
+                  :availability, :seed_data, :status, :notes, :created_by_employee_id, :attached_product_key,
+                  :attached_variant_id, :created_at, :updated_at
+                )
+                """
+            ),
+            {
+                "id": "seed_1",
+                "external_product_id": "ext_hyaluronic",
+                "market": "US",
+                "tool": None,
+                "utm_template": None,
+                "partner_type": None,
+                "disclosure_text": None,
+                "destination_url": "https://example.com/products/hyaluronic-acid-hydrating-serum",
+                "canonical_url": "https://example.com/products/hyaluronic-acid-hydrating-serum",
+                "domain": "example.com",
+                "title": "Hyaluronic Acid Hydrating Serum",
+                "image_url": None,
+                "price_amount": 24.0,
+                "price_currency": "USD",
+                "availability": "in_stock",
+                "seed_data": json.dumps(seed_data),
+                "status": "active",
+                "notes": None,
+                "created_by_employee_id": None,
+                "attached_product_key": None,
+                "attached_variant_id": None,
+                "created_at": "2026-03-29T00:00:00Z",
+                "updated_at": "2026-03-29T00:00:00Z",
+            },
+        )
+    engine.dispose()
+
+    corpus_path = tmp_path / "corpus.json"
+    corpus_path.write_text(
+        json.dumps([{"query": "hyaluronic acid hydrating serum", "source": "shopping_agent", "page": 1, "limit": 5}]),
+        encoding="utf-8",
+    )
+
+    async def fail_connect():
+        raise AssertionError("async database.connect should not be called in sync mode")
+
+    async def fail_disconnect():
+        raise AssertionError("async database.disconnect should not be called in sync mode")
+
+    monkeypatch.setattr(
+        beauty_ranking_audit,
+        "database",
+        SimpleNamespace(is_connected=False, connect=fail_connect, disconnect=fail_disconnect),
+    )
+
+    args = argparse.Namespace(
+        corpus=str(corpus_path),
+        market=None,
+        limit=5,
+        base_url=None,
+        gateway_base_url=None,
+        pivot_base_url=None,
+        header=[],
+        gateway_header=[],
+        pivot_header=[],
+        timeout_seconds=5.0,
+        database_url=f"sqlite:///{db_path}",
+        db_mode="sync",
+        seed_fetch_mode="fast",
+        seed_stage_a_timeout_seconds=0.2,
+        seed_stage_b_timeout_seconds=0.3,
+        output_json=None,
+        output_md=None,
+    )
+
+    report = asyncio.run(beauty_ranking_audit._build_report(args))
+
+    assert report["db_mode"] == "sync"
+    assert report["seed_fetch_mode"] == "fast"
+    assert report["summary"]["case_count"] == 1
+    assert report["summary"]["raw_seed_available_cases"] == 1
+    assert report["cases"][0]["top1_diff"]["gateway_vs_ranked"]["ranked_top1"] == "Hyaluronic Acid Hydrating Serum"

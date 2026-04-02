@@ -12,6 +12,7 @@ from databases import Database
 from db.orders import get_order, update_order
 from db.database import database as db
 from adapters.psp_adapter import get_psp_adapter
+from services.commerce_attribution_service import attach_refund_to_attribution_edge
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
@@ -114,6 +115,18 @@ class RefundService:
                         order_id=order_id,
                         amount=amount
                     )
+                    try:
+                        await attach_refund_to_attribution_edge(
+                            order_id=order_id,
+                            refund_id=refund_id,
+                            amount=amount,
+                        )
+                    except Exception as attribution_exc:
+                        logger.warning(
+                            "Failed to attach refund attribution edge for %s: %s",
+                            refund_id,
+                            attribution_exc,
+                        )
                     
                     return {
                         "status": "success",

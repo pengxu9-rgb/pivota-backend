@@ -37,6 +37,7 @@ def test_get_preferences_returns_defaults(monkeypatch) -> None:
     assert body["data"]["email_payments"] is True
     assert body["data"]["email_inventory"] is False
     assert body["data"]["email_weekly"] is False
+    assert body["data"]["portal_language"] == "en"
 
 
 def test_update_preferences_persists_payload(monkeypatch) -> None:
@@ -48,6 +49,7 @@ def test_update_preferences_persists_payload(monkeypatch) -> None:
         assert payload["email_payments"] is True
         assert payload["email_inventory"] is True
         assert payload["email_weekly"] is False
+        assert payload["portal_language"] == "zh-CN"
         return {
             "merchant_id": merchant_id,
             **payload,
@@ -63,6 +65,7 @@ def test_update_preferences_persists_payload(monkeypatch) -> None:
             "email_payments": True,
             "email_inventory": True,
             "email_weekly": False,
+            "portal_language": "zh-CN",
         },
     )
 
@@ -71,4 +74,16 @@ def test_update_preferences_persists_payload(monkeypatch) -> None:
     assert body["status"] == "success"
     assert body["data"]["email_orders"] is False
     assert body["data"]["email_inventory"] is True
+    assert body["data"]["portal_language"] == "zh-CN"
     assert body["data"]["updated_at"] == "2026-03-22T00:00:00Z"
+
+
+def test_update_preferences_rejects_invalid_language() -> None:
+    client, _module = _build_client()
+
+    response = client.put(
+        "/merchant/settings/preferences",
+        json={"portal_language": "es-ES"},
+    )
+
+    assert response.status_code == 422

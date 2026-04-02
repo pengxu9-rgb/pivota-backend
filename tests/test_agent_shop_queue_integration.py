@@ -151,6 +151,10 @@ async def test_invoke_find_products_multi_clamps_limit_and_includes_route_health
         "external_seed_brand_relevant_rows",
         "external_seed_broad_fallback_used",
         "external_seed_broad_scope_rows",
+        "pivot_shadow_scheduled",
+        "pivot_shadow_mode",
+        "pivot_rollout_mode",
+        "pivot_rollout_guard_passed",
     ):
         assert key in route_health
 

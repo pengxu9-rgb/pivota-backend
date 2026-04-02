@@ -71,6 +71,7 @@ def _optimization_payload(*, plan_id: str, snapshot_id: str, score: int) -> Merc
                     "product_id": "prod_1",
                     "platform": "shopify",
                     "platform_product_id": "prod_1",
+                    "platform_admin_url": "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1",
                     "title": "Alpha Product",
                     "blocked_variant_count": 1,
                     "ready_variant_count": 0,
@@ -225,6 +226,89 @@ async def test_preview_remediation_action_returns_candidate_patches(monkeypatch)
     assert preview["candidate_patches"]
     assert preview["requires_approval"] is True
     assert preview["expected_impact"]["targets"][0]["delta"]["content_quality_score"] >= 0
+    assert preview["generated_content_context"][0]["title_health"] == "needs_more_facts"
+    assert preview["generated_content_context"][0]["missing_attribute_labels"]
+    assert not any(
+        patch["target_field"] == "title_override"
+        for patch in preview["candidate_patches"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_remediation_action_returns_title_patch_when_facts_are_sufficient(monkeypatch):
+    from readiness import remediation
+
+    payload = _optimization_payload(plan_id="rdplan_current", snapshot_id="rdsnap_current", score=77)
+    snapshot = _snapshot()
+
+    async def fake_get_readiness_optimization_context(_merchant_id: str, *, channel: str = "ucp"):
+        return payload, snapshot
+
+    async def fake_get_product_cache_row(**_kwargs):
+        return {
+            "product_data": {
+                "id": "prod_1",
+                "platform": "shopify",
+                "merchant_id": "merch_efbc46b4619cfbdf",
+                "title": "Air Max Special Edition",
+                "description": "Breathable running sneakers with Max Air cushioning for daily commuting and training.",
+                "vendor": "Nike",
+                "product_type": "Sneakers",
+                "tags": ["men", "air cushion", "breathable"],
+                "price": 129.0,
+                "currency": "USD",
+                "inventory_quantity": 12,
+                "image_url": "https://example.com/product.jpg",
+                "images": ["https://example.com/product.jpg"],
+                "variants": [
+                    {
+                        "id": "var_42",
+                        "variant_id": "var_42",
+                        "title": "Black / White / 42",
+                        "price": 129.0,
+                        "currency": "USD",
+                        "inventory_quantity": 4,
+                        "options": {"Color": "Black / White", "Size": "42"},
+                    },
+                    {
+                        "id": "var_45",
+                        "variant_id": "var_45",
+                        "title": "Black / White / 45",
+                        "price": 129.0,
+                        "currency": "USD",
+                        "inventory_quantity": 3,
+                        "options": {"Color": "Black / White", "Size": "45"},
+                    },
+                ],
+                "orderable": True,
+            }
+        }
+
+    async def fake_get_enrichment(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        remediation,
+        "get_readiness_optimization_context",
+        fake_get_readiness_optimization_context,
+    )
+    monkeypatch.setattr(remediation, "get_product_cache_row", fake_get_product_cache_row)
+    monkeypatch.setattr(remediation, "get_enrichment", fake_get_enrichment)
+
+    preview = await preview_remediation_action(
+        "merch_efbc46b4619cfbdf",
+        plan_id="rdplan_current",
+        action_id="act_product:shopify:prod_1",
+    )
+
+    assert preview["generated_content_context"][0]["title_health"] == "rewrite_candidate"
+    assert preview["generated_content_context"][0]["suggested_title_preview"] == "Nike Air Max Sneakers Men's Black/White air-cushion, breathable Sizes 42-45"
+    assert preview["generated_content_context"][0]["facts_used"]["category"] == "Sneakers"
+    title_patch = next(
+        patch for patch in preview["candidate_patches"]
+        if patch["target_field"] == "title_override"
+    )
+    assert title_patch["after"] == "Nike Air Max Sneakers Men's Black/White air-cushion, breathable Sizes 42-45"
 
 
 @pytest.mark.asyncio
@@ -542,10 +626,18 @@ async def test_get_source_data_triage_returns_summary_and_rows(monkeypatch):
     assert missing_price_row["scope"] == "variant"
     assert missing_price_row["variant_id"] == "var_1"
     assert missing_price_row["agent_push_status"] == "excluded_from_agent_push"
+    assert (
+        missing_price_row["platform_admin_url"]
+        == "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1"
+    )
 
     image_row = next(row for row in triage["rows"] if row["reason_code"] == "missing_primary_image")
     assert image_row["scope"] == "product"
     assert image_row["platform_product_id"] == "prod_1"
+    assert (
+        image_row["platform_admin_url"]
+        == "https://alpha-beauty-demo.myshopify.com/admin/products/prod_1"
+    )
 
 
 @pytest.mark.asyncio

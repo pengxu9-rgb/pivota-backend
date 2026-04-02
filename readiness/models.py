@@ -224,6 +224,13 @@ class ProductReadinessQueueItem(BaseModel):
     priority_reason: Optional[str] = None
     recommended_action_id: Optional[str] = None
     recommended_action_type: Optional[str] = None
+    content_gap_codes: List[str] = Field(default_factory=list)
+    missing_attribute_labels: List[str] = Field(default_factory=list)
+    title_health: Optional[str] = None
+    suggested_title_preview: Optional[str] = None
+    suggestion_language: Optional[str] = None
+    suggestion_confidence: Optional[float] = None
+    suggestion_rationale: Optional[str] = None
     content_quality_score: Optional[float] = None
     model_readiness_score: Optional[float] = None
     conversion_potential_score: Optional[float] = None
@@ -234,6 +241,7 @@ class ProductReadinessQueueItem(BaseModel):
     eligible_variant_count: int = 0
     excluded_variant_count: int = 0
     store_data_last_checked_at: Optional[str] = None
+    platform_admin_url: Optional[str] = None
     decision_state: Optional[str] = None
 
 
@@ -326,6 +334,7 @@ class SourceDataTriageRow(BaseModel):
     agent_push_reason_codes: List[str] = Field(default_factory=list)
     recommended_action_type: Optional[str] = None
     fix_surface: Optional[str] = None
+    platform_admin_url: Optional[str] = None
     decision_state: Optional[str] = None
 
 
@@ -349,11 +358,13 @@ class SourceDataLaneNextProduct(BaseModel):
     blocked_variant_count: int = 0
     excluded_variant_count: int = 0
     sample_variant_id: Optional[str] = None
+    platform_admin_url: Optional[str] = None
 
 
 class SourceDataLaneSummary(BaseModel):
     reason_code: str
     label: str
+    reason_codes: List[str] = Field(default_factory=list)
     affected_products: int = 0
     affected_variants: int = 0
     blocked_products: int = 0
@@ -384,6 +395,25 @@ class SourceDataTriagePayload(BaseModel):
     total_rows: int = 0
 
 
+class ProductQueueAppliedFilters(BaseModel):
+    search: Optional[str] = None
+    issue_bucket: Optional[str] = None
+    push_status: str = "all"
+    blocked_only: bool = False
+    low_quality_only: bool = False
+    sort_by: str = "default"
+
+
+class ProductQueuePage(BaseModel):
+    page: int = 1
+    page_size: int = 50
+    total_items: int = 0
+    total_pages: int = 0
+    has_next: bool = False
+    has_prev: bool = False
+    applied_filters: ProductQueueAppliedFilters = Field(default_factory=ProductQueueAppliedFilters)
+
+
 class MerchantReadinessOptimizationPayload(BaseModel):
     plan: OptimizationPlan
     score_bundle: ScoreBundle = Field(default_factory=ScoreBundle)
@@ -391,6 +421,7 @@ class MerchantReadinessOptimizationPayload(BaseModel):
     issue_buckets: List[ReadinessIssueBucket] = Field(default_factory=list)
     merchant_actions: List[MerchantReadinessAction] = Field(default_factory=list)
     product_queue: List[ProductReadinessQueueItem] = Field(default_factory=list)
+    product_queue_page: Optional[ProductQueuePage] = None
     content_opportunity_count: int = 0
     source_data_lanes: List[SourceDataLaneSummary] = Field(default_factory=list)
     quality_coverage: QualityCoverageSummary = Field(default_factory=QualityCoverageSummary)

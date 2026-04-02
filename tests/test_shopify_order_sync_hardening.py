@@ -147,7 +147,7 @@ async def test_create_shopify_order_falls_back_to_other_store_on_401(monkeypatch
     monkeypatch.setattr(gql, "shopify_admin_graphql", fake_shopify_admin_graphql)
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post, raising=True)
 
-    ok = await order_routes.create_shopify_order(order_id)
+    ok = await order_routes._create_shopify_order_impl(order_id)
     assert ok is True
 
     assert len(calls) >= 2
@@ -184,7 +184,7 @@ async def test_create_shopify_order_returns_true_when_lock_not_acquired(monkeypa
     monkeypatch.setattr(order_routes, "_release_shopify_order_lock", fake_release)
     monkeypatch.setattr(order_routes, "get_order", fake_get_order)
 
-    ok = await order_routes.create_shopify_order("ORD_LOCKED")
+    ok = await order_routes._create_shopify_order_impl("ORD_LOCKED")
     assert ok is True
     assert called["get_order"] == 0
     assert called["released"] == 1

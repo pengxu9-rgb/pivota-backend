@@ -1532,13 +1532,22 @@ async def merchant_connect_woocommerce(
         if not test_result.get('success'):
             raise HTTPException(status_code=400, detail=f"WooCommerce connection failed: {test_result.get('error')}")
         
-        logger.info(f"✅ WooCommerce credentials verified for {request.store_url}")
+        normalized_store_url = adapter.store_url
+        credential_blob = json.dumps(
+            {
+                "consumer_key": request.consumer_key,
+                "consumer_secret": request.consumer_secret,
+            },
+            separators=(",", ":"),
+        )
+
+        logger.info(f"✅ WooCommerce credentials verified for {normalized_store_url}")
         
         # Check if store already exists
         existing_store = await database.fetch_one(
             """SELECT store_id FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'woocommerce' AND domain = :domain""",
-            {"merchant_id": request.merchant_id, "domain": request.store_url}
+            {"merchant_id": request.merchant_id, "domain": normalized_store_url}
         )
         
         if existing_store:
@@ -1547,7 +1556,7 @@ async def merchant_connect_woocommerce(
                 """UPDATE merchant_stores 
                    SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "api_key": f"{request.consumer_key}:{request.consumer_secret}"}
+                {"store_id": existing_store["store_id"], "api_key": credential_blob}
             )
             store_id = existing_store["store_id"]
         else:
@@ -1560,9 +1569,9 @@ async def merchant_connect_woocommerce(
                 {
                     "store_id": store_id,
                     "merchant_id": request.merchant_id,
-                    "domain": request.store_url,
+                    "domain": normalized_store_url,
                     "name": test_result.get('store_name', f"WooCommerce Store"),
-                    "api_key": f"{request.consumer_key}:{request.consumer_secret}"  # Store both
+                    "api_key": credential_blob
                 }
             )
         
@@ -1599,7 +1608,7 @@ async def merchant_connect_bigcommerce(
             raise HTTPException(status_code=400, detail="Store Hash and Access Token are required")
         
         # Test BigCommerce API connection using adapter
-        from adapters.bigcommerce_adapter import BigCommerceAdapter
+        from adapters.bigcommerce_adapter import BigCommerceAdapter, build_bigcommerce_domain
         
         adapter = BigCommerceAdapter({
             'store_hash': request.store_hash,
@@ -1617,10 +1626,20 @@ async def merchant_connect_bigcommerce(
         if not test_result.get('success'):
             raise HTTPException(status_code=400, detail=f"BigCommerce connection failed: {test_result.get('error')}")
         
-        logger.info(f"✅ BigCommerce credentials verified for {request.store_hash}")
+        normalized_store_hash = adapter.store_hash
+        store_domain = build_bigcommerce_domain(normalized_store_hash)
+        credential_blob = json.dumps(
+            {
+                "access_token": request.access_token,
+                "client_id": request.client_id,
+                "store_hash": normalized_store_hash,
+            },
+            separators=(",", ":"),
+        )
+
+        logger.info(f"✅ BigCommerce credentials verified for {normalized_store_hash}")
         
         # Check if store already exists
-        store_domain = f"{request.store_hash}.mybigcommerce.com"
         existing_store = await database.fetch_one(
             """SELECT store_id FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'bigcommerce' AND domain = :domain""",
@@ -1633,7 +1652,7 @@ async def merchant_connect_bigcommerce(
                 """UPDATE merchant_stores 
                    SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "api_key": request.access_token}
+                {"store_id": existing_store["store_id"], "api_key": credential_blob}
             )
             store_id = existing_store["store_id"]
         else:
@@ -1648,7 +1667,7 @@ async def merchant_connect_bigcommerce(
                     "merchant_id": request.merchant_id,
                     "domain": store_domain,
                     "name": test_result.get('store_name', f"BigCommerce Store"),
-                    "api_key": request.access_token
+                    "api_key": credential_blob
                 }
             )
         

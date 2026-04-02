@@ -172,7 +172,12 @@ def test_employee_merchant_analytics_route(monkeypatch):
 
     async def fake_fetch(merchant_id: str):
         assert merchant_id == "merch_1"
-        return {"total_orders": 5, "total_products": 8, "gmv": 12.5}
+        return {
+            "total_orders": 5,
+            "total_products": 8,
+            "gmv": 12.5,
+            "traffic_attribution_summary": {"requests_total": 3},
+        }
 
     monkeypatch.setattr(module, "_fetch_employee_merchant_analytics", fake_fetch)
 
@@ -186,6 +191,74 @@ def test_employee_merchant_analytics_route(monkeypatch):
     assert payload["status"] == "success"
     assert payload["data"]["total_orders"] == 5
     assert payload["data"]["total_products"] == 8
+    assert payload["data"]["traffic_attribution_summary"]["requests_total"] == 3
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_traffic_overview_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_overview(**kwargs):
+        assert kwargs["window"] == "7d"
+        assert kwargs["filters"]["source_channel"] == "shopping-agent-ui"
+        return {"requests_total": 11, "ordered_conversion": 2}
+
+    monkeypatch.setattr(module, "build_employee_traffic_overview", fake_overview)
+
+    response = client.get(
+        "/employee/traffic/overview",
+        params={"window": "7d", "source_channel": "shopping-agent-ui"},
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["requests_total"] == 11
+    assert response.json()["data"]["ordered_conversion"] == 2
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_traffic_breakdown_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_breakdown(**kwargs):
+        assert kwargs["group_by"] == "protocol_name"
+        assert kwargs["filters"]["source_family"] == "external_agent"
+        return {"slices": [{"key": "mcp", "ordered_conversion": 4}]}
+
+    monkeypatch.setattr(module, "build_employee_traffic_breakdown", fake_breakdown)
+
+    response = client.get(
+        "/employee/traffic/breakdown",
+        params={"group_by": "protocol_name", "source_family": "external_agent"},
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["slices"][0]["key"] == "mcp"
+
+    app.dependency_overrides.clear()
+
+
+def test_employee_merchant_traffic_route(monkeypatch):
+    module, app, client = _build_client_with_employee_override()
+
+    async def fake_merchant_traffic(**kwargs):
+        assert kwargs["merchant_id"] == "merch_1"
+        assert kwargs["filters"]["query_source"] == "cache_multi_intent"
+        return {"merchant_id": "merch_1", "overview": {"clicked_exposure": 9}}
+
+    monkeypatch.setattr(module, "build_employee_merchant_traffic", fake_merchant_traffic)
+
+    response = client.get(
+        "/employee/merchant/merch_1/traffic",
+        params={"query_source": "cache_multi_intent"},
+        headers={"Authorization": "Bearer employee-test-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["overview"]["clicked_exposure"] == 9
 
     app.dependency_overrides.clear()
 

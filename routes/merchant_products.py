@@ -16,6 +16,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from db.canonical_commerce import canonical_products
 from db.database import database
 from db.products import products_cache, get_cached_products
 from db.product_enrichment import (
@@ -29,6 +30,10 @@ from db.product_quality_backfill_jobs import (
     get_quality_backfill_job,
 )
 from models.standard_product import StandardProduct
+from services.canonical_commerce_service import (
+    load_canonical_cache_row,
+    load_canonical_cache_rows,
+)
 from services.product_enrichment_pipeline import run_enrichment_for_product
 from services.product_exposure_service import build_agent_push_projection_from_cache_row
 from services.product_quality_backfill_service import process_quality_backfill_job
@@ -202,6 +207,67 @@ def _build_standard_full(product_json: Dict[str, Any]) -> Dict[str, Any]:
         return standard_full
 
 
+async def _load_runtime_product_rows(
+    *,
+    merchant_id: str,
+    platform: Optional[str],
+    include_expired: bool,
+    page_size: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    canonical_rows = await load_canonical_cache_rows(
+        merchant_id=merchant_id,
+        platform=platform,
+        include_expired=include_expired,
+        limit=page_size,
+        offset=offset,
+    )
+    if canonical_rows:
+        filters = [canonical_products.c.merchant_id == merchant_id]
+        if platform:
+            filters.append(canonical_products.c.platform == platform)
+        if not include_expired:
+            filters.append(
+                or_(
+                    canonical_products.c.expires_at.is_(None),
+                    canonical_products.c.expires_at > datetime.now(),
+                )
+            )
+        count_row = await database.fetch_one(
+            select(func.count().label("total")).select_from(canonical_products).where(*filters)
+        )
+        total = 0
+        if count_row is not None:
+            total = int((dict(count_row) if not isinstance(count_row, dict) else count_row).get("total") or 0)
+        return canonical_rows, total
+
+    filters = [products_cache.c.merchant_id == merchant_id]
+    if platform:
+        filters.append(products_cache.c.platform == platform)
+    if not include_expired:
+        filters.append(
+            or_(
+                products_cache.c.expires_at.is_(None),
+                products_cache.c.expires_at > datetime.now(),
+            )
+        )
+
+    base_query = products_cache.select().where(*filters)
+    count_query = select(func.count().label("total")).select_from(products_cache).where(*filters)
+    count_row = await database.fetch_one(count_query)
+    total = 0
+    if count_row is not None:
+        total = int((dict(count_row) if not isinstance(count_row, dict) else count_row).get("total") or 0)
+
+    query = (
+        base_query.order_by(products_cache.c.cached_at.desc())
+        .limit(page_size)
+        .offset(offset)
+    )
+    rows = await database.fetch_all(query)
+    return [dict(row) for row in rows], total
+
+
 @router.get("")
 async def list_merchant_products(
     platform: Optional[str] = Query(None),
@@ -224,35 +290,13 @@ async def list_merchant_products(
 
     offset = (page - 1) * page_size
 
-    # Base query from products_cache (default: only active rows)
-    filters = [products_cache.c.merchant_id == merchant_id]
-    if platform:
-        filters.append(products_cache.c.platform == platform)
-    if not include_expired:
-        filters.append(
-            or_(
-                products_cache.c.expires_at.is_(None),
-                products_cache.c.expires_at > datetime.now(),
-            )
-        )
-
-    base_query = products_cache.select().where(*filters)
-    count_query = select(func.count().label("total")).select_from(products_cache).where(*filters)
-    count_row = await database.fetch_one(count_query)
-    total = 0
-    if count_row is not None:
-        if isinstance(count_row, dict):
-            total = int(count_row.get("total") or 0)
-        else:
-            total = int(dict(count_row).get("total") or 0)
-
-    query = (
-        base_query.order_by(products_cache.c.cached_at.desc())
-        .limit(page_size)
-        .offset(offset)
+    cache_rows, total = await _load_runtime_product_rows(
+        merchant_id=merchant_id,
+        platform=platform,
+        include_expired=include_expired,
+        page_size=page_size,
+        offset=offset,
     )
-    rows = await database.fetch_all(query)
-    cache_rows = [dict(row) for row in rows]
     quality_bundle = await _build_quality_projection_bundle(merchant_id, cache_rows)
 
     items: List[Dict[str, Any]] = []
@@ -305,11 +349,16 @@ async def get_product_quality_summary(
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
 
-    # Load all cached products (current merchant, all platforms, non-expired)
-    base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
-    base_query = base_query.where(products_cache.c.expires_at > datetime.now())
-    records = await database.fetch_all(base_query)
-    rows = [dict(r) for r in records]
+    rows = await load_canonical_cache_rows(
+        merchant_id=merchant_id,
+        platform=None,
+        include_expired=False,
+    )
+    if not rows:
+        base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
+        base_query = base_query.where(products_cache.c.expires_at > datetime.now())
+        records = await database.fetch_all(base_query)
+        rows = [dict(r) for r in records]
 
     total_products = len(rows)
     quality_bundle = await _build_quality_projection_bundle(merchant_id, rows)
@@ -453,17 +502,24 @@ async def get_merchant_product_detail(
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
 
-    cache_row = await database.fetch_one(
-        products_cache.select().where(
-            (products_cache.c.merchant_id == merchant_id)
-            & (products_cache.c.platform == platform)
-            & (products_cache.c.platform_product_id == platform_product_id)
-        )
+    cache_row = await load_canonical_cache_row(
+        merchant_id=merchant_id,
+        platform=platform,
+        platform_product_id=platform_product_id,
     )
     if not cache_row:
-        raise HTTPException(status_code=404, detail="Product not found in cache")
+        db_row = await database.fetch_one(
+            products_cache.select().where(
+                (products_cache.c.merchant_id == merchant_id)
+                & (products_cache.c.platform == platform)
+                & (products_cache.c.platform_product_id == platform_product_id)
+            )
+        )
+        cache_row = dict(db_row) if db_row else None
 
-    cache_row = dict(cache_row)
+    if not cache_row:
+        raise HTTPException(status_code=404, detail="Product not found")
+
     product_json = cache_row.get("product_data") or {}
     standard_full = _build_standard_full(product_json)
 
@@ -521,18 +577,36 @@ async def backfill_product_enrichment(
 
     # If platform specified, use helper; otherwise query all platforms for this merchant.
     if platform:
-        cached = await get_cached_products(
+        canonical_rows = await load_canonical_cache_rows(
             merchant_id=merchant_id,
             platform=platform,
             include_expired=False,
+            limit=limit,
         )
-        rows = cached[:limit]
+        if canonical_rows:
+            rows = canonical_rows[:limit]
+        else:
+            cached = await get_cached_products(
+                merchant_id=merchant_id,
+                platform=platform,
+                include_expired=False,
+            )
+            rows = cached[:limit]
     else:
-        base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
-        base_query = base_query.where(products_cache.c.expires_at > datetime.now())
-        base_query = base_query.order_by(products_cache.c.cached_at.desc()).limit(limit)
-        records = await database.fetch_all(base_query)
-        rows = [dict(r) for r in records]
+        canonical_rows = await load_canonical_cache_rows(
+            merchant_id=merchant_id,
+            platform=None,
+            include_expired=False,
+            limit=limit,
+        )
+        if canonical_rows:
+            rows = canonical_rows
+        else:
+            base_query = products_cache.select().where(products_cache.c.merchant_id == merchant_id)
+            base_query = base_query.where(products_cache.c.expires_at > datetime.now())
+            base_query = base_query.order_by(products_cache.c.cached_at.desc()).limit(limit)
+            records = await database.fetch_all(base_query)
+            rows = [dict(r) for r in records]
 
     processed = 0
     skipped = 0

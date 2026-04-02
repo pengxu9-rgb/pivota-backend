@@ -29,6 +29,7 @@ from routes.refund_api import RefundRequest, process_refund as process_refund_ro
 from services.pcs_tier_service import get_merchant_pcs_tier
 from services.agent_governance import validate_request_compat
 from services.quote_service import QuoteError, QuoteService
+from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 
 router = APIRouter(prefix="/agent/v2", tags=["agent-v2"])
@@ -793,6 +794,22 @@ async def create_order_v2(
     }
     if body.request_context:
         metadata["request_context"] = body.request_context.model_dump(exclude_none=True)
+    metadata = attach_traffic_taxonomy(
+        metadata,
+        build_traffic_taxonomy(
+            metadata,
+            authenticated_agent_id=context.agent_id,
+            caller_id=context.agent_id,
+            default_source_channel=(
+                body.request_context.channel
+                if body.request_context and body.request_context.channel
+                else None
+            ),
+            default_query_source=str(metadata.get("query_source") or "").strip() or None,
+            default_protocol_name="rest",
+            default_commerce_surface=str(metadata.get("commerce_surface") or "agent_api").strip() or "agent_api",
+        ),
+    )
 
     order_request = CreateOrderRequest(
         merchant_id=quote.merchant_id,

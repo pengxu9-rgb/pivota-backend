@@ -21,6 +21,12 @@ from services.external_referral_readiness import (
     build_external_referral_summary,
     build_platform_fallback_program_summary,
 )
+from services.traffic_analytics_service import (
+    TRAFFIC_BREAKDOWN_FIELDS,
+    build_employee_merchant_traffic,
+    build_employee_traffic_breakdown,
+    build_employee_traffic_overview,
+)
 import random
 
 router = APIRouter()
@@ -198,7 +204,8 @@ async def _fetch_employee_merchant_analytics(merchant_id: str) -> Dict[str, Any]
             COALESCE(SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE 0 END), 0) as confirmed_revenue_all_time,
             SUM(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_all_time,
             COALESCE(AVG(CASE WHEN payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN total ELSE NULL END), 0) as avg_order_value_all_time,
-            COUNT(DISTINCT customer_email) as total_customers,
+            COUNT(DISTINCT customer_email) as total_customers_all_time,
+            COUNT(DISTINCT CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN customer_email END) as total_customers_last_30_days,
             SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END) as orders_last_30_days,
             COALESCE(SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN total ELSE 0 END), 0) as gmv_last_30_days,
             SUM(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' AND payment_status IN """ + PAID_PAYMENT_STATUSES_SQL + """ THEN 1 ELSE 0 END) as paid_orders_last_30_days,
@@ -258,10 +265,15 @@ async def _fetch_employee_merchant_analytics(merchant_id: str) -> Dict[str, Any]
     average_order_value = round((confirmed_revenue_last_30 / paid_orders_last_30), 2) if paid_orders_last_30 > 0 else 0.0
     payment_success_rate = round((paid_orders_last_30 / orders_last_30 * 100), 1) if orders_last_30 > 0 else 0.0
 
-    return {
+    analytics_payload = {
         "total_orders": orders_last_30,
         "total_revenue": confirmed_revenue_last_30,
-        "total_customers": _to_int(analytics["total_customers"]) if analytics else 0,
+        "total_customers": _to_int(analytics["total_customers_last_30_days"]) if analytics else 0,
+        "customer_breakdown": {
+            "last_30_days": _to_int(analytics["total_customers_last_30_days"]) if analytics else 0,
+            "all_time": _to_int(analytics["total_customers_all_time"]) if analytics else 0,
+        },
+        "all_time_customers": _to_int(analytics["total_customers_all_time"]) if analytics else 0,
         "total_products": _to_int(products_count["count"]) if products_count else 0,
         "average_order_value": average_order_value,
         "order_growth": round(order_growth, 1),
@@ -289,6 +301,32 @@ async def _fetch_employee_merchant_analytics(merchant_id: str) -> Dict[str, Any]
         "confirmed_revenue": confirmed_revenue_last_30,
         "gmv": gmv_last_30,
     }
+    try:
+        analytics_payload["traffic_attribution_summary"] = await build_employee_traffic_overview(
+            window="30d",
+            merchant_id=merchant_id,
+        )
+    except Exception:
+        analytics_payload["traffic_attribution_summary"] = {
+            "window": "30d",
+            "merchant_id": merchant_id,
+            "requests_total": 0,
+            "clicked_exposure": 0,
+            "ordered_conversion": 0,
+            "refunded_orders": 0,
+            "gmv_total": "0",
+            "refunded_amount_total": "0",
+            "unknown_rates": {
+                "request_unknown_share": 0.0,
+                "click_unknown_share": 0.0,
+                "order_unknown_share": 0.0,
+                "source_channel_missing_ratio": 0.0,
+                "protocol_name_missing_ratio": 0.0,
+                "query_source_missing_ratio": 0.0,
+                "agent_id_missing_ratio": 0.0,
+            },
+        }
+    return analytics_payload
 
 
 def _to_int(value: Any) -> int:
@@ -685,6 +723,108 @@ async def invalidate_employee_optimization_cache(
     }
 
 
+@router.get("/employee/traffic/overview")
+async def get_employee_traffic_overview(
+    window: str = Query("30d"),
+    source_channel: Optional[str] = Query(None),
+    source_family: Optional[str] = Query(None),
+    protocol_name: Optional[str] = Query(None),
+    agent_id: Optional[str] = Query(None),
+    query_source: Optional[str] = Query(None),
+    llm_provider: Optional[str] = Query(None),
+    llm_model: Optional[str] = Query(None),
+    commerce_surface: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_employee),
+):
+    filters = {
+        "source_channel": source_channel,
+        "source_family": source_family,
+        "protocol_name": protocol_name,
+        "agent_id": agent_id,
+        "query_source": query_source,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "commerce_surface": commerce_surface,
+    }
+    return {
+        "status": "success",
+        "data": await build_employee_traffic_overview(window=window, filters=filters),
+    }
+
+
+@router.get("/employee/traffic/breakdown")
+async def get_employee_traffic_breakdown(
+    group_by: str = Query("source_channel"),
+    window: str = Query("30d"),
+    source_channel: Optional[str] = Query(None),
+    source_family: Optional[str] = Query(None),
+    protocol_name: Optional[str] = Query(None),
+    agent_id: Optional[str] = Query(None),
+    query_source: Optional[str] = Query(None),
+    llm_provider: Optional[str] = Query(None),
+    llm_model: Optional[str] = Query(None),
+    commerce_surface: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_employee),
+):
+    if group_by not in TRAFFIC_BREAKDOWN_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail="group_by must be one of " + ", ".join(sorted(TRAFFIC_BREAKDOWN_FIELDS)),
+        )
+    filters = {
+        "source_channel": source_channel,
+        "source_family": source_family,
+        "protocol_name": protocol_name,
+        "agent_id": agent_id,
+        "query_source": query_source,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "commerce_surface": commerce_surface,
+    }
+    return {
+        "status": "success",
+        "data": await build_employee_traffic_breakdown(
+            group_by=group_by,
+            window=window,
+            filters=filters,
+        ),
+    }
+
+
+@router.get("/employee/merchant/{merchant_id}/traffic")
+async def get_employee_merchant_traffic_route(
+    merchant_id: str,
+    window: str = Query("30d"),
+    source_channel: Optional[str] = Query(None),
+    source_family: Optional[str] = Query(None),
+    protocol_name: Optional[str] = Query(None),
+    agent_id: Optional[str] = Query(None),
+    query_source: Optional[str] = Query(None),
+    llm_provider: Optional[str] = Query(None),
+    llm_model: Optional[str] = Query(None),
+    commerce_surface: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_employee),
+):
+    filters = {
+        "source_channel": source_channel,
+        "source_family": source_family,
+        "protocol_name": protocol_name,
+        "agent_id": agent_id,
+        "query_source": query_source,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "commerce_surface": commerce_surface,
+    }
+    return {
+        "status": "success",
+        "data": await build_employee_merchant_traffic(
+            merchant_id=merchant_id,
+            window=window,
+            filters=filters,
+        ),
+    }
+
+
 @router.get("/employee/merchant/{merchant_id}/integrations")
 async def get_employee_merchant_integrations(
     merchant_id: str,
@@ -746,6 +886,25 @@ async def get_employee_merchant_analytics(
                 "revenue_breakdown": {"confirmed": 0.0, "gmv": 0.0, "all_time_confirmed": 0.0, "all_time_gmv": 0.0},
                 "confirmed_revenue": 0.0,
                 "gmv": 0.0,
+                "traffic_attribution_summary": {
+                    "window": "30d",
+                    "merchant_id": merchant_id,
+                    "requests_total": 0,
+                    "clicked_exposure": 0,
+                    "ordered_conversion": 0,
+                    "refunded_orders": 0,
+                    "gmv_total": "0",
+                    "refunded_amount_total": "0",
+                    "unknown_rates": {
+                        "request_unknown_share": 0.0,
+                        "click_unknown_share": 0.0,
+                        "order_unknown_share": 0.0,
+                        "source_channel_missing_ratio": 0.0,
+                        "protocol_name_missing_ratio": 0.0,
+                        "query_source_missing_ratio": 0.0,
+                        "agent_id_missing_ratio": 0.0,
+                    },
+                },
             },
         }
 

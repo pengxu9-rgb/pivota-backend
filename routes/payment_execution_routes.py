@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from db.database import database
-from db.orders import create_order, update_order, update_payment_info
+from db.orders import create_order, get_order, update_order, update_order_status, update_payment_info
 from db.merchant_onboarding import get_merchant_by_api_key, get_merchant_onboarding
 from services.merchant_payment_initiation_service import initiate_merchant_payment
 from services.merchant_psp_config_service import (
@@ -25,6 +25,16 @@ from services.merchant_psp_config_service import (
 )
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.payment_routing_service import PaymentRoutingService
+from services.commerce_attribution_service import (
+    PVT_CLICK_ID,
+    PVT_PRODUCT_ID,
+    PVT_PROMPT_CLUSTER,
+    PVT_SURFACE,
+    PVT_VARIANT_ID,
+    has_attribution_signal,
+    materialize_attribution_context,
+    upsert_order_attribution_edge,
+)
 
 
 logger = logging.getLogger("payment_execution")
@@ -498,6 +508,30 @@ async def _execute_order_backed_payment_canary(
     )
     amount_major = (Decimal(str(payment_request.amount)) / Decimal("100")).quantize(Decimal("0.01"))
     customer_name = str(payment_request.customer_name or "Pivota Ops Canary").strip() or "Pivota Ops Canary"
+    order_metadata: Dict[str, Any] = {
+        **(payment_request.metadata or {}),
+        "ops_canary": True,
+        "skip_platform_order_creation": True,
+        "source": source,
+        "provider": selected_provider,
+        "requested_order_id": payment_request.order_id,
+        "canary_label": payment_request.label,
+    }
+    if has_attribution_signal(order_metadata):
+        attribution_context = materialize_attribution_context(
+            order_metadata,
+            default_surface=str(order_metadata.get(PVT_SURFACE) or order_metadata.get("surface") or source),
+            merchant_id=str(merchant["merchant_id"]),
+        )
+        for key in (
+            PVT_SURFACE,
+            PVT_CLICK_ID,
+            PVT_PRODUCT_ID,
+            PVT_VARIANT_ID,
+            PVT_PROMPT_CLUSTER,
+        ):
+            if attribution_context.get(key):
+                order_metadata[key] = attribution_context[key]
 
     order_id = await create_order(
         {
@@ -512,16 +546,21 @@ async def _execute_order_backed_payment_canary(
             "tax": Decimal("0.00"),
             "total": amount_major,
             "currency": payment_request.currency.upper(),
-            "metadata": {
-                "ops_canary": True,
-                "skip_platform_order_creation": True,
-                "source": source,
-                "provider": selected_provider,
-                "requested_order_id": payment_request.order_id,
-                "canary_label": payment_request.label,
-            },
+            "metadata": order_metadata,
         }
     )
+    try:
+        await upsert_order_attribution_edge(
+            order_id=str(order_id),
+            merchant_id=str(merchant["merchant_id"]),
+            metadata=order_metadata,
+        )
+    except Exception as attribution_exc:
+        logger.warning(
+            "Failed to persist commerce attribution edge for order-backed canary %s: %s",
+            order_id,
+            attribution_exc,
+        )
 
     result = await initiate_merchant_payment(
         merchant_id=str(merchant["merchant_id"]),
@@ -534,8 +573,7 @@ async def _execute_order_backed_payment_canary(
             "description": payment_request.description or "ops_order_backed_canary",
             "route_id": route_config.get("route_id") if isinstance(route_config, dict) else None,
             "skip_platform_order_creation": True,
-            "ops_canary": True,
-            **(payment_request.metadata or {}),
+            **order_metadata,
             "source": source,
             "enforce_live_readiness": bool(payment_request.enforce_live_readiness),
         },
@@ -597,6 +635,58 @@ async def _execute_order_backed_payment_canary(
         error_message=result.get("error_message"),
         timestamp=datetime.now().isoformat(),
     )
+
+
+async def _cancel_order_backed_canary_order(
+    *,
+    merchant_id: str,
+    order_id: str,
+    source: str,
+) -> Dict[str, Any]:
+    order = await get_order(order_id)
+    if not order or str(order.get("merchant_id") or "").strip() != merchant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Canary order not found")
+
+    metadata = dict(order.get("metadata") or {})
+    if not bool(metadata.get("ops_canary")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Order is not managed by ops canary")
+
+    payment_status = str(order.get("payment_status") or "").strip().lower()
+    if payment_status in {"paid", "succeeded", "completed", "refunded", "partially_refunded"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot cancel paid canary order",
+        )
+
+    current_status = str(order.get("status") or "").strip().lower()
+    if current_status == "cancelled":
+        return {
+            "success": True,
+            "order_id": order_id,
+            "status": "cancelled",
+            "message": "Order already cancelled",
+        }
+
+    update_success = await update_order_status(
+        order_id=order_id,
+        status="cancelled",
+        cancelled_at=datetime.now(),
+        payment_status="cancelled",
+        metadata={
+            **metadata,
+            "cleanup_source": source,
+            "cleanup_reason": "ops_canary_cleanup",
+        },
+    )
+    if not update_success:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to cancel canary order")
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "status": "cancelled",
+        "message": "Order cancelled",
+    }
 
 
 @router.post("/execute", response_model=PaymentExecuteResponse)
@@ -680,6 +770,33 @@ async def execute_internal_order_backed_canary(
         raise HTTPException(
             status_code=500,
             detail=f"Internal order-backed canary failed: {str(exc)}",
+        )
+
+
+@router.post(
+    "/internal/canary/merchants/{merchant_id}/orders/{order_id}/cancel",
+    include_in_schema=False,
+)
+async def cancel_internal_order_backed_canary(
+    merchant_id: str,
+    order_id: str,
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+):
+    try:
+        _require_internal_canary_access(request, x_pivota_internal_key)
+        return await _cancel_order_backed_canary_order(
+            merchant_id=merchant_id,
+            order_id=order_id,
+            source="ops_order_backed_canary_cleanup",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Internal order-backed canary cleanup failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal order-backed canary cleanup failed: {str(exc)}",
         )
 
 
