@@ -163,6 +163,12 @@ async def _run(args: argparse.Namespace) -> int:
                 and not normalized["provider_summary"].get("webhook_ready")
             ):
                 drift_reasons.append("stripe_live_missing_webhook")
+            if (
+                provider == "stripe"
+                and str(normalized["provider_summary"].get("mode") or "payment_intent").strip().lower() == "payment_intent"
+                and not normalized["provider_summary"].get("public_key_present")
+            ):
+                drift_reasons.append("stripe_missing_public_key")
             if active_counter[(payload.get("merchant_id"), provider)] > 1 and str(payload.get("status") or "").strip().lower() == "active":
                 drift_reasons.append("duplicate_active_provider")
             if (
@@ -198,6 +204,7 @@ async def _run(args: argparse.Namespace) -> int:
                 "normalized_validation_status": repaired_validation_status,
                 "live_charge_ready": readiness["live_charge_ready"],
                 "webhook_ready": normalized["provider_summary"].get("webhook_ready"),
+                "public_key_present": normalized["provider_summary"].get("public_key_present"),
                 "readiness_blockers": readiness["readiness_blockers"],
                 "duplicate_active_count": active_counter[(payload.get("merchant_id"), provider)],
                 "drift_reasons": drift_reasons,

@@ -109,6 +109,7 @@ class PaymentAction(BaseModel):
     type: Optional[str] = None  # stripe_client_secret | adyen_session | redirect_url | hosted_page
     client_secret: Optional[str] = None  # 当 type 需要 client_secret 时使用
     url: Optional[str] = None  # 当 type 需要重定向/托管页面时使用
+    public_key: Optional[str] = None  # Stripe / Checkout.com public key when client-owned confirmation needs it
     raw: Optional[Dict[str, Any]] = None  # 适配器原始 payload（可选，用于调试/扩展）
 
 

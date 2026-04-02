@@ -1,16 +1,22 @@
 from decimal import Decimal
+from typing import Optional
 
 import pytest
 
 
 class _FakePaymentIntent:
-    def __init__(self, *, payment_id: str, psp_type: str, client_secret: str):
+    def __init__(self, *, payment_id: str, psp_type: str, client_secret: str, public_key: Optional[str] = None):
         self.id = payment_id
         self.psp_type = psp_type
         self.client_secret = client_secret
+        self.public_key = public_key
         self.redirect_url = None
         self.status = "requires_action"
-        self.raw_response = {"clientKey": "test_client_key", "environment": "test"}
+        self.raw_response = {
+            "clientKey": "test_client_key",
+            "environment": "test",
+            **({"public_key": public_key} if public_key else {}),
+        }
 
 
 @pytest.mark.asyncio
@@ -138,3 +144,20 @@ async def test_initiate_merchant_payment_uses_preferred_order_for_fallback(monke
     assert result["success"] is True
     assert result["psp_used"] == "checkout"
     assert result["payment_action"]["type"] == "checkout_session"
+
+
+def test_build_payment_action_includes_stripe_public_key() -> None:
+    from services.merchant_payment_initiation_service import build_payment_action
+
+    action = build_payment_action(
+        _FakePaymentIntent(
+            payment_id="pi_live_123",
+            psp_type="stripe",
+            client_secret="pi_live_123_secret_abc",
+            public_key="pk_live_123",
+        ),
+        psp_used="stripe",
+    )
+
+    assert action["type"] == "stripe_client_secret"
+    assert action["public_key"] == "pk_live_123"

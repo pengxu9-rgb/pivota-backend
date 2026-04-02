@@ -81,6 +81,7 @@ def build_payment_action(payment_intent: Any, *, psp_used: str) -> Dict[str, Any
     raw = _normalize_raw_payload(getattr(payment_intent, "raw_response", None))
     client_secret = getattr(payment_intent, "client_secret", None)
     redirect_url = getattr(payment_intent, "redirect_url", None)
+    public_key = str(getattr(payment_intent, "public_key", None) or raw.get("public_key") or "").strip() or None
     payment_type = str(psp_used or getattr(payment_intent, "psp_type", "") or "").strip().lower()
 
     if redirect_url:
@@ -94,6 +95,7 @@ def build_payment_action(payment_intent: Any, *, psp_used: str) -> Dict[str, Any
         return {
             "type": "stripe_client_secret",
             "client_secret": client_secret,
+            "public_key": public_key,
             "raw": raw,
         }
 
@@ -133,6 +135,7 @@ def build_payment_action(payment_intent: Any, *, psp_used: str) -> Dict[str, Any
     return {
         "type": None,
         "client_secret": client_secret,
+        "public_key": public_key,
         "raw": raw,
     }
 
@@ -179,6 +182,7 @@ def build_payment_initiation_result(
         "transaction_id": transaction_id,
         "requires_customer_action": requires_customer_action,
         "payment_action": payment_action,
+        "public_key": str(getattr(payment_intent, "public_key", None) or raw.get("public_key") or "").strip() or None,
         "error_message": error,
     }
 

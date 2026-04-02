@@ -38,6 +38,7 @@ class ConnectPSPRequest(BaseModel):
     test_mode: bool = True
     account_id: Optional[str] = None
     secret_key: Optional[str] = None  # For PayPal Client Secret
+    public_key: Optional[str] = None
     # Custom PSP onboarding: allow saving provider selection without credentials.
     setup_later: bool = False
     custom_psp: bool = False
@@ -268,6 +269,12 @@ async def setup_merchant_psp(
             # Stripe/others: keep provided account_id if present; otherwise NULL.
             account_id = raw_account_id or None
 
+        provider_config = None
+        if request.psp_type == "stripe":
+            public_key = (request.public_key or "").strip()
+            if public_key:
+                provider_config = {"public_key": public_key}
+
         api_key_value = api_key if not setup_later else "pending_setup"
         persisted = await persist_canonical_merchant_psp(
             merchant_id=request.merchant_id,
@@ -276,7 +283,7 @@ async def setup_merchant_psp(
             account_id=account_id,
             secret_key=request.secret_key,
             environment="test" if request.test_mode else "live",
-            provider_config=None,
+            provider_config=provider_config,
             name=f"{request.psp_type.capitalize()} Account",
             capabilities=capabilities,
             status="pending" if setup_later else "active",

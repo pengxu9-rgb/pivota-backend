@@ -464,6 +464,12 @@ async def admin_connect_psp(
             "merchant_account": account_id,
             "client_key": client_key,
         }
+    elif provider == "stripe":
+        public_key = str(payload.get("public_key") or "").strip()
+        if public_key:
+            provider_config = {
+                "public_key": public_key,
+            }
     elif provider == "checkout":
         public_key = str(payload.get("public_key") or "").strip()
         if not public_key:

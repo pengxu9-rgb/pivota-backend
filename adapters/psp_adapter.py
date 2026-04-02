@@ -23,6 +23,7 @@ class PaymentIntent:
         psp_type: str,
         raw_response: Dict[str, Any],
         redirect_url: Optional[str] = None,
+        public_key: Optional[str] = None,
     ):
         self.id = id
         self.client_secret = client_secret
@@ -31,6 +32,7 @@ class PaymentIntent:
         self.status = status
         self.psp_type = psp_type
         self.raw_response = raw_response
+        self.public_key = public_key
         # 对于基于重定向的支付方式（如 Stripe Checkout、PayPal 等），返回可直接跳转的支付 URL
         # 非重定向方式则为 None
         self.redirect_url = redirect_url
@@ -89,11 +91,13 @@ class StripeAdapter(PSPAdapter):
         account_id: Optional[str] = None,
         mode: str = "payment_intent",
         environment: Optional[str] = None,
+        public_key: Optional[str] = None,
     ):
         self.api_key = api_key
         self.account_id = account_id
         self.mode = mode if mode in {"payment_intent", "checkout_session"} else "payment_intent"
         self.environment = (environment or "").strip().lower() or None
+        self.public_key = str(public_key or "").strip() or None
         stripe.api_key = api_key
     
     async def create_payment_intent(
@@ -151,11 +155,12 @@ class StripeAdapter(PSPAdapter):
                         currency=currency,
                         status="requires_action",
                         psp_type="stripe_checkout",
-                        raw_response=session,
-                        redirect_url=session.url,
-                    ),
-                    None,
-                )
+                    raw_response=session,
+                    redirect_url=session.url,
+                    public_key=self.public_key,
+                ),
+                None,
+            )
 
             # 默认：PaymentIntent + client_secret（传统前端使用）
             payment_intent = stripe.PaymentIntent.create(
@@ -178,8 +183,15 @@ class StripeAdapter(PSPAdapter):
                     currency=payment_intent.currency,
                     status=payment_intent.status,
                     psp_type="stripe",
-                    raw_response=payment_intent,
+                    raw_response={
+                        "id": payment_intent.id,
+                        "status": payment_intent.status,
+                        "amount": payment_intent.amount,
+                        "currency": payment_intent.currency,
+                        **({"public_key": self.public_key} if self.public_key else {}),
+                    },
                     redirect_url=None,
+                    public_key=self.public_key,
                 ),
                 None,
             )
@@ -505,6 +517,7 @@ def get_psp_adapter(psp_type: str, api_key: str, **kwargs) -> PSPAdapter:
             account_id=kwargs.get("account_id"),
             mode=kwargs.get("mode", "payment_intent"),
             environment=kwargs.get("environment"),
+            public_key=kwargs.get("public_key"),
         )
     elif psp_type == "adyen":
         merchant_account = kwargs.get("merchant_account", "PivotaTestMerchant")
