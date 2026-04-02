@@ -2,6 +2,7 @@
 Unified Payment Endpoint for Agent SDK
 Provides production-ready payment processing with PSP integration
 """
+import asyncio
 import hashlib
 import json
 import os
@@ -19,10 +20,18 @@ from db.orders import get_order, update_payment_info
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
 from services.payment_routing_service import PaymentRoutingService
+from services.merchant_payment_initiation_service import build_payment_action
 from db.database import database
 from utils.logger import logger
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-payments"])
+
+AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS = max(
+    1.0,
+    float(
+        os.getenv("AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS", "25") or "25"
+    ),
+)
 
 # ============================================================================
 # Request/Response Models
@@ -399,20 +408,42 @@ async def create_payment(
         except Exception:
             pass
 
-        success, payment_intent, error, psp_used = await create_payment_with_failover(
-            merchant_id=merchant_id,
-            amount=amount,
-            currency=currency,
-            metadata={
-                "order_id": request.order_id,
-                "agent_id": context.agent_id,
-                "payment_method_type": request.payment_method.type,
-                "idempotency_key": request.idempotency_key,
-            },
-            preferred_psps=preferred_psps,
-            canonical_psp_required=True,
-            enforce_live_readiness=True,
-        )
+        try:
+            success, payment_intent, error, psp_used = await asyncio.wait_for(
+                create_payment_with_failover(
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    currency=currency,
+                    metadata={
+                        "order_id": request.order_id,
+                        "agent_id": context.agent_id,
+                        "payment_method_type": request.payment_method.type,
+                        "idempotency_key": request.idempotency_key,
+                    },
+                    preferred_psps=preferred_psps,
+                    canonical_psp_required=True,
+                    enforce_live_readiness=True,
+                ),
+                timeout=AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            logger.error(
+                "[AgentPayments] Payment initiation timed out for order %s after %.2fs",
+                request.order_id,
+                AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "error": "UPSTREAM_TIMEOUT",
+                    "message": (
+                        "Payment initiation timed out before a PSP surface was created"
+                    ),
+                    "timeout_seconds": AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
+                    "order_id": request.order_id,
+                    "selected_psp": selected_psp,
+                },
+            ) from exc
 
         if not success:
             logger.error(f"Payment intent creation failed via {psp_used}: {error}")
@@ -497,6 +528,8 @@ async def create_payment(
         )
         
         logger.info(f"Payment created: {payment_id} for order {request.order_id} via {psp_used}")
+
+        payment_action = build_payment_action(payment_intent, psp_used=psp_used)
 
         # MVP ledger event (best-effort): payment timeline entry.
         try:
@@ -614,7 +647,7 @@ async def create_payment(
             currency=currency,
             psp_used=psp_used,
             psp=psp_used,
-            payment_action=None,
+            payment_action=payment_action,
             next_action=next_action,
             created_at=datetime.now().isoformat()
         )
