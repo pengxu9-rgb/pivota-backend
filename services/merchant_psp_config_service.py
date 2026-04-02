@@ -38,6 +38,18 @@ def _json_sortable(value: Any) -> str:
     return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
 
 
+def _extract_public_key(config: Optional[Dict[str, Any]]) -> Optional[str]:
+    config_dict = config if isinstance(config, dict) else {}
+    value = str(
+        config_dict.get("public_key")
+        or config_dict.get("publicKey")
+        or config_dict.get("publishable_key")
+        or config_dict.get("publishableKey")
+        or ""
+    ).strip()
+    return value or None
+
+
 def _generate_psp_id(provider: str) -> str:
     alphabet = string.ascii_lowercase + string.digits
     suffix = "".join(secrets.choice(alphabet) for _ in range(12))
@@ -119,7 +131,7 @@ def normalize_provider_config(
         mode = str(config.get("mode") or "payment_intent").strip().lower()
         if mode not in {"payment_intent", "checkout_session"}:
             mode = "payment_intent"
-        public_key = str(config.get("public_key") or config.get("publicKey") or "").strip()
+        public_key = _extract_public_key(config)
         normalized = {
             "mode": mode,
         }
@@ -161,7 +173,7 @@ def normalize_provider_config(
             or account_value
             or ""
         ).strip()
-        public_key = str(config.get("public_key") or config.get("publicKey") or "").strip()
+        public_key = _extract_public_key(config)
         normalized = {
             "processing_channel_id": processing_channel_id or None,
             "public_key": public_key or None,
@@ -285,7 +297,7 @@ def build_stripe_connect_provider_config(
         if value:
             config[key] = value
     if not public_key_value:
-        existing_public_key = str(existing.get("public_key") or "").strip()
+        existing_public_key = _extract_public_key(existing)
         if existing_public_key:
             config["public_key"] = existing_public_key
     return config
@@ -687,7 +699,7 @@ async def persist_canonical_merchant_psp(
             next_account_id=account_value,
             next_environment=requested_environment,
             mode=stripe_mode,
-            public_key=requested_provider_config.get("public_key") or requested_provider_config.get("publicKey"),
+            public_key=_extract_public_key(requested_provider_config),
         )
     elif next_provider_config is None and canonical_existing:
         next_provider_config = existing_provider_config

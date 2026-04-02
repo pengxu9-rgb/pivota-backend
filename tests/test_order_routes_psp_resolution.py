@@ -10,6 +10,36 @@ def test_normalize_order_provider_hint_ignores_non_provider_preference() -> None
     assert module._normalize_order_provider_hint("adyen", "stripe_checkout") == "adyen"
 
 
+def test_normalize_order_provider_hint_prefers_explicit_provider_override() -> None:
+    import routes.order_routes as module
+
+    assert module._normalize_order_provider_hint("stripe", "adyen") == "adyen"
+
+
+def test_build_order_preferred_psps_prepends_explicit_provider_and_dedupes() -> None:
+    import routes.order_routes as module
+
+    assert module._build_order_preferred_psps(
+        {
+            "psp_priority": [
+                {"psp": "stripe", "priority": 1},
+                {"psp": "adyen", "priority": 2},
+                {"psp": "checkout", "priority": 3},
+            ]
+        },
+        "adyen",
+    ) == ["adyen", "stripe", "checkout"]
+
+
+def test_build_order_preferred_psps_ignores_stripe_checkout_as_provider_override() -> None:
+    import routes.order_routes as module
+
+    assert module._build_order_preferred_psps(
+        {"psp_priority": [{"psp": "stripe", "priority": 1}]},
+        "stripe_checkout",
+    ) == ["stripe"]
+
+
 def test_finalize_order_psp_used_uses_safe_fallback() -> None:
     import routes.order_routes as module
 

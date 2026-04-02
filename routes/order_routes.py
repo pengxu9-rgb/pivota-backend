@@ -145,11 +145,37 @@ async def _release_shopify_order_lock(lock_key: Optional[int], *, lock_acquired:
 def _normalize_order_provider_hint(
     selected_psp: Optional[str], preferred_psp: Optional[str]
 ) -> Optional[str]:
-    for candidate in (selected_psp, preferred_psp):
+    for candidate in (preferred_psp, selected_psp):
         provider = str(candidate or "").strip().lower()
         if provider in _SUPPORTED_ORDER_PROVIDER_HINTS:
             return provider
     return None
+
+
+def _build_order_preferred_psps(
+    route_config: Optional[Dict[str, Any]],
+    preferred_psp: Optional[str],
+) -> Optional[List[str]]:
+    providers: List[str] = []
+
+    explicit_provider = _normalize_order_provider_hint(None, preferred_psp)
+    if explicit_provider:
+        providers.append(explicit_provider)
+
+    raw_priority = route_config.get("psp_priority") if isinstance(route_config, dict) else []
+    if isinstance(raw_priority, str):
+        try:
+            raw_priority = json.loads(raw_priority)
+        except Exception:
+            raw_priority = []
+
+    if isinstance(raw_priority, list):
+        for entry in sorted(raw_priority, key=lambda item: (item or {}).get("priority", 999)):
+            provider = str((entry or {}).get("psp") or "").strip().lower()
+            if provider and provider not in providers:
+                providers.append(provider)
+
+    return providers or None
 
 
 def _finalize_order_psp_used(psp_used: Optional[str], fallback_provider: Optional[str]) -> str:
@@ -1546,23 +1572,11 @@ async def create_new_order(
         
         try:
             # Build preferred PSP ordering from routing config (if available)
-            preferred_psps: Optional[List[str]] = None
             try:
-                if isinstance(route_config, dict):
-                    raw_priority = route_config.get("psp_priority") or []
-                    if isinstance(raw_priority, str):
-                        try:
-                            raw_priority = json.loads(raw_priority)
-                        except Exception:
-                            raw_priority = []
-                    if isinstance(raw_priority, list) and raw_priority:
-                        preferred_psps = [
-                            str(entry.get("psp", "")).lower()
-                            for entry in sorted(
-                                raw_priority, key=lambda e: e.get("priority", 999)
-                            )
-                            if entry.get("psp")
-                        ]
+                preferred_psps = _build_order_preferred_psps(
+                    route_config,
+                    order_request.preferred_psp,
+                )
             except Exception as pref_err:
                 logger.warning(
                     f"[OrderRoutes] Failed to build preferred_psps list from route_config: {pref_err}"

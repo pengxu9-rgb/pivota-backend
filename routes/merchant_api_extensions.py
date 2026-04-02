@@ -1911,7 +1911,13 @@ async def connect_psp(
             "client_key": client_key,
         }
     elif provider == "stripe":
-        public_key = str(psp_data.get("public_key") or "").strip()
+        public_key = str(
+            psp_data.get("public_key")
+            or psp_data.get("publicKey")
+            or psp_data.get("publishable_key")
+            or psp_data.get("publishableKey")
+            or ""
+        ).strip()
         if public_key:
             provider_config = {
                 "public_key": public_key,
