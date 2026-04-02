@@ -1162,15 +1162,9 @@ async def build_merchant_commerce_cohort_summary() -> Dict[str, Any]:
         store_count = len(store_domains)
         catalog_product_count = int(product_counts_by_merchant.get(merchant_id) or 0)
         psp_providers = list(psp_providers_by_merchant.get(merchant_id) or [])
-        onboarding_psp = bool(merchant.get("psp_connected"))
-        if onboarding_psp and str(merchant.get("psp_type") or "").strip():
-            psp_type = str(merchant.get("psp_type") or "").strip().lower()
-            if psp_type not in psp_providers:
-                psp_providers.append(psp_type)
-
         has_store_domain = store_count > 0
         has_catalog_products = catalog_product_count > 0
-        has_psp = onboarding_psp or bool(psp_providers)
+        has_psp = bool(psp_providers)
 
         if has_store_domain:
             store_connected_merchants += 1
@@ -1270,19 +1264,13 @@ async def build_merchant_commerce_readiness_list() -> Dict[str, Any]:
         store_count = len(store_domains)
         catalog_product_count = int(product_counts_by_merchant.get(merchant_id) or 0)
         psp_providers = list(psp_providers_by_merchant.get(merchant_id) or [])
-        onboarding_psp = bool(merchant.get("psp_connected"))
-        if onboarding_psp and str(merchant.get("psp_type") or "").strip():
-            psp_type = str(merchant.get("psp_type") or "").strip().lower()
-            if psp_type not in psp_providers:
-                psp_providers.append(psp_type)
-
         evidence = dict(paid_order_evidence_by_merchant.get(merchant_id) or {})
         paid_orders_last_30_days = int(evidence.get("paid_orders_last_30_days") or 0)
         all_time_paid_orders = int(evidence.get("paid_orders_all_time") or 0)
 
         has_store_domain = store_count > 0
         has_catalog_products = catalog_product_count > 0
-        has_psp = onboarding_psp or bool(psp_providers)
+        has_psp = bool(psp_providers)
         order_payment_loop_observed = all_time_paid_orders > 0
         merchant_valid = has_store_domain and has_catalog_products and has_psp
         status = _merchant_commerce_status(

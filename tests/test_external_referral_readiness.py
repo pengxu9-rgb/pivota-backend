@@ -1,9 +1,14 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+
+
+def _iso_days_ago(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
 def _seed_row(**overrides):
@@ -31,7 +36,7 @@ def _seed_row(**overrides):
                 "canonical_url": "https://example.com/en-us/product/referral-serum",
                 "title": "Referral Serum",
                 "description": "A helpful daily serum.",
-                "extracted_at": "2026-03-19T00:00:00+00:00",
+                "extracted_at": _iso_days_ago(1),
             },
             "variants": [
                 {
@@ -96,7 +101,7 @@ async def test_evaluate_external_referral_seed_marks_blockers(monkeypatch):
             "snapshot": {
                 "canonical_url": "https://blocked.example/product",
                 "title": "Blocked referral",
-                "extracted_at": "2026-03-01T00:00:00+00:00",
+                "extracted_at": _iso_days_ago(30),
             },
             "variants": [],
         },
@@ -128,7 +133,7 @@ async def test_build_external_referral_summary_counts_statuses(monkeypatch):
                 "canonical_url": "https://example.com/en-us/product/blocked",
                 "title": "Blocked referral",
                 "description": "Blocked referral",
-                "extracted_at": "2026-03-01T00:00:00+00:00",
+                "extracted_at": _iso_days_ago(30),
             },
             "variants": [],
         },
@@ -143,7 +148,7 @@ async def test_build_external_referral_summary_counts_statuses(monkeypatch):
                 "canonical_url": "https://example.com/en-us/product/review",
                 "title": "Review referral",
                 "description": "Experience the ultimate luxury with Review referral.",
-                "extracted_at": "2026-03-19T00:00:00+00:00",
+                "extracted_at": _iso_days_ago(1),
             },
             "variants": [
                 {
@@ -228,7 +233,7 @@ async def test_build_platform_fallback_program_summary_counts_global_seed_health
                 "canonical_url": "https://blocked.example/product/blocked",
                 "title": "Blocked referral",
                 "description": "Blocked referral",
-                "extracted_at": "2026-03-01T00:00:00+00:00",
+                "extracted_at": _iso_days_ago(30),
             },
             "variants": [],
         },
@@ -247,7 +252,7 @@ async def test_build_platform_fallback_program_summary_counts_global_seed_health
                 "canonical_url": "https://review.example/product/review",
                 "title": "Review referral",
                 "description": "Experience the ultimate luxury with Review referral.",
-                "extracted_at": "2026-03-19T00:00:00+00:00",
+                "extracted_at": _iso_days_ago(1),
             },
             "variants": [
                 {
@@ -274,7 +279,7 @@ async def test_build_platform_fallback_program_summary_counts_global_seed_health
                 "canonical_url": "https://healthy.example/product/healthy",
                 "title": "Healthy referral",
                 "description": "A helpful daily serum.",
-                "extracted_at": "2026-03-19T00:00:00+00:00",
+                "extracted_at": _iso_days_ago(1),
             },
             "variants": [
                 {
