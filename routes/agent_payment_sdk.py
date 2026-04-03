@@ -419,6 +419,7 @@ async def create_payment(
                         "agent_id": context.agent_id,
                         "payment_method_type": request.payment_method.type,
                         "idempotency_key": request.idempotency_key,
+                        **({"return_url": request.return_url} if request.return_url else {}),
                     },
                     preferred_psps=preferred_psps,
                     canonical_psp_required=True,
