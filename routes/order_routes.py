@@ -94,6 +94,27 @@ def _clean_text(value: Any) -> Optional[str]:
     return text or None
 
 
+def _checkout_ui_base() -> str:
+    return (os.getenv("CHECKOUT_UI_BASE_URL") or "https://agent.pivota.cc").rstrip("/")
+
+
+def _build_order_payment_return_url(
+    order_id: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    explicit = _clean_text(
+        metadata_dict.get("payment_return_url")
+        or metadata_dict.get("paymentReturnUrl")
+        or metadata_dict.get("return_url")
+        or metadata_dict.get("returnUrl")
+    )
+    if explicit:
+        return explicit.replace("{order_id}", str(order_id))
+
+    return f"{_checkout_ui_base()}/order/success?{urlencode({'orderId': str(order_id), 'finalizing': '1'})}"
+
+
 router = APIRouter(prefix="/orders", tags=["orders"])
 _PG_SHOPIFY_LOCK_SUPPORTED: Optional[bool] = None
 _SUPPORTED_ORDER_PROVIDER_HINTS = {"stripe", "adyen", "checkout", "paypal"}
@@ -1597,6 +1618,7 @@ async def create_new_order(
             if (order_request.preferred_psp or "").lower() == "stripe_checkout":
                 psp_mode = "stripe_checkout"
             enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
+            payment_return_url = _build_order_payment_return_url(order_id, order_metadata)
 
             success, payment_intent, error, psp_used = await create_payment_with_failover(
                 merchant_id=order_request.merchant_id,
@@ -1620,6 +1642,7 @@ async def create_new_order(
                         else {}
                     ),
                     **({"psp_mode": psp_mode} if psp_mode else {}),
+                    **({"return_url": payment_return_url} if payment_return_url else {}),
                 },
                 preferred_psps=preferred_psps,
                 canonical_psp_required=True,
