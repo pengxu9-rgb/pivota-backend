@@ -180,6 +180,8 @@ def _resolve_order_merchant_id(order: Dict[str, Any]) -> Optional[str]:
 
 async def _build_existing_order_payment_surface(
     order: Dict[str, Any],
+    *,
+    require_redirect_ready: bool = False,
 ) -> Optional[Dict[str, Any]]:
     merchant_id = _resolve_order_merchant_id(order)
     if not merchant_id:
@@ -198,6 +200,13 @@ async def _build_existing_order_payment_surface(
         return None
 
     psp_used = str(order.get("psp_used") or "").strip().lower()
+    if (
+        require_redirect_ready
+        and psp_used == "stripe"
+        and payment_status in {"awaiting_payment", "requires_payment_method", "requires_confirmation"}
+    ):
+        return None
+
     payment_intent_id = str(order.get("payment_intent_id") or "").strip()
     client_secret = str(order.get("client_secret") or "").strip()
     if not psp_used or not client_secret:
@@ -454,7 +463,10 @@ async def create_payment(
                     created_at=datetime.now().isoformat()
                 )
 
-        existing_payment_surface = await _build_existing_order_payment_surface(order)
+        existing_payment_surface = await _build_existing_order_payment_surface(
+            order,
+            require_redirect_ready=bool(request.return_url),
+        )
         if existing_payment_surface:
             logger.info(
                 "[AgentPayments] Reusing existing %s payment surface for order %s",
