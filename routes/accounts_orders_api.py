@@ -15,6 +15,7 @@ import os
 import uuid
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
@@ -59,6 +60,11 @@ from services.ugc_capabilities_service import (
     get_review_slot_summary,
     get_user_review_for_subject,
     is_question_rate_limited,
+)
+from services.merchant_payment_initiation_service import build_payment_action
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    fetch_active_runtime_merchant_psp,
 )
 
 
@@ -1011,6 +1017,70 @@ def _build_tracking_events(order_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
 
     return timeline
+
+
+async def _build_resumable_payment_payload(
+    order_data: Dict[str, Any],
+    *,
+    payment_status: str,
+) -> Optional[Dict[str, Any]]:
+    merchant_id = str(order_data.get("merchant_id") or "").strip()
+    psp_used = str(order_data.get("psp_used") or "").strip().lower()
+    payment_intent_id = str(order_data.get("payment_intent_id") or "").strip()
+    client_secret = str(order_data.get("client_secret") or "").strip()
+
+    if payment_status not in {"pending", "processing", "requires_action"}:
+        return None
+    if not merchant_id or not psp_used or not client_secret:
+        return None
+
+    try:
+        runtime_row = await fetch_active_runtime_merchant_psp(
+            merchant_id=merchant_id,
+            provider=psp_used,
+        )
+    except Exception:
+        runtime_row = None
+    raw_response: Dict[str, Any] = {}
+    if runtime_row:
+        adapter_kwargs = build_runtime_adapter_kwargs(
+            psp_used,
+            api_key=runtime_row.get("api_key"),
+            account_id=runtime_row.get("account_id"),
+            provider_config=runtime_row.get("provider_config"),
+            environment=runtime_row.get("environment"),
+            secret_key=runtime_row.get("secret_key"),
+        )
+        if psp_used == "stripe":
+            if adapter_kwargs.get("public_key"):
+                raw_response["public_key"] = adapter_kwargs["public_key"]
+            if adapter_kwargs.get("account_id"):
+                raw_response["stripe_account"] = adapter_kwargs["account_id"]
+        elif psp_used == "adyen":
+            if adapter_kwargs.get("client_key"):
+                raw_response["clientKey"] = adapter_kwargs["client_key"]
+        elif psp_used == "checkout":
+            if adapter_kwargs.get("public_key"):
+                raw_response["public_key"] = adapter_kwargs["public_key"]
+            if adapter_kwargs.get("processing_channel_id"):
+                raw_response["processing_channel_id"] = adapter_kwargs["processing_channel_id"]
+
+    payment_intent = SimpleNamespace(
+        id=payment_intent_id or None,
+        client_secret=client_secret,
+        raw_response=raw_response,
+        psp_type=psp_used,
+    )
+    payment_action = build_payment_action(payment_intent, psp_used=psp_used)
+    if not payment_action or not payment_action.get("type"):
+        return None
+
+    return {
+        "psp": psp_used,
+        "payment_intent_id": payment_intent_id or None,
+        "payment_action": payment_action,
+        "status": payment_status,
+    }
 
 
 def _extract_tracking_url(order_data: Dict[str, Any]) -> Optional[str]:
@@ -2224,6 +2294,11 @@ async def get_order_detail(
     except Exception:
         payment_records = []
 
+    resumable_payment = await _build_resumable_payment_payload(
+        order_data,
+        payment_status=payment_status_mapped,
+    )
+
     # Fulfillment / shipments (best-effort, derived from tracking fields)
     tracking_events = _build_tracking_events(order_data)
     tracking_url = _extract_tracking_url(order_data)
@@ -2325,7 +2400,10 @@ async def get_order_detail(
             }
             for it in items
         ],
-        "payment": {"records": payment_records},
+        "payment": {
+            "records": payment_records,
+            "current": resumable_payment,
+        },
         "fulfillment": {"shipments": shipments},
         "tracking": {
             "status": delivery_status,
