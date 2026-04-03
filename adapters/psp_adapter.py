@@ -128,6 +128,21 @@ class StripeAdapter(PSPAdapter):
                 )
             ),
         )
+
+    def _resolve_redirect_policy(self, metadata: Dict[str, Any]) -> str:
+        explicit = str(
+            metadata.get("stripe_allow_redirects")
+            or metadata.get("allow_redirects")
+            or ""
+        ).strip().lower()
+        if explicit in {"always", "never"}:
+            return explicit
+
+        return_url = str(metadata.get("return_url") or "").strip()
+        if return_url:
+            return "always"
+
+        return "never"
     
     async def create_payment_intent(
         self,
@@ -193,6 +208,7 @@ class StripeAdapter(PSPAdapter):
             )
 
             # 默认：PaymentIntent + client_secret（传统前端使用）
+            redirect_policy = self._resolve_redirect_policy(metadata)
             payment_intent = await asyncio.to_thread(
                 self._client.v1.payment_intents.create,
                 {
@@ -201,7 +217,7 @@ class StripeAdapter(PSPAdapter):
                     "metadata": metadata,
                     "automatic_payment_methods": {
                         "enabled": True,
-                        "allow_redirects": "never",  # 避免测试环境强依赖 return_url
+                        "allow_redirects": redirect_policy,
                     },
                 },
                 request_options,
