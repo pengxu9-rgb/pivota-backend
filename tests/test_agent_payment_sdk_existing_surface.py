@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from typing import Any, Dict, Optional
 
 import httpx
@@ -22,6 +24,35 @@ def test_resolve_order_merchant_id_falls_back_to_unique_item_merchant() -> None:
     }
 
     assert payment_module._resolve_order_merchant_id(order) == "merch_test_123"
+
+
+def test_build_existing_order_payment_surface_accepts_awaiting_payment() -> None:
+    import routes.agent_payment_sdk as payment_module
+
+    order = {
+        "order_id": "ORD_TEST_2",
+        "payment_status": "awaiting_payment",
+        "psp_used": "stripe",
+        "payment_intent_id": "pi_existing_awaiting_123",
+        "client_secret": "pi_existing_awaiting_123_secret_456",
+        "items": [
+            {
+                "product_id": "prod_1",
+                "merchant_id": "merch_test_123",
+            }
+        ],
+        "metadata": {},
+    }
+
+    surface = asyncio.run(payment_module._build_existing_order_payment_surface(order))
+
+    # No PSP runtime row is required for the resume decision itself; the client
+    # secret is enough to reuse the original payment surface.
+    assert surface is not None
+    assert surface["merchant_id"] == "merch_test_123"
+    assert surface["psp_used"] == "stripe"
+    assert surface["client_secret"] == "pi_existing_awaiting_123_secret_456"
+    assert surface["payment_action"]["type"] == "stripe_client_secret"
 
 
 @pytest.mark.asyncio

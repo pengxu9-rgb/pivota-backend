@@ -186,7 +186,15 @@ async def _build_existing_order_payment_surface(
         return None
 
     payment_status = str(order.get("payment_status") or "").strip().lower()
-    if payment_status not in {"unpaid", "pending", "processing", "requires_action"}:
+    if payment_status not in {
+        "unpaid",
+        "pending",
+        "processing",
+        "requires_action",
+        "awaiting_payment",
+        "requires_payment_method",
+        "requires_confirmation",
+    }:
         return None
 
     psp_used = str(order.get("psp_used") or "").strip().lower()
