@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import secrets
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel, Field
@@ -21,6 +22,10 @@ from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_payment_initiation_service import build_payment_action
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    fetch_active_runtime_merchant_psp,
+)
 from db.database import database
 from utils.logger import logger
 
@@ -98,6 +103,150 @@ def _checkout_ui_base() -> str:
     return (os.getenv("CHECKOUT_UI_BASE_URL") or "https://agent.pivota.cc").rstrip("/")
 
 
+def _first_non_empty_string(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed:
+                return trimmed
+            continue
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _coerce_json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _coerce_json_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _resolve_order_merchant_id(order: Dict[str, Any]) -> Optional[str]:
+    metadata = _coerce_json_object(order.get("metadata"))
+    direct_merchant_id = _first_non_empty_string(
+        order.get("resolved_merchant_id"),
+        order.get("merchant_id"),
+        metadata.get("resolved_merchant_id"),
+        metadata.get("resolvedMerchantId"),
+        metadata.get("merchant_id"),
+        metadata.get("merchantId"),
+    )
+    if direct_merchant_id:
+        return direct_merchant_id
+
+    item_merchant_ids: List[str] = []
+    for item in _coerce_json_list(order.get("items")):
+        if not isinstance(item, dict):
+            continue
+        item_metadata = _coerce_json_object(item.get("metadata"))
+        resolved = _first_non_empty_string(
+            item.get("resolved_merchant_id"),
+            item.get("resolvedMerchantId"),
+            item.get("merchant_id"),
+            item.get("merchantId"),
+            item_metadata.get("resolved_merchant_id"),
+            item_metadata.get("resolvedMerchantId"),
+            item_metadata.get("merchant_id"),
+            item_metadata.get("merchantId"),
+        )
+        if resolved and resolved not in item_merchant_ids:
+            item_merchant_ids.append(resolved)
+
+    if len(item_merchant_ids) == 1:
+        return item_merchant_ids[0]
+    return None
+
+
+async def _build_existing_order_payment_surface(
+    order: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    merchant_id = _resolve_order_merchant_id(order)
+    if not merchant_id:
+        return None
+
+    payment_status = str(order.get("payment_status") or "").strip().lower()
+    if payment_status not in {"unpaid", "pending", "processing", "requires_action"}:
+        return None
+
+    psp_used = str(order.get("psp_used") or "").strip().lower()
+    payment_intent_id = str(order.get("payment_intent_id") or "").strip()
+    client_secret = str(order.get("client_secret") or "").strip()
+    if not psp_used or not client_secret:
+        return None
+
+    runtime_row = None
+    try:
+        runtime_row = await fetch_active_runtime_merchant_psp(
+            merchant_id=merchant_id,
+            provider=psp_used,
+        )
+    except Exception:
+        runtime_row = None
+
+    raw_response: Dict[str, Any] = {}
+    if runtime_row:
+        adapter_kwargs = build_runtime_adapter_kwargs(
+            psp_used,
+            api_key=runtime_row.get("api_key"),
+            account_id=runtime_row.get("account_id"),
+            provider_config=runtime_row.get("provider_config"),
+            environment=runtime_row.get("environment"),
+            secret_key=runtime_row.get("secret_key"),
+        )
+        if psp_used == "stripe":
+            if adapter_kwargs.get("public_key"):
+                raw_response["public_key"] = adapter_kwargs["public_key"]
+            if adapter_kwargs.get("account_id"):
+                raw_response["stripe_account"] = adapter_kwargs["account_id"]
+        elif psp_used == "adyen":
+            if adapter_kwargs.get("client_key"):
+                raw_response["clientKey"] = adapter_kwargs["client_key"]
+        elif psp_used == "checkout":
+            if adapter_kwargs.get("public_key"):
+                raw_response["public_key"] = adapter_kwargs["public_key"]
+            if adapter_kwargs.get("processing_channel_id"):
+                raw_response["processing_channel_id"] = adapter_kwargs["processing_channel_id"]
+
+    payment_intent = SimpleNamespace(
+        id=payment_intent_id or None,
+        client_secret=client_secret,
+        raw_response=raw_response,
+        psp_type=psp_used,
+    )
+    payment_action = build_payment_action(payment_intent, psp_used=psp_used)
+    if not payment_action or not payment_action.get("type"):
+        return None
+
+    return {
+        "merchant_id": merchant_id,
+        "psp_used": psp_used,
+        "payment_intent_id": payment_intent_id,
+        "client_secret": client_secret,
+        "payment_action": payment_action,
+    }
+
+
 # ============================================================================
 # Payment Endpoint
 # ============================================================================
@@ -134,7 +283,9 @@ async def create_payment(
         if order.get("payment_status") == "paid":
             raise HTTPException(status_code=400, detail="Order already paid")
         
-        merchant_id = order.get("merchant_id")
+        merchant_id = _resolve_order_merchant_id(order)
+        if not merchant_id:
+            raise HTTPException(status_code=400, detail="Order merchant could not be resolved")
         
         # Get order total with fallback (support both total_amount and total fields)
         order_total = order.get("total_amount") or order.get("total")
@@ -294,6 +445,26 @@ async def create_payment(
                     psp_used="cached",
                     created_at=datetime.now().isoformat()
                 )
+
+        existing_payment_surface = await _build_existing_order_payment_surface(order)
+        if existing_payment_surface:
+            logger.info(
+                "[AgentPayments] Reusing existing %s payment surface for order %s",
+                existing_payment_surface["psp_used"],
+                request.order_id,
+            )
+            return PaymentResponse(
+                status="requires_action",
+                payment_id=f"pay_{existing_payment_surface['payment_intent_id'] or request.order_id}",
+                payment_intent_id=existing_payment_surface["payment_intent_id"] or "",
+                client_secret=existing_payment_surface["client_secret"],
+                amount=order_total,
+                currency=order.get("currency", "USD"),
+                psp_used=existing_payment_surface["psp_used"],
+                psp=existing_payment_surface["psp_used"],
+                payment_action=existing_payment_surface["payment_action"],
+                created_at=datetime.now().isoformat(),
+            )
 
         # MVP measurement scaffolding: checkout attempted (payment stage).
         try:
