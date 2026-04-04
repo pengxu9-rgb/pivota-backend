@@ -537,6 +537,20 @@ def _beauty_query_prefers_treatment(normalized_query: str) -> bool:
     return _contains_any_term(normalized_query, _BEAUTY_TREATMENT_TERMS)
 
 
+def _has_beauty_retrieval_signal(text: Optional[str]) -> bool:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return False
+    if _beauty_query_prefers_sunscreen(raw) or _beauty_query_prefers_treatment(raw):
+        return True
+    return bool(
+        re.search(
+            r"\b(skincare|skin care|moisturizer|moisturiser|cleanser|face wash|toner|essence|cream|acne|blemish|barrier repair|face serum)\b",
+            raw,
+        )
+    )
+
+
 def _resolve_retrieval_profile(
     *,
     query_text: Optional[str],
@@ -554,6 +568,12 @@ def _resolve_retrieval_profile(
         if "fragrance" in hint or "perfume" in hint or "parfum" in hint:
             return {
                 "id": "fragrance_strict",
+                "reason": "explicit_profile_hint",
+                "confidence": "high",
+            }
+        if "beauty" in hint or "skincare" in hint or "cosmetic" in hint:
+            return {
+                "id": "beauty_strict",
                 "reason": "explicit_profile_hint",
                 "confidence": "high",
             }
@@ -576,6 +596,12 @@ def _resolve_retrieval_profile(
         return {
             "id": "lingerie_strict",
             "reason": "lingerie_keyword_match",
+            "confidence": "high",
+        }
+    if _has_beauty_retrieval_signal(query) or _has_beauty_retrieval_signal(category):
+        return {
+            "id": "beauty_strict",
+            "reason": "beauty_keyword_match",
             "confidence": "high",
         }
 
@@ -3817,6 +3843,10 @@ async def agent_search_products(
             external_seed_strategy,
             fallback="legacy",
         )
+        normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
+        retrieval_profile_hint = (
+            normalized_catalog_surface if normalized_catalog_surface == CATALOG_SURFACE_BEAUTY else None
+        )
         _push_gate_trace(
             gate_id="seed_strategy",
             applied=True,
@@ -3849,11 +3879,20 @@ async def agent_search_products(
         retrieval_profile = _resolve_retrieval_profile(
             query_text=normalized_query,
             category_text=normalized_category,
-            profile_hint=None,
+            profile_hint=retrieval_profile_hint,
         )
         query_semantic_class = _normalize_semantic_class_from_profile(
             str(retrieval_profile.get("id") or "default").strip().lower()
         )
+        if (
+            allow_external_seed
+            and normalized_seed_strategy == "legacy"
+            and (
+                normalized_catalog_surface == CATALOG_SURFACE_BEAUTY
+                or query_semantic_class == "beauty"
+            )
+        ):
+            normalized_seed_strategy = "unified_relevance"
         brand_query = _detect_brand_query(normalized_query)
         brand_query_detected = bool(brand_query.get("brand_like"))
         brand_query_terms: List[str] = list(brand_query.get("brand_terms") or [])
@@ -3888,7 +3927,6 @@ async def agent_search_products(
             or normalized_seed_strategy == "legacy"
             or bool(re.search(r"\b(perfume|fragrance|parfum|cologne|body mist)\b", normalized_query, re.IGNORECASE))
         )
-        normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
         external_seed_health = _new_external_seed_health()
         external_seed_health["query_semantic_class"] = query_semantic_class
         search_stage_timings: Dict[str, int] = {

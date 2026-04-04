@@ -40,6 +40,26 @@ def test_resolve_retrieval_profile_respects_hint():
     assert profile["reason"] == "explicit_profile_hint"
 
 
+def test_resolve_retrieval_profile_recognizes_beauty_hint():
+    profile = agent_api._resolve_retrieval_profile(
+        query_text="anything",
+        category_text=None,
+        profile_hint="beauty",
+    )
+    assert profile["id"] == "beauty_strict"
+    assert profile["reason"] == "explicit_profile_hint"
+
+
+def test_resolve_retrieval_profile_recognizes_beauty_keywords():
+    profile = agent_api._resolve_retrieval_profile(
+        query_text="best sunscreen for oily skin",
+        category_text=None,
+        profile_hint=None,
+    )
+    assert profile["id"] == "beauty_strict"
+    assert profile["reason"] == "beauty_keyword_match"
+
+
 def test_profile_filter_is_recall_first_for_fragrance():
     original = agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE
     agent_api.SEARCH_EXTERNAL_HARD_RULE_PRUNE = False
