@@ -194,6 +194,72 @@ async def test_agent_api_build_external_seed_product_uses_canonical_url_when_des
 
 
 @pytest.mark.asyncio
+async def test_agent_api_build_external_seed_product_uses_snapshot_fields_when_top_level_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
+
+    product = await agent_api_module._build_external_seed_product(
+        req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
+        seed_row={
+            "id": "seed_snapshot_1",
+            "external_product_id": "",
+            "market": "US",
+            "tool": "*",
+            "destination_url": "",
+            "canonical_url": "",
+            "seed_data": {
+                "snapshot": {
+                    "external_product_id": "ext_snapshot_1",
+                    "canonical_url": "https://example.com/p/snapshot-1",
+                    "title": "Snapshot Product",
+                    "product_type": "sunscreen",
+                    "category": "face sunscreen",
+                }
+            },
+        },
+        allowed_domains=[],
+        metrics_out={},
+    )
+
+    assert product is not None
+    assert product["product_id"] == "ext_snapshot_1"
+    assert product["destination_url"] == "https://example.com/p/snapshot-1"
+    assert product["title"] == "Snapshot Product"
+    assert product["product_type"] == "sunscreen"
+
+
+def test_dedupe_external_seed_rows_uses_snapshot_identity_when_top_level_missing() -> None:
+    from services.external_seed_search import dedupe_external_seed_rows
+
+    rows = [
+        {
+            "id": "seed_snapshot_1",
+            "external_product_id": "",
+            "canonical_url": "",
+            "destination_url": "",
+            "seed_data": {
+                "snapshot": {
+                    "external_product_id": "ext_snapshot_1",
+                    "canonical_url": "https://example.com/p/snapshot-1",
+                }
+            },
+        }
+    ]
+
+    deduped = dedupe_external_seed_rows(rows, limit=10)
+
+    assert len(deduped) == 1
+    assert deduped[0]["id"] == "seed_snapshot_1"
+
+
+@pytest.mark.asyncio
 async def test_agent_api_load_external_seed_products_records_builder_exception_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

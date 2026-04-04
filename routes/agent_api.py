@@ -966,6 +966,11 @@ def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     variants = seed_data.get("variants")
     if isinstance(variants, list):
         return [v for v in variants if isinstance(v, dict)]
+    snapshot = seed_data.get("snapshot")
+    if isinstance(snapshot, dict):
+        snapshot_variants = snapshot.get("variants")
+        if isinstance(snapshot_variants, list):
+            return [v for v in snapshot_variants if isinstance(v, dict)]
     return []
 
 
@@ -2736,8 +2741,23 @@ async def _build_external_seed_product(
     market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     tool = str(seed_row.get("tool") or "*").strip() or "*"
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
-    canonical_url = str(seed_row.get("canonical_url") or "").strip() or None
+    snapshot = _ensure_json_obj(seed_data.get("snapshot"))
+    canonical_url = (
+        str(seed_row.get("canonical_url") or "").strip()
+        or str(snapshot.get("canonical_url") or "").strip()
+        or str(snapshot.get("destination_url") or "").strip()
+        or str(seed_data.get("canonical_url") or "").strip()
+        or str(seed_data.get("destination_url") or "").strip()
+        or None
+    )
     destination_url = str(seed_row.get("destination_url") or "").strip()
+    if not destination_url:
+        destination_url = (
+            str(snapshot.get("destination_url") or "").strip()
+            or str(snapshot.get("canonical_url") or "").strip()
+            or str(seed_data.get("destination_url") or "").strip()
+            or str(seed_data.get("canonical_url") or "").strip()
+        )
     destination_url = (
         destination_url
         if destination_url.startswith("http://") or destination_url.startswith("https://")
@@ -2750,12 +2770,15 @@ async def _build_external_seed_product(
     if not destination_url:
         _increment_external_seed_metric_reason(metrics_out, "missing_destination_url")
         return None
-    title = seed_data.get("title") or seed_row.get("title") or None
+    title = seed_data.get("title") or snapshot.get("title") or seed_row.get("title") or None
     brand = (
         str(
             seed_data.get("brand")
+            or snapshot.get("brand")
             or seed_data.get("vendor")
+            or snapshot.get("vendor")
             or seed_data.get("manufacturer")
+            or snapshot.get("manufacturer")
             or ""
         ).strip()
         or None
@@ -2763,8 +2786,11 @@ async def _build_external_seed_product(
     vendor = (
         str(
             seed_data.get("vendor")
+            or snapshot.get("vendor")
             or seed_data.get("brand")
+            or snapshot.get("brand")
             or seed_data.get("manufacturer")
+            or snapshot.get("manufacturer")
             or seed_row.get("domain")
             or ""
         ).strip()
@@ -2773,8 +2799,11 @@ async def _build_external_seed_product(
     product_type = (
         str(
             seed_data.get("product_type")
+            or snapshot.get("product_type")
             or seed_data.get("category")
+            or snapshot.get("category")
             or seed_data.get("type")
+            or snapshot.get("type")
             or "external"
         ).strip()
         or "external"
@@ -2782,8 +2811,11 @@ async def _build_external_seed_product(
     category = (
         str(
             seed_data.get("category")
+            or snapshot.get("category")
             or seed_data.get("product_type")
+            or snapshot.get("product_type")
             or seed_data.get("type")
+            or snapshot.get("type")
             or ""
         ).strip()
         or None
@@ -2794,12 +2826,18 @@ async def _build_external_seed_product(
     else:
         tags = []
     image_urls = _seed_image_urls(seed_data)
-    image_url = seed_data.get("image_url") or seed_row.get("image_url") or (image_urls[0] if image_urls else None)
+    image_url = (
+        seed_data.get("image_url")
+        or snapshot.get("image_url")
+        or seed_row.get("image_url")
+        or (image_urls[0] if image_urls else None)
+    )
 
     external_product_id = (
         str(seed_row.get("external_product_id") or "").strip()
         or str(seed_data.get("external_product_id") or "").strip()
-        or _stable_external_product_id(canonical_url or destination_url)
+        or str(snapshot.get("external_product_id") or "").strip()
+        or _stable_external_product_id(canonical_url or destination_url or seed_id)
     )
     if not external_product_id:
         _increment_external_seed_metric_reason(metrics_out, "missing_external_product_id")

@@ -465,10 +465,26 @@ def dedupe_external_seed_rows(rows: List[Dict[str, Any]], *, limit: int) -> List
     for raw in rows or []:
         seed_row = dict(raw or {})
         seed_data = ensure_json_obj(seed_row.get("seed_data"))
+        snapshot = ensure_json_obj(seed_data.get("snapshot"))
+        canonical_url = (
+            str(seed_row.get("canonical_url") or "").strip()
+            or str(snapshot.get("canonical_url") or "").strip()
+            or str(snapshot.get("destination_url") or "").strip()
+            or str(seed_data.get("canonical_url") or "").strip()
+            or str(seed_data.get("destination_url") or "").strip()
+        )
+        destination_url = (
+            str(seed_row.get("destination_url") or "").strip()
+            or str(snapshot.get("destination_url") or "").strip()
+            or str(snapshot.get("canonical_url") or "").strip()
+            or str(seed_data.get("destination_url") or "").strip()
+            or str(seed_data.get("canonical_url") or "").strip()
+        )
         external_product_id = (
             str(seed_row.get("external_product_id") or "").strip()
             or str(seed_data.get("external_product_id") or "").strip()
-            or stable_external_product_id(seed_row.get("canonical_url") or seed_row.get("destination_url") or "")
+            or str(snapshot.get("external_product_id") or "").strip()
+            or stable_external_product_id(canonical_url or destination_url or str(seed_row.get("id") or ""))
         )
         if not external_product_id or external_product_id in seen:
             continue
