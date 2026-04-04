@@ -299,6 +299,9 @@ async def test_agent_api_load_external_seed_products_records_builder_exception_r
     assert products == []
     assert metrics.get("build_drop_reasons", {}) == {}
     assert metrics.get("build_exception_reasons", {}) == {"runtimeerror": 1}
+    assert metrics.get("candidate_rows") == 1
+    assert metrics.get("build_tasks_started") == 1
+    assert metrics.get("build_deadline_skips") == 0
 
 
 @pytest.mark.asyncio

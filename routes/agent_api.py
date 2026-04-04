@@ -1414,6 +1414,9 @@ def _build_route_health(
             if isinstance(seed_health.get("external_seed_build_exception_reasons"), dict)
             else {}
         ),
+        "external_seed_candidate_rows": max(0, int(seed_health.get("external_seed_candidate_rows") or 0)),
+        "external_seed_build_tasks_started": max(0, int(seed_health.get("external_seed_build_tasks_started") or 0)),
+        "external_seed_build_deadline_skips": max(0, int(seed_health.get("external_seed_build_deadline_skips") or 0)),
         "external_seed_returned_count": external_raw_count,
         "internal_raw_count": internal_raw_count,
         "external_raw_count": external_raw_count,
@@ -1595,6 +1598,21 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     route_health["external_seed_build_exception_reasons"] = (
         dict(build_exception_reasons) if isinstance(build_exception_reasons, dict) else {}
     )
+    route_health["external_seed_candidate_rows"] = _int_non_negative(
+        route_health.get("external_seed_candidate_rows")
+        if route_health.get("external_seed_candidate_rows") is not None
+        else md.get("external_seed_candidate_rows")
+    )
+    route_health["external_seed_build_tasks_started"] = _int_non_negative(
+        route_health.get("external_seed_build_tasks_started")
+        if route_health.get("external_seed_build_tasks_started") is not None
+        else md.get("external_seed_build_tasks_started")
+    )
+    route_health["external_seed_build_deadline_skips"] = _int_non_negative(
+        route_health.get("external_seed_build_deadline_skips")
+        if route_health.get("external_seed_build_deadline_skips") is not None
+        else md.get("external_seed_build_deadline_skips")
+    )
     route_health["internal_raw_count"] = _int_non_negative(
         route_health.get("internal_raw_count")
         if route_health.get("internal_raw_count") is not None
@@ -1720,6 +1738,9 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
     md["external_seed_build_drop_reasons"] = route_health["external_seed_build_drop_reasons"]
     md["external_seed_build_exception_reasons"] = route_health["external_seed_build_exception_reasons"]
+    md["external_seed_candidate_rows"] = route_health["external_seed_candidate_rows"]
+    md["external_seed_build_tasks_started"] = route_health["external_seed_build_tasks_started"]
+    md["external_seed_build_deadline_skips"] = route_health["external_seed_build_deadline_skips"]
     md["external_seed_returned_count"] = route_health["external_seed_returned_count"]
     md["internal_raw_count"] = route_health["internal_raw_count"]
     md["external_raw_count"] = route_health["external_raw_count"]
@@ -1773,6 +1794,9 @@ def _new_external_seed_health() -> Dict[str, Any]:
         "external_seed_broad_scope_rows": 0,
         "external_seed_build_drop_reasons": {},
         "external_seed_build_exception_reasons": {},
+        "external_seed_candidate_rows": 0,
+        "external_seed_build_tasks_started": 0,
+        "external_seed_build_deadline_skips": 0,
         "domain_filter_dropped_external": 0,
         "external_fill_gate_reason": None,
         "query_semantic_class": "default",
@@ -1893,6 +1917,30 @@ def _apply_external_seed_metrics(
                 continue
             merged_exception_reasons[normalized_key] = max(0, int(raw_value or 0))
         external_seed_health["external_seed_build_exception_reasons"] = merged_exception_reasons
+    external_seed_health["external_seed_candidate_rows"] = max(
+        0,
+        int(
+            metrics.get("candidate_rows")
+            or external_seed_health.get("external_seed_candidate_rows")
+            or 0
+        ),
+    )
+    external_seed_health["external_seed_build_tasks_started"] = max(
+        0,
+        int(
+            metrics.get("build_tasks_started")
+            or external_seed_health.get("external_seed_build_tasks_started")
+            or 0
+        ),
+    )
+    external_seed_health["external_seed_build_deadline_skips"] = max(
+        0,
+        int(
+            metrics.get("build_deadline_skips")
+            or external_seed_health.get("external_seed_build_deadline_skips")
+            or 0
+        ),
+    )
     external_seed_health["domain_filter_dropped_external"] = max(
         0,
         int(
@@ -3025,6 +3073,9 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("stage_b_timeout", False)
         metrics.setdefault("build_drop_reasons", {})
         metrics.setdefault("build_exception_reasons", {})
+        metrics.setdefault("candidate_rows", 0)
+        metrics.setdefault("build_tasks_started", 0)
+        metrics.setdefault("build_deadline_skips", 0)
 
     normalized_brand_required_terms = _normalize_external_seed_terms_for_cache(
         brand_required_terms if brand_required_terms is not None else brand_terms
@@ -3238,6 +3289,8 @@ async def _load_external_seed_products_for_search(
         return []
 
     candidate_rows = dedupe_external_seed_rows(rows, limit=limit)
+    if metrics is not None:
+        metrics["candidate_rows"] = len(candidate_rows)
     if not candidate_rows:
         if metrics is not None:
             metrics["rows_built"] = 0
@@ -3267,7 +3320,11 @@ async def _load_external_seed_products_for_search(
 
     async def _build_guarded(seed_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         async with semaphore:
+            if metrics is not None:
+                metrics["build_tasks_started"] = int(metrics.get("build_tasks_started") or 0) + 1
             if deadline is not None and time.perf_counter() >= deadline:
+                if metrics is not None:
+                    metrics["build_deadline_skips"] = int(metrics.get("build_deadline_skips") or 0) + 1
                 return None
             try:
                 return await _build_external_seed_product(
