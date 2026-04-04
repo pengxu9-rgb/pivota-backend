@@ -2645,12 +2645,20 @@ async def _build_external_seed_product(
 
     market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     tool = str(seed_row.get("tool") or "*").strip() or "*"
-    destination_url = str(seed_row.get("destination_url") or "").strip()
-    if not destination_url.startswith("http://") and not destination_url.startswith("https://"):
-        return None
-
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
     canonical_url = str(seed_row.get("canonical_url") or "").strip() or None
+    destination_url = str(seed_row.get("destination_url") or "").strip()
+    destination_url = (
+        destination_url
+        if destination_url.startswith("http://") or destination_url.startswith("https://")
+        else ""
+    )
+    if not destination_url and canonical_url and (
+        canonical_url.startswith("http://") or canonical_url.startswith("https://")
+    ):
+        destination_url = canonical_url
+    if not destination_url:
+        return None
     title = seed_data.get("title") or seed_row.get("title") or None
     brand = (
         str(
@@ -2815,7 +2823,7 @@ async def _build_external_seed_product(
         "merchant_name": "External",
         "platform": "external",
         "platform_product_id": external_product_id,
-        "title": title or destination_url,
+        "title": title or canonical_url or destination_url,
         "description": str(seed_data.get("description") or "") or "",
         **({"brand": brand} if brand else {}),
         **({"vendor": vendor} if vendor else {}),

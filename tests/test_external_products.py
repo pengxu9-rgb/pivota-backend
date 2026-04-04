@@ -114,6 +114,39 @@ async def test_agent_api_build_external_seed_product_skips_blocked_referral_seed
 
 
 @pytest.mark.asyncio
+async def test_agent_api_build_external_seed_product_uses_canonical_url_when_destination_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
+
+    product = await agent_api_module._build_external_seed_product(
+        req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
+        seed_row={
+            "id": "seed_2",
+            "external_product_id": "ext_2",
+            "market": "US",
+            "tool": "*",
+            "destination_url": "",
+            "canonical_url": "https://example.com/p/2",
+            "seed_data": {"title": "Fallback Canonical Product"},
+        },
+        allowed_domains=[],
+        metrics_out={},
+    )
+
+    assert product is not None
+    assert product["destination_url"] == "https://example.com/p/2"
+    assert product["external_url"] == "https://example.com/p/2"
+    assert "/r?token=" in product["external_redirect_url"]
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_make_external_redirect_url_without_allowlist_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
