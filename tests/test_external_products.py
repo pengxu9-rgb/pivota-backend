@@ -85,6 +85,49 @@ async def test_agent_api_load_external_seed_products_builds_without_allowlist_pr
 
 
 @pytest.mark.asyncio
+async def test_agent_api_load_external_seed_products_records_build_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    seed_rows = [
+        {
+            "id": "seed_1",
+            "external_product_id": "ext_1",
+            "destination_url": "https://example.com/p/1",
+            "canonical_url": "https://example.com/p/1",
+            "seed_data": {},
+        }
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return seed_rows
+        return []
+
+    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
+        raise ValueError("bad seed payload")
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "_build_external_seed_product", fake_build_external_seed_product)
+
+    metrics = {}
+    products = await agent_api_module._load_external_seed_products_for_search(
+        req=None,
+        query="example",
+        limit=10,
+        build_budget_ms=1000,
+        metrics_out=metrics,
+    )
+
+    assert products == []
+    assert metrics.get("build_drop_reasons", {}) == {}
+    assert metrics["build_exception_reasons"]["valueerror"] == 1
+    assert int(metrics.get("rows_built") or 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_agent_api_build_external_seed_product_skips_blocked_referral_seed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -148,6 +191,48 @@ async def test_agent_api_build_external_seed_product_uses_canonical_url_when_des
     assert product["external_url"] == "https://example.com/p/2"
     assert "/r?token=" in product["external_redirect_url"]
     assert metrics.get("build_drop_reasons", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_api_load_external_seed_products_records_builder_exception_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    seed_rows = [
+        {
+            "id": "seed_1",
+            "external_product_id": "ext_1",
+            "destination_url": "https://example.com/p/1",
+            "canonical_url": "https://example.com/p/1",
+            "seed_data": {},
+        }
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return seed_rows
+        return []
+
+    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "_build_external_seed_product", fake_build_external_seed_product)
+
+    metrics = {}
+    products = await agent_api_module._load_external_seed_products_for_search(
+        req=None,
+        query="sunscreen",
+        limit=10,
+        build_budget_ms=1000,
+        metrics_out=metrics,
+    )
+
+    assert products == []
+    assert metrics.get("build_drop_reasons", {}) == {}
+    assert metrics.get("build_exception_reasons", {}) == {"runtimeerror": 1}
 
 
 @pytest.mark.asyncio

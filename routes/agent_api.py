@@ -649,20 +649,35 @@ def _derive_external_seed_cache_hit(
     return bool(cache_hit) or reason_token == "cache_hit"
 
 
-def _increment_external_seed_metric_reason(
+def _increment_external_seed_metric_bucket_reason(
     metrics_out: Optional[Dict[str, Any]],
+    bucket_name: str,
     reason: str,
 ) -> None:
     if not isinstance(metrics_out, dict):
         return
+    normalized_bucket = str(bucket_name or "").strip()
+    if not normalized_bucket:
+        return
     normalized_reason = str(reason or "").strip().lower()
     if not normalized_reason:
         return
-    counter = metrics_out.get("build_drop_reasons")
+    counter = metrics_out.get(normalized_bucket)
     if not isinstance(counter, dict):
         counter = {}
     counter[normalized_reason] = max(0, int(counter.get(normalized_reason) or 0)) + 1
-    metrics_out["build_drop_reasons"] = counter
+    metrics_out[normalized_bucket] = counter
+
+
+def _increment_external_seed_metric_reason(
+    metrics_out: Optional[Dict[str, Any]],
+    reason: str,
+) -> None:
+    _increment_external_seed_metric_bucket_reason(
+        metrics_out,
+        "build_drop_reasons",
+        reason,
+    )
 
 
 def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -> bool:
@@ -1389,6 +1404,11 @@ def _build_route_health(
         "external_seed_brand_relevant_rows": max(0, int(seed_health.get("external_seed_brand_relevant_rows") or 0)),
         "external_seed_broad_fallback_used": bool(seed_health.get("external_seed_broad_fallback_used") or False),
         "external_seed_broad_scope_rows": max(0, int(seed_health.get("external_seed_broad_scope_rows") or 0)),
+        "external_seed_build_exception_reasons": (
+            dict(seed_health.get("external_seed_build_exception_reasons"))
+            if isinstance(seed_health.get("external_seed_build_exception_reasons"), dict)
+            else {}
+        ),
         "external_seed_returned_count": external_raw_count,
         "internal_raw_count": internal_raw_count,
         "external_raw_count": external_raw_count,
@@ -1562,6 +1582,14 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     route_health["external_seed_build_drop_reasons"] = (
         dict(build_drop_reasons) if isinstance(build_drop_reasons, dict) else {}
     )
+    build_exception_reasons = (
+        route_health.get("external_seed_build_exception_reasons")
+        if route_health.get("external_seed_build_exception_reasons") is not None
+        else md.get("external_seed_build_exception_reasons")
+    )
+    route_health["external_seed_build_exception_reasons"] = (
+        dict(build_exception_reasons) if isinstance(build_exception_reasons, dict) else {}
+    )
     route_health["internal_raw_count"] = _int_non_negative(
         route_health.get("internal_raw_count")
         if route_health.get("internal_raw_count") is not None
@@ -1686,6 +1714,7 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
     md["external_seed_build_drop_reasons"] = route_health["external_seed_build_drop_reasons"]
+    md["external_seed_build_exception_reasons"] = route_health["external_seed_build_exception_reasons"]
     md["external_seed_returned_count"] = route_health["external_seed_returned_count"]
     md["internal_raw_count"] = route_health["internal_raw_count"]
     md["external_raw_count"] = route_health["external_raw_count"]
@@ -1738,6 +1767,7 @@ def _new_external_seed_health() -> Dict[str, Any]:
         "external_seed_broad_fallback_used": False,
         "external_seed_broad_scope_rows": 0,
         "external_seed_build_drop_reasons": {},
+        "external_seed_build_exception_reasons": {},
         "domain_filter_dropped_external": 0,
         "external_fill_gate_reason": None,
         "query_semantic_class": "default",
@@ -1846,6 +1876,18 @@ def _apply_external_seed_metrics(
                 continue
             merged_drop_reasons[normalized_key] = max(0, int(raw_value or 0))
         external_seed_health["external_seed_build_drop_reasons"] = merged_drop_reasons
+    build_exception_reasons = metrics.get("build_exception_reasons")
+    if isinstance(build_exception_reasons, dict):
+        existing_exception_reasons = external_seed_health.get("external_seed_build_exception_reasons")
+        if not isinstance(existing_exception_reasons, dict):
+            existing_exception_reasons = {}
+        merged_exception_reasons: Dict[str, int] = dict(existing_exception_reasons)
+        for key, raw_value in build_exception_reasons.items():
+            normalized_key = str(key or "").strip().lower()
+            if not normalized_key:
+                continue
+            merged_exception_reasons[normalized_key] = max(0, int(raw_value or 0))
+        external_seed_health["external_seed_build_exception_reasons"] = merged_exception_reasons
     external_seed_health["domain_filter_dropped_external"] = max(
         0,
         int(
@@ -2935,6 +2977,7 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("stage_b_rows", 0)
         metrics.setdefault("stage_b_timeout", False)
         metrics.setdefault("build_drop_reasons", {})
+        metrics.setdefault("build_exception_reasons", {})
 
     normalized_brand_required_terms = _normalize_external_seed_terms_for_cache(
         brand_required_terms if brand_required_terms is not None else brand_terms
@@ -3186,7 +3229,12 @@ async def _load_external_seed_products_for_search(
                     allowed_domains=None,
                     metrics_out=metrics,
                 )
-            except Exception:
+            except Exception as exc:
+                _increment_external_seed_metric_bucket_reason(
+                    metrics,
+                    "build_exception_reasons",
+                    type(exc).__name__ or "unknown_exception",
+                )
                 return None
 
     tasks = [asyncio.create_task(_build_guarded(seed_row)) for seed_row in candidate_rows]
