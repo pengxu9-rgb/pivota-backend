@@ -424,6 +424,119 @@ def _has_beauty_tool_signal(text: Optional[str]) -> bool:
     )
 
 
+_BEAUTY_SUNSCREEN_TERMS = (
+    "sunscreen",
+    "sun screen",
+    "sunblock",
+    "spf",
+    "broad spectrum",
+    "uv",
+)
+_BEAUTY_TREATMENT_TERMS = (
+    "treatment",
+    "serum",
+    "ampoule",
+    "essence",
+    "booster",
+    "spot treatment",
+    "acne treatment",
+    "retinol",
+    "retinal",
+    "niacinamide",
+    "salicylic",
+)
+_BEAUTY_LIP_TERMS = (
+    "lipstick",
+    "lip gloss",
+    "lipgloss",
+    "lip balm",
+    "lipbalm",
+    "lip oil",
+    "lip treatment",
+    "lip mask",
+    "lip tint",
+    "lip care",
+)
+_BEAUTY_BODY_TERMS = (
+    "body oil",
+    "body lotion",
+    "body cream",
+    "body mist",
+    "body butter",
+    "body wash",
+    "body serum",
+    "hand cream",
+    "hand lotion",
+    "shower gel",
+    "bath",
+)
+_BEAUTY_FACE_TERMS = (
+    "face",
+    "facial",
+)
+
+
+def _contains_any_term(text: str, terms: tuple[str, ...]) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(term in lowered for term in terms)
+
+
+def _build_product_visible_category_blob(product: Dict[str, Any]) -> str:
+    tags = product.get("tags")
+    if isinstance(tags, list):
+        tags_text = " ".join(str(v or "").strip() for v in tags if str(v or "").strip())
+    else:
+        tags_text = str(tags or "").strip()
+
+    recommendation_meta = _ensure_json_obj(product.get("recommendation_meta"))
+    recommendation_facets = _ensure_json_obj(recommendation_meta.get("facets"))
+    recommendation_tags = recommendation_meta.get("tags")
+    if isinstance(recommendation_tags, list):
+        recommendation_tags_text = " ".join(
+            str(v or "").strip() for v in recommendation_tags if str(v or "").strip()
+        )
+    else:
+        recommendation_tags_text = str(recommendation_tags or "").strip()
+
+    seed_data = _ensure_json_obj(product.get("seed_data"))
+    seed_tags = seed_data.get("tags")
+    if isinstance(seed_tags, list):
+        seed_tags_text = " ".join(str(v or "").strip() for v in seed_tags if str(v or "").strip())
+    else:
+        seed_tags_text = str(seed_tags or "").strip()
+
+    parts = [
+        product.get("title"),
+        product.get("name"),
+        product.get("product_type"),
+        product.get("category"),
+        product.get("vendor"),
+        product.get("brand"),
+        tags_text,
+        recommendation_facets.get("cat"),
+        recommendation_tags_text,
+        seed_data.get("title"),
+        seed_data.get("brand"),
+        seed_data.get("vendor"),
+        seed_data.get("product_type"),
+        seed_data.get("category"),
+        seed_tags_text,
+    ]
+    return " ".join(str(v or "").strip().lower() for v in parts if str(v or "").strip())
+
+
+def _beauty_query_prefers_sunscreen(normalized_query: str) -> bool:
+    return _contains_any_term(normalized_query, _BEAUTY_SUNSCREEN_TERMS)
+
+
+def _beauty_query_prefers_treatment(normalized_query: str) -> bool:
+    if _beauty_query_prefers_sunscreen(normalized_query):
+        return False
+    return _contains_any_term(normalized_query, _BEAUTY_TREATMENT_TERMS)
+
+
 def _resolve_retrieval_profile(
     *,
     query_text: Optional[str],
@@ -528,16 +641,61 @@ def _apply_semantic_soft_penalty(
     product: Dict[str, Any],
     score: float,
     query_semantic_class: str,
+    normalized_query: Optional[str] = None,
 ) -> float:
     if not SEARCH_EXTERNAL_HARD_RULE_PRUNE:
         return float(score or 0.0)
     semantic_class = str(query_semantic_class or "").strip().lower()
-    if semantic_class != "fragrance":
-        return float(score or 0.0)
-    blob = _build_product_search_blob(product)
-    if _has_beauty_tool_signal(blob):
-        return max(0.05, float(score or 0.0) * 0.65)
-    return float(score or 0.0)
+    adjusted = float(score or 0.0)
+    if semantic_class == "fragrance":
+        blob = _build_product_search_blob(product)
+        if _has_beauty_tool_signal(blob):
+            return max(0.05, adjusted * 0.65)
+        return adjusted
+    if semantic_class != "beauty":
+        return adjusted
+
+    category_blob = _build_product_visible_category_blob(product)
+    if not category_blob:
+        return adjusted
+
+    if _has_beauty_tool_signal(category_blob):
+        adjusted *= 0.35
+
+    query_blob = str(normalized_query or "").strip().lower()
+    if not query_blob:
+        return max(0.0, adjusted)
+
+    has_sunscreen_signal = _contains_any_term(category_blob, _BEAUTY_SUNSCREEN_TERMS)
+    has_treatment_signal = _contains_any_term(category_blob, _BEAUTY_TREATMENT_TERMS)
+    has_lip_signal = _contains_any_term(category_blob, _BEAUTY_LIP_TERMS)
+    has_body_signal = _contains_any_term(category_blob, _BEAUTY_BODY_TERMS)
+    has_face_signal = _contains_any_term(category_blob, _BEAUTY_FACE_TERMS)
+
+    if _beauty_query_prefers_sunscreen(query_blob):
+        if has_sunscreen_signal:
+            adjusted = min(1.0, adjusted * 1.12)
+        else:
+            adjusted *= 0.18
+        if has_lip_signal:
+            adjusted *= 0.12
+        if has_body_signal:
+            adjusted *= 0.35
+        if has_treatment_signal and not has_sunscreen_signal:
+            adjusted *= 0.25
+    elif _beauty_query_prefers_treatment(query_blob):
+        if has_treatment_signal:
+            adjusted = min(1.0, adjusted * 1.08)
+        else:
+            adjusted *= 0.55
+        if has_lip_signal:
+            adjusted *= 0.18
+        if has_body_signal and not has_face_signal:
+            adjusted *= 0.35
+        if has_sunscreen_signal and not has_treatment_signal:
+            adjusted *= 0.4
+
+    return max(0.0, adjusted)
 
 
 AGENT_PRODUCT_DETAIL_STALE_FALLBACK_ENABLED = _env_bool(
@@ -2373,6 +2531,7 @@ async def _search_products_fast_mode(
             product=product,
             score=score,
             query_semantic_class=query_semantic_class,
+            normalized_query=normalized_query,
         )
         if normalized_query and score <= 0 and not (
             SEARCH_EXTERNAL_HARD_RULE_PRUNE and is_external_seed
@@ -4139,6 +4298,7 @@ async def agent_search_products(
                             product=product,
                             score=score,
                             query_semantic_class=query_semantic_class,
+                            normalized_query=normalized_query,
                         )
                         if brand_query_detected and not brand_relevant:
                             score = max(0.05, float(score or 0.0) * 0.55)
@@ -4906,6 +5066,7 @@ async def agent_search_products(
                     product=product,
                     score=relevance_score,
                     query_semantic_class=query_semantic_class,
+                    normalized_query=normalized_query,
                 )
 
                 product["relevance_score"] = relevance_score

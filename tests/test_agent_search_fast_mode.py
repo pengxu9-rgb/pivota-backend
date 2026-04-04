@@ -261,6 +261,87 @@ def test_agent_search_catalog_surface_param_filters_non_beauty_products(
     assert payload["metadata"]["catalog_surface"] == "beauty"
 
 
+def test_agent_search_standard_beauty_prefers_sunscreen_over_serum_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    class DummyProduct:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def model_dump(self):
+            return dict(self.payload)
+
+    merchant_rows = [{"merchant_id": "merch_1", "business_name": "Merchant One"}]
+
+    async def fake_fetch_all(query, values=None):
+        text = str(query)
+        if "SELECT merchant_id, business_name FROM merchant_onboarding" in text:
+            return merchant_rows
+        return []
+
+    async def fake_get_products_hybrid(*args, **kwargs):
+        return (
+            [
+                DummyProduct(
+                    {
+                        "id": "prod_serum_1",
+                        "product_id": "prod_serum_1",
+                        "title": "Niacinamide 10% + Zinc 1% Serum",
+                        "description": "oil control serum",
+                        "product_type": "serum",
+                        "category": "serum",
+                        "price": 12,
+                        "currency": "USD",
+                        "in_stock": True,
+                    }
+                ),
+                DummyProduct(
+                    {
+                        "id": "prod_sunscreen_1",
+                        "product_id": "prod_sunscreen_1",
+                        "title": "Lightweight Face Sunscreen SPF 50",
+                        "description": "broad spectrum sunscreen for oily skin",
+                        "product_type": "sunscreen",
+                        "category": "face sunscreen",
+                        "price": 24,
+                        "currency": "USD",
+                        "in_stock": True,
+                    }
+                ),
+            ],
+            "cache",
+            None,
+        )
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "get_products_hybrid", fake_get_products_hybrid)
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api_module, "hydrate_quality_and_enrichment", AsyncMock(return_value=None))
+
+    response = client.get(
+        "/agent/v1/products/search",
+        params={
+            "query": "best sunscreen for oily skin",
+            "catalog_surface": "beauty",
+            "limit": 10,
+            "offset": 0,
+            "search_all_merchants": "true",
+            "allow_external_seed": "false",
+        },
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["products"][0]["product_id"] == "prod_sunscreen_1"
+    product_ids = [item["product_id"] for item in payload["products"]]
+    assert "prod_serum_1" not in product_ids or product_ids.index("prod_sunscreen_1") < product_ids.index("prod_serum_1")
+    assert payload["metadata"]["catalog_surface"] == "beauty"
+
+
 def test_agent_sdk_fixed_search_route_clamps_limit_201_to_200(
     monkeypatch: pytest.MonkeyPatch,
     client: TestClient,

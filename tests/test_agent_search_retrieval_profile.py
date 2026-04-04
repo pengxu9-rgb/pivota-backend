@@ -84,3 +84,80 @@ def test_has_fragrance_signal_supports_compact_tokens():
     assert agent_api._has_fragrance_signal("EAUDEPARFUM collection") is True
     assert agent_api._has_fragrance_signal("best bodymist picks") is True
     assert agent_api._has_fragrance_signal("Le Labo Santal 33") is True
+
+
+def test_beauty_soft_penalty_prefers_sunscreen_over_serum_for_sunscreen_query():
+    sunscreen_like = {
+        "title": "Lightweight Face Sunscreen SPF 50",
+        "category": "face sunscreen",
+        "product_type": "sunscreen",
+        "tags": ["spf", "sunscreen", "face"],
+    }
+    serum_like = {
+        "title": "Niacinamide 10% + Zinc 1% Serum",
+        "category": "serum",
+        "product_type": "serum",
+        "tags": ["niacinamide", "oil control"],
+    }
+
+    sunscreen_score = agent_api._apply_semantic_soft_penalty(
+        product=sunscreen_like,
+        score=0.6,
+        query_semantic_class="beauty",
+        normalized_query="best sunscreen for oily skin",
+    )
+    serum_score = agent_api._apply_semantic_soft_penalty(
+        product=serum_like,
+        score=0.6,
+        query_semantic_class="beauty",
+        normalized_query="best sunscreen for oily skin",
+    )
+
+    assert sunscreen_score > serum_score
+    assert sunscreen_score > 0.6
+    assert serum_score < 0.2
+
+
+def test_beauty_soft_penalty_demotes_lip_and_body_candidates_for_treatment_query():
+    treatment_like = {
+        "title": "Oil Control Treatment Serum",
+        "category": "serum treatment",
+        "product_type": "serum",
+        "tags": ["oil control", "treatment"],
+    }
+    lip_like = {
+        "title": "Overnight Lip Treatment",
+        "category": "lip care",
+        "product_type": "lip balm",
+        "tags": ["lip treatment"],
+    }
+    body_like = {
+        "title": "Body Oil for Dry Skin",
+        "category": "body oil",
+        "product_type": "body oil",
+        "tags": ["body", "oil"],
+    }
+
+    treatment_score = agent_api._apply_semantic_soft_penalty(
+        product=treatment_like,
+        score=0.55,
+        query_semantic_class="beauty",
+        normalized_query="oil control treatment",
+    )
+    lip_score = agent_api._apply_semantic_soft_penalty(
+        product=lip_like,
+        score=0.55,
+        query_semantic_class="beauty",
+        normalized_query="oil control treatment",
+    )
+    body_score = agent_api._apply_semantic_soft_penalty(
+        product=body_like,
+        score=0.55,
+        query_semantic_class="beauty",
+        normalized_query="oil control treatment",
+    )
+
+    assert treatment_score > lip_score
+    assert treatment_score > body_score
+    assert lip_score < 0.15
+    assert body_score < 0.15
