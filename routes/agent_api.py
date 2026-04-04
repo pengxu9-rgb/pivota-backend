@@ -537,6 +537,50 @@ def _beauty_query_prefers_treatment(normalized_query: str) -> bool:
     return _contains_any_term(normalized_query, _BEAUTY_TREATMENT_TERMS)
 
 
+def _build_fast_mode_cache_query_terms(
+    *,
+    normalized_query: str,
+    query_semantic_class: str,
+) -> List[str]:
+    raw = str(normalized_query or "").strip().lower()
+    if not raw:
+        return []
+    semantic_class = str(query_semantic_class or "").strip().lower()
+    terms: List[str] = []
+
+    def _add(value: Optional[str]) -> None:
+        token = str(value or "").strip().lower()
+        if not token:
+            return
+        if token in terms:
+            return
+        terms.append(token)
+
+    if semantic_class == "beauty":
+        if _beauty_query_prefers_sunscreen(raw):
+            for token in ("sunscreen", "spf", "sunblock", "face sunscreen"):
+                _add(token)
+        elif _beauty_query_prefers_treatment(raw):
+            for token in ("treatment", "serum", "niacinamide", "salicylic"):
+                _add(token)
+        else:
+            for token in re.findall(r"[a-z0-9]+", raw):
+                if len(token) <= 1:
+                    continue
+                _add(token)
+                if len(terms) >= 4:
+                    break
+        return terms[:4]
+
+    for token in re.findall(r"[a-z0-9]+", raw):
+        if len(token) <= 1:
+            continue
+        _add(token)
+        if len(terms) >= 4:
+            break
+    return terms[:4]
+
+
 def _has_beauty_retrieval_signal(text: Optional[str]) -> bool:
     raw = str(text or "").strip().lower()
     if not raw:
@@ -2655,6 +2699,25 @@ async def _search_products_fast_mode(
         params["merchant_ids"] = merchant_scope
     if not allow_stale_cache:
         where_clauses.append("(pc.expires_at IS NULL OR pc.expires_at > NOW())")
+    cache_query_terms = _build_fast_mode_cache_query_terms(
+        normalized_query=normalized_query,
+        query_semantic_class=query_semantic_class,
+    )
+    if cache_query_terms:
+        cache_where_parts: List[str] = []
+        for idx, term in enumerate(cache_query_terms):
+            key = f"cache_like_{idx}"
+            params[key] = f"%{term.lower()}%"
+            cache_where_parts.append(
+                "("
+                + "LOWER(COALESCE(pc.product_data->>'title','')) LIKE :" + key
+                + " OR LOWER(COALESCE(pc.product_data->>'description','')) LIKE :" + key
+                + " OR LOWER(COALESCE(pc.product_data->>'product_type','')) LIKE :" + key
+                + " OR LOWER(COALESCE(pc.product_data->>'vendor','')) LIKE :" + key
+                + " OR LOWER(CAST(pc.product_data AS TEXT)) LIKE :" + key
+                + ")"
+            )
+        where_clauses.append("(" + " OR ".join(cache_where_parts) + ")")
 
     if AGENT_SEARCH_FAST_MODE_SKIP_MERCHANT_JOIN:
         rows = await database.fetch_all(

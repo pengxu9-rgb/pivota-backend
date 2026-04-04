@@ -320,6 +320,72 @@ def test_agent_search_beauty_surface_defaults_to_unified_external_seed_strategy(
     assert payload["metadata"]["source_breakdown"]["strategy_applied"] == "unified_relevance"
 
 
+def test_agent_search_fast_mode_beauty_query_applies_cache_prefilter_terms(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    merchant_rows = [{"merchant_id": "merch_1", "business_name": "Merchant One"}]
+    observed = {}
+    product_rows = [
+        {
+            "merchant_id": "merch_1",
+            "merchant_name": "Merchant One",
+            "product_data": {
+                "id": "prod_sunscreen_1",
+                "product_id": "prod_sunscreen_1",
+                "title": "Lightweight Face Sunscreen SPF 50",
+                "description": "broad spectrum sunscreen for oily skin",
+                "product_type": "sunscreen",
+                "category": "face sunscreen",
+                "price": 24,
+                "currency": "USD",
+                "in_stock": True,
+            },
+            "cached_at": "2026-02-20T00:00:00Z",
+            "expires_at": "2026-02-28T00:00:00Z",
+        }
+    ]
+
+    async def fake_fetch_all(query, values=None):
+        text = str(query)
+        if "SELECT merchant_id, business_name FROM merchant_onboarding" in text:
+            return merchant_rows
+        if "FROM products_cache pc" in text and "ORDER BY pc.cached_at" in text:
+            observed["query"] = text
+            observed["values"] = dict(values or {})
+            return product_rows
+        return []
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api_module, "log_agent_request", AsyncMock(return_value=None))
+
+    response = client.get(
+        "/agent/v1/products/search",
+        params={
+            "query": "best sunscreen for oily skin",
+            "catalog_surface": "beauty",
+            "limit": 10,
+            "offset": 0,
+            "search_all_merchants": "true",
+            "fast_mode": "true",
+            "allow_external_seed": "false",
+            "allow_stale_cache": "false",
+        },
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["products"][0]["product_id"] == "prod_sunscreen_1"
+    values = observed.get("values") or {}
+    like_values = {key: value for key, value in values.items() if str(key).startswith("cache_like_")}
+    assert like_values
+    assert "%sunscreen%" in like_values.values()
+    assert "%spf%" in like_values.values()
+    assert "LOWER(COALESCE(pc.product_data->>'title','')) LIKE :cache_like_0" in observed.get("query", "")
+
+
 def test_agent_search_standard_beauty_prefers_sunscreen_over_serum_candidates(
     monkeypatch: pytest.MonkeyPatch,
     client: TestClient,
