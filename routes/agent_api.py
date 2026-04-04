@@ -2118,9 +2118,14 @@ def _should_cache_external_seed_result(
         return True
     if not isinstance(metrics, dict):
         return False
+    query_semantic_class = str(metrics.get("query_semantic_class") or "").strip().lower()
+    if query_semantic_class == "beauty":
+        return False
     if bool(metrics.get("query_timeout") or False):
         return False
     if bool(metrics.get("budget_exhausted") or False):
+        return False
+    if int(metrics.get("rows_fetched") or 0) > 0 and int(metrics.get("rows_built") or 0) <= 0:
         return False
     skip_reason = str(metrics.get("skip_reason") or "").strip()
     if skip_reason in {"seed_loader_error", "seed_table_missing"}:
@@ -2210,6 +2215,10 @@ async def _load_external_seed_products_with_cache(
     metrics.setdefault("query_timeout", False)
     metrics.setdefault("rows_fetched", 0)
     metrics.setdefault("rows_built", 0)
+    metrics.setdefault(
+        "query_semantic_class",
+        str(query_semantic_class or "default").strip().lower() or "default",
+    )
     metrics.setdefault("budget_exhausted", False)
     metrics.setdefault("brand_strict_rows", 0)
     metrics.setdefault("brand_relevant_rows", 0)
