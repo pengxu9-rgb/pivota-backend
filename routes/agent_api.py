@@ -680,6 +680,33 @@ def _increment_external_seed_metric_reason(
     )
 
 
+def _merge_external_seed_metric_bucket(
+    metrics_out: Optional[Dict[str, Any]],
+    bucket_name: str,
+    bucket_values: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(metrics_out, dict):
+        return
+    if not isinstance(bucket_values, dict):
+        return
+    normalized_bucket = str(bucket_name or "").strip()
+    if not normalized_bucket:
+        return
+    existing = metrics_out.get(normalized_bucket)
+    if not isinstance(existing, dict):
+        existing = {}
+    merged = dict(existing)
+    for key, raw_value in bucket_values.items():
+        normalized_key = str(key or "").strip().lower()
+        if not normalized_key:
+            continue
+        merged[normalized_key] = max(0, int(merged.get(normalized_key) or 0)) + max(
+            0,
+            int(raw_value or 0),
+        )
+    metrics_out[normalized_bucket] = merged
+
+
 def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -> bool:
     pid = str(profile_id or "").strip().lower()
     if not pid or pid == "default":
@@ -1414,6 +1441,11 @@ def _build_route_health(
             if isinstance(seed_health.get("external_seed_build_exception_reasons"), dict)
             else {}
         ),
+        "external_seed_build_null_reasons": (
+            dict(seed_health.get("external_seed_build_null_reasons"))
+            if isinstance(seed_health.get("external_seed_build_null_reasons"), dict)
+            else {}
+        ),
         "external_seed_candidate_rows": max(0, int(seed_health.get("external_seed_candidate_rows") or 0)),
         "external_seed_build_tasks_started": max(0, int(seed_health.get("external_seed_build_tasks_started") or 0)),
         "external_seed_build_deadline_skips": max(0, int(seed_health.get("external_seed_build_deadline_skips") or 0)),
@@ -1598,6 +1630,14 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     route_health["external_seed_build_exception_reasons"] = (
         dict(build_exception_reasons) if isinstance(build_exception_reasons, dict) else {}
     )
+    build_null_reasons = (
+        route_health.get("external_seed_build_null_reasons")
+        if route_health.get("external_seed_build_null_reasons") is not None
+        else md.get("external_seed_build_null_reasons")
+    )
+    route_health["external_seed_build_null_reasons"] = (
+        dict(build_null_reasons) if isinstance(build_null_reasons, dict) else {}
+    )
     route_health["external_seed_candidate_rows"] = _int_non_negative(
         route_health.get("external_seed_candidate_rows")
         if route_health.get("external_seed_candidate_rows") is not None
@@ -1738,6 +1778,7 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
     md["external_seed_build_drop_reasons"] = route_health["external_seed_build_drop_reasons"]
     md["external_seed_build_exception_reasons"] = route_health["external_seed_build_exception_reasons"]
+    md["external_seed_build_null_reasons"] = route_health["external_seed_build_null_reasons"]
     md["external_seed_candidate_rows"] = route_health["external_seed_candidate_rows"]
     md["external_seed_build_tasks_started"] = route_health["external_seed_build_tasks_started"]
     md["external_seed_build_deadline_skips"] = route_health["external_seed_build_deadline_skips"]
@@ -1794,6 +1835,7 @@ def _new_external_seed_health() -> Dict[str, Any]:
         "external_seed_broad_scope_rows": 0,
         "external_seed_build_drop_reasons": {},
         "external_seed_build_exception_reasons": {},
+        "external_seed_build_null_reasons": {},
         "external_seed_candidate_rows": 0,
         "external_seed_build_tasks_started": 0,
         "external_seed_build_deadline_skips": 0,
@@ -1917,6 +1959,18 @@ def _apply_external_seed_metrics(
                 continue
             merged_exception_reasons[normalized_key] = max(0, int(raw_value or 0))
         external_seed_health["external_seed_build_exception_reasons"] = merged_exception_reasons
+    build_null_reasons = metrics.get("build_null_reasons")
+    if isinstance(build_null_reasons, dict):
+        existing_null_reasons = external_seed_health.get("external_seed_build_null_reasons")
+        if not isinstance(existing_null_reasons, dict):
+            existing_null_reasons = {}
+        merged_null_reasons: Dict[str, int] = dict(existing_null_reasons)
+        for key, raw_value in build_null_reasons.items():
+            normalized_key = str(key or "").strip().lower()
+            if not normalized_key:
+                continue
+            merged_null_reasons[normalized_key] = max(0, int(raw_value or 0))
+        external_seed_health["external_seed_build_null_reasons"] = merged_null_reasons
     external_seed_health["external_seed_candidate_rows"] = max(
         0,
         int(
@@ -3073,6 +3127,7 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("stage_b_timeout", False)
         metrics.setdefault("build_drop_reasons", {})
         metrics.setdefault("build_exception_reasons", {})
+        metrics.setdefault("build_null_reasons", {})
         metrics.setdefault("candidate_rows", 0)
         metrics.setdefault("build_tasks_started", 0)
         metrics.setdefault("build_deadline_skips", 0)
@@ -3326,13 +3381,27 @@ async def _load_external_seed_products_for_search(
                 if metrics is not None:
                     metrics["build_deadline_skips"] = int(metrics.get("build_deadline_skips") or 0) + 1
                 return None
+            task_metrics: Dict[str, Any] = {}
             try:
-                return await _build_external_seed_product(
+                product = await _build_external_seed_product(
                     req=req,
                     seed_row=seed_row,
                     allowed_domains=None,
-                    metrics_out=metrics,
+                    metrics_out=task_metrics,
                 )
+                if metrics is not None:
+                    _merge_external_seed_metric_bucket(
+                        metrics,
+                        "build_drop_reasons",
+                        task_metrics.get("build_drop_reasons"),
+                    )
+                if product is None and not (task_metrics.get("build_drop_reasons") or {}):
+                    _increment_external_seed_metric_bucket_reason(
+                        metrics,
+                        "build_null_reasons",
+                        "null_without_drop_reason",
+                    )
+                return product
             except Exception as exc:
                 _increment_external_seed_metric_bucket_reason(
                     metrics,
