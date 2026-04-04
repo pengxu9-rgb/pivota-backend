@@ -95,6 +95,7 @@ async def test_agent_api_build_external_seed_product_skips_blocked_referral_seed
 
     monkeypatch.setattr(agent_api_module, "should_block_external_referral_runtime", fake_gate)
 
+    metrics = {}
     product = await agent_api_module._build_external_seed_product(
         req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
         seed_row={
@@ -107,10 +108,11 @@ async def test_agent_api_build_external_seed_product_skips_blocked_referral_seed
             "seed_data": {},
         },
         allowed_domains=[],
-        metrics_out={},
+        metrics_out=metrics,
     )
 
     assert product is None
+    assert metrics["build_drop_reasons"]["blocked_referral_runtime"] == 1
 
 
 @pytest.mark.asyncio
@@ -125,6 +127,7 @@ async def test_agent_api_build_external_seed_product_uses_canonical_url_when_des
         AsyncMock(return_value=(False, None)),
     )
 
+    metrics = {}
     product = await agent_api_module._build_external_seed_product(
         req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
         seed_row={
@@ -137,13 +140,14 @@ async def test_agent_api_build_external_seed_product_uses_canonical_url_when_des
             "seed_data": {"title": "Fallback Canonical Product"},
         },
         allowed_domains=[],
-        metrics_out={},
+        metrics_out=metrics,
     )
 
     assert product is not None
     assert product["destination_url"] == "https://example.com/p/2"
     assert product["external_url"] == "https://example.com/p/2"
     assert "/r?token=" in product["external_redirect_url"]
+    assert metrics.get("build_drop_reasons", {}) == {}
 
 
 @pytest.mark.asyncio

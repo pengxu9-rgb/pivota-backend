@@ -649,6 +649,22 @@ def _derive_external_seed_cache_hit(
     return bool(cache_hit) or reason_token == "cache_hit"
 
 
+def _increment_external_seed_metric_reason(
+    metrics_out: Optional[Dict[str, Any]],
+    reason: str,
+) -> None:
+    if not isinstance(metrics_out, dict):
+        return
+    normalized_reason = str(reason or "").strip().lower()
+    if not normalized_reason:
+        return
+    counter = metrics_out.get("build_drop_reasons")
+    if not isinstance(counter, dict):
+        counter = {}
+    counter[normalized_reason] = max(0, int(counter.get(normalized_reason) or 0)) + 1
+    metrics_out["build_drop_reasons"] = counter
+
+
 def _passes_retrieval_profile_filter(product: Dict[str, Any], profile_id: str) -> bool:
     pid = str(profile_id or "").strip().lower()
     if not pid or pid == "default":
@@ -1538,6 +1554,14 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
         if route_health.get("external_seed_broad_scope_rows") is not None
         else md.get("external_seed_broad_scope_rows")
     )
+    build_drop_reasons = (
+        route_health.get("external_seed_build_drop_reasons")
+        if route_health.get("external_seed_build_drop_reasons") is not None
+        else md.get("external_seed_build_drop_reasons")
+    )
+    route_health["external_seed_build_drop_reasons"] = (
+        dict(build_drop_reasons) if isinstance(build_drop_reasons, dict) else {}
+    )
     route_health["internal_raw_count"] = _int_non_negative(
         route_health.get("internal_raw_count")
         if route_health.get("internal_raw_count") is not None
@@ -1661,6 +1685,7 @@ def _finalize_search_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, A
     md["external_seed_brand_relevant_rows"] = route_health["external_seed_brand_relevant_rows"]
     md["external_seed_broad_fallback_used"] = route_health["external_seed_broad_fallback_used"]
     md["external_seed_broad_scope_rows"] = route_health["external_seed_broad_scope_rows"]
+    md["external_seed_build_drop_reasons"] = route_health["external_seed_build_drop_reasons"]
     md["external_seed_returned_count"] = route_health["external_seed_returned_count"]
     md["internal_raw_count"] = route_health["internal_raw_count"]
     md["external_raw_count"] = route_health["external_raw_count"]
@@ -1712,6 +1737,7 @@ def _new_external_seed_health() -> Dict[str, Any]:
         "external_seed_brand_relevant_rows": 0,
         "external_seed_broad_fallback_used": False,
         "external_seed_broad_scope_rows": 0,
+        "external_seed_build_drop_reasons": {},
         "domain_filter_dropped_external": 0,
         "external_fill_gate_reason": None,
         "query_semantic_class": "default",
@@ -1808,6 +1834,18 @@ def _apply_external_seed_metrics(
             or 0
         ),
     )
+    build_drop_reasons = metrics.get("build_drop_reasons")
+    if isinstance(build_drop_reasons, dict):
+        existing_drop_reasons = external_seed_health.get("external_seed_build_drop_reasons")
+        if not isinstance(existing_drop_reasons, dict):
+            existing_drop_reasons = {}
+        merged_drop_reasons: Dict[str, int] = dict(existing_drop_reasons)
+        for key, raw_value in build_drop_reasons.items():
+            normalized_key = str(key or "").strip().lower()
+            if not normalized_key:
+                continue
+            merged_drop_reasons[normalized_key] = max(0, int(raw_value or 0))
+        external_seed_health["external_seed_build_drop_reasons"] = merged_drop_reasons
     external_seed_health["domain_filter_dropped_external"] = max(
         0,
         int(
@@ -2641,6 +2679,7 @@ async def _build_external_seed_product(
 ) -> Optional[Dict[str, Any]]:
     seed_id = str(seed_row.get("id") or "").strip()
     if not seed_id:
+        _increment_external_seed_metric_reason(metrics_out, "missing_seed_id")
         return None
 
     market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
@@ -2658,6 +2697,7 @@ async def _build_external_seed_product(
     ):
         destination_url = canonical_url
     if not destination_url:
+        _increment_external_seed_metric_reason(metrics_out, "missing_destination_url")
         return None
     title = seed_data.get("title") or seed_row.get("title") or None
     brand = (
@@ -2711,6 +2751,7 @@ async def _build_external_seed_product(
         or _stable_external_product_id(canonical_url or destination_url)
     )
     if not external_product_id:
+        _increment_external_seed_metric_reason(metrics_out, "missing_external_product_id")
         return None
 
     blocked, _gate_status = await should_block_external_referral_runtime(
@@ -2719,6 +2760,7 @@ async def _build_external_seed_product(
         allowed_domains=allowed_domains,
     )
     if blocked:
+        _increment_external_seed_metric_reason(metrics_out, "blocked_referral_runtime")
         return None
 
     disclosure_text = (
@@ -2735,6 +2777,7 @@ async def _build_external_seed_product(
         destination_url=dest_with_utm,
         allowed_domains=allowed_domains,
     ):
+        _increment_external_seed_metric_reason(metrics_out, "destination_domain_not_allowed")
         return None
 
     token = make_redirect_token(
@@ -2891,6 +2934,7 @@ async def _load_external_seed_products_for_search(
         metrics.setdefault("stage_b_attempted", False)
         metrics.setdefault("stage_b_rows", 0)
         metrics.setdefault("stage_b_timeout", False)
+        metrics.setdefault("build_drop_reasons", {})
 
     normalized_brand_required_terms = _normalize_external_seed_terms_for_cache(
         brand_required_terms if brand_required_terms is not None else brand_terms
