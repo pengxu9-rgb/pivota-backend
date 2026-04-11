@@ -88,6 +88,58 @@ async def test_get_agent_context_still_rejects_unknown_agent_api_key(
     lookup.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_get_agent_context_retries_transient_api_key_lookup_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_auth as module
+
+    calls = {"lookup": 0}
+
+    async def fake_lookup(api_key: str, metrics_out=None):
+        calls["lookup"] += 1
+        if calls["lookup"] == 1:
+            raise module.AgentAuthLookupTransientError("pool is closing")
+        if isinstance(metrics_out, dict):
+            metrics_out["auth_lookup_ms"] = 1
+            metrics_out["auth_cache_hit"] = False
+            metrics_out["auth_source"] = "agent_api_keys_sha256"
+        return {
+            "agent_id": "agent_retry",
+            "agent_name": "Retry Agent",
+            "allowed_merchants": None,
+            "is_active": True,
+            "rate_limit": 100,
+            "daily_quota": 1000,
+        }
+
+    async def fake_rate_limit(*args, **kwargs):
+        return True, 0, 100
+
+    async def fake_daily_quota(*args, **kwargs):
+        return True, 0, 1000
+
+    async def fake_update_stats(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(module, "_INTERNAL_TRUSTED_API_KEYS", ())
+    monkeypatch.setattr(module, "get_agent_by_key", fake_lookup)
+    monkeypatch.setattr(module, "check_rate_limit", fake_rate_limit)
+    monkeypatch.setattr(module, "check_daily_quota", fake_daily_quota)
+    monkeypatch.setattr(module, "update_agent_stats", fake_update_stats)
+
+    request = _request()
+    context = await module.get_agent_context(
+        request,
+        api_key="ak_" + ("b" * 64),
+        checkout_token=None,
+    )
+
+    assert context.agent_id == "agent_retry"
+    assert request.state.agent_auth_source == "agent_api_keys_sha256"
+    assert calls["lookup"] == 2
+
+
 def test_agent_commerce_checkout_accepts_internal_trusted_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
