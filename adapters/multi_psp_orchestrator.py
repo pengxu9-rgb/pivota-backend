@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, Tuple, List
 from decimal import Decimal
 from dataclasses import dataclass
 from datetime import datetime
+import asyncio
 
 from adapters.psp_adapter import PSPAdapter, get_psp_adapter, PaymentIntent
 from db.database import database
@@ -16,6 +17,7 @@ from services.merchant_psp_config_service import (
     fetch_active_merchant_psps,
 )
 from utils.logger import logger
+from utils.transient_errors import is_asyncpg_busy_error
 import hashlib
 
 
@@ -63,10 +65,24 @@ class MultiPSPOrchestrator:
         self.psp_configs = []
 
         try:
-            psps = await fetch_active_merchant_psps(
-                merchant_id=self.merchant_id,
-            )
+            try:
+                psps = await fetch_active_merchant_psps(
+                    merchant_id=self.merchant_id,
+                )
+            except Exception as e:
+                if not is_asyncpg_busy_error(e):
+                    raise
+                logger.warning(
+                    "[MultiPSP] transient asyncpg state loading merchant_psps for %s; retrying once",
+                    self.merchant_id,
+                )
+                await asyncio.sleep(0.05)
+                psps = await fetch_active_merchant_psps(
+                    merchant_id=self.merchant_id,
+                )
         except Exception as e:
+            if is_asyncpg_busy_error(e):
+                raise
             logger.error(f"Failed to load merchant_psps for {self.merchant_id}: {e}")
             psps = []
 

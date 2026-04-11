@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from typing import Awaitable, Callable, Optional, Dict, Any, List, TypeVar
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +28,7 @@ from services.merchant_psp_config_service import (
 )
 from db.database import database
 from utils.logger import logger
+from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-payments"])
 
@@ -37,6 +38,44 @@ AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS = max(
         os.getenv("AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS", "25") or "25"
     ),
 )
+
+_T = TypeVar("_T")
+
+
+async def _with_asyncpg_busy_retry(
+    label: str,
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    attempts: int = 2,
+    base_delay_seconds: float = 0.05,
+) -> _T:
+    """
+    Retry only local DB operations that are safe to replay.
+
+    Do not wrap PSP/Stripe creation with this helper. Once a PSP call may have
+    happened, retry the following DB write independently so idempotency stays
+    anchored to the original PaymentIntent.
+    """
+    last_exc: Optional[BaseException] = None
+    total_attempts = max(1, int(attempts or 1))
+    for attempt in range(total_attempts):
+        try:
+            return await operation()
+        except Exception as exc:
+            if not is_asyncpg_busy_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= total_attempts - 1:
+                break
+            logger.warning(
+                "[AgentPayments] transient asyncpg state during %s; retrying once",
+                label,
+            )
+            try:
+                await asyncio.sleep(max(0.0, base_delay_seconds) * (attempt + 1))
+            except Exception:
+                pass
+    raise db_busy_http_exception() from last_exc
 
 # ============================================================================
 # Request/Response Models
@@ -293,7 +332,10 @@ async def create_payment(
     """
     try:
         # 1. Get order and validate
-        order = await get_order(request.order_id)
+        order = await _with_asyncpg_busy_retry(
+            "order lookup",
+            lambda: get_order(request.order_id),
+        )
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         
@@ -445,11 +487,14 @@ async def create_payment(
         # 3. Check idempotency
         if request.idempotency_key:
             # Check if payment with this key already exists
-            existing = await database.fetch_one(
-                """SELECT payment_id, payment_intent_id, status 
-                   FROM payments 
-                   WHERE idempotency_key = :key AND order_id = :order_id""",
-                {"key": request.idempotency_key, "order_id": request.order_id}
+            existing = await _with_asyncpg_busy_retry(
+                "payment idempotency lookup",
+                lambda: database.fetch_one(
+                    """SELECT payment_id, payment_intent_id, status
+                       FROM payments
+                       WHERE idempotency_key = :key AND order_id = :order_id""",
+                    {"key": request.idempotency_key, "order_id": request.order_id},
+                ),
             )
             if existing:
                 logger.info(f"Returning existing payment for idempotency key: {request.idempotency_key}")
@@ -525,11 +570,14 @@ async def create_payment(
         routing_service = PaymentRoutingService(database)
         currency_code = order.get("currency", "USD")
 
-        selected_psp, route_config = await routing_service.select_psp(
-            agent_id=context.agent_id,
-            merchant_id=merchant_id,
-            amount=order_total,
-            currency=currency_code,
+        selected_psp, route_config = await _with_asyncpg_busy_retry(
+            "payment route selection",
+            lambda: routing_service.select_psp(
+                agent_id=context.agent_id,
+                merchant_id=merchant_id,
+                amount=order_total,
+                currency=currency_code,
+            ),
         )
 
         logger.info(
@@ -538,7 +586,10 @@ async def create_payment(
         )
 
         # 5. Resolve merchant config and create payment intent with the selected PSP
-        merchant = await get_merchant_onboarding(merchant_id)
+        merchant = await _with_asyncpg_busy_retry(
+            "merchant onboarding lookup",
+            lambda: get_merchant_onboarding(merchant_id),
+        )
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
 
@@ -659,33 +710,42 @@ async def create_payment(
         # 7. Store payment record
         payment_id = f"pay_{payment_intent.id}"
         
-        await database.execute(
-            """INSERT INTO payments 
-               (payment_id, order_id, payment_intent_id, amount, currency, 
-                psp_type, status, idempotency_key, created_at, agent_id)
-               VALUES (:payment_id, :order_id, :intent_id, :amount, :currency,
-                       :psp, :status, :idem_key, :created_at, :agent_id)""",
-            {
-                "payment_id": payment_id,
-                "order_id": request.order_id,
-                "intent_id": payment_intent.id,
-                "amount": float(amount),
-                "currency": currency,
-                "psp": psp_used,
-                "status": status,
-                "idem_key": request.idempotency_key,
-                "created_at": datetime.now(),
-                "agent_id": context.agent_id
-            }
+        await _with_asyncpg_busy_retry(
+            "payment record insert",
+            lambda: database.execute(
+                """INSERT INTO payments
+                   (payment_id, order_id, payment_intent_id, amount, currency,
+                    psp_type, status, idempotency_key, created_at, agent_id)
+                   VALUES (:payment_id, :order_id, :intent_id, :amount, :currency,
+                           :psp, :status, :idem_key, :created_at, :agent_id)
+                   ON CONFLICT (payment_id) DO UPDATE
+                   SET status = EXCLUDED.status,
+                       updated_at = EXCLUDED.created_at""",
+                {
+                    "payment_id": payment_id,
+                    "order_id": request.order_id,
+                    "intent_id": payment_intent.id,
+                    "amount": float(amount),
+                    "currency": currency,
+                    "psp": psp_used,
+                    "status": status,
+                    "idem_key": request.idempotency_key,
+                    "created_at": datetime.now(),
+                    "agent_id": context.agent_id,
+                },
+            ),
         )
         
         # 8. Update order payment status
-        await update_payment_info(
-            order_id=request.order_id,
-            payment_intent_id=payment_intent.id,
-            client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
-            payment_status="processing",
-            psp_used=psp_used,
+        await _with_asyncpg_busy_retry(
+            "order payment info update",
+            lambda: update_payment_info(
+                order_id=request.order_id,
+                payment_intent_id=payment_intent.id,
+                client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
+                payment_status="processing",
+                psp_used=psp_used,
+            ),
         )
 
         # PCS v0.2-b (best-effort): internal payment fact for reducer replay (no PII).
@@ -897,6 +957,8 @@ async def create_payment(
             pass
         raise
     except Exception as e:
+        if is_asyncpg_busy_error(e):
+            raise db_busy_http_exception() from e
         logger.error(f"Payment creation error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Payment processing failed: {str(e)}")
 

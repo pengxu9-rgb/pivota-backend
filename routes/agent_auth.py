@@ -264,7 +264,15 @@ async def get_agent_context(
     try:
         agent = await get_agent_by_key(api_key, metrics_out=auth_metrics)
     except AgentAuthLookupTransientError:
-        raise db_busy_http_exception()
+        logger.warning("[AgentAuth] transient DB state during API key lookup; retrying once")
+        try:
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+        try:
+            agent = await get_agent_by_key(api_key, metrics_out=auth_metrics)
+        except AgentAuthLookupTransientError as exc2:
+            raise db_busy_http_exception() from exc2
     try:
         request.state.agent_auth_lookup_ms = max(0, int(auth_metrics.get("auth_lookup_ms") or 0))
         request.state.agent_auth_cache_hit = bool(auth_metrics.get("auth_cache_hit") or False)
