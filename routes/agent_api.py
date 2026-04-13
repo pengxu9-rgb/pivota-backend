@@ -2445,7 +2445,15 @@ async def _load_external_seed_products_with_cache(
         page_offset=page_offset,
     )
     cached_products = _get_cached_external_seed_products(cache_key)
-    if cached_products is not None:
+    # Unified relevance is recall-first: an empty cache entry is not authoritative,
+    # because it can freeze broad beauty queries at zero external recall after a
+    # transient empty sync. Fall through to a live refresh instead of hard-zeroing.
+    bypass_empty_cache_hit = (
+        cached_products is not None
+        and not cached_products
+        and normalized_seed_strategy == "unified_relevance"
+    )
+    if cached_products is not None and not bypass_empty_cache_hit:
         metrics["executed"] = False
         metrics["skip_reason"] = "cache_hit"
         metrics["cache_hit"] = True
