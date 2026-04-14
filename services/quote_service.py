@@ -534,12 +534,20 @@ class QuoteService:
         if not promotions:
             promotions = await _load_promotions(channel_filter=None)
 
-        # Best-effort: if promotions are still missing, attempt an on-demand Shopify promotions sync,
-        # throttled per merchant. This helps creators see Shopify marketing discounts without requiring
-        # a separate admin sync call.
+        def _has_synced_shopify_promotion_metadata(promos: List[Any]) -> bool:
+            for p in promos or []:
+                cfg = getattr(p, "config", None) or {}
+                if isinstance(cfg, dict) and cfg.get("source") in {"shopify_discount_node", "shopify_price_rule"}:
+                    return True
+            return False
+
+        # Best-effort: if Shopify-native promotion metadata is missing, attempt
+        # an on-demand Shopify promotions sync, throttled per merchant. This
+        # still runs when manual Pivota promos exist, otherwise one manual promo
+        # can permanently mask stale/missing Shopify discount-node metadata.
         auto_sync = os.getenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "1")
         if (
-            not promotions
+            not _has_synced_shopify_promotion_metadata(promotions)
             and auto_sync not in ("0", "false", "False")
             and _should_attempt_shopify_promotions_sync(merchant_id)
         ):
@@ -580,7 +588,8 @@ class QuoteService:
                         "Shopify promotions sync skipped/failed (quote budget)",
                         extra={"merchant_id": merchant_id, "wait_seconds": wait_seconds, "error": str(e)},
                     )
-                    return None
+                    if not promotions:
+                        return None
             else:
                 try:
                     asyncio.create_task(
@@ -595,7 +604,8 @@ class QuoteService:
                         "Failed to schedule Shopify promotions background sync",
                         extra={"merchant_id": merchant_id, "error": str(e)},
                     )
-                return None
+                if not promotions:
+                    return None
 
         if not promotions:
             return None
@@ -708,6 +718,18 @@ class QuoteService:
                 # Apply as an order-level manual adjustment.
                 pricing["discount_total"] = d(pricing.get("discount_total")) + promo_discount
                 pricing["total"] = max(d(pricing.get("total")) - promo_discount, Decimal("0.00"))
+                if isinstance(discount_evidence, dict):
+                    discount_evidence["pricing_confidence"] = "partial"
+                    decisions = discount_evidence.setdefault("decisions", [])
+                    if isinstance(decisions, list):
+                        decisions.append(
+                            {
+                                "promotion_id": getattr(promo, "id", None),
+                                "decision": "applied",
+                                "reason": "pivota_manual_adjustment_not_shopify_allocation",
+                                "source": "pivota_infra",
+                            }
+                        )
 
                 promotion_lines.append(
                     {

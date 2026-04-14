@@ -127,6 +127,64 @@ async def test_quote_service_auto_sync_shopify_promotions_when_missing(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_quote_service_auto_syncs_shopify_metadata_when_only_manual_promo_exists(monkeypatch):
+    svc = QuoteService()
+
+    promo = SimpleNamespace(
+        id="promo_manual",
+        type="MULTI_BUY_DISCOUNT",
+        scope={"global": True},
+        config={"thresholdQuantity": 3, "discountPercent": 10},
+        humanReadableRule="Buy 3, get 10% off",
+        name="Buy 3 deal",
+    )
+
+    calls = {"sync": 0}
+
+    async def fake_list_promotions(*, merchant_id, status, channel=None, creator_id=None, search=None, limit=50, offset=0):
+        return ([promo], 1)
+
+    async def fake_sync_shopify_promotions_for_merchant(*, merchant_id, channel="creator_agents"):
+        calls["sync"] += 1
+        return {"merchantId": merchant_id, "discountNodesFetched": 1, "created": 1, "updated": 0, "skipped": 0}
+
+    monkeypatch.setattr("services.quote_service.list_promotions", fake_list_promotions)
+    monkeypatch.setattr("services.quote_service.sync_shopify_promotions_for_merchant", fake_sync_shopify_promotions_for_merchant)
+    monkeypatch.setattr("services.quote_service._should_attempt_shopify_promotions_sync", lambda _mid: True)
+    monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "1")
+    monkeypatch.setenv("PROMOTIONS_SYNC_QUOTE_WAIT_SECONDS", "1")
+
+    pricing = {
+        "subtotal": Decimal("100.00"),
+        "discount_total": Decimal("0.00"),
+        "shipping_fee": Decimal("0.00"),
+        "tax": Decimal("0.00"),
+        "total": Decimal("100.00"),
+    }
+    promotion_lines = []
+    evidence = {"codes": [], "applications": [], "decisions": [], "pricing_confidence": "authoritative"}
+
+    await svc._apply_infra_promotions_best_effort(
+        merchant_id="merch_1",
+        items=[{"product_id": "p1", "variant_id": "v1", "quantity": 3}],
+        pricing=pricing,
+        line_items=[{"product_id": "p1", "quantity": 3, "unit_price_effective": Decimal("10.00")}],
+        promotion_lines=promotion_lines,
+        discount_evidence=evidence,
+        creator_id="agent_1",
+        channel="creator_agents",
+    )
+
+    assert calls["sync"] == 1
+    assert pricing["discount_total"] == Decimal("3.00")
+    assert pricing["total"] == Decimal("97.00")
+    assert len(promotion_lines) == 1
+    assert evidence["pricing_confidence"] == "partial"
+    assert evidence["decisions"][0]["decision"] == "applied"
+    assert evidence["decisions"][0]["reason"] == "pivota_manual_adjustment_not_shopify_allocation"
+
+
+@pytest.mark.asyncio
 async def test_quote_service_skips_manual_promo_when_shopify_discount_present(monkeypatch):
     svc = QuoteService()
 
