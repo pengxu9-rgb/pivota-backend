@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -63,6 +64,30 @@ def _now_slug() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _redact_url_query(value: str) -> str:
+    lowered = value.lower()
+    if not any(marker in lowered for marker in ("?key=", "&key=", "?token=", "&token=", "access_token=")):
+        return value
+    try:
+        parts = urlsplit(value)
+    except Exception:
+        return value
+    if not parts.query:
+        return value
+    sensitive_keys = {"key", "token", "access_token", "checkout_token", "cart_token"}
+    pairs = []
+    changed = False
+    for key, raw in parse_qsl(parts.query, keep_blank_values=True):
+        if key.lower() in sensitive_keys:
+            pairs.append((key, "[redacted]"))
+            changed = True
+        else:
+            pairs.append((key, raw))
+    if not changed:
+        return value
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs, doseq=True), parts.fragment))
+
+
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         out: Dict[str, Any] = {}
@@ -70,6 +95,10 @@ def _redact(value: Any) -> Any:
             key = str(k).lower()
             if any(token in key for token in ("token", "api_key", "authorization", "access_token", "secret")):
                 out[k] = "[redacted]"
+            elif key == "checkout_url" and isinstance(v, str):
+                out[k] = "[redacted_checkout_url]"
+            elif key == "engine_ref" and isinstance(v, str) and "cart" in v.lower():
+                out[k] = "[redacted_cart_reference]"
             elif key in {"customer_email", "email"} and isinstance(v, str) and "@" in v:
                 local, _, domain = v.partition("@")
                 out[k] = f"{local[:2]}***@{domain}"
@@ -78,6 +107,8 @@ def _redact(value: Any) -> Any:
         return out
     if isinstance(value, list):
         return [_redact(v) for v in value]
+    if isinstance(value, str):
+        return _redact_url_query(value)
     return value
 
 
