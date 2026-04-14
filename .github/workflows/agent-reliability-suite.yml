@@ -2,6 +2,27 @@ name: Agent Reliability Suite
 
 on:
   workflow_dispatch:
+    inputs:
+      run_shopify_discount_validation:
+        description: "Run Shopify discount validation. Defaults to dev/test unless live no-order mode is explicitly allowed."
+        required: true
+        default: false
+        type: boolean
+      allow_remote_dev_url:
+        description: "Allow a non-localhost validation base URL."
+        required: true
+        default: false
+        type: boolean
+      allow_live_no_order:
+        description: "Allow live quote/cart validation only. Blocks Shopify order creation and payment paths."
+        required: true
+        default: false
+        type: boolean
+      include_shopify_order_create:
+        description: "Also run quote-to-order create. Dev/test only; incompatible with live no-order mode."
+        required: true
+        default: false
+        type: boolean
   pull_request:
     paths:
       - "routes/**"
@@ -14,6 +35,7 @@ on:
 
 jobs:
   quick-reliability:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.run_shopify_discount_validation }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -45,3 +67,101 @@ jobs:
       - name: Run quick reliability suite
         run: |
           ./scripts/run_agent_reliability_suite.sh quick
+
+  shopify-discount-dev-store:
+    name: Shopify discount validation
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shopify_discount_validation }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SHOPIFY_DISCOUNT_TEST_BASE_URL: ${{ secrets.SHOPIFY_DISCOUNT_TEST_BASE_URL || vars.SHOPIFY_DISCOUNT_TEST_BASE_URL }}
+      SHOPIFY_DISCOUNT_TEST_MERCHANT_ID: ${{ secrets.SHOPIFY_DISCOUNT_TEST_MERCHANT_ID || vars.SHOPIFY_DISCOUNT_TEST_MERCHANT_ID }}
+      SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY: ${{ secrets.SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY }}
+      SHOPIFY_DISCOUNT_TEST_PRODUCT_ID: ${{ secrets.SHOPIFY_DISCOUNT_TEST_PRODUCT_ID || vars.SHOPIFY_DISCOUNT_TEST_PRODUCT_ID }}
+      SHOPIFY_DISCOUNT_TEST_VARIANT_ID: ${{ secrets.SHOPIFY_DISCOUNT_TEST_VARIANT_ID || vars.SHOPIFY_DISCOUNT_TEST_VARIANT_ID }}
+      SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL: ${{ secrets.SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL || vars.SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL }}
+      SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE || vars.SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE }}
+      SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED: ${{ vars.SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED }}
+      SHOPIFY_DISCOUNT_TEST_BXGY_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_BXGY_CODE || vars.SHOPIFY_DISCOUNT_TEST_BXGY_CODE }}
+      SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY: ${{ vars.SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY }}
+      SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE || vars.SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE }}
+      SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE || vars.SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE }}
+      SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE || vars.SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE }}
+      SHOPIFY_DISCOUNT_TEST_ACTIVE_WINDOW_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_ACTIVE_WINDOW_CODE || vars.SHOPIFY_DISCOUNT_TEST_ACTIVE_WINDOW_CODE }}
+      SHOPIFY_DISCOUNT_TEST_INACTIVE_WINDOW_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_INACTIVE_WINDOW_CODE || vars.SHOPIFY_DISCOUNT_TEST_INACTIVE_WINDOW_CODE }}
+      SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A: ${{ secrets.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A || vars.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A }}
+      SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B: ${{ secrets.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B || vars.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B }}
+      SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A || vars.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A }}
+      SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B || vars.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Validate required fixtures
+        shell: bash
+        run: |
+          if [[ "${{ inputs.allow_live_no_order }}" == "true" && "${{ inputs.include_shopify_order_create }}" == "true" ]]; then
+            echo "Live quote/cart validation cannot include Shopify order creation." >&2
+            exit 1
+          fi
+
+          missing=()
+          for key in \
+            SHOPIFY_DISCOUNT_TEST_BASE_URL \
+            SHOPIFY_DISCOUNT_TEST_MERCHANT_ID \
+            SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY \
+            SHOPIFY_DISCOUNT_TEST_VARIANT_ID
+          do
+            if [[ -z "${!key:-}" ]]; then
+              missing+=("$key")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing required Shopify discount validation fixture env vars:\n' >&2
+            printf ' - %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+      - name: Run Shopify discount validation
+        shell: bash
+        run: |
+          output_dir="artifacts/shopify-discount-validation/${GITHUB_RUN_ID}"
+          cmd=(
+            python3 scripts/validate_shopify_discounts.py
+            --output-dir "$output_dir"
+          )
+          if [[ "${{ inputs.allow_live_no_order }}" == "true" ]]; then
+            cmd+=(--allow-live-no-order)
+          else
+            cmd+=(--allow-dev-store)
+          fi
+          if [[ "${{ inputs.allow_remote_dev_url }}" == "true" || "${{ inputs.allow_live_no_order }}" == "true" ]]; then
+            cmd+=(--allow-remote)
+          fi
+          if [[ "${{ inputs.include_shopify_order_create }}" == "true" ]]; then
+            export SHOPIFY_DISCOUNT_TEST_ORDER_CREATE=1
+            cmd+=(--include-order-create)
+          fi
+          "${cmd[@]}"
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopify-discount-validation-${{ github.run_id }}
+          path: artifacts/shopify-discount-validation/**
+          if-no-files-found: ignore

@@ -25,6 +25,7 @@ class ShopifyPricingResult:
     line_items: List[Dict[str, Any]]
     delivery_options: Optional[List[Dict[str, Any]]]
     debug: Dict[str, Any]
+    discount_evidence: Optional[Dict[str, Any]] = None
 
 
 class ShopifyPricingError(Exception):
@@ -180,6 +181,12 @@ class ShopifyPricingService:
         promotion_lines, rounding_meta = self._extract_promotion_lines(
             checkout=checkout, discount_total=pricing["discount_total"]
         )
+        discount_evidence = self._build_discount_evidence(
+            submitted_codes=discount_codes,
+            promotion_lines=promotion_lines,
+            discount_total=pricing["discount_total"],
+            source="shopify_rest_checkout",
+        )
         line_items = await self._extract_line_items(
             merchant_id=merchant_id,
             store=store,
@@ -214,7 +221,57 @@ class ShopifyPricingService:
             line_items=line_items,
             delivery_options=delivery_options,
             debug=debug,
+            discount_evidence=discount_evidence,
         )
+
+    def _build_discount_evidence(
+        self,
+        *,
+        submitted_codes: List[str],
+        promotion_lines: List[Dict[str, Any]],
+        discount_total: Decimal,
+        source: str,
+    ) -> Dict[str, Any]:
+        applied_codes = {
+            str(pl.get("code") or "").strip().upper()
+            for pl in promotion_lines or []
+            if str(pl.get("method") or "").lower() == "code" and str(pl.get("code") or "").strip()
+        }
+        codes: List[Dict[str, Any]] = []
+        for code in submitted_codes or []:
+            normalized = str(code or "").strip().upper()
+            if not normalized:
+                continue
+            codes.append(
+                {
+                    "code": normalized,
+                    "applicable": True if normalized in applied_codes else None,
+                    "source": source,
+                }
+            )
+
+        applications: List[Dict[str, Any]] = []
+        for pl in promotion_lines or []:
+            applications.append(
+                {
+                    "id": pl.get("id"),
+                    "source": pl.get("source") or "shopify",
+                    "source_ref": pl.get("source_ref"),
+                    "discount_class": pl.get("discount_class"),
+                    "method": pl.get("method"),
+                    "label": pl.get("label"),
+                    "code": pl.get("code"),
+                    "amount": str(pl.get("amount")),
+                }
+            )
+
+        return {
+            "source": source,
+            "codes": codes,
+            "applications": applications,
+            "decisions": [],
+            "pricing_confidence": "authoritative" if Decimal(str(discount_total or "0")) > 0 or not submitted_codes else "partial",
+        }
 
     def _build_checkout_payload(
         self,

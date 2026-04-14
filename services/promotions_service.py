@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 
 from pydantic import BaseModel, Field, validator
-from sqlalchemy import and_, desc, func, select, update
+from sqlalchemy import and_, desc, func, or_, select, update
 
 from db.database import database, promotions
 
@@ -34,7 +34,7 @@ class PromotionBase(BaseModel):
     type: str  # 'FLASH_SALE' | 'MULTI_BUY_DISCOUNT' | 'FREE_SHIPPING'
     description: Optional[str] = ""
     startAt: datetime
-    endAt: datetime
+    endAt: Optional[datetime] = None
     channels: List[str] = Field(default_factory=list)
     scope: Dict[str, Any] = Field(default_factory=dict)
     config: Dict[str, Any] = Field(default_factory=dict)
@@ -61,8 +61,8 @@ class PromotionBase(BaseModel):
 
     @validator("endAt", pre=False, always=True)
     def normalize_and_validate_end_at(
-        cls, end_at: datetime, values: Dict[str, Any]
-    ) -> datetime:
+        cls, end_at: Optional[datetime], values: Dict[str, Any]
+    ) -> Optional[datetime]:
         if isinstance(end_at, datetime):
             end_at = _normalize_dt(end_at)
         start_at = values.get("startAt")
@@ -202,10 +202,11 @@ async def list_promotions(
         # We filter by time window at DB level to reduce rows.
         if status == PromotionStatus.ACTIVE:
             conditions.append(promotions.c.start_at <= now)
-            conditions.append(promotions.c.end_at > now)
+            conditions.append(or_(promotions.c.end_at.is_(None), promotions.c.end_at > now))
         elif status == PromotionStatus.UPCOMING:
             conditions.append(promotions.c.start_at > now)
         elif status == PromotionStatus.ENDED:
+            conditions.append(promotions.c.end_at.is_not(None))
             conditions.append(promotions.c.end_at <= now)
 
     # channel / creatorId / search can be refined later; for now we do simple filtering in Python
@@ -258,9 +259,11 @@ async def create_promotion(data: PromotionCreate) -> PromotionOut:
     if cfg.get("kind") not in (ptype,):
         cfg["kind"] = ptype
     if ptype == "MULTI_BUY_DISCOUNT":
-        if not cfg.get("thresholdQuantity"):
+        source = cfg.get("source")
+        sync_metadata_only = source in {"shopify_discount_node", "shopify_price_rule"}
+        if not sync_metadata_only and not cfg.get("thresholdQuantity"):
             raise ValueError("thresholdQuantity is required for MULTI_BUY_DISCOUNT")
-        if not cfg.get("discountPercent"):
+        if not sync_metadata_only and not cfg.get("discountPercent"):
             raise ValueError("discountPercent is required for MULTI_BUY_DISCOUNT")
     elif ptype == "FLASH_SALE":
         if cfg.get("flashPrice") is None:

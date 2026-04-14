@@ -84,6 +84,7 @@ class QuotePreviewResponse(BaseModel):
     settlement_currency: Optional[str] = None
     pricing: QuotePricing
     promotion_lines: List[PromotionLine]
+    discount_evidence: Optional[Dict[str, Any]] = None
     line_items: List[QuoteLineItem]
     delivery_options: Optional[List[Dict[str, Any]]] = None
     # Debug helpers (safe): allow clients to understand why an engine was chosen.
