@@ -30,6 +30,7 @@ on:
 
 jobs:
   quick-reliability:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.run_shopify_discount_validation }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
