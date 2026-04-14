@@ -1,9 +1,13 @@
-# Shopify Discount Dev-Store Validation
+# Shopify Discount Validation Gate
 
 Use this gate before merging Shopify discount execution changes. It must target
-only a dev/test Pivota merchant, a Shopify dev/test store, test products, and
-test PSP/order paths. Do not use production stores, live discounts, live
-checkout traffic, live orders, or live credentials.
+a dev/test Pivota merchant by default.
+
+Live validation is allowed only when explicitly requested and only in
+`live_no_order` mode. That mode may exercise live quote/cart paths and live
+discount codes, but it must not create Shopify orders, confirm PSP payments, or
+create/update Shopify discount nodes. Treat Storefront cart validation as live
+cart traffic, not a purely read-only operation.
 
 ## Required fixtures
 
@@ -12,12 +16,12 @@ manual workflow:
 
 | Name | Secret or variable | Notes |
 | --- | --- | --- |
-| `SHOPIFY_DISCOUNT_TEST_BASE_URL` | secret or variable | Pivota dev/test backend URL. Use `allow_remote_dev_url=true` only for non-local dev/test URLs. |
-| `SHOPIFY_DISCOUNT_TEST_MERCHANT_ID` | secret or variable | Dev/test merchant connected to a Shopify dev/test store. |
-| `SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY` | secret | Agent API key for the dev/test backend only. |
+| `SHOPIFY_DISCOUNT_TEST_BASE_URL` | secret or variable | Pivota backend URL. Use dev/test by default; live no-order validation requires explicit merchant approval. |
+| `SHOPIFY_DISCOUNT_TEST_MERCHANT_ID` | secret or variable | Merchant connected to the Shopify store under validation. |
+| `SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY` | secret | Agent API key for the selected backend. Do not paste it into logs. |
 | `SHOPIFY_DISCOUNT_TEST_PRODUCT_ID` | secret or variable | Pivota product id for the Shopify test product. Optional if the default placeholder is valid for the environment. |
 | `SHOPIFY_DISCOUNT_TEST_VARIANT_ID` | secret or variable | Shopify variant id for the test product. Required. |
-| `SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL` | secret or variable | Test buyer email. Use an address safe for dev-store customer lookup. |
+| `SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL` | secret or variable | Test buyer email. Use an address approved for the selected merchant/store. |
 
 Configure scenario fixtures as available:
 
@@ -42,7 +46,7 @@ Configure scenario fixtures as available:
 The validation job is embedded in `Agent Reliability Suite` so it can be
 dispatched against a PR branch before this branch is merged to `main`.
 
-Run read-only quote validation:
+Run dev/test quote validation:
 
 ```bash
 gh workflow run agent-reliability-suite.yml \
@@ -50,11 +54,24 @@ gh workflow run agent-reliability-suite.yml \
   --ref codex/shopify-discount-repair-20260414 \
   -f run_shopify_discount_validation=true \
   -f allow_remote_dev_url=true \
+  -f allow_live_no_order=false \
+  -f include_shopify_order_create=false
+```
+
+Run live quote/cart validation only after the merchant has approved live testing:
+
+```bash
+gh workflow run agent-reliability-suite.yml \
+  --repo pengxu9-rgb/pivota-backend \
+  --ref codex/shopify-discount-repair-20260414 \
+  -f run_shopify_discount_validation=true \
+  -f allow_remote_dev_url=true \
+  -f allow_live_no_order=true \
   -f include_shopify_order_create=false
 ```
 
 Run quote-to-order validation only after the merchant, Shopify store, and test
-PSP path are confirmed safe:
+PSP path are confirmed safe. Do not combine this with `allow_live_no_order=true`:
 
 ```bash
 gh workflow run agent-reliability-suite.yml \
@@ -62,6 +79,7 @@ gh workflow run agent-reliability-suite.yml \
   --ref codex/shopify-discount-repair-20260414 \
   -f run_shopify_discount_validation=true \
   -f allow_remote_dev_url=true \
+  -f allow_live_no_order=false \
   -f include_shopify_order_create=true
 ```
 
@@ -70,13 +88,22 @@ Evidence is written under `artifacts/shopify-discount-validation/<run_id>/`.
 
 ## Local run
 
-Use local runs only when the shell is configured with dev/test fixtures:
+Use local runs with dev/test fixtures:
 
 ```bash
 python3 scripts/validate_shopify_discounts.py \
   --allow-dev-store \
   --allow-remote \
   --output-dir artifacts/shopify-discount-validation/local
+```
+
+Use local live quote/cart validation only with merchant-approved fixtures:
+
+```bash
+python3 scripts/validate_shopify_discounts.py \
+  --allow-live-no-order \
+  --allow-remote \
+  --output-dir artifacts/shopify-discount-validation/live-no-order
 ```
 
 For order creation:
@@ -89,6 +116,8 @@ python3 scripts/validate_shopify_discounts.py \
   --include-order-create \
   --output-dir artifacts/shopify-discount-validation/local-order-create
 ```
+
+The harness blocks `--include-order-create` when `--allow-live-no-order` is set.
 
 ## Pass criteria
 
@@ -110,7 +139,8 @@ Required before converting the PR out of draft:
 
 ## Release decision
 
-Keep `SHOPIFY_DISCOUNT_RECONCILIATION_MODE=observe` while collecting dev-store
+Keep `SHOPIFY_DISCOUNT_RECONCILIATION_MODE=observe` while collecting validation
 evidence. Pilot merchants must use `SHOPIFY_DISCOUNT_RECONCILIATION_MODE=fail_closed`
-and merchant allowlisting. Production rollout remains blocked until dev-store
-validation artifacts show the checkout/order totals match the Pivota quote.
+and merchant allowlisting before any order/payment path is enabled. Production
+order creation remains blocked until dev-store quote-to-order artifacts show the
+Shopify order totals match the Pivota quote and PSP transaction.

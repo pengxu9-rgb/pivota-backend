@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Dev-store Shopify discount validation harness.
+"""Shopify discount validation harness.
 
 This script drives Pivota's quote API and captures redacted evidence. It does
-not use production credentials by default, and order creation is disabled unless
-both an explicit CLI flag and env gate are present.
+not use production credentials by default. Live quote/cart validation requires
+an explicit flag, and order creation is disabled unless both an explicit CLI flag
+and env gate are present for a dev/test target.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ class Scenario:
 
 
 def _args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate Shopify discounts against a dev/test Pivota merchant.")
+    parser = argparse.ArgumentParser(description="Validate Shopify discounts against an explicitly approved Pivota merchant.")
     parser.add_argument("--base-url", default=os.getenv("SHOPIFY_DISCOUNT_TEST_BASE_URL") or os.getenv("PIVOTA_BASE_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--merchant-id", default=os.getenv("SHOPIFY_DISCOUNT_TEST_MERCHANT_ID"))
     parser.add_argument("--agent-api-key", default=os.getenv("SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY") or os.getenv("PIVOTA_AGENT_API_KEY"))
@@ -41,9 +42,19 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--variant-id", default=os.getenv("SHOPIFY_DISCOUNT_TEST_VARIANT_ID"))
     parser.add_argument("--customer-email", default=os.getenv("SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL", "shopify-discount-test@example.com"))
     parser.add_argument("--currency", default=os.getenv("SHOPIFY_DISCOUNT_TEST_CURRENCY", "USD"))
-    parser.add_argument("--allow-dev-store", action="store_true", help="Required acknowledgement that only a dev/test Shopify store is targeted.")
-    parser.add_argument("--allow-remote", action="store_true", help="Allow non-localhost base URLs. Do not use this for production.")
-    parser.add_argument("--include-order-create", action="store_true", help="Also call agent order create for a successful quote.")
+    parser.add_argument("--allow-dev-store", action="store_true", help="Acknowledge that only a dev/test Shopify store is targeted.")
+    parser.add_argument(
+        "--allow-live-no-order",
+        action="store_true",
+        help="Acknowledge live quote/cart validation is approved. Blocks order creation and payment paths.",
+    )
+    parser.add_argument(
+        "--allow-live-readonly",
+        action="store_true",
+        help="Alias for --allow-live-no-order.",
+    )
+    parser.add_argument("--allow-remote", action="store_true", help="Allow non-localhost base URLs.")
+    parser.add_argument("--include-order-create", action="store_true", help="Also call agent order create for a successful quote. Dev/test only.")
     parser.add_argument("--output-dir", default=os.getenv("SHOPIFY_DISCOUNT_VALIDATION_OUTPUT_DIR"))
     return parser.parse_args()
 
@@ -247,15 +258,21 @@ async def _post_json(client: httpx.AsyncClient, path: str, body: Dict[str, Any])
 
 
 async def _run(args: argparse.Namespace) -> int:
-    if not args.allow_dev_store:
-        raise SystemExit("--allow-dev-store is required; this harness must target a dev/test Shopify store only")
+    allow_live_no_order = bool(args.allow_live_no_order or args.allow_live_readonly)
+    if args.allow_dev_store and allow_live_no_order:
+        raise SystemExit("Choose either --allow-dev-store or --allow-live-no-order, not both")
+    if not args.allow_dev_store and not allow_live_no_order:
+        raise SystemExit("--allow-dev-store or --allow-live-no-order is required")
+    if allow_live_no_order and (args.include_order_create or os.getenv("SHOPIFY_DISCOUNT_TEST_ORDER_CREATE") == "1"):
+        raise SystemExit("Live validation is quote/cart only; order creation is blocked with --allow-live-no-order")
     if not args.allow_remote and not args.base_url.startswith(("http://127.0.0.1", "http://localhost")):
-        raise SystemExit("--allow-remote is required for non-local base URLs; do not use it with production")
+        raise SystemExit("--allow-remote is required for non-local base URLs")
     if not args.merchant_id or not args.agent_api_key or not args.variant_id:
         raise SystemExit("merchant id, agent API key, and variant id are required")
     if args.include_order_create and os.getenv("SHOPIFY_DISCOUNT_TEST_ORDER_CREATE") != "1":
         raise SystemExit("SHOPIFY_DISCOUNT_TEST_ORDER_CREATE=1 is required with --include-order-create")
 
+    validation_mode = "live_no_order" if allow_live_no_order else "dev_store"
     output_dir = Path(args.output_dir or f"artifacts/shopify-discount-validation/{_now_slug()}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -296,6 +313,7 @@ async def _run(args: argparse.Namespace) -> int:
                 json.dumps(
                     {
                         "scenario": scenario.__dict__,
+                        "validation_mode": validation_mode,
                         "request": _redact(request_body),
                         "status_code": status_code,
                         "response": _redact(payload),
@@ -348,6 +366,7 @@ async def _run(args: argparse.Namespace) -> int:
                 artifact.write_text(
                     json.dumps(
                         {
+                            "validation_mode": validation_mode,
                             "request": _redact(order_body),
                             "status_code": status_code,
                             "response": _redact(payload),
@@ -374,13 +393,15 @@ async def _run(args: argparse.Namespace) -> int:
                     "scenario_id": "SFD-012",
                     "description": "quote -> order create -> Shopify reconciliation",
                     "status": "blocked",
-                    "actual_result": "order creation intentionally gated; rerun with --include-order-create and SHOPIFY_DISCOUNT_TEST_ORDER_CREATE=1 in a dev store",
+                    "actual_result": "order creation blocked for live quote/cart validation"
+                    if allow_live_no_order
+                    else "order creation intentionally gated; rerun with --include-order-create and SHOPIFY_DISCOUNT_TEST_ORDER_CREATE=1 in a dev store",
                     "evidence_artifact_path": "",
                 }
             )
 
     summary_path = output_dir / "summary.json"
-    summary_path.write_text(json.dumps({"rows": rows}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary_path.write_text(json.dumps({"validation_mode": validation_mode, "rows": rows}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     csv_path = output_dir / "summary.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:

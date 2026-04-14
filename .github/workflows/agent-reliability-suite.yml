@@ -4,17 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       run_shopify_discount_validation:
-        description: "Run Shopify discount dev-store validation. Requires dev/test fixtures."
+        description: "Run Shopify discount validation. Defaults to dev/test unless live no-order mode is explicitly allowed."
         required: true
         default: false
         type: boolean
       allow_remote_dev_url:
-        description: "Allow a non-localhost dev/test base URL. Never use production."
+        description: "Allow a non-localhost validation base URL."
+        required: true
+        default: false
+        type: boolean
+      allow_live_no_order:
+        description: "Allow live quote/cart validation only. Blocks Shopify order creation and payment paths."
         required: true
         default: false
         type: boolean
       include_shopify_order_create:
-        description: "Also run quote-to-order create. Requires a dev/test merchant and test PSP setup."
+        description: "Also run quote-to-order create. Dev/test only; incompatible with live no-order mode."
         required: true
         default: false
         type: boolean
@@ -64,6 +69,7 @@ jobs:
           ./scripts/run_agent_reliability_suite.sh quick
 
   shopify-discount-dev-store:
+    name: Shopify discount validation
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shopify_discount_validation }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -104,9 +110,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Validate required dev-store fixtures
+      - name: Validate required fixtures
         shell: bash
         run: |
+          if [[ "${{ inputs.allow_live_no_order }}" == "true" && "${{ inputs.include_shopify_order_create }}" == "true" ]]; then
+            echo "Live quote/cart validation cannot include Shopify order creation." >&2
+            exit 1
+          fi
+
           missing=()
           for key in \
             SHOPIFY_DISCOUNT_TEST_BASE_URL \
@@ -120,21 +131,25 @@ jobs:
           done
 
           if (( ${#missing[@]} > 0 )); then
-            printf 'Missing required dev-store fixture env vars:\n' >&2
+            printf 'Missing required Shopify discount validation fixture env vars:\n' >&2
             printf ' - %s\n' "${missing[@]}" >&2
             exit 1
           fi
 
-      - name: Run dev-store discount validation
+      - name: Run Shopify discount validation
         shell: bash
         run: |
           output_dir="artifacts/shopify-discount-validation/${GITHUB_RUN_ID}"
           cmd=(
             python3 scripts/validate_shopify_discounts.py
-            --allow-dev-store
             --output-dir "$output_dir"
           )
-          if [[ "${{ inputs.allow_remote_dev_url }}" == "true" ]]; then
+          if [[ "${{ inputs.allow_live_no_order }}" == "true" ]]; then
+            cmd+=(--allow-live-no-order)
+          else
+            cmd+=(--allow-dev-store)
+          fi
+          if [[ "${{ inputs.allow_remote_dev_url }}" == "true" || "${{ inputs.allow_live_no_order }}" == "true" ]]; then
             cmd+=(--allow-remote)
           fi
           if [[ "${{ inputs.include_shopify_order_create }}" == "true" ]]; then
