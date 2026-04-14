@@ -34,7 +34,7 @@ class Scenario:
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate Shopify discounts against a dev/test Pivota merchant.")
-    parser.add_argument("--base-url", default=os.getenv("PIVOTA_BASE_URL", "http://127.0.0.1:8000"))
+    parser.add_argument("--base-url", default=os.getenv("SHOPIFY_DISCOUNT_TEST_BASE_URL") or os.getenv("PIVOTA_BASE_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--merchant-id", default=os.getenv("SHOPIFY_DISCOUNT_TEST_MERCHANT_ID"))
     parser.add_argument("--agent-api-key", default=os.getenv("SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY") or os.getenv("PIVOTA_AGENT_API_KEY"))
     parser.add_argument("--product-id", default=os.getenv("SHOPIFY_DISCOUNT_TEST_PRODUCT_ID", "shopify_test_product"))
