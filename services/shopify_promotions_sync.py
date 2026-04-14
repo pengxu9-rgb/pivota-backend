@@ -2,19 +2,20 @@
 Shopify promotions → Pivota promotions sync.
 
 MVP scope:
-- Fetch Shopify price rules for a given merchant (using existing connector credentials).
-- Normalize them into PromotionCreate objects (FLASH_SALE | MULTI_BUY_DISCOUNT | FREE_SHIPPING-like).
+- Fetch Shopify discount nodes for a given merchant (using existing connector credentials).
+- Normalize them into metadata-only PromotionCreate objects for quote/display policy.
 - Upsert into the DB-backed promotions table via promotions_service.
 
-This keeps Pivota as the source of truth for promotions, while reusing
-Shopify's richer discount model as much as possible.
+This keeps Shopify as the source of truth for discount execution while letting
+Pivota cache read-only promotion metadata for quote/display policy.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import hashlib
 import logging
 import os
 
@@ -33,11 +34,13 @@ from services.promotions_service import (
     get_promotion,
     update_promotion,
 )
+from services.shopify_graphql_client import ShopifyGraphQLError, shopify_admin_graphql
 
 logger = logging.getLogger(__name__)
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-07")
 SHOPIFY_PRICE_RULE_PAGE_LIMIT = 250
+SHOPIFY_DISCOUNT_NODE_PAGE_LIMIT = 50
 
 
 class ShopifyPromotionsError(Exception):
@@ -240,6 +243,266 @@ def _build_promotion_id(prefix: str, price_rule_id: Any, merchant_id: str) -> st
     return f"{prefix}_{merchant_id}_{price_rule_id}"
 
 
+def _build_discount_node_promotion_id(discount_node_id: str, merchant_id: str) -> str:
+    digest = hashlib.sha256(f"{merchant_id}:{discount_node_id}".encode("utf-8")).hexdigest()[:24]
+    return f"shopify_discount_{merchant_id}_{digest}"
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _connection_nodes(connection: Any) -> List[Dict[str, Any]]:
+    if not isinstance(connection, dict):
+        return []
+    nodes = connection.get("nodes")
+    if isinstance(nodes, list):
+        return [n for n in nodes if isinstance(n, dict)]
+    edges = connection.get("edges")
+    out: List[Dict[str, Any]] = []
+    if isinstance(edges, list):
+        for edge in edges:
+            node = (edge or {}).get("node") if isinstance(edge, dict) else None
+            if isinstance(node, dict):
+                out.append(node)
+    return out
+
+
+def _extract_discount_codes(discount: Dict[str, Any]) -> List[str]:
+    codes: List[str] = []
+    for node in _connection_nodes(discount.get("codes")):
+        code = str(node.get("code") or "").strip()
+        if code:
+            codes.append(code)
+    code = str(discount.get("code") or "").strip()
+    if code:
+        codes.append(code)
+    return list(dict.fromkeys(codes))
+
+
+def _discount_type_from_typename(typename: str) -> str:
+    value = typename.lower()
+    if "bxgy" in value:
+        return "bxgy"
+    if "freeshipping" in value or "free_shipping" in value:
+        return "free_shipping"
+    return "basic"
+
+
+def _discount_method_from_typename(typename: str) -> str:
+    return "code" if typename.startswith("DiscountCode") else "automatic"
+
+
+def _map_discount_node_to_promotion(
+    node: Dict[str, Any],
+    merchant_id: str,
+    channel: str = "creator_agents",
+) -> Optional[PromotionCreate]:
+    discount = node.get("discount") if isinstance(node, dict) else None
+    if not isinstance(discount, dict):
+        return None
+    node_id = str(node.get("id") or "").strip()
+    typename = str(discount.get("__typename") or "").strip()
+    if not node_id or not typename:
+        return None
+
+    discount_type = _discount_type_from_typename(typename)
+    discount_method = _discount_method_from_typename(typename)
+    promo_type = "FREE_SHIPPING" if discount_type == "free_shipping" else "MULTI_BUY_DISCOUNT"
+
+    title = (
+        str(discount.get("title") or "").strip()
+        or str(discount.get("summary") or "").strip()
+        or typename
+    )
+    start_at = _safe_datetime(discount.get("startsAt"), fallback=datetime.utcnow())
+    end_at = _safe_datetime(discount.get("endsAt"))
+
+    customer_gets = discount.get("customerGets") if isinstance(discount.get("customerGets"), dict) else {}
+    customer_buys = discount.get("customerBuys") if isinstance(discount.get("customerBuys"), dict) else None
+    minimum_requirement = (
+        discount.get("minimumRequirement") if isinstance(discount.get("minimumRequirement"), dict) else None
+    )
+    combines_with = discount.get("combinesWith") if isinstance(discount.get("combinesWith"), dict) else {}
+    context = (
+        discount.get("customerSelection")
+        or discount.get("context")
+        or discount.get("appliesOnSubscription")
+        or {}
+    )
+
+    scope: Dict[str, Any] = {"global": True}
+    items = customer_gets.get("items") if isinstance(customer_gets, dict) else None
+    if isinstance(items, dict) and items.get("__typename"):
+        scope = {"shopifyItems": items}
+
+    cfg: Dict[str, Any] = {
+        "source": "shopify_discount_node",
+        "kind": promo_type,
+        "shopifyDiscountNodeId": node_id,
+        "discountTypename": typename,
+        "discountMethod": discount_method,
+        "discountType": discount_type,
+        "status": discount.get("status"),
+        "summary": discount.get("summary"),
+        "discountClasses": discount.get("discountClasses") or [],
+        "combinesWith": combines_with,
+        "context": context,
+        "customerGets": customer_gets,
+        "customerBuys": customer_buys,
+        "minimumRequirement": minimum_requirement,
+        "usageLimit": discount.get("usageLimit"),
+        "appliesOncePerCustomer": discount.get("appliesOncePerCustomer"),
+        "asyncUsageCount": discount.get("asyncUsageCount"),
+        "codes": _extract_discount_codes(discount),
+    }
+    if promo_type == "FREE_SHIPPING":
+        cfg["freeShipping"] = True
+
+    return PromotionCreate(
+        id=_build_discount_node_promotion_id(node_id, merchant_id),
+        merchantId=merchant_id,
+        name=title,
+        type=promo_type,
+        description=str(discount.get("summary") or "").strip(),
+        startAt=start_at,
+        endAt=end_at,
+        channels=[channel],
+        scope=scope,
+        config=cfg,
+        exposeToCreators=True,
+        allowedCreatorIds=None,
+    )
+
+
+async def fetch_all_discount_nodes(cfg: ShopifyStoreConfig) -> List[Dict[str, Any]]:
+    if not cfg.is_configured:
+        raise ShopifyPromotionsConfigError("Shopify store config is missing shop_domain or access_token")
+
+    query = """
+query($first: Int!, $after: String) {
+  discountNodes(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        discount {
+          __typename
+          ... on DiscountCodeBasic {
+            title
+            status
+            summary
+            startsAt
+            endsAt
+            discountClasses
+            combinesWith { orderDiscounts productDiscounts shippingDiscounts }
+            customerSelection { __typename }
+            customerGets { __typename value { __typename } items { __typename } }
+            minimumRequirement { __typename }
+            usageLimit
+            appliesOncePerCustomer
+            asyncUsageCount
+            codes(first: 20) { nodes { code } }
+          }
+          ... on DiscountAutomaticBasic {
+            title
+            status
+            summary
+            startsAt
+            endsAt
+            discountClasses
+            combinesWith { orderDiscounts productDiscounts shippingDiscounts }
+            customerGets { __typename value { __typename } items { __typename } }
+            minimumRequirement { __typename }
+            asyncUsageCount
+          }
+          ... on DiscountCodeBxgy {
+            title
+            status
+            summary
+            startsAt
+            endsAt
+            discountClasses
+            combinesWith { orderDiscounts productDiscounts shippingDiscounts }
+            customerSelection { __typename }
+            customerBuys { __typename }
+            customerGets { __typename }
+            usageLimit
+            appliesOncePerCustomer
+            asyncUsageCount
+            codes(first: 20) { nodes { code } }
+          }
+          ... on DiscountAutomaticBxgy {
+            title
+            status
+            summary
+            startsAt
+            endsAt
+            discountClasses
+            combinesWith { orderDiscounts productDiscounts shippingDiscounts }
+            customerBuys { __typename }
+            customerGets { __typename }
+            asyncUsageCount
+          }
+          ... on DiscountCodeFreeShipping {
+            title
+            status
+            summary
+            startsAt
+            endsAt
+            discountClasses
+            combinesWith { orderDiscounts productDiscounts shippingDiscounts }
+            customerSelection { __typename }
+            minimumRequirement { __typename }
+            usageLimit
+            appliesOncePerCustomer
+            asyncUsageCount
+            codes(first: 20) { nodes { code } }
+          }
+          ... on DiscountAutomaticFreeShipping {
+            title
+            status
+            summary
+            startsAt
+            endsAt
+            discountClasses
+            combinesWith { orderDiscounts productDiscounts shippingDiscounts }
+            minimumRequirement { __typename }
+            asyncUsageCount
+          }
+        }
+      }
+    }
+  }
+}
+"""
+    nodes: List[Dict[str, Any]] = []
+    after: Optional[str] = None
+    while True:
+        data = await shopify_admin_graphql(
+            shop_domain=cfg.shop_domain,
+            access_token=cfg.access_token,
+            query=query,
+            variables={"first": SHOPIFY_DISCOUNT_NODE_PAGE_LIMIT, "after": after},
+            api_version=SHOPIFY_API_VERSION,
+            timeout_s=20.0,
+        )
+        root = data.get("discountNodes") if isinstance(data, dict) else None
+        if not isinstance(root, dict):
+            break
+        for edge in root.get("edges") or []:
+            node = (edge or {}).get("node") if isinstance(edge, dict) else None
+            if isinstance(node, dict):
+                nodes.append(node)
+        page_info = root.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+        if not after:
+            break
+    return nodes
+
+
 def _map_price_rule_to_promotion(
     rule: Dict[str, Any],
     merchant_id: str,
@@ -290,13 +553,7 @@ def _map_price_rule_to_promotion(
             scope["variantIds"] = [str(vid) for vid in variant_ids]
 
     start_at = _safe_datetime(rule.get("starts_at"), fallback=datetime.utcnow())
-    # Shopify price rules can be open-ended; promotions table requires an endAt.
     end_at = _safe_datetime(rule.get("ends_at"))
-    if end_at is None and start_at is not None:
-        end_at = start_at + timedelta(days=365)
-    if end_at is None:
-        # Fallback safety: 1 year from now
-        end_at = datetime.utcnow() + timedelta(days=365)
 
     # Determine promotion type and config
     cfg: Dict[str, Any] = {
@@ -361,26 +618,29 @@ async def sync_shopify_promotions_for_merchant(
             f"Shopify configuration not found for merchant_id={merchant_id}"
         )
 
-    rules = await fetch_all_price_rules(cfg)
-    logger.info(
-        "Fetched Shopify price rules",
-        extra={"merchant_id": merchant_id, "count": len(rules)},
-    )
-
+    use_graphql = _env_enabled("SHOPIFY_DISCOUNT_GRAPHQL_SYNC", "1")
+    use_legacy_price_rules = _env_enabled("SHOPIFY_DISCOUNT_LEGACY_PRICE_RULE_SYNC", "0")
     created = 0
     updated = 0
     skipped = 0
+    fetched = 0
+    sync_source = "shopify_discount_nodes" if use_graphql else "shopify_price_rules"
 
-    for rule in rules:
-        promo = _map_price_rule_to_promotion(rule, merchant_id=merchant_id, channel=channel)
-        if not promo:
-            skipped += 1
-            continue
+    if not use_graphql and not use_legacy_price_rules:
+        return {
+            "merchantId": merchant_id,
+            "syncSource": "disabled",
+            "rulesFetched": 0,
+            "discountNodesFetched": 0,
+            "created": 0,
+            "updated": 0,
+            "skipped": 0,
+        }
 
-        # Upsert by promo.id
+    async def _upsert(promo: PromotionCreate) -> None:
+        nonlocal created, updated
         existing = await get_promotion(promo.id)
         if existing:
-            # Update mutable fields (name, description, dates, channels, scope, config, exposure).
             update_payload = PromotionUpdate(
                 name=promo.name,
                 description=promo.description,
@@ -398,9 +658,68 @@ async def sync_shopify_promotions_for_merchant(
             await create_promotion(promo)
             created += 1
 
+    if use_graphql:
+        try:
+            nodes = await fetch_all_discount_nodes(cfg)
+            fetched = len(nodes)
+            logger.info(
+                "Fetched Shopify discount nodes",
+                extra={"merchant_id": merchant_id, "count": fetched},
+            )
+            for node in nodes:
+                promo = _map_discount_node_to_promotion(node, merchant_id=merchant_id, channel=channel)
+                if not promo:
+                    skipped += 1
+                    continue
+                await _upsert(promo)
+            return {
+                "merchantId": merchant_id,
+                "syncSource": sync_source,
+                "rulesFetched": fetched,
+                "discountNodesFetched": fetched,
+                "created": created,
+                "updated": updated,
+                "skipped": skipped,
+            }
+        except (ShopifyGraphQLError, RuntimeError) as exc:
+            if not use_legacy_price_rules:
+                raise ShopifyPromotionsError(f"Shopify discountNodes sync failed: {exc}") from exc
+            logger.warning(
+                "Shopify discountNodes sync failed; falling back to legacy price rules",
+                extra={"merchant_id": merchant_id, "error": str(exc)},
+            )
+
+    if not use_legacy_price_rules and use_graphql:
+        return {
+            "merchantId": merchant_id,
+            "syncSource": sync_source,
+            "rulesFetched": fetched,
+            "discountNodesFetched": fetched,
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+        }
+
+    rules = await fetch_all_price_rules(cfg)
+    fetched = len(rules)
+    sync_source = "shopify_price_rules"
+    logger.info(
+        "Fetched Shopify price rules",
+        extra={"merchant_id": merchant_id, "count": len(rules)},
+    )
+
+    for rule in rules:
+        promo = _map_price_rule_to_promotion(rule, merchant_id=merchant_id, channel=channel)
+        if not promo:
+            skipped += 1
+            continue
+
+        await _upsert(promo)
+
     return {
         "merchantId": merchant_id,
-        "rulesFetched": len(rules),
+        "syncSource": sync_source,
+        "rulesFetched": fetched,
         "created": created,
         "updated": updated,
         "skipped": skipped,

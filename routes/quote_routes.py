@@ -77,6 +77,7 @@ async def preview_quote(
             "total": parse_decimal_money(pricing.get("total")),
         },
         "promotion_lines": result.get("promotion_lines") or [],
+        "discount_evidence": result.get("discount_evidence") or {},
         "line_items": result.get("line_items") or [],
         "delivery_options": result.get("delivery_options"),
         "debug_id": result.get("debug_id"),

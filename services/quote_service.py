@@ -269,12 +269,18 @@ class QuoteService:
                 details={"attempts": attempts},
             )
 
+        discount_evidence = self._coerce_discount_evidence(
+            getattr(result, "discount_evidence", None) or (result.debug or {}).get("discount_evidence"),
+            submitted_codes=codes,
+            source=result.engine,
+        )
         await self._apply_infra_promotions_best_effort(
             merchant_id=merchant_id,
             items=normalized_items,
             pricing=result.pricing,
             line_items=result.line_items,
             promotion_lines=result.promotion_lines,
+            discount_evidence=discount_evidence,
             creator_id=agent_id,
         )
 
@@ -298,6 +304,7 @@ class QuoteService:
                 "total": str(result.pricing["total"]),
             },
             "promotion_lines": self._serialize_promotion_lines(result.promotion_lines),
+            "discount_evidence": self._serialize_discount_evidence(discount_evidence),
             "line_items": self._serialize_line_items(result.line_items),
             "delivery_options": result.delivery_options,
             "metadata": {
@@ -378,12 +385,115 @@ class QuoteService:
             "settlement_currency": settlement_currency,
             "pricing": result.pricing,
             "promotion_lines": result.promotion_lines,
+            "discount_evidence": discount_evidence,
             "line_items": result.line_items,
             "delivery_options": result.delivery_options,
             "checkout_url": (result.debug or {}).get("checkout_url"),
             "debug_id": (result.debug or {}).get("debug_id"),
             "attempts": attempts or [],
         }
+
+    def _coerce_discount_evidence(
+        self,
+        evidence: Optional[Dict[str, Any]],
+        *,
+        submitted_codes: List[str],
+        source: str,
+    ) -> Dict[str, Any]:
+        out = dict(evidence or {})
+        out.setdefault("source", source)
+        out.setdefault("applications", [])
+        out.setdefault("decisions", [])
+        codes = out.get("codes")
+        if not isinstance(codes, list):
+            codes = []
+        existing = {str((row or {}).get("code") or "").strip().upper() for row in codes if isinstance(row, dict)}
+        for code in submitted_codes or []:
+            normalized = str(code or "").strip().upper()
+            if normalized and normalized not in existing:
+                codes.append({"code": normalized, "applicable": None, "source": source})
+        out["codes"] = codes
+        if "pricing_confidence" not in out:
+            out["pricing_confidence"] = "unverified" if submitted_codes else "authoritative"
+        return out
+
+    def _has_shopify_applied_discount(self, discount_evidence: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(discount_evidence, dict):
+            return False
+        for app in discount_evidence.get("applications") or []:
+            if not isinstance(app, dict):
+                continue
+            if str(app.get("source") or "shopify") != "pivota_infra":
+                try:
+                    if Decimal(str(app.get("amount") or "0")).copy_abs() > 0:
+                        return True
+                except Exception:
+                    return True
+        for code in discount_evidence.get("codes") or []:
+            if isinstance(code, dict) and code.get("applicable") is True:
+                return True
+        return False
+
+    def _manual_promo_can_stack_with_shopify(
+        self,
+        cfg: Dict[str, Any],
+        discount_evidence: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if cfg.get("canStackWithShopify") is not True:
+            return False
+        combines = cfg.get("combinesWith") or cfg.get("combines_with") or {}
+        if not isinstance(combines, dict):
+            return False
+        discount_classes = set()
+        if isinstance(discount_evidence, dict):
+            for app in discount_evidence.get("applications") or []:
+                if not isinstance(app, dict):
+                    continue
+                discount_class = str(app.get("discount_class") or "").strip().lower()
+                if discount_class:
+                    discount_classes.add(discount_class)
+        if not discount_classes:
+            return bool(
+                combines.get("orderDiscounts")
+                or combines.get("order_discounts")
+                or combines.get("productDiscounts")
+                or combines.get("product_discounts")
+                or combines.get("shippingDiscounts")
+                or combines.get("shipping_discounts")
+            )
+        for discount_class in discount_classes:
+            if discount_class == "shipping":
+                if not (combines.get("shippingDiscounts") or combines.get("shipping_discounts")):
+                    return False
+            elif discount_class == "product":
+                if not (combines.get("productDiscounts") or combines.get("product_discounts")):
+                    return False
+            else:
+                if not (combines.get("orderDiscounts") or combines.get("order_discounts")):
+                    return False
+        return True
+
+    def _manual_promo_requires_shopify_new_customer_evidence(self, cfg: Dict[str, Any]) -> bool:
+        if not isinstance(cfg, dict):
+            return False
+        for key in ("newCustomerOnly", "new_customer_only", "firstOrderOnly", "first_order_only"):
+            if cfg.get(key) is True:
+                return True
+        eligibility = cfg.get("customerEligibility") or cfg.get("customer_eligibility") or cfg.get("eligibility")
+        if isinstance(eligibility, dict):
+            value = eligibility.get("type") or eligibility.get("kind") or eligibility.get("segment")
+        else:
+            value = eligibility
+        token = str(value or "").strip().lower()
+        return token in {"new_customer", "first_time_customer", "first_order", "shopify_first_order"}
+
+    def _has_verified_shopify_new_customer_evidence(self, discount_evidence: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(discount_evidence, dict):
+            return False
+        evidence = discount_evidence.get("customer_eligibility")
+        if not isinstance(evidence, dict):
+            return False
+        return evidence.get("status") == "verified" and evidence.get("new_customer") is True
 
     async def _apply_infra_promotions_best_effort(
         self,
@@ -393,6 +503,7 @@ class QuoteService:
         pricing: Dict[str, Decimal],
         line_items: List[Dict[str, Any]],
         promotion_lines: List[Dict[str, Any]],
+        discount_evidence: Optional[Dict[str, Any]] = None,
         creator_id: Optional[str] = None,
         channel: str = "creator_agents",
     ) -> None:
@@ -502,6 +613,39 @@ class QuoteService:
 
                 scope = getattr(promo, "scope", None) or {}
                 cfg = getattr(promo, "config", None) or {}
+
+                if self._has_shopify_applied_discount(discount_evidence) and not self._manual_promo_can_stack_with_shopify(
+                    cfg,
+                    discount_evidence,
+                ):
+                    if isinstance(discount_evidence, dict):
+                        decisions = discount_evidence.setdefault("decisions", [])
+                        if isinstance(decisions, list):
+                            decisions.append(
+                                {
+                                    "promotion_id": getattr(promo, "id", None),
+                                    "decision": "skipped",
+                                    "reason": "shopify_discount_present",
+                                    "source": "pivota_infra",
+                                }
+                            )
+                    continue
+
+                if self._manual_promo_requires_shopify_new_customer_evidence(
+                    cfg
+                ) and not self._has_verified_shopify_new_customer_evidence(discount_evidence):
+                    if isinstance(discount_evidence, dict):
+                        decisions = discount_evidence.setdefault("decisions", [])
+                        if isinstance(decisions, list):
+                            decisions.append(
+                                {
+                                    "promotion_id": getattr(promo, "id", None),
+                                    "decision": "skipped",
+                                    "reason": "shopify_new_customer_unverified_or_ineligible",
+                                    "source": "pivota_infra",
+                                }
+                            )
+                    continue
 
                 threshold = int(cfg.get("thresholdQuantity") or cfg.get("threshold_quantity") or 0)
                 discount_percent_raw = cfg.get("discountPercent") or cfg.get("discount_percent") or 0
@@ -663,6 +807,20 @@ class QuoteService:
                 }
             )
         return out
+
+    def _serialize_discount_evidence(self, evidence: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        def _convert(value: Any) -> Any:
+            if isinstance(value, Decimal):
+                return str(value)
+            if isinstance(value, dict):
+                return {k: _convert(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_convert(v) for v in value]
+            return value
+
+        if not isinstance(evidence, dict):
+            return {}
+        return _convert(evidence)
 
     def _serialize_line_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out = []

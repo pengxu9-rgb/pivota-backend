@@ -87,6 +87,11 @@ class StorefrontCartResult:
     delivery_options: Optional[List[Dict[str, Any]]]
     selected_delivery_option: Optional[Dict[str, Any]]
     unit_price_by_variant_id: Dict[str, Decimal]
+    line_pricing_by_variant_id: Dict[str, Dict[str, Decimal]]
+    promotion_lines: List[Dict[str, Any]]
+    discount_codes: List[Dict[str, Any]]
+    discount_total: Decimal
+    discount_evidence: Dict[str, Any]
 
 
 _STOREFRONT_ROTATE_ATTEMPTED_AT: Dict[str, float] = {}
@@ -129,6 +134,265 @@ def _first_item_variant_id(items: List[Dict[str, Any]]) -> Optional[str]:
         if vid:
             return vid
     return None
+
+
+def _normalize_code(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _discount_class_from_storefront_target(target_type: Any) -> str:
+    value = str(target_type or "").strip().lower()
+    if "shipping" in value:
+        return "shipping"
+    if "line" in value or "product" in value:
+        return "product"
+    return "order"
+
+
+def _discount_method_from_storefront_allocation(allocation: Dict[str, Any]) -> str:
+    typename = str(allocation.get("__typename") or "")
+    if typename == "CartCodeDiscountAllocation" or allocation.get("code"):
+        return "code"
+    if typename == "CartAutomaticDiscountAllocation":
+        return "automatic"
+    return "app"
+
+
+def _empty_discount_evidence(
+    *,
+    source: str,
+    submitted_codes: Optional[List[str]] = None,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    codes = [
+        {"code": code, "applicable": None, "source": source}
+        for code in [_normalize_code(c) for c in (submitted_codes or [])]
+        if code
+    ]
+    return {
+        "source": source,
+        "codes": codes,
+        "applications": [],
+        "decisions": [],
+        "pricing_confidence": "unverified" if codes else "authoritative",
+        **({"reason": reason} if reason else {}),
+    }
+
+
+def _is_storefront_discount_query_error(err: ShopifyPricingError) -> bool:
+    details = getattr(err, "details", {}) or {}
+    errors = details.get("errors") or []
+    haystack = " ".join(
+        str((e or {}).get("message") or "") + " " + str((e or {}).get("path") or "")
+        for e in errors
+        if isinstance(e, dict)
+    ).lower()
+    return any(
+        token in haystack
+        for token in (
+            "discountallocations",
+            "discountcodes",
+            "discountedamount",
+            "targettype",
+            "cartcodediscountallocation",
+            "cartautomaticdiscountallocation",
+            "cartcustomdiscountallocation",
+        )
+    )
+
+
+def _parse_storefront_cart_discounts(
+    *,
+    cart: Dict[str, Any],
+    submitted_codes: Optional[List[str]],
+    source: str = "shopify_storefront_cart",
+) -> Dict[str, Any]:
+    submitted = [_normalize_code(c) for c in (submitted_codes or []) if _normalize_code(c)]
+
+    code_rows: List[Dict[str, Any]] = []
+    cart_codes = cart.get("discountCodes")
+    if isinstance(cart_codes, list):
+        seen_codes = set()
+        for row in cart_codes:
+            if not isinstance(row, dict):
+                continue
+            code = _normalize_code(row.get("code"))
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            applicable = row.get("applicable")
+            code_rows.append(
+                {
+                    "code": code,
+                    "applicable": bool(applicable) if applicable is not None else None,
+                    "source": source,
+                }
+            )
+        for code in submitted:
+            if code not in seen_codes:
+                code_rows.append({"code": code, "applicable": None, "source": source})
+    else:
+        code_rows = [{"code": code, "applicable": None, "source": source} for code in submitted]
+
+    unit_price_by_variant_id: Dict[str, Decimal] = {}
+    line_pricing_by_variant_id: Dict[str, Dict[str, Decimal]] = {}
+    grouped: Dict[str, Dict[str, Any]] = {}
+    discount_total = Decimal("0.00")
+
+    lines_root = cart.get("lines") or {}
+    edges = lines_root.get("edges") or []
+    for edge in edges or []:
+        node = (edge.get("node") or {}) if isinstance(edge, dict) else {}
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attributes") or []
+        variant_id = None
+        if isinstance(attrs, list):
+            for attr in attrs:
+                if isinstance(attr, dict) and attr.get("key") == "pivota_variant_id":
+                    variant_id = attr.get("value")
+                    break
+        if not isinstance(variant_id, str) or not variant_id.strip():
+            continue
+        variant_id = variant_id.strip()
+        try:
+            qty = int(node.get("quantity") or 0)
+        except Exception:
+            qty = 0
+        qty_decimal = Decimal(str(qty if qty > 0 else 1))
+
+        cost = node.get("cost") or {}
+        apq = (cost.get("amountPerQuantity") or {}) if isinstance(cost, dict) else {}
+        total_amount = (cost.get("totalAmount") or {}) if isinstance(cost, dict) else {}
+        amount_per_quantity = _d(apq.get("amount"))
+        line_total_after_discount = _d(total_amount.get("amount"))
+
+        line_discount_total = Decimal("0.00")
+        allocations = node.get("discountAllocations") or []
+        if isinstance(allocations, list):
+            for alloc in allocations:
+                if not isinstance(alloc, dict):
+                    continue
+                amount = _d((alloc.get("discountedAmount") or {}).get("amount"))
+                if amount <= 0:
+                    continue
+                line_discount_total += amount
+                method = _discount_method_from_storefront_allocation(alloc)
+                code = _normalize_code(alloc.get("code")) or None
+                label = code or alloc.get("title") or "Shopify discount"
+                discount_class = _discount_class_from_storefront_target(alloc.get("targetType") or "LINE_ITEM")
+                group_key = "|".join(
+                    [
+                        str(method),
+                        str(code or ""),
+                        str(label or ""),
+                        str(discount_class),
+                        str(alloc.get("__typename") or ""),
+                    ]
+                )
+                group = grouped.setdefault(
+                    group_key,
+                    {
+                        "source": "shopify",
+                        "source_ref": group_key,
+                        "discount_class": discount_class,
+                        "method": method,
+                        "label": label,
+                        "code": code,
+                        "amount": Decimal("0.00"),
+                        "allocations": [],
+                        "metadata": {
+                            "source": source,
+                            "typename": alloc.get("__typename"),
+                        },
+                    },
+                )
+                group["amount"] += amount
+                group["allocations"].append(
+                    {
+                        "target_type": "line_item",
+                        "target_id": variant_id,
+                        "amount": (Decimal("0.00") - amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                    }
+                )
+
+        discount_total += line_discount_total
+        if qty > 0:
+            unit_effective = (line_total_after_discount / qty_decimal).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            unit_original = ((line_total_after_discount + line_discount_total) / qty_decimal).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        else:
+            unit_effective = amount_per_quantity
+            unit_original = amount_per_quantity
+        if unit_original <= 0 and amount_per_quantity > 0:
+            unit_original = amount_per_quantity
+        if unit_effective <= 0 and amount_per_quantity > 0 and line_total_after_discount <= 0:
+            unit_effective = amount_per_quantity
+
+        unit_price_by_variant_id[variant_id] = unit_original
+        line_pricing_by_variant_id[variant_id] = {
+            "unit_price_original": unit_original,
+            "unit_price_effective": unit_effective,
+            "line_discount_total": line_discount_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        }
+
+    promotion_lines: List[Dict[str, Any]] = []
+    for idx, group in enumerate(grouped.values()):
+        amount = _d(group.get("amount"))
+        if amount <= 0:
+            continue
+        promotion_lines.append(
+            {
+                "id": f"sf_pl_{idx}",
+                "source": "shopify",
+                "source_ref": group.get("source_ref"),
+                "discount_class": group.get("discount_class") or "product",
+                "method": group.get("method") or "automatic",
+                "label": group.get("label") or "Shopify discount",
+                "code": group.get("code"),
+                "amount": (Decimal("0.00") - amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                "allocations": group.get("allocations") or [],
+                "metadata": group.get("metadata") or {},
+            }
+        )
+
+    applications = [
+        {
+            "id": pl.get("id"),
+            "source": pl.get("source") or "shopify",
+            "source_ref": pl.get("source_ref"),
+            "discount_class": pl.get("discount_class"),
+            "method": pl.get("method"),
+            "label": pl.get("label"),
+            "code": pl.get("code"),
+            "amount": str(pl.get("amount")),
+        }
+        for pl in promotion_lines
+    ]
+    if promotion_lines:
+        pricing_confidence = "authoritative"
+    elif any(row.get("applicable") is not None for row in code_rows):
+        pricing_confidence = "partial"
+    elif submitted:
+        pricing_confidence = "unverified"
+    else:
+        pricing_confidence = "authoritative"
+
+    return {
+        "unit_price_by_variant_id": unit_price_by_variant_id,
+        "line_pricing_by_variant_id": line_pricing_by_variant_id,
+        "promotion_lines": promotion_lines,
+        "discount_codes": code_rows,
+        "discount_total": discount_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "discount_evidence": {
+            "source": source,
+            "codes": code_rows,
+            "applications": applications,
+            "decisions": [],
+            "pricing_confidence": pricing_confidence,
+        },
+    }
 
 
 async def _rotate_storefront_token_best_effort(
@@ -250,6 +514,70 @@ class ShopifyStorefrontPricingService:
             logger.warning({"debug_id": debug_id, "errors": data.get("errors")[:3]}, "Shopify Admin GraphQL errors")
             return {}
         return data.get("data") or {}
+
+    async def _fetch_new_customer_evidence(
+        self,
+        *,
+        shop_domain: str,
+        admin_access_token: Optional[str],
+        customer_email: Optional[str],
+        debug_id: str,
+    ) -> Dict[str, Any]:
+        email = str(customer_email or "").strip()
+        if not email:
+            return {"source": "shopify_admin_graphql", "status": "unverified", "reason": "missing_customer_email"}
+        if not admin_access_token:
+            return {"source": "shopify_admin_graphql", "status": "unverified", "reason": "missing_admin_access_token"}
+
+        query = """
+query($query: String!) {
+  customers(first: 1, query: $query) {
+    edges {
+      node {
+        id
+        numberOfOrders
+      }
+    }
+  }
+}
+"""
+        safe_email = email.replace("\\", "\\\\").replace('"', '\\"')
+        data = await self._admin_graphql(
+            shop_domain=shop_domain,
+            admin_access_token=admin_access_token,
+            query=query,
+            variables={"query": f'email:"{safe_email}"'},
+            debug_id=debug_id,
+        )
+        customers = data.get("customers") if isinstance(data, dict) else None
+        edges = customers.get("edges") if isinstance(customers, dict) else None
+        if not isinstance(edges, list):
+            return {"source": "shopify_admin_graphql", "status": "unverified", "reason": "customer_lookup_unavailable"}
+        if not edges:
+            return {
+                "source": "shopify_admin_graphql",
+                "status": "verified",
+                "new_customer": True,
+                "basis": "no_shopify_customer_found",
+            }
+        node = (edges[0] or {}).get("node") or {}
+        raw_count = node.get("numberOfOrders")
+        try:
+            order_count = int(raw_count or 0)
+        except Exception:
+            return {
+                "source": "shopify_admin_graphql",
+                "status": "unverified",
+                "reason": "number_of_orders_unavailable",
+                "customer_id": node.get("id"),
+            }
+        return {
+            "source": "shopify_admin_graphql",
+            "status": "verified",
+            "new_customer": order_count == 0,
+            "shopify_order_count": order_count,
+            "customer_id": node.get("id"),
+        }
 
     async def _admin_variant_exists(
         self,
@@ -614,22 +942,34 @@ query($ids: [ID!]!) {
             qty = int(it.get("quantity") or 0)
             if not vid or qty <= 0:
                 continue
-            unit = cart.unit_price_by_variant_id.get(vid) or Decimal("0.00")
+            line_pricing = cart.line_pricing_by_variant_id.get(vid) or {}
+            unit_original = line_pricing.get("unit_price_original") or cart.unit_price_by_variant_id.get(vid) or Decimal("0.00")
+            unit_effective = line_pricing.get("unit_price_effective") or unit_original
+            line_discount_total = line_pricing.get("line_discount_total") or Decimal("0.00")
             line_items.append(
                 {
                     "product_id": it.get("product_id"),
                     "variant_id": vid,
                     "quantity": qty,
-                    "unit_price_original": unit,
-                    "unit_price_effective": unit,
-                    "line_discount_total": Decimal("0.00"),
+                    "unit_price_original": unit_original,
+                    "unit_price_effective": unit_effective,
+                    "line_discount_total": line_discount_total,
                     "compare_at_savings": Decimal("0.00"),
                 }
             )
 
+        discount_evidence = dict(cart.discount_evidence or _empty_discount_evidence(source="shopify_storefront_cart"))
+        if customer_email:
+            discount_evidence["customer_eligibility"] = await self._fetch_new_customer_evidence(
+                shop_domain=shop_domain,
+                admin_access_token=admin_access_token,
+                customer_email=customer_email,
+                debug_id=debug_id,
+            )
+
         pricing = {
             "subtotal": cart.subtotal,
-            "discount_total": max(cart.subtotal - cart.total, Decimal("0.00")),
+            "discount_total": cart.discount_total,
             "shipping_fee": Decimal("0.00"),
             "tax": cart.tax,
             "total": cart.total,
@@ -654,6 +994,7 @@ query($ids: [ID!]!) {
             "checkout_url": cart.checkout_url,
             "selected_delivery_option": cart.selected_delivery_option,
             "storefront_delivery_options_count": len(cart.delivery_options or []),
+            "discount_evidence": discount_evidence,
         }
 
         return ShopifyPricingResult(
@@ -661,10 +1002,11 @@ query($ids: [ID!]!) {
             engine_ref=str(cart.cart_id),
             currency=cart.currency,
             pricing=pricing,
-            promotion_lines=[],
+            promotion_lines=cart.promotion_lines,
             line_items=line_items,
             delivery_options=cart.delivery_options,
             debug=debug,
+            discount_evidence=discount_evidence,
         )
 
     async def _storefront_graphql(
@@ -801,21 +1143,31 @@ query($ids: [ID!]!) {
             )
 
         cart_create = """
-mutation($input: CartInput!) {
-  cartCreate(input: $input) {
-    cart {
-      id
-      checkoutUrl
-      lines(first: 100) {
-        edges {
-          node {
-            quantity
-            attributes { key value }
-            cost {
-              amountPerQuantity { amount currencyCode }
-              totalAmount { amount currencyCode }
-            }
-          }
+	mutation($input: CartInput!) {
+	  cartCreate(input: $input) {
+	    cart {
+	      id
+	      checkoutUrl
+	      discountCodes { code applicable }
+	      lines(first: 100) {
+	        edges {
+	          node {
+	            id
+	            quantity
+	            attributes { key value }
+	            discountAllocations {
+	              __typename
+	              targetType
+	              discountedAmount { amount currencyCode }
+	              ... on CartCodeDiscountAllocation { code }
+	              ... on CartAutomaticDiscountAllocation { title }
+	              ... on CartCustomDiscountAllocation { title }
+	            }
+	            cost {
+	              amountPerQuantity { amount currencyCode }
+	              totalAmount { amount currencyCode }
+	            }
+	          }
         }
       }
       cost {
@@ -826,21 +1178,62 @@ mutation($input: CartInput!) {
     }
     userErrors { field message code }
   }
-}
-"""
+	}
+	"""
+        legacy_cart_create = """
+	mutation($input: CartInput!) {
+	  cartCreate(input: $input) {
+	    cart {
+	      id
+	      checkoutUrl
+	      lines(first: 100) {
+	        edges {
+	          node {
+	            quantity
+	            attributes { key value }
+	            cost {
+	              amountPerQuantity { amount currencyCode }
+	              totalAmount { amount currencyCode }
+	            }
+	          }
+	        }
+	      }
+	      cost {
+	        subtotalAmount { amount currencyCode }
+	        totalTaxAmount { amount currencyCode }
+	        totalAmount { amount currencyCode }
+	      }
+	    }
+	    userErrors { field message code }
+	  }
+	}
+	"""
         variables: Dict[str, Any] = {"input": {"lines": lines}}
         if discount_codes:
             variables["input"]["discountCodes"] = discount_codes
         if use_buyer_country_for_pricing and country:
             variables["input"]["buyerIdentity"] = {"countryCode": country}
 
-        data = await self._storefront_graphql(
-            shop_domain=shop_domain,
-            storefront_token=storefront_token,
-            query=cart_create,
-            variables=variables,
-            debug_id=debug_id,
-        )
+        discount_schema_fallback = False
+        try:
+            data = await self._storefront_graphql(
+                shop_domain=shop_domain,
+                storefront_token=storefront_token,
+                query=cart_create,
+                variables=variables,
+                debug_id=debug_id,
+            )
+        except ShopifyPricingError as e:
+            if not _is_storefront_discount_query_error(e):
+                raise
+            discount_schema_fallback = True
+            data = await self._storefront_graphql(
+                shop_domain=shop_domain,
+                storefront_token=storefront_token,
+                query=legacy_cart_create,
+                variables=variables,
+                debug_id=debug_id,
+            )
         root = (data.get("cartCreate") or {}) if isinstance(data, dict) else {}
         user_errors = root.get("userErrors") or []
         if user_errors:
@@ -863,11 +1256,24 @@ mutation($input: CartInput!) {
                 details={"user_errors": safe_user_errors[:5]},
             )
         cart = root.get("cart") or {}
+        if discount_schema_fallback and isinstance(cart, dict):
+            cart["_discount_schema_fallback"] = True
 
         cart_id = cart.get("id") or ""
         checkout_url = cart.get("checkoutUrl") or None
 
-        unit_price_by_variant_id: Dict[str, Decimal] = {}
+        parsed_discount_state = _parse_storefront_cart_discounts(
+            cart=cart,
+            submitted_codes=discount_codes,
+            source="shopify_storefront_cart",
+        )
+        if discount_schema_fallback:
+            evidence = dict(parsed_discount_state["discount_evidence"])
+            evidence["pricing_confidence"] = "unverified"
+            evidence["reason"] = "storefront_discount_schema_fallback"
+            parsed_discount_state["discount_evidence"] = evidence
+
+        unit_price_by_variant_id: Dict[str, Decimal] = dict(parsed_discount_state["unit_price_by_variant_id"])
         try:
             lines_root = cart.get("lines") or {}
             edges = lines_root.get("edges") or []
@@ -898,7 +1304,7 @@ mutation($input: CartInput!) {
                     continue
                 unit_price_by_variant_id[variant_id.strip()] = _d(amt)
         except Exception:
-            unit_price_by_variant_id = {}
+            unit_price_by_variant_id = dict(parsed_discount_state["unit_price_by_variant_id"])
         cost = cart.get("cost") or {}
         subtotal = _d((cost.get("subtotalAmount") or {}).get("amount"))
         total = _d((cost.get("totalAmount") or {}).get("amount"))
@@ -936,6 +1342,7 @@ mutation($input: CartInput!) {
                         shop_domain=shop_domain,
                         storefront_token=storefront_token,
                         cart_id=cart_id,
+                        submitted_codes=discount_codes,
                         debug_id=debug_id,
                     )
                     return opts, sel, refreshed
@@ -949,6 +1356,12 @@ mutation($input: CartInput!) {
                     total = refreshed.total
                     tax = refreshed.tax
                     currency = refreshed.currency
+                    unit_price_by_variant_id = refreshed.unit_price_by_variant_id or unit_price_by_variant_id
+                    parsed_discount_state["line_pricing_by_variant_id"] = refreshed.line_pricing_by_variant_id
+                    parsed_discount_state["promotion_lines"] = refreshed.promotion_lines
+                    parsed_discount_state["discount_codes"] = refreshed.discount_codes
+                    parsed_discount_state["discount_total"] = refreshed.discount_total
+                    parsed_discount_state["discount_evidence"] = refreshed.discount_evidence
             except asyncio.TimeoutError:
                 logger.info(
                     {"debug_id": debug_id, "timeout_seconds": delivery_timeout_s},
@@ -972,6 +1385,11 @@ mutation($input: CartInput!) {
             delivery_options=delivery_options,
             selected_delivery_option=selected,
             unit_price_by_variant_id=unit_price_by_variant_id,
+            line_pricing_by_variant_id=parsed_discount_state["line_pricing_by_variant_id"],
+            promotion_lines=parsed_discount_state["promotion_lines"],
+            discount_codes=parsed_discount_state["discount_codes"],
+            discount_total=parsed_discount_state["discount_total"],
+            discount_evidence=parsed_discount_state["discount_evidence"],
         )
 
     async def _get_cart_cost(
@@ -980,6 +1398,7 @@ mutation($input: CartInput!) {
         shop_domain: str,
         storefront_token: str,
         cart_id: str,
+        submitted_codes: Optional[List[str]] = None,
         debug_id: str,
     ) -> Optional[StorefrontCartResult]:
         query = """
@@ -987,6 +1406,28 @@ query($id: ID!) {
   cart(id: $id) {
     id
     checkoutUrl
+    discountCodes { code applicable }
+    lines(first: 100) {
+      edges {
+        node {
+          id
+          quantity
+          attributes { key value }
+          discountAllocations {
+            __typename
+            targetType
+            discountedAmount { amount currencyCode }
+            ... on CartCodeDiscountAllocation { code }
+            ... on CartAutomaticDiscountAllocation { title }
+            ... on CartCustomDiscountAllocation { title }
+          }
+          cost {
+            amountPerQuantity { amount currencyCode }
+            totalAmount { amount currencyCode }
+          }
+        }
+      }
+    }
     cost {
       subtotalAmount { amount currencyCode }
       totalTaxAmount { amount currencyCode }
@@ -1005,6 +1446,11 @@ query($id: ID!) {
         cart = (data.get("cart") or {}) if isinstance(data, dict) else {}
         if not cart:
             return None
+        parsed_discount_state = _parse_storefront_cart_discounts(
+            cart=cart,
+            submitted_codes=submitted_codes or [],
+            source="shopify_storefront_cart",
+        )
         cost = cart.get("cost") or {}
         subtotal = _d((cost.get("subtotalAmount") or {}).get("amount"))
         total = _d((cost.get("totalAmount") or {}).get("amount"))
@@ -1022,7 +1468,12 @@ query($id: ID!) {
             tax=tax,
             delivery_options=None,
             selected_delivery_option=None,
-            unit_price_by_variant_id={},
+            unit_price_by_variant_id=parsed_discount_state["unit_price_by_variant_id"],
+            line_pricing_by_variant_id=parsed_discount_state["line_pricing_by_variant_id"],
+            promotion_lines=parsed_discount_state["promotion_lines"],
+            discount_codes=parsed_discount_state["discount_codes"],
+            discount_total=parsed_discount_state["discount_total"],
+            discount_evidence=parsed_discount_state["discount_evidence"],
         )
 
     async def _attach_address_and_select_delivery_best_effort(

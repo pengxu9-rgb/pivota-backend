@@ -1121,6 +1121,240 @@ def _build_quote_drift_normalized_request(
     }
 
 
+def _coerce_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _pricing_quote_meta_from_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _coerce_dict((order or {}).get("metadata"))
+    pricing_quote = metadata.get("pricing_quote")
+    return pricing_quote if isinstance(pricing_quote, dict) else {}
+
+
+def _shopify_discount_reconciliation_mode() -> str:
+    mode = str(os.getenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe") or "").strip().lower()
+    return mode if mode in {"observe", "fail_closed"} else "observe"
+
+
+def _money2(value: Any) -> Decimal:
+    return parse_decimal_money(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _discount_evidence_hash(discount_evidence: Any) -> Optional[str]:
+    if not isinstance(discount_evidence, dict) or not discount_evidence:
+        return None
+    payload = json.dumps(discount_evidence, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _pricing_quote_discount_total(pricing_quote_meta: Dict[str, Any]) -> Decimal:
+    pricing = pricing_quote_meta.get("pricing") if isinstance(pricing_quote_meta, dict) else None
+    if isinstance(pricing, dict):
+        total = _money2(pricing.get("discount_total"))
+        if total > 0:
+            return total
+
+    total = Decimal("0.00")
+    for collection_key in ("promotion_lines",):
+        for line in pricing_quote_meta.get(collection_key) or []:
+            if not isinstance(line, dict):
+                continue
+            total += _money2(line.get("amount")).copy_abs()
+    evidence = pricing_quote_meta.get("discount_evidence")
+    if isinstance(evidence, dict):
+        for app in evidence.get("applications") or []:
+            if isinstance(app, dict):
+                total += _money2(app.get("amount")).copy_abs()
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _build_shopify_order_discount_codes(pricing_quote_meta: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    REST order creation supports order-level discount_codes. Use fixed amounts only
+    because the quote snapshot carries final allocated amounts, not reusable merchant rule math.
+    """
+    if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
+        return []
+
+    evidence = pricing_quote_meta.get("discount_evidence")
+    applicable_codes = set()
+    if isinstance(evidence, dict):
+        for row in evidence.get("codes") or []:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("code") or "").strip()
+            if code and row.get("applicable") is True:
+                applicable_codes.add(code)
+
+    amounts_by_code: Dict[str, Decimal] = {}
+    source_rows = (evidence or {}).get("applications") if isinstance(evidence, dict) else []
+    if not source_rows:
+        source_rows = pricing_quote_meta.get("promotion_lines") or []
+    for row in source_rows or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        if not code:
+            continue
+        amount = _money2(row.get("amount")).copy_abs()
+        if amount <= 0:
+            continue
+        if applicable_codes and code not in applicable_codes:
+            continue
+        amounts_by_code[code] = amounts_by_code.get(code, Decimal("0.00")) + amount
+
+    discount_total = _pricing_quote_discount_total(pricing_quote_meta)
+    if not amounts_by_code and len(applicable_codes) == 1 and discount_total > 0:
+        code = next(iter(applicable_codes))
+        amounts_by_code[code] = discount_total
+
+    out: List[Dict[str, str]] = []
+    for code, amount in amounts_by_code.items():
+        if amount <= 0:
+            continue
+        out.append({"code": code, "amount": str(amount.quantize(Decimal("0.01"))), "type": "fixed_amount"})
+    return out[:1]
+
+
+def _build_shopify_discount_order_annotations(
+    *,
+    order_id: str,
+    pricing_quote_meta: Dict[str, Any],
+) -> Tuple[List[str], List[Dict[str, str]]]:
+    if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
+        return [], []
+
+    tags: List[str] = []
+    note_attributes: List[Dict[str, str]] = []
+    quote_id = str(pricing_quote_meta.get("quote_id") or "").strip()
+    if quote_id:
+        tags.append(f"pivota_quote_id:{quote_id}")
+        note_attributes.append({"name": "pivota_quote_id", "value": quote_id})
+
+    evidence = pricing_quote_meta.get("discount_evidence")
+    evidence_hash = _discount_evidence_hash(evidence)
+    if evidence_hash:
+        tags.append(f"pivota_discount_evidence:{evidence_hash}")
+        note_attributes.append({"name": "pivota_discount_evidence_hash", "value": evidence_hash})
+
+    if isinstance(evidence, dict):
+        confidence = str(evidence.get("pricing_confidence") or "").strip()
+        if confidence:
+            note_attributes.append({"name": "pivota_discount_pricing_confidence", "value": confidence})
+
+    # Keep a stable cross-system join key even if the quote id is absent on a legacy row.
+    note_attributes.append({"name": "pivota_order_id", "value": str(order_id)})
+    return tags, note_attributes
+
+
+def _extract_shopify_order_reconciliation_totals(
+    shopify_order: Optional[Dict[str, Any]],
+) -> Dict[str, Optional[Decimal]]:
+    if not isinstance(shopify_order, dict):
+        return {"total": None, "discount_total": None, "transaction_total": None}
+
+    total_price_set = shopify_order.get("total_price_set")
+    total_shop_money = (total_price_set or {}).get("shop_money") if isinstance(total_price_set, dict) else {}
+    discount_price_set = shopify_order.get("total_discounts_set")
+    discount_shop_money = (discount_price_set or {}).get("shop_money") if isinstance(discount_price_set, dict) else {}
+    total = _money2(
+        shopify_order.get("current_total_price")
+        or shopify_order.get("total_price")
+        or (total_shop_money or {}).get("amount")
+    )
+    discount_total = _money2(
+        shopify_order.get("current_total_discounts")
+        or shopify_order.get("total_discounts")
+        or (discount_shop_money or {}).get("amount")
+    )
+
+    transaction_total: Optional[Decimal] = None
+    transactions = shopify_order.get("transactions")
+    if isinstance(transactions, list):
+        transaction_total = Decimal("0.00")
+        for txn in transactions:
+            if not isinstance(txn, dict):
+                continue
+            status_value = str(txn.get("status") or "").strip().lower()
+            kind = str(txn.get("kind") or "").strip().lower()
+            if status_value and status_value not in {"success", "succeeded"}:
+                continue
+            if kind and kind not in {"sale", "capture"}:
+                continue
+            transaction_total += _money2(txn.get("amount"))
+        transaction_total = transaction_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    return {
+        "total": total,
+        "discount_total": discount_total,
+        "transaction_total": transaction_total,
+    }
+
+
+def _reconcile_shopify_discount_order(
+    *,
+    order: Dict[str, Any],
+    pricing_quote_meta: Dict[str, Any],
+    shopify_order: Optional[Dict[str, Any]],
+    transaction_amount: Decimal,
+) -> Dict[str, Any]:
+    mode = _shopify_discount_reconciliation_mode()
+    expected_total = _money2((order or {}).get("total"))
+    expected_discount = _pricing_quote_discount_total(pricing_quote_meta)
+    observed = _extract_shopify_order_reconciliation_totals(shopify_order)
+
+    mismatches: List[str] = []
+    unverified: List[str] = []
+
+    observed_total = observed.get("total")
+    if observed_total is None:
+        unverified.append("shopify_order_total")
+    elif observed_total != expected_total:
+        mismatches.append("shopify_order_total")
+
+    observed_discount = observed.get("discount_total")
+    if expected_discount > 0:
+        if observed_discount is None:
+            unverified.append("shopify_discount_total")
+        elif observed_discount != expected_discount:
+            mismatches.append("shopify_discount_total")
+
+    observed_transaction_total = observed.get("transaction_total")
+    if transaction_amount > 0:
+        if observed_transaction_total is None:
+            unverified.append("shopify_transaction_total")
+        elif observed_transaction_total != transaction_amount:
+            mismatches.append("shopify_transaction_total")
+
+    status_value = "passed"
+    if mismatches:
+        status_value = "failed"
+    elif unverified:
+        status_value = "partial"
+
+    return {
+        "status": status_value,
+        "mode": mode,
+        "passed": not (mode == "fail_closed" and (mismatches or unverified)),
+        "mismatches": mismatches,
+        "unverified": unverified,
+        "expected": {
+            "pivota_total": str(expected_total),
+            "pivota_discount_total": str(expected_discount),
+            "psp_transaction_total": str(transaction_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        },
+        "observed": {k: (str(v) if isinstance(v, Decimal) else None) for k, v in observed.items()},
+    }
+
+
 # ============================================================================
 # 订单创建（Agent 调用）
 # ============================================================================
@@ -1357,6 +1591,7 @@ async def create_new_order(
                     "quote_hash_sha256": quote.quote_hash_sha256,
                     "pricing": pricing,
                     "promotion_lines": snap.get("promotion_lines") or [],
+                    "discount_evidence": snap.get("discount_evidence") or {},
                     "line_items": snap.get("line_items") or [],
                 }
             except QuoteError as e:
@@ -2414,6 +2649,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
         from services.shopify_graphql_client import shopify_admin_graphql
         from db.orders import update_order as update_order_row
 
+        pricing_quote_meta = _pricing_quote_meta_from_order(order)
         pivota_tag = f"pivota_order_id:{order_id}"
 
         def _token_fingerprint(token: Optional[str]) -> Optional[str]:
@@ -2605,6 +2841,13 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 txn["authorization"] = external_payment_ref
             transactions_payload = [txn]
 
+        discount_tags, discount_note_attributes = _build_shopify_discount_order_annotations(
+            order_id=order_id,
+            pricing_quote_meta=pricing_quote_meta,
+        )
+        shopify_discount_codes = _build_shopify_order_discount_codes(pricing_quote_meta)
+        shopify_tags = ["pivota", "agent-order", pivota_tag, *discount_tags]
+
         shopify_order_data = {
             "order": {
                 # Email is required for receipts; keep optional in payload in case a legacy order row is missing it.
@@ -2623,8 +2866,10 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 "shipping_address": shopify_shipping,
                 # Many templates reference billing_address.* for the buyer identity.
                 "billing_address": shopify_shipping,
+                **({"discount_codes": shopify_discount_codes} if shopify_discount_codes else {}),
+                **({"note_attributes": discount_note_attributes} if discount_note_attributes else {}),
                 "note": f"Pivota Order ID: {order_id}",
-                "tags": ",".join(["pivota", "agent-order", pivota_tag])
+                "tags": ",".join(shopify_tags),
             }
         }
 
@@ -2635,7 +2880,37 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             shop_domain: str,
             access_token: str,
             event_type: str,
+            shopify_order_payload: Optional[Dict[str, Any]] = None,
         ) -> bool:
+            if pricing_quote_meta:
+                reconciliation = _reconcile_shopify_discount_order(
+                    order=order,
+                    pricing_quote_meta=pricing_quote_meta,
+                    shopify_order=shopify_order_payload,
+                    transaction_amount=order_total,
+                )
+                await log_order_event(
+                    event_type="shopify_discount_reconciliation",
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                    metadata={
+                        **reconciliation,
+                        "shopify_order_id": shopify_order_id,
+                        "store_id": str((store_used or {}).get("store_id") or "").strip() or None,
+                        "domain": shop_domain,
+                    },
+                )
+                if not reconciliation.get("passed"):
+                    logger.error(
+                        "[Shopify] Discount reconciliation blocked order link: order_id=%s shopify_order_id=%s status=%s mismatches=%s unverified=%s",
+                        order_id,
+                        shopify_order_id,
+                        reconciliation.get("status"),
+                        reconciliation.get("mismatches"),
+                        reconciliation.get("unverified"),
+                    )
+                    return False
+
             await update_fulfillment_info(
                 order_id=order_id,
                 shopify_order_id=shopify_order_id,
@@ -2758,6 +3033,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                             shop_domain=shop_domain,
                             access_token=access_token,
                             event_type="shopify_order_reused",
+                            shopify_order_payload=None,
                         )
 
                     url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
@@ -2805,6 +3081,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                                 shop_domain=shop_domain,
                                 access_token=access_token,
                                 event_type="shopify_order_created",
+                                shopify_order_payload=shopify_order,
                             )
 
                         # Auth errors: try another store row (stale token recovery).
