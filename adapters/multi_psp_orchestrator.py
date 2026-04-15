@@ -21,6 +21,13 @@ from utils.transient_errors import is_asyncpg_busy_error
 import hashlib
 
 
+def _payment_attempt_agent_id(agent_id: Optional[str]) -> Optional[str]:
+    value = str(agent_id or "").strip()
+    if not value or value.startswith("agent_internal_trusted_"):
+        return None
+    return value
+
+
 @dataclass
 class PSPConfig:
     """PSP configuration"""
@@ -173,7 +180,7 @@ class MultiPSPOrchestrator:
         
         order_id_for_log = str(metadata.get("order_id") or "").strip() or None
         route_id_for_log = str(metadata.get("route_id") or "").strip() or None
-        agent_id_for_log = str(metadata.get("agent_id") or "").strip() or None
+        agent_id_for_log = _payment_attempt_agent_id(metadata.get("agent_id"))
 
         async def _log_attempt_start(*, attempt_number: int, psp_name: str) -> Optional[str]:
             if not order_id_for_log:
@@ -212,8 +219,10 @@ class MultiPSPOrchestrator:
                 return attempt_id
             except Exception as e:
                 logger.warning(
-                    {"order_id": order_id_for_log, "psp": psp_name, "error": str(e)},
-                    "Failed to log payment attempt start (best-effort)",
+                    "Failed to log payment attempt start (best-effort): order_id=%s psp=%s error=%s",
+                    order_id_for_log,
+                    psp_name,
+                    str(e),
                 )
                 return None
 
