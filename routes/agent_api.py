@@ -8439,6 +8439,31 @@ async def agent_confirm_payment(
         raise HTTPException(status_code=500, detail=f"Payment confirmation failed: {str(e)}")
 
 
+@router.get("/orders/events")
+async def agent_list_order_events(
+    background_tasks: BackgroundTasks,
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    wait_ms: int = Query(default=0, ge=0, le=25_000),
+    merchant_id: Optional[str] = None,
+    order_id: Optional[str] = None,
+    buyer_ref: Optional[str] = None,
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
+):
+    return await _agent_list_order_events_impl(
+        background_tasks=background_tasks,
+        after_id=after_id,
+        limit=limit,
+        wait_ms=wait_ms,
+        merchant_id=merchant_id,
+        order_id=order_id,
+        buyer_ref=buyer_ref,
+        context=context,
+        agent_user=agent_user,
+    )
+
+
 @router.get("/orders/{order_id}")
 async def agent_get_order(
     order_id: str,
@@ -8699,8 +8724,7 @@ async def agent_list_orders(
         )
         raise HTTPException(status_code=500, detail="Failed to list orders")
 
-@router.get("/orders/events")
-async def agent_list_order_events(
+async def _agent_list_order_events_impl(
     background_tasks: BackgroundTasks,
     after_id: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
