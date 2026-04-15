@@ -4,6 +4,7 @@ Processes refund webhooks from various e-commerce platforms
 """
 from fastapi import APIRouter, Request, HTTPException, Header
 from typing import Optional
+from decimal import Decimal, InvalidOperation
 import hmac
 import hashlib
 import json
@@ -19,6 +20,98 @@ from config.settings import settings
 from utils.logger import logger
 
 router = APIRouter(prefix="/webhooks/refunds", tags=["refund-webhooks"])
+
+
+def _money(value) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def _shopify_refund_is_observation_only(refund_event: PlatformRefundEvent, order: dict) -> Optional[str]:
+    if str(refund_event.platform_type or "").lower() != "shopify":
+        return None
+
+    psp_used = str(order.get("psp_used") or order.get("payment_method") or "").strip().lower()
+    payment_reference = str(order.get("payment_intent_id") or "").strip()
+    external_psps = {
+        "stripe",
+        "adyen",
+        "paypal",
+        "braintree",
+        "square",
+        "checkout",
+        "checkout.com",
+        "mollie",
+        "ap2",
+    }
+    external_payment_prefixes = ("cs_", "pi_", "ch_", "re_")
+    if psp_used in external_psps or payment_reference.startswith(external_payment_prefixes):
+        return "shopify_refund_webhook_observation_only_external_psp"
+
+    order_total = _money(order.get("total"))
+    current_total_refunded = _money(order.get("total_refunded"))
+    event_amount = _money(refund_event.amount)
+    if order_total > Decimal("0") and current_total_refunded >= order_total:
+        return "shopify_refund_webhook_order_already_refunded"
+    if order_total > Decimal("0") and current_total_refunded + event_amount > order_total:
+        return "shopify_refund_webhook_would_over_refund"
+
+    return None
+
+
+async def _record_ignored_platform_refund(
+    refund_event: PlatformRefundEvent,
+    *,
+    order_id: str,
+    merchant_id: str,
+    reason: str,
+) -> str:
+    import secrets
+
+    refund_id = f"REF_{secrets.token_hex(8).upper()}"
+    insert_refund = """
+    INSERT INTO refund_records (
+        refund_id, order_id, merchant_id, amount, currency,
+        reason, source, status,
+        platform_type, platform_refund_id,
+        raw_payload, error_message, created_at, processed_at
+    ) VALUES (
+        :refund_id, :order_id, :merchant_id, :amount, :currency,
+        :reason, 'platform_webhook', 'ignored',
+        :platform_type, :platform_refund_id,
+        :raw_payload, :error_message, NOW(), NOW()
+    )
+    """
+
+    await database.execute(insert_refund, {
+        "refund_id": refund_id,
+        "order_id": order_id,
+        "merchant_id": merchant_id,
+        "amount": refund_event.amount,
+        "currency": refund_event.currency,
+        "reason": refund_event.reason,
+        "platform_type": refund_event.platform_type,
+        "platform_refund_id": refund_event.platform_refund_id,
+        "raw_payload": json.dumps(refund_event.raw_event),
+        "error_message": reason,
+    })
+
+    await log_order_event(
+        event_type="platform_refund_webhook_ignored",
+        order_id=order_id,
+        merchant_id=merchant_id,
+        metadata={
+            "refund_id": refund_id,
+            "platform_type": refund_event.platform_type,
+            "platform_refund_id": refund_event.platform_refund_id,
+            "amount": refund_event.amount,
+            "currency": refund_event.currency,
+            "reason": reason,
+        }
+    )
+    return refund_id
 
 
 async def process_platform_refund(
@@ -38,7 +131,8 @@ async def process_platform_refund(
     try:
         # Find the order in our system
         query = """
-        SELECT order_id, merchant_id, total, total_refunded, payment_status
+        SELECT order_id, merchant_id, total, total_refunded, payment_status,
+               status, payment_method, payment_intent_id, psp_used, metadata
         FROM orders
         WHERE merchant_id = :merchant_id
         AND (
@@ -85,6 +179,26 @@ async def process_platform_refund(
                 "status": "duplicate",
                 "refund_id": existing_refund["refund_id"],
                 "message": "Refund already processed"
+            }
+
+        ignore_reason = _shopify_refund_is_observation_only(refund_event, dict(order))
+        if ignore_reason:
+            refund_id = await _record_ignored_platform_refund(
+                refund_event,
+                order_id=order_id,
+                merchant_id=merchant_id,
+                reason=ignore_reason,
+            )
+            logger.info(
+                f"Platform refund ignored: {refund_id} for order {order_id} "
+                f"({refund_event.platform_type}) reason={ignore_reason}"
+            )
+            return {
+                "status": "ignored",
+                "refund_id": refund_id,
+                "order_id": order_id,
+                "amount": refund_event.amount,
+                "reason": ignore_reason,
             }
         
         # Create refund record directly (bypass PSP since it's already refunded on platform)
