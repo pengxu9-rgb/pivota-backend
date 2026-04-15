@@ -91,6 +91,7 @@ class StorefrontCartResult:
     promotion_lines: List[Dict[str, Any]]
     discount_codes: List[Dict[str, Any]]
     discount_total: Decimal
+    shipping_discount_total: Decimal
     discount_evidence: Dict[str, Any]
     delivery_diagnostics: Optional[Dict[str, Any]] = None
 
@@ -380,6 +381,7 @@ def _parse_storefront_cart_discounts(
     grouped: Dict[str, Dict[str, Any]] = {}
     line_shipping_requirements: List[Dict[str, Any]] = []
     discount_total = Decimal("0.00")
+    shipping_discount_total = Decimal("0.00")
 
     lines_root = cart.get("lines") or {}
     edges = lines_root.get("edges") or []
@@ -499,6 +501,59 @@ def _parse_storefront_cart_discounts(
             "line_discount_total": line_discount_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         }
 
+    cart_allocations = cart.get("discountAllocations") or []
+    if isinstance(cart_allocations, list):
+        for alloc in cart_allocations:
+            if not isinstance(alloc, dict):
+                continue
+            amount = _d((alloc.get("discountedAmount") or {}).get("amount"))
+            if amount <= 0:
+                continue
+            method = _discount_method_from_storefront_allocation(alloc)
+            code = _normalize_code(alloc.get("code")) or None
+            label = code or alloc.get("title") or "Shopify discount"
+            discount_class = _discount_class_from_storefront_target(alloc.get("targetType") or "ORDER")
+            group_key = "|".join(
+                [
+                    "cart",
+                    str(method),
+                    str(code or ""),
+                    str(label or ""),
+                    str(discount_class),
+                    str(alloc.get("__typename") or ""),
+                ]
+            )
+            group = grouped.setdefault(
+                group_key,
+                {
+                    "source": "shopify",
+                    "source_ref": group_key,
+                    "discount_class": discount_class,
+                    "method": method,
+                    "label": label,
+                    "code": code,
+                    "amount": Decimal("0.00"),
+                    "allocations": [],
+                    "metadata": {
+                        "source": source,
+                        "typename": alloc.get("__typename"),
+                        "allocation_scope": "cart",
+                    },
+                },
+            )
+            group["amount"] += amount
+            group["allocations"].append(
+                {
+                    "target_type": "shipping_line" if discount_class == "shipping" else "cart",
+                    "target_id": cart.get("id") or "cart",
+                    "amount": (Decimal("0.00") - amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                }
+            )
+            if discount_class == "shipping":
+                shipping_discount_total += amount
+            else:
+                discount_total += amount
+
     promotion_lines: List[Dict[str, Any]] = []
     for idx, group in enumerate(grouped.values()):
         amount = _d(group.get("amount"))
@@ -552,6 +607,10 @@ def _parse_storefront_cart_discounts(
         discount_evidence["shipping_evidence"] = {
             "line_shipping_requirements": line_shipping_requirements,
         }
+    if shipping_discount_total > 0:
+        shipping_evidence = dict(discount_evidence.get("shipping_evidence") or {})
+        shipping_evidence["discount_total"] = str(_d(shipping_discount_total))
+        discount_evidence["shipping_evidence"] = shipping_evidence
 
     return {
         "unit_price_by_variant_id": unit_price_by_variant_id,
@@ -559,6 +618,7 @@ def _parse_storefront_cart_discounts(
         "promotion_lines": promotion_lines,
         "discount_codes": code_rows,
         "discount_total": discount_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "shipping_discount_total": shipping_discount_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "discount_evidence": discount_evidence,
     }
 
@@ -1159,6 +1219,18 @@ query($ids: [ID!]!) {
         if shipping_fee is not None:
             pricing["shipping_fee"] = shipping_fee
             _mark_shipping_evidence(discount_evidence, status="authoritative", amount=shipping_fee)
+            shipping_evidence = dict(discount_evidence.get("shipping_evidence") or {})
+            gross_shipping_fee = None
+            opts = cart.delivery_options or []
+            chosen = cart.selected_delivery_option or (opts[0] if opts else None)
+            est = chosen.get("estimatedCost") if isinstance(chosen, dict) else None
+            if isinstance(est, dict) and est.get("amount") is not None:
+                gross_shipping_fee = _d(est.get("amount"))
+            if gross_shipping_fee is not None:
+                shipping_evidence["gross_amount"] = str(gross_shipping_fee)
+            if cart.shipping_discount_total > 0:
+                shipping_evidence["discount_total"] = str(_d(cart.shipping_discount_total))
+            discount_evidence["shipping_evidence"] = shipping_evidence
         else:
             fallback_enabled = (
                 os.getenv("SHOPIFY_STOREFRONT_SHIPPING_FALLBACK_INFER", "").strip().lower()
@@ -1352,6 +1424,14 @@ query($ids: [ID!]!) {
 	      id
 	      checkoutUrl
 	      discountCodes { code applicable }
+          discountAllocations {
+            __typename
+            targetType
+            discountedAmount { amount currencyCode }
+            ... on CartCodeDiscountAllocation { code }
+            ... on CartAutomaticDiscountAllocation { title }
+            ... on CartCustomDiscountAllocation { title }
+          }
 	      lines(first: 100) {
 	        edges {
 	          node {
@@ -1647,6 +1727,7 @@ query($ids: [ID!]!) {
             promotion_lines=parsed_discount_state["promotion_lines"],
             discount_codes=parsed_discount_state["discount_codes"],
             discount_total=parsed_discount_state["discount_total"],
+            shipping_discount_total=parsed_discount_state["shipping_discount_total"],
             discount_evidence=parsed_discount_state["discount_evidence"],
             delivery_diagnostics=delivery_diagnostics,
         )
@@ -1666,6 +1747,14 @@ query($id: ID!) {
     id
     checkoutUrl
     discountCodes { code applicable }
+    discountAllocations {
+      __typename
+      targetType
+      discountedAmount { amount currencyCode }
+      ... on CartCodeDiscountAllocation { code }
+      ... on CartAutomaticDiscountAllocation { title }
+      ... on CartCustomDiscountAllocation { title }
+    }
     lines(first: 100) {
       edges {
 	        node {
@@ -1741,6 +1830,7 @@ query($id: ID!) {
             promotion_lines=parsed_discount_state["promotion_lines"],
             discount_codes=parsed_discount_state["discount_codes"],
             discount_total=parsed_discount_state["discount_total"],
+            shipping_discount_total=parsed_discount_state["shipping_discount_total"],
             discount_evidence=parsed_discount_state["discount_evidence"],
         )
 
@@ -2117,4 +2207,5 @@ query($ids: [ID!]!) {
         fee = _d(amt)
         if fee < 0:
             return Decimal("0.00")
-        return fee
+        shipping_discount_total = _d(getattr(cart, "shipping_discount_total", Decimal("0.00")))
+        return max(_d(fee - shipping_discount_total), Decimal("0.00"))

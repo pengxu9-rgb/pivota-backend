@@ -7,6 +7,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/tes
 
 from services.shopify_storefront_pricing_service import (
     ShopifyStorefrontPricingService,
+    StorefrontCartResult,
     _infer_shipping_fee_from_totals,
     _mark_shipping_evidence,
     _original_subtotal_from_line_items,
@@ -52,6 +53,46 @@ def test_storefront_discount_parser_uses_line_allocations_not_total_delta():
     assert parsed["line_pricing_by_variant_id"]["111"]["unit_price_effective"] == Decimal("7.50")
     assert parsed["line_pricing_by_variant_id"]["111"]["line_discount_total"] == Decimal("5.00")
     assert parsed["promotion_lines"][0]["amount"] == Decimal("-5.00")
+    assert parsed["discount_evidence"]["pricing_confidence"] == "authoritative"
+
+
+def test_storefront_discount_parser_records_cart_level_shipping_discount_allocations():
+    cart = {
+        "id": "gid://shopify/Cart/test",
+        "discountCodes": [{"code": "freeship", "applicable": True}],
+        "discountAllocations": [
+            {
+                "__typename": "CartCodeDiscountAllocation",
+                "targetType": "SHIPPING_LINE",
+                "code": "freeship",
+                "discountedAmount": {"amount": "29.00", "currencyCode": "EUR"},
+            }
+        ],
+        "lines": {
+            "edges": [
+                {
+                    "node": {
+                        "id": "line_1",
+                        "quantity": 1,
+                        "attributes": [{"key": "pivota_variant_id", "value": "111"}],
+                        "discountAllocations": [],
+                        "cost": {
+                            "amountPerQuantity": {"amount": "29.00", "currencyCode": "EUR"},
+                            "totalAmount": {"amount": "29.00", "currencyCode": "EUR"},
+                        },
+                    }
+                }
+            ]
+        },
+    }
+
+    parsed = _parse_storefront_cart_discounts(cart=cart, submitted_codes=["freeship"])
+
+    assert parsed["discount_total"] == Decimal("0.00")
+    assert parsed["shipping_discount_total"] == Decimal("29.00")
+    assert parsed["promotion_lines"][0]["discount_class"] == "shipping"
+    assert parsed["promotion_lines"][0]["amount"] == Decimal("-29.00")
+    assert parsed["discount_evidence"]["shipping_evidence"]["discount_total"] == "29.00"
     assert parsed["discount_evidence"]["pricing_confidence"] == "authoritative"
 
 
@@ -160,6 +201,37 @@ def test_shipping_inference_can_recover_selected_shipping_from_authoritative_tot
     )
 
     assert shipping_fee == Decimal("7.00")
+
+
+def test_derive_shipping_fee_uses_net_shipping_after_shipping_discount():
+    service = ShopifyStorefrontPricingService()
+
+    shipping_fee = service._derive_shipping_fee(
+        StorefrontCartResult(
+            cart_id="cart_1",
+            checkout_url=None,
+            currency="EUR",
+            subtotal=Decimal("29.00"),
+            total=Decimal("29.00"),
+            tax=Decimal("0.00"),
+            delivery_options=[
+                {
+                    "handle": "standard",
+                    "estimatedCost": {"amount": "29.00", "currencyCode": "EUR"},
+                }
+            ],
+            selected_delivery_option=None,
+            unit_price_by_variant_id={},
+            line_pricing_by_variant_id={},
+            promotion_lines=[],
+            discount_codes=[],
+            discount_total=Decimal("0.00"),
+            shipping_discount_total=Decimal("29.00"),
+            discount_evidence={},
+        )
+    )
+
+    assert shipping_fee == Decimal("0.00")
 
 
 def test_unverified_shipping_evidence_downgrades_pricing_confidence():
