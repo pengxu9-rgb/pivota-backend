@@ -2109,6 +2109,9 @@ async def create_new_order(
                     event_type="order_created",
                     order_id=order_id,
                     merchant_id=order_request.merchant_id,
+                    total_amount=float(total),
+                    currency=order_request.currency,
+                    payment_method=psp_type,
                     metadata={
                         "total": float(total),
                         "currency": order_request.currency,
@@ -2151,6 +2154,8 @@ async def create_new_order(
                             event_type="payment_fallback_platform_checkout",
                             order_id=order_id,
                             merchant_id=order_request.merchant_id,
+                            total_amount=float(total),
+                            currency=order_request.currency,
                             metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                         )
                 else:
@@ -2163,6 +2168,8 @@ async def create_new_order(
                     event_type="payment_intent_failed",
                     order_id=order_id,
                     merchant_id=order_request.merchant_id,
+                    total_amount=float(total),
+                    currency=order_request.currency,
                     metadata={"error": error, "psp_type": final_psp},
                 )
         except Exception as e:
@@ -2199,6 +2206,8 @@ async def create_new_order(
                         event_type="payment_fallback_platform_checkout",
                         order_id=order_id,
                         merchant_id=order_request.merchant_id,
+                        total_amount=float(total),
+                        currency=order_request.currency,
                         metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                     )
             else:
@@ -2210,6 +2219,8 @@ async def create_new_order(
                 event_type="payment_intent_error",
                 order_id=order_id,
                 merchant_id=order_request.merchant_id,
+                total_amount=float(total),
+                currency=order_request.currency,
                 metadata={"error": str(e)},
             )
 
@@ -2294,6 +2305,10 @@ async def confirm_payment(
                 event_type="payment_succeeded",
                 order_id=payment_request.order_id,
                 merchant_id=order["merchant_id"],
+                total_amount=float(order["total"]),
+                currency=str(order["currency"]),
+                payment_method=psp_type,
+                status="succeeded",
                 metadata={
                     "payment_intent_id": order["payment_intent_id"],
                     "amount": float(order["total"]),
@@ -3081,6 +3096,8 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                     event_type="shopify_discount_reconciliation",
                     order_id=order_id,
                     merchant_id=order["merchant_id"],
+                    total_amount=float(order.get("total") or 0),
+                    currency=str(order.get("currency") or "USD"),
                     metadata={
                         **reconciliation,
                         "shopify_order_id": shopify_order_id,
@@ -3115,6 +3132,8 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 event_type=event_type,
                 order_id=order_id,
                 merchant_id=order["merchant_id"],
+                total_amount=float(order.get("total") or 0),
+                currency=str(order.get("currency") or "USD"),
                 metadata={
                     "shopify_order_id": shopify_order_id,
                     "store_id": store_id_used,

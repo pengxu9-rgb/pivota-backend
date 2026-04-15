@@ -444,13 +444,39 @@ async def log_api_call(
     await database.execute(query)
 
 
+def _event_currency_from_metadata(metadata: Optional[Dict]) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+
+    for key in ("currency", "presentment_currency", "charge_currency"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+
+    for key in ("amount", "total", "total_amount"):
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            currency = value.get("currency") or value.get("currencyCode")
+            if isinstance(currency, str) and currency.strip():
+                return currency.strip().upper()
+
+    return None
+
+
+def _resolve_order_event_currency(currency: Optional[str], metadata: Optional[Dict]) -> str:
+    explicit = str(currency or "").strip().upper()
+    if explicit:
+        return explicit
+    return _event_currency_from_metadata(metadata) or "USD"
+
+
 async def log_order_event(
     event_type: str,
     merchant_id: str,
     order_id: str,
     product_ids: Optional[List[str]] = None,
     total_amount: Optional[float] = None,
-    currency: str = "USD",
+    currency: Optional[str] = None,
     payment_method: Optional[str] = None,
     status: Optional[str] = None,
     error_message: Optional[str] = None,
@@ -465,7 +491,7 @@ async def log_order_event(
         order_id=order_id,
         product_ids=product_ids,
         total_amount=total_amount,
-        currency=currency,
+        currency=_resolve_order_event_currency(currency, metadata),
         payment_method=payment_method,
         status=status,
         error_message=error_message,
