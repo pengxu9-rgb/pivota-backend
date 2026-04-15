@@ -92,6 +92,7 @@ def test_storefront_discount_parser_records_cart_level_shipping_discount_allocat
     assert parsed["shipping_discount_total"] == Decimal("29.00")
     assert parsed["promotion_lines"][0]["discount_class"] == "shipping"
     assert parsed["promotion_lines"][0]["amount"] == Decimal("-29.00")
+    assert parsed["promotion_lines"][0]["allocations"][0]["target_type"] == "shipping"
     assert parsed["discount_evidence"]["shipping_evidence"]["discount_total"] == "29.00"
     assert parsed["discount_evidence"]["pricing_confidence"] == "authoritative"
 

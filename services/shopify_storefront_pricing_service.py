@@ -544,7 +544,7 @@ def _parse_storefront_cart_discounts(
             group["amount"] += amount
             group["allocations"].append(
                 {
-                    "target_type": "shipping_line" if discount_class == "shipping" else "cart",
+                    "target_type": "shipping" if discount_class == "shipping" else "order",
                     "target_id": cart.get("id") or "cart",
                     "amount": (Decimal("0.00") - amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
                 }
