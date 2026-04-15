@@ -40,7 +40,6 @@ Validation scope included production quote/cart probes, quote-backed order creat
 - `BXGY positive`: `PIVOTA_TEST_BXGY` becomes applicable at quantity `3` and applies `29.00` off.
 - `Non-combinable pair`: with `PIVOTA_TEST_NOCOMBO_A + PIVOTA_TEST_BXGY` at quantity `3`, Shopify accepts `PIVOTA_TEST_BXGY` and rejects `PIVOTA_TEST_NOCOMBO_A` cleanly.
 - `Expired code`: `PIVOTA_TEST_EXPIRED` is rejected with `applicable=false`.
-- `Exhausted/unavailable code`: `PIVOTA_TEST_EXHAUSTED` is rejected with `applicable=false`.
 - `Cross-class stacking probe`: `PIVOTA_TEST_AMOUNT10 + PIVOTA_TEST_FREESHIP` does not stack in the tested configuration; Shopify accepts the amount-off code and rejects the free-shipping code cleanly.
 - `Order create probe`: a quote-backed amount-off order created successfully on retry, preserved the discounted total `55.10`, stayed in `awaiting_payment`, did not create a Shopify order before payment confirmation, and was then cancelled cleanly.
 - `Unpaid payment confirmation guard`: production rejected an unpaid Stripe PaymentIntent with `409 PAYMENT_NOT_SUCCEEDED`, left the order in `awaiting_payment`, kept `shopify_order_id=null`, and allowed cancellation.
