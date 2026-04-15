@@ -92,6 +92,7 @@ class StorefrontCartResult:
     discount_codes: List[Dict[str, Any]]
     discount_total: Decimal
     discount_evidence: Dict[str, Any]
+    delivery_diagnostics: Optional[Dict[str, Any]] = None
 
 
 _STOREFRONT_ROTATE_ATTEMPTED_AT: Dict[str, float] = {}
@@ -565,8 +566,8 @@ class ShopifyStorefrontPricingService:
     Admin REST Checkout API (which requires write_checkouts).
     """
 
-    def __init__(self, api_version: str = "2024-07", timeout_seconds: float = 20.0):
-        self.api_version = api_version
+    def __init__(self, api_version: Optional[str] = None, timeout_seconds: float = 20.0):
+        self.api_version = (api_version or os.getenv("SHOPIFY_STOREFRONT_API_VERSION") or "2026-04").strip()
         self.timeout_seconds = timeout_seconds
         self._rotate_cooldown_s = int(os.getenv("SHOPIFY_STOREFRONT_ROTATE_COOLDOWN_SECONDS", "3600") or "3600")
         # Avoid repeatedly using Admin API tokens to auto-create Storefront tokens at runtime.
@@ -1075,6 +1076,10 @@ query($ids: [ID!]!) {
             )
 
         discount_evidence = dict(cart.discount_evidence or _empty_discount_evidence(source="shopify_storefront_cart"))
+        if cart.delivery_diagnostics:
+            shipping_evidence = dict(discount_evidence.get("shipping_evidence") or {})
+            shipping_evidence["delivery_diagnostics"] = cart.delivery_diagnostics
+            discount_evidence["shipping_evidence"] = shipping_evidence
         if customer_email:
             discount_evidence["customer_eligibility"] = await self._fetch_new_customer_evidence(
                 shop_domain=shop_domain,
@@ -1494,14 +1499,20 @@ query($ids: [ID!]!) {
 
         delivery_options = None
         selected = None
+        delivery_diagnostics = None
 
         # Best-effort: attach a delivery address and fetch delivery options.
         if cart_id and country and postal:
             delivery_timeout_s = float(os.getenv("SHOPIFY_STOREFRONT_DELIVERY_TIMEOUT_SECONDS", "8") or "8")
             delivery_timeout_s = max(0.5, delivery_timeout_s)
             try:
-                async def _delivery_work() -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], Optional[StorefrontCartResult]]:
-                    opts, sel = await self._attach_address_and_select_delivery_best_effort(
+                async def _delivery_work() -> tuple[
+                    Optional[List[Dict[str, Any]]],
+                    Optional[Dict[str, Any]],
+                    Optional[StorefrontCartResult],
+                    Optional[Dict[str, Any]],
+                ]:
+                    opts, sel, diagnostics = await self._attach_address_and_select_delivery_best_effort(
                         shop_domain=shop_domain,
                         storefront_token=storefront_token,
                         cart_id=cart_id,
@@ -1523,9 +1534,9 @@ query($ids: [ID!]!) {
                         submitted_codes=discount_codes,
                         debug_id=debug_id,
                     )
-                    return opts, sel, refreshed
+                    return opts, sel, refreshed, diagnostics
 
-                delivery_options, selected, refreshed = await asyncio.wait_for(
+                delivery_options, selected, refreshed, delivery_diagnostics = await asyncio.wait_for(
                     _delivery_work(), timeout=delivery_timeout_s
                 )
 
@@ -1541,11 +1552,19 @@ query($ids: [ID!]!) {
                     parsed_discount_state["discount_total"] = refreshed.discount_total
                     parsed_discount_state["discount_evidence"] = refreshed.discount_evidence
             except asyncio.TimeoutError:
+                delivery_diagnostics = {"delivery_timeout": True, "timeout_seconds": delivery_timeout_s}
                 logger.info(
                     {"debug_id": debug_id, "timeout_seconds": delivery_timeout_s},
                     "Storefront delivery options timed out; continuing without delivery selection",
                 )
             except ShopifyPricingError as e:
+                delivery_diagnostics = {
+                    "delivery_error": {
+                        "code": e.code,
+                        "message": e.message,
+                        "details": getattr(e, "details", {}) or {},
+                    }
+                }
                 # Delivery address/options are best-effort; keep the quote usable even if
                 # the Storefront schema differs across shops/versions.
                 logger.info(
@@ -1568,6 +1587,7 @@ query($ids: [ID!]!) {
             discount_codes=parsed_discount_state["discount_codes"],
             discount_total=parsed_discount_state["discount_total"],
             discount_evidence=parsed_discount_state["discount_evidence"],
+            delivery_diagnostics=delivery_diagnostics,
         )
 
     async def _get_cart_cost(
@@ -1677,7 +1697,7 @@ query($id: ID!) {
         address2: Optional[str],
         selected_delivery_option: Optional[Dict[str, Any]],
         debug_id: str,
-    ) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
+    ) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], Dict[str, Any]]:
         # NOTE: Storefront schema varies by shop/api-version. Some expect:
         # - addresses: [CartSelectableAddressInput!]! with field "deliveryAddress"
         # - others expect field "address"
@@ -1710,7 +1730,17 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
 
         added = False
         last_error_details: Dict[str, Any] = {}
+        diagnostics: Dict[str, Any] = {
+            "storefront_api_version": self.api_version,
+            "address_add_attempted": True,
+            "address_add_succeeded": False,
+            "address_add_shapes_attempted": 0,
+            "delivery_groups_count": None,
+            "delivery_options_count": None,
+            "selected_delivery_addresses_count": None,
+        }
         for addresses in add_shapes:
+            diagnostics["address_add_shapes_attempted"] = int(diagnostics["address_add_shapes_attempted"] or 0) + 1
             try:
                 data = await self._storefront_graphql(
                     shop_domain=shop_domain,
@@ -1723,12 +1753,28 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
                 user_errors = root.get("userErrors") or []
                 if user_errors:
                     # Keep trying other shapes.
-                    last_error_details = {"user_errors": user_errors}
+                    safe_errors = [
+                        {
+                            "field": err.get("field"),
+                            "message": err.get("message"),
+                            "code": err.get("code"),
+                        }
+                        for err in user_errors
+                        if isinstance(err, dict)
+                    ]
+                    last_error_details = {"user_errors": safe_errors[:5]}
+                    diagnostics["last_address_add_user_errors"] = safe_errors[:5]
                     continue
                 added = True
+                diagnostics["address_add_succeeded"] = True
                 break
             except ShopifyPricingError as e:
                 last_error_details = getattr(e, "details", {}) or {}
+                diagnostics["last_address_add_error"] = {
+                    "code": e.code,
+                    "message": e.message,
+                    "details": last_error_details,
+                }
                 continue
 
         # Even if we fail to attach the address, still try to query deliveryGroups.
@@ -1738,6 +1784,13 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
         delivery_query = """
 query($id: ID!) {
   cart(id: $id) {
+    delivery {
+      addresses(selected: true) {
+        id
+        selected
+        oneTimeUse
+      }
+    }
     deliveryGroups(first: 10) {
       edges {
         node {
@@ -1769,7 +1822,13 @@ query($id: ID!) {
                 debug_id=debug_id,
             )
             cart = (data2.get("cart") or {}) if isinstance(data2, dict) else {}
+            delivery = cart.get("delivery") if isinstance(cart, dict) else None
+            if isinstance(delivery, dict):
+                selected_addresses = delivery.get("addresses")
+                if isinstance(selected_addresses, list):
+                    diagnostics["selected_delivery_addresses_count"] = len(selected_addresses)
             groups = (((cart.get("deliveryGroups") or {}).get("edges")) or []) if isinstance(cart, dict) else []
+            diagnostics["delivery_groups_count"] = len(groups)
             options = []
             for edge in groups:
                 node = (edge or {}).get("node") or {}
@@ -1778,6 +1837,7 @@ query($id: ID!) {
                     if not isinstance(opt, dict):
                         continue
                     options.append({**opt, "delivery_group_id": group_id})
+            diagnostics["delivery_options_count"] = len(options)
             if options:
                 break
             if attempt < attempts - 1 and retry_delay_s > 0:
@@ -1785,13 +1845,8 @@ query($id: ID!) {
 
         if not options:
             if not added and last_error_details:
-                raise ShopifyPricingError(
-                    "SHOPIFY_PRICING_UNAVAILABLE",
-                    "No delivery options; address attach failed",
-                    debug_id,
-                    details=last_error_details,
-                )
-            return None, None
+                diagnostics["address_add_failure_details"] = last_error_details
+            return None, None, diagnostics
 
         def _opt_cost_amount(o: Dict[str, Any]) -> Decimal:
             est = o.get("estimatedCost") or {}
@@ -1839,7 +1894,9 @@ mutation($cartId: ID!, $selectedDeliveryOptions: [CartSelectedDeliveryOptionInpu
         except Exception:
             pass
 
-        return options, chosen
+        diagnostics["selected_delivery_option_handle"] = chosen.get("handle")
+        diagnostics["selected_delivery_option_amount"] = (chosen.get("estimatedCost") or {}).get("amount")
+        return options, chosen, diagnostics
 
     async def _build_line_items(
         self,
