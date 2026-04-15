@@ -4,7 +4,9 @@
 
 The Shopify discount integration is no longer just cosmetic. The quote-time path now has live evidence for Shopify-native code acceptance/rejection, product discount allocation parsing, paid shipping, free-shipping netting, BXGY quantity gating, and basic conflict handling. The current production build reads Shopify Storefront `discountCodes` and `discountAllocations`, carries normalized discount evidence into quote snapshots, suppresses overlapping Pivota manual promotions, and now prevents a rejected Shopify code from being silently replaced by a local manual promo. Evidence is in `services/shopify_storefront_pricing_service.py:355-623`, `services/quote_service.py:437-449`, `services/quote_service.py:641-658`, and the live artifacts under `artifacts/shopify-discount-validation/`.
 
-This is still not ready for a serious merchant rollout of discount-linked checkout. The largest unresolved gap is paid-order reconciliation: the code has a real fail-closed reconciliation path in `routes/order_routes.py:1142-1360` and `routes/order_routes.py:2873-2940`, and payment confirmation now verifies PSP status, amount, and currency before marking an order paid (`routes/order_routes.py:304-407`, `adapters/psp_adapter.py:288-361`). Production validation proved the unpaid-rejection path, but not a successful discounted paid order that creates and reconciles a Shopify order.
+The paid path is now live-proven for this explicitly approved Stripe + Shopify test merchant across three discounted orders: free shipping (`ORD_508D4460ACA8DE11`), amount-off (`ORD_E2CC099ACF7A88A7`), and BXGY (`ORD_F56E0A1E5DC79E82`). Those orders were refunded through the production app path. The refund cleanup exposed and fixed three real defects: agent refund idempotency, Stripe Checkout Session refund resolution, and Shopify refund-webhook double counting.
+
+This is still not ready for a broad merchant rollout. Discount-node sync is blocked for the current merchant install because Shopify Admin GraphQL denied `discountNodes` without `read_discounts`; production scopes now request `read_discounts`, but the merchant must reconnect. Positive combinability, automatic discounts, restricted customer/segment discounts, active-window-positive behavior, and true usage exhaustion remain fixture-blocked.
 
 One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evidence of fixed-amount discount support. Live behavior on a `29.00` item produced a `2.90` discount, so the validated fixture is a 10% product discount, not a fixed `10` amount discount (`artifacts/shopify-discount-validation/live-us-shipping-final-retest-20260415T051842Z/summary.json:175-214`).
 
@@ -22,6 +24,10 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
   - `db/migrations/062_shopify_discount_open_ended_promotions.sql:1-12`
   - `services/promotions_service.py:101-113`
   - `services/promotions_service.py:201-210`
+- Production scope configuration now requests `read_discounts`, which Shopify requires for `discountNodes` reads:
+  - `config/settings.py:70-77`
+  - `services/shopify_integration_verify.py:24-35`
+  - `routes/merchant_store_connections.py:789-798`
 
 ### 2. Where eligibility is computed
 
@@ -145,6 +151,13 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
    - `services/quote_service.py:641-658`
    - `artifacts/shopify-discount-validation/live-rejected-code-promo-skip-20260415T080245Z/quote-matrix/summary.json`
 
+9. The approved live paid test merchant can complete discounted Stripe payments and write Shopify orders for the proven classes.
+   - Free shipping: `ORD_508D4460ACA8DE11`, total `1.69 EUR`, Shopify order `7531476451656`.
+   - Amount-off: `ORD_E2CC099ACF7A88A7`, total `2.22 EUR`, Shopify order `7531537269064`.
+   - BXGY: `ORD_F56E0A1E5DC79E82`, total `4.07 EUR`, Shopify order `7531638980936`.
+   - Refund cleanup evidence:
+   - `artifacts/shopify-discount-validation/live-test-order-refund-status-after-ledger-repair-20260415T135016Z/summary.json`
+
 ## What partially works
 
 1. Automatic discounts are wired in code, but not live-proven for this merchant.
@@ -160,6 +173,7 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
      - `services/shopify_promotions_sync.py:339-358`
      - `services/shopify_promotions_sync.py:621-700`
    - This is enough for visibility/governance, not enough to claim Pivota manages merchant discount lifecycle.
+   - Current merchant install is blocked until reconnect because live Admin GraphQL returned `ACCESS_DENIED` for `discountNodes` without `read_discounts`.
 
 3. New-customer logic exists, but only partially proven.
    - Shopify is queried for `numberOfOrders` by email and returns verified/unverified evidence:
@@ -168,13 +182,13 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
      - `services/quote_service.py:476-496`
      - `services/quote_service.py:644-658`
      - `tests/test_quote_service_promotions_auto_sync.py:299-338`
-   - Live responses for the supplied email return `basis=no_shopify_customer_found`, but no native Shopify restricted-discount fixture was provided to prove acceptance/rejection at checkout.
+   - Latest live responses for the supplied email return verified Shopify customer evidence with `shopify_order_count=3` and `new_customer=false`, but no native Shopify restricted-discount fixture was provided to prove acceptance/rejection at checkout.
 
-4. Order reconciliation logic exists and is unit-tested, but not live-proven end to end.
+4. Order reconciliation logic exists, is unit-tested, and is live-proven only for the approved Stripe + Shopify test merchant.
    - `routes/order_routes.py:1136-1360`
    - `routes/order_routes.py:2873-2940`
    - `tests/test_shopify_order_discount_reconciliation.py:27-118`
-   - No paid discounted order was completed, so this remains unproven in production.
+   - Three paid discounted orders were completed for the approved test merchant. Broader readiness still requires fail-closed canaries per merchant/PSP configuration.
 
 5. PSP amount/currency verification is implemented for Stripe and unit-tested; fail-closed mode now blocks status-only PSP adapters.
    - `adapters/psp_adapter.py:288-361`
@@ -183,21 +197,16 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
    - Non-Stripe PSP adapters need equivalent structured status details before they can be used in fail-closed discount pilots.
 
 6. Active date and usage-limit behavior are partially proven.
-   - Live evidence shows expired/unavailable codes are rejected:
+   - Live evidence shows expired codes are rejected:
      - `artifacts/shopify-discount-validation/live-us-discount-matrix-20260415T052251Z/summary.json:147-284`
    - Sync preserves `usageLimit`, `appliesOncePerCustomer`, and open-ended `endsAt=None`:
      - `services/shopify_promotions_sync.py:318-358`
      - `tests/test_shopify_promotions_graphql_sync.py:9-44`
-   - The positive boundary for “one use left” was not proven because `PIVOTA_TEST_EXHAUSTED` was already unavailable at validation time.
+   - The latest readonly matrix shows `PIVOTA_TEST_EXHAUSTED` is currently applicable and discounts `0.90`, so it is not an exhausted fixture.
 
 ## What is missing
 
-1. Live proof that a discounted, paid order survives:
-   - quote total
-   - PSP transaction amount
-   - Shopify order total
-   - Shopify total discounts
-   - Shopify transaction total
+1. Merchant reconnect/reauthorization with `read_discounts`, then live discount-node sync proof for usage limits, active windows, combinations, and customer context.
 
 2. A live automatic-discount fixture for this merchant.
 
@@ -207,7 +216,7 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
 
 5. Hard evidence for fixed-amount discount formulas. The validated live product-discount fixture behaves as percentage off, not fixed amount.
 
-6. Successful paid Shopify order reconciliation in production. The unpaid rejection path is proven; the successful paid path is still not.
+6. Pilot-grade fail-closed canary evidence for each merchant/PSP/store configuration. The approved Stripe + Shopify test path is proven; other configurations are not.
 
 7. Adapter-complete PSP amount/currency details for every PSP used in merchant pilots. Fail-closed now blocks status-only adapters, but that means non-Stripe paid pilots are blocked until adapter details exist.
 
@@ -219,10 +228,13 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
    - `routes/agent_api.py:8176-8179`
    - `utils/transient_errors.py:12-38`
 
+9. Refund and platform-webhook observability.
+   - The live refund cleanup uncovered a Shopify webhook double-counting bug. It is fixed, but pilot rollout should alert on any `total_refunded > total` condition.
+
 ## Highest-risk failure points
 
-1. Discounted paid orders are not yet reconciled live.
-   - This is the main place where “displayed offer” and “final charged price” can still drift.
+1. Discounted paid reconciliation is not yet proven across merchant/PSP configurations.
+   - The approved Stripe + Shopify test merchant passed paid live canaries, but each new merchant/PSP setup can still drift between displayed offer and final charged price.
 
 2. Successful payment transition depends on PSP adapter quality.
    - Stripe now returns structured status, amount, and currency details. In fail-closed mode, status-only adapters are blocked rather than trusted.
@@ -237,8 +249,8 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
 
 ## Recommended next fixes ranked by impact × implementation effort
 
-1. Run one discounted paid test order with `SHOPIFY_DISCOUNT_RECONCILIATION_MODE=fail_closed`, then compare quote total, PSP amount, Shopify order total, Shopify total discounts, and Shopify transactions.
-2. Replace or repair `PIVOTA_TEST_COMBO_A`, then validate one positive combinable pair and one non-combinable pair against the same product/address.
-3. Add one Shopify automatic discount fixture and one restricted-customer/new-customer fixture for live validation.
-4. Add structured amount/currency verification for every non-Stripe PSP adapter that should be allowed in discount pilots; fail-closed now blocks unsupported status-only adapters.
+1. Reconnect the test merchant with `read_discounts`, rerun GraphQL discount-node sync, and verify node metadata for usage limits, active dates, combinations, and customer context.
+2. Run the next paid canary with `SHOPIFY_DISCOUNT_RECONCILIATION_MODE=fail_closed`, then compare quote total, PSP amount, Shopify order total, Shopify total discounts, Shopify transactions, and refund status.
+3. Replace or repair `PIVOTA_TEST_COMBO_A`, then validate one positive combinable pair and one non-combinable pair against the same product/address.
+4. Add Shopify automatic, restricted-customer/new-customer, active-window-positive, and true exhausted-usage fixtures for live validation.
 5. Add one true fixed-amount product discount fixture and one true fixed-amount order discount fixture, then validate both quote-time and paid-order behavior.

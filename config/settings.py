@@ -67,11 +67,12 @@ class Settings(BaseSettings):
     # Signing key for no-login install links (one-time signed tokens).
     # If empty, we fall back to JWT_SECRET_KEY (not ideal, but keeps deployments working).
     shopify_install_link_signing_key: Optional[str] = os.getenv("SHOPIFY_INSTALL_LINK_SIGNING_KEY")
-    # Needed for: product sync + creating manual sale/refund records on orders.
+    # Needed for: product sync + creating manual sale/refund records on orders
+    # + read-only Shopify discount node sync.
     # Note: webhook subscription requires `write_webhooks`.
     shopify_scopes: str = os.getenv(
         "SHOPIFY_SCOPES",
-        "read_products,read_orders,read_fulfillments,write_orders,write_webhooks",
+        "read_products,read_orders,read_fulfillments,write_orders,write_webhooks,read_discounts",
     )
     
     # Wix

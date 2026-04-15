@@ -4,7 +4,7 @@
 
 Validation date: 2026-04-15.
 
-Validation scope included production quote/cart probes, quote-backed order creation without completing payment, unpaid payment-confirmation rejection, and focused post-deploy regression probes. No successful live paid charge was executed.
+Validation scope included production quote/cart probes, quote-backed order creation without completing payment, unpaid payment-confirmation rejection, focused post-deploy regression probes, three explicitly approved live paid discounted orders, and refund cleanup through the production app path.
 
 - US baseline quote with no discount code
 - US amount-off code
@@ -16,11 +16,15 @@ Validation scope included production quote/cart probes, quote-backed order creat
 - BXGY positive case at quantity 3
 - non-combinable pair with BXGY at quantity 3
 - expired code
-- exhausted/unavailable code
+- usage-limit fixture probe
 - cross-class stacking probe with amount-off plus free shipping
 - positive combinable fixture probe with `PIVOTA_TEST_COMBO_A`
 - quote -> order create probe with amount-off quote, without payment confirmation
 - unpaid payment confirmation guard
+- live paid free-shipping order
+- live paid amount-off order
+- live paid BXGY order
+- live app-path refund cleanup for the three paid test orders
 - rejected Shopify code against quantity-based Pivota manual fallback
 - PSP amount/currency verification unit coverage
 
@@ -42,25 +46,33 @@ Validation scope included production quote/cart probes, quote-backed order creat
 - `Unpaid payment confirmation guard`: production rejected an unpaid Stripe PaymentIntent with `409 PAYMENT_NOT_SUCCEEDED`, left the order in `awaiting_payment`, kept `shopify_order_id=null`, and allowed cancellation.
 - `PSP amount/currency guard`: automated tests now prove successful PSP status is not enough; amount and currency must also match the Pivota order before an order can be marked paid, and fail-closed mode rejects status-only PSP adapters.
 - `Rejected-code fallback isolation`: production no longer lets an inapplicable Shopify code trigger a Pivota quantity-based manual promotion. `PIVOTA_TEST_NOCOMBO_A` alone at quantity `3` now returns `discount_total=0`, records a skipped decision reason `shopify_code_rejected`, and emits no applied promotion lines.
+- `Live paid free shipping`: `ORD_508D4460ACA8DE11` completed at `1.69 EUR`, wrote back to Shopify order `7531476451656`, and was later refunded through the production app route.
+- `Live paid amount-off`: `ORD_E2CC099ACF7A88A7` completed at `2.22 EUR`, wrote back to Shopify order `7531537269064`, and was later refunded through the production app route.
+- `Live paid BXGY`: `ORD_F56E0A1E5DC79E82` completed at `4.07 EUR`, wrote back to Shopify order `7531638980936`, and was later refunded through the production app route.
+- `Refund cleanup after fixes`: production `/orders/{order_id}/refund-status` now reports `total_refunded == original_amount` for all three live test orders after fixing Stripe Checkout Session refund resolution and Shopify refund-webhook double counting.
 
 ## Failed
 
 - `PIVOTA_TEST_COMBO_A` positive combinability fixture failed validation. Shopify returned `applicable=false` for `PIVOTA_TEST_COMBO_A`; with `PIVOTA_TEST_AMOUNT10 + PIVOTA_TEST_COMBO_A`, only `PIVOTA_TEST_AMOUNT10` applied.
+- `PIVOTA_TEST_EXHAUSTED` is not currently an exhausted fixture. The latest readonly matrix returned `applicable=true` and `discount_total=0.90`, so it cannot prove usage-limit exhaustion.
 
 ## Blocked
 
-- `quote -> paid PSP confirmation -> Shopify order create -> reconciliation`: blocked because no successful test-mode or approved live paid charge was executed in this round.
 - `automatic discount live execution`: blocked by missing explicit automatic-discount fixture for this merchant.
 - `segment-restricted / new-customer restricted discount live execution`: the lookup path is implemented, but no restricted Shopify-native fixture code was supplied for checkout validation.
 - `positive combinable pair`: blocked until the merchant fixture is corrected or replaced with two codes Shopify actually marks applicable together.
-- `available usage-limit boundary`: `PIVOTA_TEST_EXHAUSTED` was already unavailable at probe time, so only exhausted rejection was proven.
+- `available usage-limit boundary`: `PIVOTA_TEST_EXHAUSTED` is currently still applicable in quote/cart validation, and quote probes do not consume usage. A separate available-then-exhausted fixture or controlled paid-consumption test is still needed.
 - `active window positive case`: no active scheduling-window fixture was supplied; expired/inactive rejection was proven.
+- `GraphQL discount-node sync for the current merchant install`: Shopify Admin GraphQL returned `ACCESS_DENIED` for `discountNodes` because the installed token lacks `read_discounts`. Production `SHOPIFY_SCOPES` has now been updated to request `read_discounts`, but this merchant must reconnect/reauthorize before discount-node reads can work.
 
 ## Root cause by failure
 
 - Historical free-shipping failure was caused by Pivota reading gross delivery price without netting Shopify shipping discount allocations into `shipping_fee`. That defect is fixed and live evidence now shows US free-shipping and CA paid-shipping behavior diverge correctly.
 - The positive combinability failure is fixture-side unless the business expected `PIVOTA_TEST_COMBO_A` to be eligible for the test product/address. Storefront returned `applicable=false`, so Pivota should not apply or simulate that discount.
 - The rejected-code fallback defect was Pivota-side: a rejected Shopify code could previously fall through into local infra promotions. The fix now records the skipped manual promotion as a decision instead of applying it.
+- The first app-path refund attempt exposed an agent refund proxy bug: the internal request object did not carry `idempotency_key`. PR #179 fixed that path.
+- The second refund attempt exposed a Stripe bug: Pivota stores Stripe Checkout Session IDs (`cs_...`) for hosted Checkout, while the refund adapter tried to refund them as PaymentIntent IDs. PR #180 now resolves Checkout Sessions to PaymentIntents before creating refunds.
+- The successful refunds exposed a Shopify webhook reconciliation bug: Pivota-originated Shopify refund/cancel writeback triggered Shopify `refunds/create`, and the platform refund webhook handler counted that event as a second monetary refund. PR #181 now treats Shopify refund webhooks as observation-only for external PSP orders and ignores over-refund events.
 
 ## Exact evidence references
 
@@ -90,6 +102,14 @@ Validation scope included production quote/cart probes, quote-backed order creat
   - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/90-order-get.json`
   - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/91-order-cancel.json`
   - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/92-order-get-after-cancel.json`
+- Latest readonly matrix after paid/refund fixes:
+  - `artifacts/shopify-discount-validation/live-post-refund-fixes-readonly-20260415T135141Z/quote-matrix/summary.csv`
+  - `artifacts/shopify-discount-validation/live-post-refund-fixes-readonly-20260415T135141Z/quote-matrix/SFD-007.json`
+  - `artifacts/shopify-discount-validation/live-post-refund-fixes-readonly-20260415T135141Z/quote-matrix/SFD-010.json`
+- Live refund cleanup and ledger repair:
+  - `artifacts/shopify-discount-validation/live-test-order-refunds-admin-after-checkout-session-fix-20260415T133853Z/summary.json`
+  - `artifacts/shopify-discount-validation/live-test-order-refund-ledger-repair-20260415T134952Z/refund-ledger-repair.json`
+  - `artifacts/shopify-discount-validation/live-test-order-refund-status-after-ledger-repair-20260415T135016Z/summary.json`
 
 ## Whether the system is ready for merchant pilots on discounts
 
@@ -97,8 +117,8 @@ Validation scope included production quote/cart probes, quote-backed order creat
 
 Rationale:
 
-- Quote-time Shopify-native amount-off, free-shipping, BXGY threshold behavior, invalid-code rejection, exhausted/expired rejection, and non-combinable conflict behavior now have production evidence.
+- Quote-time Shopify-native amount-off, free-shipping, BXGY threshold behavior, invalid-code rejection, expired rejection, and non-combinable conflict behavior now have production evidence.
 - Authoritative Storefront delivery pricing is now carried into quotes; US no-code and CA no-code both price shipping at `29.00`, while the US free-shipping code nets shipping to `0.00`.
 - The most dangerous fake-discount path found in this round is fixed: rejected Shopify codes no longer trigger Pivota manual fallback promotions.
 - Payment confirmation now refuses unpaid PSP references and unit tests enforce amount/currency matching before paid transition; fail-closed mode blocks PSP adapters that cannot provide amount/currency details.
-- The system is not ready for broad merchant rollout until a successful discounted paid flow reconciles Pivota quote total, PSP amount/currency, Shopify order total, Shopify total discounts, and Shopify transactions.
+- Three live paid discounted orders completed and were refunded, but broad rollout is still blocked by fixture gaps, missing `read_discounts` reauthorization for discount-node sync, and the need to run merchant-pilot canaries in `fail_closed` reconciliation mode with alerting.
