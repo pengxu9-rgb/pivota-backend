@@ -192,7 +192,8 @@ jobs:
                   text = str(value)
                   if "\n" in text or "\r" in text:
                       raise SystemExit(f"Fixture env {key} must be single-line")
-                  print(f"::add-mask::{text}")
+                  if len(text) >= 4:
+                      print(f"::add-mask::{text}")
                   env_file.write(f"{key}={text}\n")
           PY
 
