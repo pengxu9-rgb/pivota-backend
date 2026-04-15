@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from fastapi import BackgroundTasks
 
-from models.order import OrderItem
+from models.order import CreateOrderRequest, OrderItem, ShippingAddress
 
 
 def test_build_woocommerce_checkout_permalink_best_effort_single_item() -> None:
@@ -68,3 +69,164 @@ async def test_get_platform_checkout_fallback_dispatches_woocommerce(monkeypatch
         "platform": "woocommerce",
         "method": "checkout_add_to_cart",
     }
+
+
+def _build_order_request() -> CreateOrderRequest:
+    return CreateOrderRequest(
+        merchant_id="merch_test",
+        customer_email="buyer@example.com",
+        items=[
+            OrderItem(
+                product_id="prod_1",
+                product_title="Test Product",
+                variant_id="var_1",
+                quantity=1,
+                unit_price="10.00",
+                subtotal="10.00",
+            )
+        ],
+        shipping_address=ShippingAddress(
+            name="Test Buyer",
+            address_line1="1 Test St",
+            city="San Francisco",
+            state="CA",
+            postal_code="94107",
+            country="US",
+        ),
+        currency="USD",
+        metadata={},
+    )
+
+
+def _install_create_new_order_harness(monkeypatch: pytest.MonkeyPatch, module) -> list[tuple[str, dict]]:
+    import services.quote_first_enforcement as quote_first_enforcement
+
+    events: list[tuple[str, dict]] = []
+
+    async def fake_should_require_quote_for_order_create(*, merchant_id: str):
+        return False, {}
+
+    async def fake_get_merchant_onboarding(_merchant_id: str):
+        return {"merchant_id": _merchant_id, "psp_connected": True}
+
+    async def fake_check_inventory_availability(merchant_id: str, items):
+        return True, {"items": []}
+
+    async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
+        return "stripe", {"route_id": "route_test"}
+
+    async def fake_resolve_active_order_psp(merchant_id: str, provider_hint: str):
+        return "stripe", "psp_test"
+
+    async def fake_create_order(order_data):
+        return "ORD_TEST_PLATFORM_FALLBACK"
+
+    async def noop_async(*args, **kwargs):
+        return None
+
+    async def fake_log_order_event(*, event_type: str, order_id: str, merchant_id: str, metadata=None):
+        events.append((event_type, metadata or {}))
+        return None
+
+    monkeypatch.setattr(
+        quote_first_enforcement,
+        "should_require_quote_for_order_create",
+        fake_should_require_quote_for_order_create,
+    )
+    monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(module, "check_inventory_availability", fake_check_inventory_availability)
+    monkeypatch.setattr(module.PaymentRoutingService, "select_psp", fake_select_psp)
+    monkeypatch.setattr(module, "_resolve_active_order_psp", fake_resolve_active_order_psp)
+    monkeypatch.setattr(module, "create_order", fake_create_order)
+    monkeypatch.setattr(module, "upsert_order_attribution_edge", noop_async)
+    monkeypatch.setattr(module, "emit_merchant_webhook_event", noop_async)
+    monkeypatch.setattr(module, "get_primary_store", noop_async)
+    monkeypatch.setattr(module, "log_order_event", fake_log_order_event)
+
+    return events
+
+
+@pytest.mark.asyncio
+async def test_create_new_order_skips_platform_checkout_fallback_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.delenv("ORDER_PLATFORM_CHECKOUT_FALLBACK_ENABLED", raising=False)
+    events = _install_create_new_order_harness(monkeypatch, module)
+
+    async def fake_create_payment_with_failover(*args, **kwargs):
+        return False, None, "psp unavailable", "stripe"
+
+    async def fail_platform_checkout_fallback(**kwargs):
+        raise AssertionError("platform checkout fallback should be disabled by default")
+
+    monkeypatch.setattr(module, "create_payment_with_failover", fake_create_payment_with_failover)
+    monkeypatch.setattr(
+        module,
+        "_get_platform_checkout_fallback_url_best_effort",
+        fail_platform_checkout_fallback,
+    )
+
+    response = await module.create_new_order(
+        _build_order_request(),
+        BackgroundTasks(),
+        current_user={},
+    )
+
+    assert response.order_id == "ORD_TEST_PLATFORM_FALLBACK"
+    assert response.psp == "stripe"
+    assert response.payment_intent_id is None
+    assert response.client_secret is None
+    assert response.payment_action is None
+    assert ("payment_intent_failed", {"error": "psp unavailable", "psp_type": "stripe"}) in events
+    assert all(event_type != "payment_fallback_platform_checkout" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_create_new_order_allows_platform_checkout_fallback_only_when_explicitly_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.setenv("ORDER_PLATFORM_CHECKOUT_FALLBACK_ENABLED", "1")
+    events = _install_create_new_order_harness(monkeypatch, module)
+
+    async def fake_create_payment_with_failover(*args, **kwargs):
+        return False, None, "psp unavailable", "stripe"
+
+    async def fake_platform_checkout_fallback(**kwargs):
+        return {
+            "url": "https://shop.example.com/cart/1:1?discount=CODE",
+            "platform": "shopify",
+            "method": "cart_permalink",
+        }
+
+    monkeypatch.setattr(module, "create_payment_with_failover", fake_create_payment_with_failover)
+    monkeypatch.setattr(
+        module,
+        "_get_platform_checkout_fallback_url_best_effort",
+        fake_platform_checkout_fallback,
+    )
+
+    response = await module.create_new_order(
+        _build_order_request(),
+        BackgroundTasks(),
+        current_user={},
+    )
+
+    assert response.psp == "checkout"
+    assert response.client_secret == "https://shop.example.com/cart/1:1?discount=CODE"
+    assert response.payment_action.model_dump() == {
+        "type": "redirect_url",
+        "url": "https://shop.example.com/cart/1:1?discount=CODE",
+        "client_secret": None,
+        "public_key": None,
+        "raw": {
+            "reason": "psp_unavailable",
+            "error": "psp unavailable",
+            "platform": "shopify",
+            "method": "cart_permalink",
+        },
+    }
+    assert any(event_type == "payment_fallback_platform_checkout" for event_type, _ in events)

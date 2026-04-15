@@ -238,6 +238,84 @@ async def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     return dict(result) if result else None
 
 
+async def find_replayable_order_for_create(
+    *,
+    merchant_id: str,
+    idempotency_key: Optional[str] = None,
+    quote_id: Optional[str] = None,
+    agent_session_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Find the most recent order that is safe to replay for order-create recovery.
+
+    Priority:
+    1. metadata.idempotency_key
+    2. metadata.pricing_quote.quote_id
+    3. agent_session_id
+    """
+    merchant_id = str(merchant_id or "").strip()
+    if not merchant_id:
+        return None
+
+    candidate_queries = []
+    if idempotency_key:
+        candidate_queries.append(
+            (
+                """
+                SELECT *
+                FROM orders
+                WHERE merchant_id = :merchant_id
+                  AND COALESCE(is_deleted, FALSE) = FALSE
+                  AND metadata ->> 'idempotency_key' = :match_value
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                str(idempotency_key).strip(),
+            )
+        )
+    if quote_id:
+        candidate_queries.append(
+            (
+                """
+                SELECT *
+                FROM orders
+                WHERE merchant_id = :merchant_id
+                  AND COALESCE(is_deleted, FALSE) = FALSE
+                  AND metadata -> 'pricing_quote' ->> 'quote_id' = :match_value
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                str(quote_id).strip(),
+            )
+        )
+    if agent_session_id:
+        candidate_queries.append(
+            (
+                """
+                SELECT *
+                FROM orders
+                WHERE merchant_id = :merchant_id
+                  AND COALESCE(is_deleted, FALSE) = FALSE
+                  AND agent_session_id = :match_value
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                str(agent_session_id).strip(),
+            )
+        )
+
+    for query, match_value in candidate_queries:
+        if not match_value:
+            continue
+        row = await database.fetch_one(
+            query,
+            {"merchant_id": merchant_id, "match_value": match_value},
+        )
+        if row:
+            return dict(row)
+    return None
+
+
 async def get_orders_by_merchant(
     merchant_id: str, 
     status: Optional[str] = None,

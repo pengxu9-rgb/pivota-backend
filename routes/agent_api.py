@@ -16,13 +16,19 @@ import json
 import os
 import re
 import time
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from models.order import CreateOrderRequest, OrderResponse
 from models.standard_product import StandardProduct
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
-from db.orders import get_order, get_orders_by_merchant, update_payment_info
+from db.orders import (
+    find_replayable_order_for_create,
+    get_order,
+    get_orders_by_merchant,
+    update_payment_info,
+)
 from routes.refund_api import process_refund
 from routes.order_routes import cancel_order as admin_cancel_order
 from routes.fulfillment_api import track_order_fulfillment
@@ -58,6 +64,11 @@ from services.product_exposure_service import (
     AGENT_PUSH_STATUS_EXCLUDED,
     build_agent_push_projection_from_standard_product,
 )
+from services.merchant_payment_initiation_service import build_payment_action
+from services.merchant_psp_config_service import (
+    build_runtime_adapter_kwargs,
+    fetch_active_runtime_merchant_psp,
+)
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
 from db.products import get_cached_products
@@ -88,6 +99,201 @@ def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[D
         request.state.traffic_taxonomy = dict(taxonomy)
     except Exception:
         return
+
+
+def _coerce_json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _format_agent_order_payment_instructions(
+    psp_type: str,
+    payment_action: Optional[Dict[str, Any]],
+    client_secret: Optional[str] = None,
+) -> str:
+    if psp_type == "adyen":
+        return (
+            "Use payment_action.type='adyen_session' with payment_action.client_secret "
+            "(sessionData) to initialize Adyen Drop-in."
+        )
+    if payment_action and payment_action.get("type") == "redirect_url":
+        return (
+            "Redirect the shopper to payment_action.url to complete the payment, then wait "
+            "for webhook/order status to update."
+        )
+    if not payment_action and not str(client_secret or "").strip():
+        return "Payment initiation is unavailable; retry PSP payment creation before asking the shopper to pay."
+    return "Use client_secret for Stripe payment confirmation"
+
+
+async def _build_agent_order_payment_surface(order: Dict[str, Any]) -> Dict[str, Any]:
+    merchant_id = str(order.get("merchant_id") or "").strip()
+    psp_type = str(order.get("psp_used") or "stripe").strip().lower() or "stripe"
+    client_secret = str(order.get("client_secret") or "").strip() or None
+    payment_intent_id = str(order.get("payment_intent_id") or "").strip() or None
+    payment_action: Optional[Dict[str, Any]] = None
+
+    if client_secret:
+        raw_response: Dict[str, Any] = {}
+        if merchant_id and psp_type:
+            runtime_row = None
+            try:
+                runtime_row = await fetch_active_runtime_merchant_psp(
+                    merchant_id=merchant_id,
+                    provider=psp_type,
+                )
+            except Exception:
+                runtime_row = None
+            if runtime_row:
+                try:
+                    adapter_kwargs = build_runtime_adapter_kwargs(
+                        psp_type,
+                        api_key=runtime_row.get("api_key"),
+                        account_id=runtime_row.get("account_id"),
+                        provider_config=runtime_row.get("provider_config"),
+                        environment=runtime_row.get("environment"),
+                        secret_key=runtime_row.get("secret_key"),
+                    )
+                    if psp_type == "stripe":
+                        if adapter_kwargs.get("public_key"):
+                            raw_response["public_key"] = adapter_kwargs["public_key"]
+                        if adapter_kwargs.get("account_id"):
+                            raw_response["stripe_account"] = adapter_kwargs["account_id"]
+                    elif psp_type == "adyen":
+                        if adapter_kwargs.get("client_key"):
+                            raw_response["clientKey"] = adapter_kwargs["client_key"]
+                    elif psp_type == "checkout":
+                        if adapter_kwargs.get("public_key"):
+                            raw_response["public_key"] = adapter_kwargs["public_key"]
+                        if adapter_kwargs.get("processing_channel_id"):
+                            raw_response["processing_channel_id"] = adapter_kwargs["processing_channel_id"]
+                except Exception:
+                    raw_response = {}
+
+        payment_action = build_payment_action(
+            SimpleNamespace(
+                id=payment_intent_id,
+                client_secret=client_secret,
+                raw_response=raw_response,
+                psp_type=psp_type,
+            ),
+            psp_used=psp_type,
+        )
+
+    return {
+        "psp": psp_type,
+        "client_secret": client_secret,
+        "payment_intent_id": payment_intent_id,
+        "payment_action": payment_action,
+        "instructions": _format_agent_order_payment_instructions(
+            psp_type,
+            payment_action,
+            client_secret,
+        ),
+    }
+
+
+async def _build_agent_order_create_response_from_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _coerce_json_object(order.get("metadata"))
+    pricing_quote = _coerce_json_object(metadata.get("pricing_quote"))
+    payment = await _build_agent_order_payment_surface(order)
+    created_at = order.get("created_at")
+    created_at_iso = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or "")
+    total_amount = float(order.get("total") or 0.0)
+    currency = str(order.get("currency") or "USD")
+
+    response: Dict[str, Any] = {
+        "status": "success",
+        "order_id": str(order.get("order_id") or ""),
+        "merchant_id": str(order.get("merchant_id") or ""),
+        "total": str(order.get("total") or 0),
+        "total_amount": total_amount,
+        "currency": currency,
+        "presentment_currency": currency,
+        "charge_currency": currency,
+        "settlement_currency": None,
+        "payment": payment,
+        "tracking": {
+            "agent_session_id": order.get("agent_session_id"),
+            "created_at": created_at_iso,
+        },
+    }
+
+    mvp_meta = _coerce_json_object(metadata.get("mvp"))
+    offers = mvp_meta.get("offers")
+    preflight = mvp_meta.get("preflight")
+    if isinstance(offers, list):
+        response["offers"] = offers
+    if isinstance(preflight, list):
+        response["preflight"] = preflight
+
+    if pricing_quote:
+        response["pricing"] = pricing_quote.get("pricing")
+        response["promotion_lines"] = pricing_quote.get("promotion_lines") or []
+        response["line_items"] = pricing_quote.get("line_items") or []
+        response["quote"] = {
+            "quote_id": pricing_quote.get("quote_id"),
+            "expires_at": pricing_quote.get("expires_at"),
+            "engine": pricing_quote.get("engine"),
+            "engine_ref": pricing_quote.get("engine_ref"),
+        }
+        q_currency = (
+            pricing_quote.get("charge_currency")
+            or pricing_quote.get("presentment_currency")
+            or pricing_quote.get("currency")
+        )
+        if q_currency:
+            response["presentment_currency"] = q_currency
+            response["charge_currency"] = q_currency
+        q_settlement = pricing_quote.get("settlement_currency")
+        if q_settlement:
+            response["settlement_currency"] = q_settlement
+
+    return response
+
+
+async def _cache_agent_order_create_response_best_effort(
+    idempotency_key: Optional[str],
+    response: Dict[str, Any],
+) -> None:
+    if not idempotency_key:
+        return
+    try:
+        from mvp.idempotency import PostgresIdempotencyStore
+
+        idem = PostgresIdempotencyStore()
+        await idem.put(scope="order_create", key=idempotency_key, value=response)
+    except Exception:
+        pass
+
+
+async def _load_replayable_agent_order_create_response(
+    order_request: CreateOrderRequest,
+) -> Optional[Dict[str, Any]]:
+    try:
+        existing_order = await find_replayable_order_for_create(
+            merchant_id=order_request.merchant_id,
+            idempotency_key=getattr(order_request, "idempotency_key", None),
+            quote_id=getattr(order_request, "quote_id", None),
+            agent_session_id=getattr(order_request, "agent_session_id", None),
+        )
+    except Exception:
+        return None
+    if not existing_order:
+        return None
+    response = await _build_agent_order_create_response_from_order(existing_order)
+    await _cache_agent_order_create_response_best_effort(
+        getattr(order_request, "idempotency_key", None),
+        response,
+    )
+    return response
 FIND_PRODUCTS_MULTI_SEED_BUDGET_MS = max(
     0,
     min(
@@ -7224,6 +7430,9 @@ async def agent_create_order(
                         return existing.value
             except Exception:
                 pass
+        replay_response = await _load_replayable_agent_order_create_response(order_request)
+        if replay_response:
+            return replay_response
 
         # OfferObject + PreFlight (best-effort, additive): compute canonical offer(s) from quote snapshot and
         # attach to order metadata. Enforcement is gated by `MVP_PREFLIGHT_ENFORCE=true`.
@@ -7470,13 +7679,16 @@ async def agent_create_order(
             try:
                 order_response = await order_routes_module.create_new_order(order_request, background_tasks)
             except Exception as e:
-                # For transient asyncpg pool-state issues, retry once without resetting
-                # the shared global pool. Global disconnect/reconnect can break
-                # concurrent requests on unrelated endpoints.
+                # `create_new_order` persists the order row before PSP creation.
+                # On a transient DB-busy failure, first try to replay that persisted
+                # order. Only if no order exists yet do we retry the full create.
                 if is_asyncpg_busy_error(e):
+                    replay_response = await _load_replayable_agent_order_create_response(order_request)
+                    if replay_response:
+                        return replay_response
                     try:
                         logger.warning(
-                            "[agent_orders_create] transient asyncpg state; retrying once without pool reset"
+                            "[agent_orders_create] transient asyncpg state; no replayable order found, retrying once"
                         )
                         await asyncio.sleep(0.05)
                     except Exception:
@@ -7485,6 +7697,9 @@ async def agent_create_order(
                         order_response = await order_routes_module.create_new_order(order_request, background_tasks)
                     except Exception as e2:
                         if is_asyncpg_busy_error(e2):
+                            replay_response = await _load_replayable_agent_order_create_response(order_request)
+                            if replay_response:
+                                return replay_response
                             raise db_busy_http_exception()
                         raise
                 else:
@@ -7704,19 +7919,11 @@ async def agent_create_order(
                 payment_action = None
         
         # 根据 PSP 类型生成说明文案，兼容旧的 Stripe 提示
-        if psp_type == "adyen":
-            payment_instructions = (
-                "Use payment_action.type='adyen_session' with payment_action.client_secret "
-                "(sessionData) to initialize Adyen Drop-in."
-            )
-        elif payment_action and payment_action.get("type") == "redirect_url":
-            payment_instructions = (
-                "Redirect the shopper to payment_action.url to complete the payment, then wait "
-                "for webhook/order status to update."
-            )
-        else:
-            # 默认保持 Stripe 风格，兼容已有客户端
-            payment_instructions = "Use client_secret for Stripe payment confirmation"
+        payment_instructions = _format_agent_order_payment_instructions(
+            psp_type,
+            payment_action,
+            getattr(order_response, "client_secret", None),
+        )
         
         # 返回简化的响应给 Agent
         response = {
@@ -7789,14 +7996,10 @@ async def agent_create_order(
             pass
 
         # Store idempotency record (best-effort).
-        if order_request.idempotency_key:
-            try:
-                from mvp.idempotency import PostgresIdempotencyStore
-
-                idem = PostgresIdempotencyStore()
-                await idem.put(scope="order_create", key=order_request.idempotency_key, value=response)
-            except Exception:
-                pass
+        await _cache_agent_order_create_response_best_effort(
+            getattr(order_request, "idempotency_key", None),
+            response,
+        )
 
         try:
             from services.agent_webhook_service import emit_agent_webhook_event

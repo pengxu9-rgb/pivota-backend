@@ -115,6 +115,15 @@ def _build_order_payment_return_url(
     return f"{_checkout_ui_base()}/order/success?{urlencode({'orderId': str(order_id), 'finalizing': '1'})}"
 
 
+def _platform_checkout_fallback_enabled() -> bool:
+    return str(os.getenv("ORDER_PLATFORM_CHECKOUT_FALLBACK_ENABLED", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 router = APIRouter(prefix="/orders", tags=["orders"])
 _PG_SHOPIFY_LOCK_SUPPORTED: Optional[bool] = None
 _SUPPORTED_ORDER_PROVIDER_HINTS = {"stripe", "adyen", "checkout", "paypal"}
@@ -1729,6 +1738,8 @@ async def create_new_order(
         
         # 合并订单元数据并记录促销信息（如果有）
         order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
+        if getattr(order_request, "idempotency_key", None):
+            order_metadata.setdefault("idempotency_key", str(order_request.idempotency_key))
         if pricing_quote_meta:
             order_metadata["pricing_quote"] = pricing_quote_meta
         elif discount_total > 0:
@@ -1780,8 +1791,8 @@ async def create_new_order(
         order_data = {
             "merchant_id": order_request.merchant_id,
             "customer_email": order_request.customer_email,
-            "items": [json.loads(item.json()) for item in order_request.items],
-            "shipping_address": json.loads(order_request.shipping_address.json()),
+            "items": [item.model_dump(mode="json") for item in order_request.items],
+            "shipping_address": order_request.shipping_address.model_dump(mode="json"),
             "subtotal": float(subtotal),
             "shipping_fee": float(shipping_fee),
             "tax": float(tax),
@@ -1970,8 +1981,55 @@ async def create_new_order(
                 )
             else:
                 logger.error(f"Payment intent creation failed via MultiPSP: {error}")
-                # Long-term fallback: if we have a platform checkout URL from the quote snapshot,
-                # return a redirect_url action so the client can continue on the store platform.
+                if _platform_checkout_fallback_enabled():
+                    fallback_checkout_url = None
+                    try:
+                        if isinstance(pricing_quote_meta, dict):
+                            fallback_checkout_url = pricing_quote_meta.get("checkout_url")
+                    except Exception:
+                        fallback_checkout_url = None
+
+                    platform_checkout = None
+                    if not fallback_checkout_url:
+                        platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
+                            merchant_id=order_request.merchant_id,
+                            items=order_request.items,
+                            discount_codes=order_request.discount_codes,
+                        )
+
+                    if (fallback_checkout_url or platform_checkout) and not payment_action:
+                        psp_type = "checkout"
+                        client_secret = str(fallback_checkout_url or (platform_checkout or {}).get("url"))
+                        payment_action = {
+                            "type": "redirect_url",
+                            "url": str(fallback_checkout_url or (platform_checkout or {}).get("url")),
+                            "raw": {
+                                "reason": "psp_unavailable",
+                                "error": error,
+                                **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
+                            },
+                        }
+                        await log_order_event(
+                            event_type="payment_fallback_platform_checkout",
+                            order_id=order_id,
+                            merchant_id=order_request.merchant_id,
+                            metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
+                        )
+                else:
+                    logger.warning(
+                        "[OrderRoutes] platform checkout fallback disabled; keeping PSP-first failure visible for order %s",
+                        order_id,
+                    )
+                # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
+                await log_order_event(
+                    event_type="payment_intent_failed",
+                    order_id=order_id,
+                    merchant_id=order_request.merchant_id,
+                    metadata={"error": error, "psp_type": final_psp},
+                )
+        except Exception as e:
+            logger.error(f"Payment intent creation error: {e}")
+            if _platform_checkout_fallback_enabled():
                 fallback_checkout_url = None
                 try:
                     if isinstance(pricing_quote_meta, dict):
@@ -1994,8 +2052,8 @@ async def create_new_order(
                         "type": "redirect_url",
                         "url": str(fallback_checkout_url or (platform_checkout or {}).get("url")),
                         "raw": {
-                            "reason": "psp_unavailable",
-                            "error": error,
+                            "reason": "psp_error",
+                            "error": str(e),
                             **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
                         },
                     }
@@ -2005,47 +2063,10 @@ async def create_new_order(
                         merchant_id=order_request.merchant_id,
                         metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                     )
-                # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
-                await log_order_event(
-                    event_type="payment_intent_failed",
-                    order_id=order_id,
-                    merchant_id=order_request.merchant_id,
-                    metadata={"error": error, "psp_type": final_psp},
-                )
-        except Exception as e:
-            logger.error(f"Payment intent creation error: {e}")
-            fallback_checkout_url = None
-            try:
-                if isinstance(pricing_quote_meta, dict):
-                    fallback_checkout_url = pricing_quote_meta.get("checkout_url")
-            except Exception:
-                fallback_checkout_url = None
-
-            platform_checkout = None
-            if not fallback_checkout_url:
-                platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
-                    merchant_id=order_request.merchant_id,
-                    items=order_request.items,
-                    discount_codes=order_request.discount_codes,
-                )
-
-            if (fallback_checkout_url or platform_checkout) and not payment_action:
-                psp_type = "checkout"
-                client_secret = str(fallback_checkout_url or (platform_checkout or {}).get("url"))
-                payment_action = {
-                    "type": "redirect_url",
-                    "url": str(fallback_checkout_url or (platform_checkout or {}).get("url")),
-                    "raw": {
-                        "reason": "psp_error",
-                        "error": str(e),
-                        **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
-                    },
-                }
-                await log_order_event(
-                    event_type="payment_fallback_platform_checkout",
-                    order_id=order_id,
-                    merchant_id=order_request.merchant_id,
-                    metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
+            else:
+                logger.warning(
+                    "[OrderRoutes] platform checkout fallback disabled after PSP error; keeping failure visible for order %s",
+                    order_id,
                 )
             await log_order_event(
                 event_type="payment_intent_error",

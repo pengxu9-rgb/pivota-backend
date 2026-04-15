@@ -36,6 +36,19 @@ async def _override_get_agent_context() -> _TestAgentContext:
     return _TestAgentContext()
 
 
+def test_agent_order_payment_instructions_do_not_claim_client_secret_when_missing() -> None:
+    import routes.agent_api as agent_api_module
+
+    assert (
+        agent_api_module._format_agent_order_payment_instructions("stripe", None, None)
+        == "Payment initiation is unavailable; retry PSP payment creation before asking the shopper to pay."
+    )
+    assert (
+        agent_api_module._format_agent_order_payment_instructions("stripe", None, "cs_live")
+        == "Use client_secret for Stripe payment confirmation"
+    )
+
+
 @pytest.mark.asyncio
 async def test_agent_create_order_replay_returns_cached_response(monkeypatch: pytest.MonkeyPatch) -> None:
     from main import app
@@ -62,6 +75,17 @@ async def test_agent_create_order_replay_returns_cached_response(monkeypatch: py
 
         monkeypatch.setattr(governance_module.agent_governance, "validate_request", noop_validate_request)
         monkeypatch.setattr(governance_module.agent_governance, "record_response", noop_record_response)
+
+        import services.agent_webhook_service as agent_webhook_service
+
+        async def noop_emit_agent_webhook_event(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            agent_webhook_service,
+            "emit_agent_webhook_event",
+            noop_emit_agent_webhook_event,
+        )
 
         # Avoid DB usage logging.
         import routes.agent_auth as agent_auth_module
@@ -166,6 +190,381 @@ async def test_agent_create_order_replay_returns_cached_response(monkeypatch: py
         body2 = second.json()
         assert body1["order_id"] == body2["order_id"]
         assert calls["count"] == 1
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_replays_existing_order_before_recreating(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        import mvp.events as mvp_events
+        import mvp.idempotency as idempotency_module
+        import mvp.ledger_events as ledger_events
+        import services.agent_governance as governance_module
+        import services.agent_webhook_service as agent_webhook_service
+        import routes.agent_api as agent_api_module
+        import routes.agent_auth as agent_auth_module
+        import routes.order_routes as order_routes_module
+
+        monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+        monkeypatch.setattr(ledger_events, "emit_best_effort", lambda **_: None)
+
+        async def noop_validate_request(agent_id: str) -> None:
+            return None
+
+        async def noop_record_response(agent_id: str, latency_ms: int, success: bool) -> None:
+            return None
+
+        monkeypatch.setattr(governance_module.agent_governance, "validate_request", noop_validate_request)
+        monkeypatch.setattr(governance_module.agent_governance, "record_response", noop_record_response)
+
+        async def noop_emit_agent_webhook_event(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            agent_webhook_service,
+            "emit_agent_webhook_event",
+            noop_emit_agent_webhook_event,
+        )
+
+        async def noop_log_agent_request(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(agent_auth_module, "log_agent_request", noop_log_agent_request)
+        monkeypatch.setattr(agent_api_module, "log_agent_request", noop_log_agent_request)
+
+        class FakePostgresIdempotencyStore:
+            async def get(self, *, scope: str, key: str):
+                return None
+
+            async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
+                return None
+
+        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+
+        expected = {
+            "status": "success",
+            "order_id": "ord_existing",
+            "merchant_id": "m_test",
+            "total": "10.00",
+            "total_amount": 10.0,
+            "currency": "USD",
+            "presentment_currency": "USD",
+            "charge_currency": "USD",
+            "settlement_currency": None,
+            "payment": {
+                "psp": "stripe",
+                "client_secret": "cs_existing",
+                "payment_intent_id": "pi_existing",
+                "payment_action": {"type": "stripe_client_secret", "client_secret": "cs_existing"},
+                "instructions": "Use client_secret for Stripe payment confirmation",
+            },
+            "tracking": {
+                "agent_session_id": "agent_test_123",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
+        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+            return expected
+
+        async def fail_create_new_order(order_request: Any, background_tasks: Any):
+            raise AssertionError("create_new_order should not run when replayable order exists")
+
+        monkeypatch.setattr(
+            agent_api_module,
+            "_load_replayable_agent_order_create_response",
+            fake_load_replayable_agent_order_create_response,
+        )
+        monkeypatch.setattr(order_routes_module, "create_new_order", fail_create_new_order)
+
+        payload = {
+            "merchant_id": "m_test",
+            "quote_id": "q_test",
+            "customer_email": "test@example.com",
+            "items": [{"product_id": "p_1", "variant_id": "v_1", "quantity": 1}],
+            "shipping_address": {
+                "name": "Test",
+                "address_line1": "1 Test St",
+                "city": "SF",
+                "state": "CA",
+                "postal_code": "94107",
+                "country": "US",
+            },
+            "currency": "USD",
+            "idempotency_key": "idem_order_create_replay_existing",
+            "metadata": {},
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/agent/v1/orders/create", json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json()["order_id"] == "ord_existing"
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_busy_replays_existing_order_without_second_create(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        import mvp.events as mvp_events
+        import mvp.idempotency as idempotency_module
+        import mvp.ledger_events as ledger_events
+        import services.agent_governance as governance_module
+        import services.agent_webhook_service as agent_webhook_service
+        import routes.agent_api as agent_api_module
+        import routes.agent_auth as agent_auth_module
+        import routes.order_routes as order_routes_module
+
+        monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+        monkeypatch.setattr(ledger_events, "emit_best_effort", lambda **_: None)
+
+        async def noop_validate_request(agent_id: str) -> None:
+            return None
+
+        async def noop_record_response(agent_id: str, latency_ms: int, success: bool) -> None:
+            return None
+
+        monkeypatch.setattr(governance_module.agent_governance, "validate_request", noop_validate_request)
+        monkeypatch.setattr(governance_module.agent_governance, "record_response", noop_record_response)
+
+        async def noop_emit_agent_webhook_event(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            agent_webhook_service,
+            "emit_agent_webhook_event",
+            noop_emit_agent_webhook_event,
+        )
+
+        async def noop_log_agent_request(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(agent_auth_module, "log_agent_request", noop_log_agent_request)
+        monkeypatch.setattr(agent_api_module, "log_agent_request", noop_log_agent_request)
+
+        class FakePostgresIdempotencyStore:
+            async def get(self, *, scope: str, key: str):
+                return None
+
+            async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
+                return None
+
+        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+
+        replay_checks = {"count": 0}
+        expected = {
+            "status": "success",
+            "order_id": "ord_replayed_after_busy",
+            "merchant_id": "m_test",
+            "total": "10.00",
+            "total_amount": 10.0,
+            "currency": "USD",
+            "presentment_currency": "USD",
+            "charge_currency": "USD",
+            "settlement_currency": None,
+            "payment": {
+                "psp": "stripe",
+                "client_secret": "cs_existing",
+                "payment_intent_id": "pi_existing",
+                "payment_action": {"type": "stripe_client_secret", "client_secret": "cs_existing"},
+                "instructions": "Use client_secret for Stripe payment confirmation",
+            },
+            "tracking": {
+                "agent_session_id": "agent_test_123",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
+        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+            replay_checks["count"] += 1
+            if replay_checks["count"] == 1:
+                return None
+            return expected
+
+        calls = {"count": 0}
+
+        async def fake_create_new_order(order_request: Any, background_tasks: Any):
+            calls["count"] += 1
+            raise RuntimeError("cannot perform operation: another operation is in progress")
+
+        monkeypatch.setattr(
+            agent_api_module,
+            "_load_replayable_agent_order_create_response",
+            fake_load_replayable_agent_order_create_response,
+        )
+        monkeypatch.setattr(order_routes_module, "create_new_order", fake_create_new_order)
+
+        payload = {
+            "merchant_id": "m_test",
+            "quote_id": "q_test",
+            "customer_email": "test@example.com",
+            "items": [{"product_id": "p_1", "variant_id": "v_1", "quantity": 1}],
+            "shipping_address": {
+                "name": "Test",
+                "address_line1": "1 Test St",
+                "city": "SF",
+                "state": "CA",
+                "postal_code": "94107",
+                "country": "US",
+            },
+            "currency": "USD",
+            "idempotency_key": "idem_order_create_busy_replay",
+            "metadata": {},
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/agent/v1/orders/create", json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json()["order_id"] == "ord_replayed_after_busy"
+        assert calls["count"] == 1
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_busy_retries_once_when_no_existing_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        import mvp.events as mvp_events
+        import mvp.idempotency as idempotency_module
+        import mvp.ledger_events as ledger_events
+        import services.agent_governance as governance_module
+        import services.agent_webhook_service as agent_webhook_service
+        import routes.agent_api as agent_api_module
+        import routes.agent_auth as agent_auth_module
+        import routes.order_routes as order_routes_module
+        from models.order import OrderResponse, PaymentAction
+
+        monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+        monkeypatch.setattr(ledger_events, "emit_best_effort", lambda **_: None)
+
+        async def noop_validate_request(agent_id: str) -> None:
+            return None
+
+        async def noop_record_response(agent_id: str, latency_ms: int, success: bool) -> None:
+            return None
+
+        monkeypatch.setattr(governance_module.agent_governance, "validate_request", noop_validate_request)
+        monkeypatch.setattr(governance_module.agent_governance, "record_response", noop_record_response)
+
+        async def noop_emit_agent_webhook_event(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            agent_webhook_service,
+            "emit_agent_webhook_event",
+            noop_emit_agent_webhook_event,
+        )
+
+        async def noop_log_agent_request(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(agent_auth_module, "log_agent_request", noop_log_agent_request)
+        monkeypatch.setattr(agent_api_module, "log_agent_request", noop_log_agent_request)
+
+        class FakePostgresIdempotencyStore:
+            async def get(self, *, scope: str, key: str):
+                return None
+
+            async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
+                return None
+
+        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+
+        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+            return None
+
+        calls = {"count": 0}
+
+        async def fake_create_new_order(order_request: Any, background_tasks: Any):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("cannot perform operation: another operation is in progress")
+            now = datetime.now(timezone.utc)
+            return OrderResponse(
+                order_id="ord_retry_success",
+                merchant_id=order_request.merchant_id,
+                customer_email=order_request.customer_email,
+                items=order_request.items,
+                shipping_address=order_request.shipping_address,
+                subtotal=Decimal("10.00"),
+                shipping_fee=Decimal("0.00"),
+                tax=Decimal("0.00"),
+                total=Decimal("10.00"),
+                currency=order_request.currency or "USD",
+                status="pending",
+                payment_status="unpaid",
+                fulfillment_status=None,
+                payment_intent_id="pi_retry_success",
+                client_secret="cs_retry_success",
+                psp="stripe",
+                payment_action=PaymentAction(type="stripe_client_secret", client_secret="cs_retry_success"),
+                shopify_order_id=None,
+                tracking_number=None,
+                created_at=now,
+                updated_at=now,
+                paid_at=None,
+                shipped_at=None,
+                agent_session_id=order_request.agent_session_id,
+                metadata=order_request.metadata,
+            )
+
+        monkeypatch.setattr(
+            agent_api_module,
+            "_load_replayable_agent_order_create_response",
+            fake_load_replayable_agent_order_create_response,
+        )
+        monkeypatch.setattr(order_routes_module, "create_new_order", fake_create_new_order)
+
+        payload = {
+            "merchant_id": "m_test",
+            "customer_email": "test@example.com",
+            "items": [
+                {
+                    "product_id": "p_1",
+                    "product_title": "Test Product",
+                    "variant_id": "v_1",
+                    "quantity": 1,
+                    "unit_price": "10.00",
+                    "subtotal": "10.00",
+                }
+            ],
+            "shipping_address": {
+                "name": "Test",
+                "address_line1": "1 Test St",
+                "city": "SF",
+                "state": "CA",
+                "postal_code": "94107",
+                "country": "US",
+            },
+            "currency": "USD",
+            "idempotency_key": "idem_order_create_busy_retry",
+            "metadata": {},
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/agent/v1/orders/create", json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json()["order_id"] == "ord_retry_success"
+        assert calls["count"] == 2
     finally:
         app.dependency_overrides.pop(get_agent_context, None)
 
