@@ -130,15 +130,21 @@ jobs:
 
       - name: Apply dispatch fixture env
         shell: bash
-        env:
-          SHOPIFY_DISCOUNT_FIXTURE_ENV_JSON: ${{ inputs.shopify_discount_fixture_env_json }}
         run: |
           python3 - <<'PY'
           import json
           import os
           import sys
 
-          raw = (os.environ.get("SHOPIFY_DISCOUNT_FIXTURE_ENV_JSON") or "").strip()
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          event = {}
+          if event_path:
+              try:
+                  with open(event_path, "r", encoding="utf-8") as event_file:
+                      event = json.load(event_file) or {}
+              except Exception as exc:
+                  raise SystemExit(f"Unable to read GitHub event payload: {exc}") from exc
+          raw = str(((event.get("inputs") or {}).get("shopify_discount_fixture_env_json") or "")).strip()
           if not raw or raw == "{}":
               sys.exit(0)
 
@@ -186,6 +192,7 @@ jobs:
                   text = str(value)
                   if "\n" in text or "\r" in text:
                       raise SystemExit(f"Fixture env {key} must be single-line")
+                  print(f"::add-mask::{text}")
                   env_file.write(f"{key}={text}\n")
           PY
 
