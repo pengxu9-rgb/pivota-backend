@@ -3,6 +3,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from starlette.routing import Match
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -36,3 +38,17 @@ def test_runtime_routes_have_unique_method_path_pairs():
     }
 
     assert not duplicates, f"duplicate mounted routes: {duplicates}"
+
+
+def test_agent_order_events_route_precedes_dynamic_order_route():
+    scope = {"type": "http", "method": "GET", "path": "/agent/v1/orders/events"}
+    matches = []
+
+    for route in app.routes:
+        match, _ = route.matches(scope) if hasattr(route, "matches") else (Match.NONE, {})
+        if match == Match.FULL:
+            matches.append(route)
+
+    assert matches, "GET /agent/v1/orders/events should match a registered route"
+    endpoint = getattr(matches[0], "endpoint", None)
+    assert getattr(endpoint, "__name__", None) == "agent_list_order_events"
