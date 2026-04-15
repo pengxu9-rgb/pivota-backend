@@ -215,7 +215,9 @@ def _mark_shipping_evidence(
     amount: Optional[Decimal] = None,
     source: str = "shopify_storefront_cart",
 ) -> None:
-    row: Dict[str, Any] = {"status": status, "source": source}
+    existing = evidence.get("shipping_evidence") if isinstance(evidence, dict) else None
+    row: Dict[str, Any] = dict(existing or {}) if isinstance(existing, dict) else {}
+    row.update({"status": status, "source": source})
     if reason:
         row["reason"] = reason
     if amount is not None:
@@ -223,6 +225,23 @@ def _mark_shipping_evidence(
     evidence["shipping_evidence"] = row
     if status != "authoritative" and evidence.get("pricing_confidence") == "authoritative":
         evidence["pricing_confidence"] = "partial"
+
+
+def _shipping_unverified_reason(evidence: Dict[str, Any]) -> str:
+    shipping_evidence = evidence.get("shipping_evidence") if isinstance(evidence, dict) else None
+    line_requirements = (
+        shipping_evidence.get("line_shipping_requirements")
+        if isinstance(shipping_evidence, dict)
+        else None
+    )
+    if not isinstance(line_requirements, list) or not line_requirements:
+        return "delivery_options_unavailable"
+    known = [row.get("requires_shipping") for row in line_requirements if isinstance(row, dict)]
+    if known and all(value is False for value in known):
+        return "cart_lines_do_not_require_shipping"
+    if known and any(value is True for value in known):
+        return "shipping_rates_unavailable_for_shippable_lines"
+    return "delivery_options_unavailable"
 
 
 def _shopify_cart_selectable_address_input(
@@ -307,6 +326,7 @@ def _parse_storefront_cart_discounts(
     unit_price_by_variant_id: Dict[str, Decimal] = {}
     line_pricing_by_variant_id: Dict[str, Dict[str, Decimal]] = {}
     grouped: Dict[str, Dict[str, Any]] = {}
+    line_shipping_requirements: List[Dict[str, Any]] = []
     discount_total = Decimal("0.00")
 
     lines_root = cart.get("lines") or {}
@@ -325,6 +345,26 @@ def _parse_storefront_cart_discounts(
         if not isinstance(variant_id, str) or not variant_id.strip():
             continue
         variant_id = variant_id.strip()
+        merchandise = node.get("merchandise") if isinstance(node, dict) else None
+        if isinstance(merchandise, dict):
+            line_shipping_requirements.append(
+                {
+                    "variant_id": variant_id,
+                    "storefront_variant_id": merchandise.get("id"),
+                    "requires_shipping": (
+                        bool(merchandise.get("requiresShipping"))
+                        if merchandise.get("requiresShipping") is not None
+                        else None
+                    ),
+                    "available_for_sale": (
+                        bool(merchandise.get("availableForSale"))
+                        if merchandise.get("availableForSale") is not None
+                        else None
+                    ),
+                    "weight": merchandise.get("weight"),
+                    "weight_unit": merchandise.get("weightUnit"),
+                }
+            )
         try:
             qty = int(node.get("quantity") or 0)
         except Exception:
@@ -449,19 +489,25 @@ def _parse_storefront_cart_discounts(
     else:
         pricing_confidence = "authoritative"
 
+    discount_evidence = {
+        "source": source,
+        "codes": code_rows,
+        "applications": applications,
+        "decisions": [],
+        "pricing_confidence": pricing_confidence,
+    }
+    if line_shipping_requirements:
+        discount_evidence["shipping_evidence"] = {
+            "line_shipping_requirements": line_shipping_requirements,
+        }
+
     return {
         "unit_price_by_variant_id": unit_price_by_variant_id,
         "line_pricing_by_variant_id": line_pricing_by_variant_id,
         "promotion_lines": promotion_lines,
         "discount_codes": code_rows,
         "discount_total": discount_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        "discount_evidence": {
-            "source": source,
-            "codes": code_rows,
-            "applications": applications,
-            "decisions": [],
-            "pricing_confidence": pricing_confidence,
-        },
+        "discount_evidence": discount_evidence,
     }
 
 
@@ -1084,7 +1130,7 @@ query($ids: [ID!]!) {
                 _mark_shipping_evidence(
                     discount_evidence,
                     status="unverified",
-                    reason="delivery_options_unavailable",
+                    reason=_shipping_unverified_reason(discount_evidence),
                 )
 
         debug = {
@@ -1256,6 +1302,15 @@ query($ids: [ID!]!) {
 	            id
 	            quantity
 	            attributes { key value }
+	            merchandise {
+	              ... on ProductVariant {
+	                id
+	                availableForSale
+	                requiresShipping
+	                weight
+	                weightUnit
+	              }
+	            }
 	            discountAllocations {
 	              __typename
 	              targetType
@@ -1292,6 +1347,15 @@ query($ids: [ID!]!) {
 	          node {
 	            quantity
 	            attributes { key value }
+	            merchandise {
+	              ... on ProductVariant {
+	                id
+	                availableForSale
+	                requiresShipping
+	                weight
+	                weightUnit
+	              }
+	            }
 	            cost {
 	              amountPerQuantity { amount currencyCode }
 	              totalAmount { amount currencyCode }
@@ -1523,11 +1587,20 @@ query($id: ID!) {
     discountCodes { code applicable }
     lines(first: 100) {
       edges {
-        node {
-          id
-          quantity
-          attributes { key value }
-          discountAllocations {
+	        node {
+	          id
+	          quantity
+	          attributes { key value }
+	          merchandise {
+	            ... on ProductVariant {
+	              id
+	              availableForSale
+	              requiresShipping
+	              weight
+	              weightUnit
+	            }
+	          }
+	          discountAllocations {
             __typename
             targetType
             discountedAmount { amount currencyCode }

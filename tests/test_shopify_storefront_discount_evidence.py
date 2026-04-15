@@ -11,6 +11,7 @@ from services.shopify_storefront_pricing_service import (
     _mark_shipping_evidence,
     _original_subtotal_from_line_items,
     _parse_storefront_cart_discounts,
+    _shipping_unverified_reason,
     _shopify_cart_selectable_address_input,
 )
 
@@ -83,6 +84,49 @@ def test_storefront_discount_parser_records_invalid_code_without_discount_amount
     assert parsed["discount_evidence"]["pricing_confidence"] == "partial"
 
 
+def test_storefront_discount_parser_records_line_shipping_requirements():
+    cart = {
+        "discountCodes": [],
+        "lines": {
+            "edges": [
+                {
+                    "node": {
+                        "id": "line_1",
+                        "quantity": 1,
+                        "attributes": [{"key": "pivota_variant_id", "value": "333"}],
+                        "merchandise": {
+                            "id": "gid://shopify/ProductVariant/333",
+                            "availableForSale": True,
+                            "requiresShipping": False,
+                            "weight": 0.0,
+                            "weightUnit": "KILOGRAMS",
+                        },
+                        "discountAllocations": [],
+                        "cost": {
+                            "amountPerQuantity": {"amount": "20.00", "currencyCode": "USD"},
+                            "totalAmount": {"amount": "20.00", "currencyCode": "USD"},
+                        },
+                    }
+                }
+            ]
+        },
+    }
+
+    parsed = _parse_storefront_cart_discounts(cart=cart, submitted_codes=[])
+
+    assert parsed["discount_evidence"]["shipping_evidence"]["line_shipping_requirements"] == [
+        {
+            "variant_id": "333",
+            "storefront_variant_id": "gid://shopify/ProductVariant/333",
+            "requires_shipping": False,
+            "available_for_sale": True,
+            "weight": 0.0,
+            "weight_unit": "KILOGRAMS",
+        }
+    ]
+    assert _shipping_unverified_reason(parsed["discount_evidence"]) == "cart_lines_do_not_require_shipping"
+
+
 def test_original_subtotal_preserves_pre_discount_line_amount_for_quote_display():
     line_items = [
         {
@@ -119,15 +163,31 @@ def test_shipping_inference_can_recover_selected_shipping_from_authoritative_tot
 
 
 def test_unverified_shipping_evidence_downgrades_pricing_confidence():
-    evidence = {"pricing_confidence": "authoritative"}
+    evidence = {
+        "pricing_confidence": "authoritative",
+        "shipping_evidence": {
+            "line_shipping_requirements": [
+                {
+                    "variant_id": "333",
+                    "requires_shipping": True,
+                }
+            ]
+        },
+    }
 
-    _mark_shipping_evidence(evidence, status="unverified", reason="delivery_options_unavailable")
+    _mark_shipping_evidence(evidence, status="unverified", reason=_shipping_unverified_reason(evidence))
 
     assert evidence["pricing_confidence"] == "partial"
     assert evidence["shipping_evidence"] == {
         "status": "unverified",
         "source": "shopify_storefront_cart",
-        "reason": "delivery_options_unavailable",
+        "reason": "shipping_rates_unavailable_for_shippable_lines",
+        "line_shipping_requirements": [
+            {
+                "variant_id": "333",
+                "requires_shipping": True,
+            }
+        ],
     }
 
 
