@@ -20,6 +20,40 @@ PLATFORM_DEFAULT_COMMISSION = {
     # 'standard' removed - converted to 'basic' per migration 018
 }
 
+VALID_REVENUE_MATCH_STATUSES = {
+    'perfect_match',
+    'merchant_offer_accepted',
+    'agent_below_min',
+    'fallback_platform',
+    'no_rules',
+}
+VALID_REVENUE_MATCH_SOURCES = {
+    'merchant_offer',
+    'agent_expectation',
+    'platform_default',
+    'negotiated',
+}
+
+
+def normalize_revenue_match_status(value: Optional[str]) -> str:
+    """Normalize service-era names to the Migration 014 database enum contract."""
+    status = str(value or '').strip()
+    if status in VALID_REVENUE_MATCH_STATUSES:
+        return status
+    if status == 'platform_fallback':
+        return 'fallback_platform'
+    return 'fallback_platform'
+
+
+def normalize_revenue_match_source(value: Optional[str]) -> str:
+    """Normalize service-era names to the Migration 014 database enum contract."""
+    source = str(value or '').strip()
+    if source in VALID_REVENUE_MATCH_SOURCES:
+        return source
+    if source == 'platform_policy':
+        return 'platform_default'
+    return 'platform_default'
+
 
 class RevenueShareService:
     """
@@ -297,7 +331,7 @@ class RevenueShareService:
                     'actual_rate': float(platform_rate),
                     'actual_commission_rate': float(platform_rate),
                     'match_status': 'agent_below_min',
-                    'match_source': 'platform_policy',
+                    'match_source': 'platform_default',
                     'merchant_offered_rate': float(offered_rate),
                     'agent_expected_rate': float(expected_rate),
                     'agent_minimum_rate': float(min_rate),
@@ -333,8 +367,8 @@ class RevenueShareService:
             return {
                 'actual_rate': float(rate),
                 'actual_commission_rate': float(rate),
-                'match_status': 'platform_fallback',
-                'match_source': 'platform_policy',
+                'match_status': 'fallback_platform',
+                'match_source': 'platform_default',
                 'merchant_offered_rate': None,
                 'agent_expected_rate': float(expected_rate),
                 'agent_minimum_rate': float(agent_expectation.get('min_acceptable_rate', 0)),
@@ -352,7 +386,7 @@ class RevenueShareService:
                 'actual_rate': float(platform_rate),
                 'actual_commission_rate': float(platform_rate),
                 'match_status': 'no_rules',
-                'match_source': 'platform_policy',
+                'match_source': 'platform_default',
                 'merchant_offered_rate': None,
                 'agent_expected_rate': None,
                 'agent_minimum_rate': None,
@@ -394,8 +428,8 @@ class RevenueShareService:
             "agent_expected": match_result.get('agent_expected_rate'),
             "agent_minimum": match_result.get('agent_minimum_rate'),
             "actual_rate": match_result['actual_commission_rate'],
-            "match_status": match_result['match_status'],
-            "match_source": match_result['match_source'],
+            "match_status": normalize_revenue_match_status(match_result.get('match_status')),
+            "match_source": normalize_revenue_match_source(match_result.get('match_source')),
             "platform_default": match_result['platform_default_used'],
             "metadata": match_result.get('note', '')
         })
