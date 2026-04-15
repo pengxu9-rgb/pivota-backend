@@ -1,10 +1,17 @@
 import os
 from decimal import Decimal
 
+import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
 
-from services.shopify_storefront_pricing_service import _parse_storefront_cart_discounts
+from services.shopify_storefront_pricing_service import (
+    ShopifyStorefrontPricingService,
+    _infer_shipping_fee_from_totals,
+    _mark_shipping_evidence,
+    _original_subtotal_from_line_items,
+    _parse_storefront_cart_discounts,
+)
 
 
 def test_storefront_discount_parser_uses_line_allocations_not_total_delta():
@@ -73,3 +80,98 @@ def test_storefront_discount_parser_records_invalid_code_without_discount_amount
     assert parsed["promotion_lines"] == []
     assert parsed["discount_codes"] == [{"code": "BADCODE", "applicable": False, "source": "shopify_storefront_cart"}]
     assert parsed["discount_evidence"]["pricing_confidence"] == "partial"
+
+
+def test_original_subtotal_preserves_pre_discount_line_amount_for_quote_display():
+    line_items = [
+        {
+            "quantity": 3,
+            "unit_price_original": Decimal("29.00"),
+            "unit_price_effective": Decimal("19.33"),
+            "line_discount_total": Decimal("29.00"),
+        }
+    ]
+
+    assert _original_subtotal_from_line_items(line_items) == Decimal("87.00")
+
+
+def test_shipping_inference_does_not_treat_product_discount_as_shipping():
+    shipping_fee = _infer_shipping_fee_from_totals(
+        subtotal=Decimal("29.00"),
+        total=Decimal("26.10"),
+        tax=Decimal("0.00"),
+        discount_total=Decimal("2.90"),
+    )
+
+    assert shipping_fee is None
+
+
+def test_shipping_inference_can_recover_selected_shipping_from_authoritative_totals():
+    shipping_fee = _infer_shipping_fee_from_totals(
+        subtotal=Decimal("29.00"),
+        total=Decimal("33.10"),
+        tax=Decimal("0.00"),
+        discount_total=Decimal("2.90"),
+    )
+
+    assert shipping_fee == Decimal("7.00")
+
+
+def test_unverified_shipping_evidence_downgrades_pricing_confidence():
+    evidence = {"pricing_confidence": "authoritative"}
+
+    _mark_shipping_evidence(evidence, status="unverified", reason="delivery_options_unavailable")
+
+    assert evidence["pricing_confidence"] == "partial"
+    assert evidence["shipping_evidence"] == {
+        "status": "unverified",
+        "source": "shopify_storefront_cart",
+        "reason": "delivery_options_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_delivery_address_add_uses_shopify_current_selectable_address_shape(monkeypatch):
+    service = ShopifyStorefrontPricingService()
+    calls = []
+
+    async def fake_storefront_graphql(**kwargs):
+        calls.append(kwargs)
+        query = kwargs["query"]
+        if "cartDeliveryAddressesAdd" in query:
+            return {"cartDeliveryAddressesAdd": {"cart": {"id": "cart_1"}, "userErrors": []}}
+        return {"cart": {"deliveryGroups": {"edges": []}}}
+
+    monkeypatch.setattr(service, "_storefront_graphql", fake_storefront_graphql)
+
+    options, selected = await service._attach_address_and_select_delivery_best_effort(
+        shop_domain="example.myshopify.com",
+        storefront_token="sf_token",
+        cart_id="gid://shopify/Cart/test",
+        country="US",
+        postal="10118",
+        city="New York",
+        province="NY",
+        address1="350 5th Ave",
+        address2="",
+        selected_delivery_option=None,
+        debug_id="dbg",
+    )
+
+    assert options is None
+    assert selected is None
+    assert calls[0]["variables"]["addresses"] == [
+        {
+            "selected": True,
+            "oneTimeUse": True,
+            "address": {
+                "deliveryAddress": {
+                    "countryCode": "US",
+                    "zip": "10118",
+                    "city": "New York",
+                    "provinceCode": "NY",
+                    "address1": "350 5th Ave",
+                }
+            },
+        }
+    ]

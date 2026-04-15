@@ -22,6 +22,11 @@ manual workflow:
 | `SHOPIFY_DISCOUNT_TEST_PRODUCT_ID` | secret or variable | Pivota product id for the Shopify test product. Optional if the default placeholder is valid for the environment. |
 | `SHOPIFY_DISCOUNT_TEST_VARIANT_ID` | secret or variable | Shopify variant id for the test product. Required. |
 | `SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL` | secret or variable | Test buyer email. Use an address approved for the selected merchant/store. |
+| `SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY` | secret or variable | Shipping country for delivery-rate evidence, defaults to `CA`. Use `US` for US free-shipping fixtures. |
+| `SHOPIFY_DISCOUNT_TEST_SHIPPING_STATE` | secret or variable | State/province code for delivery-rate evidence. |
+| `SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE` | secret or variable | Postal/ZIP code that is inside the test shipping zone. |
+| `SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY` | secret or variable | City for the test shipping address. |
+| `SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1` | secret or variable | Street line for the test shipping address. |
 
 Configure scenario fixtures as available:
 
@@ -129,6 +134,9 @@ Required before converting the PR out of draft:
 - Automatic discount evidence appears when the dev-store fixture is enabled.
 - BXGY and free-shipping fixtures produce Shopify evidence without fabricated
   free-shipping amounts.
+- Shipping fee is accepted as authoritative only when Shopify returns a selected
+  delivery option. Delta-based shipping inference is default-off; do not enable
+  `SHOPIFY_STOREFRONT_SHIPPING_FALLBACK_INFER=1` for pilot charge paths.
 - New-customer/customer-context validation reports Shopify eligibility evidence
   or remains blocked/unverified without locally applying a manual new-customer
   promotion.

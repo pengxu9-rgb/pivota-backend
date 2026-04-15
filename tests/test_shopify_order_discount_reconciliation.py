@@ -42,6 +42,28 @@ def test_shopify_order_discount_codes_and_annotations_from_quote_evidence():
     assert {"name": "pivota_order_id", "value": "ord_123"} in note_attributes
 
 
+def test_pricing_quote_detects_unverified_shipping_evidence():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["discount_evidence"]["shipping_evidence"] = {
+        "status": "unverified",
+        "reason": "delivery_options_unavailable",
+        "source": "shopify_storefront_cart",
+    }
+
+    assert order_routes._pricing_quote_has_unverified_shipping(pricing_quote_meta) is True
+
+
+def test_pricing_quote_accepts_authoritative_shipping_evidence():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["discount_evidence"]["shipping_evidence"] = {
+        "status": "authoritative",
+        "amount": "7.00",
+        "source": "shopify_storefront_cart",
+    }
+
+    assert order_routes._pricing_quote_has_unverified_shipping(pricing_quote_meta) is False
+
+
 def test_shopify_order_reconciliation_passes_when_totals_match(monkeypatch):
     monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
     result = order_routes._reconcile_shopify_discount_order(
