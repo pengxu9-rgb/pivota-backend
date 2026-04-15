@@ -218,6 +218,7 @@ def test_shopify_selectable_address_input_matches_cart_delivery_shape():
 
 @pytest.mark.asyncio
 async def test_delivery_address_add_uses_shopify_current_selectable_address_shape(monkeypatch):
+    monkeypatch.setenv("SHOPIFY_STOREFRONT_DELIVERY_OPTIONS_ATTEMPTS", "1")
     service = ShopifyStorefrontPricingService()
     calls = []
 
@@ -261,6 +262,66 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_delivery_options_query_retries_until_rates_are_available(monkeypatch):
+    monkeypatch.setenv("SHOPIFY_STOREFRONT_DELIVERY_OPTIONS_ATTEMPTS", "3")
+    monkeypatch.setenv("SHOPIFY_STOREFRONT_DELIVERY_OPTIONS_RETRY_DELAY_SECONDS", "0")
+    service = ShopifyStorefrontPricingService()
+    delivery_query_count = 0
+
+    async def fake_storefront_graphql(**kwargs):
+        nonlocal delivery_query_count
+        query = kwargs["query"]
+        if "cartDeliveryAddressesAdd" in query:
+            return {"cartDeliveryAddressesAdd": {"cart": {"id": "cart_1"}, "userErrors": []}}
+        if "cartSelectedDeliveryOptionsUpdate" in query:
+            return {"cartSelectedDeliveryOptionsUpdate": {"cart": {"id": "cart_1"}, "userErrors": []}}
+        delivery_query_count += 1
+        if delivery_query_count < 2:
+            return {"cart": {"deliveryGroups": {"edges": []}}}
+        return {
+            "cart": {
+                "deliveryGroups": {
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "group_1",
+                                "deliveryOptions": [
+                                    {
+                                        "handle": "standard",
+                                        "title": "Standard",
+                                        "estimatedCost": {"amount": "7.00", "currencyCode": "USD"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            },
+            "cartSelectedDeliveryOptionsUpdate": {"cart": {"id": "cart_1"}, "userErrors": []},
+        }
+
+    monkeypatch.setattr(service, "_storefront_graphql", fake_storefront_graphql)
+
+    options, selected = await service._attach_address_and_select_delivery_best_effort(
+        shop_domain="example.myshopify.com",
+        storefront_token="sf_token",
+        cart_id="gid://shopify/Cart/test",
+        country="US",
+        postal="10118",
+        city="New York",
+        province="NY",
+        address1="350 5th Ave",
+        address2="",
+        selected_delivery_option=None,
+        debug_id="dbg",
+    )
+
+    assert delivery_query_count == 2
+    assert options and options[0]["handle"] == "standard"
+    assert selected and selected["estimatedCost"]["amount"] == "7.00"
 
 
 @pytest.mark.asyncio

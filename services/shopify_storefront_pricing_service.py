@@ -1754,23 +1754,34 @@ query($id: ID!) {
   }
 }
 """
-        data2 = await self._storefront_graphql(
-            shop_domain=shop_domain,
-            storefront_token=storefront_token,
-            query=delivery_query,
-            variables={"id": cart_id},
-            debug_id=debug_id,
-        )
-        cart = (data2.get("cart") or {}) if isinstance(data2, dict) else {}
-        groups = (((cart.get("deliveryGroups") or {}).get("edges")) or []) if isinstance(cart, dict) else []
+        attempts = int(os.getenv("SHOPIFY_STOREFRONT_DELIVERY_OPTIONS_ATTEMPTS", "4") or "4")
+        attempts = max(1, min(attempts, 8))
+        retry_delay_s = float(os.getenv("SHOPIFY_STOREFRONT_DELIVERY_OPTIONS_RETRY_DELAY_SECONDS", "0.75") or "0.75")
+        retry_delay_s = max(0.0, min(retry_delay_s, 3.0))
+
         options: List[Dict[str, Any]] = []
-        for edge in groups:
-            node = (edge or {}).get("node") or {}
-            group_id = node.get("id")
-            for opt in node.get("deliveryOptions") or []:
-                if not isinstance(opt, dict):
-                    continue
-                options.append({**opt, "delivery_group_id": group_id})
+        for attempt in range(attempts):
+            data2 = await self._storefront_graphql(
+                shop_domain=shop_domain,
+                storefront_token=storefront_token,
+                query=delivery_query,
+                variables={"id": cart_id},
+                debug_id=debug_id,
+            )
+            cart = (data2.get("cart") or {}) if isinstance(data2, dict) else {}
+            groups = (((cart.get("deliveryGroups") or {}).get("edges")) or []) if isinstance(cart, dict) else []
+            options = []
+            for edge in groups:
+                node = (edge or {}).get("node") or {}
+                group_id = node.get("id")
+                for opt in node.get("deliveryOptions") or []:
+                    if not isinstance(opt, dict):
+                        continue
+                    options.append({**opt, "delivery_group_id": group_id})
+            if options:
+                break
+            if attempt < attempts - 1 and retry_delay_s > 0:
+                await asyncio.sleep(retry_delay_s)
 
         if not options:
             if not added and last_error_details:
