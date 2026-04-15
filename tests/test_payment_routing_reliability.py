@@ -178,3 +178,37 @@ async def test_payment_routing_legacy_path_remains_default(
     assert result["psp_used"] == "adyen"
     assert result["attempt_number"] == 2
     assert calls == ["stripe", "adyen"]
+
+
+@pytest.mark.asyncio
+async def test_payment_attempt_logging_omits_internal_trusted_agent_id() -> None:
+    import services.payment_routing_service as prs
+
+    captured: dict = {}
+
+    async def fake_execute(query: str, values: dict):
+        captured.update(values)
+
+    service = prs.PaymentRoutingService(database=SimpleNamespace(execute=fake_execute))
+
+    await service._log_payment_attempt(
+        attempt_id="att_test",
+        order_id="ord_test",
+        route_id=None,
+        agent_id="agent_internal_trusted_abc123",
+        psp_name="stripe",
+        attempt_number=1,
+        status="pending",
+        amount=10.0,
+        currency="USD",
+    )
+
+    assert captured["agent_id"] is None
+
+
+def test_multi_psp_attempt_logging_omits_internal_trusted_agent_id() -> None:
+    from adapters.multi_psp_orchestrator import _payment_attempt_agent_id
+
+    assert _payment_attempt_agent_id("agent_internal_trusted_abc123") is None
+    assert _payment_attempt_agent_id("") is None
+    assert _payment_attempt_agent_id("agent_real") == "agent_real"

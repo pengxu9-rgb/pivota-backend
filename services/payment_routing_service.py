@@ -28,6 +28,13 @@ from core.reliability.budget import RequestBudget
 logger = logging.getLogger(__name__)
 
 
+def _payment_attempt_agent_id(agent_id: Optional[str]) -> Optional[str]:
+    value = str(agent_id or "").strip()
+    if not value or value.startswith("agent_internal_trusted_"):
+        return None
+    return value
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
@@ -1057,6 +1064,7 @@ class PaymentRoutingService:
     
     async def _log_payment_attempt(self, **kwargs):
         """Log payment attempt to database"""
+        kwargs["agent_id"] = _payment_attempt_agent_id(kwargs.get("agent_id"))
         await self.database.execute(
             """
             INSERT INTO payment_attempts (
