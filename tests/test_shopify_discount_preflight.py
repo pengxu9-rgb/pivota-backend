@@ -6,7 +6,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/tes
 import pytest
 
 from scripts.preflight_shopify_discounts import _baseline_result, _scenario_blocker
-from scripts.validate_shopify_discounts import Scenario, _evaluate
+from scripts.validate_shopify_discounts import Scenario, _evaluate, _scenario_catalog
 from services.shopify_graphql_client import ShopifyGraphQLError
 from services.shopify_promotions_sync import (
     ShopifyStoreConfig,
@@ -91,6 +91,16 @@ def test_validation_requires_one_applied_and_one_rejected_for_noncombinable_conf
 
     assert status == "pass"
     assert "applied=['BXGY']" in actual
+
+
+def test_noncombinable_conflict_uses_bxgy_quantity(monkeypatch):
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY", "3")
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A", "NOCOMBO")
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B", "BXGY")
+
+    scenario = next(row for row in _scenario_catalog() if row.scenario_id == "SFD-011")
+
+    assert scenario.quantity == 3
 
 
 @pytest.mark.asyncio

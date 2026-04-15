@@ -210,6 +210,11 @@ def _scenario_catalog() -> List[Scenario]:
                 os.getenv("SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A", "").strip(),
                 os.getenv("SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B", "").strip(),
             ],
+            quantity=int(
+                os.getenv("SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_QUANTITY")
+                or os.getenv("SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY", "2")
+                or "2"
+            ),
             expected="conflict_recorded",
             env_required="SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A",
             required_code_count=2,
