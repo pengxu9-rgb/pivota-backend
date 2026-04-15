@@ -1,0 +1,104 @@
+# Shopify Discount Validation Results
+
+## Tested scenarios
+
+Validation date: 2026-04-15.
+
+Validation scope included production quote/cart probes, quote-backed order creation without completing payment, unpaid payment-confirmation rejection, and focused post-deploy regression probes. No successful live paid charge was executed.
+
+- US baseline quote with no discount code
+- US amount-off code
+- US free-shipping code
+- CA baseline quote with no discount code
+- CA free-shipping code against non-US address
+- CA amount-off code against non-US address
+- BXGY boundary at quantity 2
+- BXGY positive case at quantity 3
+- non-combinable pair with BXGY at quantity 3
+- expired code
+- exhausted/unavailable code
+- cross-class stacking probe with amount-off plus free shipping
+- positive combinable fixture probe with `PIVOTA_TEST_COMBO_A`
+- quote -> order create probe with amount-off quote, without payment confirmation
+- unpaid payment confirmation guard
+- rejected Shopify code against quantity-based Pivota manual fallback
+- PSP amount/currency verification unit coverage
+
+## Passed
+
+- `US baseline`: shipping is priced and returned as `29.00`; pricing confidence is authoritative.
+- `US amount-off`: `PIVOTA_TEST_AMOUNT10` is applicable, applies `2.90` off the line item, and keeps shipping at `29.00`.
+- `US free shipping`: `PIVOTA_TEST_FREESHIP` is applicable, gross shipping is `29.00`, Shopify shipping discount nets `shipping_fee` to `0.00`, and final total is `29.00`.
+- `CA baseline`: shipping is priced at `29.00`; pricing confidence is authoritative.
+- `CA free shipping negative`: `PIVOTA_TEST_FREESHIP` is rejected with `applicable=false` for a Canada address, and shipping remains `29.00`.
+- `CA amount-off`: `PIVOTA_TEST_AMOUNT10` remains applicable for the Canada address and does not zero out shipping.
+- `BXGY boundary`: `PIVOTA_TEST_BXGY` is not applicable at quantity `2`, which is consistent with a buy-2-get-1 style threshold.
+- `BXGY positive`: `PIVOTA_TEST_BXGY` becomes applicable at quantity `3` and applies `29.00` off.
+- `Non-combinable pair`: with `PIVOTA_TEST_NOCOMBO_A + PIVOTA_TEST_BXGY` at quantity `3`, Shopify accepts `PIVOTA_TEST_BXGY` and rejects `PIVOTA_TEST_NOCOMBO_A` cleanly.
+- `Expired code`: `PIVOTA_TEST_EXPIRED` is rejected with `applicable=false`.
+- `Exhausted/unavailable code`: `PIVOTA_TEST_EXHAUSTED` is rejected with `applicable=false`.
+- `Cross-class stacking probe`: `PIVOTA_TEST_AMOUNT10 + PIVOTA_TEST_FREESHIP` does not stack in the tested configuration; Shopify accepts the amount-off code and rejects the free-shipping code cleanly.
+- `Order create probe`: a quote-backed amount-off order created successfully on retry, preserved the discounted total `55.10`, stayed in `awaiting_payment`, did not create a Shopify order before payment confirmation, and was then cancelled cleanly.
+- `Unpaid payment confirmation guard`: production rejected an unpaid Stripe PaymentIntent with `409 PAYMENT_NOT_SUCCEEDED`, left the order in `awaiting_payment`, kept `shopify_order_id=null`, and allowed cancellation.
+- `PSP amount/currency guard`: automated tests now prove successful PSP status is not enough; amount and currency must also match the Pivota order before an order can be marked paid, and fail-closed mode rejects status-only PSP adapters.
+- `Rejected-code fallback isolation`: production no longer lets an inapplicable Shopify code trigger a Pivota quantity-based manual promotion. `PIVOTA_TEST_NOCOMBO_A` alone at quantity `3` now returns `discount_total=0`, records a skipped decision reason `shopify_code_rejected`, and emits no applied promotion lines.
+
+## Failed
+
+- `PIVOTA_TEST_COMBO_A` positive combinability fixture failed validation. Shopify returned `applicable=false` for `PIVOTA_TEST_COMBO_A`; with `PIVOTA_TEST_AMOUNT10 + PIVOTA_TEST_COMBO_A`, only `PIVOTA_TEST_AMOUNT10` applied.
+
+## Blocked
+
+- `quote -> paid PSP confirmation -> Shopify order create -> reconciliation`: blocked because no successful test-mode or approved live paid charge was executed in this round.
+- `automatic discount live execution`: blocked by missing explicit automatic-discount fixture for this merchant.
+- `segment-restricted / new-customer restricted discount live execution`: the lookup path is implemented, but no restricted Shopify-native fixture code was supplied for checkout validation.
+- `positive combinable pair`: blocked until the merchant fixture is corrected or replaced with two codes Shopify actually marks applicable together.
+- `available usage-limit boundary`: `PIVOTA_TEST_EXHAUSTED` was already unavailable at probe time, so only exhausted rejection was proven.
+- `active window positive case`: no active scheduling-window fixture was supplied; expired/inactive rejection was proven.
+
+## Root cause by failure
+
+- Historical free-shipping failure was caused by Pivota reading gross delivery price without netting Shopify shipping discount allocations into `shipping_fee`. That defect is fixed and live evidence now shows US free-shipping and CA paid-shipping behavior diverge correctly.
+- The positive combinability failure is fixture-side unless the business expected `PIVOTA_TEST_COMBO_A` to be eligible for the test product/address. Storefront returned `applicable=false`, so Pivota should not apply or simulate that discount.
+- The rejected-code fallback defect was Pivota-side: a rejected Shopify code could previously fall through into local infra promotions. The fix now records the skipped manual promotion as a decision instead of applying it.
+
+## Exact evidence references
+
+- Final US/CA shipping matrix after deployment:
+  - `artifacts/shopify-discount-validation/live-us-ca-shipping-matrix-20260415T075522Z/quote-matrix/summary.json`
+  - `artifacts/shopify-discount-validation/live-us-ca-shipping-matrix-20260415T075522Z/quote-matrix/US-FREESHIP.json`
+  - `artifacts/shopify-discount-validation/live-us-ca-shipping-matrix-20260415T075522Z/quote-matrix/CA-FREESHIP.json`
+- Discount matrix after PSP guard deployment:
+  - `artifacts/shopify-discount-validation/live-us-discount-matrix-post-psp-guard-20260415T075604Z/summary.csv`
+  - `artifacts/shopify-discount-validation/live-us-discount-matrix-post-psp-guard-20260415T075604Z/SFD-001.json`
+  - `artifacts/shopify-discount-validation/live-us-discount-matrix-post-psp-guard-20260415T075604Z/SFD-004.json`
+  - `artifacts/shopify-discount-validation/live-us-discount-matrix-post-psp-guard-20260415T075604Z/SFD-005.json`
+  - `artifacts/shopify-discount-validation/live-us-discount-matrix-post-psp-guard-20260415T075604Z/SFD-010.json`
+- Unpaid PSP confirmation and cancellation guard:
+  - `artifacts/shopify-discount-validation/live-psp-amount-currency-guard-20260415T075403Z/manual-probes/summary.json`
+  - `artifacts/shopify-discount-validation/live-psp-amount-currency-guard-20260415T075403Z/manual-probes/20-confirm-payment.json`
+  - `artifacts/shopify-discount-validation/live-psp-amount-currency-guard-20260415T075403Z/manual-probes/21-order-after-confirm-reject.json`
+  - `artifacts/shopify-discount-validation/live-psp-amount-currency-guard-20260415T075403Z/manual-probes/31-order-after-cancel.json`
+- Rejected-code fallback isolation:
+  - `artifacts/shopify-discount-validation/live-rejected-code-promo-skip-20260415T080245Z/quote-matrix/summary.json`
+  - `artifacts/shopify-discount-validation/live-rejected-code-promo-skip-20260415T080245Z/quote-matrix/NOCOMBO-A-ALONE-Q3.json`
+  - `artifacts/shopify-discount-validation/live-rejected-code-promo-skip-20260415T080245Z/quote-matrix/BXGY-ALONE-Q3.json`
+  - `artifacts/shopify-discount-validation/live-rejected-code-promo-skip-20260415T080245Z/quote-matrix/NOCOMBO-A-BXGY-Q3.json`
+- Order create probe before payment confirmation:
+  - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/summary.json`
+  - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/01-order-create.json`
+  - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/90-order-get.json`
+  - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/91-order-cancel.json`
+  - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/92-order-get-after-cancel.json`
+
+## Whether the system is ready for merchant pilots on discounts
+
+`limited`
+
+Rationale:
+
+- Quote-time Shopify-native amount-off, free-shipping, BXGY threshold behavior, invalid-code rejection, exhausted/expired rejection, and non-combinable conflict behavior now have production evidence.
+- Authoritative Storefront delivery pricing is now carried into quotes; US no-code and CA no-code both price shipping at `29.00`, while the US free-shipping code nets shipping to `0.00`.
+- The most dangerous fake-discount path found in this round is fixed: rejected Shopify codes no longer trigger Pivota manual fallback promotions.
+- Payment confirmation now refuses unpaid PSP references and unit tests enforce amount/currency matching before paid transition; fail-closed mode blocks PSP adapters that cannot provide amount/currency details.
+- The system is not ready for broad merchant rollout until a successful discounted paid flow reconciles Pivota quote total, PSP amount/currency, Shopify order total, Shopify total discounts, and Shopify transactions.

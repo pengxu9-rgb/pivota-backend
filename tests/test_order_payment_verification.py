@@ -94,8 +94,66 @@ async def test_verify_order_payment_succeeded_keeps_legacy_status_fallback(monke
         return "legacy", _LegacyTupleAdapter()
 
     monkeypatch.setattr(order_routes, "_resolve_order_psp_adapter", fake_resolve)
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe")
 
     assert await order_routes.verify_order_payment_succeeded(_order()) == (True, "succeeded", None)
+
+
+@pytest.mark.asyncio
+async def test_verify_order_payment_succeeded_fail_closed_rejects_legacy_status_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as order_routes
+
+    async def fake_resolve(order: Dict[str, Any]):
+        return "legacy", _LegacyTupleAdapter()
+
+    monkeypatch.setattr(order_routes, "_resolve_order_psp_adapter", fake_resolve)
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
+
+    ok, status, error = await order_routes.verify_order_payment_succeeded(_order())
+
+    assert ok is False
+    assert status == "details_unavailable"
+    assert "amount/currency details" in str(error)
+
+
+@pytest.mark.asyncio
+async def test_verify_order_payment_succeeded_fail_closed_requires_order_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as order_routes
+
+    async def fake_resolve(order: Dict[str, Any]):
+        return "stripe", _DetailsAdapter()
+
+    monkeypatch.setattr(order_routes, "_resolve_order_psp_adapter", fake_resolve)
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
+
+    ok, status, error = await order_routes.verify_order_payment_succeeded(_order(total=None))
+
+    assert ok is False
+    assert status == "succeeded"
+    assert "Order total is unavailable" in str(error)
+
+
+@pytest.mark.asyncio
+async def test_verify_order_payment_succeeded_fail_closed_requires_order_currency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as order_routes
+
+    async def fake_resolve(order: Dict[str, Any]):
+        return "stripe", _DetailsAdapter()
+
+    monkeypatch.setattr(order_routes, "_resolve_order_psp_adapter", fake_resolve)
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
+
+    ok, status, error = await order_routes.verify_order_payment_succeeded(_order(currency=None))
+
+    assert ok is False
+    assert status == "succeeded"
+    assert "Order currency is unavailable" in str(error)
 
 
 @pytest.mark.asyncio
