@@ -103,6 +103,9 @@ Validation scope included production quote/cart probes, quote-backed order creat
   - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/91-order-cancel.json`
   - `artifacts/shopify-discount-validation/live-order-create-retry-20260415T054846Z/92-order-get-after-cancel.json`
 - Latest readonly matrix after paid/refund fixes:
+  - `artifacts/shopify-discount-validation/live-post-read-discounts-scope-readonly-20260415T140417Z/quote-matrix/summary.csv`
+  - `artifacts/shopify-discount-validation/live-post-read-discounts-scope-readonly-20260415T140417Z/quote-matrix/SFD-007.json`
+  - `artifacts/shopify-discount-validation/live-post-read-discounts-scope-readonly-20260415T140417Z/quote-matrix/SFD-010.json`
   - `artifacts/shopify-discount-validation/live-post-refund-fixes-readonly-20260415T135141Z/quote-matrix/summary.csv`
   - `artifacts/shopify-discount-validation/live-post-refund-fixes-readonly-20260415T135141Z/quote-matrix/SFD-007.json`
   - `artifacts/shopify-discount-validation/live-post-refund-fixes-readonly-20260415T135141Z/quote-matrix/SFD-010.json`
