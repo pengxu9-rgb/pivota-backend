@@ -87,6 +87,15 @@ from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
 
 _ORDER_CREATE_LOCKS: Dict[str, asyncio.Lock] = {}
+_ORDER_EVENT_ORDER_TOTAL_TYPES = {
+    "order_created",
+    "payment_succeeded",
+    "shopify_discount_reconciliation",
+    "shopify_order_created",
+    "tender_transaction_webhook",
+    "order_updated_webhook",
+    "shopify_order_webhook",
+}
 
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
@@ -8759,10 +8768,30 @@ def _currency_from_order_event_metadata(metadata: Dict[str, Any]) -> Optional[st
     return None
 
 
+def _order_event_amount_value(value: Any) -> Optional[float]:
+    if isinstance(value, dict):
+        value = value.get("value") if value.get("value") is not None else value.get("amount")
+    if value is None:
+        return None
+    try:
+        return float(Decimal(str(value)))
+    except Exception:
+        return None
+
+
+def _amount_from_order_event_metadata(metadata: Dict[str, Any]) -> Optional[float]:
+    for key in ("amount", "total", "total_amount"):
+        amount = _order_event_amount_value(metadata.get(key))
+        if amount is not None:
+            return amount
+    return None
+
+
 def _normalize_order_event_feed_row(row: Dict[str, Any]) -> Dict[str, Any]:
     event = dict(row)
     metadata = _order_event_metadata_dict(event.pop("event_metadata", None))
     order_currency = str(event.pop("order_currency", "") or "").strip().upper()
+    order_total = event.pop("order_total", None)
     metadata_currency = _currency_from_order_event_metadata(metadata)
     event_currency = str(event.get("currency") or "").strip().upper()
 
@@ -8772,6 +8801,11 @@ def _normalize_order_event_feed_row(row: Dict[str, Any]) -> Dict[str, Any]:
         event["currency"] = order_currency
     else:
         event["currency"] = event_currency or "USD"
+
+    if event.get("total_amount") is None and event.get("event_type") in _ORDER_EVENT_ORDER_TOTAL_TYPES:
+        event["total_amount"] = _amount_from_order_event_metadata(metadata)
+        if event["total_amount"] is None:
+            event["total_amount"] = _order_event_amount_value(order_total)
 
     return event
 
@@ -8821,7 +8855,8 @@ async def _agent_list_order_events_impl(
                 e.error_message,
                 e.created_at,
                 e.metadata AS event_metadata,
-                o.currency AS order_currency
+                o.currency AS order_currency,
+                o.total AS order_total
             FROM order_events e
             JOIN orders o ON o.order_id = e.order_id
             WHERE o.agent_id = :agent_id

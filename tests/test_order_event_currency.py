@@ -41,13 +41,16 @@ def test_agent_order_events_feed_normalizes_legacy_default_usd_from_metadata() -
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {"amount": 2.22, "currency": "EUR"},
         "order_currency": "EUR",
+        "order_total": "2.22",
     }
 
     event = _normalize_order_event_feed_row(row)
 
     assert event["currency"] == "EUR"
+    assert event["total_amount"] == 2.22
     assert "event_metadata" not in event
     assert "order_currency" not in event
+    assert "order_total" not in event
 
 
 def test_agent_order_events_feed_normalizes_legacy_default_usd_from_order() -> None:
@@ -66,8 +69,10 @@ def test_agent_order_events_feed_normalizes_legacy_default_usd_from_order() -> N
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {"shopify_order_id": "7531537269064"},
         "order_currency": "EUR",
+        "order_total": "2.22",
     }
 
     event = _normalize_order_event_feed_row(row)
 
     assert event["currency"] == "EUR"
+    assert event["total_amount"] == 2.22
