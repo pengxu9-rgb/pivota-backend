@@ -294,6 +294,52 @@ async def _load_replayable_agent_order_create_response(
         response,
     )
     return response
+
+
+ORDER_CREATE_BUSY_REPLAY_ATTEMPTS = max(
+    1,
+    min(
+        20,
+        int(os.getenv("ORDER_CREATE_BUSY_REPLAY_ATTEMPTS", "10") or 10),
+    ),
+)
+ORDER_CREATE_BUSY_REPLAY_INITIAL_DELAY_SECONDS = max(
+    0.0,
+    min(
+        2.0,
+        int(os.getenv("ORDER_CREATE_BUSY_REPLAY_INITIAL_DELAY_MS", "50") or 50) / 1000.0,
+    ),
+)
+ORDER_CREATE_BUSY_REPLAY_MAX_DELAY_SECONDS = max(
+    ORDER_CREATE_BUSY_REPLAY_INITIAL_DELAY_SECONDS,
+    min(
+        2.0,
+        int(os.getenv("ORDER_CREATE_BUSY_REPLAY_MAX_DELAY_MS", "500") or 500) / 1000.0,
+    ),
+)
+
+
+async def _load_replayable_agent_order_create_response_with_backoff(
+    order_request: CreateOrderRequest,
+    *,
+    attempts: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Poll for an already-persisted order after transient asyncpg busy failures."""
+    total_attempts = max(1, attempts or ORDER_CREATE_BUSY_REPLAY_ATTEMPTS)
+    delay = ORDER_CREATE_BUSY_REPLAY_INITIAL_DELAY_SECONDS
+    for attempt in range(total_attempts):
+        replay_response = await _load_replayable_agent_order_create_response(order_request)
+        if replay_response:
+            return replay_response
+        if attempt >= total_attempts - 1:
+            break
+        try:
+            await asyncio.sleep(delay)
+        except Exception:
+            pass
+        if delay > 0:
+            delay = min(ORDER_CREATE_BUSY_REPLAY_MAX_DELAY_SECONDS, delay * 2)
+    return None
 FIND_PRODUCTS_MULTI_SEED_BUDGET_MS = max(
     0,
     min(
@@ -7683,7 +7729,7 @@ async def agent_create_order(
                 # On a transient DB-busy failure, first try to replay that persisted
                 # order. Only if no order exists yet do we retry the full create.
                 if is_asyncpg_busy_error(e):
-                    replay_response = await _load_replayable_agent_order_create_response(order_request)
+                    replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
                     if replay_response:
                         return replay_response
                     try:
@@ -7697,7 +7743,7 @@ async def agent_create_order(
                         order_response = await order_routes_module.create_new_order(order_request, background_tasks)
                     except Exception as e2:
                         if is_asyncpg_busy_error(e2):
-                            replay_response = await _load_replayable_agent_order_create_response(order_request)
+                            replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
                             if replay_response:
                                 return replay_response
                             raise db_busy_http_exception()
@@ -7812,13 +7858,16 @@ async def agent_create_order(
         order_amount = float(order_response.total)
         
         # 记录成功请求
-        await log_agent_request(
-            context=context,
-            status_code=200,
-            merchant_id=order_request.merchant_id,
-            order_id=order_response.order_id,
-            order_amount=order_amount
-        )
+        try:
+            await log_agent_request(
+                context=context,
+                status_code=200,
+                merchant_id=order_request.merchant_id,
+                order_id=order_response.order_id,
+                order_amount=order_amount,
+            )
+        except Exception as log_error:
+            logger.warning(f"[agent_orders_create] usage logging failed after order create: {log_error}")
         # 记录购买事件（best-effort，与业务逻辑解耦）
         try:
             # Try to infer basic product identifiers from order items metadata
@@ -8111,16 +8160,22 @@ async def agent_create_order(
             )
         except Exception:
             pass
-        await log_agent_request(
-            context=context,
-            status_code=e.status_code,
-            merchant_id=order_request.merchant_id,
-            error_message=e.detail
-        )
+        try:
+            await log_agent_request(
+                context=context,
+                status_code=e.status_code,
+                merchant_id=order_request.merchant_id,
+                error_message=e.detail,
+            )
+        except Exception as log_error:
+            logger.warning(f"[agent_orders_create] usage logging failed for order create HTTP error: {log_error}")
         raise
     except Exception as e:
         success = False
         if is_asyncpg_busy_error(e):
+            replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
+            if replay_response:
+                return replay_response
             raise db_busy_http_exception()
         logger.error(f"Agent order creation error: {e}")
         try:
@@ -8167,12 +8222,15 @@ async def agent_create_order(
             )
         except Exception:
             pass
-        await log_agent_request(
-            context=context,
-            status_code=500,
-            merchant_id=order_request.merchant_id,
-            error_message=str(e)
-        )
+        try:
+            await log_agent_request(
+                context=context,
+                status_code=500,
+                merchant_id=order_request.merchant_id,
+                error_message=str(e),
+            )
+        except Exception as log_error:
+            logger.warning(f"[agent_orders_create] usage logging failed for order create exception: {log_error}")
         raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
     finally:
         # STEP 3: Record governance metrics (always executed)
