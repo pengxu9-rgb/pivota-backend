@@ -15,6 +15,7 @@ import hashlib
 import httpx
 import os
 import json
+import re
 from contextlib import asynccontextmanager
 from sqlalchemy import and_, or_, select
 
@@ -1359,6 +1360,29 @@ def _build_shopify_order_discount_codes(pricing_quote_meta: Dict[str, Any]) -> L
     return out[:1]
 
 
+_SHOPIFY_ORDER_TAG_MAX_LEN = 40
+_SHOPIFY_ORDER_TAG_SAFE_RE = re.compile(r"[^A-Za-z0-9-]+")
+
+
+def _shopify_order_tag(prefix: str, value: str) -> str:
+    """
+    Build a Shopify order tag that survives REST order creation.
+
+    Keep full IDs in note_attributes; tags are short, searchable join keys.
+    """
+    safe_prefix = _SHOPIFY_ORDER_TAG_SAFE_RE.sub("-", str(prefix or "").strip()).strip("-")
+    safe_value = _SHOPIFY_ORDER_TAG_SAFE_RE.sub("-", str(value or "").strip()).strip("-")
+    safe_prefix = re.sub(r"-+", "-", safe_prefix) or "pivota"
+    safe_value = re.sub(r"-+", "-", safe_value)
+    tag = f"{safe_prefix}-{safe_value}" if safe_value else safe_prefix
+    if len(tag) <= _SHOPIFY_ORDER_TAG_MAX_LEN:
+        return tag
+
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:8]
+    keep = max(1, _SHOPIFY_ORDER_TAG_MAX_LEN - len(digest) - 1)
+    return f"{tag[:keep].rstrip('-')}-{digest}"
+
+
 def _build_shopify_discount_order_annotations(
     *,
     order_id: str,
@@ -1371,13 +1395,13 @@ def _build_shopify_discount_order_annotations(
     note_attributes: List[Dict[str, str]] = []
     quote_id = str(pricing_quote_meta.get("quote_id") or "").strip()
     if quote_id:
-        tags.append(f"pivota_quote_id:{quote_id}")
+        tags.append(_shopify_order_tag("pivota-quote-id", quote_id))
         note_attributes.append({"name": "pivota_quote_id", "value": quote_id})
 
     evidence = pricing_quote_meta.get("discount_evidence")
     evidence_hash = _discount_evidence_hash(evidence)
     if evidence_hash:
-        tags.append(f"pivota_discount_evidence:{evidence_hash}")
+        tags.append(_shopify_order_tag("pivota-discount-evidence", evidence_hash))
         note_attributes.append({"name": "pivota_discount_evidence_hash", "value": evidence_hash})
 
     if isinstance(evidence, dict):
@@ -2814,7 +2838,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
         from db.orders import update_order as update_order_row
 
         pricing_quote_meta = _pricing_quote_meta_from_order(order)
-        pivota_tag = f"pivota_order_id:{order_id}"
+        pivota_tag = _shopify_order_tag("pivota-order-id", order_id)
 
         def _token_fingerprint(token: Optional[str]) -> Optional[str]:
             if not token:
