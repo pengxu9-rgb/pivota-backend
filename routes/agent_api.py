@@ -8251,7 +8251,13 @@ async def agent_confirm_payment(
     """确认支付并触发 Shopify 订单创建（Agent 调用）"""
     try:
         from services.agent_governance import agent_governance
-        from routes.order_routes import create_shopify_order, get_order, log_order_event, mark_order_paid
+        from routes.order_routes import (
+            create_shopify_order,
+            get_order,
+            log_order_event,
+            mark_order_paid,
+            verify_order_payment_succeeded,
+        )
         from services.merchant_store_service import get_primary_store
         from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
         
@@ -8316,6 +8322,34 @@ async def agent_confirm_payment(
                 "shopify_sync": "already_linked" if order.get("shopify_order_id") else ("not_configured" if not can_shopify_sync else "missing_shopify_order_id"),
                 "shopify_order_id": order.get("shopify_order_id"),
             }
+
+        payment_verified, psp_status, psp_error = await verify_order_payment_succeeded(order)
+        if not payment_verified:
+            try:
+                await log_order_event(
+                    event_type="payment_confirm_rejected",
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                    metadata={
+                        "payment_intent_id": order.get("payment_intent_id"),
+                        "psp_status": psp_status,
+                        "error": psp_error,
+                        "confirmed_by": "agent",
+                    },
+                )
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "PAYMENT_NOT_SUCCEEDED",
+                    "message": "PSP payment is not succeeded; refusing to mark the order paid or sync it to Shopify.",
+                    "order_id": order_id,
+                    "payment_intent_id": order.get("payment_intent_id"),
+                    "psp_status": psp_status,
+                    **({"psp_error": psp_error} if psp_error else {}),
+                },
+            )
 
         await mark_order_paid(order_id)
 
