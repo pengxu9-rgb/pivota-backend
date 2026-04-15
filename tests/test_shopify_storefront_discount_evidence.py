@@ -231,7 +231,7 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
 
     monkeypatch.setattr(service, "_storefront_graphql", fake_storefront_graphql)
 
-    options, selected = await service._attach_address_and_select_delivery_best_effort(
+    options, selected, diagnostics = await service._attach_address_and_select_delivery_best_effort(
         shop_domain="example.myshopify.com",
         storefront_token="sf_token",
         cart_id="gid://shopify/Cart/test",
@@ -247,6 +247,9 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
 
     assert options is None
     assert selected is None
+    assert diagnostics["storefront_api_version"] == "2026-04"
+    assert diagnostics["address_add_succeeded"] is True
+    assert diagnostics["delivery_options_count"] == 0
     assert calls[0]["variables"]["addresses"] == [
         {
             "selected": True,
@@ -305,7 +308,7 @@ async def test_delivery_options_query_retries_until_rates_are_available(monkeypa
 
     monkeypatch.setattr(service, "_storefront_graphql", fake_storefront_graphql)
 
-    options, selected = await service._attach_address_and_select_delivery_best_effort(
+    options, selected, diagnostics = await service._attach_address_and_select_delivery_best_effort(
         shop_domain="example.myshopify.com",
         storefront_token="sf_token",
         cart_id="gid://shopify/Cart/test",
@@ -322,6 +325,10 @@ async def test_delivery_options_query_retries_until_rates_are_available(monkeypa
     assert delivery_query_count == 2
     assert options and options[0]["handle"] == "standard"
     assert selected and selected["estimatedCost"]["amount"] == "7.00"
+    assert diagnostics["address_add_succeeded"] is True
+    assert diagnostics["delivery_groups_count"] == 1
+    assert diagnostics["delivery_options_count"] == 1
+    assert diagnostics["selected_delivery_option_handle"] == "standard"
 
 
 @pytest.mark.asyncio
