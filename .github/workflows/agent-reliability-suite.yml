@@ -23,6 +23,16 @@ on:
         required: true
         default: false
         type: boolean
+      shopify_discount_test_base_url:
+        description: "Optional validation base URL. Falls back to repo secret/variable."
+        required: false
+        default: ""
+        type: string
+      shopify_discount_fixture_env_json:
+        description: "Optional JSON object of non-secret SHOPIFY_DISCOUNT_TEST_* fixture env vars."
+        required: false
+        default: "{}"
+        type: string
   pull_request:
     paths:
       - "routes/**"
@@ -77,7 +87,7 @@ jobs:
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      SHOPIFY_DISCOUNT_TEST_BASE_URL: ${{ secrets.SHOPIFY_DISCOUNT_TEST_BASE_URL || vars.SHOPIFY_DISCOUNT_TEST_BASE_URL }}
+      SHOPIFY_DISCOUNT_TEST_BASE_URL: ${{ inputs.shopify_discount_test_base_url || secrets.SHOPIFY_DISCOUNT_TEST_BASE_URL || vars.SHOPIFY_DISCOUNT_TEST_BASE_URL }}
       SHOPIFY_DISCOUNT_TEST_MERCHANT_ID: ${{ secrets.SHOPIFY_DISCOUNT_TEST_MERCHANT_ID || vars.SHOPIFY_DISCOUNT_TEST_MERCHANT_ID }}
       SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY: ${{ secrets.SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY }}
       SHOPIFY_DISCOUNT_TEST_PRODUCT_ID: ${{ secrets.SHOPIFY_DISCOUNT_TEST_PRODUCT_ID || vars.SHOPIFY_DISCOUNT_TEST_PRODUCT_ID }}
@@ -86,7 +96,7 @@ jobs:
       SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE || vars.SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE }}
       SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED: ${{ vars.SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED }}
       SHOPIFY_DISCOUNT_TEST_BXGY_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_BXGY_CODE || vars.SHOPIFY_DISCOUNT_TEST_BXGY_CODE }}
-      SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY: ${{ vars.SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY }}
+      SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY: ${{ vars.SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY || '2' }}
       SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE || vars.SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE }}
       SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE || vars.SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE }}
       SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE: ${{ secrets.SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE || vars.SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE }}
@@ -96,6 +106,11 @@ jobs:
       SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B: ${{ secrets.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B || vars.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B }}
       SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A || vars.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A }}
       SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B || vars.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B }}
+      SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1: ${{ vars.SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1 || '350 Fifth Avenue' }}
+      SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY: ${{ vars.SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY || 'New York' }}
+      SHOPIFY_DISCOUNT_TEST_SHIPPING_STATE: ${{ vars.SHOPIFY_DISCOUNT_TEST_SHIPPING_STATE || 'NY' }}
+      SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE: ${{ vars.SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE || '10118' }}
+      SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY: ${{ vars.SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY || 'US' }}
       SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY: ${{ secrets.SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY }}
 
     steps:
@@ -112,6 +127,67 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Apply dispatch fixture env
+        shell: bash
+        env:
+          SHOPIFY_DISCOUNT_FIXTURE_ENV_JSON: ${{ inputs.shopify_discount_fixture_env_json }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          raw = (os.environ.get("SHOPIFY_DISCOUNT_FIXTURE_ENV_JSON") or "").strip()
+          if not raw or raw == "{}":
+              sys.exit(0)
+
+          allowed = {
+              "SHOPIFY_DISCOUNT_TEST_MERCHANT_ID",
+              "SHOPIFY_DISCOUNT_TEST_PRODUCT_ID",
+              "SHOPIFY_DISCOUNT_TEST_VARIANT_ID",
+              "SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL",
+              "SHOPIFY_DISCOUNT_TEST_CURRENCY",
+              "SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE",
+              "SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED",
+              "SHOPIFY_DISCOUNT_TEST_BXGY_CODE",
+              "SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY",
+              "SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE",
+              "SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE",
+              "SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE",
+              "SHOPIFY_DISCOUNT_TEST_ACTIVE_WINDOW_CODE",
+              "SHOPIFY_DISCOUNT_TEST_INACTIVE_WINDOW_CODE",
+              "SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A",
+              "SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B",
+              "SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A",
+              "SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_NAME",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS2",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_STATE",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY",
+              "SHOPIFY_DISCOUNT_TEST_SHIPPING_PHONE",
+          }
+          try:
+              parsed = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              raise SystemExit(f"Invalid shopify_discount_fixture_env_json: {exc}") from exc
+          if not isinstance(parsed, dict):
+              raise SystemExit("shopify_discount_fixture_env_json must be a JSON object")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              for key, value in parsed.items():
+                  if key not in allowed:
+                      continue
+                  if value is None:
+                      continue
+                  text = str(value)
+                  if "\n" in text or "\r" in text:
+                      raise SystemExit(f"Fixture env {key} must be single-line")
+                  env_file.write(f"{key}={text}\n")
+          PY
 
       - name: Validate required fixtures
         shell: bash

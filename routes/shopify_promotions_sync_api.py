@@ -137,8 +137,8 @@ async def preflight_shopify_discount_nodes_access(
     Read-only Admin GraphQL preflight for discount-node access.
 
     This intentionally does not call the promotion sync/upsert path. It exists
-    so live fixture validation can distinguish a merchant reauthorization/scope
-    blocker from quote-time discount execution regressions.
+    so live fixture validation can distinguish a custom-app token/scope blocker
+    from quote-time discount execution regressions.
     """
     try:
         probe = await probe_shopify_discount_nodes_access_for_merchant(

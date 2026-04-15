@@ -6,7 +6,7 @@ The Shopify discount integration is no longer just cosmetic. The quote-time path
 
 The paid path is now live-proven for this explicitly approved Stripe + Shopify test merchant across three discounted orders: free shipping (`ORD_508D4460ACA8DE11`), amount-off (`ORD_E2CC099ACF7A88A7`), and BXGY (`ORD_F56E0A1E5DC79E82`). Those orders were refunded through the production app path. The refund cleanup exposed and fixed three real defects: agent refund idempotency, Stripe Checkout Session refund resolution, and Shopify refund-webhook double counting.
 
-This is still not ready for a broad merchant rollout. Discount-node sync is blocked for the current merchant install because Shopify Admin GraphQL denied `discountNodes` without `read_discounts`; production scopes now request `read_discounts`, but the merchant must reconnect. Positive combinability, automatic discounts, restricted customer/segment discounts, active-window-positive behavior, and true usage exhaustion remain fixture-blocked.
+This is still not ready for a broad merchant rollout. Discount-node sync is blocked for the current merchant custom app connection because Shopify Admin GraphQL denied `discountNodes` without `read_discounts`; this merchant uses its own Shopify custom app secret, so the stored custom app Admin token must be regenerated/updated with `read_discounts` before node sync can run. Positive combinability and true usage exhaustion have been reported fixture-ready but still need recorded rerun evidence; automatic discounts, restricted customer/segment discounts, and active-window-positive behavior remain fixture-blocked.
 
 One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evidence of fixed-amount discount support. Live behavior on a `29.00` item produced a `2.90` discount, so the validated fixture is a 10% product discount, not a fixed `10` amount discount (`artifacts/shopify-discount-validation/live-us-shipping-final-retest-20260415T051842Z/summary.json:175-214`).
 
@@ -24,7 +24,7 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
   - `db/migrations/062_shopify_discount_open_ended_promotions.sql:1-12`
   - `services/promotions_service.py:101-113`
   - `services/promotions_service.py:201-210`
-- Production scope configuration now requests `read_discounts`, which Shopify requires for `discountNodes` reads:
+- Shopify Admin GraphQL `discountNodes` reads require `read_discounts`; for this merchant that scope must be present on the merchant custom app Admin token stored in Pivota:
   - `config/settings.py:70-77`
   - `services/shopify_integration_verify.py:24-35`
   - `routes/merchant_store_connections.py:789-798`
@@ -173,7 +173,7 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
      - `services/shopify_promotions_sync.py:339-358`
      - `services/shopify_promotions_sync.py:621-700`
    - This is enough for visibility/governance, not enough to claim Pivota manages merchant discount lifecycle.
-   - Current merchant install is blocked until reconnect because live Admin GraphQL returned `ACCESS_DENIED` for `discountNodes` without `read_discounts`.
+   - The current merchant custom app token is blocked until the stored Admin token includes `read_discounts` because live Admin GraphQL returned `ACCESS_DENIED` for `discountNodes`.
 
 3. New-customer logic exists, but only partially proven.
    - Shopify is queried for `numberOfOrders` by email and returns verified/unverified evidence:
@@ -202,17 +202,17 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
    - Sync preserves `usageLimit`, `appliesOncePerCustomer`, and open-ended `endsAt=None`:
      - `services/shopify_promotions_sync.py:318-358`
      - `tests/test_shopify_promotions_graphql_sync.py:9-44`
-   - The latest readonly matrix shows `PIVOTA_TEST_EXHAUSTED` is currently applicable and discounts `0.90`, so it is not an exhausted fixture.
+   - The latest completed readonly matrix showed `PIVOTA_TEST_EXHAUSTED` applicable with a `0.90` discount, so it did not prove exhaustion. The merchant has since reported that the fixture is ready and needs rerun evidence.
 
 ## What is missing
 
-1. Merchant reconnect/reauthorization with `read_discounts`, then live discount-node sync proof for usage limits, active windows, combinations, and customer context.
+1. Merchant custom app Admin token update/regeneration with `read_discounts`, then live discount-node sync proof for usage limits, active windows, combinations, and customer context.
 
 2. A live automatic-discount fixture for this merchant.
 
 3. A live new-customer-only or segment-restricted Shopify-native discount fixture.
 
-4. A live positive combinable pair fixture. Conflict handling is proven; positive stacking is not.
+4. Rerun the repaired live positive combinable pair fixture. Conflict handling is proven; positive stacking is pending rerun evidence.
 
 5. Hard evidence for fixed-amount discount formulas. The validated live product-discount fixture behaves as percentage off, not fixed amount.
 
@@ -249,8 +249,8 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
 
 ## Recommended next fixes ranked by impact × implementation effort
 
-1. Reconnect the test merchant with `read_discounts`, rerun GraphQL discount-node sync, and verify node metadata for usage limits, active dates, combinations, and customer context.
+1. Update/regenerate the test merchant custom app Admin token with `read_discounts`, rerun GraphQL discount-node sync, and verify node metadata for usage limits, active dates, combinations, and customer context.
 2. Run the next paid canary with `SHOPIFY_DISCOUNT_RECONCILIATION_MODE=fail_closed`, then compare quote total, PSP amount, Shopify order total, Shopify total discounts, Shopify transactions, and refund status.
-3. Replace or repair `PIVOTA_TEST_COMBO_A`, then validate one positive combinable pair and one non-combinable pair against the same product/address.
+3. Rerun the repaired `PIVOTA_TEST_COMBO_A`, then validate one positive combinable pair and one non-combinable pair against the same product/address.
 4. Add Shopify automatic, restricted-customer/new-customer, active-window-positive, and true exhausted-usage fixtures for live validation.
 5. Add one true fixed-amount product discount fixture and one true fixed-amount order discount fixture, then validate both quote-time and paid-order behavior.
