@@ -8283,6 +8283,8 @@ async def agent_confirm_payment(
                         event_type="shopify_sync_retry_requested",
                         order_id=order_id,
                         merchant_id=order["merchant_id"],
+                        total_amount=float(order.get("total") or 0),
+                        currency=str(order.get("currency") or "USD"),
                         metadata={"requested_by": "agent_confirm_payment"},
                     )
                 except Exception:
@@ -8330,6 +8332,8 @@ async def agent_confirm_payment(
                     event_type="payment_confirm_rejected",
                     order_id=order_id,
                     merchant_id=order["merchant_id"],
+                    total_amount=float(order.get("total") or 0),
+                    currency=str(order.get("currency") or "USD"),
                     metadata={
                         "payment_intent_id": order.get("payment_intent_id"),
                         "psp_status": psp_status,
@@ -8382,6 +8386,8 @@ async def agent_confirm_payment(
                 event_type="payment_succeeded",
                 order_id=order_id,
                 merchant_id=order["merchant_id"],
+                total_amount=float(order["total"]),
+                currency=str(order["currency"]),
                 metadata={
                     "payment_intent_id": order.get("payment_intent_id"),
                     "amount": float(order["total"]),
@@ -8724,6 +8730,52 @@ async def agent_list_orders(
         )
         raise HTTPException(status_code=500, detail="Failed to list orders")
 
+
+def _order_event_metadata_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _currency_from_order_event_metadata(metadata: Dict[str, Any]) -> Optional[str]:
+    for key in ("currency", "presentment_currency", "charge_currency"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+
+    for key in ("amount", "total", "total_amount"):
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            currency = value.get("currency") or value.get("currencyCode")
+            if isinstance(currency, str) and currency.strip():
+                return currency.strip().upper()
+
+    return None
+
+
+def _normalize_order_event_feed_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    event = dict(row)
+    metadata = _order_event_metadata_dict(event.pop("event_metadata", None))
+    order_currency = str(event.pop("order_currency", "") or "").strip().upper()
+    metadata_currency = _currency_from_order_event_metadata(metadata)
+    event_currency = str(event.get("currency") or "").strip().upper()
+
+    if metadata_currency and (not event_currency or event_currency == "USD"):
+        event["currency"] = metadata_currency
+    elif order_currency and (not event_currency or (event_currency == "USD" and order_currency != "USD")):
+        event["currency"] = order_currency
+    else:
+        event["currency"] = event_currency or "USD"
+
+    return event
+
+
 async def _agent_list_order_events_impl(
     background_tasks: BackgroundTasks,
     after_id: int = Query(default=0, ge=0),
@@ -8767,7 +8819,9 @@ async def _agent_list_order_events_impl(
                 e.currency,
                 e.payment_method,
                 e.error_message,
-                e.created_at
+                e.created_at,
+                e.metadata AS event_metadata,
+                o.currency AS order_currency
             FROM order_events e
             JOIN orders o ON o.order_id = e.order_id
             WHERE o.agent_id = :agent_id
@@ -8838,7 +8892,7 @@ async def _agent_list_order_events_impl(
                 break
             await asyncio.sleep(0.25)
 
-        events = [dict(r) for r in (rows or [])]
+        events = [_normalize_order_event_feed_row(dict(r)) for r in (rows or [])]
         last_id = int(events[-1]["id"]) if events else int(after_id or 0)
 
         background_tasks.add_task(
