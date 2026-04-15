@@ -220,6 +220,7 @@ async def test_agent_v1_confirm_payment_refuses_when_psp_not_succeeded(
 
     assert resp.status_code == 409
     body = resp.json()
+    assert body["error"]["code"] == "PAYMENT_NOT_SUCCEEDED"
     assert body["detail"]["error"] == "PAYMENT_NOT_SUCCEEDED"
     assert body["detail"]["psp_status"] == "requires_payment_method"
     assert marked_paid["called"] is False

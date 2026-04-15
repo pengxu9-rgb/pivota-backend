@@ -191,6 +191,11 @@ class ErrorCode(Enum):
         402,
         "Insufficient funds for payment"
     )
+    PAYMENT_NOT_SUCCEEDED = ErrorDefinition(
+        "PAYMENT_NOT_SUCCEEDED",
+        409,
+        "Payment has not succeeded"
+    )
     
     # Rate Limiting (429)
     RATE_LIMIT_EXCEEDED = ErrorDefinition(
