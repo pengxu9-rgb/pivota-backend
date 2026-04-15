@@ -149,8 +149,14 @@ class OrderCommissionService:
         """Check if commission already calculated for this order"""
         try:
             query = """
-                SELECT id FROM revenue_matching_logs
+                SELECT 1
+                FROM revenue_matching_logs
                 WHERE order_id = :order_id
+                UNION ALL
+                SELECT 1
+                FROM commissions
+                WHERE order_id = :order_id
+                  AND type = 'agent'
                 LIMIT 1
             """
             result = await self.database.fetch_one(query, {"order_id": order_id})
@@ -321,4 +327,3 @@ async def process_order_commission(order_id: str, database: Database) -> Dict[st
     """
     service = OrderCommissionService(database)
     return await service.calculate_commission_for_order(order_id)
-

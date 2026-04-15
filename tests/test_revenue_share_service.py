@@ -77,6 +77,18 @@ class _CaptureDatabase:
         return 1
 
 
+class _ExistingCommissionDatabase:
+    def __init__(self, row):
+        self.row = row
+        self.query = None
+        self.values = None
+
+    async def fetch_one(self, query, values):
+        self.query = query
+        self.values = values
+        return self.row
+
+
 @pytest.mark.asyncio
 async def test_order_commission_log_normalizes_legacy_revenue_match_names():
     database = _CaptureDatabase()
@@ -101,3 +113,22 @@ async def test_order_commission_log_normalizes_legacy_revenue_match_names():
 
     assert database.values["match_status"] == "fallback_platform"
     assert database.values["match_source"] == "platform_default"
+
+
+@pytest.mark.asyncio
+async def test_existing_commission_check_includes_commissions_table():
+    database = _ExistingCommissionDatabase(row={"exists": 1})
+    service = OrderCommissionService(database)
+
+    assert await service._check_existing_commission("ORD_TEST") is True
+    assert "FROM revenue_matching_logs" in database.query
+    assert "FROM commissions" in database.query
+    assert database.values == {"order_id": "ORD_TEST"}
+
+
+@pytest.mark.asyncio
+async def test_existing_commission_check_returns_false_when_no_audit_or_commission_row():
+    database = _ExistingCommissionDatabase(row=None)
+    service = OrderCommissionService(database)
+
+    assert await service._check_existing_commission("ORD_TEST") is False
