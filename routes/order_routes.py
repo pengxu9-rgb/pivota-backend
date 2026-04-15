@@ -1155,6 +1155,18 @@ def _discount_evidence_hash(discount_evidence: Any) -> Optional[str]:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _pricing_quote_has_unverified_shipping(pricing_quote_meta: Dict[str, Any]) -> bool:
+    if not isinstance(pricing_quote_meta, dict):
+        return False
+    evidence = pricing_quote_meta.get("discount_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    shipping_evidence = evidence.get("shipping_evidence")
+    if not isinstance(shipping_evidence, dict):
+        return False
+    return str(shipping_evidence.get("status") or "").strip().lower() == "unverified"
+
+
 def _pricing_quote_discount_total(pricing_quote_meta: Dict[str, Any]) -> Decimal:
     pricing = pricing_quote_meta.get("pricing") if isinstance(pricing_quote_meta, dict) else None
     if isinstance(pricing, dict):
@@ -1594,6 +1606,23 @@ async def create_new_order(
                     "discount_evidence": snap.get("discount_evidence") or {},
                     "line_items": snap.get("line_items") or [],
                 }
+                if (
+                    _shopify_discount_reconciliation_mode() == "fail_closed"
+                    and _pricing_quote_has_unverified_shipping(pricing_quote_meta)
+                ):
+                    raise QuoteError(
+                        "QUOTE_SHIPPING_UNVERIFIED",
+                        "quote shipping fee is not backed by a Shopify delivery option",
+                        debug_id=quote.debug_id,
+                        details={
+                            "quote_id": quote.quote_id,
+                            "shipping_evidence": (
+                                (pricing_quote_meta.get("discount_evidence") or {}).get("shipping_evidence")
+                                if isinstance(pricing_quote_meta.get("discount_evidence"), dict)
+                                else None
+                            ),
+                        },
+                    )
             except QuoteError as e:
                 raise HTTPException(
                     status_code=409,

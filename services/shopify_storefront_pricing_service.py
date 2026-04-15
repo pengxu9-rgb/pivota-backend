@@ -179,6 +179,52 @@ def _empty_discount_evidence(
     }
 
 
+def _original_subtotal_from_line_items(line_items: List[Dict[str, Any]]) -> Decimal:
+    subtotal = Decimal("0.00")
+    for li in line_items or []:
+        if not isinstance(li, dict):
+            continue
+        try:
+            qty = int(li.get("quantity") or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        subtotal += _d(li.get("unit_price_original")) * Decimal(qty)
+    return _d(subtotal)
+
+
+def _infer_shipping_fee_from_totals(
+    *,
+    subtotal: Decimal,
+    total: Decimal,
+    tax: Decimal,
+    discount_total: Decimal,
+) -> Optional[Decimal]:
+    delta = _d(total) - _d(subtotal) - _d(tax) + _d(discount_total)
+    if delta <= 0:
+        return None
+    return _d(delta)
+
+
+def _mark_shipping_evidence(
+    evidence: Dict[str, Any],
+    *,
+    status: str,
+    reason: Optional[str] = None,
+    amount: Optional[Decimal] = None,
+    source: str = "shopify_storefront_cart",
+) -> None:
+    row: Dict[str, Any] = {"status": status, "source": source}
+    if reason:
+        row["reason"] = reason
+    if amount is not None:
+        row["amount"] = str(_d(amount))
+    evidence["shipping_evidence"] = row
+    if status != "authoritative" and evidence.get("pricing_confidence") == "authoritative":
+        evidence["pricing_confidence"] = "partial"
+
+
 def _is_storefront_discount_query_error(err: ShopifyPricingError) -> bool:
     details = getattr(err, "details", {}) or {}
     errors = details.get("errors") or []
@@ -967,24 +1013,55 @@ query($ids: [ID!]!) {
                 debug_id=debug_id,
             )
 
+        # Shopify's CartCost subtotal can already be net of line-level allocations.
+        # Keep Pivota's quote subtotal as the pre-discount item subtotal so discount
+        # totals and shipping inference do not double count product discounts.
+        line_original_subtotal = _original_subtotal_from_line_items(line_items)
+        pricing_subtotal = _d(line_original_subtotal) if line_original_subtotal > 0 else cart.subtotal
+
         pricing = {
-            "subtotal": cart.subtotal,
+            "subtotal": pricing_subtotal,
             "discount_total": cart.discount_total,
             "shipping_fee": Decimal("0.00"),
             "tax": cart.tax,
             "total": cart.total,
         }
 
-        # Best-effort derive shipping_fee:
-        # - Prefer selected delivery option estimatedCost when available.
-        # - Else fallback to delta: total - subtotal - tax + discount_total (clamped >= 0).
+        # Shipping is authoritative only when Shopify returns a selected delivery option.
+        # Delta inference is default-off because it is not safe enough for the charge path.
         shipping_fee = self._derive_shipping_fee(cart)
         if shipping_fee is not None:
             pricing["shipping_fee"] = shipping_fee
+            _mark_shipping_evidence(discount_evidence, status="authoritative", amount=shipping_fee)
         else:
-            delta = pricing["total"] - pricing["subtotal"] - pricing["tax"] + pricing["discount_total"]
-            if delta > 0:
-                pricing["shipping_fee"] = _d(delta)
+            fallback_enabled = (
+                os.getenv("SHOPIFY_STOREFRONT_SHIPPING_FALLBACK_INFER", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            inferred_shipping_fee = (
+                _infer_shipping_fee_from_totals(
+                    subtotal=pricing["subtotal"],
+                    total=pricing["total"],
+                    tax=pricing["tax"],
+                    discount_total=pricing["discount_total"],
+                )
+                if fallback_enabled
+                else None
+            )
+            if inferred_shipping_fee is not None:
+                pricing["shipping_fee"] = inferred_shipping_fee
+                _mark_shipping_evidence(
+                    discount_evidence,
+                    status="inferred",
+                    reason="subtotal_total_delta",
+                    amount=inferred_shipping_fee,
+                )
+            elif shipping_address:
+                _mark_shipping_evidence(
+                    discount_evidence,
+                    status="unverified",
+                    reason="delivery_options_unavailable",
+                )
 
         debug = {
             "debug_id": debug_id,
@@ -1514,6 +1591,8 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
         }
 
         add_shapes = [
+            [{"selected": True, "oneTimeUse": True, "address": {"deliveryAddress": base_addr}}],
+            [{"address": {"deliveryAddress": base_addr}}],
             [{"deliveryAddress": base_addr}],
             [{"address": base_addr}],
         ]

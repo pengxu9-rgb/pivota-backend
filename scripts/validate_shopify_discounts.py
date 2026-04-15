@@ -114,14 +114,14 @@ def _redact(value: Any) -> Any:
 
 def _shipping_address() -> Dict[str, Any]:
     return {
-        "name": "Shopify Discount Test",
-        "address_line1": "150 Elgin St",
-        "address_line2": "",
-        "city": "Ottawa",
-        "state": "ON",
-        "postal_code": "K2P1L4",
-        "country": "CA",
-        "phone": None,
+        "name": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_NAME", "Shopify Discount Test"),
+        "address_line1": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1", "150 Elgin St"),
+        "address_line2": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS2", ""),
+        "city": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY", "Ottawa"),
+        "state": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_STATE", "ON"),
+        "postal_code": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE", "K2P1L4"),
+        "country": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY", "CA"),
+        "phone": os.getenv("SHOPIFY_DISCOUNT_TEST_SHIPPING_PHONE") or None,
     }
 
 
