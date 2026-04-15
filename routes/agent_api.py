@@ -8984,8 +8984,15 @@ async def agent_refund_order(
             amount: Optional[float] = None
             reason: Optional[str] = None
             restore_inventory: bool = True
+            idempotency_key: Optional[str] = None
 
-        req = _Req(order_id=order_id, amount=None, reason="Agent requested refund", restore_inventory=True)
+        req = _Req(
+            order_id=order_id,
+            amount=None,
+            reason="Agent requested refund",
+            restore_inventory=True,
+            idempotency_key=f"agent_refund:{context.agent_id}:{order_id}",
+        )
         result = await process_refund(order_id, req, background_tasks, current_user={"role": "admin"})
         try:
             if str((result or {}).get("status") or "").lower() == "success":
