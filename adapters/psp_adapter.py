@@ -371,7 +371,25 @@ class StripeAdapter(PSPAdapter):
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Stripe 退款"""
         try:
-            refund_data = {"payment_intent": payment_intent_id}
+            payment_reference = str(payment_intent_id or "").strip()
+            payment_intent_ref = payment_reference
+            if payment_reference.startswith("cs_"):
+                session = await asyncio.to_thread(
+                    self._client.v1.checkout.sessions.retrieve,
+                    payment_reference,
+                    {"expand": ["payment_intent"]},
+                )
+                session_payment_intent = getattr(session, "payment_intent", None)
+                if isinstance(session_payment_intent, dict):
+                    payment_intent_ref = str(session_payment_intent.get("id") or "").strip()
+                elif hasattr(session_payment_intent, "id"):
+                    payment_intent_ref = str(session_payment_intent.id or "").strip()
+                else:
+                    payment_intent_ref = str(session_payment_intent or "").strip()
+                if not payment_intent_ref:
+                    return False, None, f"Checkout Session {payment_reference} has no payment_intent"
+
+            refund_data = {"payment_intent": payment_intent_ref}
             if amount:
                 refund_data["amount"] = int(amount * 100)
             if reason:
@@ -383,6 +401,10 @@ class StripeAdapter(PSPAdapter):
                     refund_data["reason"] = reason_norm
                 else:
                     refund_data["metadata"] = {"reason": reason_norm}
+            if payment_reference.startswith("cs_"):
+                metadata = dict(refund_data.get("metadata") or {})
+                metadata["checkout_session_id"] = payment_reference
+                refund_data["metadata"] = metadata
 
             request_options = None
             if idempotency_key:
