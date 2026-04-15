@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import contextvars
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -13,6 +15,9 @@ from pydantic import BaseModel, Field
 
 from mvp.constants import RiskTier, SCHEMA_VERSION, SchemaVersion
 from services.pcs_hash import chain_hash, sha256_json
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -309,7 +314,15 @@ def emit_best_effort(
         coro = emit(sink=sink, event_type=event_type, payload=payload, context=ctx)
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(coro)
+            task = contextvars.Context().run(loop.create_task, coro)
+
+            def _consume_result(done: asyncio.Task) -> None:
+                try:
+                    done.result()
+                except Exception as exc:
+                    logger.warning("Best-effort MVP event emit failed: %s", exc)
+
+            task.add_done_callback(_consume_result)
         except RuntimeError:
             asyncio.run(coro)
     except Exception:
