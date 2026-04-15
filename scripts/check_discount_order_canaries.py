@@ -17,6 +17,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+if os.getenv("SHOPIFY_DISCOUNT_CANARY_DATABASE_URL"):
+    os.environ["DATABASE_URL"] = os.getenv("SHOPIFY_DISCOUNT_CANARY_DATABASE_URL", "")
+
 from db.database import database
 from scripts.validate_shopify_discounts import _now_slug, _redact
 
@@ -237,14 +240,15 @@ async def _run(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     should_disconnect = False
-    if not database.is_connected:
-        await database.connect()
-        should_disconnect = True
-
+    orders: List[Dict[str, Any]] = []
+    checked: List[Dict[str, Any]] = []
+    findings: List[CanaryFinding] = []
     try:
+        if not database.is_connected:
+            await database.connect()
+            should_disconnect = True
+
         orders = await _fetch_orders(merchant_id=args.merchant_id, limit=args.limit)
-        checked: List[Dict[str, Any]] = []
-        findings: List[CanaryFinding] = []
         for order in orders:
             if not args.include_undiscounted and not _is_discounted_order(order):
                 continue
@@ -294,7 +298,7 @@ async def _run(args: argparse.Namespace) -> int:
         print(json.dumps({"output_dir": str(output_dir), "summary": str(summary_path), "csv": str(csv_path)}, indent=2))
         return 1
     finally:
-        if should_disconnect:
+        if should_disconnect and database.is_connected:
             await database.disconnect()
 
     finding_rows = [finding.__dict__ for finding in findings]
