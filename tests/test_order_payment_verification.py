@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Dict
 
@@ -212,3 +213,41 @@ async def test_stripe_payment_status_details_from_checkout_session(monkeypatch: 
     assert details["amount"] == "55.10"
     assert details["currency"] == "EUR"
     assert details["payment_reference_type"] == "stripe_checkout_session"
+
+
+@pytest.mark.asyncio
+async def test_stripe_refund_resolves_checkout_session_to_payment_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    import adapters.psp_adapter as psp_adapter
+
+    adapter = psp_adapter.StripeAdapter("sk_test_fake")
+    calls = []
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        calls.append({"fn": fn, "args": args, "kwargs": kwargs})
+        if len(calls) == 1:
+            assert args[0] == "cs_refund"
+            assert args[1] == {"expand": ["payment_intent"]}
+            return SimpleNamespace(
+                id="cs_refund",
+                payment_intent=SimpleNamespace(id="pi_refund"),
+            )
+        assert args[0]["payment_intent"] == "pi_refund"
+        assert args[0]["amount"] == 222
+        assert args[0]["metadata"]["reason"] == "live_test_cleanup"
+        assert args[0]["metadata"]["checkout_session_id"] == "cs_refund"
+        assert args[1] == {"idempotency_key": "refund_key"}
+        return SimpleNamespace(id="re_refund")
+
+    monkeypatch.setattr(psp_adapter.asyncio, "to_thread", fake_to_thread)
+
+    ok, refund_id, error = await adapter.refund_payment(
+        payment_intent_id="cs_refund",
+        amount=Decimal("2.22"),
+        reason="live_test_cleanup",
+        idempotency_key="refund_key",
+    )
+
+    assert ok is True
+    assert refund_id == "re_refund"
+    assert error is None
+    assert len(calls) == 2
