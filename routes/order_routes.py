@@ -301,6 +301,34 @@ async def _resolve_order_psp_adapter(order: Dict[str, Any]) -> Tuple[str, Any]:
     return provider, adapter
 
 
+_PSP_SUCCEEDED_STATUSES = {
+    "succeeded",
+    "paid",
+    "completed",
+    "success",
+    "settled",
+    "captured",
+    "authorised",
+    "authorized",
+}
+
+
+async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
+    """Verify the PSP payment state before any server-side paid transition."""
+    payment_reference = str(order.get("payment_intent_id") or "").strip()
+    if not payment_reference:
+        return False, "missing_payment_reference", "Order has no PSP payment reference"
+
+    psp_type, psp_adapter = await _resolve_order_psp_adapter(order)
+    ok, status_value, error = await psp_adapter.get_payment_status(payment_reference)
+    normalized_status = str(status_value or "").strip().lower() or "unknown"
+    if not ok:
+        return False, normalized_status, error or f"{psp_type} status lookup failed"
+    if normalized_status not in _PSP_SUCCEEDED_STATUSES:
+        return False, normalized_status, None
+    return True, normalized_status, None
+
+
 # ============================================================================
 # 促销折扣应用（多件折扣）
 # ============================================================================
