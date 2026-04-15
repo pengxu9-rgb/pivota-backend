@@ -313,6 +313,44 @@ _PSP_SUCCEEDED_STATUSES = {
 }
 
 
+def _normalize_psp_status_result(result: Any) -> Tuple[bool, str, Optional[str]]:
+    if isinstance(result, tuple):
+        ok = bool(result[0]) if len(result) > 0 else False
+        status = str(result[1] if len(result) > 1 else "unknown").strip().lower() or "unknown"
+        error = result[2] if len(result) > 2 else None
+        return ok, status, str(error) if error else None
+    if isinstance(result, dict):
+        ok = bool(result.get("success", True))
+        status = str(result.get("status") or "unknown").strip().lower() or "unknown"
+        error = result.get("error")
+        return ok, status, str(error) if error else None
+    return True, str(result or "unknown").strip().lower() or "unknown", None
+
+
+def _normalize_psp_amount(value: Any) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        return None
+
+
+async def _get_order_payment_status_details(psp_adapter: Any, payment_reference: str) -> Optional[Tuple[bool, Dict[str, Any], Optional[str]]]:
+    details_fn = getattr(psp_adapter, "get_payment_status_details", None)
+    if not callable(details_fn):
+        return None
+    result = await details_fn(payment_reference)
+    if isinstance(result, tuple):
+        ok = bool(result[0]) if len(result) > 0 else False
+        details = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
+        error = result[2] if len(result) > 2 else None
+        return ok, details, str(error) if error else None
+    if isinstance(result, dict):
+        return bool(result.get("success", True)), result, str(result.get("error") or "") or None
+    return False, {"status": "unknown"}, "Unexpected PSP status detail response"
+
+
 async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
     """Verify the PSP payment state before any server-side paid transition."""
     payment_reference = str(order.get("payment_intent_id") or "").strip()
@@ -320,8 +358,39 @@ async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, s
         return False, "missing_payment_reference", "Order has no PSP payment reference"
 
     psp_type, psp_adapter = await _resolve_order_psp_adapter(order)
-    ok, status_value, error = await psp_adapter.get_payment_status(payment_reference)
-    normalized_status = str(status_value or "").strip().lower() or "unknown"
+
+    status_details = await _get_order_payment_status_details(psp_adapter, payment_reference)
+    if status_details is not None:
+        ok, details, error = status_details
+        normalized_status = str(details.get("status") or "").strip().lower() or "unknown"
+        if not ok:
+            return False, normalized_status, error or f"{psp_type} status lookup failed"
+        if normalized_status not in _PSP_SUCCEEDED_STATUSES:
+            return False, normalized_status, None
+
+        expected_amount = _normalize_psp_amount(order.get("total"))
+        observed_amount = _normalize_psp_amount(details.get("amount"))
+        expected_currency = str(order.get("currency") or "").strip().upper()
+        observed_currency = str(details.get("currency") or "").strip().upper()
+        if expected_amount is not None and observed_amount is None:
+            return False, normalized_status, "PSP payment amount is unavailable"
+        if expected_amount is not None and observed_amount != expected_amount:
+            return (
+                False,
+                normalized_status,
+                f"PSP payment amount mismatch: expected {expected_amount} {expected_currency or 'UNKNOWN'}, got {observed_amount} {observed_currency or 'UNKNOWN'}",
+            )
+        if expected_currency and observed_currency and observed_currency != expected_currency:
+            return (
+                False,
+                normalized_status,
+                f"PSP payment currency mismatch: expected {expected_currency}, got {observed_currency}",
+            )
+        if expected_currency and not observed_currency:
+            return False, normalized_status, "PSP payment currency is unavailable"
+        return True, normalized_status, None
+
+    ok, normalized_status, error = _normalize_psp_status_result(await psp_adapter.get_payment_status(payment_reference))
     if not ok:
         return False, normalized_status, error or f"{psp_type} status lookup failed"
     if normalized_status not in _PSP_SUCCEEDED_STATUSES:
