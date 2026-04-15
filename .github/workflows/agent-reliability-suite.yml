@@ -30,7 +30,9 @@ on:
       - "db/**"
       - "models/**"
       - "tests/**"
-      - "scripts/run_agent_reliability_suite.sh"
+      - "scripts/**"
+      - "docs/ops/SHOPIFY_DISCOUNT_DEV_STORE_VALIDATION.md"
+      - "docs/shopify-discount-*.md"
       - ".github/workflows/agent-reliability-suite.yml"
 
 jobs:
@@ -94,6 +96,7 @@ jobs:
       SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B: ${{ secrets.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B || vars.SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B }}
       SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A || vars.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A }}
       SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B: ${{ secrets.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B || vars.SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B }}
+      SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY: ${{ secrets.SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY }}
 
     steps:
       - name: Checkout
@@ -136,10 +139,28 @@ jobs:
             exit 1
           fi
 
+      - name: Run Shopify discount preflight
+        shell: bash
+        run: |
+          output_dir="artifacts/shopify-discount-validation/${GITHUB_RUN_ID}/preflight"
+          cmd=(
+            python3 scripts/preflight_shopify_discounts.py
+            --output-dir "$output_dir"
+          )
+          if [[ "${{ inputs.allow_live_no_order }}" == "true" ]]; then
+            cmd+=(--allow-live-readonly)
+          else
+            cmd+=(--allow-dev-store)
+          fi
+          if [[ "${{ inputs.allow_remote_dev_url }}" == "true" || "${{ inputs.allow_live_no_order }}" == "true" ]]; then
+            cmd+=(--allow-remote)
+          fi
+          "${cmd[@]}"
+
       - name: Run Shopify discount validation
         shell: bash
         run: |
-          output_dir="artifacts/shopify-discount-validation/${GITHUB_RUN_ID}"
+          output_dir="artifacts/shopify-discount-validation/${GITHUB_RUN_ID}/quote-matrix"
           cmd=(
             python3 scripts/validate_shopify_discounts.py
             --output-dir "$output_dir"

@@ -3,7 +3,7 @@
 ## Top remaining gaps
 
 1. `Pilot-grade reconciliation and refund monitoring` is still thin.
-   - Three approved live paid discounted orders completed and were refunded, but the cleanup exposed real refund-path defects: agent refund idempotency, Stripe Checkout Session refund resolution, and Shopify refund-webhook double counting. Those are fixed, but pilot rollout needs canary monitoring and fail-closed reconciliation alerts.
+   - Three approved live paid discounted orders completed and were refunded, but the cleanup exposed real refund-path defects: agent refund idempotency, Stripe Checkout Session refund resolution, and Shopify refund-webhook double counting. Those are fixed, and `scripts/check_discount_order_canaries.py` now provides a read-only audit for missing Shopify links, non-authoritative pricing evidence, over-refunds, and Shopify webhook double-counting. Pilot rollout still needs this audit run after each paid canary plus fail-closed reconciliation alerts.
 
 2. `GraphQL discount-node sync is blocked on merchant reauthorization`.
    - Shopify Admin GraphQL returned `ACCESS_DENIED` for `discountNodes` because the installed token lacks `read_discounts`. Production `SHOPIFY_SCOPES` now requests `read_discounts`, but this merchant must reconnect before node sync can read usage limits, combinations, context, and active windows.
@@ -20,8 +20,8 @@
 6. `PSP amount/currency verification is Stripe-proven, not adapter-complete`.
    - Stripe PaymentIntent and Checkout Session structured status parsing is implemented and unit-tested. Fail-closed mode now blocks status-only PSP adapters, so other PSPs need equivalent structured amount/currency verification before paid discount pilots.
 
-7. `Merchant setup validation is still manual`.
-   - Shipping zones, markets, delivery rates, discount scope, usage limits, active windows, and combination settings are still validated by ad hoc probes rather than a preflight validator.
+7. `Merchant setup validation now has a preflight gate, but it must be run after fixture changes`.
+   - `scripts/preflight_shopify_discounts.py` checks backend health, product/variant quoteability, authoritative shipping evidence, fixture code behavior, and read-only Admin GraphQL `discountNodes` access when an internal admin key is provided. Remaining blockers are merchant-side: reconnect for `read_discounts`, repair combinable/exhausted fixtures, and add automatic/customer-context fixtures.
 
 ## What should be fixed first
 
@@ -29,7 +29,7 @@
 2. Run the next paid canary with `SHOPIFY_DISCOUNT_RECONCILIATION_MODE=fail_closed`, then verify quote total, PSP amount/currency, Shopify order total, Shopify total discounts, Shopify transactions, and refund status.
 3. Replace or repair `PIVOTA_TEST_COMBO_A` so Storefront returns `applicable=true` together with its intended companion code, then rerun the combinability matrix.
 4. Add merchant fixtures for automatic discount, new-customer/segment eligibility, active scheduling window, and available-then-exhausted usage limit.
-5. Add a merchant preflight validator that checks Shopify app scopes, Markets, shipping delivery options, test product/variant availability, discount code eligibility, combination flags, usage limits, and active dates before live validation begins.
+5. Run the preflight validator after each merchant-side fixture or scope change and treat any `fail` row as a blocker before paid canaries.
 
 ## Rollout position
 

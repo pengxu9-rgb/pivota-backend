@@ -31,6 +31,7 @@ class Scenario:
     quantity: int = 1
     expected: str = "record_only"
     env_required: Optional[str] = None
+    required_code_count: int = 0
     boundary: bool = False
 
 
@@ -198,8 +199,9 @@ def _scenario_catalog() -> List[Scenario]:
                 os.getenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A", "").strip(),
                 os.getenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B", "").strip(),
             ],
-            expected="valid_code_discount",
+            expected="all_codes_applicable_discount",
             env_required="SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A",
+            required_code_count=2,
         ),
         Scenario(
             "SFD-011",
@@ -210,6 +212,7 @@ def _scenario_catalog() -> List[Scenario]:
             ],
             expected="conflict_recorded",
             env_required="SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A",
+            required_code_count=2,
         ),
     ]
 
@@ -248,6 +251,21 @@ def _discount_total(payload: Dict[str, Any]) -> float:
         return 0.0
 
 
+def _shipping_discount_total(payload: Dict[str, Any]) -> float:
+    try:
+        pricing = payload.get("pricing") or {}
+        return float(pricing.get("shipping_discount_total") or 0)
+    except Exception:
+        return 0.0
+
+
+def _discount_applications(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    evidence = payload.get("discount_evidence") if isinstance(payload, dict) else None
+    if not isinstance(evidence, dict):
+        return []
+    return [row for row in evidence.get("applications") or [] if isinstance(row, dict)]
+
+
 def _evaluate(scenario: Scenario, status_code: int, payload: Dict[str, Any]) -> tuple[str, str]:
     if status_code >= 400:
         return "fail", f"HTTP {status_code}"
@@ -258,13 +276,29 @@ def _evaluate(scenario: Scenario, status_code: int, payload: Dict[str, Any]) -> 
         if code and applicability.get(code) is True and discount_total > 0:
             return "pass", "applicable code produced a discount"
         return "fail", f"expected applicable discount for {code}; applicability={applicability}, discount_total={discount_total}"
+    if scenario.expected == "all_codes_applicable_discount":
+        codes = [c.upper() for c in scenario.discount_codes if c]
+        missing = [code for code in codes if applicability.get(code) is not True]
+        applications = _discount_applications(payload)
+        applied_codes = {str(app.get("code") or "").upper() for app in applications if app.get("code")}
+        if not missing and discount_total > 0 and applied_codes.intersection(codes):
+            return "pass", f"all submitted codes applicable; discount_total={discount_total}"
+        return (
+            "fail",
+            f"expected all codes applicable with discount evidence; missing={missing}, applicability={applicability}, "
+            f"applied_codes={sorted(applied_codes)}, discount_total={discount_total}",
+        )
     if scenario.expected == "invalid_code_rejected":
         code = next((c.upper() for c in scenario.discount_codes if c), "")
         if code and applicability.get(code) is False and discount_total <= 0:
             return "pass", "invalid/unavailable code rejected without discount"
         return "fail", f"expected rejected code and no discount; applicability={applicability}, discount_total={discount_total}"
     if scenario.expected == "automatic_discount":
-        return ("pass", "automatic discount observed") if discount_total > 0 else ("fail", "no automatic discount observed")
+        applications = _discount_applications(payload)
+        has_auto = any(str(app.get("method") or "").lower() == "automatic" for app in applications)
+        if discount_total > 0 and (has_auto or not applications):
+            return "pass", "automatic discount observed"
+        return "fail", f"no automatic discount observed; applications={applications}, discount_total={discount_total}"
     if scenario.expected == "customer_eligibility_evidence":
         evidence = payload.get("discount_evidence") or {}
         customer_evidence = evidence.get("customer_eligibility") if isinstance(evidence, dict) else None
@@ -273,9 +307,27 @@ def _evaluate(scenario: Scenario, status_code: int, payload: Dict[str, Any]) -> 
         evidence = payload.get("discount_evidence") or {}
         confidence = evidence.get("pricing_confidence") if isinstance(evidence, dict) else None
         code = next((c.upper() for c in scenario.discount_codes if c), "")
+        shipping_discount = _shipping_discount_total(payload)
         if code and applicability.get(code) is True and confidence in {"authoritative", "partial"}:
-            return "pass", f"free-shipping code applicability captured; pricing_confidence={confidence}"
-        return "fail", f"free-shipping applicability not captured; applicability={applicability}, confidence={confidence}"
+            return (
+                "pass",
+                f"free-shipping code applicability captured; pricing_confidence={confidence}; shipping_discount_total={shipping_discount}",
+            )
+        return (
+            "fail",
+            f"free-shipping applicability not captured; applicability={applicability}, confidence={confidence}, "
+            f"shipping_discount_total={shipping_discount}",
+        )
+    if scenario.expected == "conflict_recorded":
+        codes = [c.upper() for c in scenario.discount_codes if c]
+        applied = [code for code in codes if applicability.get(code) is True]
+        rejected = [code for code in codes if applicability.get(code) is False]
+        if applied and rejected and discount_total > 0:
+            return "pass", f"conflict recorded; applied={applied}, rejected={rejected}, discount_total={discount_total}"
+        return (
+            "fail",
+            f"expected one code applied and one rejected; applicability={applicability}, discount_total={discount_total}",
+        )
     return "pass", "recorded for manual review"
 
 
@@ -321,6 +373,18 @@ async def _run(args: argparse.Namespace) -> int:
                         "description": scenario.description,
                         "status": "blocked",
                         "actual_result": f"missing fixture env {scenario.env_required}",
+                        "evidence_artifact_path": "",
+                    }
+                )
+                continue
+            submitted_codes = [code for code in scenario.discount_codes if code]
+            if scenario.required_code_count and len(submitted_codes) < scenario.required_code_count:
+                rows.append(
+                    {
+                        "scenario_id": scenario.scenario_id,
+                        "description": scenario.description,
+                        "status": "blocked",
+                        "actual_result": f"missing discount code fixtures; expected {scenario.required_code_count}, got {len(submitted_codes)}",
                         "evidence_artifact_path": "",
                     }
                 )

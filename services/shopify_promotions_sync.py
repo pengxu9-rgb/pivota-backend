@@ -503,6 +503,125 @@ query($first: Int!, $after: String) {
     return nodes
 
 
+async def _fetch_access_scopes_for_config(
+    cfg: ShopifyStoreConfig,
+    *,
+    timeout_s: float = 12.0,
+) -> List[str]:
+    if not cfg.is_configured:
+        raise ShopifyPromotionsConfigError("Shopify store config is missing shop_domain or access_token")
+
+    url = f"https://{cfg.shop_domain}/admin/oauth/access_scopes.json"
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.get(url, headers={"X-Shopify-Access-Token": cfg.access_token})
+        if resp.status_code >= 400:
+            raise ShopifyPromotionsAuthError(f"Shopify access_scopes fetch failed (status={resp.status_code})")
+        data = resp.json() or {}
+
+    scopes: List[str] = []
+    for item in data.get("access_scopes") or []:
+        if isinstance(item, dict) and item.get("handle"):
+            scopes.append(str(item["handle"]))
+    return sorted(set(scopes))
+
+
+def _first_graphql_error_summary(exc: ShopifyGraphQLError) -> Dict[str, Any]:
+    first = exc.errors[0] if exc.errors else {}
+    if not isinstance(first, dict):
+        first = {}
+    extensions = first.get("extensions") if isinstance(first.get("extensions"), dict) else {}
+    return {
+        "message": str(first.get("message") or exc.message or "").strip(),
+        "code": str(extensions.get("code") or "").strip() or None,
+        "requestId": exc.request_id,
+    }
+
+
+async def probe_shopify_discount_nodes_access_for_merchant(
+    merchant_id: str,
+    *,
+    api_version: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Read-only probe used by Ops/preflight validation.
+
+    It checks the installed merchant token's scopes and runs a one-node
+    `discountNodes` query. It never creates or updates Shopify discounts and
+    does not upsert Pivota promotions.
+    """
+    cfg = await get_shopify_config_for_merchant(merchant_id)
+    if not cfg.is_configured:
+        raise ShopifyPromotionsConfigError(
+            f"Shopify configuration not found for merchant_id={merchant_id}"
+        )
+
+    version = api_version or SHOPIFY_API_VERSION
+    report: Dict[str, Any] = {
+        "merchantId": merchant_id,
+        "shopDomain": cfg.shop_domain,
+        "apiVersion": version,
+        "hasReadDiscountsScope": False,
+        "discountNodesAccess": "unknown",
+        "sampleNodeCount": 0,
+        "errors": [],
+    }
+
+    try:
+        scopes = await _fetch_access_scopes_for_config(cfg)
+        report["installedScopes"] = scopes
+        report["hasReadDiscountsScope"] = "read_discounts" in scopes
+    except ShopifyPromotionsError as exc:
+        report["discountNodesAccess"] = "blocked"
+        report["errors"].append({"source": "access_scopes", "message": str(exc)})
+        return report
+
+    query = """
+query DiscountNodeAccessProbe {
+  discountNodes(first: 1) {
+    nodes {
+      id
+      discount {
+        __typename
+        ... on DiscountCodeBasic { title status }
+        ... on DiscountAutomaticBasic { title status }
+        ... on DiscountCodeBxgy { title status }
+        ... on DiscountAutomaticBxgy { title status }
+        ... on DiscountCodeFreeShipping { title status }
+        ... on DiscountAutomaticFreeShipping { title status }
+      }
+    }
+  }
+}
+"""
+    try:
+        data = await shopify_admin_graphql(
+            shop_domain=cfg.shop_domain,
+            access_token=cfg.access_token,
+            query=query,
+            api_version=version,
+            timeout_s=20.0,
+        )
+        root = data.get("discountNodes") if isinstance(data, dict) else None
+        nodes = root.get("nodes") if isinstance(root, dict) and isinstance(root.get("nodes"), list) else []
+        report["discountNodesAccess"] = "ok"
+        report["sampleNodeCount"] = len(nodes)
+        report["sampleTypenames"] = [
+            str(((node.get("discount") or {}).get("__typename") or "")).strip()
+            for node in nodes
+            if isinstance(node, dict)
+        ]
+        return report
+    except ShopifyGraphQLError as exc:
+        summary = _first_graphql_error_summary(exc)
+        report["discountNodesAccess"] = "blocked"
+        report["errors"].append({"source": "discountNodes", **summary})
+        return report
+    except RuntimeError as exc:
+        report["discountNodesAccess"] = "blocked"
+        report["errors"].append({"source": "discountNodes", "message": str(exc)})
+        return report
+
+
 def _map_price_rule_to_promotion(
     rule: Dict[str, Any],
     merchant_id: str,

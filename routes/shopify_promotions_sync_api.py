@@ -16,6 +16,7 @@ from services.shopify_promotions_sync import (
     ShopifyPromotionsAuthError,
     ShopifyPromotionsRateLimitError,
     ShopifyPromotionsError,
+    probe_shopify_discount_nodes_access_for_merchant,
     sync_shopify_promotions_for_merchant,
 )
 
@@ -120,3 +121,44 @@ async def sync_shopify_promotions_get(
         background_tasks=background_tasks,
         merchant_id=merchant_id,
     )
+
+
+@router.get(
+    "/preflight/{merchant_id}/discount-nodes",
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+)
+async def preflight_shopify_discount_nodes_access(
+    merchant_id: str = Path(..., description="Internal merchant ID"),
+    api_version: str = Query("2024-07", description="Shopify Admin API version to probe."),
+    _: None = Depends(require_shopify_promotions_admin),
+) -> Dict[str, Any]:
+    """
+    Read-only Admin GraphQL preflight for discount-node access.
+
+    This intentionally does not call the promotion sync/upsert path. It exists
+    so live fixture validation can distinguish a merchant reauthorization/scope
+    blocker from quote-time discount execution regressions.
+    """
+    try:
+        probe = await probe_shopify_discount_nodes_access_for_merchant(
+            merchant_id=merchant_id,
+            api_version=api_version,
+        )
+        ok = probe.get("discountNodesAccess") == "ok" and bool(probe.get("hasReadDiscountsScope"))
+        return {"ok": ok, "probe": probe}
+    except ShopifyPromotionsConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "SHOPIFY_CONFIG_ERROR", "message": str(exc)},
+        )
+    except ShopifyPromotionsAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "SHOPIFY_AUTH_ERROR", "message": str(exc)},
+        )
+    except ShopifyPromotionsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "SHOPIFY_PREFLIGHT_ERROR", "message": str(exc)},
+        )
