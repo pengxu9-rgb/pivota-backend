@@ -22,12 +22,19 @@ manual workflow:
 | `SHOPIFY_DISCOUNT_TEST_PRODUCT_ID` | secret or variable | Pivota product id for the Shopify test product. Optional if the default placeholder is valid for the environment. |
 | `SHOPIFY_DISCOUNT_TEST_VARIANT_ID` | secret or variable | Shopify variant id for the test product. Required. |
 | `SHOPIFY_DISCOUNT_TEST_CUSTOMER_EMAIL` | secret or variable | Test buyer email. Use an address approved for the selected merchant/store. |
-| `SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY` | secret or variable | Shipping country for delivery-rate evidence, defaults to `CA`. Use `US` for US free-shipping fixtures. |
+| `SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY` | secret or variable | Shipping country for delivery-rate evidence. The manual workflow defaults to `US` for US free-shipping fixtures. |
 | `SHOPIFY_DISCOUNT_TEST_SHIPPING_STATE` | secret or variable | State/province code for delivery-rate evidence. |
 | `SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE` | secret or variable | Postal/ZIP code that is inside the test shipping zone. |
 | `SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY` | secret or variable | City for the test shipping address. |
 | `SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1` | secret or variable | Street line for the test shipping address. |
 | `SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY` | secret | Optional internal key for the read-only `discountNodes` access probe. Do not use this for public validation jobs. |
+
+The manual workflow also accepts a dispatch-time
+`shopify_discount_fixture_env_json` input for non-secret merchant, product,
+variant, shipping, and discount-code fixtures. Keep
+`SHOPIFY_DISCOUNT_TEST_AGENT_API_KEY` and `SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY`
+as GitHub secrets; do not pass live keys through workflow inputs. The JSON
+input is allowlisted and ignores secret-bearing keys.
 
 Configure scenario fixtures as available:
 
@@ -57,7 +64,7 @@ Run dev/test quote validation:
 ```bash
 gh workflow run agent-reliability-suite.yml \
   --repo pengxu9-rgb/pivota-backend \
-  --ref codex/shopify-discount-repair-20260414 \
+  --ref main \
   -f run_shopify_discount_validation=true \
   -f allow_remote_dev_url=true \
   -f allow_live_no_order=false \
@@ -69,11 +76,13 @@ Run live quote/cart validation only after the merchant has approved live testing
 ```bash
 gh workflow run agent-reliability-suite.yml \
   --repo pengxu9-rgb/pivota-backend \
-  --ref codex/shopify-discount-repair-20260414 \
+  --ref main \
   -f run_shopify_discount_validation=true \
   -f allow_remote_dev_url=true \
   -f allow_live_no_order=true \
-  -f include_shopify_order_create=false
+  -f include_shopify_order_create=false \
+  -f shopify_discount_test_base_url=https://web-production-fedb.up.railway.app \
+  -f shopify_discount_fixture_env_json='{"SHOPIFY_DISCOUNT_TEST_MERCHANT_ID":"merch_test","SHOPIFY_DISCOUNT_TEST_PRODUCT_ID":"shopify_product_id","SHOPIFY_DISCOUNT_TEST_VARIANT_ID":"shopify_variant_id","SHOPIFY_DISCOUNT_TEST_AMOUNT_CODE":"PIVOTA_TEST_AMOUNT10","SHOPIFY_DISCOUNT_TEST_BXGY_CODE":"PIVOTA_TEST_BXGY","SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY":"3","SHOPIFY_DISCOUNT_TEST_FREE_SHIPPING_CODE":"PIVOTA_TEST_FREESHIP","SHOPIFY_DISCOUNT_TEST_EXHAUSTED_CODE":"PIVOTA_TEST_EXHAUSTED","SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A":"PIVOTA_TEST_AMOUNT10","SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B":"PIVOTA_TEST_COMBO_A","SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A":"PIVOTA_TEST_NOCOMBO_A","SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_B":"PIVOTA_TEST_BXGY","SHOPIFY_DISCOUNT_TEST_SHIPPING_COUNTRY":"US","SHOPIFY_DISCOUNT_TEST_SHIPPING_STATE":"NY","SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY":"New York","SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE":"10118","SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1":"350 Fifth Avenue"}'
 ```
 
 Run quote-to-order validation only after the merchant, Shopify store, and test
@@ -82,7 +91,7 @@ PSP path are confirmed safe. Do not combine this with `allow_live_no_order=true`
 ```bash
 gh workflow run agent-reliability-suite.yml \
   --repo pengxu9-rgb/pivota-backend \
-  --ref codex/shopify-discount-repair-20260414 \
+  --ref main \
   -f run_shopify_discount_validation=true \
   -f allow_remote_dev_url=true \
   -f allow_live_no_order=false \
@@ -115,7 +124,10 @@ the internal read-only discount-node probe:
 GET /agent/internal/shopify/promotions/preflight/{merchant_id}/discount-nodes
 ```
 
-That endpoint checks installed OAuth scopes and runs `discountNodes(first: 1)`.
+That endpoint checks the stored Shopify Admin token scopes and runs `discountNodes(first: 1)`.
+For merchants connected through their own Shopify custom app, `read_discounts`
+must be enabled on that custom app and the stored Admin API access token must be
+regenerated/updated before this probe can pass.
 It does not call the promotion sync/upsert path.
 
 Use local runs with dev/test fixtures:

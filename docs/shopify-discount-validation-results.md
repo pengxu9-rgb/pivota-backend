@@ -52,17 +52,17 @@ Validation scope included production quote/cart probes, quote-backed order creat
 
 ## Failed
 
-- `PIVOTA_TEST_COMBO_A` positive combinability fixture failed validation. Shopify returned `applicable=false` for `PIVOTA_TEST_COMBO_A`; with `PIVOTA_TEST_AMOUNT10 + PIVOTA_TEST_COMBO_A`, only `PIVOTA_TEST_AMOUNT10` applied.
-- `PIVOTA_TEST_EXHAUSTED` is not currently an exhausted fixture. The latest readonly matrix returned `applicable=true` and `discount_total=0.90`, so it cannot prove usage-limit exhaustion.
+- `PIVOTA_TEST_COMBO_A` positive combinability fixture failed the last completed validation. Shopify returned `applicable=false` for `PIVOTA_TEST_COMBO_A`; with `PIVOTA_TEST_AMOUNT10 + PIVOTA_TEST_COMBO_A`, only `PIVOTA_TEST_AMOUNT10` applied. The merchant has since reported that this fixture is repaired; it is pending rerun evidence.
+- `PIVOTA_TEST_EXHAUSTED` did not prove exhaustion in the last completed validation. The latest readonly matrix returned `applicable=true` and `discount_total=0.90`. The merchant has since reported that this fixture is ready; it is pending rerun evidence.
 
 ## Blocked
 
 - `automatic discount live execution`: blocked by missing explicit automatic-discount fixture for this merchant.
 - `segment-restricted / new-customer restricted discount live execution`: the lookup path is implemented, but no restricted Shopify-native fixture code was supplied for checkout validation.
-- `positive combinable pair`: blocked until the merchant fixture is corrected or replaced with two codes Shopify actually marks applicable together.
-- `available usage-limit boundary`: `PIVOTA_TEST_EXHAUSTED` is currently still applicable in quote/cart validation, and quote probes do not consume usage. A separate available-then-exhausted fixture or controlled paid-consumption test is still needed.
+- `positive combinable pair`: pending rerun after the merchant fixture repair; Shopify must mark both intended codes applicable together before this becomes rollout evidence.
+- `available usage-limit boundary`: pending rerun after the merchant fixture repair. Quote probes do not consume usage, so a separate available-then-exhausted fixture or controlled paid-consumption test is still needed for the full boundary.
 - `active window positive case`: no active scheduling-window fixture was supplied; expired/inactive rejection was proven.
-- `GraphQL discount-node sync for the current merchant install`: Shopify Admin GraphQL returned `ACCESS_DENIED` for `discountNodes` because the installed token lacks `read_discounts`. Production `SHOPIFY_SCOPES` has now been updated to request `read_discounts`, but this merchant must reconnect/reauthorize before discount-node reads can work.
+- `GraphQL discount-node sync for the current merchant custom app connection`: Shopify Admin GraphQL returned `ACCESS_DENIED` for `discountNodes` because the stored custom app Admin token lacks `read_discounts`. Enable `read_discounts` on the merchant custom app, regenerate/update the Admin API access token, update the stored Shopify credential in Pivota, then rerun preflight/sync.
 
 ## Root cause by failure
 
@@ -123,4 +123,4 @@ Rationale:
 - Authoritative Storefront delivery pricing is now carried into quotes; US no-code and CA no-code both price shipping at `29.00`, while the US free-shipping code nets shipping to `0.00`.
 - The most dangerous fake-discount path found in this round is fixed: rejected Shopify codes no longer trigger Pivota manual fallback promotions.
 - Payment confirmation now refuses unpaid PSP references and unit tests enforce amount/currency matching before paid transition; fail-closed mode blocks PSP adapters that cannot provide amount/currency details.
-- Three live paid discounted orders completed and were refunded, but broad rollout is still blocked by fixture gaps, missing `read_discounts` reauthorization for discount-node sync, and the need to run merchant-pilot canaries in `fail_closed` reconciliation mode with alerting.
+- Three live paid discounted orders completed and were refunded, but broad rollout is still blocked by fixture gaps, missing `read_discounts` on the merchant custom app Admin token for discount-node sync, and the need to run merchant-pilot canaries in `fail_closed` reconciliation mode with alerting.

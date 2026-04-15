@@ -296,7 +296,10 @@ async def _run(args: argparse.Namespace) -> int:
                     area="admin_graphql",
                     status="blocked",
                     actual_result="missing admin key for read-only discountNodes access probe",
-                    recommended_action="Set SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY or run the internal endpoint manually after merchant reauthorization.",
+                    recommended_action=(
+                        "Set SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY or run the internal endpoint manually "
+                        "after the merchant custom app Admin token is updated with read_discounts."
+                    ),
                 )
             )
         elif not args.merchant_id:
@@ -348,7 +351,10 @@ async def _run(args: argparse.Namespace) -> int:
                         status="blocked",
                         actual_result=f"discountNodes not readable; probe={_redact(probe or payload)}",
                         evidence_artifact_path=artifact,
-                        recommended_action="Reconnect the Shopify app so the installed token includes read_discounts, then rerun preflight.",
+                        recommended_action=(
+                            "Regenerate or update the merchant custom app Admin token with read_discounts, "
+                            "update the stored Shopify credential, then rerun preflight."
+                        ),
                     )
                 )
 
