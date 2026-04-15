@@ -434,6 +434,20 @@ class QuoteService:
                 return True
         return False
 
+    def _has_rejected_shopify_discount_code(self, discount_evidence: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(discount_evidence, dict):
+            return False
+        for code in discount_evidence.get("codes") or []:
+            if not isinstance(code, dict):
+                continue
+            normalized = str(code.get("code") or "").strip()
+            if normalized and code.get("applicable") is False:
+                return True
+        return False
+
+    def _manual_promo_can_apply_after_shopify_code_rejected(self, cfg: Dict[str, Any]) -> bool:
+        return cfg.get("canApplyWhenShopifyCodeRejected") is True or cfg.get("can_apply_when_shopify_code_rejected") is True
+
     def _manual_promo_can_stack_with_shopify(
         self,
         cfg: Dict[str, Any],
@@ -624,7 +638,26 @@ class QuoteService:
                 scope = getattr(promo, "scope", None) or {}
                 cfg = getattr(promo, "config", None) or {}
 
-                if self._has_shopify_applied_discount(discount_evidence) and not self._manual_promo_can_stack_with_shopify(
+                has_shopify_discount = self._has_shopify_applied_discount(discount_evidence)
+                if (
+                    self._has_rejected_shopify_discount_code(discount_evidence)
+                    and not has_shopify_discount
+                    and not self._manual_promo_can_apply_after_shopify_code_rejected(cfg)
+                ):
+                    if isinstance(discount_evidence, dict):
+                        decisions = discount_evidence.setdefault("decisions", [])
+                        if isinstance(decisions, list):
+                            decisions.append(
+                                {
+                                    "promotion_id": getattr(promo, "id", None),
+                                    "decision": "skipped",
+                                    "reason": "shopify_code_rejected",
+                                    "source": "pivota_infra",
+                                }
+                            )
+                    continue
+
+                if has_shopify_discount and not self._manual_promo_can_stack_with_shopify(
                     cfg,
                     discount_evidence,
                 ):

@@ -242,6 +242,113 @@ async def test_quote_service_skips_manual_promo_when_shopify_discount_present(mo
 
 
 @pytest.mark.asyncio
+async def test_quote_service_skips_manual_promo_when_shopify_code_rejected(monkeypatch):
+    svc = QuoteService()
+
+    promo = SimpleNamespace(
+        id="promo_invalid_code_mask",
+        type="MULTI_BUY_DISCOUNT",
+        scope={"global": True},
+        config={"thresholdQuantity": 3, "discountPercent": 10},
+        humanReadableRule="Buy 3, get 10% off",
+        name="Buy 3 deal",
+    )
+
+    async def fake_list_promotions(*, merchant_id, status, channel=None, creator_id=None, search=None, limit=50, offset=0):
+        return ([promo], 1)
+
+    monkeypatch.setattr("services.quote_service.list_promotions", fake_list_promotions)
+    monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "0")
+
+    pricing = {
+        "subtotal": Decimal("100.00"),
+        "discount_total": Decimal("0.00"),
+        "shipping_fee": Decimal("0.00"),
+        "tax": Decimal("0.00"),
+        "total": Decimal("100.00"),
+    }
+    evidence = {
+        "codes": [{"code": "BADCODE", "applicable": False, "source": "shopify_storefront_cart"}],
+        "applications": [],
+        "decisions": [],
+        "pricing_confidence": "partial",
+    }
+    promotion_lines = []
+
+    await svc._apply_infra_promotions_best_effort(
+        merchant_id="merch_1",
+        items=[{"product_id": "p1", "variant_id": "v1", "quantity": 3}],
+        pricing=pricing,
+        line_items=[{"product_id": "p1", "quantity": 3, "unit_price_effective": Decimal("10.00")}],
+        promotion_lines=promotion_lines,
+        discount_evidence=evidence,
+        creator_id="agent_1",
+        channel="creator_agents",
+    )
+
+    assert pricing["discount_total"] == Decimal("0.00")
+    assert pricing["total"] == Decimal("100.00")
+    assert promotion_lines == []
+    assert evidence["decisions"][0]["decision"] == "skipped"
+    assert evidence["decisions"][0]["reason"] == "shopify_code_rejected"
+
+
+@pytest.mark.asyncio
+async def test_quote_service_allows_manual_promo_after_rejected_code_when_explicitly_configured(monkeypatch):
+    svc = QuoteService()
+
+    promo = SimpleNamespace(
+        id="promo_invalid_code_fallback_allowed",
+        type="MULTI_BUY_DISCOUNT",
+        scope={"global": True},
+        config={
+            "thresholdQuantity": 3,
+            "discountPercent": 10,
+            "canApplyWhenShopifyCodeRejected": True,
+        },
+        humanReadableRule="Buy 3, get 10% off",
+        name="Buy 3 deal",
+    )
+
+    async def fake_list_promotions(*, merchant_id, status, channel=None, creator_id=None, search=None, limit=50, offset=0):
+        return ([promo], 1)
+
+    monkeypatch.setattr("services.quote_service.list_promotions", fake_list_promotions)
+    monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "0")
+
+    pricing = {
+        "subtotal": Decimal("100.00"),
+        "discount_total": Decimal("0.00"),
+        "shipping_fee": Decimal("0.00"),
+        "tax": Decimal("0.00"),
+        "total": Decimal("100.00"),
+    }
+    evidence = {
+        "codes": [{"code": "BADCODE", "applicable": False, "source": "shopify_storefront_cart"}],
+        "applications": [],
+        "decisions": [],
+        "pricing_confidence": "partial",
+    }
+    promotion_lines = []
+
+    await svc._apply_infra_promotions_best_effort(
+        merchant_id="merch_1",
+        items=[{"product_id": "p1", "variant_id": "v1", "quantity": 3}],
+        pricing=pricing,
+        line_items=[{"product_id": "p1", "quantity": 3, "unit_price_effective": Decimal("10.00")}],
+        promotion_lines=promotion_lines,
+        discount_evidence=evidence,
+        creator_id="agent_1",
+        channel="creator_agents",
+    )
+
+    assert pricing["discount_total"] == Decimal("3.00")
+    assert pricing["total"] == Decimal("97.00")
+    assert len(promotion_lines) == 1
+    assert evidence["decisions"][0]["decision"] == "applied"
+
+
+@pytest.mark.asyncio
 async def test_quote_service_allows_manual_stack_when_same_discount_class_allowed(monkeypatch):
     svc = QuoteService()
 
