@@ -156,7 +156,8 @@ async def test_create_shopify_order_falls_back_to_other_store_on_401(monkeypatch
 
     payload = calls[0]["json"] or {}
     tags = ((payload.get("order") or {}).get("tags") or "")
-    assert f"pivota_order_id:{order_id}" in tags
+    assert f"pivota-order-id-{order_id.replace('_', '-')}" in tags
+    assert "pivota_order_id:" not in tags
 
     assert updated_store_id["order_id"] == order_id
     assert updated_store_id["update_data"]["store_id"] == "store_2"

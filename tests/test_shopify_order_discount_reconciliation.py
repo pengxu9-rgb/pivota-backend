@@ -36,10 +36,23 @@ def test_shopify_order_discount_codes_and_annotations_from_quote_evidence():
         pricing_quote_meta=pricing_quote_meta,
     )
 
-    assert "pivota_quote_id:q_123" in tags
-    assert any(tag.startswith("pivota_discount_evidence:") for tag in tags)
+    assert "pivota-quote-id-q-123" in tags
+    assert any(tag.startswith("pivota-discount-evidence-") for tag in tags)
+    assert all(":" not in tag and "_" not in tag and len(tag) <= 40 for tag in tags)
     assert {"name": "pivota_quote_id", "value": "q_123"} in note_attributes
     assert {"name": "pivota_order_id", "value": "ord_123"} in note_attributes
+
+
+def test_shopify_order_tag_sanitizes_and_bounds_values():
+    tag = order_routes._shopify_order_tag(
+        "pivota_order_id",
+        "ORD_508D4460ACA8DE11/unsafe:value-that-is-way-too-long",
+    )
+
+    assert ":" not in tag
+    assert "_" not in tag
+    assert "/" not in tag
+    assert len(tag) <= 40
 
 
 def test_pricing_quote_detects_unverified_shipping_evidence():
