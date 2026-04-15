@@ -9,6 +9,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Optional, Protocol
 
 from pydantic import BaseModel, Field
@@ -26,6 +27,18 @@ def _utc_now() -> datetime:
 
 def _utc_now_iso() -> str:
     return _utc_now().isoformat()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 class MvpEventEnvelope(BaseModel):
@@ -251,6 +264,7 @@ def build_envelope(
 ) -> MvpEventEnvelope:
     eid = event_id or f"evt_{uuid.uuid4().hex}"
     ts = occurred_at or _utc_now()
+    payload = _json_safe(payload)
     payload_sha = sha256_json(payload)
 
     prev = _chain_cursor.get_prev(context.merchant_id)

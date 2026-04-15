@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from decimal import Decimal
 
 import pytest
 
@@ -39,6 +40,26 @@ def test_event_chain_advances_per_merchant():
     e2 = build_envelope(event_type="t2", payload={"a": 2}, context=ctx)
     assert e2.prev_chain_hash == e1.chain_hash
     assert e2.chain_hash != e1.chain_hash
+
+
+def test_event_payload_normalizes_decimal_values():
+    ctx = EmitContext(
+        merchant_id="merch_decimal",
+        geo=None,
+        surface=SURFACE_BACKEND,
+        adapter="unit_test",
+        risk_tier="unknown",
+        idempotency_key="idem_decimal",
+    )
+
+    env = build_envelope(
+        event_type="order_created",
+        payload={"amount": Decimal("55.10"), "lines": [{"discount": Decimal("2.90")}]},
+        context=ctx,
+    )
+
+    assert env.payload == {"amount": "55.10", "lines": [{"discount": "2.90"}]}
+    assert env.payload_sha256 == sha256_json(env.payload)
 
 
 @pytest.mark.asyncio
