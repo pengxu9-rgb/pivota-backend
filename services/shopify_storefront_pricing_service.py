@@ -269,6 +269,57 @@ def _shopify_cart_selectable_address_input(
     }
 
 
+def _shopify_buyer_delivery_address_preference_input(
+    *,
+    country: str,
+    postal: str,
+    city: Optional[str],
+    province: Optional[str],
+    address1: Optional[str],
+    address2: Optional[str],
+) -> Dict[str, Any]:
+    delivery_address = {
+        "country": country,
+        "zip": postal,
+        **({"city": city} if city else {}),
+        **({"province": province} if province else {}),
+        **({"address1": address1} if address1 else {}),
+        **({"address2": address2} if address2 else {}),
+    }
+    return {
+        "oneTimeUse": True,
+        "deliveryAddress": delivery_address,
+    }
+
+
+def _shopify_cart_buyer_identity_input(
+    *,
+    country: Optional[str],
+    postal: Optional[str],
+    city: Optional[str],
+    province: Optional[str],
+    address1: Optional[str],
+    address2: Optional[str],
+    use_buyer_country_for_pricing: bool,
+) -> Dict[str, Any]:
+    buyer_identity: Dict[str, Any] = {}
+    if use_buyer_country_for_pricing and country:
+        buyer_identity["countryCode"] = country
+    if country and postal:
+        buyer_identity["preferences"] = {"delivery": {"deliveryMethod": ["SHIPPING"]}}
+        buyer_identity["deliveryAddressPreferences"] = [
+            _shopify_buyer_delivery_address_preference_input(
+                country=country,
+                postal=postal,
+                city=city,
+                province=province,
+                address1=address1,
+                address2=address2,
+            )
+        ]
+    return buyer_identity
+
+
 def _is_storefront_discount_query_error(err: ShopifyPricingError) -> bool:
     details = getattr(err, "details", {}) or {}
     errors = details.get("errors") or []
@@ -1381,8 +1432,17 @@ query($ids: [ID!]!) {
         variables: Dict[str, Any] = {"input": {"lines": lines}}
         if discount_codes:
             variables["input"]["discountCodes"] = discount_codes
-        if use_buyer_country_for_pricing and country:
-            variables["input"]["buyerIdentity"] = {"countryCode": country}
+        buyer_identity = _shopify_cart_buyer_identity_input(
+            country=country,
+            postal=postal,
+            city=city,
+            province=province,
+            address1=address1,
+            address2=address2,
+            use_buyer_country_for_pricing=use_buyer_country_for_pricing,
+        )
+        if buyer_identity:
+            variables["input"]["buyerIdentity"] = buyer_identity
         if country and postal:
             variables["input"]["delivery"] = {
                 "addresses": [
@@ -1523,6 +1583,7 @@ query($ids: [ID!]!) {
                         address1=address1,
                         address2=address2,
                         selected_delivery_option=selected_delivery_option,
+                        use_buyer_country_for_pricing=use_buyer_country_for_pricing,
                         debug_id=debug_id,
                     )
 
@@ -1696,6 +1757,7 @@ query($id: ID!) {
         address1: Optional[str],
         address2: Optional[str],
         selected_delivery_option: Optional[Dict[str, Any]],
+        use_buyer_country_for_pricing: bool,
         debug_id: str,
     ) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], Dict[str, Any]]:
         # NOTE: Storefront schema varies by shop/api-version. Some expect:
@@ -1738,6 +1800,8 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
             "delivery_groups_count": None,
             "delivery_options_count": None,
             "selected_delivery_addresses_count": None,
+            "buyer_identity_update_attempted": False,
+            "buyer_identity_update_succeeded": False,
         }
         for addresses in add_shapes:
             diagnostics["address_add_shapes_attempted"] = int(diagnostics["address_add_shapes_attempted"] or 0) + 1
@@ -1779,6 +1843,54 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
 
         # Even if we fail to attach the address, still try to query deliveryGroups.
         # Some shops return delivery options based on buyerIdentity/country only.
+
+        buyer_identity = _shopify_cart_buyer_identity_input(
+            country=country,
+            postal=postal,
+            city=city,
+            province=province,
+            address1=address1,
+            address2=address2,
+            use_buyer_country_for_pricing=use_buyer_country_for_pricing,
+        )
+        if buyer_identity:
+            update_buyer_identity = """
+mutation($cartId: ID!, $buyerIdentity: CartBuyerIdentityInput!) {
+  cartBuyerIdentityUpdate(cartId: $cartId, buyerIdentity: $buyerIdentity) {
+    cart { id }
+    userErrors { field message code }
+  }
+}
+"""
+            diagnostics["buyer_identity_update_attempted"] = True
+            try:
+                data = await self._storefront_graphql(
+                    shop_domain=shop_domain,
+                    storefront_token=storefront_token,
+                    query=update_buyer_identity,
+                    variables={"cartId": cart_id, "buyerIdentity": buyer_identity},
+                    debug_id=debug_id,
+                )
+                root = (data.get("cartBuyerIdentityUpdate") or {}) if isinstance(data, dict) else {}
+                user_errors = root.get("userErrors") or []
+                if user_errors:
+                    diagnostics["last_buyer_identity_update_user_errors"] = [
+                        {
+                            "field": err.get("field"),
+                            "message": err.get("message"),
+                            "code": err.get("code"),
+                        }
+                        for err in user_errors
+                        if isinstance(err, dict)
+                    ][:5]
+                else:
+                    diagnostics["buyer_identity_update_succeeded"] = True
+            except ShopifyPricingError as e:
+                diagnostics["last_buyer_identity_update_error"] = {
+                    "code": e.code,
+                    "message": e.message,
+                    "details": getattr(e, "details", {}) or {},
+                }
 
         # Query delivery options (schema varies; keep it tolerant).
         delivery_query = """

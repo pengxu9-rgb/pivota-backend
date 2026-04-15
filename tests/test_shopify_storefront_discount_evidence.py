@@ -227,6 +227,8 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
         query = kwargs["query"]
         if "cartDeliveryAddressesAdd" in query:
             return {"cartDeliveryAddressesAdd": {"cart": {"id": "cart_1"}, "userErrors": []}}
+        if "cartBuyerIdentityUpdate" in query:
+            return {"cartBuyerIdentityUpdate": {"cart": {"id": "cart_1"}, "userErrors": []}}
         return {"cart": {"deliveryGroups": {"edges": []}}}
 
     monkeypatch.setattr(service, "_storefront_graphql", fake_storefront_graphql)
@@ -242,6 +244,7 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
         address1="350 5th Ave",
         address2="",
         selected_delivery_option=None,
+        use_buyer_country_for_pricing=True,
         debug_id="dbg",
     )
 
@@ -249,6 +252,7 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
     assert selected is None
     assert diagnostics["storefront_api_version"] == "2026-04"
     assert diagnostics["address_add_succeeded"] is True
+    assert diagnostics["buyer_identity_update_succeeded"] is True
     assert diagnostics["delivery_options_count"] == 0
     assert calls[0]["variables"]["addresses"] == [
         {
@@ -279,6 +283,8 @@ async def test_delivery_options_query_retries_until_rates_are_available(monkeypa
         query = kwargs["query"]
         if "cartDeliveryAddressesAdd" in query:
             return {"cartDeliveryAddressesAdd": {"cart": {"id": "cart_1"}, "userErrors": []}}
+        if "cartBuyerIdentityUpdate" in query:
+            return {"cartBuyerIdentityUpdate": {"cart": {"id": "cart_1"}, "userErrors": []}}
         if "cartSelectedDeliveryOptionsUpdate" in query:
             return {"cartSelectedDeliveryOptionsUpdate": {"cart": {"id": "cart_1"}, "userErrors": []}}
         delivery_query_count += 1
@@ -319,6 +325,7 @@ async def test_delivery_options_query_retries_until_rates_are_available(monkeypa
         address1="350 5th Ave",
         address2="",
         selected_delivery_option=None,
+        use_buyer_country_for_pricing=True,
         debug_id="dbg",
     )
 
@@ -326,6 +333,7 @@ async def test_delivery_options_query_retries_until_rates_are_available(monkeypa
     assert options and options[0]["handle"] == "standard"
     assert selected and selected["estimatedCost"]["amount"] == "7.00"
     assert diagnostics["address_add_succeeded"] is True
+    assert diagnostics["buyer_identity_update_succeeded"] is True
     assert diagnostics["delivery_groups_count"] == 1
     assert diagnostics["delivery_options_count"] == 1
     assert diagnostics["selected_delivery_option_handle"] == "standard"
@@ -378,7 +386,22 @@ async def test_cart_create_includes_delivery_address_in_cart_input(monkeypatch):
     )
 
     cart_create_variables = calls[0]["variables"]
-    assert cart_create_variables["input"]["buyerIdentity"] == {"countryCode": "US"}
+    assert cart_create_variables["input"]["buyerIdentity"] == {
+        "countryCode": "US",
+        "preferences": {"delivery": {"deliveryMethod": ["SHIPPING"]}},
+        "deliveryAddressPreferences": [
+            {
+                "oneTimeUse": True,
+                "deliveryAddress": {
+                    "country": "US",
+                    "zip": "10118",
+                    "city": "New York",
+                    "province": "NY",
+                    "address1": "350 5th Ave",
+                },
+            }
+        ],
+    }
     assert cart_create_variables["input"]["delivery"] == {
         "addresses": [
             {
