@@ -8349,6 +8349,7 @@ async def agent_confirm_payment(
                     "psp_status": psp_status,
                     **({"psp_error": psp_error} if psp_error else {}),
                 },
+                headers={"X-Error-Code": "PAYMENT_NOT_SUCCEEDED"},
             )
 
         await mark_order_paid(order_id)
