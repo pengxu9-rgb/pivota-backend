@@ -27,6 +27,7 @@ manual workflow:
 | `SHOPIFY_DISCOUNT_TEST_SHIPPING_POSTAL_CODE` | secret or variable | Postal/ZIP code that is inside the test shipping zone. |
 | `SHOPIFY_DISCOUNT_TEST_SHIPPING_CITY` | secret or variable | City for the test shipping address. |
 | `SHOPIFY_DISCOUNT_TEST_SHIPPING_ADDRESS1` | secret or variable | Street line for the test shipping address. |
+| `SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY` | secret | Optional internal key for the read-only `discountNodes` access probe. Do not use this for public validation jobs. |
 
 Configure scenario fixtures as available:
 
@@ -90,8 +91,32 @@ gh workflow run agent-reliability-suite.yml \
 
 Download the generated artifact named `shopify-discount-validation-<run_id>`.
 Evidence is written under `artifacts/shopify-discount-validation/<run_id>/`.
+The workflow runs `scripts/preflight_shopify_discounts.py` first and stores
+setup evidence under `preflight/`; the quote matrix is stored under
+`quote-matrix/`.
 
 ## Local run
+
+Run the preflight first. It separates Shopify fixture/scope/shipping setup
+blockers from quote-path regressions and never creates orders, confirms PSP
+payments, or writes Shopify discounts:
+
+```bash
+python3 scripts/preflight_shopify_discounts.py \
+  --allow-live-readonly \
+  --allow-remote \
+  --output-dir artifacts/shopify-discount-validation/preflight-live
+```
+
+If `SHOPIFY_DISCOUNT_PREFLIGHT_ADMIN_KEY` is present, the preflight also calls
+the internal read-only discount-node probe:
+
+```bash
+GET /agent/internal/shopify/promotions/preflight/{merchant_id}/discount-nodes
+```
+
+That endpoint checks installed OAuth scopes and runs `discountNodes(first: 1)`.
+It does not call the promotion sync/upsert path.
 
 Use local runs with dev/test fixtures:
 
@@ -123,6 +148,22 @@ python3 scripts/validate_shopify_discounts.py \
 ```
 
 The harness blocks `--include-order-create` when `--allow-live-no-order` is set.
+
+## Paid canary audit
+
+After an approved paid discounted order canary, run the read-only ledger audit
+against the same environment:
+
+```bash
+python3 scripts/check_discount_order_canaries.py \
+  --merchant-id "$SHOPIFY_DISCOUNT_TEST_MERCHANT_ID" \
+  --output-dir artifacts/shopify-discount-validation/order-canaries
+```
+
+This checks discounted paid orders for missing Shopify order links,
+non-authoritative quote evidence, refund ledger totals greater than the order
+total, and Shopify refund webhooks that were not ignored for external PSP
+orders.
 
 ## Pass criteria
 
