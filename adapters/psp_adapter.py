@@ -284,6 +284,81 @@ class StripeAdapter(PSPAdapter):
         except Exception as e:
             # Fall back to generic exception to avoid dependency on stripe.error namespace
             return False, "unknown", str(e)
+
+    async def get_payment_status_details(
+        self,
+        payment_intent_id: str,
+    ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        """Return status plus amount/currency evidence for paid-transition reconciliation."""
+
+        def _get(obj: Any, key: str, default: Any = None) -> Any:
+            if obj is None:
+                return default
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            try:
+                return obj.get(key, default)
+            except Exception:
+                return getattr(obj, key, default)
+
+        def _minor_to_major(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                return str((Decimal(str(value)) / Decimal("100")).quantize(Decimal("0.01")))
+            except Exception:
+                return None
+
+        try:
+            if str(payment_intent_id or "").startswith("cs_"):
+                session = await asyncio.to_thread(
+                    self._client.v1.checkout.sessions.retrieve,
+                    payment_intent_id,
+                    {"expand": ["payment_intent"]},
+                )
+                payment_intent = _get(session, "payment_intent")
+                payment_status = str(_get(session, "payment_status", "") or "").lower()
+                intent_status = str(_get(payment_intent, "status", "") or "").lower()
+                status = intent_status or ("succeeded" if payment_status == "paid" else payment_status or "unknown")
+                amount_minor = (
+                    _get(payment_intent, "amount_received")
+                    if payment_intent is not None
+                    else None
+                )
+                if amount_minor is None:
+                    amount_minor = _get(session, "amount_total")
+                currency = _get(payment_intent, "currency") if payment_intent is not None else None
+                currency = currency or _get(session, "currency")
+                return (
+                    True,
+                    {
+                        "status": status,
+                        "amount": _minor_to_major(amount_minor),
+                        "currency": str(currency or "").upper() or None,
+                        "payment_reference_type": "stripe_checkout_session",
+                    },
+                    None,
+                )
+
+            payment_intent = await asyncio.to_thread(
+                self._client.v1.payment_intents.retrieve,
+                payment_intent_id,
+            )
+            amount_minor = _get(payment_intent, "amount_received")
+            if amount_minor is None:
+                amount_minor = _get(payment_intent, "amount")
+            return (
+                True,
+                {
+                    "status": str(_get(payment_intent, "status", "") or "").lower() or "unknown",
+                    "amount": _minor_to_major(amount_minor),
+                    "currency": str(_get(payment_intent, "currency", "") or "").upper() or None,
+                    "payment_reference_type": "stripe_payment_intent",
+                },
+                None,
+            )
+        except Exception as e:
+            return False, {"status": "unknown"}, str(e)
     
     async def refund_payment(
         self,
