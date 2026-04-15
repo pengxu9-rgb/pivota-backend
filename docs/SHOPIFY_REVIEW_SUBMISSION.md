@@ -50,6 +50,7 @@ Provide a short reason for each scope requested. Example:
 - read_fulfillments: Capture shipment updates and tracking numbers.
 - read_customers: Support customer matching for post-purchase communication (if enabled).
 - read_products: Sync product catalog for order context (if enabled).
+- read_discounts: Read Shopify-native discount metadata for quote validation and promotion display.
 - read_returns: Process return events (if enabled).
 - read_shopify_payments_disputes: Track dispute events (if enabled).
 - read_shopify_payments_payouts: Reconcile payouts (if enabled).

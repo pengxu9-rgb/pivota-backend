@@ -790,6 +790,7 @@ async def shopify_token_diagnostic(
         "scope_summary": {
             "read_products": "read_products" in scope_set,
             "read_orders": "read_orders" in scope_set,
+            "read_discounts": "read_discounts" in scope_set,
             "read_fulfillments": "read_fulfillments" in scope_set,
             "read_customers": "read_customers" in scope_set,
             "write_orders": "write_orders" in scope_set,

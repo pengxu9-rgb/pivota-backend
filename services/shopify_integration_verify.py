@@ -29,6 +29,7 @@ REQUIRED_SCOPES = [
 # Optional scopes that raise the ceiling (disputes/payouts/returns/policies).
 OPTIONAL_SCOPES = [
     "read_products",
+    "read_discounts",
     "read_customers",
     "read_fulfillments",
     "read_returns",
