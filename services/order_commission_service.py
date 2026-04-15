@@ -9,7 +9,11 @@ from datetime import datetime
 import logging
 
 from databases import Database
-from services.revenue_share_service import RevenueShareService
+from services.revenue_share_service import (
+    RevenueShareService,
+    normalize_revenue_match_source,
+    normalize_revenue_match_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,8 +265,8 @@ class OrderCommissionService:
                 "agent_expected": match_result.get('agent_expected_rate'),
                 "agent_minimum": match_result.get('agent_minimum_rate'),
                 "actual_rate": float(match_result.get('actual_rate', 0)),
-                "match_status": match_result.get('match_status', 'no_rules'),
-                "match_source": match_result.get('match_source', 'platform_default'),
+                "match_status": normalize_revenue_match_status(match_result.get('match_status', 'no_rules')),
+                "match_source": normalize_revenue_match_source(match_result.get('match_source', 'platform_default')),
                 "platform_default": match_result.get('platform_default_used', False),
                 "metadata": json.dumps({
                     "order_amount": float(order.get('total', 0)),
@@ -317,5 +321,4 @@ async def process_order_commission(order_id: str, database: Database) -> Dict[st
     """
     service = OrderCommissionService(database)
     return await service.calculate_commission_for_order(order_id)
-
 
