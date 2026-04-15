@@ -11,6 +11,7 @@ from services.shopify_storefront_pricing_service import (
     _mark_shipping_evidence,
     _original_subtotal_from_line_items,
     _parse_storefront_cart_discounts,
+    _shopify_cart_selectable_address_input,
 )
 
 
@@ -130,6 +131,31 @@ def test_unverified_shipping_evidence_downgrades_pricing_confidence():
     }
 
 
+def test_shopify_selectable_address_input_matches_cart_delivery_shape():
+    address = _shopify_cart_selectable_address_input(
+        country="US",
+        postal="10118",
+        city="New York",
+        province="NY",
+        address1="350 5th Ave",
+        address2=None,
+    )
+
+    assert address == {
+        "selected": True,
+        "oneTimeUse": True,
+        "address": {
+            "deliveryAddress": {
+                "countryCode": "US",
+                "zip": "10118",
+                "city": "New York",
+                "provinceCode": "NY",
+                "address1": "350 5th Ave",
+            }
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_delivery_address_add_uses_shopify_current_selectable_address_shape(monkeypatch):
     service = ShopifyStorefrontPricingService()
@@ -175,3 +201,70 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_cart_create_includes_delivery_address_in_cart_input(monkeypatch):
+    service = ShopifyStorefrontPricingService()
+    calls = []
+
+    async def fake_storefront_graphql(**kwargs):
+        calls.append(kwargs)
+        query = kwargs["query"]
+        if "cartCreate" in query:
+            return {
+                "cartCreate": {
+                    "cart": {
+                        "id": "gid://shopify/Cart/test",
+                        "checkoutUrl": "https://example.test/cart",
+                        "discountCodes": [],
+                        "lines": {"edges": []},
+                        "cost": {
+                            "subtotalAmount": {"amount": "0.00", "currencyCode": "USD"},
+                            "totalTaxAmount": {"amount": "0.00", "currencyCode": "USD"},
+                            "totalAmount": {"amount": "0.00", "currencyCode": "USD"},
+                        },
+                    },
+                    "userErrors": [],
+                }
+            }
+        return {"cart": {"deliveryGroups": {"edges": []}}}
+
+    monkeypatch.setattr(service, "_storefront_graphql", fake_storefront_graphql)
+
+    await service._create_cart(
+        shop_domain="example.myshopify.com",
+        storefront_token="sf_token",
+        items=[{"variant_id": "123", "quantity": 1}],
+        discount_codes=[],
+        shipping_address={
+            "country": "US",
+            "postal_code": "10118",
+            "city": "New York",
+            "state": "NY",
+            "address_line1": "350 5th Ave",
+        },
+        selected_delivery_option=None,
+        use_buyer_country_for_pricing=True,
+        debug_id="dbg",
+    )
+
+    cart_create_variables = calls[0]["variables"]
+    assert cart_create_variables["input"]["buyerIdentity"] == {"countryCode": "US"}
+    assert cart_create_variables["input"]["delivery"] == {
+        "addresses": [
+            {
+                "selected": True,
+                "oneTimeUse": True,
+                "address": {
+                    "deliveryAddress": {
+                        "countryCode": "US",
+                        "zip": "10118",
+                        "city": "New York",
+                        "provinceCode": "NY",
+                        "address1": "350 5th Ave",
+                    }
+                },
+            }
+        ]
+    }

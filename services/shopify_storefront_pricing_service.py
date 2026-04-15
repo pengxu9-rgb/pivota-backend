@@ -225,6 +225,30 @@ def _mark_shipping_evidence(
         evidence["pricing_confidence"] = "partial"
 
 
+def _shopify_cart_selectable_address_input(
+    *,
+    country: str,
+    postal: str,
+    city: Optional[str],
+    province: Optional[str],
+    address1: Optional[str],
+    address2: Optional[str],
+) -> Dict[str, Any]:
+    delivery_address = {
+        "countryCode": country,
+        "zip": postal,
+        **({"city": city} if city else {}),
+        **({"provinceCode": province} if province else {}),
+        **({"address1": address1} if address1 else {}),
+        **({"address2": address2} if address2 else {}),
+    }
+    return {
+        "selected": True,
+        "oneTimeUse": True,
+        "address": {"deliveryAddress": delivery_address},
+    }
+
+
 def _is_storefront_discount_query_error(err: ShopifyPricingError) -> bool:
     details = getattr(err, "details", {}) or {}
     errors = details.get("errors") or []
@@ -1290,6 +1314,19 @@ query($ids: [ID!]!) {
             variables["input"]["discountCodes"] = discount_codes
         if use_buyer_country_for_pricing and country:
             variables["input"]["buyerIdentity"] = {"countryCode": country}
+        if country and postal:
+            variables["input"]["delivery"] = {
+                "addresses": [
+                    _shopify_cart_selectable_address_input(
+                        country=country,
+                        postal=postal,
+                        city=city,
+                        province=province,
+                        address1=address1,
+                        address2=address2,
+                    )
+                ]
+            }
 
         discount_schema_fallback = False
         try:
@@ -1581,17 +1618,18 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
 }
 """
 
-        base_addr = {
-            "countryCode": country,
-            "zip": postal,
-            **({"city": city} if city else {}),
-            **({"provinceCode": province} if province else {}),
-            **({"address1": address1} if address1 else {}),
-            **({"address2": address2} if address2 else {}),
-        }
+        selected_address = _shopify_cart_selectable_address_input(
+            country=country,
+            postal=postal,
+            city=city,
+            province=province,
+            address1=address1,
+            address2=address2,
+        )
+        base_addr = selected_address["address"]["deliveryAddress"]
 
         add_shapes = [
-            [{"selected": True, "oneTimeUse": True, "address": {"deliveryAddress": base_addr}}],
+            [selected_address],
             [{"address": {"deliveryAddress": base_addr}}],
             [{"deliveryAddress": base_addr}],
             [{"address": base_addr}],
