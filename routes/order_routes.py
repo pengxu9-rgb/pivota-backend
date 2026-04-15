@@ -351,6 +351,11 @@ async def _get_order_payment_status_details(psp_adapter: Any, payment_reference:
     return False, {"status": "unknown"}, "Unexpected PSP status detail response"
 
 
+def _psp_payment_verification_fail_closed() -> bool:
+    mode = str(os.getenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe") or "").strip().lower()
+    return mode == "fail_closed"
+
+
 async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
     """Verify the PSP payment state before any server-side paid transition."""
     payment_reference = str(order.get("payment_intent_id") or "").strip()
@@ -358,6 +363,7 @@ async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, s
         return False, "missing_payment_reference", "Order has no PSP payment reference"
 
     psp_type, psp_adapter = await _resolve_order_psp_adapter(order)
+    fail_closed = _psp_payment_verification_fail_closed()
 
     status_details = await _get_order_payment_status_details(psp_adapter, payment_reference)
     if status_details is not None:
@@ -372,6 +378,8 @@ async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, s
         observed_amount = _normalize_psp_amount(details.get("amount"))
         expected_currency = str(order.get("currency") or "").strip().upper()
         observed_currency = str(details.get("currency") or "").strip().upper()
+        if fail_closed and expected_amount is None:
+            return False, normalized_status, "Order total is unavailable for fail-closed PSP verification"
         if expected_amount is not None and observed_amount is None:
             return False, normalized_status, "PSP payment amount is unavailable"
         if expected_amount is not None and observed_amount != expected_amount:
@@ -388,7 +396,16 @@ async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, s
             )
         if expected_currency and not observed_currency:
             return False, normalized_status, "PSP payment currency is unavailable"
+        if fail_closed and not expected_currency:
+            return False, normalized_status, "Order currency is unavailable for fail-closed PSP verification"
         return True, normalized_status, None
+
+    if fail_closed:
+        return (
+            False,
+            "details_unavailable",
+            f"{psp_type} does not provide PSP amount/currency details required by fail-closed verification",
+        )
 
     ok, normalized_status, error = _normalize_psp_status_result(await psp_adapter.get_payment_status(payment_reference))
     if not ok:
