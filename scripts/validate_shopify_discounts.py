@@ -199,6 +199,7 @@ def _scenario_catalog() -> List[Scenario]:
                 os.getenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A", "").strip(),
                 os.getenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B", "").strip(),
             ],
+            quantity=int(os.getenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_QUANTITY", "1") or "1"),
             expected="all_codes_applicable_discount",
             env_required="SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A",
             required_code_count=2,
