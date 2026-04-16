@@ -103,6 +103,16 @@ def test_noncombinable_conflict_uses_bxgy_quantity(monkeypatch):
     assert scenario.quantity == 3
 
 
+def test_combinable_discount_uses_fixture_quantity(monkeypatch):
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A", "COMBO_A")
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B", "COMBO_ORDER")
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_QUANTITY", "3")
+
+    scenario = next(row for row in _scenario_catalog() if row.scenario_id == "SFD-010")
+
+    assert scenario.quantity == 3
+
+
 @pytest.mark.asyncio
 async def test_discount_nodes_probe_reports_scope_blocker(monkeypatch):
     async def fake_config(_merchant_id):
