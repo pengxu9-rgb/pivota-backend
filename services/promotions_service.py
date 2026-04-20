@@ -324,7 +324,10 @@ async def update_promotion(promo_id: str, data: PromotionUpdate) -> Optional[Pro
         update_fields["description"] = data.description
     if data.startAt is not None:
         update_fields["start_at"] = _normalize_dt(data.startAt)
-    if data.endAt is not None:
+    fields_set = getattr(data, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(data, "__fields_set__", set())
+    if "endAt" in fields_set:
         update_fields["end_at"] = _normalize_dt(data.endAt)
     if data.channels is not None:
         update_fields["channels"] = data.channels
@@ -343,7 +346,7 @@ async def update_promotion(promo_id: str, data: PromotionUpdate) -> Optional[Pro
     if "start_at" in update_fields or "end_at" in update_fields:
         start_at = update_fields.get("start_at", row["start_at"])
         end_at = update_fields.get("end_at", row["end_at"])
-        if end_at <= start_at:
+        if end_at is not None and end_at <= start_at:
             raise ValueError("endAt must be after startAt")
 
     cfg = update_fields.get("config", row.get("config") or {})
