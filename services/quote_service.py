@@ -413,14 +413,14 @@ class QuoteService:
             },
             "promotion_lines": self._serialize_promotion_lines(result.promotion_lines),
             "discount_evidence": self._serialize_discount_evidence(discount_evidence),
-            "store_discount_evidence": store_discount_evidence,
-            "payment_offer_evidence": payment_offer_evidence,
-            "payment_pricing": payment_pricing,
-            "savings_presentation": savings_presentation,
+            "store_discount_evidence": self._json_safe(store_discount_evidence),
+            "payment_offer_evidence": self._json_safe(payment_offer_evidence),
+            "payment_pricing": self._json_safe(payment_pricing),
+            "savings_presentation": self._json_safe(savings_presentation),
             "line_items": self._serialize_line_items(result.line_items),
-            "delivery_options": result.delivery_options,
+            "delivery_options": self._json_safe(result.delivery_options),
             "metadata": {
-                **(result.debug or {}),
+                **self._json_safe(result.debug or {}),
                 "discount_codes": codes,
             },
         }
@@ -502,17 +502,17 @@ class QuoteService:
             "charge_currency": charge_currency,
             "settlement_currency": settlement_currency,
             "pricing": result.pricing,
-            "promotion_lines": result.promotion_lines,
-            "discount_evidence": discount_evidence,
-            "store_discount_evidence": store_discount_evidence,
-            "payment_offer_evidence": payment_offer_evidence,
-            "payment_pricing": payment_pricing,
-            "savings_presentation": savings_presentation,
-            "line_items": result.line_items,
-            "delivery_options": result.delivery_options,
+            "promotion_lines": self._serialize_promotion_lines(result.promotion_lines),
+            "discount_evidence": self._serialize_discount_evidence(discount_evidence),
+            "store_discount_evidence": self._json_safe(store_discount_evidence),
+            "payment_offer_evidence": self._json_safe(payment_offer_evidence),
+            "payment_pricing": self._json_safe(payment_pricing),
+            "savings_presentation": self._json_safe(savings_presentation),
+            "line_items": self._serialize_line_items(result.line_items),
+            "delivery_options": self._json_safe(result.delivery_options),
             "checkout_url": (result.debug or {}).get("checkout_url"),
             "debug_id": (result.debug or {}).get("debug_id"),
-            "attempts": attempts or [],
+            "attempts": self._json_safe(attempts or []),
         }
 
     def _coerce_discount_evidence(
@@ -986,18 +986,20 @@ class QuoteService:
         return out
 
     def _serialize_discount_evidence(self, evidence: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        def _convert(value: Any) -> Any:
-            if isinstance(value, Decimal):
-                return str(value)
-            if isinstance(value, dict):
-                return {k: _convert(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [_convert(v) for v in value]
-            return value
-
         if not isinstance(evidence, dict):
             return {}
-        return _convert(evidence)
+        return self._json_safe(evidence)
+
+    def _json_safe(self, value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, tuple):
+            return [self._json_safe(v) for v in value]
+        return value
 
     def _serialize_line_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out = []
