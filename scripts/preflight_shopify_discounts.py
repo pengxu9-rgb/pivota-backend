@@ -138,7 +138,7 @@ def _scenario_blocker(scenario: Scenario) -> Optional[str]:
     submitted_codes = [code for code in scenario.discount_codes if code]
     if scenario.required_code_count and len(submitted_codes) < scenario.required_code_count:
         return f"missing discount code fixtures; expected {scenario.required_code_count}, got {len(submitted_codes)}"
-    if not submitted_codes and scenario.expected != "automatic_discount":
+    if not submitted_codes and scenario.expected not in {"automatic_discount", "customer_eligibility_evidence"}:
         return "missing discount code fixture"
     return None
 
