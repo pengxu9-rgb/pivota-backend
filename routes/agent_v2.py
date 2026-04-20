@@ -13,6 +13,7 @@ from db.database import database
 from db.orders import get_order
 from db.quotes import expire_quote_if_needed, get_quote
 from models.order import CreateOrderRequest, OrderItem, ShippingAddress
+from models.catalog import PivotPaymentContext
 from models.quote import QuotePreviewRequest
 from routes.agent_api import agent_create_order as agent_v1_create_order
 from routes.agent_api import agent_search_products as agent_v1_search_products
@@ -72,6 +73,7 @@ class SearchProductsRequest(BaseModel):
     allow_stale_cache: bool = True
     external_seed_strategy: str = "legacy"
     fast_mode: bool = False
+    payment_context: Optional[PivotPaymentContext] = None
     request_context: Optional[RequestContext] = None
 
 
@@ -88,6 +90,7 @@ class QuotePreviewBody(BaseModel):
     discount_codes: Optional[List[str]] = None
     buyer_context: Optional[BuyerContext] = None
     selected_delivery_option: Optional[Dict[str, Any]] = None
+    payment_context: Optional[PivotPaymentContext] = None
     request_context: Optional[RequestContext] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -98,6 +101,8 @@ class CreateOrderBody(BaseModel):
     request_context: Optional[RequestContext] = None
     metadata: Optional[Dict[str, Any]] = None
     preferred_psp: Optional[str] = None
+    selected_payment_offer_id: Optional[str] = None
+    payment_method_evidence: Optional[Dict[str, Any]] = None
     idempotency_key: Optional[str] = None
 
 
@@ -343,6 +348,10 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                 "freshness_ts": _utc_iso(product.get("cached_at") or product.get("updated_at")),
                 "confidence": product.get("score") or product.get("confidence") or 1.0,
                 "capability_flags": _capability_flags_from_product(product),
+                "payment_offer_evidence": product.get("payment_offer_evidence") or {},
+                "payment_offer_summary": product.get("payment_offer_summary") or {},
+                "payment_offer_badges": product.get("payment_offer_badges") or [],
+                "savings_presentation": product.get("savings_presentation") or {},
             }
         )
 
@@ -361,6 +370,10 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
         or {"score": product.get("score")},
         "variants": normalized_variants,
         "offers": offers,
+        "payment_offer_evidence": product.get("payment_offer_evidence") or {},
+        "payment_offer_summary": product.get("payment_offer_summary") or {},
+        "payment_offer_badges": product.get("payment_offer_badges") or [],
+        "savings_presentation": product.get("savings_presentation") or {},
         "provenance": {
             "merchant_id": merchant_id,
             "merchant_name": product.get("merchant_name"),
@@ -441,6 +454,11 @@ def _quote_response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "settlement_currency": snapshot_json.get("settlement_currency"),
         "line_items": snapshot_json.get("line_items") or [],
         "promotion_lines": snapshot_json.get("promotion_lines") or [],
+        "discount_evidence": snapshot_json.get("discount_evidence") or {},
+        "store_discount_evidence": snapshot_json.get("store_discount_evidence") or {},
+        "payment_offer_evidence": snapshot_json.get("payment_offer_evidence") or {},
+        "payment_pricing": snapshot_json.get("payment_pricing") or {},
+        "savings_presentation": snapshot_json.get("savings_presentation") or {},
         "provenance": {
             "engine": row.get("engine"),
             "engine_ref": row.get("engine_ref"),
@@ -635,6 +653,13 @@ async def search_products_v2(
         allow_stale_cache=body.allow_stale_cache,
         external_seed_strategy=body.external_seed_strategy,
         fast_mode=body.fast_mode,
+        market=body.request_context.country if body.request_context and body.request_context.country else None,
+        psp=body.payment_context.psp if body.payment_context else None,
+        payment_method_type=body.payment_context.payment_method_type if body.payment_context else None,
+        card_network=body.payment_context.card_network if body.payment_context else None,
+        issuer_name=body.payment_context.issuer_name if body.payment_context else None,
+        wallet_type=body.payment_context.wallet_type if body.payment_context else None,
+        installment_provider=body.payment_context.installment_provider if body.payment_context else None,
         context=context,
     )
     products = [
@@ -674,6 +699,7 @@ async def preview_quote_v2(
         customer_email=buyer_context.customer_email,
         shipping_address=buyer_context.shipping_address,
         selected_delivery_option=body.selected_delivery_option,
+        payment_context=body.payment_context,
         brief_id=request_context.get("request_id"),
         brief_schema_version="agent_v2",
     )
@@ -704,6 +730,11 @@ async def preview_quote_v2(
         "settlement_currency": result.get("settlement_currency"),
         "line_items": result.get("line_items") or [],
         "promotion_lines": result.get("promotion_lines") or [],
+        "discount_evidence": result.get("discount_evidence") or {},
+        "store_discount_evidence": result.get("store_discount_evidence") or {},
+        "payment_offer_evidence": result.get("payment_offer_evidence") or {},
+        "payment_pricing": result.get("payment_pricing") or {},
+        "savings_presentation": result.get("savings_presentation") or {},
         "provenance": {
             "engine": result.get("engine"),
             "engine_ref": result.get("engine_ref"),
@@ -794,6 +825,10 @@ async def create_order_v2(
     }
     if body.request_context:
         metadata["request_context"] = body.request_context.model_dump(exclude_none=True)
+    if body.selected_payment_offer_id:
+        metadata["selected_payment_offer_id"] = body.selected_payment_offer_id
+    if isinstance(body.payment_method_evidence, dict):
+        metadata["payment_method_evidence"] = body.payment_method_evidence
     metadata = attach_traffic_taxonomy(
         metadata,
         build_traffic_taxonomy(
@@ -829,6 +864,8 @@ async def create_order_v2(
         agent_session_id=(body.request_context.request_id if body.request_context else None),
         metadata=metadata,
         preferred_psp=body.preferred_psp,
+        selected_payment_offer_id=body.selected_payment_offer_id,
+        payment_method_evidence=body.payment_method_evidence,
         idempotency_key=body.idempotency_key,
     )
 

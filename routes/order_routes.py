@@ -38,6 +38,7 @@ from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_payment_initiation_service import build_payment_action
+from services.payment_offer_evidence_service import emit_payment_offer_analytics_event, stable_payment_offer_hash
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
@@ -1409,6 +1410,11 @@ def _build_shopify_discount_order_annotations(
         if confidence:
             note_attributes.append({"name": "pivota_discount_pricing_confidence", "value": confidence})
 
+    payment_offer_evidence = pricing_quote_meta.get("payment_offer_evidence")
+    payment_offer_hash = stable_payment_offer_hash(payment_offer_evidence)
+    if payment_offer_hash:
+        note_attributes.append({"name": "pivota_payment_offer_evidence_hash", "value": payment_offer_hash})
+
     # Keep a stable cross-system join key even if the quote id is absent on a legacy row.
     note_attributes.append({"name": "pivota_order_id", "value": str(order_id)})
     return tags, note_attributes
@@ -1751,6 +1757,10 @@ async def create_new_order(
                     "pricing": pricing,
                     "promotion_lines": snap.get("promotion_lines") or [],
                     "discount_evidence": snap.get("discount_evidence") or {},
+                    "store_discount_evidence": snap.get("store_discount_evidence") or {},
+                    "payment_offer_evidence": snap.get("payment_offer_evidence") or {},
+                    "payment_pricing": snap.get("payment_pricing") or {},
+                    "savings_presentation": snap.get("savings_presentation") or {},
                     "line_items": snap.get("line_items") or [],
                 }
                 if (
@@ -1878,8 +1888,15 @@ async def create_new_order(
         order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
         if getattr(order_request, "idempotency_key", None):
             order_metadata.setdefault("idempotency_key", str(order_request.idempotency_key))
+        if getattr(order_request, "selected_payment_offer_id", None):
+            order_metadata["selected_payment_offer_id"] = str(order_request.selected_payment_offer_id)
+        if isinstance(getattr(order_request, "payment_method_evidence", None), dict):
+            order_metadata["payment_method_evidence"] = order_request.payment_method_evidence
         if pricing_quote_meta:
             order_metadata["pricing_quote"] = pricing_quote_meta
+            payment_offer_hash = stable_payment_offer_hash(pricing_quote_meta.get("payment_offer_evidence"))
+            if payment_offer_hash:
+                order_metadata["payment_offer_evidence_hash"] = payment_offer_hash
         elif discount_total > 0:
             promo_meta = {
                 "discount_total": float(discount_total),
@@ -1965,6 +1982,72 @@ async def create_new_order(
                 attribution_exc,
             )
 
+        payment_offer_evidence_for_events = (
+            pricing_quote_meta.get("payment_offer_evidence")
+            if isinstance(pricing_quote_meta, dict) and isinstance(pricing_quote_meta.get("payment_offer_evidence"), dict)
+            else {}
+        )
+        selected_payment_offer_id = (
+            str(order_request.selected_payment_offer_id)
+            if getattr(order_request, "selected_payment_offer_id", None)
+            else None
+        )
+        payment_method_evidence = (
+            order_request.payment_method_evidence
+            if isinstance(getattr(order_request, "payment_method_evidence", None), dict)
+            else None
+        )
+        if selected_payment_offer_id:
+            emit_payment_offer_analytics_event(
+                event_type="payment_offer.selected",
+                merchant_id=order_request.merchant_id,
+                surface="order_create",
+                evidence=payment_offer_evidence_for_events,
+                selected_payment_offer_id=selected_payment_offer_id,
+                payment_method_evidence=payment_method_evidence,
+                order_id=str(order_id),
+                adapter=psp_type,
+                idempotency_key=f"payment_offer.selected:{order_id}:{selected_payment_offer_id}",
+            )
+        if payment_method_evidence:
+            verification_status = str(payment_method_evidence.get("verification_status") or "").strip().lower()
+            eligible = payment_method_evidence.get("eligible")
+            emit_payment_offer_analytics_event(
+                event_type="payment_offer.psp_evidence_received",
+                merchant_id=order_request.merchant_id,
+                surface="order_create",
+                evidence=payment_offer_evidence_for_events,
+                selected_payment_offer_id=selected_payment_offer_id,
+                payment_method_evidence=payment_method_evidence,
+                order_id=str(order_id),
+                adapter=psp_type,
+                idempotency_key=f"payment_offer.psp_evidence:{order_id}",
+            )
+            if verification_status in {"psp_verified", "verified"} or eligible is True:
+                emit_payment_offer_analytics_event(
+                    event_type="payment_offer.psp_verified",
+                    merchant_id=order_request.merchant_id,
+                    surface="order_create",
+                    evidence=payment_offer_evidence_for_events,
+                    selected_payment_offer_id=selected_payment_offer_id,
+                    payment_method_evidence=payment_method_evidence,
+                    order_id=str(order_id),
+                    adapter=psp_type,
+                    idempotency_key=f"payment_offer.psp_verified:{order_id}:{selected_payment_offer_id or 'none'}",
+                )
+            elif eligible is False or verification_status in {"rejected", "not_eligible", "unavailable"}:
+                emit_payment_offer_analytics_event(
+                    event_type="payment_offer.rejected",
+                    merchant_id=order_request.merchant_id,
+                    surface="order_create",
+                    evidence=payment_offer_evidence_for_events,
+                    selected_payment_offer_id=selected_payment_offer_id,
+                    payment_method_evidence=payment_method_evidence,
+                    order_id=str(order_id),
+                    adapter=psp_type,
+                    idempotency_key=f"payment_offer.rejected:{order_id}:{selected_payment_offer_id or 'none'}",
+                )
+
         try:
             await emit_merchant_webhook_event(
                 order_request.merchant_id,
@@ -2043,6 +2126,16 @@ async def create_new_order(
                     "customer_email": order_request.customer_email,
                     "route_id": route_id_for_attempt,
                     "agent_id": agent_id,
+                    **(
+                        {"selected_payment_offer_id": str(order_request.selected_payment_offer_id)}
+                        if getattr(order_request, "selected_payment_offer_id", None)
+                        else {}
+                    ),
+                    **(
+                        {"payment_offer_evidence_hash": str(order_metadata.get("payment_offer_evidence_hash"))}
+                        if order_metadata.get("payment_offer_evidence_hash")
+                        else {}
+                    ),
                     **(
                         {
                             PVT_SURFACE: order_metadata.get(PVT_SURFACE),

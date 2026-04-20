@@ -15,6 +15,19 @@ import time
 from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, insert_quote, mark_quote_consumed
 from services.promotions_service import PromotionStatus, list_promotions
 from services.pcs_hash import sha256_json
+from services.payment_offer_evidence_service import (
+    PaymentOfferTarget,
+    empty_payment_offer_evidence,
+    emit_payment_offer_analytics_event,
+    payment_pricing_summary,
+    resolve_payment_offer_evidence,
+)
+from services.store_discount_evidence_service import (
+    StoreDiscountTarget,
+    empty_store_discount_evidence,
+    resolve_store_discount_evidence_for_targets,
+)
+from services.savings_presentation_service import build_savings_presentation
 from services.shopify_promotions_sync import sync_shopify_promotions_for_merchant
 from services.shopify_pricing_service import ShopifyPricingError, ShopifyPricingService
 from services.shopify_storefront_pricing_service import ShopifyStorefrontPricingService
@@ -179,6 +192,7 @@ class QuoteService:
         customer_email: Optional[str],
         shipping_address: Optional[Dict[str, Any]],
         selected_delivery_option: Optional[Dict[str, Any]],
+        payment_context: Optional[Any] = None,
         brief_id: Optional[str] = None,
         brief_schema_version: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -287,6 +301,100 @@ class QuoteService:
         presentment_currency = result.currency
         charge_currency = result.currency
         settlement_currency: Optional[str] = None
+        store_discount_evidence: Dict[str, Any]
+        try:
+            store_targets = [
+                StoreDiscountTarget(
+                    target_id=str(item.get("variant_id") or item.get("product_id") or idx),
+                    merchant_id=merchant_id,
+                    product_id=str(item.get("product_id") or "").strip() or None,
+                    variant_id=str(item.get("variant_id") or "").strip() or None,
+                    quantity=int(item.get("quantity") or 1),
+                    subtotal=None,
+                    currency=presentment_currency,
+                )
+                for idx, item in enumerate(normalized_items)
+            ]
+            per_target_store_evidence = await resolve_store_discount_evidence_for_targets(
+                merchant_id=merchant_id,
+                targets=store_targets,
+            )
+            store_offers: List[Dict[str, Any]] = []
+            store_decisions: List[Dict[str, Any]] = []
+            for evidence in per_target_store_evidence.values():
+                store_offers.extend([offer for offer in evidence.get("offers") or [] if isinstance(offer, dict)])
+                store_decisions.extend([item for item in evidence.get("decisions") or [] if isinstance(item, dict)])
+            store_discount_evidence = {
+                "pricing_confidence": (
+                    "metadata_available"
+                    if store_offers
+                    else "not_applicable"
+                ),
+                "offers": store_offers,
+                "decisions": store_decisions,
+                "presentation_contract_version": "savings.v1",
+            }
+        except Exception as e:
+            store_discount_evidence = empty_store_discount_evidence("resolver_error")
+            store_discount_evidence["decisions"] = [
+                {
+                    "type": "store_discount_resolution",
+                    "reason": "resolver_error",
+                    "message": str(e)[:240],
+                }
+            ]
+        payment_offer_evidence: Dict[str, Any]
+        try:
+            quote_targets = [
+                PaymentOfferTarget(
+                    target_id=str(item.get("variant_id") or item.get("product_id") or idx),
+                    merchant_id=merchant_id,
+                    product_id=str(item.get("product_id") or "").strip() or None,
+                    variant_id=str(item.get("variant_id") or "").strip() or None,
+                    amount=None,
+                    currency=presentment_currency,
+                )
+                for idx, item in enumerate(normalized_items)
+            ]
+            payment_offer_evidence = await resolve_payment_offer_evidence(
+                merchant_id=merchant_id,
+                targets=quote_targets,
+                payment_context=payment_context,
+                total_amount=result.pricing.get("total"),
+                currency=presentment_currency,
+            )
+        except Exception as e:
+            payment_offer_evidence = empty_payment_offer_evidence("resolver_error")
+            payment_offer_evidence["decisions"] = [
+                {
+                    "type": "payment_offer_resolution",
+                    "reason": "resolver_error",
+                    "message": str(e)[:240],
+                }
+            ]
+        payment_pricing = payment_pricing_summary(
+            evidence=payment_offer_evidence,
+            checkout_total=result.pricing.get("total"),
+            currency=presentment_currency,
+        )
+        savings_presentation = build_savings_presentation(
+            pricing=result.pricing,
+            currency=presentment_currency,
+            promotion_lines=result.promotion_lines,
+            discount_evidence=discount_evidence,
+            store_discount_evidence=store_discount_evidence,
+            payment_offer_evidence=payment_offer_evidence,
+            payment_pricing=payment_pricing,
+        )
+        emit_payment_offer_analytics_event(
+            event_type="payment_offer.displayed",
+            merchant_id=merchant_id,
+            surface="quote_preview",
+            evidence=payment_offer_evidence,
+            payment_context=payment_context,
+            quote_id=quote_id,
+            idempotency_key=f"payment_offer.displayed:{quote_id}",
+        )
 
         snapshot_json: Dict[str, Any] = {
             "engine": result.engine,
@@ -305,6 +413,10 @@ class QuoteService:
             },
             "promotion_lines": self._serialize_promotion_lines(result.promotion_lines),
             "discount_evidence": self._serialize_discount_evidence(discount_evidence),
+            "store_discount_evidence": store_discount_evidence,
+            "payment_offer_evidence": payment_offer_evidence,
+            "payment_pricing": payment_pricing,
+            "savings_presentation": savings_presentation,
             "line_items": self._serialize_line_items(result.line_items),
             "delivery_options": result.delivery_options,
             "metadata": {
@@ -320,6 +432,12 @@ class QuoteService:
             # PII minimization: only store minimal address fields for fingerprint/audit.
             "shipping_address": _normalize_shipping_for_fingerprint(shipping_address),
             "selected_delivery_option": selected_delivery_option or None,
+            "payment_context": (
+                payment_context.model_dump(exclude_none=True)
+                if hasattr(payment_context, "model_dump")
+                else payment_context
+            )
+            or None,
         }
 
         now = datetime.now(timezone.utc)
@@ -386,6 +504,10 @@ class QuoteService:
             "pricing": result.pricing,
             "promotion_lines": result.promotion_lines,
             "discount_evidence": discount_evidence,
+            "store_discount_evidence": store_discount_evidence,
+            "payment_offer_evidence": payment_offer_evidence,
+            "payment_pricing": payment_pricing,
+            "savings_presentation": savings_presentation,
             "line_items": result.line_items,
             "delivery_options": result.delivery_options,
             "checkout_url": (result.debug or {}).get("checkout_url"),

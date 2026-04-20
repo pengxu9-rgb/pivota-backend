@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from config.settings import resolve_public_api_base_url
 from db.database import database
-from models.catalog import PivotQueryRequest, PivotResultItem
+from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
 from models.reviews_refs import SkuRef as ReviewsSkuRef
 from services.beauty_external_ranking import (
     BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
@@ -83,6 +83,14 @@ from observability.reliability_metrics import (
     set_catalog_upstream_circuit,
 )
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
+from services.payment_offer_evidence_service import (
+    enrich_product_cards_with_payment_offers,
+    enrich_product_detail_with_payment_offers,
+)
+from services.store_discount_evidence_service import (
+    enrich_product_cards_with_store_discounts,
+    enrich_product_detail_with_store_discounts,
+)
 
 def _resolve_default_agent_api_base() -> str:
     configured = str(os.getenv("AGENT_API_BASE", "") or "").strip().rstrip("/")
@@ -2705,6 +2713,7 @@ class FindProductsMultiPayload(BaseModel):
     search: MultiSearchFilters
     user: Optional[UserIntent] = None
     metadata: Optional[RequestMetadata] = None
+    payment_context: Optional[PivotPaymentContext] = None
     creator_id: Optional[str] = Field(None, alias="creatorId", description="Optional creator context to scope results")
     intent_safety: Optional[Dict[str, Any]] = Field(
         None,
@@ -2791,9 +2800,9 @@ def _normalize_find_products_multi_payload(raw_payload: Dict[str, Any]) -> Dict[
             if key in payload:
                 search[key] = payload.get(key)
     normalized: Dict[str, Any] = {"search": search}
-    for key in ("user", "metadata", "creator_id", "creatorId", "intent_safety"):
+    for key in ("user", "metadata", "payment_context", "paymentContext", "creator_id", "creatorId", "intent_safety"):
         if key in payload:
-            normalized[key] = payload.get(key)
+            normalized["payment_context" if key == "paymentContext" else key] = payload.get(key)
     return normalized
 
 
@@ -3022,12 +3031,12 @@ def _extract_raw_commerce_surface(
     request_metadata: Optional[Dict[str, Any]],
 ) -> Optional[str]:
     raw = str(payload_surface or "").strip()
-    if raw:
+    if raw and raw.lower() != "unknown":
         return raw
     meta = request_metadata if isinstance(request_metadata, dict) else {}
     for key in ("commerce_surface", "commerceSurface"):
         value = str(meta.get(key) or "").strip()
-        if value:
+        if value and value.lower() != "unknown":
             return value
     return None
 
@@ -4507,6 +4516,8 @@ class OrderPayloadBody(BaseModel):
     discount_codes: Optional[List[str]] = None
     selected_delivery_option: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+    selected_payment_offer_id: Optional[str] = None
+    payment_method_evidence: Optional[Dict[str, Any]] = None
     idempotency_key: Optional[str] = None
     items: List[OrderItem]
     shipping_address: ShippingAddress
@@ -4542,6 +4553,18 @@ class PaymentPayloadBody(BaseModel):
 
 class SubmitPaymentPayload(BaseModel):
     payment: PaymentPayloadBody
+
+
+class RecordPaymentOfferEvidencePayload(BaseModel):
+    order_id: Optional[str] = None
+    quote_id: Optional[str] = None
+    merchant_id: Optional[str] = None
+    selected_payment_offer_id: Optional[str] = None
+    payment_method_evidence: Dict[str, Any] = Field(default_factory=dict)
+    payment_offer_evidence: Optional[Dict[str, Any]] = None
+    surface: str = "checkout"
+    event_type: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 class ShopGatewayRequest(BaseModel):
@@ -4843,7 +4866,23 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
             if primary_offer:
                 merchant_price = getattr(primary_offer.pricing, "merchant_effective_price", None)
                 estimated_price = getattr(primary_offer.pricing, "estimated_best_price", None)
-                if primary_offer.incentives or (
+                payment_offer_evidence = getattr(primary_offer, "payment_offer_evidence", {}) or {}
+                payment_offers = (
+                    payment_offer_evidence.get("offers")
+                    if isinstance(payment_offer_evidence, dict)
+                    else []
+                ) or []
+                if payment_offers:
+                    best_deal_payload = {
+                        "estimated_best_price": (
+                            payment_offers[0].get("estimated_total_after_payment_offer")
+                            if isinstance(payment_offers[0], dict)
+                            else estimated_price
+                        ),
+                        "payment_offer_evidence": payment_offer_evidence,
+                        "source": "payment_offer_evidence",
+                    }
+                elif primary_offer.incentives or (
                     estimated_price is not None
                     and merchant_price is not None
                     and estimated_price < merchant_price
@@ -4878,6 +4917,9 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
             }
             if best_deal_payload:
                 group["best_deal"] = best_deal_payload
+            if primary_offer:
+                group["payment_offer_evidence"] = getattr(primary_offer, "payment_offer_evidence", {}) or {}
+                group["savings_presentation"] = getattr(primary_offer, "savings_presentation", {}) or {}
             if item.verticals.get("beauty"):
                 group["beauty"] = item.verticals.get("beauty")
             grouped[product_id] = group
@@ -4902,6 +4944,8 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
             },
             "image_url": item.product.image_url,
             "availability": availability,
+            "payment_offer_evidence": getattr(primary_offer, "payment_offer_evidence", {}) if primary_offer else {},
+            "savings_presentation": getattr(primary_offer, "savings_presentation", {}) if primary_offer else {},
         }
 
         existing_variant_ids = {
@@ -5398,7 +5442,7 @@ async def _handle_find_products_multi_via_pivot(
             limit=raw_limit,
             include_external=PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL,
             include_incentives=PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES,
-            payment_context=None,
+            payment_context=payload.payment_context,
         )
     )
 
@@ -6400,9 +6444,23 @@ async def _handle_find_products(
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
     page_items = filtered[start_idx:end_idx]
+    product_payloads = [_standard_to_shop_product(p) for p in page_items]
+    try:
+        product_payloads = await enrich_product_cards_with_payment_offers(
+            product_payloads,
+            merchant_id=merchant_id,
+            payment_context=None,
+            market=None,
+        )
+        product_payloads = await enrich_product_cards_with_store_discounts(
+            product_payloads,
+            merchant_id=merchant_id,
+        )
+    except Exception:
+        pass
 
     return {
-        "products": [_standard_to_shop_product(p) for p in page_items],
+        "products": product_payloads,
         "total": total,
         "page": page,
         "page_size": len(page_items),
@@ -10954,6 +11012,19 @@ async def _handle_get_product_detail(
             match.currency = shop_currency
 
     base = _standard_to_shop_product(match)
+    try:
+        await enrich_product_detail_with_payment_offers(
+            base,
+            merchant_id=merchant_id,
+            payment_context=None,
+            market=None,
+        )
+        await enrich_product_detail_with_store_discounts(
+            base,
+            merchant_id=merchant_id,
+        )
+    except Exception:
+        pass
 
     # Optional attributes bag for LLM/Agent use; keep it simple for now.
     attributes: Dict[str, Any] = {}
@@ -11127,6 +11198,8 @@ async def _handle_create_order(
         **({"discount_codes": order.discount_codes} if isinstance(order.discount_codes, list) else {}),
         **({"selected_delivery_option": order.selected_delivery_option} if isinstance(order.selected_delivery_option, dict) else {}),
         **({"metadata": order_metadata} if order_metadata else {}),
+        **({"selected_payment_offer_id": order.selected_payment_offer_id} if order.selected_payment_offer_id else {}),
+        **({"payment_method_evidence": order.payment_method_evidence} if isinstance(order.payment_method_evidence, dict) else {}),
         **({"idempotency_key": order.idempotency_key} if order.idempotency_key else {}),
         "items": [
             {
@@ -11175,6 +11248,25 @@ async def _handle_submit_payment(payment: PaymentPayloadBody, *, checkout_token:
     }
 
     return await _proxy_agent_api("POST", "/agent/v1/payments", body, checkout_token=checkout_token)
+
+
+async def _handle_record_payment_offer_evidence(
+    payload: RecordPaymentOfferEvidencePayload,
+    *,
+    checkout_token: Optional[str],
+) -> Dict[str, Any]:
+    body = {
+        **({"order_id": payload.order_id} if payload.order_id else {}),
+        **({"quote_id": payload.quote_id} if payload.quote_id else {}),
+        **({"merchant_id": payload.merchant_id} if payload.merchant_id else {}),
+        **({"selected_payment_offer_id": payload.selected_payment_offer_id} if payload.selected_payment_offer_id else {}),
+        "payment_method_evidence": payload.payment_method_evidence or {},
+        **({"payment_offer_evidence": payload.payment_offer_evidence} if isinstance(payload.payment_offer_evidence, dict) else {}),
+        "surface": payload.surface or "checkout",
+        **({"event_type": payload.event_type} if payload.event_type else {}),
+        **({"idempotency_key": payload.idempotency_key} if payload.idempotency_key else {}),
+    }
+    return await _proxy_agent_api("POST", "/agent/v1/orders/payment-offer-evidence", body, checkout_token=checkout_token)
 
 
 INVOKE_SHORT_WAIT_SECONDS_RAW = os.getenv("AGENT_SHOP_INVOKE_MAX_WAIT_SECONDS")
@@ -12030,6 +12122,10 @@ async def invoke_shop_operation(
     if operation == "submit_payment":
         payload = SubmitPaymentPayload(**request.payload)
         return await _handle_submit_payment(payload.payment, checkout_token=checkout_token)
+
+    if operation == "record_payment_offer_evidence":
+        payload = RecordPaymentOfferEvidencePayload(**request.payload)
+        return await _handle_record_payment_offer_evidence(payload, checkout_token=checkout_token)
 
     # For now we only support product operations here.
     raise HTTPException(

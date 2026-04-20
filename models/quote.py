@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from models.catalog import PivotPaymentContext
+
 
 class QuoteItemInput(BaseModel):
     product_id: str
@@ -20,6 +22,7 @@ class QuotePreviewRequest(BaseModel):
     customer_email: Optional[str] = None
     shipping_address: Optional[Dict[str, Any]] = None
     selected_delivery_option: Optional[Dict[str, Any]] = None
+    payment_context: Optional[PivotPaymentContext] = None
     brief_id: Optional[str] = None
     brief_schema_version: Optional[str] = None
 
@@ -45,7 +48,7 @@ class PromotionAllocation(BaseModel):
 
 class PromotionLine(BaseModel):
     id: str
-    source: Literal["shopify"] = "shopify"
+    source: str = "store"
     source_ref: Optional[str] = None
     discount_class: PromotionDiscountClass
     method: PromotionMethod
@@ -85,6 +88,10 @@ class QuotePreviewResponse(BaseModel):
     pricing: QuotePricing
     promotion_lines: List[PromotionLine]
     discount_evidence: Optional[Dict[str, Any]] = None
+    store_discount_evidence: Optional[Dict[str, Any]] = None
+    payment_offer_evidence: Optional[Dict[str, Any]] = None
+    payment_pricing: Optional[Dict[str, Any]] = None
+    savings_presentation: Optional[Dict[str, Any]] = None
     line_items: List[QuoteLineItem]
     delivery_options: Optional[List[Dict[str, Any]]] = None
     # Debug helpers (safe): allow clients to understand why an engine was chosen.

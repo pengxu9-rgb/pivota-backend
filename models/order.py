@@ -3,7 +3,7 @@
 Pivota 核心业务对象
 """
 
-from pydantic import BaseModel, computed_field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from decimal import Decimal
@@ -84,6 +84,8 @@ class CreateOrderRequest(BaseModel):
     agent_session_id: Optional[str] = None  # Agent 会话 ID（用于追踪）
     metadata: Optional[Dict[str, Any]] = None  # 额外元数据
     preferred_psp: Optional[str] = None  # 指定首选 PSP (stripe/adyen/checkout)
+    selected_payment_offer_id: Optional[str] = None  # Display-only v1; never changes PSP amount
+    payment_method_evidence: Optional[Dict[str, Any]] = None  # PSP/client evidence for future offer verification
     idempotency_key: Optional[str] = None  # Best-effort retry safety (agent/gateway)
 
     @model_validator(mode="after")
@@ -102,6 +104,19 @@ class CreateOrderRequest(BaseModel):
                     except Exception:
                         raise ValueError("items[].subtotal is required when quote_id is not provided")
         return self
+
+
+class RecordPaymentOfferEvidenceRequest(BaseModel):
+    """Display-only payment-offer evidence captured after checkout UI state changes."""
+    order_id: Optional[str] = None
+    quote_id: Optional[str] = None
+    merchant_id: Optional[str] = None
+    selected_payment_offer_id: Optional[str] = None
+    payment_method_evidence: Dict[str, Any] = Field(default_factory=dict)
+    payment_offer_evidence: Optional[Dict[str, Any]] = None
+    surface: str = "checkout"
+    event_type: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 class PaymentAction(BaseModel):

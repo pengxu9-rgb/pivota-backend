@@ -32,6 +32,7 @@ async def preview_quote(
             customer_email=req.customer_email,
             shipping_address=req.shipping_address,
             selected_delivery_option=req.selected_delivery_option,
+            payment_context=req.payment_context,
             brief_id=req.brief_id,
             brief_schema_version=req.brief_schema_version,
         )
@@ -78,6 +79,10 @@ async def preview_quote(
         },
         "promotion_lines": result.get("promotion_lines") or [],
         "discount_evidence": result.get("discount_evidence") or {},
+        "store_discount_evidence": result.get("store_discount_evidence") or {},
+        "payment_offer_evidence": result.get("payment_offer_evidence") or {},
+        "payment_pricing": result.get("payment_pricing") or {},
+        "savings_presentation": result.get("savings_presentation") or {},
         "line_items": result.get("line_items") or [],
         "delivery_options": result.get("delivery_options"),
         "debug_id": result.get("debug_id"),

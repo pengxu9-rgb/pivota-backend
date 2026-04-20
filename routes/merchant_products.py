@@ -12,7 +12,7 @@ experience, not the public Agent API.
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel
 
@@ -25,6 +25,7 @@ from db.product_enrichment import (
     upsert_enrichment,
 )
 from db.product_quality_backfill_jobs import (
+    complete_quality_backfill_job,
     create_quality_backfill_job,
     get_active_quality_backfill_job,
     get_quality_backfill_job,
@@ -50,6 +51,8 @@ from sqlalchemy import func, or_, select
 
 router = APIRouter(prefix="/merchant/products", tags=["Merchant Products"])
 
+QUALITY_BACKFILL_STALE_SECONDS = 15 * 60
+
 
 class EnrichmentBackfillRequest(BaseModel):
     platform: Optional[str] = None
@@ -60,6 +63,42 @@ class QualityBackfillRequest(BaseModel):
     platform: Optional[str] = None
     force_refresh: bool = False
     missing_only: bool = True
+
+
+def _parse_quality_backfill_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+    return None
+
+
+def _quality_backfill_job_is_stale(job: Dict[str, Any]) -> bool:
+    if str(job.get("status") or "").lower() != "running":
+        return False
+    started_at = _parse_quality_backfill_datetime(job.get("started_at"))
+    if not started_at:
+        return False
+    return (datetime.utcnow() - started_at).total_seconds() > QUALITY_BACKFILL_STALE_SECONDS
+
+
+async def _process_quality_backfill_job_safely(job_id: Optional[str]) -> None:
+    if not job_id:
+        return
+    try:
+        await process_quality_backfill_job(str(job_id))
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "quality_backfill_background_failed",
+            extra={"job_id": str(job_id), "error": str(exc)[:240]},
+        )
 
 
 def _quality_response(projection: Dict[str, Any]) -> Dict[str, Any]:
@@ -435,13 +474,29 @@ async def queue_quality_backfill(
         platform=body.platform,
     )
     if active_job is not None:
-        return {
-            "status": "queued",
-            "data": {
-                "job": active_job,
-                "already_active": True,
-            },
-        }
+        if _quality_backfill_job_is_stale(active_job):
+            await complete_quality_backfill_job(
+                str(active_job.get("job_id")),
+                status="failed",
+                total_candidates=active_job.get("total_candidates"),
+                processed=active_job.get("processed"),
+                skipped=active_job.get("skipped"),
+                failed=active_job.get("failed"),
+                errors_sample=[
+                    {
+                        "error": "stale_quality_backfill_job_replaced",
+                        "message": "Stale running quality backfill was marked failed before queueing a replacement.",
+                    }
+                ],
+            )
+        else:
+            return {
+                "status": "queued",
+                "data": {
+                    "job": active_job,
+                    "already_active": True,
+                },
+            }
 
     job = await create_quality_backfill_job(
         merchant_id=merchant_id,
@@ -450,7 +505,7 @@ async def queue_quality_backfill(
         force_refresh=body.force_refresh,
         missing_only=body.missing_only,
     )
-    background_tasks.add_task(process_quality_backfill_job, job.get("job_id"))
+    background_tasks.add_task(_process_quality_backfill_job_safely, job.get("job_id"))
 
     return {
         "status": "queued",

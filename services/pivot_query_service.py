@@ -39,6 +39,12 @@ from services.external_seed_search import (
     fetch_external_seed_rows,
     seed_search_terms,
 )
+from services.payment_offer_evidence_service import (
+    PaymentOfferTarget,
+    empty_payment_offer_evidence,
+    resolve_payment_offer_evidence_for_targets,
+)
+from services.savings_presentation_service import build_savings_presentation
 from services.query_semantic_class import classify_query_semantic_class
 from services.quote_service import QuoteService
 
@@ -371,12 +377,26 @@ def _estimate_best_price(base_price: Optional[Decimal], incentives: List[Incenti
     return best
 
 
-def _build_canonical_offer_node(row: Dict[str, Any], incentives: List[IncentiveNode]) -> OfferNode:
+def _build_canonical_offer_node(
+    row: Dict[str, Any],
+    incentives: List[IncentiveNode],
+    payment_offer_evidence: Optional[Dict[str, Any]] = None,
+) -> OfferNode:
     base_price = _to_decimal(row.get("merchant_effective_price"))
     estimated_best_price = _to_decimal(row.get("estimated_best_price"))
-    computed_best = _estimate_best_price(base_price, incentives)
-    if computed_best is not None and (estimated_best_price is None or computed_best < estimated_best_price):
-        estimated_best_price = computed_best
+    currency = row.get("currency")
+    savings_presentation = build_savings_presentation(
+        pricing={
+            "subtotal": base_price,
+            "discount_total": "0",
+            "shipping_fee": "0",
+            "tax": "0",
+            "total": base_price,
+        },
+        currency=currency,
+        payment_offer_evidence=payment_offer_evidence or empty_payment_offer_evidence(),
+        max_summary_badges=4,
+    )
     return OfferNode(
         offer_id=str(row.get("offer_id") or ""),
         catalog_track=str(row.get("offer_catalog_track") or row.get("catalog_track") or "internal_merchant"),
@@ -395,6 +415,8 @@ def _build_canonical_offer_node(row: Dict[str, Any], incentives: List[IncentiveN
             price_confidence=_to_decimal(row.get("price_confidence")),
         ),
         incentives=incentives,
+        payment_offer_evidence=payment_offer_evidence or empty_payment_offer_evidence(),
+        savings_presentation=savings_presentation,
     )
 
 
@@ -710,6 +732,7 @@ async def _build_canonical_items(
     payment_context: Optional[PivotPaymentContext],
     include_vertical_payload: bool,
     include_incentives: bool,
+    market: Optional[str] = None,
 ) -> List[PivotResultItem]:
     if not rows:
         return []
@@ -721,6 +744,35 @@ async def _build_canonical_items(
         if include_incentives
         else {}
     )
+    payment_evidence_by_offer: Dict[str, Dict[str, Any]] = {}
+    targets_by_merchant: Dict[str, List[PaymentOfferTarget]] = {}
+    if include_incentives:
+        for row in rows:
+            offer_id = str(row.get("offer_id") or "").strip()
+            merchant_id = str(row.get("merchant_id") or "").strip()
+            if not offer_id or not merchant_id:
+                continue
+            targets_by_merchant.setdefault(merchant_id, []).append(
+                PaymentOfferTarget(
+                    target_id=offer_id,
+                    merchant_id=merchant_id,
+                    product_id=str(row.get("source_product_id") or "").strip() or None,
+                    variant_id=str(row.get("source_variant_id") or "").strip() or None,
+                    offer_id=offer_id,
+                    amount=_to_decimal(row.get("merchant_effective_price")),
+                    currency=row.get("currency"),
+                    market=market,
+                )
+            )
+        for merchant_id, targets in targets_by_merchant.items():
+            payment_evidence_by_offer.update(
+                await resolve_payment_offer_evidence_for_targets(
+                    merchant_id=merchant_id,
+                    targets=targets,
+                    payment_context=payment_context,
+                    market=market,
+                )
+            )
     items: List[PivotResultItem] = []
 
     for sku_key, sku_rows in grouped.items():
@@ -729,7 +781,13 @@ async def _build_canonical_items(
         for row in sku_rows:
             offer_id = str(row.get("offer_id") or "").strip()
             offer_incentives = incentives_by_offer.get(offer_id, [])
-            offers.append(_build_canonical_offer_node(row, offer_incentives))
+            offers.append(
+                _build_canonical_offer_node(
+                    row,
+                    offer_incentives,
+                    payment_offer_evidence=payment_evidence_by_offer.get(offer_id),
+                )
+            )
         verticals: Dict[str, Any] = {}
         if include_vertical_payload:
             vertical_payload = await _fetch_beauty_vertical_payload(
@@ -1008,6 +1066,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
         canonical_rows,
         query=request.query,
         payment_context=request.payment_context,
+        market=request.market,
         include_vertical_payload=_vertical_intent(request.query),
         include_incentives=request.include_incentives,
     )
@@ -1038,24 +1097,36 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
     return PivotQueryResponse(query=request.query, total=len(items), items=items)
 
 
-async def get_pivot_product(product_key: str) -> Optional[PivotResultItem]:
+async def get_pivot_product(
+    product_key: str,
+    *,
+    payment_context: Optional[PivotPaymentContext] = None,
+    market: Optional[str] = None,
+) -> Optional[PivotResultItem]:
     rows = await _fetch_canonical_rows_for_product(product_key)
     items = await _build_canonical_items(
         rows,
         query=product_key,
-        payment_context=None,
+        payment_context=payment_context,
+        market=market,
         include_vertical_payload=True,
         include_incentives=True,
     )
     return items[0] if items else None
 
 
-async def get_pivot_sku(sku_key: str) -> Optional[PivotResultItem]:
+async def get_pivot_sku(
+    sku_key: str,
+    *,
+    payment_context: Optional[PivotPaymentContext] = None,
+    market: Optional[str] = None,
+) -> Optional[PivotResultItem]:
     rows = await _fetch_canonical_rows_for_sku(sku_key)
     items = await _build_canonical_items(
         rows,
         query=sku_key,
-        payment_context=None,
+        payment_context=payment_context,
+        market=market,
         include_vertical_payload=True,
         include_incentives=True,
     )
@@ -1066,11 +1137,19 @@ async def resolve_pivot_offers(request: PivotOffersResolveRequest) -> PivotOffer
     started = time.perf_counter()
     items: List[PivotResultItem] = []
     if request.sku_key:
-        item = await get_pivot_sku(request.sku_key)
+        item = await get_pivot_sku(
+            request.sku_key,
+            payment_context=request.payment_context,
+            market=request.market,
+        )
         if item:
             items = [item]
     elif request.product_key:
-        item = await get_pivot_product(request.product_key)
+        item = await get_pivot_product(
+            request.product_key,
+            payment_context=request.payment_context,
+            market=request.market,
+        )
         if item:
             items = [item]
     elif request.query:
@@ -1261,6 +1340,7 @@ async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
         customer_email=request.customer_email,
         shipping_address=request.shipping_address,
         selected_delivery_option=request.selected_delivery_option,
+        payment_context=request.payment_context,
         brief_id=None,
         brief_schema_version=None,
     )
@@ -1279,7 +1359,7 @@ async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
     tax = _to_decimal(quote_result.get("pricing", {}).get("tax")) or Decimal("0")
     total = _to_decimal(quote_result.get("pricing", {}).get("total"))
     merchant_effective_price = subtotal - discount_total if subtotal is not None else None
-    estimated_best_price = _estimate_best_price(total, flattened_incentives) if total is not None else None
+    estimated_best_price = total
 
     for row in resolved_rows:
         offer_id = str(row.get("offer_id") or "").strip() or None
@@ -1300,6 +1380,7 @@ async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
             expires_at=quote_result.get("expires_at"),
         )
 
+    payment_offer_evidence = quote_result.get("payment_offer_evidence") or empty_payment_offer_evidence()
     return PivotQuoteResponse(
         quote_id=str(quote_result.get("quote_id") or ""),
         merchant_id=request.merchant_id,
@@ -1312,5 +1393,8 @@ async def preview_pivot_quote(request: PivotQuoteRequest) -> PivotQuoteResponse:
             price_confidence=Decimal("1.0"),
         ),
         incentives=flattened_incentives,
+        store_discount_evidence=quote_result.get("store_discount_evidence") or {},
+        payment_offer_evidence=payment_offer_evidence,
+        savings_presentation=quote_result.get("savings_presentation") or {},
         quote_payload=quote_result,
     )
