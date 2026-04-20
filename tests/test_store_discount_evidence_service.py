@@ -46,6 +46,24 @@ def _promo(**overrides: Any) -> PromotionOut:
     return PromotionOut(**base)
 
 
+def test_store_discount_card_target_prefers_nested_variant_id() -> None:
+    target = module._target_from_product_card(
+        {
+            "merchant_id": "merch_1",
+            "product_id": "prod_1",
+            "id": "prod_1",
+            "price": "10.00",
+            "currency": "USD",
+            "variants": [{"variant_id": "var_real"}],
+        }
+    )
+
+    assert target is not None
+    assert target.product_id == "prod_1"
+    assert target.variant_id == "var_real"
+    assert target.target_id == "merch_1:var_real"
+
+
 @pytest.mark.asyncio
 async def test_store_discount_evidence_basic_code_is_metadata_available(
     monkeypatch: pytest.MonkeyPatch,

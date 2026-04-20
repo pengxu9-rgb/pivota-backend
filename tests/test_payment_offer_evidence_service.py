@@ -43,6 +43,24 @@ def _row(**overrides: Any) -> Dict[str, Any]:
     return base
 
 
+def test_payment_offer_card_target_prefers_nested_variant_id() -> None:
+    target = module._target_from_product_card(
+        {
+            "merchant_id": "merch_1",
+            "product_id": "prod_1",
+            "id": "prod_1",
+            "price": "10.00",
+            "currency": "USD",
+            "variants": [{"variant_id": "var_real"}],
+        }
+    )
+
+    assert target is not None
+    assert target.product_id == "prod_1"
+    assert target.variant_id == "var_real"
+    assert target.target_id == "merch_1:var_real"
+
+
 def test_emit_payment_offer_analytics_event_redacts_payment_method_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

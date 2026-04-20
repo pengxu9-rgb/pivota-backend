@@ -53,6 +53,39 @@ def _lower(value: Any) -> str:
     return _text(value).lower()
 
 
+def _first_nested_variant_id(product: Dict[str, Any]) -> str:
+    for key in ("variants", "options"):
+        values = product.get(key)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            variant_id = _text(
+                item.get("variant_id")
+                or item.get("variantId")
+                or item.get("id")
+                or item.get("sku_id")
+                or item.get("skuId")
+            )
+            if variant_id:
+                return variant_id
+    offers = product.get("offers")
+    if isinstance(offers, list):
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+            variant_id = _text(
+                offer.get("variant_id")
+                or offer.get("variantId")
+                or offer.get("sku_id")
+                or offer.get("skuId")
+            )
+            if variant_id:
+                return variant_id
+    return ""
+
+
 def _as_list(value: Any) -> List[Any]:
     if value is None:
         return []
@@ -413,7 +446,14 @@ async def resolve_store_discount_evidence_for_targets(
 def _target_from_product_card(product: Dict[str, Any], fallback_merchant_id: Optional[str] = None) -> Optional[StoreDiscountTarget]:
     merchant_id = _text(product.get("merchant_id") or fallback_merchant_id)
     product_id = _text(product.get("platform_product_id") or product.get("product_id") or product.get("id"))
-    variant_id = _text(product.get("variant_id") or product.get("id"))
+    variant_id = _text(
+        product.get("variant_id")
+        or product.get("variantId")
+        or product.get("sku_id")
+        or product.get("skuId")
+        or _first_nested_variant_id(product)
+        or product.get("id")
+    )
     if not merchant_id or not (product_id or variant_id):
         return None
     quantity = None
