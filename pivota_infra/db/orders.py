@@ -335,29 +335,26 @@ async def update_order(order_id: str, update_data: Dict[str, Any]) -> bool:
     """更新订单数据"""
     if not update_data:
         return False
-    
-    # 构建更新语句
-    set_clauses = []
-    values = {"order_id": order_id}
-    
+
+    update_values: Dict[str, Any] = {}
     for key, value in update_data.items():
-        if key not in ["order_id", "is_deleted", "created_at"]:  # 保护某些字段
-            # 将Python字段名转换为数据库字段名
-            if hasattr(orders.c, key):
-                set_clauses.append(f"{key} = :{key}")
-                values[key] = value
-    
-    if not set_clauses:
+        if key in {"order_id", "is_deleted", "created_at"}:
+            continue
+        if hasattr(orders.c, key):
+            update_values[key] = value
+
+    if not update_values:
         return False
-    
-    query = f"""
-        UPDATE orders 
-        SET {', '.join(set_clauses)}, updated_at = CURRENT_TIMESTAMP
-        WHERE order_id = :order_id AND is_deleted = false
-        RETURNING order_id
-    """
-    
-    result = await database.fetch_one(query, values)
+
+    update_values["updated_at"] = datetime.now()
+    query = (
+        orders.update()
+        .where((orders.c.order_id == order_id) & (orders.c.is_deleted.is_(False)))
+        .values(**update_values)
+        .returning(orders.c.order_id)
+    )
+
+    result = await database.fetch_one(query)
     return result is not None
 
 # ============================================================================
@@ -398,4 +395,3 @@ async def get_order_stats(merchant_id: str) -> Dict[str, Any]:
         "total_revenue": float(total_revenue),
         "currency": "USD"
     }
-
