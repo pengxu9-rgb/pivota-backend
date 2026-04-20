@@ -312,6 +312,103 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
         and str(source.get("query")) == "external_seed_by_canonical_attached_prefetch"
         for source in (metadata.get("sources") or [])
     )
+
+
+def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_rebind(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "LOWER(COALESCE(title,'')) LIKE" in q:
+            assert values["identity_title_0"] == "%kravebeauty great barrier relief%"
+            assert values["identity_title_1"] == "%great barrier relief%"
+            return [
+                {
+                    "id": "eps_krave_gbr",
+                    "external_product_id": "ext_krave_gbr",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://kravebeauty.com/products/great-barrier-relief",
+                    "canonical_url": "https://kravebeauty.com/products/great-barrier-relief",
+                    "domain": "kravebeauty.com",
+                    "title": "Great Barrier Relief",
+                    "price_amount": 32.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "attached_product_key": "old_merch|shopify|old_product",
+                    "attached_variant_id": "old_variant",
+                    "seed_data": {
+                        "brand": "KraveBeauty",
+                        "variants": [
+                            {
+                                "variant_id": "external_standard",
+                                "title": "Standard - 45 mL",
+                                "price_amount": 32.0,
+                                "price_currency": "USD",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                }
+            ]
+        if "FROM external_product_seeds" in q:
+            raise asyncio.TimeoutError()
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_new",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_new_gbr",
+                    "product_data": {
+                        "id": "prod_new_gbr",
+                        "title": "KraveBeauty Great Barrier Relief",
+                        "brand": "KraveBeauty",
+                        "currency": "USD",
+                        "price": 28.0,
+                        "inventory_quantity": 10,
+                        "variants": [{"id": "variant_new_standard", "price": 28.0, "inventory_quantity": 10}],
+                        "merchant_name": "KraveBeauty",
+                    },
+                }
+            ]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=identity"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "prod_new_gbr"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert len(offers) >= 2
+    assert offers[0]["purchase_route"] == "internal_checkout"
+    external = next(offer for offer in offers if offer.get("purchase_route") == "affiliate_outbound")
+    assert external["source"]["external_product_id"] == "ext_krave_gbr"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("has_external") is True
+    assert any(
+        str(source.get("source")) == "external_product_seeds_identity_retry"
+        and str(source.get("status")) == "ok"
+        and str(source.get("query")) == "external_seed_by_internal_identity"
+        for source in (metadata.get("sources") or [])
+    )
+
+
 def test_offers_resolve_strict_surface_substitutes_same_product_variant(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:

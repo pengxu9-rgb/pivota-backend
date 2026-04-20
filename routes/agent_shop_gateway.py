@@ -3270,6 +3270,15 @@ def _build_internal_offer_summary(
             "variant_id": variant_id,
             "canonical_ref": canonical_ref,
             "product_group_id": canonical_group_id,
+            "title": str(product_payload.get("title") or "").strip() or None,
+            "brand": str(
+                product_payload.get("brand")
+                or product_payload.get("vendor")
+                or product_payload.get("merchant_name")
+                or product_payload.get("store_name")
+                or ""
+            ).strip()
+            or None,
         },
     }
 
@@ -3415,6 +3424,7 @@ async def _handle_offers_resolve(
     substitution_reason_codes: List[str] = []
     exact_target_matched = False
     surface_not_servable_reason_codes: List[str] = []
+    internal_identity_payloads: List[Dict[str, Any]] = []
 
     def _public_reason_code(raw_code: Optional[str]) -> str:
         code = str(raw_code or "").strip().lower()
@@ -3508,6 +3518,106 @@ async def _handle_offers_resolve(
                   AND attached_product_key LIKE :attached_prefix
                   AND ({' OR '.join(match_clauses)})
                 ORDER BY updated_at DESC, created_at DESC
+                LIMIT :limit
+                """,
+                params,
+            ),
+            timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+        )
+        return list(rows or [])
+
+    def _external_identity_terms_from_product_payloads(
+        product_payloads: List[Dict[str, Any]],
+    ) -> tuple[List[str], List[str]]:
+        title_terms: List[str] = []
+        brand_terms: List[str] = []
+
+        def _add_unique(target: List[str], raw: Any, *, min_len: int = 3) -> None:
+            value = _normalize_offer_title(str(raw or ""))
+            if len(value) >= min_len and value not in target:
+                target.append(value)
+
+        for product_payload in product_payloads[:6]:
+            if not isinstance(product_payload, dict):
+                continue
+            title = str(product_payload.get("title") or "").strip()
+            normalized_title = _normalize_offer_title(title)
+            _add_unique(title_terms, title, min_len=5)
+
+            raw_brand_values = [
+                product_payload.get("brand"),
+                product_payload.get("vendor"),
+                product_payload.get("merchant_name"),
+                product_payload.get("store_name"),
+            ]
+            brands_before = list(brand_terms)
+            for raw_brand in raw_brand_values:
+                _add_unique(brand_terms, raw_brand, min_len=3)
+
+            # Shopify merchant products often duplicate the brand in title
+            # (e.g. "KraveBeauty Great Barrier Relief") while external seeds
+            # may keep the canonical product title ("Great Barrier Relief").
+            for brand in brands_before + brand_terms:
+                if normalized_title.startswith(f"{brand} "):
+                    _add_unique(title_terms, normalized_title[len(brand) + 1 :], min_len=5)
+
+        return title_terms[:8], brand_terms[:8]
+
+    async def _fetch_external_seed_rows_by_internal_identity(
+        product_payloads: List[Dict[str, Any]],
+    ) -> List[Any]:
+        title_terms, brand_terms = _external_identity_terms_from_product_payloads(product_payloads)
+        if not title_terms:
+            return []
+
+        params: Dict[str, Any] = {
+            "limit": attached_seed_limit,
+            "market": market_hint,
+            "tool": tool_hint,
+        }
+        title_clauses: List[str] = []
+        for idx, term in enumerate(title_terms):
+            key = f"identity_title_{idx}"
+            params[key] = f"%{term}%"
+            title_clauses.append(
+                "("
+                f"LOWER(COALESCE(title,'')) LIKE :{key}"
+                f" OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key}"
+                ")"
+            )
+
+        brand_clause = "TRUE"
+        if brand_terms:
+            brand_clauses: List[str] = []
+            for idx, brand in enumerate(brand_terms):
+                key = f"identity_brand_{idx}"
+                params[key] = f"%{brand}%"
+                brand_clauses.append(
+                    "("
+                    f"LOWER(COALESCE(seed_data->>'brand','')) LIKE :{key}"
+                    f" OR LOWER(COALESCE(seed_data->>'vendor','')) LIKE :{key}"
+                    f" OR LOWER(COALESCE(domain,'')) LIKE :{key}"
+                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{key}"
+                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{key}"
+                    f" OR LOWER(COALESCE(title,'')) LIKE :{key}"
+                    ")"
+                )
+            brand_clause = "(" + " OR ".join(brand_clauses) + ")"
+
+        rows = await asyncio.wait_for(
+            database.fetch_all(
+                f"""
+                SELECT *
+                FROM external_product_seeds
+                WHERE status = 'active'
+                  AND (CAST(:market AS TEXT) IS NULL OR market = CAST(:market AS TEXT) OR market = '*')
+                  AND (CAST(:tool AS TEXT) IS NULL OR tool = CAST(:tool AS TEXT) OR tool = '*')
+                  AND ({' OR '.join(title_clauses)})
+                  AND {brand_clause}
+                ORDER BY
+                  CASE WHEN attached_product_key IS NULL THEN 1 ELSE 0 END ASC,
+                  updated_at DESC,
+                  created_at DESC
                 LIMIT :limit
                 """,
                 params,
@@ -4144,6 +4254,14 @@ async def _handle_offers_resolve(
                 )
                 if exact_variant is not None or exact_pid_match or not sku_id_aliases:
                     exact_target_matched = True
+                    product_identity_key = f"{merchant_id}:{platform}:{pid}"
+                    if not any(
+                        str(item.get("_identity_key") or "") == product_identity_key
+                        for item in internal_identity_payloads
+                    ):
+                        identity_payload = dict(product_payload)
+                        identity_payload["_identity_key"] = product_identity_key
+                        internal_identity_payloads.append(identity_payload)
 
                 chosen_bundle = (
                     pick_first_eligible_variant_from_standard_product(product_payload)
@@ -4347,6 +4465,30 @@ async def _handle_offers_resolve(
                 source_started=attached_retry_started,
                 error=type(e).__name__,
                 query="external_seed_by_canonical_attached_ref",
+            )
+
+    if allow_external_fallback and not external_offers and internal_identity_payloads:
+        identity_retry_started = time.perf_counter()
+        try:
+            identity_rows = await _fetch_external_seed_rows_by_internal_identity(internal_identity_payloads)
+            await _append_external_offers_from_seed_rows(identity_rows)
+            _record_source(
+                source="external_product_seeds_identity_retry",
+                status="ok" if identity_rows else "empty",
+                reason_code="ok" if identity_rows else "no_candidates",
+                source_started=identity_retry_started,
+                row_count=len(identity_rows or []),
+                query="external_seed_by_internal_identity",
+            )
+        except Exception as e:
+            logger.info("offers.resolve.external.identity_retry.failed", extra={"error": str(e)})
+            _record_source(
+                source="external_product_seeds_identity_retry",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=identity_retry_started,
+                error=type(e).__name__,
+                query="external_seed_by_internal_identity",
             )
 
     # Internal offers always come first for checkout.
