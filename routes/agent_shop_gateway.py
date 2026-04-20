@@ -544,6 +544,67 @@ def _clamp_search_limit(raw_limit: Any, *, fallback: int = 20) -> int:
     return max(1, min(limit, SEARCH_LIMIT_MAX))
 
 
+async def _enrich_product_cards_with_savings_evidence(
+    product_payloads: List[Dict[str, Any]],
+    *,
+    merchant_id: str,
+    payment_context: Optional[PivotPaymentContext] = None,
+    market: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not product_payloads:
+        return product_payloads
+    try:
+        product_payloads = await enrich_product_cards_with_payment_offers(
+            product_payloads,
+            merchant_id=merchant_id,
+            payment_context=payment_context,
+            market=market,
+        )
+        product_payloads = await enrich_product_cards_with_store_discounts(
+            product_payloads,
+            merchant_id=merchant_id,
+        )
+        return product_payloads
+    except Exception as exc:
+        logger.warning(
+            "savings.card_enrichment.batch_failed",
+            extra={
+                "merchant_id": merchant_id,
+                "product_count": len(product_payloads),
+                "error": type(exc).__name__,
+            },
+        )
+
+    isolated: List[Dict[str, Any]] = []
+    for product in product_payloads:
+        if not isinstance(product, dict):
+            continue
+        try:
+            single = await enrich_product_cards_with_payment_offers(
+                [product],
+                merchant_id=merchant_id,
+                payment_context=payment_context,
+                market=market,
+            )
+            single = await enrich_product_cards_with_store_discounts(
+                single,
+                merchant_id=merchant_id,
+            )
+            isolated.append(single[0] if single else product)
+        except Exception as exc:
+            product["savings_evidence_status"] = "unavailable"
+            logger.warning(
+                "savings.card_enrichment.item_failed",
+                extra={
+                    "merchant_id": merchant_id,
+                    "product_id": product.get("product_id") or product.get("id"),
+                    "error": type(exc).__name__,
+                },
+            )
+            isolated.append(product)
+    return isolated
+
+
 def _classify_query_semantic_class(query: Optional[str]) -> str:
     return classify_query_semantic_class(query)
 
@@ -6445,19 +6506,12 @@ async def _handle_find_products(
     end_idx = start_idx + limit
     page_items = filtered[start_idx:end_idx]
     product_payloads = [_standard_to_shop_product(p) for p in page_items]
-    try:
-        product_payloads = await enrich_product_cards_with_payment_offers(
-            product_payloads,
-            merchant_id=merchant_id,
-            payment_context=None,
-            market=None,
-        )
-        product_payloads = await enrich_product_cards_with_store_discounts(
-            product_payloads,
-            merchant_id=merchant_id,
-        )
-    except Exception:
-        pass
+    product_payloads = await _enrich_product_cards_with_savings_evidence(
+        product_payloads,
+        merchant_id=merchant_id,
+        payment_context=None,
+        market=None,
+    )
 
     return {
         "products": product_payloads,
