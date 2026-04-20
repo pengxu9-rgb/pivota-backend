@@ -4,6 +4,7 @@ import json
 import pytest
 
 from scripts.validate_shopify_discounts import Scenario, _quote_request
+from scripts.preflight_shopify_discounts import _scenario_blocker
 
 
 def _args() -> argparse.Namespace:
@@ -56,3 +57,33 @@ def test_quote_request_rejects_invalid_scenario_items_json(monkeypatch):
                 items_env="SHOPIFY_DISCOUNT_TEST_BXGY_ITEMS_JSON",
             ),
         )
+
+
+def test_automatic_and_new_customer_scenarios_can_run_without_codes(monkeypatch):
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED", "1")
+    assert (
+        _scenario_blocker(
+            Scenario(
+                "SFD-003",
+                "automatic amount-off discount",
+                [],
+                expected="automatic_discount",
+                env_required="SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED",
+            )
+        )
+        is None
+    )
+
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_ENABLED", "1")
+    assert (
+        _scenario_blocker(
+            Scenario(
+                "SFD-006",
+                "new-customer or segment eligibility",
+                [],
+                expected="customer_eligibility_evidence",
+                env_required="SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_ENABLED",
+            )
+        )
+        is None
+    )

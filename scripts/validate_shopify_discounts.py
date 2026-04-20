@@ -146,6 +146,7 @@ def _scenario_catalog() -> List[Scenario]:
             "SFD-003",
             "automatic amount-off discount",
             [],
+            items_env="SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ITEMS_JSON",
             expected="automatic_discount",
             env_required="SHOPIFY_DISCOUNT_TEST_AUTOMATIC_ENABLED",
         ),
@@ -169,8 +170,13 @@ def _scenario_catalog() -> List[Scenario]:
             "SFD-006",
             "new-customer or segment eligibility",
             [os.getenv("SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE", "").strip()],
+            items_env="SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_ITEMS_JSON",
             expected="customer_eligibility_evidence",
-            env_required="SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE",
+            env_required=(
+                "SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE"
+                if os.getenv("SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_CODE")
+                else "SHOPIFY_DISCOUNT_TEST_NEW_CUSTOMER_ENABLED"
+            ),
         ),
         Scenario(
             "SFD-007",
@@ -428,7 +434,7 @@ async def _run(args: argparse.Namespace) -> int:
                     }
                 )
                 continue
-            if not any(scenario.discount_codes) and scenario.expected != "automatic_discount":
+            if not any(scenario.discount_codes) and scenario.expected not in {"automatic_discount", "customer_eligibility_evidence"}:
                 rows.append(
                     {
                         "scenario_id": scenario.scenario_id,
