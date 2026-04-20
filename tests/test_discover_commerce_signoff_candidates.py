@@ -43,6 +43,7 @@ def test_build_candidate_marks_live_eligible() -> None:
                     "account_id": None,
                     "provider_config": {
                         "mode": "payment_intent",
+                        "public_key": "pk_live_123",
                         "webhook_endpoint_id": "we_123",
                         "webhook_endpoint_secret": "whsec_123",
                     },
@@ -91,6 +92,7 @@ def test_build_report_counts_gaps_and_capacity() -> None:
                         "account_id": None,
                         "provider_config": {
                             "mode": "payment_intent",
+                            "public_key": "pk_live_123",
                             "webhook_endpoint_id": "we_123",
                             "webhook_endpoint_secret": "whsec_123",
                         },
@@ -198,6 +200,7 @@ def test_main_writes_json_and_markdown(monkeypatch, tmp_path: Path) -> None:
                         "account_id": None,
                         "provider_config": {
                             "mode": "payment_intent",
+                            "public_key": "pk_live_123",
                             "webhook_endpoint_id": "we_123",
                             "webhook_endpoint_secret": "whsec_123",
                         },

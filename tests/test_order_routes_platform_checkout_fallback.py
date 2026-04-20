@@ -124,7 +124,7 @@ def _install_create_new_order_harness(monkeypatch: pytest.MonkeyPatch, module) -
     async def noop_async(*args, **kwargs):
         return None
 
-    async def fake_log_order_event(*, event_type: str, order_id: str, merchant_id: str, metadata=None):
+    async def fake_log_order_event(*, event_type: str, order_id: str, merchant_id: str, metadata=None, **kwargs):
         events.append((event_type, metadata or {}))
         return None
 

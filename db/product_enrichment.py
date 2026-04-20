@@ -39,6 +39,7 @@ product_enrichment = Table(
     # Audit
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
+    extend_existing=True,
 )
 
 Index(
@@ -50,7 +51,14 @@ Index(
 logger = logging.getLogger(__name__)
 
 _PRODUCT_ENRICHMENT_DDL_READY = False
-_PRODUCT_ENRICHMENT_DDL_LOCK = asyncio.Lock()
+_PRODUCT_ENRICHMENT_DDL_LOCK: Optional[asyncio.Lock] = None
+
+
+def _product_enrichment_ddl_lock() -> asyncio.Lock:
+    global _PRODUCT_ENRICHMENT_DDL_LOCK
+    if _PRODUCT_ENRICHMENT_DDL_LOCK is None:
+        _PRODUCT_ENRICHMENT_DDL_LOCK = asyncio.Lock()
+    return _PRODUCT_ENRICHMENT_DDL_LOCK
 
 
 async def ensure_product_enrichment_table() -> None:
@@ -64,7 +72,7 @@ async def ensure_product_enrichment_table() -> None:
     global _PRODUCT_ENRICHMENT_DDL_READY
     if _PRODUCT_ENRICHMENT_DDL_READY:
         return
-    async with _PRODUCT_ENRICHMENT_DDL_LOCK:
+    async with _product_enrichment_ddl_lock():
         if _PRODUCT_ENRICHMENT_DDL_READY:
             return
         try:

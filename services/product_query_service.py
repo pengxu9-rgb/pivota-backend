@@ -128,8 +128,11 @@ async def _fetch_all_cache_rows_with_retry(query: str, params: Dict[str, Any]) -
 
             # Retry via an explicitly-scoped connection to avoid leaking
             # task-scoped acquire/release state across retries.
-            async with database.connection() as conn:
-                return await conn.fetch_all(query, params)
+            connection = database.connection()
+            if hasattr(connection, "__aenter__"):
+                async with connection as conn:
+                    return await conn.fetch_all(query, params)
+            return await connection.fetch_all(query, params)
         except Exception as exc:
             last_exc = exc
             is_transient = _is_transient_cache_db_error(exc)

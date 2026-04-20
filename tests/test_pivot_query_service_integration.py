@@ -1076,6 +1076,18 @@ async def test_preview_pivot_quote_stores_snapshot_and_estimates_incentives(monk
                     "tax": "0.00",
                     "total": "28.00",
                 },
+                "payment_offer_evidence": {
+                    "pricing_confidence": "context_matched",
+                    "offers": [
+                        {
+                            "payment_offer_id": "inc_1",
+                            "label": "Mastercard 5% Off",
+                            "estimated_savings": "1.40",
+                            "estimated_total_after_payment_offer": "26.60",
+                        }
+                    ],
+                    "decisions": [],
+                },
                 "expires_at": datetime.now(timezone.utc),
             }
 
@@ -1117,7 +1129,8 @@ async def test_preview_pivot_quote_stores_snapshot_and_estimates_incentives(monk
 
     assert result.quote_id == "quote_123"
     assert result.pricing.exact_quote_price == Decimal("28.00")
-    assert result.pricing.estimated_best_price == Decimal("26.60")
+    assert result.pricing.estimated_best_price == Decimal("28.00")
+    assert result.payment_offer_evidence["offers"][0]["estimated_total_after_payment_offer"] == "26.60"
     assert len(result.incentives) == 1
     assert len(observed_snapshots) == 1
     assert observed_snapshots[0]["offer_id"] == "offer::1"

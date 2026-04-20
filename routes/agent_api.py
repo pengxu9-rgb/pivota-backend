@@ -19,7 +19,8 @@ import time
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from models.order import CreateOrderRequest, OrderResponse
+from models.order import CreateOrderRequest, OrderResponse, RecordPaymentOfferEvidenceRequest
+from models.catalog import PivotPaymentContext
 from models.standard_product import StandardProduct
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
@@ -27,6 +28,7 @@ from db.orders import (
     find_replayable_order_for_create,
     get_order,
     get_orders_by_merchant,
+    update_order,
     update_payment_info,
 )
 from routes.refund_api import process_refund
@@ -69,6 +71,14 @@ from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
 )
+from services.payment_offer_evidence_service import (
+    emit_payment_offer_analytics_event,
+    enrich_product_cards_with_payment_offers,
+    payment_context_from_mapping,
+    redact_payment_method_evidence,
+    stable_payment_offer_hash,
+)
+from services.store_discount_evidence_service import enrich_product_cards_with_store_discounts
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
 from db.products import get_cached_products
@@ -246,6 +256,10 @@ async def _build_agent_order_create_response_from_order(order: Dict[str, Any]) -
     if pricing_quote:
         response["pricing"] = pricing_quote.get("pricing")
         response["promotion_lines"] = pricing_quote.get("promotion_lines") or []
+        response["discount_evidence"] = pricing_quote.get("discount_evidence") or {}
+        response["payment_offer_evidence"] = pricing_quote.get("payment_offer_evidence") or {}
+        response["payment_pricing"] = pricing_quote.get("payment_pricing") or {}
+        response["savings_presentation"] = pricing_quote.get("savings_presentation") or {}
         response["line_items"] = pricing_quote.get("line_items") or []
         response["quote"] = {
             "quote_id": pricing_quote.get("quote_id"),
@@ -3524,6 +3538,7 @@ async def _load_external_seed_products_for_search(
     )
     should_attempt_stage_b = (
         bool(str(query or "").strip())
+        and not brand_query_detected
         and (
             stage_a_timeout
             or len(stage_a_rows) < stage_b_min_rows
@@ -4345,7 +4360,6 @@ async def agent_get_shopify_webhook_events(
 # 产品搜索和浏览
 # ============================================================================
 
-@router.get("/products/search")
 async def agent_search_products(
     req: Request,
     background_tasks: BackgroundTasks,
@@ -4371,6 +4385,13 @@ async def agent_search_products(
     allow_stale_cache: bool = Query(default=True),
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
+    market: Optional[str] = Query(default=None),
+    psp: Optional[str] = Query(default=None),
+    payment_method_type: Optional[str] = Query(default=None),
+    card_network: Optional[str] = Query(default=None),
+    issuer_name: Optional[str] = Query(default=None),
+    wallet_type: Optional[str] = Query(default=None),
+    installment_provider: Optional[str] = Query(default=None),
     context: AgentContext = Depends(get_agent_context),
 ):
     """
@@ -5879,6 +5900,30 @@ async def agent_search_products(
         # Pagination
         total = len(ranked_candidates)
         paginated_products = ranked_candidates[offset : offset + limit]
+        payment_context_payload = {
+            "psp": psp,
+            "payment_method_type": payment_method_type,
+            "card_network": card_network,
+            "issuer_name": issuer_name,
+            "wallet_type": wallet_type,
+            "installment_provider": installment_provider,
+        }
+        payment_context_payload = {
+            key: str(value).strip()
+            for key, value in payment_context_payload.items()
+            if str(value or "").strip()
+        }
+        payment_context = PivotPaymentContext(**payment_context_payload) if payment_context_payload else None
+        paginated_products = await enrich_product_cards_with_payment_offers(
+            paginated_products,
+            merchant_id=merchant_id,
+            payment_context=payment_context,
+            market=market,
+        )
+        paginated_products = await enrich_product_cards_with_store_discounts(
+            paginated_products,
+            merchant_id=merchant_id,
+        )
         external_count = sum(1 for p in paginated_products if _is_external_seed_product(p))
         if external_count > 0 and not external_seed_inclusion_reason:
             external_seed_inclusion_reason = "ranked_pool_contains_external"
@@ -6164,6 +6209,13 @@ async def agent_search_products_beauty(
     allow_stale_cache: bool = Query(default=True),
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
+    market: Optional[str] = Query(default=None),
+    psp: Optional[str] = Query(default=None),
+    payment_method_type: Optional[str] = Query(default=None),
+    card_network: Optional[str] = Query(default=None),
+    issuer_name: Optional[str] = Query(default=None),
+    wallet_type: Optional[str] = Query(default=None),
+    installment_provider: Optional[str] = Query(default=None),
     context: AgentContext = Depends(get_agent_context),
 ):
     """
@@ -6188,6 +6240,13 @@ async def agent_search_products_beauty(
         allow_stale_cache=allow_stale_cache,
         external_seed_strategy=external_seed_strategy,
         fast_mode=fast_mode,
+        market=market,
+        psp=psp,
+        payment_method_type=payment_method_type,
+        card_network=card_network,
+        issuer_name=issuer_name,
+        wallet_type=wallet_type,
+        installment_provider=installment_provider,
         context=context,
     )
 
@@ -7338,6 +7397,128 @@ async def agent_validate_cart(
 # 订单管理
 # ============================================================================
 
+def _payment_offer_event_type_from_request(
+    request: RecordPaymentOfferEvidenceRequest,
+    redacted_evidence: Dict[str, Any],
+) -> str:
+    explicit = str(request.event_type or "").strip()
+    if explicit:
+        return explicit
+    verification = str(
+        redacted_evidence.get("verification_status")
+        or redacted_evidence.get("status")
+        or ""
+    ).strip().lower()
+    if verification == "psp_verified" or redacted_evidence.get("psp_verified") is True:
+        return "payment_offer.psp_verified"
+    if request.selected_payment_offer_id:
+        return "payment_offer.selected"
+    if redacted_evidence.get("available_payment_methods"):
+        return "payment_offer.available"
+    return "payment_offer.psp_evidence_received"
+
+
+@router.post("/orders/payment-offer-evidence")
+async def agent_record_payment_offer_evidence(
+    evidence_request: RecordPaymentOfferEvidenceRequest,
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Record card/wallet/PSP evidence without changing order totals, PSP amounts,
+    or Shopify discount fields.
+    """
+    if not evidence_request.order_id and not evidence_request.quote_id:
+        raise HTTPException(status_code=400, detail="order_id or quote_id is required")
+
+    order = None
+    if evidence_request.order_id:
+        order = await get_order(str(evidence_request.order_id))
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+    merchant_id = str(
+        evidence_request.merchant_id
+        or (order or {}).get("merchant_id")
+        or ""
+    ).strip()
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required when order_id is omitted")
+    if not context.can_access_merchant(merchant_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+    metadata = _coerce_json_object((order or {}).get("metadata"))
+    pricing_quote = _coerce_json_object(metadata.get("pricing_quote"))
+    quote_id = str(evidence_request.quote_id or pricing_quote.get("quote_id") or "").strip() or None
+    stored_payment_offer_evidence = (
+        evidence_request.payment_offer_evidence
+        if isinstance(evidence_request.payment_offer_evidence, dict)
+        else _coerce_json_object(pricing_quote.get("payment_offer_evidence"))
+    )
+    redacted_evidence = redact_payment_method_evidence(evidence_request.payment_method_evidence)
+    event_type = _payment_offer_event_type_from_request(evidence_request, redacted_evidence)
+    event_record = {
+        "recorded_at": datetime.utcnow().isoformat(),
+        "event_type": event_type,
+        "surface": str(evidence_request.surface or "checkout"),
+        "quote_id": quote_id,
+        "order_id": evidence_request.order_id,
+        "selected_payment_offer_id": evidence_request.selected_payment_offer_id,
+        "payment_method_evidence": redacted_evidence,
+        "payment_offer_evidence_hash": stable_payment_offer_hash(stored_payment_offer_evidence),
+        "application_policy": {
+            "display_only": True,
+            "affects_psp_amount_v1": False,
+            "affects_shopify_discount": False,
+        },
+    }
+
+    if order is not None:
+        events = metadata.get("payment_offer_events")
+        if not isinstance(events, list):
+            events = []
+        events.append(event_record)
+        metadata["payment_offer_events"] = events[-25:]
+        metadata["last_payment_offer_evidence"] = event_record
+        if evidence_request.selected_payment_offer_id:
+            metadata["selected_payment_offer_id"] = evidence_request.selected_payment_offer_id
+        if redacted_evidence:
+            metadata["payment_method_evidence"] = redacted_evidence
+        evidence_hash = event_record.get("payment_offer_evidence_hash")
+        if evidence_hash:
+            metadata["payment_offer_evidence_hash"] = evidence_hash
+        updated = await update_order(str(evidence_request.order_id), {"metadata": metadata})
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to record payment offer evidence")
+
+    try:
+        emit_payment_offer_analytics_event(
+            event_type=event_type,
+            merchant_id=merchant_id,
+            surface=str(evidence_request.surface or "checkout"),
+            evidence=stored_payment_offer_evidence,
+            payment_context=payment_context_from_mapping(redacted_evidence),
+            selected_payment_offer_id=evidence_request.selected_payment_offer_id,
+            payment_method_evidence=redacted_evidence,
+            quote_id=quote_id,
+            order_id=evidence_request.order_id,
+            adapter=redacted_evidence.get("psp"),
+            idempotency_key=evidence_request.idempotency_key or evidence_request.order_id or quote_id,
+        )
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "recorded": True,
+        "order_id": evidence_request.order_id,
+        "quote_id": quote_id,
+        "merchant_id": merchant_id,
+        "event_type": event_type,
+        "payment_method_evidence": redacted_evidence,
+        "application_policy": event_record["application_policy"],
+    }
+
+
 @router.post("/orders/create")
 async def agent_create_order(
     order_request: CreateOrderRequest,
@@ -8030,6 +8211,11 @@ async def agent_create_order(
             if pricing_quote:
                 response["pricing"] = pricing_quote.get("pricing")
                 response["promotion_lines"] = pricing_quote.get("promotion_lines") or []
+                response["discount_evidence"] = pricing_quote.get("discount_evidence") or {}
+                response["store_discount_evidence"] = pricing_quote.get("store_discount_evidence") or {}
+                response["payment_offer_evidence"] = pricing_quote.get("payment_offer_evidence") or {}
+                response["payment_pricing"] = pricing_quote.get("payment_pricing") or {}
+                response["savings_presentation"] = pricing_quote.get("savings_presentation") or {}
                 response["line_items"] = pricing_quote.get("line_items") or []
                 response["quote"] = {
                     "quote_id": pricing_quote.get("quote_id"),

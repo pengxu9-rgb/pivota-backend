@@ -34,6 +34,7 @@ product_quality_backfill_jobs = Table(
     Column("force_refresh", Boolean, nullable=False, default=False),
     Column("missing_only", Boolean, nullable=False, default=True),
     Column("errors_sample", JSON, nullable=True),
+    extend_existing=True,
 )
 
 Index(
@@ -44,7 +45,14 @@ Index(
 )
 
 _DDL_READY = False
-_DDL_LOCK = asyncio.Lock()
+_DDL_LOCK: Optional[asyncio.Lock] = None
+
+
+def _ddl_lock() -> asyncio.Lock:
+    global _DDL_LOCK
+    if _DDL_LOCK is None:
+        _DDL_LOCK = asyncio.Lock()
+    return _DDL_LOCK
 
 
 def _utcnow() -> datetime:
@@ -84,7 +92,7 @@ async def ensure_product_quality_backfill_jobs_table() -> None:
     global _DDL_READY
     if _DDL_READY:
         return
-    async with _DDL_LOCK:
+    async with _ddl_lock():
         if _DDL_READY:
             return
         try:

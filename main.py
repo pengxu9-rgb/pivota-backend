@@ -349,7 +349,7 @@ app = FastAPI(
 
 
 @lru_cache(maxsize=1)
-def _runtime_build_payload() -> dict:
+def _service_version_payload() -> dict:
     commit_sha = (
         os.getenv("RAILWAY_GIT_COMMIT_SHA")
         or os.getenv("GIT_COMMIT_SHA")
@@ -378,18 +378,60 @@ def _runtime_build_payload() -> dict:
         except Exception:
             branch = None
 
+    full_sha = commit_sha or None
+    commit = full_sha[:12] if full_sha else None
+    build_id = (
+        os.getenv("PIVOTA_BUILD_ID")
+        or os.getenv("RAILWAY_DEPLOYMENT_ID")
+        or os.getenv("VERCEL_GIT_COMMIT_SHA")
+        or commit
+        or f"local-{SERVICE_STARTED_AT}"
+    )
+
     return {
         "service": "pivota-backend",
+        "build_id": str(build_id),
+        "started_at": SERVICE_STARTED_AT,
+        "commit": commit,
+        "full_sha": full_sha,
+        "branch": branch,
+        "deployment_id": deployment_id,
+    }
+
+
+@lru_cache(maxsize=1)
+def _runtime_build_payload() -> dict:
+    version = _service_version_payload()
+    return {
+        "service": "pivota-backend",
+        "build_id": version["build_id"],
+        "deployment_id": version["deployment_id"],
+        "commit_sha": version["full_sha"],
+        "full_sha": version["full_sha"],
+        "version": version,
         "git": {
-            "commit_sha": commit_sha,
-            "branch": branch,
+            "commit_sha": version["full_sha"],
+            "branch": version["branch"],
         },
         "railway": {
             "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
-            "deployment_id": deployment_id,
+            "deployment_id": version["deployment_id"],
             "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
+            "service_name": os.getenv("RAILWAY_SERVICE_NAME") or None,
         },
     }
+
+
+@app.middleware("http")
+async def add_service_version_headers(request: Request, call_next):
+    response = await call_next(request)
+    version = _service_version_payload()
+    response.headers["X-Service-Build-Id"] = version["build_id"]
+    if version["commit"]:
+        response.headers["X-Service-Commit"] = version["commit"]
+    if version["deployment_id"]:
+        response.headers["X-Service-Deployment-Id"] = version["deployment_id"]
+    return response
 
 
 def _is_route_mounted(path: str, method: str) -> bool:
@@ -1590,6 +1632,7 @@ async def health_check():
             "missing_columns": missing,
             "error": db_error,
             "build": _runtime_build_payload(),
+            "version": _service_version_payload(),
             "runtime_contracts": _runtime_contracts_payload(),
             "settings_contract": _settings_contract_payload(),
         },

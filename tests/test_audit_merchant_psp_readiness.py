@@ -40,6 +40,7 @@ def test_build_report_distinguishes_live_ready_supported_psp() -> None:
                 "account_id": None,
                 "provider_config": {
                     "mode": "payment_intent",
+                    "public_key": "pk_live_123",
                     "webhook_endpoint_id": "we_123",
                     "webhook_endpoint_secret": "whsec_123",
                 },
@@ -95,6 +96,7 @@ def test_main_runs_validation_only_for_blocked_supported_psps(monkeypatch, tmp_p
                 "account_id": None,
                 "provider_config": {
                     "mode": "payment_intent",
+                    "public_key": "pk_live_123",
                     "webhook_endpoint_id": "we_123",
                     "webhook_endpoint_secret": "whsec_123",
                 },

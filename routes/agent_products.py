@@ -19,6 +19,14 @@ from services.product_exposure_service import (
     AGENT_PUSH_STATUS_EXCLUDED,
     build_agent_push_projection_from_standard_product,
 )
+from services.payment_offer_evidence_service import (
+    enrich_product_cards_with_payment_offers,
+    enrich_product_detail_with_payment_offers,
+)
+from services.store_discount_evidence_service import (
+    enrich_product_cards_with_store_discounts,
+    enrich_product_detail_with_store_discounts,
+)
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -35,6 +43,7 @@ from routes.merchant_onboarding_routes import get_merchant_onboarding
 from fastapi import BackgroundTasks
 from db.database import database
 from db.products import get_product_cache_row
+from models.catalog import PivotPaymentContext
 from models.standard_product import StandardProduct
 from db.product_quality import product_quality_snapshot
 from config.settings import settings
@@ -90,6 +99,27 @@ def _get_quality_thresholds() -> Dict[str, float]:
     except Exception:
         mr_min = 0.0
     return {"cq_min": cq_min, "mr_min": mr_min}
+
+
+def _payment_context_from_query(
+    *,
+    psp: Optional[str] = None,
+    payment_method_type: Optional[str] = None,
+    card_network: Optional[str] = None,
+    issuer_name: Optional[str] = None,
+    wallet_type: Optional[str] = None,
+    installment_provider: Optional[str] = None,
+) -> Optional[PivotPaymentContext]:
+    payload = {
+        "psp": psp,
+        "payment_method_type": payment_method_type,
+        "card_network": card_network,
+        "issuer_name": issuer_name,
+        "wallet_type": wallet_type,
+        "installment_provider": installment_provider,
+    }
+    payload = {k: str(v).strip() for k, v in payload.items() if str(v or "").strip()}
+    return PivotPaymentContext(**payload) if payload else None
 
 
 def _normalize_recommendation_meta(product_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -492,6 +522,13 @@ async def get_merchant_products(
     merchant_id: str,
     background_tasks: BackgroundTasks,
     limit: int = Query(default=50, le=250),
+    market: Optional[str] = Query(default=None),
+    psp: Optional[str] = Query(default=None),
+    payment_method_type: Optional[str] = Query(default=None),
+    card_network: Optional[str] = Query(default=None),
+    issuer_name: Optional[str] = Query(default=None),
+    wallet_type: Optional[str] = Query(default=None),
+    installment_provider: Optional[str] = Query(default=None),
     context: AgentContext = Depends(get_agent_context),
 ):
     """
@@ -655,6 +692,25 @@ async def get_merchant_products(
         else:
             agent_products = enriched_list
 
+        payment_context = _payment_context_from_query(
+            psp=psp,
+            payment_method_type=payment_method_type,
+            card_network=card_network,
+            issuer_name=issuer_name,
+            wallet_type=wallet_type,
+            installment_provider=installment_provider,
+        )
+        agent_products = await enrich_product_cards_with_payment_offers(
+            agent_products,
+            merchant_id=merchant_id,
+            payment_context=payment_context,
+            market=market,
+        )
+        agent_products = await enrich_product_cards_with_store_discounts(
+            agent_products,
+            merchant_id=merchant_id,
+        )
+
         # Log request for analytics
         background_tasks.add_task(
             log_agent_request,
@@ -735,6 +791,13 @@ async def get_product_details(
     merchant_id: str,
     product_id: str,
     background_tasks: BackgroundTasks,
+    market: Optional[str] = Query(default=None),
+    psp: Optional[str] = Query(default=None),
+    payment_method_type: Optional[str] = Query(default=None),
+    card_network: Optional[str] = Query(default=None),
+    issuer_name: Optional[str] = Query(default=None),
+    wallet_type: Optional[str] = Query(default=None),
+    installment_provider: Optional[str] = Query(default=None),
     context: AgentContext = Depends(get_agent_context),
 ):
     """Get detailed information about a specific product"""
@@ -762,6 +825,25 @@ async def get_product_details(
             _product_details_cache_key(merchant_id=merchant_id, platform=str(platform or "unknown"), platform_product_id=str(product_id))
         )
         if cached and isinstance(cached, dict) and cached.get("status") == "success":
+            product_payload = cached.get("product")
+            if isinstance(product_payload, dict):
+                await enrich_product_detail_with_payment_offers(
+                    product_payload,
+                    merchant_id=merchant_id,
+                    payment_context=_payment_context_from_query(
+                        psp=psp,
+                        payment_method_type=payment_method_type,
+                        card_network=card_network,
+                        issuer_name=issuer_name,
+                        wallet_type=wallet_type,
+                        installment_provider=installment_provider,
+                    ),
+                    market=market,
+                )
+                await enrich_product_detail_with_store_discounts(
+                    product_payload,
+                    merchant_id=merchant_id,
+                )
             background_tasks.add_task(
                 log_agent_request,
                 context=context,
@@ -864,6 +946,7 @@ async def get_product_details(
                 "product": {
                     "id": product_id_out,
                     "merchant_id": merchant_id,
+                    "currency": prod.get("currency") or "USD",
                     "title": title,
                     "description": description,
                     "vendor": prod.get("vendor"),
@@ -878,6 +961,23 @@ async def get_product_details(
                 _product_details_cache_key(merchant_id=merchant_id, platform=str(platform or "unknown"), platform_product_id=str(product_id)),
                 resp,
                 PRODUCT_DETAILS_CACHE_TTL_SECONDS,
+            )
+            await enrich_product_detail_with_payment_offers(
+                resp["product"],
+                merchant_id=merchant_id,
+                payment_context=_payment_context_from_query(
+                    psp=psp,
+                    payment_method_type=payment_method_type,
+                    card_network=card_network,
+                    issuer_name=issuer_name,
+                    wallet_type=wallet_type,
+                    installment_provider=installment_provider,
+                ),
+                market=market,
+            )
+            await enrich_product_detail_with_store_discounts(
+                resp["product"],
+                merchant_id=merchant_id,
             )
             return resp
 
@@ -1022,6 +1122,7 @@ async def get_product_details(
             "product": {
                 "id": str(product["id"]),
                 "merchant_id": merchant_id,
+                "currency": "USD",
                 "title": product["title"],
                 "description": product.get("body_html", ""),
                 "description_text": product.get("description_text", ""),
@@ -1039,6 +1140,23 @@ async def get_product_details(
             _product_details_cache_key(merchant_id=merchant_id, platform="shopify", platform_product_id=str(product_id)),
             resp,
             PRODUCT_DETAILS_CACHE_TTL_SECONDS,
+        )
+        await enrich_product_detail_with_payment_offers(
+            resp["product"],
+            merchant_id=merchant_id,
+            payment_context=_payment_context_from_query(
+                psp=psp,
+                payment_method_type=payment_method_type,
+                card_network=card_network,
+                issuer_name=issuer_name,
+                wallet_type=wallet_type,
+                installment_provider=installment_provider,
+            ),
+            market=market,
+        )
+        await enrich_product_detail_with_store_discounts(
+            resp["product"],
+            merchant_id=merchant_id,
         )
         return resp
             

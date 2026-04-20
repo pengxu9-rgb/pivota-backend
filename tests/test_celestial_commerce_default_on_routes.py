@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+
+
+def _fresh_updated_at() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @pytest.mark.asyncio
@@ -16,7 +22,7 @@ async def test_compute_merchant_commerce_readiness_state_marks_supported_platfor
         return {"platform": "shopify", "connected_at": "2026-03-25T00:00:00Z"}
 
     async def fake_fetch_listing_rows(_merchant_id: str):
-        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": "2026-03-30T00:00:00Z"}]
+        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": _fresh_updated_at()}]
 
     async def fake_fetch_click_rows(_merchant_id: str):
         return [{"click_id": "clk_1", "impression_count": 3, "click_count": 1}]
@@ -35,7 +41,12 @@ async def test_compute_merchant_commerce_readiness_state_marks_supported_platfor
                 "status": "active",
                 "api_key": "sk_live_123",
                 "account_id": "acct_123",
-                "provider_config": {"mode": "payment_intent", "webhook_endpoint_id": "we_123", "webhook_endpoint_secret": "sec_123"},
+                "provider_config": {
+                    "mode": "payment_intent",
+                    "public_key": "pk_live_123",
+                    "webhook_endpoint_id": "we_123",
+                    "webhook_endpoint_secret": "sec_123",
+                },
                 "environment": "live",
                 "validation_status": "valid",
                 "validation_error": None,
@@ -75,7 +86,7 @@ async def test_compute_merchant_commerce_readiness_state_marks_woocommerce_and_b
         return {"platform": platform, "connected_at": "2026-03-25T00:00:00Z"}
 
     async def fake_fetch_listing_rows(_merchant_id: str):
-        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": "2026-03-30T00:00:00Z"}]
+        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": _fresh_updated_at()}]
 
     async def fake_fetch_click_rows(_merchant_id: str):
         return [{"click_id": "clk_1", "impression_count": 2, "click_count": 1}]
@@ -94,7 +105,12 @@ async def test_compute_merchant_commerce_readiness_state_marks_woocommerce_and_b
                 "status": "active",
                 "api_key": "sk_live_123",
                 "account_id": "acct_123",
-                "provider_config": {"mode": "payment_intent", "webhook_endpoint_id": "we_123", "webhook_endpoint_secret": "sec_123"},
+                "provider_config": {
+                    "mode": "payment_intent",
+                    "public_key": "pk_live_123",
+                    "webhook_endpoint_id": "we_123",
+                    "webhook_endpoint_secret": "sec_123",
+                },
                 "environment": "live",
                 "validation_status": "valid",
                 "validation_error": None,
@@ -136,7 +152,7 @@ async def test_compute_merchant_commerce_readiness_state_uses_catalog_fallback_f
                 "canonical_product_id": "prod::merch_1::wix::prod_1",
                 "canonical_variant_id": "sku::prod::merch_1::wix::var_1",
                 "surface": "default",
-                "updated_at": "2026-03-30T00:00:00Z",
+                "updated_at": _fresh_updated_at(),
             }
         ]
 
@@ -157,7 +173,12 @@ async def test_compute_merchant_commerce_readiness_state_uses_catalog_fallback_f
                 "status": "active",
                 "api_key": "sk_live_123",
                 "account_id": "acct_123",
-                "provider_config": {"mode": "payment_intent", "webhook_endpoint_id": "we_123", "webhook_endpoint_secret": "sec_123"},
+                "provider_config": {
+                    "mode": "payment_intent",
+                    "public_key": "pk_live_123",
+                    "webhook_endpoint_id": "we_123",
+                    "webhook_endpoint_secret": "sec_123",
+                },
                 "environment": "live",
                 "validation_status": "valid",
                 "validation_error": None,
@@ -194,7 +215,7 @@ async def test_compute_merchant_commerce_readiness_state_blocks_execute_without_
         return {"platform": "wix", "connected_at": "2026-03-25T00:00:00Z"}
 
     async def fake_fetch_listing_rows(_merchant_id: str):
-        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": "2026-03-30T00:00:00Z"}]
+        return [{"status": "indexed", "canonical_variant_id": "cv_1", "updated_at": _fresh_updated_at()}]
 
     async def fake_fetch_click_rows(_merchant_id: str):
         return [{"click_id": "clk_1", "impression_count": 1, "click_count": 0}]

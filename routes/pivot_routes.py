@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from models.catalog import (
     PivotOffersResolveRequest,
     PivotOffersResolveResponse,
+    PivotPaymentContext,
     PivotQueryRequest,
     PivotQueryResponse,
     PivotQuoteRequest,
@@ -37,9 +38,24 @@ async def pivot_query(
 @router.get("/products/{product_key}", response_model=PivotResultItem)
 async def get_product(
     product_key: str,
+    market: Optional[str] = Query(default=None),
+    psp: Optional[str] = Query(default=None),
+    payment_method_type: Optional[str] = Query(default=None),
+    card_network: Optional[str] = Query(default=None),
+    issuer_name: Optional[str] = Query(default=None),
+    wallet_type: Optional[str] = Query(default=None),
+    installment_provider: Optional[str] = Query(default=None),
     _: Dict[str, Any] = Depends(get_current_user),
 ) -> PivotResultItem:
-    item = await get_pivot_product(product_key)
+    payment_context = PivotPaymentContext(
+        psp=psp,
+        payment_method_type=payment_method_type,
+        card_network=card_network,
+        issuer_name=issuer_name,
+        wallet_type=wallet_type,
+        installment_provider=installment_provider,
+    )
+    item = await get_pivot_product(product_key, payment_context=payment_context, market=market)
     if item is None:
         raise HTTPException(status_code=404, detail="Catalog product not found")
     return item
@@ -48,9 +64,24 @@ async def get_product(
 @router.get("/skus/{sku_key}", response_model=PivotResultItem)
 async def get_sku(
     sku_key: str,
+    market: Optional[str] = Query(default=None),
+    psp: Optional[str] = Query(default=None),
+    payment_method_type: Optional[str] = Query(default=None),
+    card_network: Optional[str] = Query(default=None),
+    issuer_name: Optional[str] = Query(default=None),
+    wallet_type: Optional[str] = Query(default=None),
+    installment_provider: Optional[str] = Query(default=None),
     _: Dict[str, Any] = Depends(get_current_user),
 ) -> PivotResultItem:
-    item = await get_pivot_sku(sku_key)
+    payment_context = PivotPaymentContext(
+        psp=psp,
+        payment_method_type=payment_method_type,
+        card_network=card_network,
+        issuer_name=issuer_name,
+        wallet_type=wallet_type,
+        installment_provider=installment_provider,
+    )
+    item = await get_pivot_sku(sku_key, payment_context=payment_context, market=market)
     if item is None:
         raise HTTPException(status_code=404, detail="Catalog sku not found")
     return item

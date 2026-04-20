@@ -369,10 +369,10 @@ def test_test_psp_connection_provisions_stripe_webhook_and_persists_truth(monkey
         assert kwargs["psp_id"] == "psp_stripe_live_1"
         assert kwargs["environment"] == "live"
         return (
-                {
-                    "mode": "payment_intent",
-                    "public_key": "pk_live_stripe_public",
-                    "webhook_endpoint_id": "we_live_123",
+            {
+                "mode": "payment_intent",
+                "public_key": "pk_live_stripe_public",
+                "webhook_endpoint_id": "we_live_123",
                 "webhook_endpoint_secret": "whsec_live_123",
                 "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_live_1",
             },

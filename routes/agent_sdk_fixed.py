@@ -727,6 +727,7 @@ async def list_merchants(
 # PRODUCTS SEARCH
 # ============================================================================
 
+@router.get("/products/search")
 async def search_products(
     req: Request,
     background_tasks: BackgroundTasks,
@@ -998,82 +999,6 @@ async def search_products(
         if in_stock is not None
         else True
     )
-
-    # Keep legacy behavior for explicit external seed browsing.
-    if merchant_id == EXTERNAL_SEED_MERCHANT_ID:
-        seed_metrics: Dict[str, Any] = {}
-        external_products = await _load_external_seed_products_for_search(
-            req=req,
-            query=query,
-            limit=limit,
-            offset=offset,
-            build_budget_ms=AGENT_SDK_FIXED_EXTERNAL_SEED_BUDGET_MS,
-            build_concurrency=FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY,
-            metrics_out=seed_metrics,
-        )
-        seed_query_ms = max(0, int(seed_metrics.get("query_ms") or 0))
-        seed_build_ms = max(0, int(seed_metrics.get("build_ms") or 0))
-        seed_rows_fetched = max(0, int(seed_metrics.get("rows_fetched") or 0))
-        seed_rows_built = max(0, int(seed_metrics.get("rows_built") or 0))
-        seed_budget_exhausted = bool(seed_metrics.get("budget_exhausted") or False)
-        seed_query_timeout = bool(seed_metrics.get("query_timeout") or False)
-        seed_executed = bool(seed_metrics.get("executed", True))
-        seed_skip_reason = str(seed_metrics.get("skip_reason") or "").strip() or None
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        return {
-            "status": "success",
-            "products": external_products,
-            "pagination": {
-                "total": offset + len(external_products),
-                "limit": limit,
-                "offset": offset,
-                "has_more": len(external_products) == limit,
-            },
-            "metadata": {
-                "reason_code": "ok",
-                "source": "agent_sdk_fixed_external_seed",
-                "catalog_surface": normalized_catalog_surface,
-                "latency_ms": latency_ms,
-                "external_seed_returned_count": len(external_products),
-                "route_health": {
-                    "orchestrator_path": "agent_sdk_fixed.products.search",
-                    "decision_node": "agent_sdk_fixed_external_seed",
-                    "primary_path_used": "agent_sdk_fixed_external_seed",
-                    "primary_latency_ms": max(0, int(latency_ms)),
-                    "fallback_triggered": False,
-                    "fallback_reason": None,
-                    "query_semantic_class": "default",
-                    "domain_filter_dropped_external": 0,
-                    "external_fill_gate_reason": seed_skip_reason,
-                    "semantic_retry_applied": False,
-                    "semantic_retry_query": None,
-                    "semantic_retry_hits": 0,
-                    "external_seed_executed": seed_executed,
-                    "external_seed_skip_reason": seed_skip_reason,
-                    "external_seed_query_ms": seed_query_ms,
-                    "external_seed_build_ms": seed_build_ms,
-                    "external_seed_cache_hit": False,
-                    "external_seed_query_timeout": seed_query_timeout,
-                    "external_seed_rows_fetched": seed_rows_fetched,
-                    "external_seed_rows_built": seed_rows_built,
-                    "external_seed_budget_exhausted": seed_budget_exhausted,
-                    "external_seed_brand_strict_rows": 0,
-                    "external_seed_brand_relevant_rows": 0,
-                    "external_seed_broad_fallback_used": False,
-                    "external_seed_broad_scope_rows": 0,
-                    "segment_fetch_ms": 0,
-                    "segment_external_seed_ms": seed_query_ms + seed_build_ms,
-                    "segment_filter_ms": 0,
-                    "segment_hydrate_ms": 0,
-                    "segment_rank_sort_ms": 0,
-                    "segment_log_ms": 0,
-                    "segment_known_total_ms": seed_query_ms + seed_build_ms,
-                    "segment_unattributed_ms": max(
-                        0, int(latency_ms) - (seed_query_ms + seed_build_ms)
-                    ),
-                },
-            },
-        }
 
     try:
         delegate_timeout_s = _resolve_delegate_timeout_seconds(merchant_id)

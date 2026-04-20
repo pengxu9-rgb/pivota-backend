@@ -86,6 +86,7 @@ class IncentivesReconcileResponse(BaseModel):
 
 
 class PivotPaymentContext(BaseModel):
+    psp: Optional[str] = None
     payment_method_type: Optional[str] = None
     card_network: Optional[str] = None
     issuer_name: Optional[str] = None
@@ -185,6 +186,8 @@ class OfferNode(BaseModel):
     inventory_quantity: Optional[int] = None
     pricing: PivotPricing = Field(default_factory=PivotPricing)
     incentives: List[IncentiveNode] = Field(default_factory=list)
+    payment_offer_evidence: Dict[str, Any] = Field(default_factory=dict)
+    savings_presentation: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PivotResultItem(BaseModel):
@@ -231,6 +234,9 @@ class PivotQuoteResponse(BaseModel):
     merchant_id: str
     pricing: PivotPricing
     incentives: List[IncentiveNode] = Field(default_factory=list)
+    store_discount_evidence: Dict[str, Any] = Field(default_factory=dict)
+    payment_offer_evidence: Dict[str, Any] = Field(default_factory=dict)
+    savings_presentation: Dict[str, Any] = Field(default_factory=dict)
     quote_payload: Dict[str, Any] = Field(default_factory=dict)
 
 
