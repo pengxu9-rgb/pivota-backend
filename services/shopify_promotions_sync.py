@@ -27,6 +27,7 @@ from db.connector_credentials import (
     mark_credential_used,
 )
 from services.crypto_service import crypto_service
+from services.merchant_store_service import get_primary_store
 from services.promotions_service import (
     PromotionCreate,
     PromotionUpdate,
@@ -34,6 +35,7 @@ from services.promotions_service import (
     get_promotion,
     update_promotion,
 )
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.shopify_graphql_client import ShopifyGraphQLError, shopify_admin_graphql
 
 logger = logging.getLogger(__name__)
@@ -96,7 +98,8 @@ async def get_shopify_config_for_merchant(merchant_id: str) -> ShopifyStoreConfi
 
     Order of precedence:
     1) Per-merchant encrypted connector_credentials (connector='shopify').
-    2) Global settings/env fallback.
+    2) Active merchant_stores Shopify custom app credentials.
+    3) Global settings/env fallback.
     """
     # Try per-merchant encrypted credentials first
     try:
@@ -133,6 +136,51 @@ async def get_shopify_config_for_merchant(merchant_id: str) -> ShopifyStoreConfi
                     "error": str(exc),
                 },
             )
+
+    # Keep discount-node sync aligned with quote/order paths. Production
+    # merchants commonly connect Shopify via merchant_stores custom app
+    # credentials rather than connector_credentials.
+    try:
+        store = await get_primary_store(merchant_id)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.error(
+            "Failed to load Shopify merchant store for discount sync",
+            extra={
+                "merchant_id": merchant_id,
+                "connector": "shopify",
+                "error": str(exc),
+            },
+        )
+        store = None
+
+    if store and str(store.get("platform") or "").strip().lower() == "shopify":
+        shop_domain = (store.get("domain") or "").strip()
+        access_token, token_meta = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store.get("api_key_raw") or store.get("api_key"),
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
+        access_token = (access_token or "").strip()
+        if shop_domain and access_token:
+            logger.info(
+                "Resolved Shopify discount sync config from merchant_stores",
+                extra={
+                    "merchant_id": merchant_id,
+                    "store_id": store.get("store_id"),
+                    "shop_domain": shop_domain,
+                    "token_refreshed": bool((token_meta or {}).get("refreshed")),
+                },
+            )
+            return ShopifyStoreConfig(shop_domain=shop_domain, access_token=access_token)
+        logger.warning(
+            "Shopify merchant store missing domain or Admin token; falling back to env",
+            extra={
+                "merchant_id": merchant_id,
+                "store_id": store.get("store_id"),
+                "has_shop_domain": bool(shop_domain),
+                "has_access_token": bool(access_token),
+            },
+        )
 
     # Fallback to global configuration
     return await _get_shopify_config_from_env()
