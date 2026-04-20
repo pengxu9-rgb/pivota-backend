@@ -40,6 +40,10 @@ from services.merchant_psp_config_service import (
     evaluate_psp_readiness,
     parse_capabilities,
 )
+from services.merchant_psp_telemetry_service import (
+    get_merchant_psp_telemetry,
+    unavailable_payment_telemetry,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -585,6 +589,8 @@ async def get_merchant_psps(
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         print(f"DEBUG: Found {len(rows)} PSPs in database for merchant {merchant_id}")
 
+        psp_telemetry = await get_merchant_psp_telemetry(merchant_id)
+
         for row in rows:
             row_dict = dict(row)
             capabilities = parse_capabilities(row_dict.get("capabilities"))
@@ -606,7 +612,7 @@ async def get_merchant_psps(
                 "connected_at": row_dict["connected_at"],
                 "capabilities": capabilities,
                 "api_key_last4": api_key[-4:] if api_key and len(api_key) >= 4 else "****",
-                "payment_telemetry_reported": False,
+                **(psp_telemetry.get(psp_id) or unavailable_payment_telemetry()),
                 "is_active": (effective_status or "").lower() == "active",
                 **evaluate_psp_readiness(
                     provider,

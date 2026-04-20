@@ -1,11 +1,13 @@
 """PSP telemetry endpoints."""
 from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
+from services.merchant_psp_telemetry_service import (
+    get_merchant_psp_telemetry,
+    unavailable_payment_telemetry,
+)
 from utils.auth import get_current_user
 
 router = APIRouter()
-
-PAYMENT_TELEMETRY_NOT_REPORTED = "Payment telemetry not reported"
 
 @router.get("/merchant/psps/{psp_id}/metrics")
 async def get_psp_metrics(
@@ -18,26 +20,27 @@ async def get_psp_metrics(
     
     try:
         # Get PSP info
-        psp_query = "SELECT provider FROM merchant_psps WHERE psp_id = :psp_id"
+        psp_query = "SELECT psp_id, provider, merchant_id FROM merchant_psps WHERE psp_id = :psp_id"
         psp = await database.fetch_one(psp_query, {"psp_id": psp_id})
         
         if not psp:
-            return {
-                "payment_telemetry_reported": False,
-                "message": PAYMENT_TELEMETRY_NOT_REPORTED
-            }
+            return unavailable_payment_telemetry()
         
         provider = psp["provider"]
+        merchant_id = psp["merchant_id"]
+        if current_user["role"] == "merchant" and str(current_user.get("merchant_id")) != str(merchant_id):
+            raise HTTPException(status_code=404, detail="PSP not found")
+        telemetry = await get_merchant_psp_telemetry(str(merchant_id), psp_id=psp_id)
 
         return {
             "provider": provider,
-            "payment_telemetry_reported": False,
-            "message": PAYMENT_TELEMETRY_NOT_REPORTED
+            **(telemetry.get(psp_id) or unavailable_payment_telemetry()),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return {
-            "payment_telemetry_reported": False,
-            "message": PAYMENT_TELEMETRY_NOT_REPORTED,
+            **unavailable_payment_telemetry(),
             "error": str(e)
         }
 
@@ -53,6 +56,7 @@ async def get_all_psp_metrics(current_user: dict = Depends(get_current_user)):
         # Get all PSPs
         psps_query = "SELECT psp_id, provider FROM merchant_psps WHERE merchant_id = :merchant_id"
         psps = await database.fetch_all(psps_query, {"merchant_id": merchant_id})
+        telemetry = await get_merchant_psp_telemetry(str(merchant_id))
         
         metrics = {}
         for psp in psps:
@@ -61,8 +65,7 @@ async def get_all_psp_metrics(current_user: dict = Depends(get_current_user)):
 
             metrics[psp_id] = {
                 "provider": provider,
-                "payment_telemetry_reported": False,
-                "message": PAYMENT_TELEMETRY_NOT_REPORTED
+                **(telemetry.get(psp_id) or unavailable_payment_telemetry()),
             }
         
         return {

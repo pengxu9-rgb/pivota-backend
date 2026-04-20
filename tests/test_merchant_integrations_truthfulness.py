@@ -170,6 +170,26 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
 
     async def fake_fetch_all(query, values=None):
         query_norm = " ".join(query.split())
+        if "payment_attempts" in query_norm:
+            return [
+                {
+                    "psp_id": "psp_adyen_1",
+                    "provider": "adyen",
+                    "total_count": 0,
+                    "success_count": 0,
+                    "total_volume": 0,
+                }
+            ]
+        if "LEFT JOIN orders" in query_norm:
+            return [
+                {
+                    "psp_id": "psp_adyen_1",
+                    "provider": "adyen",
+                    "total_count": 0,
+                    "success_count": 0,
+                    "total_volume": 0,
+                }
+            ]
         if "FROM merchant_psps" in query_norm:
             return [
                 {
@@ -208,6 +228,60 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
     assert "success_rate" not in payload
     assert "volume_today" not in payload
     assert "transaction_count" not in payload
+
+
+def test_get_merchant_psps_reports_real_attempt_telemetry(monkeypatch) -> None:
+    client, module = _build_client()
+
+    async def fake_fetch_all(query, values=None):
+        query_norm = " ".join(query.split())
+        if "payment_attempts" in query_norm:
+            return [
+                {
+                    "psp_id": "psp_stripe_1",
+                    "provider": "stripe",
+                    "total_count": 4,
+                    "success_count": 3,
+                    "total_volume": 125.5,
+                }
+            ]
+        if "FROM merchant_psps" in query_norm:
+            return [
+                {
+                    "psp_id": "psp_stripe_1",
+                    "provider": "stripe",
+                    "name": "Stripe Account",
+                    "account_id": "acct_live_123",
+                    "status": "active",
+                    "connected_at": None,
+                    "capabilities": "card",
+                    "api_key": "sk_live_stripe_secret",
+                    "environment": "live",
+                    "provider_config": {
+                        "mode": "payment_intent",
+                        "public_key": "pk_live_stripe_public",
+                        "webhook_endpoint_id": "we_live_123",
+                        "webhook_endpoint_secret": "whsec_live_123",
+                    },
+                    "validation_status": "valid",
+                    "validation_error": None,
+                    "last_validated_at": None,
+                }
+            ]
+        raise AssertionError(f"Unexpected query: {query_norm}")
+
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+
+    response = client.get("/merchant/merch_test_integrations/psps")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]["psps"][0]
+    assert payload["payment_telemetry_reported"] is True
+    assert payload["payment_telemetry_source"] == "payment_attempts"
+    assert payload["payment_telemetry_window"] == "utc_day"
+    assert payload["success_rate"] == 75.0
+    assert payload["volume_today"] == 125.5
+    assert payload["transaction_count"] == 4
 
 
 def test_test_psp_connection_persists_environment_and_validation_truth(monkeypatch) -> None:
