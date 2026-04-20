@@ -164,7 +164,7 @@ promotions = Table(
     Column("created_at", DateTime, default=datetime.datetime.utcnow, nullable=False),
     Column("updated_at", DateTime, default=datetime.datetime.utcnow, nullable=False),
     Column("deleted_at", DateTime, nullable=True),
-    CheckConstraint("start_at < end_at", name="ck_promotions_time_window"),
+    CheckConstraint("end_at IS NULL OR start_at < end_at", name="ck_promotions_time_window"),
 )
 
 # Create synchronous engine for table creation
