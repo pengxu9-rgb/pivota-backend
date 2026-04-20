@@ -224,10 +224,11 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
     assert payload["provider_summary"]["client_key_present"] is True
     assert payload["live_charge_ready"] is True
     assert payload["readiness_blockers"] == []
-    assert payload["payment_telemetry_reported"] is False
-    assert "success_rate" not in payload
-    assert "volume_today" not in payload
-    assert "transaction_count" not in payload
+    assert payload["payment_telemetry_reported"] is True
+    assert payload["payment_telemetry_state"] == "no_activity"
+    assert payload["success_rate"] is None
+    assert payload["volume_today"] == 0
+    assert payload["transaction_count"] == 0
 
 
 def test_get_merchant_psps_reports_real_attempt_telemetry(monkeypatch) -> None:

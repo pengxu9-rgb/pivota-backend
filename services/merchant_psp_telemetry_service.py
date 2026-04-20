@@ -17,6 +17,7 @@ from db.database import database
 logger = logging.getLogger(__name__)
 
 PAYMENT_TELEMETRY_NOT_REPORTED = "Payment telemetry not reported"
+PAYMENT_TELEMETRY_NO_ACTIVITY = "No payment activity today"
 PAYMENT_TELEMETRY_WINDOW = "utc_day"
 SUCCESS_ATTEMPT_STATUSES = ("success", "succeeded")
 SUCCESS_ORDER_STATUSES = ("paid", "completed", "succeeded")
@@ -30,9 +31,23 @@ def _today_start_utc() -> datetime:
 def unavailable_payment_telemetry() -> Dict[str, Any]:
     return {
         "payment_telemetry_reported": False,
+        "payment_telemetry_state": "not_reported",
         "payment_telemetry_source": None,
         "payment_telemetry_window": PAYMENT_TELEMETRY_WINDOW,
         "message": PAYMENT_TELEMETRY_NOT_REPORTED,
+    }
+
+
+def no_activity_payment_telemetry(*, source: str) -> Dict[str, Any]:
+    return {
+        "payment_telemetry_reported": True,
+        "payment_telemetry_state": "no_activity",
+        "payment_telemetry_source": source,
+        "payment_telemetry_window": PAYMENT_TELEMETRY_WINDOW,
+        "success_rate": None,
+        "volume_today": 0,
+        "transaction_count": 0,
+        "message": PAYMENT_TELEMETRY_NO_ACTIVITY,
     }
 
 
@@ -61,6 +76,7 @@ def _reported_telemetry(*, total_count: Any, success_count: Any, volume: Any, so
 
     return {
         "payment_telemetry_reported": True,
+        "payment_telemetry_state": "reported",
         "payment_telemetry_source": source,
         "payment_telemetry_window": PAYMENT_TELEMETRY_WINDOW,
         "success_rate": round((successful / total) * 100, 1),
@@ -103,6 +119,7 @@ async def get_merchant_psp_telemetry(
         params["psp_id"] = psp_id
 
     attempt_rows: Dict[str, Dict[str, Any]] = {}
+    attempt_query_succeeded = False
     try:
         attempt_query = f"""
             SELECT
@@ -139,6 +156,7 @@ async def get_merchant_psp_telemetry(
             GROUP BY mp.psp_id, mp.provider
         """
         attempt_rows = _normalize_rows(await database.fetch_all(attempt_query, params))
+        attempt_query_succeeded = True
     except Exception as exc:
         logger.info("Payment attempt telemetry unavailable for merchant %s: %s", merchant_id, exc)
 
@@ -157,6 +175,7 @@ async def get_merchant_psp_telemetry(
 
     # Fallback for legacy orders that have explicit PSP attribution but no
     # payment_attempts rows. This is still real attributed data, not a default.
+    order_query_succeeded = False
     if missing_psp_ids or not attempt_rows:
         try:
             order_query = f"""
@@ -197,6 +216,7 @@ async def get_merchant_psp_telemetry(
                 GROUP BY mp.psp_id, mp.provider
             """
             for row in await database.fetch_all(order_query, params):
+                order_query_succeeded = True
                 row_dict = dict(row)
                 row_psp_id = str(row_dict.get("psp_id") or "").strip()
                 if not row_psp_id:
@@ -212,8 +232,13 @@ async def get_merchant_psp_telemetry(
                 if metric.get("payment_telemetry_reported"):
                     telemetry[row_psp_id] = metric
                 else:
-                    telemetry.setdefault(row_psp_id, unavailable_payment_telemetry())
+                    telemetry.setdefault(row_psp_id, no_activity_payment_telemetry(source="orders"))
         except Exception as exc:
             logger.info("Order PSP telemetry unavailable for merchant %s: %s", merchant_id, exc)
+
+    if attempt_query_succeeded or order_query_succeeded:
+        for row_psp_id in attempt_rows:
+            if not telemetry.get(row_psp_id, {}).get("payment_telemetry_reported"):
+                telemetry[row_psp_id] = no_activity_payment_telemetry(source="payment_attempts")
 
     return telemetry
