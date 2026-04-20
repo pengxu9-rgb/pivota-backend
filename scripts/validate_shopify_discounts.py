@@ -29,6 +29,7 @@ class Scenario:
     description: str
     discount_codes: List[str]
     quantity: int = 1
+    items_env: Optional[str] = None
     expected: str = "record_only"
     env_required: Optional[str] = None
     required_code_count: int = 0
@@ -153,6 +154,7 @@ def _scenario_catalog() -> List[Scenario]:
             "Buy X Get Y code",
             [os.getenv("SHOPIFY_DISCOUNT_TEST_BXGY_CODE", "").strip()],
             quantity=int(os.getenv("SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY", "2") or "2"),
+            items_env="SHOPIFY_DISCOUNT_TEST_BXGY_ITEMS_JSON",
             expected="valid_code_discount",
             env_required="SHOPIFY_DISCOUNT_TEST_BXGY_CODE",
         ),
@@ -200,6 +202,7 @@ def _scenario_catalog() -> List[Scenario]:
                 os.getenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_B", "").strip(),
             ],
             quantity=int(os.getenv("SHOPIFY_DISCOUNT_TEST_COMBINABLE_QUANTITY", "1") or "1"),
+            items_env="SHOPIFY_DISCOUNT_TEST_COMBINABLE_ITEMS_JSON",
             expected="all_codes_applicable_discount",
             env_required="SHOPIFY_DISCOUNT_TEST_COMBINABLE_CODE_A",
             required_code_count=2,
@@ -216,6 +219,7 @@ def _scenario_catalog() -> List[Scenario]:
                 or os.getenv("SHOPIFY_DISCOUNT_TEST_BXGY_QUANTITY", "2")
                 or "2"
             ),
+            items_env="SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_ITEMS_JSON",
             expected="conflict_recorded",
             env_required="SHOPIFY_DISCOUNT_TEST_NONCOMBINABLE_CODE_A",
             required_code_count=2,
@@ -223,17 +227,46 @@ def _scenario_catalog() -> List[Scenario]:
     ]
 
 
+def _items_from_env(env_name: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    if not env_name:
+        return None
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{env_name} must be a JSON array of quote items: {exc}") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise SystemExit(f"{env_name} must be a non-empty JSON array of quote items")
+    items: List[Dict[str, Any]] = []
+    for idx, row in enumerate(parsed):
+        if not isinstance(row, dict):
+            raise SystemExit(f"{env_name}[{idx}] must be an object")
+        product_id = str(row.get("product_id") or "").strip()
+        variant_id = str(row.get("variant_id") or "").strip()
+        try:
+            quantity = int(row.get("quantity") or 0)
+        except Exception as exc:
+            raise SystemExit(f"{env_name}[{idx}].quantity must be an integer") from exc
+        if not product_id or not variant_id or quantity <= 0:
+            raise SystemExit(f"{env_name}[{idx}] must include product_id, variant_id, and quantity > 0")
+        items.append({"product_id": product_id, "variant_id": variant_id, "quantity": quantity})
+    return items
+
+
 def _quote_request(args: argparse.Namespace, scenario: Scenario) -> Dict[str, Any]:
+    items = _items_from_env(scenario.items_env) or [
+        {
+            "product_id": args.product_id,
+            "variant_id": args.variant_id,
+            "quantity": scenario.quantity,
+        }
+    ]
     return {
         "merchant_id": args.merchant_id,
         "customer_email": args.customer_email,
-        "items": [
-            {
-                "product_id": args.product_id,
-                "variant_id": args.variant_id,
-                "quantity": scenario.quantity,
-            }
-        ],
+        "items": items,
         "discount_codes": [code for code in scenario.discount_codes if code],
         "shipping_address": _shipping_address(),
     }
