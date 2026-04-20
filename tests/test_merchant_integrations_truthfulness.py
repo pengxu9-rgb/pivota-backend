@@ -180,7 +180,7 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
                     "status": "active",
                     "connected_at": None,
                     "capabilities": "card,bank_transfer",
-                    "api_key": "test_adyen_key",
+                    "api_key": "live_adyen_key",
                     "environment": "live",
                     "provider_config": {"merchant_account": "WoopayECOM", "client_key": "pub_123"},
                     "validation_status": "valid",
@@ -204,6 +204,10 @@ def test_get_merchant_psps_returns_environment_and_provider_summary(monkeypatch)
     assert payload["provider_summary"]["client_key_present"] is True
     assert payload["live_charge_ready"] is True
     assert payload["readiness_blockers"] == []
+    assert payload["payment_telemetry_reported"] is False
+    assert "success_rate" not in payload
+    assert "volume_today" not in payload
+    assert "transaction_count" not in payload
 
 
 def test_test_psp_connection_persists_environment_and_validation_truth(monkeypatch) -> None:
@@ -278,7 +282,7 @@ def test_test_psp_connection_provisions_stripe_webhook_and_persists_truth(monkey
             "merchant_id": "merch_test_integrations",
             "status": "active",
             "environment": "live",
-            "provider_config": {"mode": "payment_intent"},
+            "provider_config": {"mode": "payment_intent", "public_key": "pk_live_stripe_public"},
             "validation_status": "unknown",
             "validation_error": None,
         }
@@ -290,9 +294,10 @@ def test_test_psp_connection_provisions_stripe_webhook_and_persists_truth(monkey
         assert kwargs["psp_id"] == "psp_stripe_live_1"
         assert kwargs["environment"] == "live"
         return (
-            {
-                "mode": "payment_intent",
-                "webhook_endpoint_id": "we_live_123",
+                {
+                    "mode": "payment_intent",
+                    "public_key": "pk_live_stripe_public",
+                    "webhook_endpoint_id": "we_live_123",
                 "webhook_endpoint_secret": "whsec_live_123",
                 "webhook_url": "https://api.pivota.cc/webhooks/stripe/psp_stripe_live_1",
             },

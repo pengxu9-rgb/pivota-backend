@@ -847,11 +847,10 @@ class PaymentRoutingService:
         # - Transaction amount tiers
         
         return {
-            "recommended_psp": "stripe",
-            "reasoning": "Highest success rate in last 24 hours",
+            "recommended_psp": None,
+            "reasoning": "Routing telemetry is not measured yet",
             "metrics": {
-                "success_rate": 98.5,
-                "avg_response_time_ms": 250
+                "payment_telemetry_reported": False
             }
         }
     

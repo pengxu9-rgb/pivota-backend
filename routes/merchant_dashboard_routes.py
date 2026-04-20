@@ -566,7 +566,7 @@ async def get_merchant_psps(
     merchant_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get merchant's connected PSPs with real metrics"""
+    """Get merchant's connected PSPs."""
     if current_user["role"] not in ["merchant", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -584,53 +584,7 @@ async def get_merchant_psps(
         
         rows = await database.fetch_all(query, {"merchant_id": merchant_id})
         print(f"DEBUG: Found {len(rows)} PSPs in database for merchant {merchant_id}")
-        
-        # Calculate metrics from real orders table
-        total_volume = 0
-        success_rate = 98.5
-        transaction_count = 0
-        
-        try:
-            # Get metrics from real orders - grouped by PSP (simplified: just filter deleted, keep original payment_status logic)
-            # Prefer orders.psp_used when available (actual PSP used, e.g. from MultiPSP orchestrator),
-            # fall back to legacy psp_id for old records.
-            metrics_query = """
-                SELECT 
-                    COALESCE(psp_used, psp_id) AS psp_key,
-                    COUNT(*) as total_orders,
-                    SUM(
-                        CASE 
-                            WHEN payment_status IN ('paid', 'completed', 'succeeded') 
-                            THEN 1 
-                            ELSE 0 
-                        END
-                    ) as successful_orders,
-                    COALESCE(SUM(total), 0) as total_volume
-                FROM orders
-                WHERE merchant_id = :merchant_id 
-                AND (psp_used IS NOT NULL OR psp_id IS NOT NULL)
-                AND (is_deleted IS NULL OR is_deleted = FALSE)
-                GROUP BY COALESCE(psp_used, psp_id)
-            """
-            psp_metrics = await database.fetch_all(metrics_query, {
-                "merchant_id": merchant_id
-            })
-            
-            # Create a map of PSP metrics keyed by psp_key
-            psp_stats = {}
-            for metric in psp_metrics:
-                psp_stats[metric["psp_key"]] = {
-                    "total_orders": metric["total_orders"] or 0,
-                    "successful_orders": metric["successful_orders"] or 0,
-                    "total_volume": float(metric["total_volume"] or 0),
-                    "success_rate": round((metric["successful_orders"] / metric["total_orders"] * 100), 1) if metric["total_orders"] > 0 else 0
-                }
-        except Exception as e:
-            print(f"Could not fetch order metrics: {e}")
-            import traceback
-            traceback.print_exc()
-            psp_stats = {}  # Use empty dict if orders table doesn't exist
-        
+
         for row in rows:
             row_dict = dict(row)
             capabilities = parse_capabilities(row_dict.get("capabilities"))
@@ -642,14 +596,7 @@ async def get_merchant_psps(
             effective_status = row_dict["status"]
             if not configured and (effective_status or "").lower() == "active":
                 effective_status = "pending"
-            # Prefer metrics keyed by provider (psp_used), fall back to legacy psp_id
-            stats = psp_stats.get(provider) or psp_stats.get(psp_id) or {
-                "total_orders": 0,
-                "successful_orders": 0,
-                "total_volume": 0,
-                "success_rate": 0,
-            }
-            
+
             psps.append({
                 "id": psp_id,
                 "provider": row_dict["provider"],
@@ -659,9 +606,7 @@ async def get_merchant_psps(
                 "connected_at": row_dict["connected_at"],
                 "capabilities": capabilities,
                 "api_key_last4": api_key[-4:] if api_key and len(api_key) >= 4 else "****",
-                "success_rate": stats["success_rate"],
-                "volume_today": round(stats["total_volume"], 2),  # Now showing actual volume for this PSP
-                "transaction_count": stats["total_orders"],
+                "payment_telemetry_reported": False,
                 "is_active": (effective_status or "").lower() == "active",
                 **evaluate_psp_readiness(
                     provider,
@@ -675,7 +620,7 @@ async def get_merchant_psps(
                 ),
                 "last_validated_at": row_dict.get("last_validated_at").isoformat() if row_dict.get("last_validated_at") else None,
             })
-            print(f"DEBUG: PSP {psp_id} - Volume: ${stats['total_volume']:.2f}, Transactions: {stats['total_orders']}")
+            print(f"DEBUG: PSP {psp_id} - payment telemetry not reported")
     except Exception as e:
         print(f"Database error in get_merchant_psps: {e}")
         import traceback
