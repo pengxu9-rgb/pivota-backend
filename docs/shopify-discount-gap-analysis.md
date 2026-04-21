@@ -31,7 +31,7 @@ Top remaining gaps for the current merchant now are:
    - The last completed validation had `PIVOTA_TEST_COMBO_A` returning `applicable=false`, so the system still lacks recorded proof that two intended combinable Shopify-native discounts can both apply and remain aligned with Pivota quote totals. The merchant has since reported that the fixture is repaired; it must be rerun before this can be marked proven.
 
 4. `Automatic and restricted-customer discount execution` is not live-proven.
-   - Storefront parsing, GraphQL sync metadata, and new-customer evidence logic exist, but this merchant still needs explicit Shopify-native fixtures for automatic, segment, and new-customer cases.
+   - Automatic execution is now live-proven for the current merchant, but restricted customer / new-customer execution still needs explicit Shopify-native fixtures.
 
 5. `Usage-limit and active-window positive boundaries are pending rerun or still fixture-blocked`.
    - The last completed validation had `PIVOTA_TEST_EXHAUSTED` still applicable in quote/cart validation, and quote probes do not consume usage. The merchant has since reported that the exhausted fixture is ready; it must be rerun before usage exhaustion can be marked proven. `PIVOTA_TEST_EXPIRED` proves inactive rejection, but there is no active-window-positive fixture.
@@ -41,6 +41,11 @@ Top remaining gaps for the current merchant now are:
 
 7. `Merchant setup validation now has a preflight gate, but it must be run after fixture changes`.
    - `scripts/preflight_shopify_discounts.py` checks backend health, product/variant quoteability, authoritative shipping evidence, fixture code behavior, and read-only Admin GraphQL `discountNodes` access when an internal admin key is provided. Remaining blockers are merchant-side: update the merchant custom app Admin token for `read_discounts`, rerun the repaired combinable/exhausted fixtures, and add automatic/customer-context fixtures.
+
+8. `Current merchant token cannot auto-create missing Shopify-native fixtures`.
+   - Real-time access-scope preflight now proves the current merchant token has `read_discounts` but not `write_discounts`.
+   - That means Pivota can read/sync discounts and validate them, but it cannot safely create the missing fixed-amount / usage-limit / segment/new-customer / upcoming-window fixtures on the merchant's behalf until the merchant custom app is reissued with `write_discounts`.
+   - Evidence: `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/access_scopes_preflight.json`
 
 ## What should be fixed first
 

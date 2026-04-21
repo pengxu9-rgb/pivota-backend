@@ -34,6 +34,7 @@ Still not proven for the current merchant:
 - segment-restricted or new-customer-restricted Shopify-native discount execution
 - usage-limit exhaustion boundary
 - active-window positive boundary
+- auto-creation of missing Shopify-native fixtures by Pivota (current merchant token has `read_discounts` but not `write_discounts`)
 
 Current evidence artifacts:
 
@@ -45,6 +46,7 @@ Current evidence artifacts:
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.response.json`
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.request.json`
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/access_scopes_preflight.json`
 
 ## Tested scenarios
 
