@@ -281,7 +281,7 @@ async def create_shopify_discount_validation_fixtures(
             "endsAt": None,
             "customerSelection": {"all": True},
             "customerGets": {
-                "value": {"discountAmount": {"amount": "0.60", "appliesOnEachItem": True}},
+                "value": {"discountAmount": {"amount": "0.60", "appliesOnEachItem": False}},
                 "items": {"all": True},
             },
         },
@@ -331,7 +331,7 @@ async def create_shopify_discount_validation_fixtures(
             "endsAt": None,
             "context": {"customerSegments": {"add": [segment_domain["id"]]}},
             "customerGets": {
-                "value": {"discountAmount": {"amount": "0.50", "appliesOnEachItem": True}},
+                "value": {"discountAmount": {"amount": "0.50", "appliesOnEachItem": False}},
                 "items": {"all": True},
             },
         },
@@ -347,7 +347,7 @@ async def create_shopify_discount_validation_fixtures(
             "endsAt": None,
             "context": {"customerSegments": {"add": [segment_new_customer["id"]]}},
             "customerGets": {
-                "value": {"discountAmount": {"amount": "0.75", "appliesOnEachItem": True}},
+                "value": {"discountAmount": {"amount": "0.75", "appliesOnEachItem": False}},
                 "items": {"all": True},
             },
         },
