@@ -302,6 +302,7 @@ def _shopify_buyer_delivery_address_preference_input(
 
 def _shopify_cart_buyer_identity_input(
     *,
+    customer_email: Optional[str],
     country: Optional[str],
     postal: Optional[str],
     city: Optional[str],
@@ -311,6 +312,9 @@ def _shopify_cart_buyer_identity_input(
     use_buyer_country_for_pricing: bool,
 ) -> Dict[str, Any]:
     buyer_identity: Dict[str, Any] = {}
+    email = str(customer_email or "").strip()
+    if email:
+        buyer_identity["email"] = email
     if use_buyer_country_for_pricing and country:
         buyer_identity["countryCode"] = country
     if country and postal:
@@ -1062,6 +1066,7 @@ query($ids: [ID!]!) {
                 storefront_token=storefront_token,
                 items=items,
                 discount_codes=discount_codes,
+                customer_email=customer_email,
                 shipping_address=shipping_address,
                 selected_delivery_option=selected_delivery_option,
                 use_buyer_country_for_pricing=use_buyer_country_for_pricing,
@@ -1098,6 +1103,7 @@ query($ids: [ID!]!) {
                                 storefront_token=storefront_token,
                                 items=items,
                                 discount_codes=discount_codes,
+                                customer_email=customer_email,
                                 shipping_address=shipping_address,
                                 selected_delivery_option=selected_delivery_option,
                                 use_buyer_country_for_pricing=use_buyer_country_for_pricing,
@@ -1381,6 +1387,7 @@ query($ids: [ID!]!) {
         storefront_token: str,
         items: List[Dict[str, Any]],
         discount_codes: List[str],
+        customer_email: Optional[str],
         shipping_address: Optional[Dict[str, Any]],
         selected_delivery_option: Optional[Dict[str, Any]],
         use_buyer_country_for_pricing: bool,
@@ -1520,6 +1527,7 @@ query($ids: [ID!]!) {
         if discount_codes:
             variables["input"]["discountCodes"] = discount_codes
         buyer_identity = _shopify_cart_buyer_identity_input(
+            customer_email=customer_email,
             country=country,
             postal=postal,
             city=city,
@@ -1663,6 +1671,7 @@ query($ids: [ID!]!) {
                         shop_domain=shop_domain,
                         storefront_token=storefront_token,
                         cart_id=cart_id,
+                        customer_email=customer_email,
                         country=country,
                         postal=postal,
                         city=city,
@@ -1847,6 +1856,7 @@ query($id: ID!) {
         shop_domain: str,
         storefront_token: str,
         cart_id: str,
+        customer_email: Optional[str],
         country: str,
         postal: str,
         city: Optional[str],
@@ -1942,6 +1952,7 @@ mutation($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
         # Some shops return delivery options based on buyerIdentity/country only.
 
         buyer_identity = _shopify_cart_buyer_identity_input(
+            customer_email=customer_email,
             country=country,
             postal=postal,
             city=city,

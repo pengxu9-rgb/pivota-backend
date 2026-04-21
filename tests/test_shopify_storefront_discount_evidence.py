@@ -13,6 +13,7 @@ from services.shopify_storefront_pricing_service import (
     _original_subtotal_from_line_items,
     _parse_storefront_cart_discounts,
     _shipping_unverified_reason,
+    _shopify_cart_buyer_identity_input,
     _shopify_cart_selectable_address_input,
 )
 
@@ -54,6 +55,21 @@ def test_storefront_discount_parser_uses_line_allocations_not_total_delta():
     assert parsed["line_pricing_by_variant_id"]["111"]["line_discount_total"] == Decimal("5.00")
     assert parsed["promotion_lines"][0]["amount"] == Decimal("-5.00")
     assert parsed["discount_evidence"]["pricing_confidence"] == "authoritative"
+
+
+def test_shopify_cart_buyer_identity_input_includes_email_without_address():
+    buyer_identity = _shopify_cart_buyer_identity_input(
+        customer_email="buyer@example.com",
+        country=None,
+        postal=None,
+        city=None,
+        province=None,
+        address1=None,
+        address2=None,
+        use_buyer_country_for_pricing=True,
+    )
+
+    assert buyer_identity == {"email": "buyer@example.com"}
 
 
 def test_storefront_discount_parser_records_cart_level_shipping_discount_allocations():
@@ -350,6 +366,7 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
         shop_domain="example.myshopify.com",
         storefront_token="sf_token",
         cart_id="gid://shopify/Cart/test",
+        customer_email="buyer@example.com",
         country="US",
         postal="10118",
         city="New York",
@@ -382,6 +399,7 @@ async def test_delivery_address_add_uses_shopify_current_selectable_address_shap
             },
         }
     ]
+    assert calls[1]["variables"]["buyerIdentity"]["email"] == "buyer@example.com"
 
 
 @pytest.mark.asyncio
@@ -431,6 +449,7 @@ async def test_delivery_options_query_retries_until_rates_are_available(monkeypa
         shop_domain="example.myshopify.com",
         storefront_token="sf_token",
         cart_id="gid://shopify/Cart/test",
+        customer_email="buyer@example.com",
         country="US",
         postal="10118",
         city="New York",
@@ -486,6 +505,7 @@ async def test_cart_create_includes_delivery_address_in_cart_input(monkeypatch):
         storefront_token="sf_token",
         items=[{"variant_id": "123", "quantity": 1}],
         discount_codes=[],
+        customer_email="buyer@example.com",
         shipping_address={
             "country": "US",
             "postal_code": "10118",
@@ -500,6 +520,7 @@ async def test_cart_create_includes_delivery_address_in_cart_input(monkeypatch):
 
     cart_create_variables = calls[0]["variables"]
     assert cart_create_variables["input"]["buyerIdentity"] == {
+        "email": "buyer@example.com",
         "countryCode": "US",
         "preferences": {"delivery": {"deliveryMethod": ["SHIPPING"]}},
         "deliveryAddressPreferences": [
