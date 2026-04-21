@@ -152,6 +152,57 @@ async def test_store_discount_evidence_bxgy_minimum_quantity_is_unlockable(
 
 
 @pytest.mark.asyncio
+async def test_store_discount_evidence_bxgy_without_actionable_metadata_is_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bxgy = _promo(
+        id="promo_bxgy_sparse",
+        name="PIVOTA_TEST_BXGY",
+        scope={"global": True},
+        config={
+            "source": "shopify_discount_node",
+            "shopifyDiscountNodeId": "gid://shopify/DiscountNode/2",
+            "discountMethod": "code",
+            "discountType": "bxgy",
+            "discountClasses": ["PRODUCT"],
+            "combinesWith": {"productDiscounts": False, "orderDiscounts": True, "shippingDiscounts": False},
+            "summary": "Buy 2 items, get 1 item at 80% off",
+            "minimumRequirement": {},
+            "customerBuys": {"__typename": "DiscountCustomerBuys"},
+            "customerGets": {"__typename": "DiscountCustomerGets"},
+            "codes": ["PIVOTA_TEST_BXGY"],
+            "status": "ACTIVE",
+        },
+    )
+
+    async def fake_list_promotions(**_kwargs: Any) -> tuple[List[PromotionOut], int]:
+        return [bxgy], 1
+
+    monkeypatch.setattr(module, "list_promotions", fake_list_promotions)
+
+    result = await module.resolve_store_discount_evidence_for_targets(
+        merchant_id="merch_1",
+        targets=[
+            module.StoreDiscountTarget(
+                target_id="var_1",
+                merchant_id="merch_1",
+                product_id="prod_1",
+                variant_id="var_1",
+                quantity=3,
+                subtotal=Decimal("30.00"),
+                currency="USD",
+            )
+        ],
+    )
+
+    offer = result["var_1"]["offers"][0]
+    assert offer["discount_type"] == "bxgy"
+    assert offer["status"] == "unverified"
+    assert offer["scope_status"] == "unverified"
+    assert offer["scope_reason"] == "bxgy_scope_unverified"
+
+
+@pytest.mark.asyncio
 async def test_store_discount_evidence_free_shipping_and_unknown_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

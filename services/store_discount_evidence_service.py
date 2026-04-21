@@ -126,10 +126,40 @@ def _get_nested(mapping: Dict[str, Any], *path: str) -> Any:
     return current
 
 
+def _has_non_typename_payload(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "__typename":
+                continue
+            if nested in (None, "", [], {}):
+                continue
+            if isinstance(nested, dict) and not _has_non_typename_payload(nested):
+                continue
+            return True
+        return False
+    if isinstance(value, list):
+        return any(_has_non_typename_payload(item) for item in value)
+    return value not in (None, "")
+
+
+def _bxgy_metadata_is_actionable(cfg: Dict[str, Any]) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    if _has_non_typename_payload(cfg.get("minimumRequirement")):
+        return True
+    if _has_non_typename_payload(cfg.get("customerBuys")):
+        return True
+    if _has_non_typename_payload(cfg.get("customerGets")):
+        return True
+    return False
+
+
 def _scope_status(promo: PromotionOut, target: StoreDiscountTarget) -> tuple[bool, str, str]:
     scope = promo.scope if isinstance(promo.scope, dict) else {}
     cfg = promo.config if isinstance(promo.config, dict) else {}
     if scope.get("global") is True:
+        if _lower(cfg.get("discountType")) == "bxgy" and not _bxgy_metadata_is_actionable(cfg):
+            return True, "unverified", "bxgy_scope_unverified"
         return True, "available", "global_scope"
 
     items = scope.get("shopifyItems") if isinstance(scope.get("shopifyItems"), dict) else None
