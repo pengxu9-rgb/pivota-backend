@@ -21,7 +21,7 @@ async def test_quote_service_promotion_load_falls_back_to_any_channel(monkeypatc
         id="promo_1",
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
-        config={"thresholdQuantity": 3, "discountPercent": 10},
+        config={"source": "pivota_manual", "thresholdQuantity": 3, "discountPercent": 10},
         humanReadableRule="Buy 3, get 10% off",
         name="Buy 3 deal",
     )
@@ -72,7 +72,7 @@ async def test_quote_service_auto_sync_shopify_promotions_when_missing(monkeypat
         id="promo_2",
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
-        config={"thresholdQuantity": 3, "discountPercent": 10},
+        config={"source": "pivota_manual", "thresholdQuantity": 3, "discountPercent": 10},
         humanReadableRule="Buy 3, get 10% off",
         name="Buy 3 deal",
     )
@@ -134,7 +134,7 @@ async def test_quote_service_auto_syncs_shopify_metadata_when_only_manual_promo_
         id="promo_manual",
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
-        config={"thresholdQuantity": 3, "discountPercent": 10},
+        config={"source": "pivota_manual", "thresholdQuantity": 3, "discountPercent": 10},
         humanReadableRule="Buy 3, get 10% off",
         name="Buy 3 deal",
     )
@@ -185,6 +185,100 @@ async def test_quote_service_auto_syncs_shopify_metadata_when_only_manual_promo_
 
 
 @pytest.mark.asyncio
+async def test_quote_service_skips_unscoped_legacy_manual_promo(monkeypatch):
+    svc = QuoteService()
+
+    promo = SimpleNamespace(
+        id="promo_legacy_global",
+        type="MULTI_BUY_DISCOUNT",
+        scope={"global": True, "brandIds": [], "productIds": [], "categoryIds": []},
+        config={"thresholdQuantity": 3, "discountPercent": 20},
+        humanReadableRule="Buy 3, get 20% off",
+        name="Legacy global deal",
+    )
+
+    async def fake_list_promotions(*, merchant_id, status, channel=None, creator_id=None, search=None, limit=50, offset=0):
+        return ([promo], 1)
+
+    monkeypatch.setattr("services.quote_service.list_promotions", fake_list_promotions)
+    monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "0")
+
+    pricing = {
+        "subtotal": Decimal("100.00"),
+        "discount_total": Decimal("0.00"),
+        "shipping_fee": Decimal("0.00"),
+        "tax": Decimal("0.00"),
+        "total": Decimal("100.00"),
+    }
+    evidence = {"codes": [], "applications": [], "decisions": []}
+    promotion_lines = []
+
+    await svc._apply_infra_promotions_best_effort(
+        merchant_id="merch_1",
+        items=[{"product_id": "p1", "variant_id": "v1", "quantity": 3}],
+        pricing=pricing,
+        line_items=[{"product_id": "p1", "variant_id": "v1", "quantity": 3, "unit_price_effective": Decimal("10.00")}],
+        promotion_lines=promotion_lines,
+        discount_evidence=evidence,
+        creator_id="agent_1",
+        channel="creator_agents",
+    )
+
+    assert pricing["discount_total"] == Decimal("0.00")
+    assert pricing["total"] == Decimal("100.00")
+    assert promotion_lines == []
+    assert evidence["decisions"][0]["decision"] == "skipped"
+    assert evidence["decisions"][0]["reason"] == "legacy_unscoped_manual_promotion"
+
+
+@pytest.mark.asyncio
+async def test_quote_service_allows_scoped_manual_promo_without_source(monkeypatch):
+    svc = QuoteService()
+
+    promo = SimpleNamespace(
+        id="promo_scoped_manual",
+        type="MULTI_BUY_DISCOUNT",
+        scope={"global": False, "productIds": ["p1"]},
+        config={"thresholdQuantity": 3, "discountPercent": 20},
+        humanReadableRule="Buy 3, get 20% off",
+        name="Scoped deal",
+    )
+
+    async def fake_list_promotions(*, merchant_id, status, channel=None, creator_id=None, search=None, limit=50, offset=0):
+        return ([promo], 1)
+
+    monkeypatch.setattr("services.quote_service.list_promotions", fake_list_promotions)
+    monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "0")
+
+    pricing = {
+        "subtotal": Decimal("100.00"),
+        "discount_total": Decimal("0.00"),
+        "shipping_fee": Decimal("0.00"),
+        "tax": Decimal("0.00"),
+        "total": Decimal("100.00"),
+    }
+    evidence = {"codes": [], "applications": [], "decisions": []}
+    promotion_lines = []
+
+    await svc._apply_infra_promotions_best_effort(
+        merchant_id="merch_1",
+        items=[{"product_id": "p1", "variant_id": "v1", "quantity": 3}],
+        pricing=pricing,
+        line_items=[{"product_id": "p1", "variant_id": "v1", "quantity": 3, "unit_price_effective": Decimal("10.00")}],
+        promotion_lines=promotion_lines,
+        discount_evidence=evidence,
+        creator_id="agent_1",
+        channel="creator_agents",
+    )
+
+    assert pricing["discount_total"] == Decimal("6.00")
+    assert pricing["total"] == Decimal("94.00")
+    assert len(promotion_lines) == 1
+    assert evidence["decisions"][0]["decision"] == "applied"
+    assert evidence["decisions"][0]["reason"] == "pivota_manual_adjustment_not_shopify_allocation"
+
+
+@pytest.mark.asyncio
 async def test_quote_service_skips_manual_promo_when_shopify_discount_present(monkeypatch):
     svc = QuoteService()
 
@@ -192,7 +286,7 @@ async def test_quote_service_skips_manual_promo_when_shopify_discount_present(mo
         id="promo_skip",
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
-        config={"thresholdQuantity": 3, "discountPercent": 10},
+        config={"source": "pivota_manual", "thresholdQuantity": 3, "discountPercent": 10},
         humanReadableRule="Buy 3, get 10% off",
         name="Buy 3 deal",
     )
@@ -249,7 +343,7 @@ async def test_quote_service_skips_manual_promo_when_shopify_code_rejected(monke
         id="promo_invalid_code_mask",
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
-        config={"thresholdQuantity": 3, "discountPercent": 10},
+        config={"source": "pivota_manual", "thresholdQuantity": 3, "discountPercent": 10},
         humanReadableRule="Buy 3, get 10% off",
         name="Buy 3 deal",
     )
@@ -302,6 +396,7 @@ async def test_quote_service_allows_manual_promo_after_rejected_code_when_explic
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
         config={
+            "source": "pivota_manual",
             "thresholdQuantity": 3,
             "discountPercent": 10,
             "canApplyWhenShopifyCodeRejected": True,
@@ -357,6 +452,7 @@ async def test_quote_service_allows_manual_stack_when_same_discount_class_allowe
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
         config={
+            "source": "pivota_manual",
             "thresholdQuantity": 3,
             "discountPercent": 10,
             "canStackWithShopify": True,
@@ -410,7 +506,7 @@ async def test_quote_service_blocks_manual_new_customer_promo_without_shopify_ev
         id="promo_new_customer",
         type="MULTI_BUY_DISCOUNT",
         scope={"global": True},
-        config={"thresholdQuantity": 1, "discountPercent": 10, "newCustomerOnly": True},
+        config={"source": "pivota_manual", "thresholdQuantity": 1, "discountPercent": 10, "newCustomerOnly": True},
         humanReadableRule="New customer 10% off",
         name="New customer deal",
     )

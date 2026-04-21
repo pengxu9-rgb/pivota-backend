@@ -623,6 +623,37 @@ class QuoteService:
         token = str(value or "").strip().lower()
         return token in {"new_customer", "first_time_customer", "first_order", "shopify_first_order"}
 
+    def _is_unscoped_legacy_manual_promo(self, scope: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+        if not isinstance(scope, dict) or not isinstance(cfg, dict):
+            return False
+        if cfg.get("source"):
+            return False
+        if not scope.get("global"):
+            return False
+        explicit_scope_keys = (
+            "productIds",
+            "product_ids",
+            "variantIds",
+            "variant_ids",
+            "collectionIds",
+            "collection_ids",
+            "brandIds",
+            "brand_ids",
+            "categoryIds",
+            "category_ids",
+            "shopifyItems",
+            "shopify_items",
+        )
+        for key in explicit_scope_keys:
+            value = scope.get(key)
+            if isinstance(value, (list, tuple, set)) and len(value) > 0:
+                return False
+            if isinstance(value, dict) and len(value) > 0:
+                return False
+            if isinstance(value, str) and value.strip():
+                return False
+        return True
+
     def _has_verified_shopify_new_customer_evidence(self, discount_evidence: Optional[Dict[str, Any]]) -> bool:
         if not isinstance(discount_evidence, dict):
             return False
@@ -759,6 +790,20 @@ class QuoteService:
 
                 scope = getattr(promo, "scope", None) or {}
                 cfg = getattr(promo, "config", None) or {}
+
+                if self._is_unscoped_legacy_manual_promo(scope, cfg):
+                    if isinstance(discount_evidence, dict):
+                        decisions = discount_evidence.setdefault("decisions", [])
+                        if isinstance(decisions, list):
+                            decisions.append(
+                                {
+                                    "promotion_id": getattr(promo, "id", None),
+                                    "decision": "skipped",
+                                    "reason": "legacy_unscoped_manual_promotion",
+                                    "source": "pivota_infra",
+                                }
+                            )
+                    continue
 
                 has_shopify_discount = self._has_shopify_applied_discount(discount_evidence)
                 if (
