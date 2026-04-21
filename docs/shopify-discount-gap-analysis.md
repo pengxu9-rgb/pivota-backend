@@ -1,5 +1,24 @@
 # Shopify Discount Gap Analysis
 
+## Update: 2026-04-21 current merchant rerun
+
+The previous blockers `read_discounts missing`, `automatic not live-proven`, and `positive combinable pair pending rerun` are no longer true for the current merchant `merch_efbc46b4619cfbdf`.
+
+New current-merchant state:
+
+- GraphQL `discountNodes` sync is live and updated `6` discounts successfully.
+- Automatic discount execution is live-proven (`Pivota Auto Test`).
+- Positive combinability is live-proven for `PIVOTA_TEST_BXGY + PIVOTA_TEST_COMBO_B`.
+- Storefront parser now normalizes cart-level order code allocations as `discount_class=order`.
+- Quote and PDP/product-detail store-discount aggregates are deduped, so multi-item carts and multi-variant PDPs no longer duplicate store-offer rows.
+
+Top remaining gaps for the current merchant now are:
+
+1. Fixed-amount discount execution is still not proven. The validated `PIVOTA_TEST_AMOUNT10` fixture is percentage-off, not amount-off.
+2. Segment-restricted and new-customer-restricted Shopify-native discount execution is still not live-proven.
+3. Usage-limit exhaustion and active-window positive boundaries are still not live-proven.
+4. Pilot-grade paid canaries under `fail_closed` reconciliation still need to be rerun for this merchant after the latest discount repairs.
+
 ## Top remaining gaps
 
 1. `Pilot-grade reconciliation and refund monitoring` is still thin.

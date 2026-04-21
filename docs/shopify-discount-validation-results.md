@@ -1,5 +1,51 @@
 # Shopify Discount Validation Results
 
+## Update: 2026-04-21 current merchant rerun
+
+Current merchant: `merch_efbc46b4619cfbdf`
+
+This update supersedes the older `read_discounts blocked / automatic fixture missing / positive combinability pending` status for the current merchant.
+
+Passed on 2026-04-21:
+
+- Admin discount-node sync is live for the current merchant. Internal sync updated `6` discount nodes successfully via `discountNodes`.
+- `PIVOTA_TEST_AMOUNT10` now has synced product scope metadata for the correct products and applies cleanly on its in-scope Winona quote.
+- `PIVOTA_TEST_BXGY` is live-proven on the correct buy/get cart:
+  - buy product `10064572285225` variant `53012705509673` qty `2`
+  - get product `10064567370025` variant `53012684341545` qty `1`
+  - `discount_evidence.codes[0].applicable=true`
+  - Shopify allocation applied `-9.29` to the get-item line
+- `PIVOTA_TEST_BXGY + PIVOTA_TEST_COMBO_B` is live-proven as a positive combinable pair for the current merchant:
+  - BXGY remains applied as `discount_class=product`
+  - `PIVOTA_TEST_COMBO_B` remains applied as `discount_class=order`
+  - total combined discount `10.29`
+- Automatic discount is now live-proven for the current merchant:
+  - `Pivota Auto Test` applies automatically on `10064558096681` with no code
+  - discount amount `5.60`
+- Automatic-vs-code conflict is live-proven:
+  - on the same product, submitted code `PIVOTA_TEST_AMOUNT10` returns `applicable=false`
+  - automatic `Pivota Auto Test` remains the only applied discount
+- Quote `store_discount_evidence.offers` is now deduped across multi-item carts.
+- Product-detail `store_discount_evidence.offers` and `decisions` are now deduped across variants.
+
+Still not proven for the current merchant:
+
+- fixed-amount product/order discount execution
+- segment-restricted or new-customer-restricted Shopify-native discount execution
+- usage-limit exhaustion boundary
+- active-window positive boundary
+
+Current evidence artifacts:
+
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_real_target.request.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_real_target.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.request.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.request.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.request.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.response.json`
+
 ## Tested scenarios
 
 Validation date: 2026-04-15.

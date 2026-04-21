@@ -1,5 +1,25 @@
 # Shopify Discount Audit
 
+## Update: 2026-04-21 current merchant rerun
+
+For the current merchant `merch_efbc46b4619cfbdf`, three conclusions in the original audit have changed materially:
+
+1. Shopify Admin GraphQL discount-node sync is no longer blocked. Internal sync updated `6` live discount nodes successfully.
+2. Automatic discount execution is no longer fixture-blocked. `Pivota Auto Test` is now live-proven on an in-scope product with no code.
+3. Positive combinability is no longer pending. `PIVOTA_TEST_BXGY + PIVOTA_TEST_COMBO_B` is live-proven as a successful product-plus-order combination for the current merchant.
+
+Additional repair work since the original audit:
+
+- Storefront cart-level order-code allocations are now normalized as `discount_class=order` instead of being misclassified as `product`.
+- Quote-level `store_discount_evidence.offers` is deduped across multi-item carts.
+- Product-detail `store_discount_evidence.offers` and `decisions` are deduped across variants, which removes repeated savings rows on PDP payloads.
+
+Current remaining gaps for this merchant:
+
+- fixed-amount discount execution is still not proven
+- segment/new-customer restricted Shopify-native discount execution is still not proven
+- usage-limit exhaustion and active-window positive boundaries are still not proven
+
 ## Executive conclusion
 
 The Shopify discount integration is no longer just cosmetic. The quote-time path now has live evidence for Shopify-native code acceptance/rejection, product discount allocation parsing, paid shipping, free-shipping netting, BXGY quantity gating, and basic conflict handling. The current production build reads Shopify Storefront `discountCodes` and `discountAllocations`, carries normalized discount evidence into quote snapshots, suppresses overlapping Pivota manual promotions, and now prevents a rejected Shopify code from being silently replaced by a local manual promo. Evidence is in `services/shopify_storefront_pricing_service.py:355-623`, `services/quote_service.py:437-449`, `services/quote_service.py:641-658`, and the live artifacts under `artifacts/shopify-discount-validation/`.
