@@ -39,6 +39,7 @@ except ModuleNotFoundError:
 import subprocess
 import os
 from pathlib import Path
+from utils.database_readiness import DatabaseUnavailableError, ensure_database_ready
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 SERVICE_NAME = (os.getenv("PIVOTA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "pivota-backend").strip() or "pivota-backend"
@@ -1605,10 +1606,10 @@ async def health_check():
     db_error = None
 
     try:
-        await asyncio.wait_for(database.execute("SELECT 1"), timeout=2)
+        await ensure_database_ready(connect_timeout_seconds=2.0, probe_timeout_seconds=2.0)
         db_ok = True
-    except Exception as e:
-        db_error = type(e).__name__
+    except DatabaseUnavailableError as e:
+        db_error = e.error_type
 
     if db_ok:
         try:

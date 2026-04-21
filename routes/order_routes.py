@@ -87,6 +87,11 @@ from routes.reviews_invitation_issuer import (
 from services.reviews_invitation_send_jobs_service import (
     enqueue_invitation_send_job_from_order as enqueue_reviews_invitation_send_job_from_order,
 )
+from utils.database_readiness import (
+    DatabaseUnavailableError,
+    database_unavailable_http_exception,
+    ensure_database_ready,
+)
 
 
 def _clean_text(value: Any) -> Optional[str]:
@@ -1546,6 +1551,8 @@ async def create_new_order(
     - 支付信息与订单解耦，失败不影响订单创建
     """
     try:
+        await ensure_database_ready()
+
         # 1. 验证商户
         merchant = await get_merchant_onboarding(order_request.merchant_id)
         if not merchant:
@@ -2338,6 +2345,8 @@ async def create_new_order(
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
+    except DatabaseUnavailableError:
+        raise database_unavailable_http_exception()
     except HTTPException:
         raise
     except Exception as e:
@@ -2365,19 +2374,21 @@ async def confirm_payment(
     4. 触发履约流程（创建 Shopify 订单）
     """
     
-    order = await get_order(payment_request.order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    
-    if order["payment_status"] == "paid":
-        return {"status": "success", "message": "Order already paid"}
-    
-    # 获取商户信息
-    merchant = await get_merchant_onboarding(order["merchant_id"])
-    if not merchant:
-        raise HTTPException(status_code=404, detail="Merchant not found")
-    
     try:
+        await ensure_database_ready()
+
+        order = await get_order(payment_request.order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        if order["payment_status"] == "paid":
+            return {"status": "success", "message": "Order already paid"}
+
+        # 获取商户信息
+        merchant = await get_merchant_onboarding(order["merchant_id"])
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+
         psp_type, psp_adapter = await _resolve_order_psp_adapter(order)
         
         # 确认支付
@@ -2460,6 +2471,8 @@ async def confirm_payment(
                 "payment_intent_id": order["payment_intent_id"]
             }
             
+    except DatabaseUnavailableError:
+        raise database_unavailable_http_exception()
     except HTTPException:
         raise
     except Exception as e:

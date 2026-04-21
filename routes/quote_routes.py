@@ -7,6 +7,11 @@ from routes.agent_auth import AgentContext, get_agent_context
 from services.quote_service import QuoteError, QuoteService, parse_decimal_money
 from mvp.constants import EVENT_OFFER_GENERATED, SURFACE_BACKEND
 from mvp.events import emit_best_effort
+from utils.database_readiness import (
+    DatabaseUnavailableError,
+    database_unavailable_http_exception,
+    ensure_database_ready,
+)
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 
 
@@ -24,6 +29,7 @@ async def preview_quote(
 
     service = QuoteService()
     try:
+        await ensure_database_ready()
         result = await service.preview_quote(
             merchant_id=req.merchant_id,
             agent_id=context.agent_id,
@@ -47,6 +53,8 @@ async def preview_quote(
                 "details": getattr(e, "details", {}),
             },
         )
+    except DatabaseUnavailableError:
+        raise database_unavailable_http_exception()
     except Exception as e:
         if is_asyncpg_busy_error(e):
             raise db_busy_http_exception()
