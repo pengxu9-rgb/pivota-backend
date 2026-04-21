@@ -151,6 +151,13 @@ def _discount_class_from_storefront_target(target_type: Any) -> str:
     return "order"
 
 
+def _discount_class_from_storefront_cart_allocation(allocation: Dict[str, Any]) -> str:
+    target_type = str((allocation or {}).get("targetType") or "").strip().lower()
+    if "shipping" in target_type:
+        return "shipping"
+    return "order"
+
+
 def _discount_method_from_storefront_allocation(allocation: Dict[str, Any]) -> str:
     typename = str(allocation.get("__typename") or "")
     if typename == "CartCodeDiscountAllocation" or allocation.get("code"):
@@ -512,7 +519,7 @@ def _parse_storefront_cart_discounts(
             method = _discount_method_from_storefront_allocation(alloc)
             code = _normalize_code(alloc.get("code")) or None
             label = code or alloc.get("title") or "Shopify discount"
-            discount_class = _discount_class_from_storefront_target(alloc.get("targetType") or "ORDER")
+            discount_class = _discount_class_from_storefront_cart_allocation(alloc)
             group_key = "|".join(
                 [
                     "cart",

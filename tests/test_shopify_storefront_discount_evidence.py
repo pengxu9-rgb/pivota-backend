@@ -97,6 +97,46 @@ def test_storefront_discount_parser_records_cart_level_shipping_discount_allocat
     assert parsed["discount_evidence"]["pricing_confidence"] == "authoritative"
 
 
+def test_storefront_discount_parser_treats_cart_level_code_allocations_as_order_discounts():
+    cart = {
+        "id": "gid://shopify/Cart/test",
+        "discountCodes": [{"code": "combo_b", "applicable": True}],
+        "discountAllocations": [
+            {
+                "__typename": "CartCodeDiscountAllocation",
+                "targetType": "LINE_ITEM",
+                "code": "combo_b",
+                "discountedAmount": {"amount": "1.00", "currencyCode": "USD"},
+            }
+        ],
+        "lines": {
+            "edges": [
+                {
+                    "node": {
+                        "id": "line_1",
+                        "quantity": 1,
+                        "attributes": [{"key": "pivota_variant_id", "value": "111"}],
+                        "discountAllocations": [],
+                        "cost": {
+                            "amountPerQuantity": {"amount": "10.00", "currencyCode": "USD"},
+                            "totalAmount": {"amount": "10.00", "currencyCode": "USD"},
+                        },
+                    }
+                }
+            ]
+        },
+    }
+
+    parsed = _parse_storefront_cart_discounts(cart=cart, submitted_codes=["combo_b"])
+
+    assert parsed["discount_total"] == Decimal("1.00")
+    assert parsed["promotion_lines"][0]["discount_class"] == "order"
+    assert parsed["promotion_lines"][0]["source_ref"].startswith("cart|code|COMBO_B|COMBO_B|order|")
+    assert parsed["promotion_lines"][0]["allocations"][0]["target_type"] == "order"
+    assert parsed["promotion_lines"][0]["amount"] == Decimal("-1.00")
+    assert parsed["promotion_lines"][0]["metadata"]["allocation_scope"] == "cart"
+
+
 def test_storefront_discount_parser_records_invalid_code_without_discount_amount():
     cart = {
         "discountCodes": [{"code": "badcode", "applicable": False}],
