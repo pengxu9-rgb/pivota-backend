@@ -10,6 +10,11 @@ Passed on 2026-04-21:
 
 - Admin discount-node sync is live for the current merchant. Internal sync updated `6` discount nodes successfully via `discountNodes`.
 - `PIVOTA_TEST_AMOUNT10` now has synced product scope metadata for the correct products and applies cleanly on its in-scope Winona quote.
+- Product-scoped fixed-amount Shopify-native code execution is now live-proven:
+  - `PIVOTA_AUDIT_20260421C_FIXPROD60` returned `applicable=true`
+  - `discount_total=0.60`
+  - `line_items[0].unit_price_effective=1.09`
+  - `promotion_lines[0].discount_class=product`
 - `PIVOTA_TEST_BXGY` is live-proven on the correct buy/get cart:
   - buy product `10064572285225` variant `53012705509673` qty `2`
   - get product `10064567370025` variant `53012684341545` qty `1`
@@ -25,16 +30,26 @@ Passed on 2026-04-21:
 - Automatic-vs-code conflict is live-proven:
   - on the same product, submitted code `PIVOTA_TEST_AMOUNT10` returns `applicable=false`
   - automatic `Pivota Auto Test` remains the only applied discount
+- Segment-restricted Shopify-native execution is now live-proven:
+  - `PIVOTA_AUDIT_20260421A_SEGMENT` returned `applicable=true`
+  - synced metadata context is `DiscountCustomerSegments`
+  - quote discount total `0.50`
+- New-customer Shopify-native execution is now live-proven:
+  - `PIVOTA_AUDIT_20260421A_NEWCUST` returned `applicable=true`
+  - quote `customer_eligibility` remained `verified/new_customer=true`
+  - quote discount total `0.75`
+- Active-window boundaries are now live-proven:
+  - `PIVOTA_AUDIT_20260421B_UPCOMING` before `startsAt` returned `applicable=false`
+  - the same code after `startsAt` returned `applicable=true` with `discount_total=0.20`
+- Usage-limit availability metadata is now live-proven:
+  - `PIVOTA_AUDIT_20260421A_LIMIT1` synced with `usageLimit=1` and `appliesOncePerCustomer=true`
+  - quote/cart remained `applicable=true`, which confirms quote probes do not consume Shopify usage count
 - Quote `store_discount_evidence.offers` is now deduped across multi-item carts.
 - Product-detail `store_discount_evidence.offers` and `decisions` are now deduped across variants.
 
 Still not proven for the current merchant:
 
-- fixed-amount product/order discount execution
-- segment-restricted or new-customer-restricted Shopify-native discount execution
-- usage-limit exhaustion boundary
-- active-window positive boundary
-- auto-creation of missing Shopify-native fixtures by Pivota (current merchant token has `read_discounts` but not `write_discounts`)
+- usage-limit exhaustion boundary after a real redemption
 
 Current evidence artifacts:
 
@@ -47,10 +62,20 @@ Current evidence artifacts:
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.request.json`
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.response.json`
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/access_scopes_preflight.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixed_amount_product_scoped.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/segment_customer.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/new_customer.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_prestart.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_active.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/usage_limit_available.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/usage_limit_second_quote.response.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_a.create.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_b.create.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_c.create.json`
 
 ## Tested scenarios
 
-Validation date: 2026-04-15.
+Validation dates: 2026-04-15 and 2026-04-21.
 
 Validation scope included production quote/cart probes, quote-backed order creation without completing payment, unpaid payment-confirmation rejection, focused post-deploy regression probes, three explicitly approved live paid discounted orders, and refund cleanup through the production app path.
 
@@ -75,6 +100,12 @@ Validation scope included production quote/cart probes, quote-backed order creat
 - live app-path refund cleanup for the three paid test orders
 - rejected Shopify code against quantity-based Pivota manual fallback
 - PSP amount/currency verification unit coverage
+- current-merchant automatic discount probe
+- current-merchant fixed-amount product-scoped fixture
+- current-merchant segment-restricted fixture
+- current-merchant new-customer fixture
+- current-merchant active-window before-start and in-window probes
+- current-merchant usage-limit availability and repeated-quote probes
 
 ## Passed
 
@@ -100,22 +131,19 @@ Validation scope included production quote/cart probes, quote-backed order creat
 
 ## Failed
 
-- `PIVOTA_TEST_COMBO_A` positive combinability fixture failed the last completed validation. Shopify returned `applicable=false` for `PIVOTA_TEST_COMBO_A`; with `PIVOTA_TEST_AMOUNT10 + PIVOTA_TEST_COMBO_A`, only `PIVOTA_TEST_AMOUNT10` applied. The merchant has since reported that this fixture is repaired; it is pending rerun evidence.
-- `PIVOTA_TEST_EXHAUSTED` did not prove exhaustion in the last completed validation. The latest readonly matrix returned `applicable=true` and `discount_total=0.90`. The merchant has since reported that this fixture is ready; it is pending rerun evidence.
+- No current-merchant failure remains after the 2026-04-21 rerun; the remaining open item is blocked, not failed.
+- Historical note retained for lineage:
+  - `PIVOTA_TEST_COMBO_A` failed in the 2026-04-15 matrix because Shopify returned `applicable=false`; that historical failure is superseded by the later positive combinability proof for `PIVOTA_TEST_BXGY + PIVOTA_TEST_COMBO_B`.
+  - Historical `PIVOTA_TEST_EXHAUSTED` readonly probes never proved exhaustion; that has been replaced by the bounded `PIVOTA_AUDIT_20260421A_LIMIT1` fixture, which still requires a redeemed-order proof.
 
 ## Blocked
 
-- `automatic discount live execution`: blocked by missing explicit automatic-discount fixture for this merchant.
-- `segment-restricted / new-customer restricted discount live execution`: the lookup path is implemented, but no restricted Shopify-native fixture code was supplied for checkout validation.
-- `positive combinable pair`: pending rerun after the merchant fixture repair; Shopify must mark both intended codes applicable together before this becomes rollout evidence.
-- `available usage-limit boundary`: pending rerun after the merchant fixture repair. Quote probes do not consume usage, so a separate available-then-exhausted fixture or controlled paid-consumption test is still needed for the full boundary.
-- `active window positive case`: no active scheduling-window fixture was supplied; expired/inactive rejection was proven.
-- `GraphQL discount-node sync for the current merchant custom app connection`: Shopify Admin GraphQL returned `ACCESS_DENIED` for `discountNodes` because the stored custom app Admin token lacks `read_discounts`. Enable `read_discounts` on the merchant custom app, regenerate/update the Admin API access token, update the stored Shopify credential in Pivota, then rerun preflight/sync.
+- `usage-limit exhausted boundary`: quote probes do not consume Shopify usage count. `PIVOTA_AUDIT_20260421A_LIMIT1` stayed `applicable=true` across repeated quotes, so the remaining proof requires a controlled redeemed order and a post-redemption rejection probe.
 
 ## Root cause by failure
 
 - Historical free-shipping failure was caused by Pivota reading gross delivery price without netting Shopify shipping discount allocations into `shipping_fee`. That defect is fixed and live evidence now shows US free-shipping and CA paid-shipping behavior diverge correctly.
-- The positive combinability failure is fixture-side unless the business expected `PIVOTA_TEST_COMBO_A` to be eligible for the test product/address. Storefront returned `applicable=false`, so Pivota should not apply or simulate that discount.
+- The historical `PIVOTA_TEST_COMBO_A` failure was fixture-side unless the business expected it to be eligible for the test product/address. Storefront returned `applicable=false`, so Pivota correctly did not apply or simulate that discount. That does not apply to the later positive `PIVOTA_TEST_BXGY + PIVOTA_TEST_COMBO_B` proof.
 - The rejected-code fallback defect was Pivota-side: a rejected Shopify code could previously fall through into local infra promotions. The fix now records the skipped manual promotion as a decision instead of applying it.
 - The first app-path refund attempt exposed an agent refund proxy bug: the internal request object did not carry `idempotency_key`. PR #179 fixed that path.
 - The second refund attempt exposed a Stripe bug: Pivota stores Stripe Checkout Session IDs (`cs_...`) for hosted Checkout, while the refund adapter tried to refund them as PaymentIntent IDs. PR #180 now resolves Checkout Sessions to PaymentIntents before creating refunds.
@@ -168,7 +196,8 @@ Validation scope included production quote/cart probes, quote-backed order creat
 Rationale:
 
 - Quote-time Shopify-native amount-off, free-shipping, BXGY threshold behavior, invalid-code rejection, expired rejection, and non-combinable conflict behavior now have production evidence.
+- Current-merchant reruns now also prove product-scoped fixed-amount code execution, segment-restricted execution, new-customer execution, and active-window before/during behavior.
 - Authoritative Storefront delivery pricing is now carried into quotes; US no-code and CA no-code both price shipping at `29.00`, while the US free-shipping code nets shipping to `0.00`.
 - The most dangerous fake-discount path found in this round is fixed: rejected Shopify codes no longer trigger Pivota manual fallback promotions.
 - Payment confirmation now refuses unpaid PSP references and unit tests enforce amount/currency matching before paid transition; fail-closed mode blocks PSP adapters that cannot provide amount/currency details.
-- Three live paid discounted orders completed and were refunded, but broad rollout is still blocked by fixture gaps, missing `read_discounts` on the merchant custom app Admin token for discount-node sync, and the need to run merchant-pilot canaries in `fail_closed` reconciliation mode with alerting.
+- Three live paid discounted orders completed and were refunded, but broad rollout is still limited by the unproven exhausted-usage boundary and the need to run merchant-pilot canaries in `fail_closed` reconciliation mode with alerting.
