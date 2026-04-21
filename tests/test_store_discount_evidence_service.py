@@ -103,6 +103,47 @@ async def test_store_discount_evidence_basic_code_is_metadata_available(
 
 
 @pytest.mark.asyncio
+async def test_store_discount_evidence_matches_shopify_gid_scope_against_numeric_target_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scoped = _promo(
+        id="promo_gid_scope",
+        scope={
+            "global": False,
+            "shopifyItems": {
+                "__typename": "DiscountProducts",
+                "productIds": ["gid://shopify/Product/10064558129449"],
+                "variantIds": ["gid://shopify/ProductVariant/53012602618153"],
+            },
+        },
+    )
+
+    async def fake_list_promotions(**_kwargs: Any) -> tuple[List[PromotionOut], int]:
+        return [scoped], 1
+
+    monkeypatch.setattr(module, "list_promotions", fake_list_promotions)
+
+    result = await module.resolve_store_discount_evidence_for_targets(
+        merchant_id="merch_1",
+        targets=[
+            module.StoreDiscountTarget(
+                target_id="var_1",
+                merchant_id="merch_1",
+                product_id="10064558129449",
+                variant_id="53012602618153",
+                subtotal=Decimal("25.00"),
+                currency="USD",
+            )
+        ],
+    )
+
+    offer = result["var_1"]["offers"][0]
+    assert offer["status"] == "available"
+    assert offer["scope_status"] == "available"
+    assert offer["scope_reason"] == "product_scope_match"
+
+
+@pytest.mark.asyncio
 async def test_store_discount_evidence_bxgy_minimum_quantity_is_unlockable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -202,6 +243,64 @@ async def test_store_discount_evidence_bxgy_without_actionable_metadata_is_unver
     assert offer["scope_reason"] == "bxgy_scope_unverified"
     assert offer["display"]["badge"] == "Bundle offer"
     assert offer["display"]["short_copy"] == "Bundle offer may be available at checkout."
+
+
+@pytest.mark.asyncio
+async def test_store_discount_evidence_bxgy_matches_customer_buys_scope_when_customer_gets_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bxgy = _promo(
+        id="promo_bxgy_buys_match",
+        scope={"global": False, "shopifyItems": {"__typename": "DiscountProducts", "productIds": ["gid://shopify/Product/999"]}},
+        config={
+            "source": "shopify_discount_node",
+            "shopifyDiscountNodeId": "gid://shopify/DiscountNode/2",
+            "discountMethod": "code",
+            "discountType": "bxgy",
+            "discountClasses": ["PRODUCT"],
+            "combinesWith": {"productDiscounts": False, "orderDiscounts": True, "shippingDiscounts": False},
+            "summary": "Buy 2 items, get 1 item at 80% off",
+            "minimumRequirement": {},
+            "customerBuys": {
+                "__typename": "DiscountCustomerBuys",
+                "items": {
+                    "__typename": "DiscountProducts",
+                    "productIds": ["gid://shopify/Product/10064558129449"],
+                    "variantIds": ["gid://shopify/ProductVariant/53012602618153"],
+                },
+            },
+            "customerGets": {
+                "__typename": "DiscountCustomerGets",
+                "items": {"__typename": "DiscountProducts", "productIds": ["gid://shopify/Product/999"]},
+            },
+            "codes": ["PIVOTA_TEST_BXGY"],
+            "status": "ACTIVE",
+        },
+    )
+
+    async def fake_list_promotions(**_kwargs: Any) -> tuple[List[PromotionOut], int]:
+        return [bxgy], 1
+
+    monkeypatch.setattr(module, "list_promotions", fake_list_promotions)
+
+    result = await module.resolve_store_discount_evidence_for_targets(
+        merchant_id="merch_1",
+        targets=[
+            module.StoreDiscountTarget(
+                target_id="var_1",
+                merchant_id="merch_1",
+                product_id="10064558129449",
+                variant_id="53012602618153",
+                quantity=3,
+                subtotal=Decimal("30.00"),
+                currency="USD",
+            )
+        ],
+    )
+
+    offer = result["var_1"]["offers"][0]
+    assert offer["status"] == "available"
+    assert offer["scope_reason"] in {"product_scope_match", "variant_scope_match"}
 
 
 @pytest.mark.asyncio

@@ -102,6 +102,101 @@ def _list_text(value: Any) -> List[str]:
     return [_text(item) for item in _as_list(value) if _text(item)]
 
 
+def _connection_nodes(connection: Any) -> List[Dict[str, Any]]:
+    if not isinstance(connection, dict):
+        return []
+    nodes = connection.get("nodes")
+    if isinstance(nodes, list):
+        return [node for node in nodes if isinstance(node, dict)]
+    edges = connection.get("edges")
+    out: List[Dict[str, Any]] = []
+    if isinstance(edges, list):
+        for edge in edges:
+            node = (edge or {}).get("node") if isinstance(edge, dict) else None
+            if isinstance(node, dict):
+                out.append(node)
+    return out
+
+
+def _canonical_shopify_id(value: Any) -> str:
+    text = _text(value)
+    if text.startswith("gid://shopify/"):
+        return text.rsplit("/", 1)[-1]
+    return text
+
+
+def _canonicalize_ids(values: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    for value in values or []:
+        canonical = _canonical_shopify_id(value)
+        if canonical and canonical not in out:
+            out.append(canonical)
+    return out
+
+
+def _extract_scope_ids(items: Dict[str, Any]) -> tuple[List[str], List[str], List[str]]:
+    if not isinstance(items, dict):
+        return [], [], []
+    product_ids = _list_text(
+        items.get("productIds")
+        or items.get("product_ids")
+        or items.get("products")
+        or items.get("productGids")
+    )
+    variant_ids = _list_text(
+        items.get("variantIds")
+        or items.get("variant_ids")
+        or items.get("variants")
+        or items.get("variantGids")
+    )
+    collection_ids = _list_text(
+        items.get("collectionIds")
+        or items.get("collection_ids")
+        or items.get("collections")
+        or items.get("collectionGids")
+    )
+
+    if isinstance(items.get("products"), dict):
+        product_ids.extend(node.get("id") for node in _connection_nodes(items.get("products")))
+    if isinstance(items.get("productVariants"), dict):
+        variant_ids.extend(node.get("id") for node in _connection_nodes(items.get("productVariants")))
+    if isinstance(items.get("collections"), dict):
+        collection_ids.extend(node.get("id") for node in _connection_nodes(items.get("collections")))
+
+    return (
+        _canonicalize_ids(product_ids),
+        _canonicalize_ids(variant_ids),
+        _canonicalize_ids(collection_ids),
+    )
+
+
+def _shopify_scope_item_candidates(scope: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+
+    scope_items = scope.get("shopifyItems") if isinstance(scope.get("shopifyItems"), dict) else None
+    if isinstance(scope_items, dict):
+        candidates.append(scope_items)
+
+    customer_gets_items = cfg.get("customerGets", {}).get("items") if isinstance(cfg.get("customerGets"), dict) else None
+    if isinstance(customer_gets_items, dict):
+        candidates.append(customer_gets_items)
+
+    if _lower(cfg.get("discountType")) == "bxgy":
+        customer_buys_items = cfg.get("customerBuys", {}).get("items") if isinstance(cfg.get("customerBuys"), dict) else None
+        if isinstance(customer_buys_items, dict):
+            candidates.append(customer_buys_items)
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = repr(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
 def _to_decimal(value: Any) -> Optional[Decimal]:
     if value in (None, ""):
         return None
@@ -157,45 +252,40 @@ def _bxgy_metadata_is_actionable(cfg: Dict[str, Any]) -> bool:
 def _scope_status(promo: PromotionOut, target: StoreDiscountTarget) -> tuple[bool, str, str]:
     scope = promo.scope if isinstance(promo.scope, dict) else {}
     cfg = promo.config if isinstance(promo.config, dict) else {}
+    target_product_id = _canonical_shopify_id(target.product_id)
+    target_variant_id = _canonical_shopify_id(target.variant_id)
     if scope.get("global") is True:
         if _lower(cfg.get("discountType")) == "bxgy" and not _bxgy_metadata_is_actionable(cfg):
             return True, "unverified", "bxgy_scope_unverified"
         return True, "available", "global_scope"
 
-    items = scope.get("shopifyItems") if isinstance(scope.get("shopifyItems"), dict) else None
-    if isinstance(items, dict):
+    candidates = _shopify_scope_item_candidates(scope, cfg)
+    saw_typed_candidate = False
+    saw_explicit_scope = False
+    unverified_reason = ""
+    for items in candidates:
         typename = _text(items.get("__typename"))
         if typename == "AllDiscountItems":
             return True, "available", "all_discount_items"
-        explicit_product_ids = _list_text(
-            items.get("productIds")
-            or items.get("product_ids")
-            or items.get("products")
-            or items.get("productGids")
-        )
-        explicit_variant_ids = _list_text(
-            items.get("variantIds")
-            or items.get("variant_ids")
-            or items.get("variants")
-            or items.get("variantGids")
-        )
+        explicit_product_ids, explicit_variant_ids, _ = _extract_scope_ids(items)
         if explicit_product_ids or explicit_variant_ids:
-            if target.product_id and target.product_id in explicit_product_ids:
+            saw_explicit_scope = True
+            if target_product_id and target_product_id in explicit_product_ids:
                 return True, "available", "product_scope_match"
-            if target.variant_id and target.variant_id in explicit_variant_ids:
+            if target_variant_id and target_variant_id in explicit_variant_ids:
                 return True, "available", "variant_scope_match"
-            return False, "not_applicable", "target_out_of_scope"
+            continue
         if typename:
-            return True, "unverified", f"shopify_scope_{typename}"
+            saw_typed_candidate = True
+            if not unverified_reason:
+                unverified_reason = f"shopify_scope_{typename}"
+    if saw_explicit_scope:
+        return False, "not_applicable", "target_out_of_scope"
+    if saw_typed_candidate:
+        return True, "unverified", unverified_reason
 
     # Older syncs may place scope metadata in config. Treat unknown Shopify scope as
     # displayable but unverified so UI and agents do not over-promise final pricing.
-    cfg_items = cfg.get("customerGets", {}).get("items") if isinstance(cfg.get("customerGets"), dict) else None
-    if isinstance(cfg_items, dict) and cfg_items.get("__typename") == "AllDiscountItems":
-        return True, "available", "all_discount_items"
-    if isinstance(cfg_items, dict) and cfg_items.get("__typename"):
-        return True, "unverified", f"shopify_scope_{cfg_items.get('__typename')}"
-
     return True, "unverified", "scope_missing"
 
 

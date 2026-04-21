@@ -316,6 +316,50 @@ def _connection_nodes(connection: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _extract_connection_ids(connection: Any) -> List[str]:
+    ids: List[str] = []
+    for node in _connection_nodes(connection):
+        node_id = str(node.get("id") or "").strip()
+        if node_id:
+            ids.append(node_id)
+    return list(dict.fromkeys(ids))
+
+
+def _normalize_discount_items(items: Any) -> Dict[str, Any]:
+    if not isinstance(items, dict):
+        return {}
+    normalized = dict(items)
+    typename = str(normalized.get("__typename") or "").strip()
+    if typename == "DiscountProducts":
+        product_ids = _extract_connection_ids(normalized.get("products"))
+        variant_ids = _extract_connection_ids(normalized.get("productVariants"))
+        if product_ids:
+            normalized["productIds"] = product_ids
+        if variant_ids:
+            normalized["variantIds"] = variant_ids
+    elif typename == "DiscountCollections":
+        collection_ids = _extract_connection_ids(normalized.get("collections"))
+        if collection_ids:
+            normalized["collectionIds"] = collection_ids
+    return normalized
+
+
+def _normalize_discount_customer_gets(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    normalized = dict(value)
+    normalized["items"] = _normalize_discount_items(value.get("items"))
+    return normalized
+
+
+def _normalize_discount_customer_buys(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    normalized = dict(value)
+    normalized["items"] = _normalize_discount_items(value.get("items"))
+    return normalized
+
+
 def _extract_discount_codes(discount: Dict[str, Any]) -> List[str]:
     codes: List[str] = []
     for node in _connection_nodes(discount.get("codes")):
@@ -366,8 +410,8 @@ def _map_discount_node_to_promotion(
     start_at = _safe_datetime(discount.get("startsAt"), fallback=datetime.utcnow())
     end_at = _safe_datetime(discount.get("endsAt"))
 
-    customer_gets = discount.get("customerGets") if isinstance(discount.get("customerGets"), dict) else {}
-    customer_buys = discount.get("customerBuys") if isinstance(discount.get("customerBuys"), dict) else None
+    customer_gets = _normalize_discount_customer_gets(discount.get("customerGets"))
+    customer_buys = _normalize_discount_customer_buys(discount.get("customerBuys"))
     minimum_requirement = (
         discount.get("minimumRequirement") if isinstance(discount.get("minimumRequirement"), dict) else None
     )
@@ -381,6 +425,8 @@ def _map_discount_node_to_promotion(
 
     scope: Dict[str, Any] = {"global": True}
     items = customer_gets.get("items") if isinstance(customer_gets, dict) else None
+    if not isinstance(items, dict):
+        items = customer_buys.get("items") if isinstance(customer_buys, dict) else None
     if isinstance(items, dict) and items.get("__typename"):
         scope = {"shopifyItems": items}
 
@@ -445,8 +491,42 @@ query($first: Int!, $after: String) {
             discountClasses
             combinesWith { orderDiscounts productDiscounts shippingDiscounts }
             customerSelection { __typename }
-            customerGets { __typename value { __typename } items { __typename } }
-            minimumRequirement { __typename }
+            customerGets {
+              __typename
+              items {
+                __typename
+                ... on AllDiscountItems { allItems }
+                ... on DiscountCollections { collections(first: 50) { nodes { id } } }
+                ... on DiscountProducts {
+                  products(first: 50) { nodes { id } }
+                  productVariants(first: 50) { nodes { id } }
+                }
+              }
+              value {
+                __typename
+                ... on DiscountAmount {
+                  amount { amount currencyCode }
+                  appliesOnEachItem
+                }
+                ... on DiscountPercentage { percentage }
+                ... on DiscountOnQuantity {
+                  quantity { quantity }
+                  effect {
+                    __typename
+                    ... on DiscountAmount {
+                      amount { amount currencyCode }
+                      appliesOnEachItem
+                    }
+                    ... on DiscountPercentage { percentage }
+                  }
+                }
+              }
+            }
+            minimumRequirement {
+              __typename
+              ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount currencyCode } }
+              ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+            }
             usageLimit
             appliesOncePerCustomer
             asyncUsageCount
@@ -460,8 +540,42 @@ query($first: Int!, $after: String) {
             endsAt
             discountClasses
             combinesWith { orderDiscounts productDiscounts shippingDiscounts }
-            customerGets { __typename value { __typename } items { __typename } }
-            minimumRequirement { __typename }
+            customerGets {
+              __typename
+              items {
+                __typename
+                ... on AllDiscountItems { allItems }
+                ... on DiscountCollections { collections(first: 50) { nodes { id } } }
+                ... on DiscountProducts {
+                  products(first: 50) { nodes { id } }
+                  productVariants(first: 50) { nodes { id } }
+                }
+              }
+              value {
+                __typename
+                ... on DiscountAmount {
+                  amount { amount currencyCode }
+                  appliesOnEachItem
+                }
+                ... on DiscountPercentage { percentage }
+                ... on DiscountOnQuantity {
+                  quantity { quantity }
+                  effect {
+                    __typename
+                    ... on DiscountAmount {
+                      amount { amount currencyCode }
+                      appliesOnEachItem
+                    }
+                    ... on DiscountPercentage { percentage }
+                  }
+                }
+              }
+            }
+            minimumRequirement {
+              __typename
+              ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount currencyCode } }
+              ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+            }
             asyncUsageCount
           }
           ... on DiscountCodeBxgy {
@@ -473,8 +587,54 @@ query($first: Int!, $after: String) {
             discountClasses
             combinesWith { orderDiscounts productDiscounts shippingDiscounts }
             customerSelection { __typename }
-            customerBuys { __typename }
-            customerGets { __typename }
+            customerBuys {
+              __typename
+              items {
+                __typename
+                ... on AllDiscountItems { allItems }
+                ... on DiscountCollections { collections(first: 50) { nodes { id } } }
+                ... on DiscountProducts {
+                  products(first: 50) { nodes { id } }
+                  productVariants(first: 50) { nodes { id } }
+                }
+              }
+              value {
+                __typename
+                ... on DiscountPurchaseAmount { amount }
+                ... on DiscountQuantity { quantity }
+              }
+            }
+            customerGets {
+              __typename
+              items {
+                __typename
+                ... on AllDiscountItems { allItems }
+                ... on DiscountCollections { collections(first: 50) { nodes { id } } }
+                ... on DiscountProducts {
+                  products(first: 50) { nodes { id } }
+                  productVariants(first: 50) { nodes { id } }
+                }
+              }
+              value {
+                __typename
+                ... on DiscountAmount {
+                  amount { amount currencyCode }
+                  appliesOnEachItem
+                }
+                ... on DiscountPercentage { percentage }
+                ... on DiscountOnQuantity {
+                  quantity { quantity }
+                  effect {
+                    __typename
+                    ... on DiscountAmount {
+                      amount { amount currencyCode }
+                      appliesOnEachItem
+                    }
+                    ... on DiscountPercentage { percentage }
+                  }
+                }
+              }
+            }
             usageLimit
             appliesOncePerCustomer
             asyncUsageCount
@@ -488,8 +648,54 @@ query($first: Int!, $after: String) {
             endsAt
             discountClasses
             combinesWith { orderDiscounts productDiscounts shippingDiscounts }
-            customerBuys { __typename }
-            customerGets { __typename }
+            customerBuys {
+              __typename
+              items {
+                __typename
+                ... on AllDiscountItems { allItems }
+                ... on DiscountCollections { collections(first: 50) { nodes { id } } }
+                ... on DiscountProducts {
+                  products(first: 50) { nodes { id } }
+                  productVariants(first: 50) { nodes { id } }
+                }
+              }
+              value {
+                __typename
+                ... on DiscountPurchaseAmount { amount }
+                ... on DiscountQuantity { quantity }
+              }
+            }
+            customerGets {
+              __typename
+              items {
+                __typename
+                ... on AllDiscountItems { allItems }
+                ... on DiscountCollections { collections(first: 50) { nodes { id } } }
+                ... on DiscountProducts {
+                  products(first: 50) { nodes { id } }
+                  productVariants(first: 50) { nodes { id } }
+                }
+              }
+              value {
+                __typename
+                ... on DiscountAmount {
+                  amount { amount currencyCode }
+                  appliesOnEachItem
+                }
+                ... on DiscountPercentage { percentage }
+                ... on DiscountOnQuantity {
+                  quantity { quantity }
+                  effect {
+                    __typename
+                    ... on DiscountAmount {
+                      amount { amount currencyCode }
+                      appliesOnEachItem
+                    }
+                    ... on DiscountPercentage { percentage }
+                  }
+                }
+              }
+            }
             asyncUsageCount
           }
           ... on DiscountCodeFreeShipping {
@@ -501,7 +707,11 @@ query($first: Int!, $after: String) {
             discountClasses
             combinesWith { orderDiscounts productDiscounts shippingDiscounts }
             customerSelection { __typename }
-            minimumRequirement { __typename }
+            minimumRequirement {
+              __typename
+              ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount currencyCode } }
+              ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+            }
             usageLimit
             appliesOncePerCustomer
             asyncUsageCount
@@ -515,7 +725,11 @@ query($first: Int!, $after: String) {
             endsAt
             discountClasses
             combinesWith { orderDiscounts productDiscounts shippingDiscounts }
-            minimumRequirement { __typename }
+            minimumRequirement {
+              __typename
+              ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount currencyCode } }
+              ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+            }
             asyncUsageCount
           }
         }

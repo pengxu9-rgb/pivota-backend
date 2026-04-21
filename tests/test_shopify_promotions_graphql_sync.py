@@ -55,8 +55,28 @@ def test_discount_node_mapper_handles_bxgy_and_free_shipping_primitives():
                 "endsAt": "2026-05-01T00:00:00Z",
                 "discountClasses": ["PRODUCT"],
                 "combinesWith": {"productDiscounts": False, "orderDiscounts": False, "shippingDiscounts": False},
-                "customerBuys": {"__typename": "DiscountCustomerBuys"},
-                "customerGets": {"__typename": "DiscountCustomerGets"},
+                "customerBuys": {
+                    "__typename": "DiscountCustomerBuys",
+                    "items": {
+                        "__typename": "DiscountProducts",
+                        "products": {"nodes": [{"id": "gid://shopify/Product/10064558129449"}]},
+                        "productVariants": {"nodes": [{"id": "gid://shopify/ProductVariant/53012602618153"}]},
+                    },
+                    "value": {"__typename": "DiscountQuantity", "quantity": 2},
+                },
+                "customerGets": {
+                    "__typename": "DiscountCustomerGets",
+                    "items": {
+                        "__typename": "DiscountProducts",
+                        "products": {"nodes": [{"id": "gid://shopify/Product/10064558129449"}]},
+                        "productVariants": {"nodes": [{"id": "gid://shopify/ProductVariant/53012602618153"}]},
+                    },
+                    "value": {
+                        "__typename": "DiscountOnQuantity",
+                        "quantity": {"quantity": 1},
+                        "effect": {"__typename": "DiscountPercentage", "percentage": 80.0},
+                    },
+                },
             },
         },
         merchant_id="merch_1",
@@ -80,6 +100,12 @@ def test_discount_node_mapper_handles_bxgy_and_free_shipping_primitives():
     assert bxgy is not None
     assert bxgy.config["discountType"] == "bxgy"
     assert bxgy.config["discountMethod"] == "automatic"
+    assert bxgy.scope["shopifyItems"]["__typename"] == "DiscountProducts"
+    assert bxgy.scope["shopifyItems"]["productIds"] == ["gid://shopify/Product/10064558129449"]
+    assert bxgy.scope["shopifyItems"]["variantIds"] == ["gid://shopify/ProductVariant/53012602618153"]
+    assert bxgy.config["customerBuys"]["value"]["quantity"] == 2
+    assert bxgy.config["customerGets"]["value"]["quantity"]["quantity"] == 1
+    assert bxgy.config["customerGets"]["value"]["effect"]["percentage"] == 80.0
     assert free_shipping is not None
     assert free_shipping.type == "FREE_SHIPPING"
     assert free_shipping.config["discountType"] == "free_shipping"
