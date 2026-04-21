@@ -151,3 +151,89 @@ async def test_preview_quote_returns_nested_discount_evidence_json_safe(monkeypa
             "delivery_options": result["delivery_options"],
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_preview_quote_dedupes_store_discount_evidence_across_targets(monkeypatch):
+    svc = QuoteService()
+
+    async def fake_preview_cart_quote(**_kwargs):
+        return ShopifyPricingResult(
+            engine="shopify_storefront_cart",
+            engine_ref="cart_2",
+            currency="USD",
+            pricing={
+                "subtotal": Decimal("20.00"),
+                "discount_total": Decimal("0.00"),
+                "shipping_fee": Decimal("0.00"),
+                "tax": Decimal("0.00"),
+                "total": Decimal("20.00"),
+            },
+            promotion_lines=[],
+            line_items=[
+                {
+                    "product_id": "prod_1",
+                    "variant_id": "var_1",
+                    "quantity": 1,
+                    "unit_price_original": Decimal("10.00"),
+                    "unit_price_effective": Decimal("10.00"),
+                    "line_discount_total": Decimal("0.00"),
+                    "compare_at_savings": Decimal("0.00"),
+                },
+                {
+                    "product_id": "prod_2",
+                    "variant_id": "var_2",
+                    "quantity": 1,
+                    "unit_price_original": Decimal("10.00"),
+                    "unit_price_effective": Decimal("10.00"),
+                    "line_discount_total": Decimal("0.00"),
+                    "compare_at_savings": Decimal("0.00"),
+                },
+            ],
+            delivery_options=[],
+            debug={},
+            discount_evidence={"source": "shopify_storefront_cart", "pricing_confidence": "authoritative", "codes": [], "applications": [], "decisions": []},
+        )
+
+    async def fake_insert_quote(_row):
+        return None
+
+    async def fake_list_promotions(**_kwargs):
+        return ([], 0)
+
+    async def fake_store_discount_evidence(**_kwargs):
+        offer = {"store_discount_id": "store_1", "label": "PIVOTA_TEST_BXGY"}
+        decision = {"type": "store_discount_skipped", "store_discount_id": "expired_1", "reason": "expired"}
+        return {
+            "var_1": {"pricing_confidence": "metadata_available", "offers": [offer], "decisions": [decision]},
+            "var_2": {"pricing_confidence": "metadata_available", "offers": [dict(offer)], "decisions": [dict(decision)]},
+        }
+
+    async def fake_payment_offer_evidence(**_kwargs):
+        return {"pricing_confidence": "not_applicable", "offers": [], "decisions": []}
+
+    monkeypatch.setenv("AUTO_SYNC_SHOPIFY_PROMOTIONS_ON_QUOTE_PREVIEW", "0")
+    monkeypatch.setattr(svc.pricing_storefront, "preview_cart_quote", fake_preview_cart_quote)
+    monkeypatch.setattr("services.quote_service.insert_quote", fake_insert_quote)
+    monkeypatch.setattr("services.quote_service.list_promotions", fake_list_promotions)
+    monkeypatch.setattr("services.quote_service.resolve_store_discount_evidence_for_targets", fake_store_discount_evidence)
+    monkeypatch.setattr("services.quote_service.resolve_payment_offer_evidence", fake_payment_offer_evidence)
+    monkeypatch.setattr("services.quote_service.emit_payment_offer_analytics_event", lambda **_kwargs: None)
+
+    result = await svc.preview_quote(
+        merchant_id="merch_1",
+        agent_id="agent_1",
+        items=[
+            {"product_id": "prod_1", "variant_id": "var_1", "quantity": 1},
+            {"product_id": "prod_2", "variant_id": "var_2", "quantity": 1},
+        ],
+        discount_codes=[],
+        customer_email=None,
+        shipping_address={"country": "US", "postal_code": "10001", "city": "New York", "state": "NY"},
+        selected_delivery_option=None,
+    )
+
+    assert result["store_discount_evidence"]["offers"] == [{"store_discount_id": "store_1", "label": "PIVOTA_TEST_BXGY"}]
+    assert result["store_discount_evidence"]["decisions"] == [
+        {"type": "store_discount_skipped", "store_discount_id": "expired_1", "reason": "expired"}
+    ]

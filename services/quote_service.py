@@ -324,6 +324,8 @@ class QuoteService:
             for evidence in per_target_store_evidence.values():
                 store_offers.extend([offer for offer in evidence.get("offers") or [] if isinstance(offer, dict)])
                 store_decisions.extend([item for item in evidence.get("decisions") or [] if isinstance(item, dict)])
+            store_offers = self._dedupe_json_objects(store_offers)
+            store_decisions = self._dedupe_json_objects(store_decisions)
             store_discount_evidence = {
                 "pricing_confidence": (
                     "metadata_available"
@@ -1034,6 +1036,19 @@ class QuoteService:
         if not isinstance(evidence, dict):
             return {}
         return self._json_safe(evidence)
+
+    def _dedupe_json_objects(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            key = json.dumps(self._json_safe(row), sort_keys=True, separators=(",", ":"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+        return out
 
     def _json_safe(self, value: Any) -> Any:
         if isinstance(value, Decimal):
