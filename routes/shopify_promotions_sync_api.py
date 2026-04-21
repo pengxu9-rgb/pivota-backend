@@ -16,6 +16,8 @@ from services.shopify_promotions_sync import (
     ShopifyPromotionsAuthError,
     ShopifyPromotionsRateLimitError,
     ShopifyPromotionsError,
+    _fetch_access_scopes_for_config,
+    get_shopify_config_for_merchant,
     probe_shopify_discount_nodes_access_for_merchant,
     sync_shopify_promotions_for_merchant,
 )
@@ -147,6 +149,51 @@ async def preflight_shopify_discount_nodes_access(
         )
         ok = probe.get("discountNodesAccess") == "ok" and bool(probe.get("hasReadDiscountsScope"))
         return {"ok": ok, "probe": probe}
+    except ShopifyPromotionsConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "SHOPIFY_CONFIG_ERROR", "message": str(exc)},
+        )
+    except ShopifyPromotionsAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "SHOPIFY_AUTH_ERROR", "message": str(exc)},
+        )
+    except ShopifyPromotionsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "SHOPIFY_PREFLIGHT_ERROR", "message": str(exc)},
+        )
+
+
+@router.get(
+    "/preflight/{merchant_id}/access-scopes",
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+)
+async def preflight_shopify_access_scopes(
+    merchant_id: str = Path(..., description="Internal merchant ID"),
+    _: None = Depends(require_shopify_promotions_admin),
+) -> Dict[str, Any]:
+    """
+    Read-only preflight for the current merchant token's Shopify Admin access scopes.
+
+    This complements discount-nodes preflight when the stored capability report is
+    stale and we need the token's real-time scope set.
+    """
+    try:
+        cfg = await get_shopify_config_for_merchant(merchant_id)
+        scopes = await _fetch_access_scopes_for_config(cfg)
+        scope_set = {str(scope).strip().lower() for scope in scopes if str(scope or "").strip()}
+        return {
+            "ok": True,
+            "merchant_id": merchant_id,
+            "shop_domain": cfg.shop_domain,
+            "access_scopes": scopes,
+            "has_read_discounts": "read_discounts" in scope_set,
+            "has_write_discounts": "write_discounts" in scope_set,
+            "has_read_customers": "read_customers" in scope_set,
+        }
     except ShopifyPromotionsConfigError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
