@@ -1038,7 +1038,7 @@ async def list_merchant_capabilities_v2(
         FROM merchant_onboarding mo
         LEFT JOIN pcs_merchant_capabilities pmc
           ON pmc.merchant_id = mo.merchant_id
-        WHERE (:merchant_id IS NULL OR mo.merchant_id = :merchant_id)
+        WHERE (CAST(:merchant_id AS TEXT) IS NULL OR mo.merchant_id = CAST(:merchant_id AS TEXT))
           AND mo.status != 'deleted'
         ORDER BY mo.updated_at DESC NULLS LAST, mo.created_at DESC NULLS LAST
         """,
@@ -1050,6 +1050,14 @@ async def list_merchant_capabilities_v2(
         if not context.can_access_merchant(str(row.get("merchant_id") or "")):
             continue
         scopes_json = _decode_json_like(row.get("scopes_json"))
+        access_scopes = sorted(
+            {
+                str(scope).strip()
+                for scope in (scopes_json.get("access_scopes") or [])
+                if str(scope or "").strip()
+            }
+        )
+        access_scope_set = {scope.lower() for scope in access_scopes}
         state = _merchant_capability_state(str(row.get("status") or ""), row.get("last_checked_at"))
         merchants.append(
             {
@@ -1071,6 +1079,10 @@ async def list_merchant_capabilities_v2(
                 "policy_flags": {
                     "missing_required_scopes": scopes_json.get("missing_required_scopes") or [],
                     "missing_optional_scopes": scopes_json.get("missing_optional_scopes") or [],
+                    "access_scopes": access_scopes,
+                    "has_read_discounts": "read_discounts" in access_scope_set,
+                    "has_write_discounts": "write_discounts" in access_scope_set,
+                    "has_read_customers": "read_customers" in access_scope_set,
                 },
                 "health_score": _health_score(row, scopes_json),
                 "freshness_score": _freshness_score(row.get("last_checked_at")),
