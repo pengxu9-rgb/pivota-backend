@@ -255,7 +255,7 @@ def _minimum_requirement_status(promo: PromotionOut, target: StoreDiscountTarget
     return "unlockable", details
 
 
-def _discount_badge(promo: PromotionOut) -> str:
+def _discount_badge(promo: PromotionOut, status: str) -> str:
     cfg = promo.config if isinstance(promo.config, dict) else {}
     discount_type = _lower(cfg.get("discountType"))
     method = _lower(cfg.get("discountMethod"))
@@ -268,6 +268,8 @@ def _discount_badge(promo: PromotionOut) -> str:
             return "Free shipping code"
         return "Free shipping"
     if discount_type == "bxgy":
+        if status == "unverified":
+            return "Bundle offer"
         return summary or name or "Buy more, save"
     if method == "code" and codes:
         return f"Code {codes[0]}"
@@ -276,11 +278,21 @@ def _discount_badge(promo: PromotionOut) -> str:
 
 def _offer_display(promo: PromotionOut, status: str, minimum: Dict[str, Any]) -> Dict[str, str]:
     cfg = promo.config if isinstance(promo.config, dict) else {}
+    discount_type = _lower(cfg.get("discountType"))
     summary = _text(cfg.get("summary") or promo.humanReadableRule or promo.description)
-    badge = _discount_badge(promo)
+    badge = _discount_badge(promo, status)
     if status == "unlockable":
         short_copy = summary or "Add more to unlock this store offer."
     elif status == "unverified":
+        if discount_type == "bxgy":
+            short_copy = "Bundle offer may be available at checkout."
+            detail_copy = "Qualifying items and quantities are verified by the store platform quote and checkout."
+            return {
+                "badge": badge,
+                "short_copy": short_copy,
+                "detail_copy": detail_copy,
+                "disclaimer": "Final eligibility and amounts are verified by the store platform quote and checkout.",
+            }
         short_copy = summary or "Store offer may be available at checkout."
     else:
         short_copy = summary or "Store offer available at checkout."

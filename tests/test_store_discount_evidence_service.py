@@ -200,6 +200,8 @@ async def test_store_discount_evidence_bxgy_without_actionable_metadata_is_unver
     assert offer["status"] == "unverified"
     assert offer["scope_status"] == "unverified"
     assert offer["scope_reason"] == "bxgy_scope_unverified"
+    assert offer["display"]["badge"] == "Bundle offer"
+    assert offer["display"]["short_copy"] == "Bundle offer may be available at checkout."
 
 
 @pytest.mark.asyncio
