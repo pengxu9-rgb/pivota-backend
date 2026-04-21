@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import json
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from services.savings_presentation_service import (
@@ -100,6 +101,20 @@ def _as_list(value: Any) -> List[Any]:
 
 def _list_text(value: Any) -> List[str]:
     return [_text(item) for item in _as_list(value) if _text(item)]
+
+
+def _dedupe_dict_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        key = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
 
 
 def _connection_nodes(connection: Any) -> List[Dict[str, Any]]:
@@ -693,10 +708,10 @@ async def enrich_product_detail_with_store_discounts(
 
     aggregate = {
         "pricing_confidence": _pricing_confidence(aggregate_offers),
-        "offers": aggregate_offers,
+        "offers": _dedupe_dict_rows(aggregate_offers),
         "resolver_scope": "store_discount_metadata",
         "supported_platforms": sorted(set(SUPPORTED_STORE_DISCOUNT_METADATA_SOURCES.values())),
-        "decisions": aggregate_decisions,
+        "decisions": _dedupe_dict_rows(aggregate_decisions),
         "presentation_contract_version": "savings.v1",
     }
     product["store_discount_evidence"] = aggregate

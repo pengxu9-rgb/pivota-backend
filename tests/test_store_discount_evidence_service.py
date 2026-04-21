@@ -364,3 +364,36 @@ async def test_store_discount_evidence_skips_expired_and_non_shopify_promos(
     assert evidence["offers"] == []
     reasons = {decision["reason"] for decision in evidence["decisions"]}
     assert {"expired", "unsupported_store_discount_source"}.issubset(reasons)
+
+
+@pytest.mark.asyncio
+async def test_enrich_product_detail_store_discounts_dedupes_product_level_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_resolve(**_kwargs: Any) -> Dict[str, Dict[str, Any]]:
+        offer = {"store_discount_id": "disc_1", "label": "PIVOTA_TEST_AMOUNT10"}
+        decision = {"type": "store_discount_skipped", "store_discount_id": "expired_1", "reason": "expired"}
+        return {
+            "var_1": {"pricing_confidence": "metadata_available", "offers": [offer], "decisions": [decision]},
+            "var_2": {"pricing_confidence": "metadata_available", "offers": [dict(offer)], "decisions": [dict(decision)]},
+        }
+
+    monkeypatch.setattr(module, "resolve_store_discount_evidence_for_targets", fake_resolve)
+
+    product = {
+        "id": "prod_1",
+        "currency": "USD",
+        "variants": [
+            {"variant_id": "var_1", "price": "10.00"},
+            {"variant_id": "var_2", "price": "12.00"},
+        ],
+    }
+
+    result = await module.enrich_product_detail_with_store_discounts(product, merchant_id="merch_1")
+
+    assert result["store_discount_evidence"]["offers"] == [{"store_discount_id": "disc_1", "label": "PIVOTA_TEST_AMOUNT10"}]
+    assert result["store_discount_evidence"]["decisions"] == [
+        {"type": "store_discount_skipped", "store_discount_id": "expired_1", "reason": "expired"}
+    ]
+    assert result["variants"][0]["store_discount_evidence"]["offers"][0]["store_discount_id"] == "disc_1"
+    assert result["variants"][1]["store_discount_evidence"]["offers"][0]["store_discount_id"] == "disc_1"
