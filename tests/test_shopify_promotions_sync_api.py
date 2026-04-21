@@ -57,3 +57,37 @@ async def test_shopify_access_scopes_preflight_returns_live_scope_flags(
     assert body["has_read_discounts"] is True
     assert body["has_write_discounts"] is True
     assert body["has_read_customers"] is True
+
+
+@pytest.mark.asyncio
+async def test_shopify_discount_fixture_endpoint_returns_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.shopify_promotions_sync_api as route_module
+
+    async def fake_create_fixtures(**kwargs):
+        assert kwargs["merchant_id"] == "merch_1"
+        assert kwargs["customer_email"] == "buyer@example.com"
+        return {
+            "merchant_id": "merch_1",
+            "shop_domain": "example.myshopify.com",
+            "run_key": "PIVOTA_AUDIT_TEST",
+            "segments": {},
+            "discounts": {},
+        }
+
+    monkeypatch.setenv("PROMOTIONS_ADMIN_KEY", "test_admin_key")
+    monkeypatch.setattr(route_module, "create_shopify_discount_validation_fixtures", fake_create_fixtures)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/agent/internal/shopify/promotions/fixtures/merch_1",
+            headers={"X-ADMIN-KEY": "test_admin_key"},
+            json={"customer_email": "buyer@example.com"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["summary"]["run_key"] == "PIVOTA_AUDIT_TEST"

@@ -7,10 +7,12 @@ source of truth for promotions.
 """
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Path, Query, status
+from pydantic import BaseModel, EmailStr
 
+from services.shopify_discount_fixture_service import create_shopify_discount_validation_fixtures
 from services.shopify_promotions_sync import (
     ShopifyPromotionsConfigError,
     ShopifyPromotionsAuthError,
@@ -26,6 +28,14 @@ router = APIRouter(
     prefix="/agent/internal/shopify/promotions",
     tags=["shopify_promotions"],
 )
+
+
+class ShopifyDiscountFixtureCreateRequest(BaseModel):
+    customer_email: EmailStr
+    code_prefix: Optional[str] = None
+    upcoming_starts_in_minutes: int = 2
+    upcoming_duration_minutes: int = 20
+    api_version: Optional[str] = "2026-04"
 
 
 async def _sync_shopify_promotions_job(merchant_id: str) -> None:
@@ -208,4 +218,47 @@ async def preflight_shopify_access_scopes(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"code": "SHOPIFY_PREFLIGHT_ERROR", "message": str(exc)},
+        )
+
+
+@router.post(
+    "/fixtures/{merchant_id}",
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+)
+async def create_shopify_discount_fixtures(
+    body: ShopifyDiscountFixtureCreateRequest,
+    merchant_id: str = Path(..., description="Internal merchant ID"),
+    _: None = Depends(require_shopify_promotions_admin),
+) -> Dict[str, Any]:
+    """
+    Create a bounded set of Shopify-native discount fixtures for live validation.
+
+    This route is admin-only and intentionally narrow: it creates only the
+    specific test fixtures needed for discount audit coverage.
+    """
+    try:
+        summary = await create_shopify_discount_validation_fixtures(
+            merchant_id=merchant_id,
+            customer_email=str(body.customer_email),
+            code_prefix=body.code_prefix,
+            upcoming_starts_in_minutes=body.upcoming_starts_in_minutes,
+            upcoming_duration_minutes=body.upcoming_duration_minutes,
+            api_version=body.api_version,
+        )
+        return {"ok": True, "summary": summary}
+    except ShopifyPromotionsConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "SHOPIFY_CONFIG_ERROR", "message": str(exc)},
+        )
+    except ShopifyPromotionsAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "SHOPIFY_AUTH_ERROR", "message": str(exc)},
+        )
+    except ShopifyPromotionsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "SHOPIFY_FIXTURE_ERROR", "message": str(exc)},
         )
