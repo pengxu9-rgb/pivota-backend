@@ -227,6 +227,7 @@ async def create_shopify_discount_validation_fixtures(
     merchant_id: str,
     customer_email: str,
     code_prefix: Optional[str] = None,
+    product_id: Optional[str] = None,
     upcoming_starts_in_minutes: int = 2,
     upcoming_duration_minutes: int = 20,
     api_version: Optional[str] = None,
@@ -270,19 +271,34 @@ async def create_shopify_discount_validation_fixtures(
         query="number_of_orders = 0",
     )
 
+    fixed_product_id = str(product_id or "").strip()
+    fixed_items: Dict[str, Any] = {"all": True}
+    fixed_code = f"{run_key}_FIXITEM60"
+    fixed_title = f"{run_key} Fixed Item Amount"
+    fixed_discount_amount = {"amount": "0.60", "appliesOnEachItem": False}
+    if fixed_product_id:
+        fixed_items = {
+            "products": {
+                "productsToAdd": [f"gid://shopify/Product/{fixed_product_id}"],
+            }
+        }
+        fixed_code = f"{run_key}_FIXPROD60"
+        fixed_title = f"{run_key} Fixed Product Amount"
+        fixed_discount_amount = {"amount": "0.60", "appliesOnEachItem": True}
+
     fixed_amount = await _create_basic_discount(
         shop_domain=cfg.shop_domain,
         access_token=cfg.access_token,
         api_version=version,
         payload={
-            "title": f"{run_key} Fixed Item Amount",
-            "code": f"{run_key}_FIXITEM60",
+            "title": fixed_title,
+            "code": fixed_code,
             "startsAt": _iso(now),
             "endsAt": None,
             "customerSelection": {"all": True},
             "customerGets": {
-                "value": {"discountAmount": {"amount": "0.60", "appliesOnEachItem": False}},
-                "items": {"all": True},
+                "value": {"discountAmount": fixed_discount_amount},
+                "items": fixed_items,
             },
         },
     )

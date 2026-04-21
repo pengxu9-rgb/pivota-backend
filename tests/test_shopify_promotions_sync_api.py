@@ -68,6 +68,7 @@ async def test_shopify_discount_fixture_endpoint_returns_summary(
     async def fake_create_fixtures(**kwargs):
         assert kwargs["merchant_id"] == "merch_1"
         assert kwargs["customer_email"] == "buyer@example.com"
+        assert kwargs["product_id"] == "10064558129449"
         return {
             "merchant_id": "merch_1",
             "shop_domain": "example.myshopify.com",
@@ -84,7 +85,7 @@ async def test_shopify_discount_fixture_endpoint_returns_summary(
         resp = await client.post(
             "/agent/internal/shopify/promotions/fixtures/merch_1",
             headers={"X-ADMIN-KEY": "test_admin_key"},
-            json={"customer_email": "buyer@example.com"},
+            json={"customer_email": "buyer@example.com", "product_id": "10064558129449"},
         )
 
     assert resp.status_code == 200

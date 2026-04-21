@@ -33,6 +33,7 @@ router = APIRouter(
 class ShopifyDiscountFixtureCreateRequest(BaseModel):
     customer_email: EmailStr
     code_prefix: Optional[str] = None
+    product_id: Optional[str] = None
     upcoming_starts_in_minutes: int = 2
     upcoming_duration_minutes: int = 20
     api_version: Optional[str] = "2026-04"
@@ -242,6 +243,7 @@ async def create_shopify_discount_fixtures(
             merchant_id=merchant_id,
             customer_email=str(body.customer_email),
             code_prefix=body.code_prefix,
+            product_id=body.product_id,
             upcoming_starts_in_minutes=body.upcoming_starts_in_minutes,
             upcoming_duration_minutes=body.upcoming_duration_minutes,
             api_version=body.api_version,

@@ -79,6 +79,7 @@ async def test_create_shopify_discount_validation_fixtures_builds_expected_paylo
         merchant_id="merch_1",
         customer_email="buyer@example.com",
         code_prefix="pivota custom prefix",
+        product_id="10064558129449",
         upcoming_starts_in_minutes=3,
         upcoming_duration_minutes=11,
         api_version="2026-04",
@@ -88,7 +89,7 @@ async def test_create_shopify_discount_validation_fixtures_builds_expected_paylo
     assert summary["customer"]["numberOfOrders"] == 0
     assert summary["segments"]["email_domain"]["query"] == "customer_email_domain = 'example.com'"
     assert summary["segments"]["new_customer"]["query"] == "number_of_orders = 0"
-    assert summary["discounts"]["fixed_amount_product"]["codes"] == ["PIVOTA_CUSTOM_PREFIX_FIXITEM60"]
+    assert summary["discounts"]["fixed_amount_product"]["codes"] == ["PIVOTA_CUSTOM_PREFIX_FIXPROD60"]
     assert summary["discounts"]["usage_limit"]["usageLimit"] == 1
     assert summary["discounts"]["usage_limit"]["appliesOncePerCustomer"] is True
     assert summary["discounts"]["segment_customer"]["codes"] == ["PIVOTA_CUSTOM_PREFIX_SEGMENT"]
@@ -100,7 +101,12 @@ async def test_create_shopify_discount_validation_fixtures_builds_expected_paylo
         if "basicCodeDiscount" in (call.get("variables") or {})
     ]
     assert discount_payloads[0]["customerGets"]["value"]["discountAmount"]["amount"] == "0.60"
-    assert discount_payloads[0]["customerGets"]["items"] == {"all": True}
+    assert discount_payloads[0]["customerGets"]["value"]["discountAmount"]["appliesOnEachItem"] is True
+    assert discount_payloads[0]["customerGets"]["items"] == {
+        "products": {
+            "productsToAdd": ["gid://shopify/Product/10064558129449"],
+        }
+    }
     assert discount_payloads[1]["usageLimit"] == 1
     assert discount_payloads[1]["appliesOncePerCustomer"] is True
     assert discount_payloads[3]["context"]["customerSegments"]["add"] == [summary["segments"]["email_domain"]["id"]]
