@@ -67,6 +67,7 @@ from services.quote_service import (
 from services.shopify_transactions_service import (
     extract_shopify_access_token,
     ensure_external_payment_transaction_best_effort,
+    list_shopify_order_transactions,
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.merchant_webhook_service import emit_merchant_webhook_event
@@ -1467,6 +1468,53 @@ def _extract_shopify_order_reconciliation_totals(
         "discount_total": discount_total,
         "transaction_total": transaction_total,
     }
+
+
+async def _fetch_shopify_order_reconciliation_payload_best_effort(
+    *,
+    shop_domain: str,
+    access_token: str,
+    shopify_order_id: str,
+) -> Optional[Dict[str, Any]]:
+    if not shop_domain or not access_token or not shopify_order_id:
+        return None
+
+    url = (
+        f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}.json"
+        "?status=any&fields=id,current_total_price,total_price,current_total_discounts,total_discounts,"
+        "total_price_set,total_discounts_set"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url,
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+                timeout=12.0,
+            )
+        if response.status_code != 200:
+            return None
+        payload = response.json() if response.content else {}
+        order = (payload or {}).get("order") if isinstance(payload, dict) else None
+        if not isinstance(order, dict):
+            return None
+    except Exception:
+        return None
+
+    try:
+        txns = await list_shopify_order_transactions(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            shopify_order_id=shopify_order_id,
+        )
+        if isinstance(txns, list):
+            order["transactions"] = txns
+    except Exception:
+        pass
+
+    return order
 
 
 def _reconcile_shopify_discount_order(
@@ -3191,11 +3239,50 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             event_type: str,
             shopify_order_payload: Optional[Dict[str, Any]] = None,
         ) -> bool:
+            transaction_sync_result: Optional[Dict[str, Any]] = None
+
+            # Reconciliation must use the post-create authoritative Shopify order state.
+            # The immediate create response can be sparse, and existing-order reuse has no
+            # embedded payload at all. Sync external PSP transactions first, then refetch.
+            try:
+                psp_used = infer_runtime_provider(
+                    psp_used=order.get("psp_used"),
+                    psp_id=order.get("psp_id"),
+                    payment_reference=order.get("payment_intent_id"),
+                )
+                payment_ref = order.get("payment_intent_id") or None
+                transaction_sync_result = await ensure_external_payment_transaction_best_effort(
+                    shop_domain=shop_domain,
+                    access_token=access_token,
+                    shopify_order_id=shopify_order_id,
+                    psp_used=psp_used,
+                    external_payment_ref=payment_ref,
+                    amount=float(order.get("total") or 0),
+                    currency=str(order.get("currency") or "USD"),
+                    pivota_order_id=order_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Shopify] Payment transaction sync failed order_id=%s shopify_order_id=%s err=%s",
+                    order_id,
+                    shopify_order_id,
+                    str(e),
+                )
+
+            authoritative_shopify_order = shopify_order_payload
+            fetched_shopify_order = await _fetch_shopify_order_reconciliation_payload_best_effort(
+                shop_domain=shop_domain,
+                access_token=access_token,
+                shopify_order_id=shopify_order_id,
+            )
+            if isinstance(fetched_shopify_order, dict) and fetched_shopify_order:
+                authoritative_shopify_order = fetched_shopify_order
+
             if pricing_quote_meta:
                 reconciliation = _reconcile_shopify_discount_order(
                     order=order,
                     pricing_quote_meta=pricing_quote_meta,
-                    shopify_order=shopify_order_payload,
+                    shopify_order=authoritative_shopify_order,
                     transaction_amount=order_total,
                 )
                 await log_order_event(
@@ -3209,6 +3296,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                         "shopify_order_id": shopify_order_id,
                         "store_id": str((store_used or {}).get("store_id") or "").strip() or None,
                         "domain": shop_domain,
+                        "transaction_sync": transaction_sync_result,
                     },
                 )
                 if not reconciliation.get("passed"):
@@ -3247,32 +3335,6 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                     "api_key_fp": _token_fingerprint(access_token),
                 },
             )
-
-            # Best-effort reconciliation: record external PSP payment as a Shopify transaction.
-            try:
-                psp_used = infer_runtime_provider(
-                    psp_used=order.get("psp_used"),
-                    psp_id=order.get("psp_id"),
-                    payment_reference=order.get("payment_intent_id"),
-                )
-                payment_ref = order.get("payment_intent_id") or None
-                await ensure_external_payment_transaction_best_effort(
-                    shop_domain=shop_domain,
-                    access_token=access_token,
-                    shopify_order_id=shopify_order_id,
-                    psp_used=psp_used,
-                    external_payment_ref=payment_ref,
-                    amount=float(order.get("total") or 0),
-                    currency=str(order.get("currency") or "USD"),
-                    pivota_order_id=order_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[Shopify] Payment transaction sync failed order_id=%s shopify_order_id=%s err=%s",
-                    order_id,
-                    shopify_order_id,
-                    str(e),
-                )
 
             logger.info(
                 "[Shopify] ✅ Shopify order linked: order_id=%s shopify_order_id=%s store_id=%s domain=%s",
