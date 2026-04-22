@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any
 from decimal import Decimal
 from datetime import datetime
 
-from db.orders import get_order, update_order_status
+from db.orders import get_order, update_order, update_order_status
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
 from utils.auth import require_admin
@@ -28,8 +28,10 @@ from services.merchant_psp_config_service import (
 )
 from services.psp_payment_finalizer import finalize_refund_success
 from services.refund_observability import (
+    collect_refund_ids,
     build_order_refund_tracking_payload,
     extract_stripe_refund_snapshot,
+    merge_refund_metadata,
     stripe_refund_metadata_patch,
 )
 
@@ -83,6 +85,68 @@ async def _resolve_refund_adapter(order: Dict[str, Any]) -> tuple[str, str, Dict
             f"Canonical merchant_psps configuration is missing for {order_psp_type} refunds"
         )
     raise ValueError("Canonical merchant_psps configuration is missing for this refund")
+
+
+async def _refresh_stripe_refund_observability_for_order(
+    order: Dict[str, Any],
+) -> Dict[str, Any]:
+    psp_type, psp_key, adapter_kwargs = await _resolve_refund_adapter(order)
+    if psp_type != "stripe":
+        raise ValueError(f"Refund telemetry refresh only supports stripe orders; found {psp_type}")
+
+    psp_adapter = get_psp_adapter(psp_type, psp_key, **adapter_kwargs)
+    if not hasattr(psp_adapter, "get_refund_details"):
+        raise ValueError("Stripe refund detail retrieval is unavailable")
+
+    metadata = order.get("metadata") or {}
+    refund_ids = collect_refund_ids(metadata, provider="stripe")
+    refreshed_snapshots = []
+    errors = []
+
+    for refund_id in refund_ids:
+        try:
+            ok, refund_details, error = await psp_adapter.get_refund_details(refund_id)
+        except Exception as exc:
+            ok, refund_details, error = False, None, str(exc)
+        if not ok or not refund_details:
+            errors.append({"refund_id": refund_id, "error": error or "refund_not_found"})
+            continue
+
+        snapshot = extract_stripe_refund_snapshot(
+            refund_details,
+            source_event="refund.refresh",
+        )
+        metadata = merge_refund_metadata(
+            metadata,
+            stripe_refund_metadata_patch(
+                snapshot,
+                existing_metadata=metadata,
+            ),
+        )
+        refreshed_snapshots.append(snapshot)
+
+    updated = False
+    if refreshed_snapshots:
+        await update_order(str(order.get("order_id")), {"metadata": metadata})
+        refreshed_order = await get_order(str(order.get("order_id")))
+        if refreshed_order:
+            order = refreshed_order
+        else:
+            order = {**order, "metadata": metadata}
+        updated = True
+
+    return {
+        "order": order,
+        "refund_ids": refund_ids,
+        "refreshed_count": len(refreshed_snapshots),
+        "refreshed": refreshed_snapshots,
+        "errors": errors,
+        "updated": updated,
+        "refund_tracking": build_order_refund_tracking_payload(
+            order,
+            psp_used=order.get("psp_used"),
+        ),
+    }
 
 
 @router.post("/{order_id}/refund")
@@ -506,4 +570,35 @@ async def get_refund_status(
     return {
         "status": "success",
         "refund": refund_info
+    }
+
+
+@router.post("/{order_id}/refund-observability/refresh")
+async def refresh_refund_observability(
+    order_id: str,
+    current_user: dict = Depends(require_admin)
+):
+    """Backfill Stripe refund telemetry for historical refunded orders."""
+
+    order = await get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    try:
+        result = await _refresh_stripe_refund_observability_for_order(order)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Refund observability refresh failed for {order_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Refund observability refresh failed")
+
+    return {
+        "status": "success",
+        "order_id": order_id,
+        "refreshed_count": result["refreshed_count"],
+        "refund_ids": result["refund_ids"],
+        "errors": result["errors"],
+        "updated": result["updated"],
+        "refund": result["refund_tracking"],
+        "requested_by": current_user.get("user_id", "admin"),
     }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -57,6 +57,14 @@ def _tracking_reference_kind(reference_type: Optional[str]) -> Optional[str]:
         "retrieval_reference_number": "RRN",
     }
     return mapping.get(normalized)
+
+
+def _append_unique(target: List[str], value: Any) -> None:
+    text = _clean_str(value)
+    if not text:
+        return
+    if text not in target:
+        target.append(text)
 
 
 def _public_refund_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -248,3 +256,46 @@ def build_order_refund_tracking_payload(
         "latest": public_latest or None,
         "history": history,
     }
+
+
+def collect_refund_ids(
+    metadata_like: Any,
+    *,
+    provider: str = "stripe",
+) -> List[str]:
+    metadata = _as_dict(metadata_like)
+    provider_norm = str(provider or "").strip().lower()
+    ids: List[str] = []
+
+    latest = _as_dict(metadata.get(f"{provider_norm}_refund_status"))
+    _append_unique(ids, latest.get("refund_id"))
+
+    latest = _as_dict(metadata.get(f"{provider_norm}_last_refund"))
+    _append_unique(ids, latest.get("refund_id"))
+
+    latest_failure = _as_dict(metadata.get(f"{provider_norm}_last_refund_failure"))
+    _append_unique(ids, latest_failure.get("refund_id"))
+
+    statuses = _as_dict(metadata.get(f"{provider_norm}_refund_statuses"))
+    for refund_id in statuses.keys():
+        _append_unique(ids, refund_id)
+        snapshot = _as_dict(statuses.get(refund_id))
+        _append_unique(ids, snapshot.get("refund_id"))
+
+    psp_refund_records = _as_dict(metadata.get("psp_refund_records"))
+    for record in psp_refund_records.values():
+        refund_record = _as_dict(record)
+        if str(refund_record.get("psp") or "").strip().lower() != provider_norm:
+            continue
+        _append_unique(ids, refund_record.get("refund_id"))
+        _append_unique(ids, refund_record.get("refund_reference"))
+
+    last_refund = _as_dict(metadata.get("last_refund"))
+    if str(last_refund.get("psp") or "").strip().lower() == provider_norm:
+        _append_unique(ids, last_refund.get("refund_id"))
+        _append_unique(ids, last_refund.get("refund_reference"))
+
+    if provider_norm == "stripe":
+        ids = [refund_id for refund_id in ids if refund_id.startswith("re_")]
+
+    return ids
