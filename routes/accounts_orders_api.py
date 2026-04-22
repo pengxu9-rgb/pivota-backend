@@ -451,6 +451,8 @@ class OrdersListItem(BaseModel):
     total_amount_minor: int
     status: str
     payment_status: str
+    refund_status: Optional[str] = None
+    total_refunded_minor: int = 0
     fulfillment_status: Optional[str]
     delivery_status: str
     created_at: str
@@ -880,6 +882,8 @@ def _map_payment_status(raw_status: Optional[str]) -> str:
         return "paid"
     if raw in {"refunded"}:
         return "refunded"
+    if raw in {"partially_refunded", "partial_refund"}:
+        return "partially_refunded"
     if raw in {"failed"}:
         return "failed"
     if raw in {"partial", "partially_paid"}:
@@ -915,10 +919,16 @@ def _derive_delivery_status(
 
 
 def _derive_order_status(
-    payment_status: str, fulfillment_status: str, cancelled: bool, refunded: bool
+    payment_status: str,
+    fulfillment_status: str,
+    cancelled: bool,
+    refunded: bool,
+    partially_refunded: bool = False,
 ) -> str:
     if refunded:
         return "refunded"
+    if partially_refunded:
+        return "partially_refunded"
     if cancelled:
         return "cancelled"
     if payment_status == "paid" and fulfillment_status == "fulfilled":
@@ -928,6 +938,30 @@ def _derive_order_status(
     if payment_status in {"failed"}:
         return "pending"
     return "pending"
+
+
+def _derive_refund_status(order_row: Dict[str, Any], metadata: Dict[str, Any], status_summary: str) -> str:
+    refund_status = str(metadata.get("refund_status") or "").strip().lower()
+    if refund_status:
+        return refund_status
+
+    raw_status = str(order_row.get("status") or "").strip().lower()
+    raw_payment_status = str(order_row.get("payment_status") or "").strip().lower()
+    total_refunded_minor = _amount_to_minor(order_row.get("total_refunded"))
+    total_minor = _amount_to_minor(order_row.get("total"))
+
+    if raw_status == "refunded" or raw_payment_status == "refunded" or status_summary == "refunded":
+        return "refunded"
+    if (
+        raw_status == "partially_refunded"
+        or raw_payment_status == "partially_refunded"
+        or status_summary == "partially_refunded"
+        or (total_refunded_minor > 0 and (total_minor <= 0 or total_refunded_minor < total_minor))
+    ):
+        return "partially_refunded"
+    if total_refunded_minor > 0 and total_refunded_minor >= total_minor > 0:
+        return "refunded"
+    return "none"
 
 
 def _compute_permissions(order_row: dict, principal: AccountsPrincipal) -> Dict[str, bool]:
@@ -2420,7 +2454,7 @@ async def list_orders(
 
         for row in rows:
             data = dict(row)
-            metadata = data.get("metadata") or {}
+            metadata = _coerce_json_object(data.get("metadata"))
             creator_id = None
             creator_name = None
             creator_slug = None
@@ -2447,7 +2481,10 @@ async def list_orders(
                 fulfillment_status_mapped,
                 cancelled=(data.get("status") == "cancelled"),
                 refunded=(data.get("status") == "refunded"),
+                partially_refunded=(str(data.get("status") or "").strip().lower() == "partially_refunded"),
             )
+            refund_status = _derive_refund_status(data, metadata, status_summary)
+            total_refunded_minor = _amount_to_minor(data.get("total_refunded"))
 
             shipping = data.get("shipping_address") or {}
             items = data.get("items") or []
@@ -2459,6 +2496,8 @@ async def list_orders(
                     total_amount_minor=_amount_to_minor(data.get("total")),
                     status=status_summary,
                     payment_status=payment_status_mapped,
+                    refund_status=refund_status,
+                    total_refunded_minor=total_refunded_minor,
                     fulfillment_status=fulfillment_status_mapped,
                     delivery_status=delivery_status,
                     created_at=(data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
@@ -2525,6 +2564,9 @@ async def get_order_detail(
         fulfillment_status_mapped,
         cancelled=(order_data.get("status") == "cancelled"),
         refunded=(order_data.get("status") == "refunded"),
+        partially_refunded=(
+            str(order_data.get("status") or "").strip().lower() == "partially_refunded"
+        ),
     )
 
     shipping = _coerce_json_object(order_data.get("shipping_address"))
@@ -2626,10 +2668,7 @@ async def get_order_detail(
     }
 
     total_refunded_minor = _amount_to_minor(order_data.get("total_refunded"))
-    refund_status = (
-        str(metadata.get("refund_status") or "").strip().lower()
-        or ("refunded" if status_summary == "refunded" else "none")
-    )
+    refund_status = _derive_refund_status(order_data, metadata, status_summary)
     refund_payload = {
         "status": refund_status,
         "case_id": metadata.get("refund_case_id"),
@@ -3056,6 +3095,9 @@ async def public_order_lookup(
         fulfillment_status_mapped,
         cancelled=(order_data.get("status") == "cancelled"),
         refunded=(order_data.get("status") == "refunded"),
+        partially_refunded=(
+            str(order_data.get("status") or "").strip().lower() == "partially_refunded"
+        ),
     )
 
     shipping = order_data.get("shipping_address") or {}
