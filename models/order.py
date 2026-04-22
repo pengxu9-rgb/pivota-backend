@@ -138,6 +138,7 @@ class OrderResponse(BaseModel):
     
     # 金额
     subtotal: Decimal
+    discount_total: Decimal = Decimal("0.00")
     shipping_fee: Decimal
     tax: Decimal
     total: Decimal

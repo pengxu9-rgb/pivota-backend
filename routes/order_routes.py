@@ -190,6 +190,70 @@ def _normalize_order_provider_hint(
     return None
 
 
+def _decimal_str(value: Decimal) -> str:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP).to_eng_string()
+
+
+def _quote_line_item_key(product_id: Any, variant_id: Any) -> Tuple[str, str]:
+    return (str(product_id or "").strip(), str(variant_id or "").strip())
+
+
+def _build_persisted_order_items(
+    order_items: List[OrderItem],
+    pricing_quote_meta: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    request_items_payload = [json.loads(item.json()) for item in (order_items or [])]
+    if not isinstance(pricing_quote_meta, dict):
+        return request_items_payload
+
+    raw_line_items = pricing_quote_meta.get("line_items")
+    if not isinstance(raw_line_items, list) or not raw_line_items:
+        return request_items_payload
+
+    quote_line_items: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in raw_line_items:
+        if not isinstance(row, dict):
+            continue
+        quote_line_items[_quote_line_item_key(row.get("product_id"), row.get("variant_id"))] = row
+
+    persisted_items: List[Dict[str, Any]] = []
+    for item in request_items_payload:
+        row = quote_line_items.get(_quote_line_item_key(item.get("product_id"), item.get("variant_id")))
+        if not row:
+            persisted_items.append(item)
+            continue
+
+        try:
+            quantity = int(item.get("quantity") or row.get("quantity") or 1)
+        except Exception:
+            quantity = 1
+        quantity = max(1, quantity)
+
+        effective_unit_price = parse_decimal_money(
+            row.get("unit_price_effective")
+            or row.get("price")
+            or row.get("unit_price_original")
+            or 0
+        )
+        line_subtotal = parse_decimal_money(row.get("line_subtotal") or row.get("subtotal") or 0)
+        if line_subtotal <= 0 and effective_unit_price > 0:
+            line_subtotal = effective_unit_price * Decimal(quantity)
+
+        enriched = dict(item)
+        if row.get("title") and not enriched.get("product_title"):
+            enriched["product_title"] = str(row.get("title"))
+        if row.get("sku") and not enriched.get("sku"):
+            enriched["sku"] = str(row.get("sku"))
+        if effective_unit_price > 0:
+            enriched["unit_price"] = _decimal_str(effective_unit_price)
+        if line_subtotal > 0:
+            enriched["subtotal"] = _decimal_str(line_subtotal)
+
+        persisted_items.append(enriched)
+
+    return persisted_items
+
+
 def _build_order_preferred_psps(
     route_config: Optional[Dict[str, Any]],
     preferred_psp: Optional[str],
@@ -2062,12 +2126,18 @@ async def create_new_order(
         except Exception:
             store_id_value = None
 
+        order_metadata["amounts_source"] = "quote_snapshot" if pricing_quote_meta else (
+            "legacy_promotions" if discount_total > 0 else "legacy_incomplete"
+        )
+        persisted_order_items = _build_persisted_order_items(order_request.items, pricing_quote_meta)
+
         order_data = {
             "merchant_id": order_request.merchant_id,
             "customer_email": order_request.customer_email,
-            "items": [item.model_dump(mode="json") for item in order_request.items],
+            "items": persisted_order_items,
             "shipping_address": order_request.shipping_address.model_dump(mode="json"),
             "subtotal": float(subtotal),
+            "discount_total": float(discount_total),
             "shipping_fee": float(shipping_fee),
             "tax": float(tax),
             "total": float(total),
@@ -2441,9 +2511,10 @@ async def create_new_order(
             order_id=order_id,
             merchant_id=order_request.merchant_id,
             customer_email=order_request.customer_email,
-            items=order_request.items,
+            items=[OrderItem(**item) for item in persisted_order_items],
             shipping_address=order_request.shipping_address,
             subtotal=float(subtotal),
+            discount_total=float(discount_total),
             shipping_fee=float(shipping_fee),
             tax=float(tax),
             total=float(total),

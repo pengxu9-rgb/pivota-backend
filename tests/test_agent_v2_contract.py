@@ -502,3 +502,94 @@ async def test_agent_v2_checkout_session_rejects_non_checkoutable_order_state(
     assert body["detail"]["error"] == "CHECKOUT_SESSION_NOT_ALLOWED"
     assert body["detail"]["order_state"] == "confirmed"
     assert "awaiting checkout" in body["detail"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_agent_v2_order_and_tracking_include_pricing_breakdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_v2 as agent_v2
+    from routes.agent_auth import get_agent_context
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any] | None:
+        now = datetime.now(timezone.utc)
+        return {
+            "order_id": order_id,
+            "merchant_id": "m_contract",
+            "agent_id": "agent_v2_contract",
+            "customer_email": "buyer@example.com",
+            "items": [
+                {
+                    "product_id": "prod_1",
+                    "variant_id": "var_1",
+                    "quantity": 1,
+                    "unit_price": "1.69",
+                    "subtotal": "1.69",
+                }
+            ],
+            "shipping_address": {
+                "name": "Buyer Example",
+                "address_line1": "123 Market St",
+                "city": "San Francisco",
+                "state": "CA",
+                "postal_code": "94105",
+                "country": "US",
+            },
+            "subtotal": "1.69",
+            "discount_total": "0.16",
+            "shipping_fee": "8.00",
+            "tax": "0.00",
+            "total": "9.53",
+            "currency": "USD",
+            "status": "processing",
+            "payment_status": "paid",
+            "created_at": now,
+            "updated_at": now,
+            "tracking_number": "TRACK123",
+            "carrier": "ups",
+            "fulfillment_status": "shipped",
+        }
+
+    async def fake_track_order(**_: Any) -> Dict[str, Any]:
+        return {
+            "tracking": {
+                "status": "shipped",
+                "tracking_number": "TRACK123",
+                "carrier": "ups",
+            }
+        }
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    monkeypatch.setattr(agent_v2, "get_order", fake_get_order)
+    monkeypatch.setattr(agent_v2, "agent_v1_track_order", fake_track_order)
+
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            order_resp = await client.get("/agent/v2/orders/ORD_AMOUNT_CONTRACT")
+            tracking_resp = await client.get("/agent/v2/orders/ORD_AMOUNT_CONTRACT/tracking")
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+    assert order_resp.status_code == 200
+    order_body = order_resp.json()
+    assert order_body["order"]["amounts"] == {
+        "subtotal": "1.69",
+        "discount_total": "0.16",
+        "shipping_fee": "8.00",
+        "tax": "0",
+        "total": "9.53",
+        "currency": "USD",
+    }
+
+    assert tracking_resp.status_code == 200
+    tracking_body = tracking_resp.json()
+    assert tracking_body["tracking"]["pricing"] == {
+        "subtotal": "1.69",
+        "discount_total": "0.16",
+        "shipping_fee": "8.00",
+        "tax": "0",
+        "total": "9.53",
+        "currency": "USD",
+    }
+    assert tracking_body["tracking"]["total"] == "9.53"

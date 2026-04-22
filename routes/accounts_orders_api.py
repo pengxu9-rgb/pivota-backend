@@ -98,6 +98,8 @@ REFRESH_EXPIRE_DAYS = 7
 
 PUBLIC_LOOKUP_IP_LIMIT_PER_MINUTE = 10
 PUBLIC_LOOKUP_PAIR_LIMIT_PER_MINUTE = 3
+_browse_history_schema_ready = False
+_browse_history_schema_lock = asyncio.Lock()
 
 
 def _error(status_code: int, code: str, message: str) -> HTTPException:
@@ -126,6 +128,25 @@ async def _ensure_database_connected() -> None:
             "TEMPORARY_UNAVAILABLE",
             "Temporary database unavailable. Please retry shortly.",
         )
+
+
+async def _ensure_browse_history_schema() -> None:
+    global _browse_history_schema_ready
+
+    if _browse_history_schema_ready:
+        return
+
+    async with _browse_history_schema_lock:
+        if _browse_history_schema_ready:
+            return
+        statements = [
+            "ALTER TABLE shop_browse_history_events ADD COLUMN IF NOT EXISTS brand TEXT;",
+            "ALTER TABLE shop_browse_history_events ADD COLUMN IF NOT EXISTS category TEXT;",
+            "ALTER TABLE shop_browse_history_events ADD COLUMN IF NOT EXISTS product_type TEXT;",
+        ]
+        for statement in statements:
+            await database.execute(statement)
+        _browse_history_schema_ready = True
 
 
 async def _mark_email_verified_best_effort(user_id: str) -> None:
@@ -183,6 +204,43 @@ def _amount_to_minor(amount: Optional[float]) -> int:
         return 0
     # Avoid floating precision issues by rounding
     return int(round(float(amount) * 100))
+
+
+def _pricing_quote_pricing(order_data: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _coerce_json_object(order_data.get("metadata"))
+    pricing_quote = _coerce_json_object(metadata.get("pricing_quote"))
+    return _coerce_json_object(pricing_quote.get("pricing"))
+
+
+def _extract_order_pricing_minor(order_data: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, int]:
+    pricing = _pricing_quote_pricing(order_data)
+
+    subtotal_minor = (
+        _amount_to_minor(order_data.get("subtotal"))
+        or _amount_to_minor(pricing.get("subtotal"))
+    )
+    discount_total_minor = (
+        _amount_to_minor(order_data.get("discount_total"))
+        or _amount_to_minor(pricing.get("discount_total"))
+    )
+    shipping_fee_minor = (
+        _amount_to_minor(order_data.get("shipping_fee"))
+        or _amount_to_minor(pricing.get("shipping_fee"))
+    )
+    tax_minor = _amount_to_minor(order_data.get("tax")) or _amount_to_minor(pricing.get("tax"))
+    total_amount_minor = (
+        _amount_to_minor(order_data.get("total"))
+        or _amount_to_minor(pricing.get("total"))
+        or max(0, subtotal_minor - discount_total_minor) + shipping_fee_minor + tax_minor
+    )
+
+    return {
+        "subtotal_minor": subtotal_minor,
+        "discount_total_minor": discount_total_minor,
+        "shipping_fee_minor": shipping_fee_minor,
+        "tax_minor": tax_minor,
+        "total_amount_minor": total_amount_minor,
+    }
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -414,11 +472,20 @@ class OrdersListResponse(BaseModel):
     has_more: bool
 
 
+class OrderPricingResponse(BaseModel):
+    subtotal_minor: int
+    discount_total_minor: int
+    shipping_fee_minor: int
+    tax_minor: int
+    total_amount_minor: int
+
+
 class PublicOrderLookupResponse(BaseModel):
     order_id: str
     status: str
     currency: str
     total_amount_minor: int
+    pricing: OrderPricingResponse
     created_at: str
     items_summary: str
     shipping: Dict[str, Optional[str]]
@@ -509,13 +576,26 @@ class BrowseHistoryEventRequest(BaseModel):
     currency: Optional[str] = Field(default=None, min_length=1, max_length=16)
     image_url: Optional[str] = Field(default=None, max_length=4096)
     description: Optional[str] = Field(default=None, max_length=4000)
+    brand: Optional[str] = Field(default=None, max_length=255)
+    category: Optional[str] = Field(default=None, max_length=255)
+    product_type: Optional[str] = Field(default=None, max_length=255)
     viewed_at: Optional[str] = Field(default=None, max_length=64)
 
     @validator("product_id")
     def normalize_product_id(cls, v: str) -> str:
         return v.strip()
 
-    @validator("merchant_id", "title", "currency", "image_url", "description", "viewed_at")
+    @validator(
+        "merchant_id",
+        "title",
+        "currency",
+        "image_url",
+        "description",
+        "brand",
+        "category",
+        "product_type",
+        "viewed_at",
+    )
     def normalize_optional_fields(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return None
@@ -531,6 +611,9 @@ class BrowseHistoryItem(BaseModel):
     currency: str
     image_url: str
     description: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    product_type: Optional[str] = None
     timestamp: int
     viewed_at: str
 
@@ -1355,6 +1438,9 @@ def _history_row_to_item(row: Dict[str, Any]) -> BrowseHistoryItem:
         currency=str(row.get("currency") or "USD").strip() or "USD",
         image_url=str(row.get("image_url") or "/placeholder.svg").strip() or "/placeholder.svg",
         description=(str(row.get("description") or "").strip() or None),
+        brand=(str(row.get("brand") or "").strip() or None),
+        category=(str(row.get("category") or "").strip() or None),
+        product_type=(str(row.get("product_type") or "").strip() or None),
         timestamp=int(parsed.timestamp() * 1000),
         viewed_at=parsed.isoformat(),
     )
@@ -2067,6 +2153,7 @@ async def create_browse_history_event(
     principal: AccountsPrincipal = Depends(get_accounts_principal),
 ):
     await _ensure_database_connected()
+    await _ensure_browse_history_schema()
 
     product_id = str(body.product_id or "").strip()
     if not product_id:
@@ -2107,6 +2194,9 @@ async def create_browse_history_event(
         "currency": body.currency or "USD",
         "image_url": body.image_url or "/placeholder.svg",
         "description": body.description,
+        "brand": body.brand,
+        "category": body.category,
+        "product_type": body.product_type,
         "viewed_at": viewed_at,
     }
 
@@ -2165,6 +2255,7 @@ async def list_browse_history(
     limit: int = Query(30, ge=1, le=100),
 ):
     await _ensure_database_connected()
+    await _ensure_browse_history_schema()
 
     scan_limit = min(max(limit * 5, limit), 500)
     rows = await database.fetch_all(
@@ -2572,13 +2663,14 @@ async def get_order_detail(
         or shipping.get("zip")
         or shipping.get("zip_code")
     )
+    pricing_minor = _extract_order_pricing_minor(order_data, items)
 
     response_payload = {
         "order": {
             "order_id": order_data["order_id"],
             "merchant_id": order_data["merchant_id"],
             "currency": order_data.get("currency", "USD"),
-            "total_amount_minor": _amount_to_minor(order_data.get("total")),
+            "total_amount_minor": pricing_minor["total_amount_minor"],
             "status": status_summary,
             "payment_status": payment_status_mapped,
             "fulfillment_status": fulfillment_status_mapped,
@@ -2598,6 +2690,7 @@ async def get_order_detail(
                 "postal_code": shipping_postal_code,
                 "phone": shipping_phone,
             },
+            "pricing": pricing_minor,
         },
         "pricing_quote": _extract_pricing_quote_payload(order_data),
         "items": await _build_order_items_payload(order_data),
@@ -2613,6 +2706,7 @@ async def get_order_detail(
             "tracking_url": tracking_url,
             "events": tracking_events,
         },
+        "pricing": pricing_minor,
         "refund": refund_payload,
         "customer": customer_info,
         "permissions": _compute_permissions(order_data, principal),
@@ -2958,12 +3052,14 @@ async def public_order_lookup(
 
     shipping = order_data.get("shipping_address") or {}
     items = order_data.get("items") or []
+    pricing_minor = _extract_order_pricing_minor(order_data, items)
 
     return PublicOrderLookupResponse(
         order_id=order_id,
         status=status_summary,
         currency=order_data.get("currency", "USD"),
-        total_amount_minor=_amount_to_minor(order_data.get("total")),
+        total_amount_minor=pricing_minor["total_amount_minor"],
+        pricing=OrderPricingResponse(**pricing_minor),
         created_at=(order_data.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         items_summary=_build_items_summary(items),
         shipping={
