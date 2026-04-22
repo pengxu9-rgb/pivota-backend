@@ -207,3 +207,74 @@ def test_build_payment_action_includes_stripe_account() -> None:
 
     assert action["type"] == "stripe_client_secret"
     assert action["stripe_account"] == "acct_live_connect_123"
+
+
+def test_build_payment_action_includes_submit_owner_contract() -> None:
+    from services.merchant_payment_initiation_service import build_payment_action
+
+    stripe_action = build_payment_action(
+        _FakePaymentIntent(
+            payment_id="pi_live_connect",
+            psp_type="stripe",
+            client_secret="pi_live_connect_secret",
+            public_key="pk_live_connect",
+        ),
+        psp_used="stripe",
+    )
+    adyen_action = build_payment_action(
+        _FakePaymentIntent(
+            payment_id="adyen_session_test",
+            psp_type="adyen",
+            client_secret="session-data",
+        ),
+        psp_used="adyen",
+    )
+
+    assert stripe_action["submit_owner"] == "external_button"
+    assert stripe_action["component_kind"] == "stripe_payment_element"
+    assert stripe_action["supported_in_shopping_ui"] is True
+    assert adyen_action["submit_owner"] == "component"
+    assert adyen_action["component_kind"] == "adyen_dropin"
+    assert adyen_action["supported_in_shopping_ui"] is True
+
+
+def test_build_payment_initiation_result_exposes_payment_contract() -> None:
+    from services.merchant_payment_initiation_service import build_payment_initiation_result
+
+    result = build_payment_initiation_result(
+        success=True,
+        payment_intent=_FakePaymentIntent(
+            payment_id="pi_live_123",
+            psp_type="stripe",
+            client_secret="pi_live_123_secret_abc",
+            public_key="pk_live_123",
+        ),
+        psp_used="stripe",
+    )
+
+    assert result["payment_status"] == "requires_action"
+    assert result["confirmation_owner"] == "client"
+    assert result["requires_client_confirmation"] is True
+    assert result["payment_action"]["submit_owner"] == "external_button"
+
+
+def test_build_payment_initiation_result_normalizes_failed_status() -> None:
+    from services.merchant_payment_initiation_service import build_payment_initiation_result
+
+    intent = _FakePaymentIntent(
+        payment_id="pi_fail_123",
+        psp_type="stripe",
+        client_secret="pi_fail_123_secret",
+    )
+    intent.status = "failed"
+
+    result = build_payment_initiation_result(
+        success=False,
+        payment_intent=intent,
+        error="Card declined",
+        psp_used="stripe",
+    )
+
+    assert result["payment_status"] == "payment_failed"
+    assert result["confirmation_owner"] == "backend"
+    assert result["requires_client_confirmation"] is False
