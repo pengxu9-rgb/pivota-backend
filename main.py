@@ -1484,7 +1484,7 @@ async def startup():
             orders_columns = [
                 ("shipping_address", "JSONB"),
                 ("items", "JSONB"),
-                ("client_secret", "VARCHAR(500)")
+                ("client_secret", "TEXT")
             ]
             for col_name, col_type in orders_columns:
                 check_col = text(f"""

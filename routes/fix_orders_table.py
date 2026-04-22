@@ -43,7 +43,7 @@ async def fix_orders_table_columns():
         try:
             await database.execute(text("""
                 ALTER TABLE orders 
-                ADD COLUMN client_secret VARCHAR(500)
+                ADD COLUMN client_secret TEXT
             """))
             fixes_applied.append("Added client_secret column")
         except Exception as e:
@@ -51,6 +51,14 @@ async def fix_orders_table_columns():
                 fixes_applied.append("client_secret column already exists")
             else:
                 logger.warning(f"Could not add client_secret: {e}")
+        try:
+            await database.execute(text("""
+                ALTER TABLE orders
+                ALTER COLUMN client_secret TYPE TEXT
+            """))
+            fixes_applied.append("Ensured client_secret is TEXT")
+        except Exception as e:
+            logger.warning(f"Could not widen client_secret to TEXT: {e}")
         
         # subtotal column
         try:

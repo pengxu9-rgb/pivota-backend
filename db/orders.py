@@ -3,12 +3,15 @@
 防御性架构：订单是核心业务数据，只能追加和更新状态，不能删除
 """
 
+import asyncio
+
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Numeric, Boolean
 from sqlalchemy.sql import func
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import secrets
 import os
+from sqlalchemy import text
 
 from db.database import metadata, database
 
@@ -54,7 +57,7 @@ orders = Table(
     # 支付集成（Stripe）
     Column("payment_intent_id", String(255), nullable=True, unique=True),
     Column("payment_method_id", String(255), nullable=True),
-    Column("client_secret", String(500), nullable=True),  # Stripe 前端支付用
+    Column("client_secret", Text, nullable=True),  # PSP client secret / Adyen sessionData
     Column("psp_used", String(50), nullable=True),  # Which PSP was actually used for this order
     
     # 履约集成（Shopify/Wix）
@@ -90,6 +93,50 @@ orders = Table(
 # CRUD 操作
 # ============================================================================
 
+_client_secret_storage_ready = False
+_client_secret_storage_lock = asyncio.Lock()
+
+
+async def _ensure_client_secret_storage_allows_long_values() -> None:
+    """
+    Make `orders.client_secret` safe for long PSP surfaces such as Adyen sessionData.
+
+    Older environments still carry `VARCHAR(500)`, which truncates Adyen sessions
+    and makes client-owned confirmation surfaces invalid. We self-heal to `TEXT`
+    once and keep the call best-effort.
+    """
+    global _client_secret_storage_ready
+
+    if _client_secret_storage_ready:
+        return
+
+    async with _client_secret_storage_lock:
+        if _client_secret_storage_ready:
+            return
+        try:
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE orders
+                    ADD COLUMN IF NOT EXISTS client_secret TEXT
+                    """
+                )
+            )
+        except Exception:
+            pass
+        try:
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE orders
+                    ALTER COLUMN client_secret TYPE TEXT
+                    """
+                )
+            )
+        except Exception:
+            pass
+        _client_secret_storage_ready = True
+
 async def create_order(order_data: Dict[str, Any]) -> str:
     """创建新订单"""
     order_id = f"ORD_{secrets.token_hex(8).upper()}"
@@ -121,7 +168,7 @@ async def create_order(order_data: Dict[str, Any]) -> str:
             if "column \"client_secret\" of relation \"orders\" does not exist" in err or "client_secret" in err:
                 await database.execute(text("""
                     ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS client_secret VARCHAR(500);
+                    ADD COLUMN IF NOT EXISTS client_secret TEXT;
                 """))
             if "column \"subtotal\" of relation \"orders\" does not exist" in err or "subtotal" in err:
                 await database.execute(text("""
@@ -450,15 +497,14 @@ async def update_payment_info(
     - payment_intent_id / client_secret / payment_status 按照原有逻辑更新
     - 可选的 psp_used 用于记录实际使用的 PSP 提供方（如 'stripe' 或 'adyen'）
     """
-    # Protect against extremely long secrets (e.g. Adyen sessionData) exceeding
-    # the VARCHAR(500) limit on client_secret. We only need full secrets for
-    # PSP/frontends, not for the orders table, so truncation here is safe.
     safe_secret = client_secret
     try:
-        if client_secret and len(client_secret) > 480:
-            safe_secret = client_secret[:480]
+        if client_secret and len(str(client_secret)) > 480:
+            await _ensure_client_secret_storage_allows_long_values()
+            safe_secret = str(client_secret)
     except Exception:
-        # If length check fails for any reason, fall back to original value.
+        # Preserve the original secret if self-heal fails; callers still need the
+        # complete PSP surface for client confirmation flows.
         safe_secret = client_secret
 
     update_values = {
