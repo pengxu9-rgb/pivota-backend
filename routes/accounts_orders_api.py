@@ -502,6 +502,7 @@ class PublicOrderResumeResponse(BaseModel):
     payment: Dict[str, Any]
     refund: Dict[str, Any]
     customer: Dict[str, Any]
+    permissions: Dict[str, bool]
 
 
 class PublicTrackEvent(BaseModel):
@@ -878,14 +879,16 @@ async def _fetch_aurora_auth_me(*, aurora_token: str, aurora_uid: str) -> Dict[s
 
 def _map_payment_status(raw_status: Optional[str]) -> str:
     raw = (raw_status or "").lower()
-    if raw in {"paid", "succeeded"}:
+    if raw in {"paid", "succeeded", "completed", "success", "settled"}:
         return "paid"
     if raw in {"refunded"}:
         return "refunded"
     if raw in {"partially_refunded", "partial_refund"}:
         return "partially_refunded"
-    if raw in {"failed"}:
-        return "failed"
+    if raw in {"payment_failed", "failed"}:
+        return "payment_failed"
+    if raw in {"cancelled", "canceled"}:
+        return "cancelled"
     if raw in {"partial", "partially_paid"}:
         return "partial"
     return "pending"
@@ -931,12 +934,14 @@ def _derive_order_status(
         return "partially_refunded"
     if cancelled:
         return "cancelled"
+    if payment_status == "cancelled":
+        return "cancelled"
+    if payment_status == "payment_failed":
+        return "payment_failed"
     if payment_status == "paid" and fulfillment_status == "fulfilled":
         return "completed"
     if payment_status == "paid" and fulfillment_status != "fulfilled":
         return "paid"
-    if payment_status in {"failed"}:
-        return "pending"
     return "pending"
 
 
@@ -1146,6 +1151,15 @@ def _build_tracking_events(order_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "description": "Payment confirmed",
                 "location": None,
                 "timestamp": _to_iso_string(order_data.get("paid_at") or created_at),
+            }
+        )
+    elif payment_status == "payment_failed":
+        timeline.append(
+            {
+                "status": "payment_failed",
+                "description": "Payment failed",
+                "location": None,
+                "timestamp": _to_iso_string(order_data.get("updated_at") or created_at),
             }
         )
 
@@ -3234,6 +3248,11 @@ async def public_order_resume(
             "name": shipping_name,
             "masked_email": _mask_email(order_data.get("customer_email", "")),
         },
+        permissions={
+            "can_pay": payment_status_mapped == "pending",
+            "can_cancel": payment_status_mapped == "pending" and fulfillment_status_mapped == "not_fulfilled",
+            "can_reorder": payment_status_mapped == "paid",
+        },
     )
 
 
@@ -3269,6 +3288,16 @@ async def public_track(
         timeline.append(
             PublicTrackEvent(
                 status="paid", timestamp=paid_at.isoformat(), completed=True
+            )
+        )
+    elif payment_status_mapped == "payment_failed":
+        failed_at = order_data.get("updated_at") or created_at
+        timeline.append(
+            PublicTrackEvent(
+                status="payment_failed",
+                timestamp=failed_at.isoformat(),
+                completed=True,
+                description="Payment failed",
             )
         )
     if fulfillment_status_mapped in {"partially_fulfilled", "fulfilled"}:
