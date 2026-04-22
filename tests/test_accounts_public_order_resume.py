@@ -61,14 +61,21 @@ async def test_public_order_resume_returns_resumable_payment_payload(
                     "product_id": "prod_1",
                     "variant_id": "var_1",
                     "offer_id": "offer_1",
-                    "title": "Resume Item",
                     "quantity": 1,
-                    "unit_price": 1.53,
-                    "subtotal": 1.53,
                     "sku": "SKU-1",
-                    "image_url": "https://example.com/item.png",
                 }
             ],
+            "metadata": {
+                "pricing_quote": {
+                    "line_items": [
+                        {
+                            "product_id": "prod_1",
+                            "variant_id": "var_1",
+                            "unit_price_effective": "1.53",
+                        }
+                    ]
+                }
+            },
             "psp_used": "stripe",
             "payment_intent_id": "pi_123",
             "client_secret": "cs_test_secret",
@@ -82,6 +89,14 @@ async def test_public_order_resume_returns_resumable_payment_payload(
             "payment_intent_id": "pi_123",
             "payment_action": {"type": "stripe_client_secret"},
             "status": "pending",
+        }
+
+    async def fake_load_order_item_display_context(*, merchant_id, product_id):
+        assert merchant_id == "merch_1"
+        assert product_id == "prod_1"
+        return {
+            "title": "Resume Item",
+            "image_url": "https://example.com/item.png",
         }
 
     monkeypatch.setattr(
@@ -100,6 +115,11 @@ async def test_public_order_resume_returns_resumable_payment_payload(
         route_module,
         "_build_resumable_payment_payload",
         fake_build_resumable_payment_payload,
+    )
+    monkeypatch.setattr(
+        route_module,
+        "_load_order_item_display_context",
+        fake_load_order_item_display_context,
     )
 
     transport = httpx.ASGITransport(app=app)

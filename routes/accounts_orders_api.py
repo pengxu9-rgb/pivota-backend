@@ -53,6 +53,7 @@ from db.accounts import (
     count_recent_public_lookup_by_key,
 )
 from db.orders import orders as orders_table
+from db.products import products_cache
 from utils.auth import create_access_token, decode_token, hash_password, verify_password
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from services.ugc_capabilities_service import (
@@ -1164,25 +1165,139 @@ def _extract_tracking_url(order_data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _build_order_items_payload(order_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_pricing_quote_line_items(order_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metadata = _coerce_json_object(order_data.get("metadata"))
+    pricing_quote = _coerce_json_object(metadata.get("pricing_quote"))
+    raw = pricing_quote.get("line_items")
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
+
+def _match_pricing_quote_line_item(
+    *,
+    item: Dict[str, Any],
+    pricing_line_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    variant_id = str(item.get("variant_id") or "").strip()
+    product_id = str(item.get("product_id") or "").strip()
+    if variant_id:
+        for candidate in pricing_line_items:
+            if str(candidate.get("variant_id") or "").strip() == variant_id:
+                return candidate
+    if product_id:
+        for candidate in pricing_line_items:
+            if str(candidate.get("product_id") or "").strip() == product_id:
+                return candidate
+    return {}
+
+
+async def _load_order_item_display_context(
+    *,
+    merchant_id: Optional[str],
+    product_id: Optional[str],
+) -> Dict[str, Optional[str]]:
+    merchant_text = str(merchant_id or "").strip()
+    product_text = str(product_id or "").strip()
+    if not merchant_text or not product_text:
+        return {"title": None, "image_url": None}
+
+    row = await database.fetch_one(
+        select(products_cache.c.product_data)
+        .where(
+            and_(
+                products_cache.c.merchant_id == merchant_text,
+                products_cache.c.platform_product_id == product_text,
+            )
+        )
+        .order_by(products_cache.c.cached_at.desc())
+        .limit(1)
+    )
+    if not row:
+        return {"title": None, "image_url": None}
+
+    product_data = row.get("product_data") if hasattr(row, "get") else dict(row).get("product_data")
+    product_json = _coerce_json_object(product_data)
+    title = (
+        str(
+            product_json.get("title")
+            or product_json.get("name")
+            or product_json.get("product_title")
+            or ""
+        ).strip()
+        or None
+    )
+    image_url = (
+        str(
+            product_json.get("image_url")
+            or product_json.get("main_image_url")
+            or (
+                product_json.get("images")[0]
+                if isinstance(product_json.get("images"), list) and product_json.get("images")
+                else ""
+            )
+            or ""
+        ).strip()
+        or None
+    )
+    return {"title": title, "image_url": image_url}
+
+
+async def _build_order_items_payload(order_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     merchant_id = order_data.get("merchant_id")
     items = order_data.get("items") or []
+    pricing_line_items = _extract_pricing_quote_line_items(order_data)
+    product_context_cache: Dict[str, Dict[str, Optional[str]]] = {}
     payload: List[Dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict):
             continue
+        product_id = item.get("product_id")
+        product_key = str(product_id or "").strip()
+        pricing_line = _match_pricing_quote_line_item(
+            item=item,
+            pricing_line_items=pricing_line_items,
+        )
+        unit_price = item.get("unit_price")
+        if unit_price in {None, "", 0, 0.0, "0", "0.0", "0.00"}:
+            unit_price = (
+                pricing_line.get("unit_price_effective")
+                or pricing_line.get("unit_price_original")
+                or pricing_line.get("price")
+            )
+        subtotal = item.get("subtotal")
+        if subtotal in {None, "", 0, 0.0, "0", "0.0", "0.00"} and unit_price not in {None, ""}:
+            try:
+                subtotal = float(unit_price) * max(int(item.get("quantity") or 1), 1)
+            except Exception:
+                subtotal = unit_price
+        display_context = {"title": None, "image_url": None}
+        if product_key:
+            display_context = product_context_cache.get(product_key) or {"title": None, "image_url": None}
+            if display_context == {"title": None, "image_url": None} and product_key not in product_context_cache:
+                display_context = await _load_order_item_display_context(
+                    merchant_id=str(merchant_id or "").strip() or None,
+                    product_id=product_key,
+                )
+                product_context_cache[product_key] = display_context
         payload.append(
             {
-                "product_id": item.get("product_id"),
+                "product_id": product_id,
                 "variant_id": item.get("variant_id"),
                 "offer_id": item.get("offer_id"),
-                "title": item.get("product_title") or item.get("title"),
+                "title": (
+                    item.get("product_title")
+                    or item.get("title")
+                    or pricing_line.get("product_title")
+                    or pricing_line.get("title")
+                    or display_context.get("title")
+                ),
                 "quantity": item.get("quantity", 1),
-                "unit_price_minor": _amount_to_minor(item.get("unit_price")),
-                "subtotal_minor": _amount_to_minor(item.get("subtotal")),
+                "unit_price_minor": _amount_to_minor(unit_price),
+                "subtotal_minor": _amount_to_minor(subtotal),
                 "sku": item.get("sku"),
                 "merchant_id": merchant_id,
-                "image_url": item.get("image_url") or item.get("image"),
+                "image_url": item.get("image_url") or item.get("image") or display_context.get("image_url"),
             }
         )
     return payload
@@ -2465,18 +2580,7 @@ async def get_order_detail(
                 "phone": shipping_phone,
             },
         },
-        "items": [
-            {
-                "product_id": it.get("product_id"),
-                "title": it.get("product_title") or it.get("title"),
-                "quantity": it.get("quantity", 1),
-                "unit_price_minor": _amount_to_minor(it.get("unit_price")),
-                "subtotal_minor": _amount_to_minor(it.get("subtotal")),
-                "sku": it.get("sku"),
-                "merchant_id": order_data["merchant_id"],
-            }
-            for it in items
-        ],
+        "items": await _build_order_items_payload(order_data),
         "payment": {
             "records": payment_records,
             "current": resumable_payment,
@@ -2935,7 +3039,7 @@ async def public_order_resume(
                 "phone": shipping_phone,
             },
         },
-        items=_build_order_items_payload(order_data),
+        items=await _build_order_items_payload(order_data),
         payment={"current": resumable_payment},
         customer={
             "email": order_data.get("customer_email"),
