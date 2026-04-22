@@ -52,11 +52,14 @@ def _email_provider() -> str:
 
     Precedence:
     - EMAIL_PROVIDER env var ("ses" | "sendgrid")
+    - SendGrid when `SENDGRID_API_KEY` exists
     - Default: "ses"
     """
     raw = (os.getenv("EMAIL_PROVIDER") or "").strip().lower()
     if raw:
         return raw
+    if (os.getenv("SENDGRID_API_KEY") or "").strip():
+        return "sendgrid"
     return "ses"
 
 
