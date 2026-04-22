@@ -1216,7 +1216,8 @@ async def _load_order_item_display_context(
     if not row:
         return {"title": None, "image_url": None}
 
-    product_data = row.get("product_data") if hasattr(row, "get") else dict(row).get("product_data")
+    row_get = getattr(row, "get", None)
+    product_data = row_get("product_data") if callable(row_get) else dict(row).get("product_data")
     product_json = _coerce_json_object(product_data)
     title = (
         str(
