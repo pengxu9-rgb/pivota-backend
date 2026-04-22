@@ -283,6 +283,11 @@ class QuoteService:
                 details={"attempts": attempts},
             )
 
+        self._raise_if_shipping_unverified(
+            shipping_address=normalized_shipping,
+            result=result,
+        )
+
         discount_evidence = self._coerce_discount_evidence(
             getattr(result, "discount_evidence", None) or (result.debug or {}).get("discount_evidence"),
             submitted_codes=codes,
@@ -516,6 +521,49 @@ class QuoteService:
             "debug_id": (result.debug or {}).get("debug_id"),
             "attempts": self._json_safe(attempts or []),
         }
+
+    def _raise_if_shipping_unverified(
+        self,
+        *,
+        shipping_address: Optional[Dict[str, Any]],
+        result: Any,
+    ) -> None:
+        if not shipping_address or not isinstance(shipping_address, dict):
+            return
+        country = str(shipping_address.get("country") or "").strip().upper()
+        postal_code = str(shipping_address.get("postal_code") or "").strip().upper()
+        if not country or not postal_code:
+            return
+        if getattr(result, "engine", None) != "shopify_storefront_cart":
+            return
+
+        debug = getattr(result, "debug", {}) or {}
+        discount_evidence = getattr(result, "discount_evidence", None)
+        if not isinstance(discount_evidence, dict) and isinstance(debug, dict):
+            discount_evidence = debug.get("discount_evidence")
+
+        shipping_evidence = (
+            discount_evidence.get("shipping_evidence")
+            if isinstance(discount_evidence, dict)
+            else None
+        )
+        if not isinstance(shipping_evidence, dict) and isinstance(debug, dict):
+            shipping_evidence = debug.get("shipping_evidence")
+        if not isinstance(shipping_evidence, dict):
+            shipping_evidence = {
+                "status": "authoritative" if (getattr(result, "delivery_options", None) or []) else "unverified",
+                "reason": None if (getattr(result, "delivery_options", None) or []) else "shipping_rates_unavailable_for_shippable_lines",
+            }
+
+        if str(shipping_evidence.get("status") or "").strip().lower() != "unverified":
+            return
+
+        raise QuoteError(
+            "QUOTE_SHIPPING_UNVERIFIED",
+            "Unable to verify shipping for this address. Please update the address or try again.",
+            debug_id=str(debug.get("debug_id") or "").strip() or None,
+            details={"shipping_evidence": shipping_evidence},
+        )
 
     def _coerce_discount_evidence(
         self,
