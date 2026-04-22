@@ -67,6 +67,30 @@ def test_backend_health_surfaces_runtime_drift_contract() -> None:
         assert resp.headers["x-service-deployment-id"] == version["deployment_id"]
     assert settings_contract["rate_limit_rpm_present"] is True
     assert settings_contract["rate_limit_rpm_source"] == "settings"
+    assert settings_contract["shopify_discount_reconciliation_mode"] in {"observe", "fail_closed"}
+    assert settings_contract["shopify_discount_reconciliation_mode_source"] in {"default", "env"}
+
+
+def test_backend_health_surfaces_discount_reconciliation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
+    with TestClient(app) as client:
+        resp = client.get("/health")
+
+    assert resp.status_code == 200
+    settings_contract = resp.json()["settings_contract"]
+    assert settings_contract["shopify_discount_reconciliation_mode"] == "fail_closed"
+    assert settings_contract["shopify_discount_reconciliation_mode_source"] == "env"
+
+
+def test_public_version_surfaces_discount_reconciliation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe")
+    with TestClient(app) as client:
+        resp = client.get("/version")
+
+    assert resp.status_code == 200
+    settings_contract = resp.json()["settings_contract"]
+    assert settings_contract["shopify_discount_reconciliation_mode"] == "observe"
+    assert settings_contract["shopify_discount_reconciliation_mode_source"] in {"default", "env"}
 
 
 def test_backend_build_endpoint_exposes_stable_version_surface() -> None:

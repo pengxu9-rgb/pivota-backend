@@ -470,10 +470,16 @@ def _guard_legacy_psp_maintenance_routes() -> None:
 
 def _settings_contract_payload() -> dict:
     rate_limit_rpm = getattr(settings, "rate_limit_rpm", None)
+    reconciliation_mode_raw = str(os.getenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe") or "").strip().lower()
+    reconciliation_mode = reconciliation_mode_raw if reconciliation_mode_raw in {"observe", "fail_closed"} else "observe"
     return {
         "rate_limit_rpm_present": hasattr(settings, "rate_limit_rpm"),
         "rate_limit_rpm": rate_limit_rpm,
         "rate_limit_rpm_source": "settings" if rate_limit_rpm is not None else "default",
+        "shopify_discount_reconciliation_mode": reconciliation_mode,
+        "shopify_discount_reconciliation_mode_source": (
+            "env" if "SHOPIFY_DISCOUNT_RECONCILIATION_MODE" in os.environ else "default"
+        ),
     }
 
 
@@ -940,7 +946,8 @@ async def get_version():
             "branch": railway_branch,
             "author": railway_author,
             "environment": "production",
-            "status": "healthy"
+            "status": "healthy",
+            "settings_contract": _settings_contract_payload(),
         }
     
     # 本地开发环境，尝试 git 命令
@@ -961,14 +968,16 @@ async def get_version():
             "version": commit,
             "commit_time": commit_time,
             "environment": "local",
-            "status": "healthy"
+            "status": "healthy",
+            "settings_contract": _settings_contract_payload(),
         }
     except Exception as e:
         return {
             "version": "unknown",
             "error": str(e),
             "environment": "unknown",
-            "status": "healthy"
+            "status": "healthy",
+            "settings_contract": _settings_contract_payload(),
         }
 
 async def startup():
