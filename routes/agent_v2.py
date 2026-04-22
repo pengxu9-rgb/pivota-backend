@@ -147,6 +147,17 @@ def _money_str(value: Any) -> str:
     return str(value)
 
 
+def _decimal_or_zero(value: Any) -> Decimal:
+    if value in (None, ""):
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
 def _decode_json_like(value: Any) -> Dict[str, Any]:
     if value is None:
         return {}
@@ -173,6 +184,40 @@ def _decode_json_list(value: Any) -> List[Any]:
             return []
         return parsed if isinstance(parsed, list) else []
     return []
+
+
+def _order_amounts_from_row(order: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _decode_json_like(order.get("metadata"))
+    pricing_quote = _decode_json_like(metadata.get("pricing_quote"))
+    pricing = _decode_json_like(pricing_quote.get("pricing"))
+
+    subtotal = (
+        _decimal_or_zero(order.get("subtotal"))
+        or _decimal_or_zero(pricing.get("subtotal"))
+    )
+    discount_total = (
+        _decimal_or_zero(order.get("discount_total"))
+        or _decimal_or_zero(pricing.get("discount_total"))
+    )
+    shipping_fee = (
+        _decimal_or_zero(order.get("shipping_fee"))
+        or _decimal_or_zero(pricing.get("shipping_fee"))
+    )
+    tax = _decimal_or_zero(order.get("tax")) or _decimal_or_zero(pricing.get("tax"))
+    total = (
+        _decimal_or_zero(order.get("total"))
+        or _decimal_or_zero(pricing.get("total"))
+        or max(Decimal("0"), subtotal - discount_total) + shipping_fee + tax
+    )
+
+    return {
+        "subtotal": _money_str(subtotal),
+        "discount_total": _money_str(discount_total),
+        "shipping_fee": _money_str(shipping_fee),
+        "tax": _money_str(tax),
+        "total": _money_str(total),
+        "currency": order.get("currency") or pricing_quote.get("currency") or "USD",
+    }
 
 
 def _event(event_type: str, **payload: Any) -> Dict[str, Any]:
@@ -545,6 +590,7 @@ def _order_response_from_row(
 ) -> Dict[str, Any]:
     shipping_address = order.get("shipping_address") if isinstance(order.get("shipping_address"), dict) else {}
     metadata = _decode_json_like(order.get("metadata"))
+    amounts = _order_amounts_from_row(order)
     return {
         "order_id": order.get("order_id"),
         "quote_id": _quote_id_from_order(order) or fallback_quote_id,
@@ -572,11 +618,12 @@ def _order_response_from_row(
             "delivered_at": _utc_iso(order.get("delivered_at")),
         },
         "amounts": {
-            "subtotal": _money_str(order.get("subtotal")),
-            "shipping_fee": _money_str(order.get("shipping_fee")),
-            "tax": _money_str(order.get("tax")),
-            "total": _money_str(order.get("total")),
-            "currency": order.get("currency") or "USD",
+            "subtotal": amounts["subtotal"],
+            "discount_total": amounts["discount_total"],
+            "shipping_fee": amounts["shipping_fee"],
+            "tax": amounts["tax"],
+            "total": amounts["total"],
+            "currency": amounts["currency"],
         },
         "audit": {
             "agent_id": order.get("agent_id"),
@@ -1104,10 +1151,27 @@ async def track_order_v2(
     order_id: str,
     context: AgentContext = Depends(get_agent_context),
 ):
+    order = await get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if str(order.get("agent_id") or "") != str(context.agent_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this order")
     tracking_response = await agent_v1_track_order(order_id=order_id, context=context)
+    amounts = _order_amounts_from_row(order)
     return {
         "status": "success",
-        "tracking": tracking_response.get("tracking") if isinstance(tracking_response, dict) else {},
+        "tracking": {
+            **(tracking_response.get("tracking") if isinstance(tracking_response, dict) else {}),
+            "payment_status": str(order.get("payment_status") or ""),
+            "fulfillment_status": str(order.get("fulfillment_status") or ""),
+            "currency": amounts["currency"],
+            "pricing": amounts,
+            "subtotal": amounts["subtotal"],
+            "discount_total": amounts["discount_total"],
+            "shipping_fee": amounts["shipping_fee"],
+            "tax": amounts["tax"],
+            "total": amounts["total"],
+        },
         "capability": "optional",
     }
 
