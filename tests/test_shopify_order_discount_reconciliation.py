@@ -11,6 +11,16 @@ def _pricing_quote_meta():
     return {
         "quote_id": "q_123",
         "pricing": {"total": "95.00", "discount_total": "5.00"},
+        "line_items": [
+            {
+                "product_id": "prod_1",
+                "variant_id": "var_1",
+                "quantity": 1,
+                "unit_price_original": "100.00",
+                "unit_price_effective": "95.00",
+                "line_discount_total": "5.00",
+            }
+        ],
         "promotion_lines": [
             {"source": "shopify", "method": "code", "code": "SAVE5", "amount": "-5.00"},
         ],
@@ -26,6 +36,9 @@ def _pricing_quote_meta():
 
 def test_shopify_order_discount_codes_and_annotations_from_quote_evidence():
     pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["line_items"] = []
+    pricing_quote_meta["discount_evidence"]["applications"][0]["discount_class"] = "order"
+    pricing_quote_meta["promotion_lines"][0]["discount_class"] = "order"
 
     assert order_routes._build_shopify_order_discount_codes(pricing_quote_meta) == [
         {"code": "SAVE5", "amount": "5.00", "type": "fixed_amount"}
@@ -41,6 +54,28 @@ def test_shopify_order_discount_codes_and_annotations_from_quote_evidence():
     assert all(":" not in tag and "_" not in tag and len(tag) <= 40 for tag in tags)
     assert {"name": "pivota_quote_id", "value": "q_123"} in note_attributes
     assert {"name": "pivota_order_id", "value": "ord_123"} in note_attributes
+
+
+def test_shopify_order_discount_codes_skip_product_level_allocations():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["discount_evidence"]["applications"][0]["discount_class"] = "product"
+    pricing_quote_meta["promotion_lines"][0]["discount_class"] = "product"
+
+    assert order_routes._build_shopify_order_discount_codes(pricing_quote_meta) == []
+
+
+def test_apply_pricing_quote_line_item_overrides_sets_price_and_total_discount():
+    line_item = {"variant_id": 123, "quantity": 1}
+    order_item = {"product_id": "prod_1", "variant_id": "var_1", "quantity": 1}
+
+    out = order_routes._apply_pricing_quote_line_item_overrides(
+        line_item=line_item,
+        order_item=order_item,
+        pricing_quote_meta=_pricing_quote_meta(),
+    )
+
+    assert out["price"] == "100.00"
+    assert out["total_discount"] == "5.00"
 
 
 def test_shopify_order_tag_sanitizes_and_bounds_values():

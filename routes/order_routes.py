@@ -1319,6 +1319,17 @@ def _pricing_quote_discount_total(pricing_quote_meta: Dict[str, Any]) -> Decimal
     return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def _pricing_quote_has_line_discounts(pricing_quote_meta: Dict[str, Any]) -> bool:
+    if not isinstance(pricing_quote_meta, dict):
+        return False
+    for line in pricing_quote_meta.get("line_items") or []:
+        if not isinstance(line, dict):
+            continue
+        if _money2(line.get("line_discount_total")).copy_abs() > 0:
+            return True
+    return False
+
+
 def _build_shopify_order_discount_codes(pricing_quote_meta: Dict[str, Any]) -> List[Dict[str, str]]:
     """
     REST order creation supports order-level discount_codes. Use fixed amounts only
@@ -1344,6 +1355,9 @@ def _build_shopify_order_discount_codes(pricing_quote_meta: Dict[str, Any]) -> L
     for row in source_rows or []:
         if not isinstance(row, dict):
             continue
+        discount_class = str(row.get("discount_class") or "").strip().lower()
+        if discount_class == "product":
+            continue
         code = str(row.get("code") or "").strip()
         if not code:
             continue
@@ -1355,7 +1369,12 @@ def _build_shopify_order_discount_codes(pricing_quote_meta: Dict[str, Any]) -> L
         amounts_by_code[code] = amounts_by_code.get(code, Decimal("0.00")) + amount
 
     discount_total = _pricing_quote_discount_total(pricing_quote_meta)
-    if not amounts_by_code and len(applicable_codes) == 1 and discount_total > 0:
+    if (
+        not amounts_by_code
+        and len(applicable_codes) == 1
+        and discount_total > 0
+        and not _pricing_quote_has_line_discounts(pricing_quote_meta)
+    ):
         code = next(iter(applicable_codes))
         amounts_by_code[code] = discount_total
 
@@ -1468,6 +1487,51 @@ def _extract_shopify_order_reconciliation_totals(
         "discount_total": discount_total,
         "transaction_total": transaction_total,
     }
+
+
+def _build_pricing_quote_line_item_map(pricing_quote_meta: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(pricing_quote_meta, dict):
+        return out
+    for line in pricing_quote_meta.get("line_items") or []:
+        if not isinstance(line, dict):
+            continue
+        variant_id = str(line.get("variant_id") or "").strip()
+        product_id = str(line.get("product_id") or "").strip()
+        if variant_id:
+            out[f"variant:{variant_id}"] = dict(line)
+        if product_id:
+            out.setdefault(f"product:{product_id}", dict(line))
+    return out
+
+
+def _apply_pricing_quote_line_item_overrides(
+    *,
+    line_item: Dict[str, Any],
+    order_item: Dict[str, Any],
+    pricing_quote_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(line_item, dict):
+        return line_item
+
+    line_map = _build_pricing_quote_line_item_map(pricing_quote_meta)
+    variant_id = str(order_item.get("variant_id") or "").strip()
+    product_id = str(order_item.get("product_id") or "").strip()
+    quote_line = None
+    if variant_id:
+        quote_line = line_map.get(f"variant:{variant_id}")
+    if not quote_line and product_id:
+        quote_line = line_map.get(f"product:{product_id}")
+    if not isinstance(quote_line, dict):
+        return line_item
+
+    unit_price_original = _money2(quote_line.get("unit_price_original"))
+    line_discount_total = _money2(quote_line.get("line_discount_total")).copy_abs()
+    if unit_price_original > 0:
+        line_item["price"] = str(unit_price_original)
+    if line_discount_total > 0:
+        line_item["total_discount"] = str(line_discount_total)
+    return line_item
 
 
 async def _fetch_shopify_order_reconciliation_payload_best_effort(
@@ -3096,6 +3160,12 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                         "variant_id": variant_id,
                         "quantity": item["quantity"]
                     }
+                    if pricing_quote_meta:
+                        line_item = _apply_pricing_quote_line_item_overrides(
+                            line_item=line_item,
+                            order_item=item,
+                            pricing_quote_meta=pricing_quote_meta,
+                        )
                     line_items.append(line_item)
                     has_variant = True
                     logger.info(f"Using variant_id {variant_id} for {item.get('product_title')}")
@@ -3110,6 +3180,12 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                     "price": str(item["unit_price"]),
                     "taxable": False  # Custom items, tax already calculated
                 }
+                if pricing_quote_meta:
+                    line_item = _apply_pricing_quote_line_item_overrides(
+                        line_item=line_item,
+                        order_item=item,
+                        pricing_quote_meta=pricing_quote_meta,
+                    )
                 line_items.append(line_item)
                 logger.info(f"Using custom line item for {item.get('product_title')}")
         
