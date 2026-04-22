@@ -609,6 +609,7 @@ async def test_stripe_webhook_refund_created_logs_timeline_without_mutating_orde
     import routes.webhook_routes as webhook_routes_module
 
     order_events: list[Dict[str, Any]] = []
+    metadata_updates: list[Dict[str, Any]] = []
 
     event = _stripe_event(
         "refund.created",
@@ -618,6 +619,15 @@ async def test_stripe_webhook_refund_created_logs_timeline_without_mutating_orde
             "amount": 1200,
             "currency": "usd",
             "status": "pending",
+            "pending_reason": "processing",
+            "destination_details": {
+                "type": "card",
+                "card": {
+                    "reference_status": "pending",
+                    "reference_type": "acquirer_reference_number",
+                    "type": "refund",
+                },
+            },
             "metadata": {},
         },
     )
@@ -634,6 +644,10 @@ async def test_stripe_webhook_refund_created_logs_timeline_without_mutating_orde
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
+    async def fake_update_order(order_id: str, values: Dict[str, Any]) -> bool:
+        metadata_updates.append({"order_id": order_id, **values})
+        return True
+
     async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("refund.created should not mutate order state")
 
@@ -649,6 +663,7 @@ async def test_stripe_webhook_refund_created_logs_timeline_without_mutating_orde
     monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module, "update_order", fake_update_order)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -665,6 +680,9 @@ async def test_stripe_webhook_refund_created_logs_timeline_without_mutating_orde
     assert order_events[0]["order_id"] == "ORD_STRIPE_REFUND_CREATED"
     assert order_events[0]["metadata"]["refund_id"] == "re_created_contract"
     assert order_events[0]["metadata"]["status"] == "pending"
+    assert len(metadata_updates) == 1
+    assert metadata_updates[0]["metadata"]["stripe_refund_status"]["pending_reason"] == "processing"
+    assert metadata_updates[0]["metadata"]["stripe_refund_status"]["reference_status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -675,6 +693,7 @@ async def test_stripe_webhook_refund_updated_pending_logs_without_mutating_order
     import routes.webhook_routes as webhook_routes_module
 
     order_events: list[Dict[str, Any]] = []
+    metadata_updates: list[Dict[str, Any]] = []
 
     event = _stripe_event(
         "refund.updated",
@@ -685,6 +704,14 @@ async def test_stripe_webhook_refund_updated_pending_logs_without_mutating_order
             "currency": "usd",
             "status": "pending",
             "pending_reason": "processing",
+            "destination_details": {
+                "type": "card",
+                "card": {
+                    "reference_status": "pending",
+                    "reference_type": "acquirer_reference_number",
+                    "type": "refund",
+                },
+            },
             "metadata": {},
         },
     )
@@ -701,6 +728,10 @@ async def test_stripe_webhook_refund_updated_pending_logs_without_mutating_order
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
+    async def fake_update_order(order_id: str, values: Dict[str, Any]) -> bool:
+        metadata_updates.append({"order_id": order_id, **values})
+        return True
+
     async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("pending refund.updated should not mutate order state")
 
@@ -716,6 +747,7 @@ async def test_stripe_webhook_refund_updated_pending_logs_without_mutating_order
     monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module, "update_order", fake_update_order)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -732,6 +764,9 @@ async def test_stripe_webhook_refund_updated_pending_logs_without_mutating_order
     assert order_events[0]["order_id"] == "ORD_STRIPE_REFUND_UPDATED_PENDING"
     assert order_events[0]["metadata"]["refund_id"] == "re_updated_pending"
     assert order_events[0]["metadata"]["pending_reason"] == "processing"
+    assert len(metadata_updates) == 1
+    assert metadata_updates[0]["metadata"]["stripe_refund_status"]["status"] == "pending"
+    assert metadata_updates[0]["metadata"]["stripe_refund_status"]["reference_type"] == "acquirer_reference_number"
 
 
 @pytest.mark.asyncio
@@ -851,6 +886,9 @@ async def test_stripe_webhook_refund_failed_logs_without_rollback_when_refund_id
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
+    async def fake_update_order(order_id: str, values: Dict[str, Any]) -> bool:
+        return True
+
     async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("mismatched refund.failed should not roll back order state")
 
@@ -866,6 +904,7 @@ async def test_stripe_webhook_refund_failed_logs_without_rollback_when_refund_id
     monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(webhook_routes_module, "update_order", fake_update_order)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -901,6 +940,15 @@ async def test_stripe_webhook_refund_updated_succeeded_reconciles_refund(
             "amount": 1200,
             "currency": "usd",
             "status": "succeeded",
+            "destination_details": {
+                "type": "card",
+                "card": {
+                    "reference": "123456789012",
+                    "reference_status": "available",
+                    "reference_type": "acquirer_reference_number",
+                    "type": "refund",
+                },
+            },
             "metadata": {},
         },
     )
@@ -952,6 +1000,8 @@ async def test_stripe_webhook_refund_updated_succeeded_reconciles_refund(
     assert status_updates[0]["payment_status"] == "partially_refunded"
     assert str(status_updates[0]["total_refunded"]) == "12"
     assert status_updates[0]["metadata"]["stripe_refund_updated"]["refund_id"] == "re_updated_success"
+    assert status_updates[0]["metadata"]["stripe_refund_status"]["reference"] == "123456789012"
+    assert status_updates[0]["metadata"]["stripe_refund_status"]["tracking_reference_kind"] == "ARN"
     assert len(order_events) == 1
     assert order_events[0]["event_type"] == "refund_processed_webhook"
     assert order_events[0]["metadata"]["source_event"] == "refund.updated"

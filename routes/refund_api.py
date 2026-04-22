@@ -27,6 +27,11 @@ from services.merchant_psp_config_service import (
     infer_runtime_provider,
 )
 from services.psp_payment_finalizer import finalize_refund_success
+from services.refund_observability import (
+    build_order_refund_tracking_payload,
+    extract_stripe_refund_snapshot,
+    stripe_refund_metadata_patch,
+)
 
 
 router = APIRouter(prefix="/orders", tags=["refunds"])
@@ -262,6 +267,17 @@ async def process_refund(
         next_total_refunded = total_refunded + refund_amount
         new_status = "refunded" if next_total_refunded >= order_total else "partially_refunded"
         is_partial = new_status == "partially_refunded"
+        stripe_refund_snapshot: Optional[Dict[str, Any]] = None
+        if psp_type == "stripe" and refund_id and hasattr(psp_adapter, "get_refund_details"):
+            try:
+                details_ok, refund_details, _details_error = await psp_adapter.get_refund_details(str(refund_id))
+                if details_ok and refund_details:
+                    stripe_refund_snapshot = extract_stripe_refund_snapshot(
+                        refund_details,
+                        source_event="refund.api",
+                    )
+            except Exception:
+                stripe_refund_snapshot = None
         
         try:
             await finalize_refund_success(
@@ -276,7 +292,16 @@ async def process_refund(
                     "refund_reason": refund_request.reason,
                     "refunded_by": current_user.get("user_id", "admin"),
                     "source_event": "refund_processed",
+                    **(stripe_refund_snapshot or {}),
                 },
+                metadata_patch=(
+                    stripe_refund_metadata_patch(
+                        stripe_refund_snapshot,
+                        existing_metadata=order.get("metadata"),
+                    )
+                    if stripe_refund_snapshot
+                    else None
+                ),
                 update_order_status_fn=update_order_status,
                 log_order_event_fn=log_order_event,
             )
@@ -421,6 +446,11 @@ async def process_refund(
             "total_refunded": str(next_total_refunded),
             "remaining_refundable": str(max(order_total - next_total_refunded, Decimal('0'))),
         }
+        if stripe_refund_snapshot:
+            response["psp_refund"] = build_order_refund_tracking_payload(
+                {"metadata": stripe_refund_metadata_patch(stripe_refund_snapshot), "psp_used": "stripe"},
+                psp_used="stripe",
+            )
 
         # Best-effort idempotency record
         if refund_request.idempotency_key:

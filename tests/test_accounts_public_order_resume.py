@@ -66,6 +66,30 @@ async def test_public_order_resume_returns_resumable_payment_payload(
                 }
             ],
             "metadata": {
+                "stripe_refund_status": {
+                    "provider": "stripe",
+                    "refund_id": "re_test_refund",
+                    "status": "pending",
+                    "pending_reason": "processing",
+                    "currency": "USD",
+                    "reference_status": "pending",
+                    "reference_type": "acquirer_reference_number",
+                    "tracking_reference_kind": "ARN",
+                    "observed_at": "2026-04-21T12:00:00+00:00",
+                },
+                "stripe_refund_statuses": {
+                    "re_test_refund": {
+                        "provider": "stripe",
+                        "refund_id": "re_test_refund",
+                        "status": "pending",
+                        "pending_reason": "processing",
+                        "currency": "USD",
+                        "reference_status": "pending",
+                        "reference_type": "acquirer_reference_number",
+                        "tracking_reference_kind": "ARN",
+                        "observed_at": "2026-04-21T12:00:00+00:00",
+                    }
+                },
                 "pricing_quote": {
                     "line_items": [
                         {
@@ -168,6 +192,10 @@ async def test_public_order_resume_returns_resumable_payment_payload(
         }
     ]
     assert body["payment"]["current"]["payment_action"]["type"] == "stripe_client_secret"
+    assert body["refund"]["psp"]["provider"] == "stripe"
+    assert body["refund"]["psp"]["latest"]["refund_id"] == "re_test_refund"
+    assert body["refund"]["psp"]["latest"]["pending_reason"] == "processing"
+    assert body["refund"]["psp"]["latest"]["tracking_reference_kind"] == "ARN"
     assert body["customer"]["email"] == "buyer@example.com"
     assert recorded == [("127.0.0.1", "buyer@example.com", "ORD_RESUME_1")]
 

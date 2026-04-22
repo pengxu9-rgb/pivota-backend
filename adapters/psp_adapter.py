@@ -420,6 +420,25 @@ class StripeAdapter(PSPAdapter):
             # Fall back to generic exception to avoid dependency on stripe.error namespace
             return False, None, str(e)
 
+    async def get_refund_details(
+        self,
+        refund_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            refund = await asyncio.to_thread(
+                self._client.v1.refunds.retrieve,
+                refund_id,
+            )
+            if hasattr(refund, "to_dict"):
+                payload = refund.to_dict()
+            elif isinstance(refund, dict):
+                payload = refund
+            else:
+                payload = {}
+            return True, payload if isinstance(payload, dict) else {}, None
+        except Exception as e:
+            return False, None, str(e)
+
 
 class AdyenAdapter(PSPAdapter):
     """Adyen PSP 适配器"""

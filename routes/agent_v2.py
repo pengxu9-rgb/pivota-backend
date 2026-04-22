@@ -30,6 +30,7 @@ from routes.refund_api import RefundRequest, process_refund as process_refund_ro
 from services.pcs_tier_service import get_merchant_pcs_tier
 from services.agent_governance import validate_request_compat
 from services.quote_service import QuoteError, QuoteService
+from services.refund_observability import build_order_refund_tracking_payload
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 
@@ -625,6 +626,10 @@ def _order_response_from_row(
             "total": amounts["total"],
             "currency": amounts["currency"],
         },
+        "refund_summary": build_order_refund_tracking_payload(
+            order,
+            psp_used=order.get("psp_used"),
+        ),
         "audit": {
             "agent_id": order.get("agent_id"),
             "created_at": _utc_iso(order.get("created_at")),

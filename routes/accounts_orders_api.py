@@ -67,6 +67,7 @@ from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
 )
+from services.refund_observability import build_order_refund_tracking_payload
 
 
 router = APIRouter(prefix="/accounts", tags=["accounts-orders"])
@@ -497,6 +498,7 @@ class PublicOrderResumeResponse(BaseModel):
     pricing_quote: Dict[str, Any]
     items: List[Dict[str, Any]]
     payment: Dict[str, Any]
+    refund: Dict[str, Any]
     customer: Dict[str, Any]
 
 
@@ -2636,6 +2638,12 @@ async def get_order_detail(
         "currency": order_data.get("currency", "USD"),
         "requests": metadata.get("refund_requests") if isinstance(metadata.get("refund_requests"), list) else [],
     }
+    refund_tracking = build_order_refund_tracking_payload(
+        order_data,
+        psp_used=order_data.get("psp_used"),
+    )
+    if refund_tracking:
+        refund_payload["psp"] = refund_tracking
 
     shipping_name = shipping.get("name") or shipping.get("full_name") or shipping.get("recipient_name")
     shipping_phone = shipping.get("phone") or shipping.get("phone_number")
@@ -3131,6 +3139,26 @@ async def public_order_resume(
         or shipping.get("zip")
         or shipping.get("zip_code")
     )
+    metadata = _coerce_json_object(order_data.get("metadata"))
+    total_refunded_minor = _amount_to_minor(order_data.get("total_refunded"))
+    refund_status = (
+        str(metadata.get("refund_status") or "").strip().lower()
+        or ("refunded" if status_summary == "refunded" else "none")
+    )
+    refund_payload = {
+        "status": refund_status,
+        "case_id": metadata.get("refund_case_id"),
+        "updated_at": metadata.get("refund_updated_at"),
+        "total_refunded_minor": total_refunded_minor,
+        "currency": order_data.get("currency", "USD"),
+        "requests": metadata.get("refund_requests") if isinstance(metadata.get("refund_requests"), list) else [],
+    }
+    refund_tracking = build_order_refund_tracking_payload(
+        order_data,
+        psp_used=order_data.get("psp_used"),
+    )
+    if refund_tracking:
+        refund_payload["psp"] = refund_tracking
 
     return PublicOrderResumeResponse(
         order={
@@ -3158,6 +3186,7 @@ async def public_order_resume(
         pricing_quote=_extract_pricing_quote_payload(order_data),
         items=await _build_order_items_payload(order_data),
         payment={"current": resumable_payment},
+        refund=refund_payload,
         customer={
             "email": order_data.get("customer_email"),
             "name": shipping_name,

@@ -78,6 +78,7 @@ from services.payment_offer_evidence_service import (
     redact_payment_method_evidence,
     stable_payment_offer_hash,
 )
+from services.refund_observability import build_order_refund_tracking_payload
 from services.store_discount_evidence_service import enrich_product_cards_with_store_discounts
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
@@ -8729,7 +8730,11 @@ async def agent_get_order(
                 "tracking_number": order.get("tracking_number"),
                 "created_at": order["created_at"],
                 "updated_at": order.get("updated_at"),
-                "confirmed_at": order.get("confirmed_at")
+                "confirmed_at": order.get("confirmed_at"),
+                "refund": build_order_refund_tracking_payload(
+                    order,
+                    psp_used=order.get("psp_used"),
+                ),
             }
         }
         

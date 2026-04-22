@@ -39,6 +39,11 @@ from services.psp_payment_finalizer import (
     finalize_refund_failure,
     finalize_refund_success,
 )
+from services.refund_observability import (
+    extract_stripe_refund_snapshot,
+    merge_refund_metadata,
+    stripe_refund_metadata_patch,
+)
 from observability.reviews_metrics import record_shopify_webhook
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
@@ -212,6 +217,25 @@ async def _resolve_stripe_order_for_refund(
     return None
 
 
+async def _persist_stripe_refund_observability(
+    order: Optional[Dict[str, Any]],
+    refund_snapshot: Optional[Dict[str, Any]],
+) -> None:
+    if not order or not refund_snapshot:
+        return
+    order_id = str(order.get("order_id") or "").strip()
+    if not order_id:
+        return
+    metadata = merge_refund_metadata(
+        order.get("metadata"),
+        stripe_refund_metadata_patch(
+            refund_snapshot,
+            existing_metadata=order.get("metadata"),
+        ),
+    )
+    await update_order(order_id, {"metadata": metadata})
+
+
 async def _resolve_stripe_order_for_payment_event(
     *,
     payment_intent_id: Optional[str],
@@ -321,6 +345,7 @@ async def _finalize_stripe_refund_failure(
     refund_amount_minor: Any,
     currency: Optional[str],
     failure_reason: str,
+    refund_snapshot: Optional[Dict[str, Any]] = None,
     metadata_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     rollback_amount = _stripe_minor_unit_factor(currency or str(order.get("currency") or ""))
@@ -334,6 +359,61 @@ async def _finalize_stripe_refund_failure(
         existing_metadata = {}
     existing_refs = list(existing_metadata.get("psp_refund_refs") or [])
     legacy_match = str(existing_metadata.get("refund_id") or "").strip() == str(refund_reference or "").strip()
+    failure_payload = {
+        "refund_id": refund_reference,
+        "amount_minor": refund_amount_minor,
+        "currency": currency or str(order.get("currency") or ""),
+        "failure_reason": failure_reason,
+        "received_at": datetime.now().isoformat(),
+        **(metadata_extra or {}),
+    }
+    if refund_snapshot:
+        failure_payload.update(refund_snapshot)
+    metadata_patch = {
+        "stripe_last_refund_failure": failure_payload,
+    }
+    if refund_snapshot:
+        metadata_patch.update(
+            stripe_refund_metadata_patch(
+                refund_snapshot,
+                existing_metadata=existing_metadata,
+            )
+        )
+    if not (refund_key in existing_refs or legacy_match):
+        order_id = str(order.get("order_id") or "")
+        merchant_id = str(order.get("merchant_id") or "")
+        await update_order(
+            order_id,
+            {
+                "metadata": merge_refund_metadata(
+                    existing_metadata,
+                    metadata_patch,
+                )
+            },
+        )
+        await log_order_event(
+            event_type="refund_failed_webhook",
+            order_id=order_id,
+            merchant_id=merchant_id,
+            metadata={
+                "psp": "stripe",
+                "payment_intent_id": str(refund_reference or "").strip(),
+                "failure_reason": failure_reason,
+                "rollback_applied": False,
+                "rollback_reference": None,
+                "next_total_refunded": str(order.get("total_refunded") or "0"),
+                "refund_id": refund_reference,
+                **(metadata_extra or {}),
+            },
+        )
+        return {
+            "applied": True,
+            "rolled_back": False,
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "total_refunded": Decimal(str(order.get("total_refunded") or "0")),
+            "next_status": str(order.get("payment_status") or ""),
+        }
     return await finalize_refund_failure(
         order,
         psp="stripe",
@@ -342,20 +422,7 @@ async def _finalize_stripe_refund_failure(
         rollback_reference=refund_reference if (refund_key in existing_refs or legacy_match) else None,
         rollback_amount=rollback_total,
         metadata_extra={"refund_id": refund_reference, **(metadata_extra or {})},
-        metadata_patch=(
-            {
-                "stripe_last_refund_failure": {
-                    "refund_id": refund_reference,
-                    "amount_minor": refund_amount_minor,
-                    "currency": currency or str(order.get("currency") or ""),
-                    "failure_reason": failure_reason,
-                    "received_at": datetime.now().isoformat(),
-                    **(metadata_extra or {}),
-                }
-            }
-            if (refund_key in existing_refs or legacy_match)
-            else None
-        ),
+        metadata_patch=metadata_patch,
         update_order_status_fn=update_order_status,
         log_order_event_fn=log_order_event,
     )
@@ -667,6 +734,10 @@ async def handle_stripe_webhook(
             refund_amount = data.get("amount")
             currency = (data.get("currency") or "").strip().lower() or None
             refund_meta = data.get("metadata") or {}
+            refund_snapshot = extract_stripe_refund_snapshot(
+                data,
+                source_event="refund.created",
+            )
 
             result = await _resolve_stripe_order_for_refund(
                 payment_intent_id=payment_intent_id,
@@ -674,6 +745,7 @@ async def handle_stripe_webhook(
             )
 
             if result:
+                await _persist_stripe_refund_observability(result, refund_snapshot)
                 await log_order_event(
                     event_type="refund_created_webhook",
                     order_id=result["order_id"],
@@ -684,6 +756,10 @@ async def handle_stripe_webhook(
                         "refund_amount": refund_amount,
                         "currency": currency or str(result.get("currency") or ""),
                         "status": refund_status or "unknown",
+                        "pending_reason": refund_snapshot.get("pending_reason"),
+                        "reference_status": refund_snapshot.get("reference_status"),
+                        "reference_type": refund_snapshot.get("reference_type"),
+                        "reference": refund_snapshot.get("reference"),
                     },
                 )
 
@@ -695,6 +771,10 @@ async def handle_stripe_webhook(
             currency = (data.get("currency") or "").strip().lower() or None
             refund_meta = data.get("metadata") or {}
             pending_reason = data.get("pending_reason")
+            refund_snapshot = extract_stripe_refund_snapshot(
+                data,
+                source_event="refund.updated",
+            )
 
             result = await _resolve_stripe_order_for_refund(
                 payment_intent_id=payment_intent_id,
@@ -728,13 +808,25 @@ async def handle_stripe_webhook(
                             "refund_amount": refund_amount,
                             "status": refund_status,
                             "source_event": "refund.updated",
+                            **refund_snapshot,
                         },
                         metadata_patch={
+                            **stripe_refund_metadata_patch(
+                                refund_snapshot,
+                                existing_metadata=existing_meta,
+                            ),
                             "stripe_refund_updated": {
                                 "refund_id": refund_id,
                                 "amount_minor": refund_amount,
                                 "currency": currency or str(result.get("currency") or ""),
                                 "status": refund_status,
+                                "pending_reason": refund_snapshot.get("pending_reason"),
+                                "reference": refund_snapshot.get("reference"),
+                                "reference_status": refund_snapshot.get("reference_status"),
+                                "reference_type": refund_snapshot.get("reference_type"),
+                                "tracking_reference_kind": refund_snapshot.get("tracking_reference_kind"),
+                                "destination_type": refund_snapshot.get("destination_type"),
+                                "is_reversal": refund_snapshot.get("is_reversal"),
                                 "received_at": datetime.now().isoformat(),
                             }
                         },
@@ -747,9 +839,11 @@ async def handle_stripe_webhook(
                         refund_amount_minor=refund_amount,
                         currency=currency or str(result.get("currency") or ""),
                         failure_reason=failure_reason,
+                        refund_snapshot=refund_snapshot,
                         metadata_extra={"source_event": "refund.updated"},
                     )
                 else:
+                    await _persist_stripe_refund_observability(result, refund_snapshot)
                     await log_order_event(
                         event_type="refund_pending_webhook" if refund_status == "pending" else "refund_updated_webhook",
                         order_id=order_id,
@@ -760,6 +854,12 @@ async def handle_stripe_webhook(
                             "refund_amount": refund_amount,
                             "status": refund_status or "unknown",
                             "pending_reason": pending_reason,
+                            "reference": refund_snapshot.get("reference"),
+                            "reference_status": refund_snapshot.get("reference_status"),
+                            "reference_type": refund_snapshot.get("reference_type"),
+                            "tracking_reference_kind": refund_snapshot.get("tracking_reference_kind"),
+                            "destination_type": refund_snapshot.get("destination_type"),
+                            "is_reversal": refund_snapshot.get("is_reversal"),
                         },
                     )
 
@@ -769,6 +869,10 @@ async def handle_stripe_webhook(
             refund_amount = data.get("amount")
             currency = (data.get("currency") or "").strip().lower() or None
             failure_reason = data.get("failure_reason") or data.get("status") or "unknown"
+            refund_snapshot = extract_stripe_refund_snapshot(
+                data,
+                source_event="refund.failed",
+            )
 
             refund_meta = data.get("metadata") or {}
             result = await _resolve_stripe_order_for_refund(
@@ -783,6 +887,7 @@ async def handle_stripe_webhook(
                     refund_amount_minor=refund_amount,
                     currency=currency or str(result.get("currency") or ""),
                     failure_reason=failure_reason,
+                    refund_snapshot=refund_snapshot,
                 )
                 logger.warning(
                     "Stripe refund failed for order %s refund_id=%s rollback_applied=%s",
