@@ -13,7 +13,7 @@ from datetime import datetime
 from db.orders import get_order, update_order, update_order_status
 from db.merchant_onboarding import get_merchant_onboarding
 from db.products import log_order_event
-from utils.auth import require_admin
+from utils.auth import require_admin, require_admin_or_key
 from adapters.psp_adapter import get_psp_adapter
 from utils.logger import logger
 from services.shopify_transactions_service import (
@@ -576,7 +576,7 @@ async def get_refund_status(
 @router.post("/{order_id}/refund-observability/refresh")
 async def refresh_refund_observability(
     order_id: str,
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(require_admin_or_key)
 ):
     """Backfill Stripe refund telemetry for historical refunded orders."""
 
