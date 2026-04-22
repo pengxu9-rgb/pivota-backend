@@ -1,6 +1,6 @@
 # Shopify Discount Validation Results
 
-## Update: 2026-04-21 current merchant rerun
+## Update: 2026-04-21 current merchant rerun and redemption proof
 
 Current merchant: `merch_efbc46b4619cfbdf`
 
@@ -44,12 +44,15 @@ Passed on 2026-04-21:
 - Usage-limit availability metadata is now live-proven:
   - `PIVOTA_AUDIT_20260421A_LIMIT1` synced with `usageLimit=1` and `appliesOncePerCustomer=true`
   - quote/cart remained `applicable=true`, which confirms quote probes do not consume Shopify usage count
+- Usage-limit exhaustion after real redemption is now live-proven:
+  - order `ORD_B27BD95A214B40D4` completed with `PIVOTA_AUDIT_20260421A_LIMIT1`
+  - a post-redemption quote rerun returned `applicable=false`
+  - `discount_total=0`
+  - `customer_eligibility.shopify_order_count=1`
 - Quote `store_discount_evidence.offers` is now deduped across multi-item carts.
 - Product-detail `store_discount_evidence.offers` and `decisions` are now deduped across variants.
 
-Still not proven for the current merchant:
-
-- usage-limit exhaustion boundary after a real redemption
+No current-merchant discount execution gap remains open inside the audited Shopify-native matrix. Remaining rollout limits are broader pilot controls: `fail_closed` reconciliation canaries per merchant/PSP and adapter-complete PSP amount/currency evidence outside Stripe.
 
 Current evidence artifacts:
 
@@ -72,12 +75,17 @@ Current evidence artifacts:
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_a.create.json`
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_b.create.json`
 - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_c.create.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/01-quote.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02-order-create.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.request.json`
+- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
 
 ## Tested scenarios
 
 Validation dates: 2026-04-15 and 2026-04-21.
 
-Validation scope included production quote/cart probes, quote-backed order creation without completing payment, unpaid payment-confirmation rejection, focused post-deploy regression probes, three explicitly approved live paid discounted orders, and refund cleanup through the production app path.
+Validation scope included production quote/cart probes, quote-backed order creation without completing payment, unpaid payment-confirmation rejection, focused post-deploy regression probes, three explicitly approved live paid discounted orders, one controlled usage-limit redemption order, and refund cleanup through the production app path.
 
 - US baseline quote with no discount code
 - US amount-off code
@@ -97,6 +105,7 @@ Validation scope included production quote/cart probes, quote-backed order creat
 - live paid free-shipping order
 - live paid amount-off order
 - live paid BXGY order
+- live paid usage-limit redemption order
 - live app-path refund cleanup for the three paid test orders
 - rejected Shopify code against quantity-based Pivota manual fallback
 - PSP amount/currency verification unit coverage
@@ -106,6 +115,7 @@ Validation scope included production quote/cart probes, quote-backed order creat
 - current-merchant new-customer fixture
 - current-merchant active-window before-start and in-window probes
 - current-merchant usage-limit availability and repeated-quote probes
+- current-merchant usage-limit redeemed-order and post-redemption rejection probe
 
 ## Passed
 
@@ -128,17 +138,19 @@ Validation scope included production quote/cart probes, quote-backed order creat
 - `Live paid amount-off`: `ORD_E2CC099ACF7A88A7` completed at `2.22 EUR`, wrote back to Shopify order `7531537269064`, and was later refunded through the production app route.
 - `Live paid BXGY`: `ORD_F56E0A1E5DC79E82` completed at `4.07 EUR`, wrote back to Shopify order `7531638980936`, and was later refunded through the production app route.
 - `Refund cleanup after fixes`: production `/orders/{order_id}/refund-status` now reports `total_refunded == original_amount` for all three live test orders after fixing Stripe Checkout Session refund resolution and Shopify refund-webhook double counting.
+- `Usage-limit exhausted after redemption`: `ORD_B27BD95A214B40D4` completed with `PIVOTA_AUDIT_20260421A_LIMIT1`, and the post-redemption quote rerun returned `applicable=false`, `discount_total=0`, and `shopify_order_count=1`.
 
 ## Failed
 
-- No current-merchant failure remains after the 2026-04-21 rerun; the remaining open item is blocked, not failed.
+- No current-merchant failure remains after the 2026-04-21 rerun and redemption proof.
 - Historical note retained for lineage:
   - `PIVOTA_TEST_COMBO_A` failed in the 2026-04-15 matrix because Shopify returned `applicable=false`; that historical failure is superseded by the later positive combinability proof for `PIVOTA_TEST_BXGY + PIVOTA_TEST_COMBO_B`.
-  - Historical `PIVOTA_TEST_EXHAUSTED` readonly probes never proved exhaustion; that has been replaced by the bounded `PIVOTA_AUDIT_20260421A_LIMIT1` fixture, which still requires a redeemed-order proof.
+  - Historical `PIVOTA_TEST_EXHAUSTED` readonly probes never proved exhaustion; that gap is now closed by the bounded `PIVOTA_AUDIT_20260421A_LIMIT1` redemption proof and post-redemption rejection rerun.
 
 ## Blocked
 
-- `usage-limit exhausted boundary`: quote probes do not consume Shopify usage count. `PIVOTA_AUDIT_20260421A_LIMIT1` stayed `applicable=true` across repeated quotes, so the remaining proof requires a controlled redeemed order and a post-redemption rejection probe.
+- No current-merchant discount scenario remains blocked in this matrix.
+- Broader rollout still depends on merchant/PSP-specific `fail_closed` canaries and adapter-complete PSP amount/currency evidence outside Stripe.
 
 ## Root cause by failure
 
@@ -188,6 +200,11 @@ Validation scope included production quote/cart probes, quote-backed order creat
   - `artifacts/shopify-discount-validation/live-test-order-refunds-admin-after-checkout-session-fix-20260415T133853Z/summary.json`
   - `artifacts/shopify-discount-validation/live-test-order-refund-ledger-repair-20260415T134952Z/refund-ledger-repair.json`
   - `artifacts/shopify-discount-validation/live-test-order-refund-status-after-ledger-repair-20260415T135016Z/summary.json`
+- Usage-limit redemption proof:
+  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/01-quote.json`
+  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02-order-create.json`
+  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
+  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
 
 ## Whether the system is ready for merchant pilots on discounts
 
@@ -200,4 +217,4 @@ Rationale:
 - Authoritative Storefront delivery pricing is now carried into quotes; US no-code and CA no-code both price shipping at `29.00`, while the US free-shipping code nets shipping to `0.00`.
 - The most dangerous fake-discount path found in this round is fixed: rejected Shopify codes no longer trigger Pivota manual fallback promotions.
 - Payment confirmation now refuses unpaid PSP references and unit tests enforce amount/currency matching before paid transition; fail-closed mode blocks PSP adapters that cannot provide amount/currency details.
-- Three live paid discounted orders completed and were refunded, but broad rollout is still limited by the unproven exhausted-usage boundary and the need to run merchant-pilot canaries in `fail_closed` reconciliation mode with alerting.
+- Three live paid discounted orders plus one redeemed usage-limit proof now close the audited Shopify-native discount matrix for the current Stripe + Shopify merchant, but broad rollout is still limited by merchant-pilot canaries in `fail_closed` reconciliation mode with alerting and by non-Stripe PSP adapter completeness.
