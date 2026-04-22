@@ -38,6 +38,7 @@ orders = Table(
     
     # 金额（使用 Numeric 精确存储）
     Column("subtotal", Numeric(10, 2), nullable=False),
+    Column("discount_total", Numeric(10, 2), default=0),
     Column("shipping_fee", Numeric(10, 2), default=0),
     Column("tax", Numeric(10, 2), default=0),
     Column("total", Numeric(10, 2), nullable=False),
@@ -126,6 +127,11 @@ async def create_order(order_data: Dict[str, Any]) -> str:
                 await database.execute(text("""
                     ALTER TABLE orders 
                     ADD COLUMN IF NOT EXISTS subtotal NUMERIC(10,2);
+                """))
+            if "column \"discount_total\" of relation \"orders\" does not exist" in err or "discount_total" in err:
+                await database.execute(text("""
+                    ALTER TABLE orders
+                    ADD COLUMN IF NOT EXISTS discount_total NUMERIC(10,2) DEFAULT 0;
                 """))
             if "column \"tax\" of relation \"orders\" does not exist" in err or "tax" in err:
                 await database.execute(text("""
