@@ -424,6 +424,13 @@ class PublicOrderLookupResponse(BaseModel):
     customer: Dict[str, str]
 
 
+class PublicOrderResumeResponse(BaseModel):
+    order: Dict[str, Any]
+    items: List[Dict[str, Any]]
+    payment: Dict[str, Any]
+    customer: Dict[str, Any]
+
+
 class PublicTrackEvent(BaseModel):
     status: str
     timestamp: str
@@ -879,6 +886,52 @@ def _ensure_customer_order_access(order_data: Dict[str, Any], principal: Account
     )
 
 
+async def _load_public_order_for_customer(
+    request: Request,
+    *,
+    order_id: str,
+    email: EmailStr,
+) -> Dict[str, Any]:
+    ip = _get_client_ip(request)
+    norm_email = normalize_email(str(email))
+
+    ip_count = await count_recent_public_lookup_by_ip(ip)
+    if ip_count > PUBLIC_LOOKUP_IP_LIMIT_PER_MINUTE:
+        raise _error(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Too many requests from this IP. Please try again later.",
+        )
+    pair_count = await count_recent_public_lookup_by_key(norm_email, order_id)
+    if pair_count > PUBLIC_LOOKUP_PAIR_LIMIT_PER_MINUTE:
+        raise _error(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Too many requests for this order. Please try again later.",
+        )
+
+    order = await database.fetch_one(
+        orders_table.select().where(orders_table.c.order_id == order_id)
+    )
+    if not order:
+        raise _error(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            "Order not found or email mismatch",
+        )
+
+    order_data = dict(order)
+    if normalize_email(order_data.get("customer_email", "")) != norm_email:
+        raise _error(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            "Order not found or email mismatch",
+        )
+
+    await record_public_lookup(ip, norm_email, order_id)
+    return order_data
+
+
 def _coerce_json_object(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -1109,6 +1162,30 @@ def _extract_tracking_url(order_data: Dict[str, Any]) -> Optional[str]:
             continue
         return url
     return None
+
+
+def _build_order_items_payload(order_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    merchant_id = order_data.get("merchant_id")
+    items = order_data.get("items") or []
+    payload: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        payload.append(
+            {
+                "product_id": item.get("product_id"),
+                "variant_id": item.get("variant_id"),
+                "offer_id": item.get("offer_id"),
+                "title": item.get("product_title") or item.get("title"),
+                "quantity": item.get("quantity", 1),
+                "unit_price_minor": _amount_to_minor(item.get("unit_price")),
+                "subtotal_minor": _amount_to_minor(item.get("subtotal")),
+                "sku": item.get("sku"),
+                "merchant_id": merchant_id,
+                "image_url": item.get("image_url") or item.get("image"),
+            }
+        )
+    return payload
 
 
 def _normalize_history_merchant_id(value: Optional[str]) -> Optional[str]:
@@ -2735,45 +2812,11 @@ async def public_order_lookup(
     order_id: str = Query(...),
     email: EmailStr = Query(...),
 ):
-    ip = _get_client_ip(request)
-    norm_email = normalize_email(str(email))
-
-    # Rate limits
-    ip_count = await count_recent_public_lookup_by_ip(ip)
-    if ip_count > PUBLIC_LOOKUP_IP_LIMIT_PER_MINUTE:
-        raise _error(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Too many requests from this IP. Please try again later.",
-        )
-    pair_count = await count_recent_public_lookup_by_key(norm_email, order_id)
-    if pair_count > PUBLIC_LOOKUP_PAIR_LIMIT_PER_MINUTE:
-        raise _error(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Too many requests for this order. Please try again later.",
-        )
-
-    # Lookup order
-    order = await database.fetch_one(
-        orders_table.select().where(orders_table.c.order_id == order_id)
+    order_data = await _load_public_order_for_customer(
+        request,
+        order_id=order_id,
+        email=email,
     )
-    if not order:
-        raise _error(
-            status.HTTP_404_NOT_FOUND,
-            "NOT_FOUND",
-            "Order not found or email mismatch",
-        )
-
-    order_data = dict(order)
-    if normalize_email(order_data.get("customer_email", "")) != norm_email:
-        raise _error(
-            status.HTTP_404_NOT_FOUND,
-            "NOT_FOUND",
-            "Order not found or email mismatch",
-        )
-
-    await record_public_lookup(ip, norm_email, order_id)
 
     payment_status_mapped = _map_payment_status(order_data.get("payment_status"))
     fulfillment_status_mapped = _map_fulfillment_status(
@@ -2810,50 +2853,109 @@ async def public_order_lookup(
     )
 
 
+@router.get("/public/order-resume", response_model=PublicOrderResumeResponse)
+async def public_order_resume(
+    request: Request,
+    order_id: str = Query(...),
+    email: EmailStr = Query(...),
+):
+    order_data = await _load_public_order_for_customer(
+        request,
+        order_id=order_id,
+        email=email,
+    )
+
+    payment_status_mapped = _map_payment_status(order_data.get("payment_status"))
+    fulfillment_status_mapped = _map_fulfillment_status(
+        order_data.get("fulfillment_status")
+    )
+    delivery_status = _derive_delivery_status(
+        order_data.get("fulfillment_status"), order_data.get("tracking_number")
+    )
+    status_summary = _derive_order_status(
+        payment_status_mapped,
+        fulfillment_status_mapped,
+        cancelled=(order_data.get("status") == "cancelled"),
+        refunded=(order_data.get("status") == "refunded"),
+    )
+
+    shipping = _coerce_json_object(order_data.get("shipping_address"))
+    resumable_payment = await _build_resumable_payment_payload(
+        order_data,
+        payment_status=payment_status_mapped,
+    )
+
+    shipping_name = shipping.get("name") or shipping.get("full_name") or shipping.get("recipient_name")
+    shipping_phone = shipping.get("phone") or shipping.get("phone_number")
+    shipping_address_line1 = (
+        shipping.get("address_line1")
+        or shipping.get("address1")
+        or shipping.get("line1")
+        or shipping.get("street")
+    )
+    shipping_address_line2 = (
+        shipping.get("address_line2")
+        or shipping.get("address2")
+        or shipping.get("line2")
+        or shipping.get("unit")
+    )
+    shipping_city = shipping.get("city")
+    shipping_province = (
+        shipping.get("province")
+        or shipping.get("state")
+        or shipping.get("region")
+    )
+    shipping_country = shipping.get("country")
+    shipping_postal_code = (
+        shipping.get("postal_code")
+        or shipping.get("zip")
+        or shipping.get("zip_code")
+    )
+
+    return PublicOrderResumeResponse(
+        order={
+            "order_id": order_data["order_id"],
+            "merchant_id": order_data["merchant_id"],
+            "currency": order_data.get("currency", "USD"),
+            "total_amount_minor": _amount_to_minor(order_data.get("total")),
+            "status": status_summary,
+            "payment_status": payment_status_mapped,
+            "fulfillment_status": fulfillment_status_mapped,
+            "delivery_status": delivery_status,
+            "created_at": _to_iso_string(order_data.get("created_at") or datetime.now(timezone.utc)),
+            "updated_at": _to_iso_string(order_data.get("updated_at") or datetime.now(timezone.utc)),
+            "shipping_address": {
+                "name": shipping_name,
+                "address_line1": shipping_address_line1,
+                "address_line2": shipping_address_line2,
+                "city": shipping_city,
+                "province": shipping_province,
+                "country": shipping_country,
+                "postal_code": shipping_postal_code,
+                "phone": shipping_phone,
+            },
+        },
+        items=_build_order_items_payload(order_data),
+        payment={"current": resumable_payment},
+        customer={
+            "email": order_data.get("customer_email"),
+            "name": shipping_name,
+            "masked_email": _mask_email(order_data.get("customer_email", "")),
+        },
+    )
+
+
 @router.get("/public/track", response_model=PublicTrackResponse)
 async def public_track(
     request: Request,
     order_id: str = Query(...),
     email: EmailStr = Query(...),
 ):
-    ip = _get_client_ip(request)
-    norm_email = normalize_email(str(email))
-
-    # Rate limits
-    ip_count = await count_recent_public_lookup_by_ip(ip)
-    if ip_count > PUBLIC_LOOKUP_IP_LIMIT_PER_MINUTE:
-        raise _error(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Too many requests from this IP. Please try again later.",
-        )
-    pair_count = await count_recent_public_lookup_by_key(norm_email, order_id)
-    if pair_count > PUBLIC_LOOKUP_PAIR_LIMIT_PER_MINUTE:
-        raise _error(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Too many requests for this order. Please try again later.",
-        )
-
-    order = await database.fetch_one(
-        orders_table.select().where(orders_table.c.order_id == order_id)
+    order_data = await _load_public_order_for_customer(
+        request,
+        order_id=order_id,
+        email=email,
     )
-    if not order:
-        raise _error(
-            status.HTTP_404_NOT_FOUND,
-            "NOT_FOUND",
-            "Order not found or email mismatch",
-        )
-
-    order_data = dict(order)
-    if normalize_email(order_data.get("customer_email", "")) != norm_email:
-        raise _error(
-            status.HTTP_404_NOT_FOUND,
-            "NOT_FOUND",
-            "Order not found or email mismatch",
-        )
-
-    await record_public_lookup(ip, norm_email, order_id)
 
     payment_status_mapped = _map_payment_status(order_data.get("payment_status"))
     fulfillment_status_mapped = _map_fulfillment_status(
