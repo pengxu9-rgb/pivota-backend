@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr, Field
 
+from db.database import database
+from db.orders import get_order
 from readiness import service as readiness_service
 from readiness.flags import (
     readiness_payment_bridge_enabled,
@@ -173,6 +175,62 @@ def _readiness_http_exception(status_code: int, code: str, detail: Dict[str, Any
         detail=detail,
         headers={"X-Error-Code": code},
     )
+
+
+@router.get("/orders/{order_id}/shopify-reconciliation-debug")
+async def get_order_shopify_reconciliation_debug(
+    order_id: str,
+    request: Request,
+    x_pivota_internal_key: Optional[str] = Header(default=None, alias="X-Pivota-Internal-Key"),
+) -> Dict[str, Any]:
+    _require_internal_access(request, x_pivota_internal_key)
+
+    order = await get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    rows = await database.fetch_all(
+        """
+        SELECT id, event_type, created_at, metadata
+        FROM order_events
+        WHERE order_id = :order_id
+          AND event_type IN (
+            'payment_succeeded',
+            'shopify_sync_retry_requested',
+            'shopify_discount_reconciliation',
+            'shopify_order_created',
+            'shopify_order_reused',
+            'shopify_order_failed',
+            'shopify_order_error'
+          )
+        ORDER BY id ASC
+        """,
+        {"order_id": order_id},
+    )
+
+    events = [dict(row) for row in (rows or [])]
+    latest_reconciliation = None
+    for event in reversed(events):
+        if str(event.get("event_type") or "").strip() == "shopify_discount_reconciliation":
+            latest_reconciliation = event
+            break
+
+    return {
+        "order": {
+            "order_id": order.get("order_id"),
+            "merchant_id": order.get("merchant_id"),
+            "status": order.get("status"),
+            "payment_status": order.get("payment_status"),
+            "fulfillment_status": order.get("fulfillment_status"),
+            "shopify_order_id": order.get("shopify_order_id"),
+            "payment_intent_id": order.get("payment_intent_id"),
+            "total": str(order.get("total")) if order.get("total") is not None else None,
+            "currency": order.get("currency"),
+            "updated_at": str(order.get("updated_at")) if order.get("updated_at") is not None else None,
+        },
+        "latest_reconciliation": latest_reconciliation,
+        "events": events,
+    }
 
 
 @router.get("/merchants/{merchant_id}/report")
