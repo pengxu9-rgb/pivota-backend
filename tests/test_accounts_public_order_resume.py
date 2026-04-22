@@ -73,7 +73,16 @@ async def test_public_order_resume_returns_resumable_payment_payload(
                             "variant_id": "var_1",
                             "unit_price_effective": "1.53",
                         }
-                    ]
+                    ],
+                    "quote_id": "q_resume_1",
+                    "currency": "USD",
+                    "pricing": {
+                        "subtotal": "1.53",
+                        "discount_total": "0.16",
+                        "shipping_fee": "8.00",
+                        "tax": "0.00",
+                        "total": "9.37",
+                    },
                 }
             },
             "psp_used": "stripe",
@@ -133,6 +142,17 @@ async def test_public_order_resume_returns_resumable_payment_payload(
     body = resp.json()
     assert body["order"]["order_id"] == "ORD_RESUME_1"
     assert body["order"]["shipping_address"]["city"] == "San Francisco"
+    assert body["pricing_quote"] == {
+        "quote_id": "q_resume_1",
+        "currency": "USD",
+        "pricing": {
+            "subtotal": "1.53",
+            "discount_total": "0.16",
+            "shipping_fee": "8.00",
+            "tax": "0.00",
+            "total": "9.37",
+        },
+    }
     assert body["items"] == [
         {
             "product_id": "prod_1",

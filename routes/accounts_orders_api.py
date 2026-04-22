@@ -427,6 +427,7 @@ class PublicOrderLookupResponse(BaseModel):
 
 class PublicOrderResumeResponse(BaseModel):
     order: Dict[str, Any]
+    pricing_quote: Dict[str, Any]
     items: List[Dict[str, Any]]
     payment: Dict[str, Any]
     customer: Dict[str, Any]
@@ -1172,6 +1173,23 @@ def _extract_pricing_quote_line_items(order_data: Dict[str, Any]) -> List[Dict[s
     if isinstance(raw, list):
         return [item for item in raw if isinstance(item, dict)]
     return []
+
+
+def _extract_pricing_quote_payload(order_data: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _coerce_json_object(order_data.get("metadata"))
+    pricing_quote = _coerce_json_object(metadata.get("pricing_quote"))
+    pricing = _coerce_json_object(pricing_quote.get("pricing"))
+    return {
+        "quote_id": pricing_quote.get("quote_id"),
+        "currency": pricing_quote.get("currency") or order_data.get("currency", "USD"),
+        "pricing": {
+            "subtotal": pricing.get("subtotal"),
+            "discount_total": pricing.get("discount_total"),
+            "shipping_fee": pricing.get("shipping_fee"),
+            "tax": pricing.get("tax"),
+            "total": pricing.get("total"),
+        },
+    }
 
 
 def _match_pricing_quote_line_item(
@@ -2581,6 +2599,7 @@ async def get_order_detail(
                 "phone": shipping_phone,
             },
         },
+        "pricing_quote": _extract_pricing_quote_payload(order_data),
         "items": await _build_order_items_payload(order_data),
         "payment": {
             "records": payment_records,
@@ -3040,6 +3059,7 @@ async def public_order_resume(
                 "phone": shipping_phone,
             },
         },
+        pricing_quote=_extract_pricing_quote_payload(order_data),
         items=await _build_order_items_payload(order_data),
         payment={"current": resumable_payment},
         customer={
