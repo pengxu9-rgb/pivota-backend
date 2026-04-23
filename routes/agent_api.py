@@ -66,7 +66,11 @@ from services.product_exposure_service import (
     AGENT_PUSH_STATUS_EXCLUDED,
     build_agent_push_projection_from_standard_product,
 )
-from services.merchant_payment_initiation_service import build_payment_action
+from services.merchant_payment_initiation_service import (
+    _build_payment_surface_contract,
+    _normalize_payment_status,
+    build_payment_action,
+)
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
@@ -111,6 +115,13 @@ _ORDER_EVENT_ORDER_TOTAL_TYPES = {
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
 
+_TERMINAL_CONFIRM_PAYMENT_STATUSES = {
+    "payment_failed",
+    "cancelled",
+    "refunded",
+    "partially_refunded",
+}
+
 
 def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[Dict[str, Any]]) -> None:
     if request is None or taxonomy is None:
@@ -119,6 +130,40 @@ def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[D
         request.state.traffic_taxonomy = dict(taxonomy)
     except Exception:
         return
+
+
+def _build_confirm_payment_action_from_order(order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    redirect_url = str(order.get("redirect_url") or "").strip() or None
+    client_secret = str(order.get("client_secret") or "").strip() or None
+    psp_used = str(order.get("psp_used") or "").strip().lower() or None
+
+    if redirect_url:
+        return {"type": "redirect_url", "url": redirect_url}
+    if client_secret and client_secret.startswith("http"):
+        return {"type": "redirect_url", "url": client_secret}
+    if psp_used == "adyen" and client_secret:
+        return {"type": "adyen_session", "client_secret": client_secret}
+    if psp_used == "stripe" and client_secret:
+        return {"type": "stripe_client_secret", "client_secret": client_secret}
+    if psp_used == "checkout" and client_secret:
+        return {"type": "checkout_session", "client_secret": client_secret}
+    return None
+
+
+def _resolve_confirm_payment_contract(
+    order: Dict[str, Any],
+) -> tuple[str, Optional[str], Optional[Dict[str, Any]], Dict[str, Any]]:
+    payment_action = _build_confirm_payment_action_from_order(order)
+    surface_contract = _build_payment_surface_contract(payment_action)
+    normalized_payment_status, payment_status_raw = _normalize_payment_status(order.get("payment_status"))
+
+    if normalized_payment_status == "unknown":
+        raw_token = str(order.get("payment_status") or "").strip().lower()
+        if raw_token in {"awaiting_payment", "unpaid"}:
+            normalized_payment_status = "pending"
+            payment_status_raw = raw_token
+
+    return normalized_payment_status, payment_status_raw, payment_action, surface_contract
 
 
 def _coerce_json_object(value: Any) -> Dict[str, Any]:
@@ -8471,7 +8516,62 @@ async def agent_confirm_payment(
             str((store_info or {}).get("api_key") or "").strip()
         )
 
-        already_paid = order.get("payment_status") == "paid"
+        normalized_payment_status, payment_status_raw, payment_action, surface_contract = _resolve_confirm_payment_contract(order)
+
+        if normalized_payment_status in _TERMINAL_CONFIRM_PAYMENT_STATUSES:
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=order["merchant_id"],
+                order_id=order_id,
+            )
+
+            return {
+                "status": normalized_payment_status,
+                "message": "Payment failed and cannot be confirmed again"
+                if normalized_payment_status == "payment_failed"
+                else "Payment is already in a terminal state",
+                "order_id": order_id,
+                "payment_intent_id": order.get("payment_intent_id"),
+                "payment_status": normalized_payment_status,
+                **({"payment_status_raw": payment_status_raw} if payment_status_raw else {}),
+                "confirmation_owner": "backend",
+                "requires_client_confirmation": False,
+                "payment_action": None,
+                "shopify_sync": "not_started",
+            }
+
+        if surface_contract.get("confirmation_owner") == "client" and normalized_payment_status != "paid":
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=order["merchant_id"],
+                order_id=order_id,
+            )
+
+            return {
+                "status": "pending",
+                "message": "Waiting for authoritative PSP confirmation before marking payment as paid",
+                "order_id": order_id,
+                "payment_intent_id": order.get("payment_intent_id"),
+                "payment_status": "pending",
+                **({"payment_status_raw": payment_status_raw} if payment_status_raw else {}),
+                "confirmation_owner": surface_contract.get("confirmation_owner"),
+                "requires_client_confirmation": bool(surface_contract.get("requires_client_confirmation")),
+                "payment_action": {
+                    **(payment_action or {}),
+                    "submit_owner": surface_contract.get("submit_owner"),
+                    "component_kind": surface_contract.get("component_kind"),
+                    "supported_in_shopping_ui": bool(surface_contract.get("supported_in_shopping_ui")),
+                }
+                if payment_action
+                else None,
+                "shopify_sync": "waiting_for_psp_confirmation" if can_shopify_sync else "not_configured",
+            }
+
+        already_paid = normalized_payment_status == "paid"
         if already_paid:
             if not order.get("shopify_order_id") and can_shopify_sync:
                 try:
