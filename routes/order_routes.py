@@ -41,6 +41,8 @@ from services.merchant_payment_initiation_service import build_payment_action
 from services.payment_offer_evidence_service import emit_payment_offer_analytics_event, stable_payment_offer_hash
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
+    evaluate_psp_readiness,
+    fetch_active_merchant_psps,
     fetch_active_runtime_merchant_psp,
     infer_runtime_provider,
 )
@@ -262,7 +264,10 @@ def _build_order_preferred_psps(
 
     explicit_provider = _normalize_order_provider_hint(None, preferred_psp)
     if explicit_provider:
-        providers.append(explicit_provider)
+        # Explicit caller choice is a strict subset, not a soft hint. This prevents
+        # silent provider fallbacks that mask PSP-selection bugs and makes quote-first
+        # retries deterministic when callers intentionally compare PSP surfaces.
+        return [explicit_provider]
 
     raw_priority = route_config.get("psp_priority") if isinstance(route_config, dict) else []
     if isinstance(raw_priority, str):
@@ -278,6 +283,75 @@ def _build_order_preferred_psps(
                 providers.append(provider)
 
     return providers or None
+
+
+async def _ensure_explicit_preferred_psp_available(
+    *,
+    merchant_id: str,
+    preferred_psp: Optional[str],
+    enforce_live_readiness: bool,
+) -> Optional[str]:
+    explicit_provider = _normalize_order_provider_hint(None, preferred_psp)
+    if not explicit_provider:
+        return None
+
+    try:
+        rows = await fetch_active_merchant_psps(
+            merchant_id=merchant_id,
+            provider=explicit_provider,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[OrderRoutes] Failed to load canonical PSP configs for explicit preferred_psp %s: %s",
+            explicit_provider,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "PREFERRED_PSP_UNAVAILABLE",
+                "message": f"Unable to verify preferred PSP '{explicit_provider}' right now.",
+                "preferred_psp": explicit_provider,
+            },
+        )
+
+    if not rows:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "PREFERRED_PSP_UNAVAILABLE",
+                "message": f"Preferred PSP '{explicit_provider}' is not active for this merchant.",
+                "preferred_psp": explicit_provider,
+            },
+        )
+
+    if not enforce_live_readiness:
+        return explicit_provider
+
+    readiness = evaluate_psp_readiness(
+        explicit_provider,
+        status=rows[0].get("status"),
+        api_key=rows[0].get("api_key"),
+        account_id=rows[0].get("account_id"),
+        provider_config=rows[0].get("provider_config"),
+        environment=rows[0].get("environment"),
+        validation_status=rows[0].get("validation_status"),
+        validation_error=rows[0].get("validation_error"),
+    )
+    if readiness.get("live_charge_ready"):
+        return explicit_provider
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "PREFERRED_PSP_UNAVAILABLE",
+            "message": (
+                f"Preferred PSP '{explicit_provider}' is not available under the current live-readiness policy."
+            ),
+            "preferred_psp": explicit_provider,
+            "readiness_blockers": readiness.get("readiness_blockers") or [],
+        },
+    )
 
 
 def _finalize_order_psp_used(psp_used: Optional[str], fallback_provider: Optional[str]) -> str:
@@ -2130,6 +2204,12 @@ async def create_new_order(
             "legacy_promotions" if discount_total > 0 else "legacy_incomplete"
         )
         persisted_order_items = _build_persisted_order_items(order_request.items, pricing_quote_meta)
+        enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
+        explicit_preferred_provider = await _ensure_explicit_preferred_psp_available(
+            merchant_id=order_request.merchant_id,
+            preferred_psp=order_request.preferred_psp,
+            enforce_live_readiness=enforce_live_readiness,
+        )
 
         order_data = {
             "merchant_id": order_request.merchant_id,
@@ -2304,7 +2384,6 @@ async def create_new_order(
                 psp_mode = "stripe_checkout"
             enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
             payment_return_url = _build_order_payment_return_url(order_id, order_metadata)
-
             success, payment_intent, error, psp_used = await create_payment_with_failover(
                 merchant_id=order_request.merchant_id,
                 amount=total,
@@ -2340,6 +2419,7 @@ async def create_new_order(
                     **({"return_url": payment_return_url} if payment_return_url else {}),
                 },
                 preferred_psps=preferred_psps,
+                restrict_to_preferred_psps=bool(explicit_preferred_provider),
                 canonical_psp_required=True,
                 enforce_live_readiness=enforce_live_readiness,
             )
@@ -2472,7 +2552,67 @@ async def create_new_order(
                         discount_codes=order_request.discount_codes,
                     )
 
-                if (fallback_checkout_url or platform_checkout) and not payment_action:
+                if (
+                    not explicit_preferred_provider
+                    and (fallback_checkout_url or platform_checkout)
+                    and not payment_action
+                ):
+                    psp_type = "checkout"
+                    client_secret = str(fallback_checkout_url or (platform_checkout or {}).get("url"))
+                    payment_action = {
+                        "type": "redirect_url",
+                        "url": str(fallback_checkout_url or (platform_checkout or {}).get("url")),
+                        "raw": {
+                            "reason": "psp_error",
+                            "error": str(e),
+                            **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
+                        },
+                    }
+                    await log_order_event(
+                        event_type="payment_fallback_platform_checkout",
+                        order_id=order_id,
+                        merchant_id=order_request.merchant_id,
+                        total_amount=float(total),
+                        currency=order_request.currency,
+                        metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
+                    )
+            else:
+                logger.warning(
+                    "[OrderRoutes] platform checkout fallback disabled after PSP error; keeping failure visible for order %s",
+                    order_id,
+                )
+            # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
+            await log_order_event(
+                event_type="payment_intent_failed",
+                order_id=order_id,
+                merchant_id=order_request.merchant_id,
+                total_amount=float(total),
+                currency=order_request.currency,
+                metadata={"error": error, "psp_type": final_psp},
+            )
+        except Exception as e:
+            logger.error(f"Payment intent creation error: {e}")
+            if _platform_checkout_fallback_enabled():
+                fallback_checkout_url = None
+                try:
+                    if isinstance(pricing_quote_meta, dict):
+                        fallback_checkout_url = pricing_quote_meta.get("checkout_url")
+                except Exception:
+                    fallback_checkout_url = None
+
+                platform_checkout = None
+                if not fallback_checkout_url:
+                    platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
+                        merchant_id=order_request.merchant_id,
+                        items=order_request.items,
+                        discount_codes=order_request.discount_codes,
+                    )
+
+                if (
+                    not explicit_preferred_provider
+                    and (fallback_checkout_url or platform_checkout)
+                    and not payment_action
+                ):
                     psp_type = "checkout"
                     client_secret = str(fallback_checkout_url or (platform_checkout or {}).get("url"))
                     payment_action = {

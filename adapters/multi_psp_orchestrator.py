@@ -150,6 +150,7 @@ class MultiPSPOrchestrator:
         metadata: Dict[str, Any],
         preferred_psps: Optional[List[str]] = None,
         *,
+        restrict_to_preferred_psps: bool = False,
         canonical_psp_required: bool = False,
         enforce_live_readiness: bool = False,
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
@@ -165,6 +166,10 @@ class MultiPSPOrchestrator:
             order_map = {
                 name.lower(): idx for idx, name in enumerate(preferred_psps, start=1)
             }
+            if restrict_to_preferred_psps:
+                self.psp_configs = [
+                    cfg for cfg in self.psp_configs if cfg.psp_type in order_map
+                ]
             default_base = len(order_map) + 1
             for cfg in self.psp_configs:
                 if cfg.psp_type in order_map:
@@ -411,6 +416,7 @@ async def create_payment_with_failover(
     metadata: Dict[str, Any],
     preferred_psps: Optional[List[str]] = None,
     *,
+    restrict_to_preferred_psps: bool = False,
     canonical_psp_required: bool = False,
     enforce_live_readiness: bool = False,
 ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
@@ -431,6 +437,7 @@ async def create_payment_with_failover(
         currency,
         metadata,
         preferred_psps=preferred_psps,
+        restrict_to_preferred_psps=restrict_to_preferred_psps,
         canonical_psp_required=canonical_psp_required,
         enforce_live_readiness=enforce_live_readiness,
     )
