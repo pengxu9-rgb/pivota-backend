@@ -721,17 +721,17 @@ async def test_create_shopify_order_uses_custom_line_items_and_shipping_lines_fo
     assert ok is True
     assert captured_payloads
     order_payload = captured_payloads[0]["order"]
-    assert order_payload["send_receipt"] is True
-    assert order_payload["send_fulfillment_receipt"] is True
+    assert order_payload["send_receipt"] is False
+    assert order_payload["send_fulfillment_receipt"] is False
     assert order_payload["shipping_lines"][0]["price"] == "0.00"
     assert order_payload["shipping_lines"][0]["title"] == "Free Shipping"
-    assert order_payload["line_items"][0]["title"] == "Test Product"
-    assert "variant_id" not in order_payload["line_items"][0]
+    assert order_payload["line_items"][0]["variant_id"] == 123
     assert order_payload["line_items"][0]["price"] == "1.69"
     assert order_payload["line_items"][0]["total_discount"] == "0.60"
     assert "discount_codes" not in order_payload
-    assert "pivota-custom-line-items" in order_payload["tags"]
-    assert not any(e.get("event_type") == "shopify_receipt_suppressed" for e in captured_events)
+    assert "pivota-custom-line-items" not in order_payload["tags"]
+    suppressed_event = next(e for e in captured_events if e.get("event_type") == "shopify_receipt_suppressed")
+    assert "product_level_discount" in (suppressed_event.get("metadata") or {}).get("blockers", [])
 
 
 @pytest.mark.asyncio

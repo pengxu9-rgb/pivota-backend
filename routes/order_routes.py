@@ -1759,36 +1759,12 @@ def _pricing_quote_supports_custom_line_item_rest_encoding(pricing_quote_meta: D
     Determine whether we can faithfully encode the authoritative quote into Shopify REST
     using custom line items plus explicit shipping_lines.
 
-    This path is intentionally conservative:
-    - every non-shipping discount must already be allocated at the line level
-    - no unverified shipping quote
+    Live verification on production showed Shopify REST `orders.json` still drops
+    line-item discount state for this shape, even when the quote discount is fully
+    allocated at the line level. Keep this disabled until we move to a surface that
+    can authoritatively encode line discounts (for example Draft Orders / GraphQL).
     """
-    if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
-        return False
-    if _pricing_quote_has_unverified_shipping(pricing_quote_meta):
-        return False
-
-    line_discount_total = _pricing_quote_line_discount_total(pricing_quote_meta)
-    discount_total = _pricing_quote_discount_total(pricing_quote_meta)
-    if line_discount_total <= 0 or discount_total <= 0:
-        return False
-    if line_discount_total != discount_total:
-        return False
-
-    for line in pricing_quote_meta.get("line_items") or []:
-        if not isinstance(line, dict):
-            continue
-        quantity = int(line.get("quantity") or 0)
-        unit_price_original = _money2(line.get("unit_price_original"))
-        line_discount = _money2(line.get("line_discount_total")).copy_abs()
-        if quantity <= 0 or unit_price_original <= 0:
-            return False
-        # REST custom line items only accept a total_discount value. Keep the scope narrow
-        # to shapes that can be represented without inventing order-level discount math.
-        if line_discount <= 0:
-            return False
-
-    return True
+    return False
 
 
 def _shopify_shipping_line_title(pricing_quote_meta: Dict[str, Any]) -> str:

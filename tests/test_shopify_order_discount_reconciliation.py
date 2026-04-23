@@ -117,7 +117,7 @@ def test_shopify_receipt_is_suppressed_when_quote_has_unrenderable_discount_shap
     ) is False
 
 
-def test_pricing_quote_supports_custom_line_item_rest_encoding_when_discount_is_fully_line_allocated():
+def test_pricing_quote_disables_custom_line_item_rest_encoding_even_when_discount_is_fully_line_allocated():
     pricing_quote_meta = _pricing_quote_meta()
     pricing_quote_meta["pricing"]["shipping_fee"] = "0.00"
     pricing_quote_meta["discount_evidence"]["applications"].append(
@@ -130,7 +130,7 @@ def test_pricing_quote_supports_custom_line_item_rest_encoding_when_discount_is_
         }
     )
 
-    assert order_routes._pricing_quote_supports_custom_line_item_rest_encoding(pricing_quote_meta) is True
+    assert order_routes._pricing_quote_supports_custom_line_item_rest_encoding(pricing_quote_meta) is False
 
 
 def test_pricing_quote_rejects_custom_line_item_rest_encoding_when_discount_has_unallocated_remainder():
