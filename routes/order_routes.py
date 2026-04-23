@@ -1524,6 +1524,69 @@ def _build_shopify_order_discount_codes(pricing_quote_meta: Dict[str, Any]) -> L
     return out[:1]
 
 
+def _shopify_receipt_representation_blockers(pricing_quote_meta: Dict[str, Any]) -> List[str]:
+    """
+    Identify quote shapes that Shopify REST order creation cannot faithfully represent today.
+
+    Current REST payload support in this code path is limited to:
+    - at most one order-level discount code
+    - no code-less automatic discounts
+    - no reliable product-level discount recreation
+
+    When these blockers are present, auto-sending a Shopify receipt is unsafe because Shopify
+    may generate an email with totals/breakdown that do not match the authoritative quote/charge.
+    """
+    if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
+        return []
+
+    blockers: List[str] = []
+    evidence = pricing_quote_meta.get("discount_evidence")
+    applications = evidence.get("applications") if isinstance(evidence, dict) else None
+    if not isinstance(applications, list):
+        applications = pricing_quote_meta.get("promotion_lines") or []
+
+    applicable_codes: List[str] = []
+    if isinstance(evidence, dict):
+        for row in evidence.get("codes") or []:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("code") or "").strip()
+            if code and row.get("applicable") is True:
+                applicable_codes.append(code)
+
+    if len(set(applicable_codes)) > 1:
+        blockers.append("multiple_applicable_discount_codes")
+
+    for row in applications or []:
+        if not isinstance(row, dict):
+            continue
+        discount_class = str(row.get("discount_class") or "").strip().lower()
+        method = str(row.get("method") or "").strip().lower()
+        code = str(row.get("code") or "").strip()
+        amount = _money2(row.get("amount")).copy_abs()
+        if amount <= 0:
+            continue
+        if discount_class == "product":
+            blockers.append("product_level_discount")
+        if method == "automatic":
+            blockers.append("automatic_discount")
+        if discount_class == "shipping" and not code:
+            blockers.append("code_less_shipping_discount")
+
+    if _pricing_quote_discount_total(pricing_quote_meta) > 0 and not _build_shopify_order_discount_codes(pricing_quote_meta):
+        blockers.append("discount_not_encodable_as_rest_order_discount_code")
+
+    return sorted(set(blockers))
+
+
+def _shopify_receipt_can_be_auto_sent(
+    *,
+    customer_email: str,
+    pricing_quote_meta: Dict[str, Any],
+) -> bool:
+    return bool(customer_email) and not _shopify_receipt_representation_blockers(pricing_quote_meta)
+
+
 _SHOPIFY_ORDER_TAG_MAX_LEN = 40
 _SHOPIFY_ORDER_TAG_SAFE_RE = re.compile(r"[^A-Za-z0-9-]+")
 
@@ -3490,6 +3553,8 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             pricing_quote_meta=pricing_quote_meta,
         )
         shopify_discount_codes = _build_shopify_order_discount_codes(pricing_quote_meta)
+        receipt_blockers = _shopify_receipt_representation_blockers(pricing_quote_meta)
+        send_receipt = bool(customer_email) and not receipt_blockers
         shopify_tags = ["pivota", "agent-order", pivota_tag, *discount_tags]
 
         shopify_order_data = {
@@ -3504,8 +3569,8 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 },
                 **({"transactions": transactions_payload} if transactions_payload else {}),
                 "financial_status": "paid",
-                "send_receipt": bool(customer_email),
-                "send_fulfillment_receipt": bool(customer_email),
+                "send_receipt": send_receipt,
+                "send_fulfillment_receipt": send_receipt,
                 "line_items": line_items,
                 "shipping_address": shopify_shipping,
                 # Many templates reference billing_address.* for the buyer identity.
@@ -3516,6 +3581,22 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 "tags": ",".join(shopify_tags),
             }
         }
+        if receipt_blockers:
+            try:
+                await log_order_event(
+                    event_type="shopify_receipt_suppressed",
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                    total_amount=float(order_total),
+                    currency=currency_code,
+                    metadata={
+                        "reason": "shopify_rest_order_cannot_faithfully_render_authoritative_quote",
+                        "blockers": receipt_blockers,
+                        "quote_id": str(pricing_quote_meta.get("quote_id") or "").strip() or None,
+                    },
+                )
+            except Exception:
+                pass
 
         async def _finalize_success(
             *,
