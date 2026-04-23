@@ -198,6 +198,8 @@ async def get_order_shopify_reconciliation_debug(
             'payment_succeeded',
             'shopify_sync_retry_requested',
             'shopify_discount_reconciliation',
+            'shopify_receipt_suppressed',
+            'shopify_draft_order_failed',
             'shopify_order_created',
             'shopify_order_reused',
             'shopify_order_failed',

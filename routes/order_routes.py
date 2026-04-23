@@ -17,7 +17,7 @@ import os
 import json
 import re
 from contextlib import asynccontextmanager
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, text
 
 from models.order import (
     CreateOrderRequest, OrderResponse, PaymentConfirmRequest, 
@@ -1413,6 +1413,44 @@ def _shopify_discount_reconciliation_mode() -> str:
     return mode if mode in {"observe", "fail_closed"} else "observe"
 
 
+SHOPIFY_WRITE_STRATEGY_REST_SIMPLE = "rest_simple"
+SHOPIFY_WRITE_STRATEGY_DRAFT_ORDER_QUOTE = "draft_order_quote"
+SHOPIFY_WRITE_STRATEGY_REST_LEGACY_SUPPRESSED = "rest_legacy_suppressed"
+
+SHOPIFY_RECEIPT_POLICY_SEND = "send_shopify_receipt"
+SHOPIFY_RECEIPT_POLICY_SUPPRESSED = "shopify_receipt_suppressed"
+SHOPIFY_RECEIPT_POLICY_DRAFT_SUPPRESSED = "shopify_receipt_suppressed_pending_draft_canary"
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _csv_env_values(name: str) -> List[str]:
+    raw = str(os.getenv(name, "") or "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _shopify_draft_order_quote_sync_enabled(*, merchant_id: Optional[str] = None) -> bool:
+    if not _env_flag("SHOPIFY_DRAFT_ORDER_QUOTE_SYNC_ENABLED", "0"):
+        return False
+    allowlist = set(_csv_env_values("SHOPIFY_DRAFT_ORDER_QUOTE_MERCHANT_IDS"))
+    if not allowlist:
+        return True
+    return bool(merchant_id and merchant_id in allowlist)
+
+
+def _order_amounts_source(order: Dict[str, Any]) -> Optional[str]:
+    metadata = _coerce_dict((order or {}).get("metadata"))
+    value = metadata.get("amounts_source")
+    if value:
+        return str(value or "").strip() or None
+    pricing_quote = metadata.get("pricing_quote")
+    if isinstance(pricing_quote, dict) and pricing_quote:
+        return "quote_snapshot"
+    return None
+
+
 def _money2(value: Any) -> Decimal:
     return parse_decimal_money(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
@@ -1577,6 +1615,65 @@ def _shopify_receipt_representation_blockers(pricing_quote_meta: Dict[str, Any])
         blockers.append("discount_not_encodable_as_rest_order_discount_code")
 
     return sorted(set(blockers))
+
+
+def _select_shopify_write_policy(
+    *,
+    order: Dict[str, Any],
+    pricing_quote_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Decide how a paid Pivota order should be represented in Shopify.
+
+    `quote_snapshot` is the only authoritative amount source for customer-facing
+    Shopify receipts. Legacy/non-quote rows may still be written for merchant
+    fulfillment, but receipts stay suppressed and those rows are excluded from
+    receipt-truth canaries.
+    """
+    merchant_id = str((order or {}).get("merchant_id") or "").strip() or None
+    amounts_source = _order_amounts_source(order)
+    blockers = _shopify_receipt_representation_blockers(pricing_quote_meta)
+
+    if amounts_source != "quote_snapshot" or not pricing_quote_meta:
+        return {
+            "shopify_write_strategy": SHOPIFY_WRITE_STRATEGY_REST_LEGACY_SUPPRESSED,
+            "write_path": "rest",
+            "receipt_policy": SHOPIFY_RECEIPT_POLICY_SUPPRESSED,
+            "representation_status": "legacy_not_authoritative",
+            "reconciliation_status": "not_applicable",
+            "receipt_blockers": ["non_quote_snapshot_amounts"],
+            "draft_order_enabled": False,
+        }
+
+    if blockers:
+        draft_enabled = _shopify_draft_order_quote_sync_enabled(merchant_id=merchant_id)
+        return {
+            "shopify_write_strategy": SHOPIFY_WRITE_STRATEGY_DRAFT_ORDER_QUOTE,
+            "write_path": "draft_order" if draft_enabled else "rest_suppressed_fallback",
+            "receipt_policy": (
+                SHOPIFY_RECEIPT_POLICY_DRAFT_SUPPRESSED
+                if draft_enabled
+                else SHOPIFY_RECEIPT_POLICY_SUPPRESSED
+            ),
+            "representation_status": (
+                "draft_order_quote_enabled"
+                if draft_enabled
+                else "draft_order_quote_required_rest_suppressed"
+            ),
+            "reconciliation_status": "pending",
+            "receipt_blockers": blockers,
+            "draft_order_enabled": draft_enabled,
+        }
+
+    return {
+        "shopify_write_strategy": SHOPIFY_WRITE_STRATEGY_REST_SIMPLE,
+        "write_path": "rest",
+        "receipt_policy": SHOPIFY_RECEIPT_POLICY_SEND,
+        "representation_status": "rest_simple_representable",
+        "reconciliation_status": "pending",
+        "receipt_blockers": [],
+        "draft_order_enabled": False,
+    }
 
 
 def _shopify_receipt_can_be_auto_sent(
@@ -1802,6 +1899,245 @@ def _build_shopify_shipping_lines(
     ]
 
 
+def _shopify_money_input(amount: Decimal, currency_code: str) -> Dict[str, str]:
+    return {
+        "amount": str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "currencyCode": str(currency_code or "USD").strip().upper() or "USD",
+    }
+
+
+def _shopify_variant_gid(variant_id: Any) -> Optional[str]:
+    raw = str(variant_id or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("gid://shopify/ProductVariant/"):
+        return raw
+    if raw.isdigit():
+        return f"gid://shopify/ProductVariant/{raw}"
+    return None
+
+
+def _shopify_order_gid(order_id: Any) -> Optional[str]:
+    raw = str(order_id or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("gid://shopify/Order/"):
+        return raw
+    if raw.isdigit():
+        return f"gid://shopify/Order/{raw}"
+    return None
+
+
+def _shopify_graphql_address_input(shopify_shipping: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(shopify_shipping, dict):
+        return {}
+    payload = {
+        "firstName": shopify_shipping.get("first_name"),
+        "lastName": shopify_shipping.get("last_name"),
+        "address1": shopify_shipping.get("address1"),
+        "address2": shopify_shipping.get("address2"),
+        "city": shopify_shipping.get("city"),
+        "province": shopify_shipping.get("province"),
+        "zip": shopify_shipping.get("zip"),
+        "country": shopify_shipping.get("country"),
+        "phone": shopify_shipping.get("phone"),
+    }
+    return {key: value for key, value in payload.items() if value not in (None, "")}
+
+
+def _shopify_discount_title(pricing_quote_meta: Dict[str, Any], *, fallback: str = "Pivota Quote Discount") -> str:
+    evidence = pricing_quote_meta.get("discount_evidence") if isinstance(pricing_quote_meta, dict) else None
+    if isinstance(evidence, dict):
+        for row in evidence.get("codes") or []:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("code") or "").strip()
+            if code and row.get("applicable") is True:
+                return code
+    for row in pricing_quote_meta.get("promotion_lines") or [] if isinstance(pricing_quote_meta, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        if code:
+            return code
+    return fallback
+
+
+def _build_shopify_draft_order_input(
+    *,
+    order_id: str,
+    order: Dict[str, Any],
+    pricing_quote_meta: Dict[str, Any],
+    customer_email: str,
+    shopify_shipping: Dict[str, Any],
+    currency_code: str,
+    shopify_tags: List[str],
+    discount_note_attributes: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    pricing = pricing_quote_meta.get("pricing") if isinstance(pricing_quote_meta, dict) else {}
+    shipping_lines = _build_shopify_shipping_lines(
+        order=order,
+        pricing_quote_meta=pricing_quote_meta,
+        currency_code=currency_code,
+    )
+    shipping_line = shipping_lines[0] if shipping_lines else None
+    quote_line_map = _build_pricing_quote_line_item_map(pricing_quote_meta)
+    discount_title = _shopify_discount_title(pricing_quote_meta)
+    line_items: List[Dict[str, Any]] = []
+    allocated_line_discount_total = Decimal("0.00")
+
+    for item in order.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        variant_gid = _shopify_variant_gid(item.get("variant_id"))
+        quote_line = None
+        variant_id = str(item.get("variant_id") or "").strip()
+        product_id = str(item.get("product_id") or "").strip()
+        if variant_id:
+            quote_line = quote_line_map.get(f"variant:{variant_id}")
+        if not quote_line and product_id:
+            quote_line = quote_line_map.get(f"product:{product_id}")
+
+        quantity = int(item.get("quantity") or 0)
+        if quantity <= 0:
+            continue
+
+        unit_price_original = _money2(
+            (quote_line or {}).get("unit_price_original")
+            or item.get("unit_price")
+        )
+        line_discount_total = _money2((quote_line or {}).get("line_discount_total")).copy_abs()
+        allocated_line_discount_total += line_discount_total
+
+        draft_line: Dict[str, Any]
+        if variant_gid:
+            draft_line = {
+                "variantId": variant_gid,
+                "quantity": quantity,
+            }
+            if unit_price_original > 0:
+                draft_line["priceOverride"] = _shopify_money_input(unit_price_original, currency_code)
+        else:
+            draft_line = {
+                "title": str(item.get("product_title") or "Product"),
+                "quantity": quantity,
+                "originalUnitPriceWithCurrency": _shopify_money_input(unit_price_original, currency_code),
+                "requiresShipping": True,
+                "taxable": False,
+            }
+            sku = str(item.get("sku") or "").strip()
+            if sku:
+                draft_line["sku"] = sku
+
+        if line_discount_total > 0:
+            draft_line["appliedDiscount"] = {
+                "title": discount_title,
+                "description": "Pivota quote line discount",
+                "valueType": "FIXED_AMOUNT",
+                "value": float(line_discount_total),
+                "amountWithCurrency": _shopify_money_input(line_discount_total, currency_code),
+            }
+        line_items.append(draft_line)
+
+    pricing_discount_total = _pricing_quote_discount_total(pricing_quote_meta)
+    unallocated_discount_total = max(Decimal("0.00"), pricing_discount_total - allocated_line_discount_total)
+
+    custom_attributes = [
+        {"key": str(row.get("name")), "value": str(row.get("value"))}
+        for row in discount_note_attributes or []
+        if isinstance(row, dict) and str(row.get("name") or "").strip()
+    ]
+
+    draft_input: Dict[str, Any] = {
+        "lineItems": line_items,
+        "presentmentCurrencyCode": currency_code,
+        "tags": [tag for tag in shopify_tags if isinstance(tag, str) and tag.strip()],
+        "customAttributes": custom_attributes,
+        "note": f"Pivota Order ID: {order_id}",
+        "taxExempt": _money2((pricing or {}).get("tax")) <= 0,
+    }
+    if customer_email:
+        draft_input["email"] = customer_email
+    address_input = _shopify_graphql_address_input(shopify_shipping)
+    if address_input:
+        draft_input["shippingAddress"] = address_input
+        draft_input["billingAddress"] = address_input
+    if shipping_line:
+        draft_input["shippingLine"] = {
+            "title": str(shipping_line.get("title") or "Shipping"),
+            "price": str(shipping_line.get("price") or "0.00"),
+        }
+    if unallocated_discount_total > 0:
+        draft_input["appliedDiscount"] = {
+            "title": discount_title,
+            "description": "Pivota quote order discount",
+            "valueType": "FIXED_AMOUNT",
+            "value": float(unallocated_discount_total),
+            "amountWithCurrency": _shopify_money_input(unallocated_discount_total, currency_code),
+        }
+    return draft_input
+
+
+def _extract_shopify_legacy_resource_id(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return raw
+    match = re.search(r"/(\d+)$", raw)
+    return match.group(1) if match else None
+
+
+def _format_shopify_user_errors(errors: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in errors or []:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                "field": row.get("field"),
+                "message": str(row.get("message") or "").strip() or "Unknown Shopify user error",
+            }
+        )
+    return out
+
+
+async def _log_shopify_receipt_suppressed_once(
+    *,
+    order_id: str,
+    merchant_id: str,
+    total_amount: float,
+    currency: str,
+    metadata: Dict[str, Any],
+) -> None:
+    try:
+        existing = await database.fetch_val(
+            text(
+                """
+                SELECT 1
+                FROM order_events
+                WHERE order_id = :order_id
+                  AND event_type = 'shopify_receipt_suppressed'
+                LIMIT 1
+                """
+            ),
+            {"order_id": order_id},
+        )
+        if existing:
+            return
+    except Exception:
+        pass
+
+    await log_order_event(
+        event_type="shopify_receipt_suppressed",
+        order_id=order_id,
+        merchant_id=merchant_id,
+        total_amount=total_amount,
+        currency=currency,
+        metadata=metadata,
+    )
+
+
 async def _fetch_shopify_order_reconciliation_payload_best_effort(
     *,
     shop_domain: str,
@@ -1847,6 +2183,121 @@ async def _fetch_shopify_order_reconciliation_payload_best_effort(
         pass
 
     return order
+
+
+async def _create_shopify_draft_order_from_quote(
+    *,
+    order_id: str,
+    order: Dict[str, Any],
+    shop_domain: str,
+    access_token: str,
+    customer_email: str,
+    shopify_shipping: Dict[str, Any],
+    currency_code: str,
+    pricing_quote_meta: Dict[str, Any],
+    shopify_tags: List[str],
+    discount_note_attributes: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    from services.shopify_graphql_client import shopify_admin_graphql
+
+    api_version = str(os.getenv("SHOPIFY_DRAFT_ORDER_GRAPHQL_API_VERSION", "2025-07") or "").strip() or "2025-07"
+    draft_order_input = _build_shopify_draft_order_input(
+        order_id=order_id,
+        order=order,
+        pricing_quote_meta=pricing_quote_meta,
+        customer_email=customer_email,
+        shopify_shipping=shopify_shipping,
+        currency_code=currency_code,
+        shopify_tags=shopify_tags,
+        discount_note_attributes=discount_note_attributes,
+    )
+
+    create_mutation = """
+    mutation PivotaDraftOrderCreate($input: DraftOrderInput!) {
+      draftOrderCreate(input: $input) {
+        draftOrder {
+          id
+          legacyResourceId
+          name
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    create_data = await shopify_admin_graphql(
+        shop_domain=shop_domain,
+        access_token=access_token,
+        query=create_mutation,
+        variables={"input": draft_order_input},
+        api_version=api_version,
+        timeout_s=20.0,
+    )
+    create_payload = create_data.get("draftOrderCreate") if isinstance(create_data, dict) else None
+    create_user_errors = _format_shopify_user_errors((create_payload or {}).get("userErrors"))
+    if create_user_errors:
+        raise ValueError(f"draftOrderCreate userErrors={json.dumps(create_user_errors, ensure_ascii=True)}")
+
+    draft_order = (create_payload or {}).get("draftOrder") if isinstance(create_payload, dict) else None
+    draft_order_gid = str((draft_order or {}).get("id") or "").strip()
+    if not draft_order_gid:
+        raise ValueError("draftOrderCreate returned no draft order id")
+
+    complete_mutation = """
+    mutation PivotaDraftOrderComplete($id: ID!, $sourceName: String) {
+      draftOrderComplete(id: $id, sourceName: $sourceName) {
+        draftOrder {
+          id
+          legacyResourceId
+          order {
+            id
+            legacyResourceId
+            name
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    complete_data = await shopify_admin_graphql(
+        shop_domain=shop_domain,
+        access_token=access_token,
+        query=complete_mutation,
+        variables={"id": draft_order_gid, "sourceName": "pivota"},
+        api_version=api_version,
+        timeout_s=20.0,
+    )
+    complete_payload = complete_data.get("draftOrderComplete") if isinstance(complete_data, dict) else None
+    complete_user_errors = _format_shopify_user_errors((complete_payload or {}).get("userErrors"))
+    if complete_user_errors:
+        raise ValueError(f"draftOrderComplete userErrors={json.dumps(complete_user_errors, ensure_ascii=True)}")
+
+    completed_draft = (complete_payload or {}).get("draftOrder") if isinstance(complete_payload, dict) else None
+    completed_order = (completed_draft or {}).get("order") if isinstance(completed_draft, dict) else None
+    shopify_order_id = _extract_shopify_legacy_resource_id(
+        (completed_order or {}).get("legacyResourceId")
+        or (completed_order or {}).get("id")
+    )
+    if not shopify_order_id:
+        raise ValueError("draftOrderComplete returned no Shopify order id")
+
+    return {
+        "shopify_order_id": shopify_order_id,
+        "draft_order_id": _extract_shopify_legacy_resource_id(
+            (completed_draft or {}).get("legacyResourceId")
+            or (completed_draft or {}).get("id")
+        ),
+        "order_payload": {
+            "id": shopify_order_id,
+            "admin_graphql_api_id": _shopify_order_gid(shopify_order_id),
+            "name": (completed_order or {}).get("name"),
+        },
+    }
 
 
 def _reconcile_shopify_discount_order(
@@ -1905,6 +2356,42 @@ def _reconcile_shopify_discount_order(
     }
 
 
+def _is_checkout_ui_order_create(metadata: Optional[Dict[str, Any]]) -> bool:
+    meta = metadata if isinstance(metadata, dict) else {}
+    ui_source = str(meta.get("ui_source") or "").strip().lower()
+    created_via = str(meta.get("created_via") or "").strip().lower()
+    commerce_surface = str(meta.get("commerce_surface") or meta.get("surface") or "").strip().lower()
+    return (
+        ui_source == "checkout_ui"
+        or created_via == "checkout_ui"
+        or commerce_surface == "checkout_ui"
+    )
+
+
+async def _update_order_shopify_sync_metadata_best_effort(
+    *,
+    order_id: str,
+    order: Dict[str, Any],
+    fields: Dict[str, Any],
+) -> None:
+    latest = await get_order(order_id)
+    base_order = latest if isinstance(latest, dict) else order
+    metadata = _coerce_dict((base_order or {}).get("metadata"))
+    changed = False
+    for key, value in (fields or {}).items():
+        if value is None and key not in metadata:
+            continue
+        if metadata.get(key) != value:
+            metadata[key] = value
+            changed = True
+    if not changed:
+        return
+    try:
+        await update_order_row(order_id, {"metadata": metadata})
+    except Exception:
+        pass
+
+
 # ============================================================================
 # 订单创建（Agent 调用）
 # ============================================================================
@@ -1937,6 +2424,15 @@ async def create_new_order(
         merchant = await get_merchant_onboarding(order_request.merchant_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
+
+        if _is_checkout_ui_order_create(order_request.metadata) and not order_request.quote_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "CHECKOUT_QUOTE_REQUIRED",
+                    "message": "quote_id is required for checkout_ui order creation",
+                },
+            )
 
         # Quote-first enforcement (PCS v0.2-a): dual guard to prevent bypass.
         from services.quote_first_enforcement import should_require_quote_for_order_create
@@ -3413,6 +3909,20 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
 
         pricing_quote_meta = _pricing_quote_meta_from_order(order)
         pivota_tag = _shopify_order_tag("pivota-order-id", order_id)
+        shopify_write_policy = _select_shopify_write_policy(
+            order=order,
+            pricing_quote_meta=pricing_quote_meta,
+        )
+        await _update_order_shopify_sync_metadata_best_effort(
+            order_id=order_id,
+            order=order,
+            fields={
+                "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                "representation_status": shopify_write_policy.get("representation_status"),
+                "reconciliation_status": shopify_write_policy.get("reconciliation_status"),
+            },
+        )
 
         def _token_fingerprint(token: Optional[str]) -> Optional[str]:
             if not token:
@@ -3485,29 +3995,21 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 continue
             candidates.append(s)
 
-        rest_receipt_blockers = _shopify_receipt_representation_blockers(pricing_quote_meta)
-        force_custom_line_items = bool(rest_receipt_blockers) and _pricing_quote_supports_custom_line_item_rest_encoding(
-            pricing_quote_meta
-        )
+        receipt_blockers = list(shopify_write_policy.get("receipt_blockers") or [])
 
-        # 构造 Shopify 订单数据
-        # Default path prefers variant_id for real Shopify products.
-        # For authoritative quotes that REST order-discount fields cannot faithfully express,
-        # force custom line items so Shopify receives explicit price/total_discount values.
+        # REST-safe path: prefer variant_id for real Shopify products and only apply
+        # quote snapshot price/discount overrides when the strategy explicitly stays on REST.
         line_items = []
         for item in order["items"]:
-            # Check if item has a real Shopify variant_id
             has_variant = False
-            if item.get("variant_id") and not force_custom_line_items:
+            if item.get("variant_id"):
                 try:
                     variant_id = int(item["variant_id"])
-                    # Real Shopify variant IDs are typically > 10000000000
-                    # Use variant_id for proper inventory management
                     line_item = {
                         "variant_id": variant_id,
                         "quantity": item["quantity"]
                     }
-                    if pricing_quote_meta:
+                    if pricing_quote_meta and str(shopify_write_policy.get("write_path") or "").startswith("rest"):
                         line_item = _apply_pricing_quote_line_item_overrides(
                             line_item=line_item,
                             order_item=item,
@@ -3519,7 +4021,6 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 except (ValueError, TypeError):
                     logger.warning(f"Invalid variant_id: {item.get('variant_id')}")
             
-            # Fallback to custom line item if no variant_id
             if not has_variant:
                 line_item = {
                     "title": item.get("product_title", "Product"),
@@ -3530,7 +4031,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 sku = str(item.get("sku") or "").strip()
                 if sku:
                     line_item["sku"] = sku
-                if pricing_quote_meta:
+                if pricing_quote_meta and str(shopify_write_policy.get("write_path") or "").startswith("rest"):
                     line_item = _apply_pricing_quote_line_item_overrides(
                         line_item=line_item,
                         order_item=item,
@@ -3629,13 +4130,10 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             pricing_quote_meta=pricing_quote_meta,
         )
         shopify_discount_codes = _build_shopify_order_discount_codes(pricing_quote_meta)
-        if force_custom_line_items:
+        if shopify_write_policy.get("shopify_write_strategy") != SHOPIFY_WRITE_STRATEGY_REST_SIMPLE:
             shopify_discount_codes = []
-        receipt_blockers = [] if force_custom_line_items else rest_receipt_blockers
-        send_receipt = bool(customer_email) and not receipt_blockers
+        send_receipt = bool(customer_email) and shopify_write_policy.get("receipt_policy") == SHOPIFY_RECEIPT_POLICY_SEND
         shopify_tags = ["pivota", "agent-order", pivota_tag, *discount_tags]
-        if force_custom_line_items:
-            shopify_tags.append("pivota-custom-line-items")
         shopify_shipping_lines = _build_shopify_shipping_lines(
             order=order,
             pricing_quote_meta=pricing_quote_meta,
@@ -3667,18 +4165,24 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 "tags": ",".join(shopify_tags),
             }
         }
-        if receipt_blockers:
+        if shopify_write_policy.get("receipt_policy") != SHOPIFY_RECEIPT_POLICY_SEND:
             try:
-                await log_order_event(
-                    event_type="shopify_receipt_suppressed",
+                await _log_shopify_receipt_suppressed_once(
                     order_id=order_id,
                     merchant_id=order["merchant_id"],
                     total_amount=float(order_total),
                     currency=currency_code,
                     metadata={
-                        "reason": "shopify_rest_order_cannot_faithfully_render_authoritative_quote",
+                        "reason": (
+                            "shopify_rest_order_cannot_faithfully_render_authoritative_quote"
+                            if shopify_write_policy.get("shopify_write_strategy") != SHOPIFY_WRITE_STRATEGY_REST_LEGACY_SUPPRESSED
+                            else "non_quote_snapshot_order_receipts_are_not_authoritative"
+                        ),
                         "blockers": receipt_blockers,
                         "quote_id": str(pricing_quote_meta.get("quote_id") or "").strip() or None,
+                        "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                        "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                        "representation_status": shopify_write_policy.get("representation_status"),
                     },
                 )
             except Exception:
@@ -3751,9 +4255,40 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                         "store_id": str((store_used or {}).get("store_id") or "").strip() or None,
                         "domain": shop_domain,
                         "transaction_sync": transaction_sync_result,
+                        "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                        "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                        "representation_status": shopify_write_policy.get("representation_status"),
+                    },
+                )
+                await _update_order_shopify_sync_metadata_best_effort(
+                    order_id=order_id,
+                    order=order,
+                    fields={
+                        "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                        "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                        "representation_status": shopify_write_policy.get("representation_status"),
+                        "reconciliation_status": "passed" if reconciliation.get("passed") else "failed",
                     },
                 )
                 if not reconciliation.get("passed"):
+                    if shopify_write_policy.get("receipt_policy") == SHOPIFY_RECEIPT_POLICY_SEND:
+                        try:
+                            await _log_shopify_receipt_suppressed_once(
+                                order_id=order_id,
+                                merchant_id=order["merchant_id"],
+                                total_amount=float(order_total),
+                                currency=currency_code,
+                                metadata={
+                                    "reason": "shopify_reconciliation_failed_after_write",
+                                    "blockers": reconciliation.get("mismatches") or [],
+                                    "quote_id": str(pricing_quote_meta.get("quote_id") or "").strip() or None,
+                                    "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                                    "receipt_policy": SHOPIFY_RECEIPT_POLICY_SUPPRESSED,
+                                    "representation_status": shopify_write_policy.get("representation_status"),
+                                },
+                            )
+                        except Exception:
+                            pass
                     logger.error(
                         "[Shopify] Discount reconciliation blocked order link: order_id=%s shopify_order_id=%s status=%s mismatches=%s unverified=%s",
                         order_id,
@@ -3787,6 +4322,9 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                     "store_id": store_id_used,
                     "domain": shop_domain,
                     "api_key_fp": _token_fingerprint(access_token),
+                    "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                    "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                    "representation_status": shopify_write_policy.get("representation_status"),
                 },
             )
 
@@ -3865,6 +4403,47 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                             shopify_order_payload=None,
                         )
 
+                    if shopify_write_policy.get("write_path") == "draft_order":
+                        try:
+                            draft_result = await _create_shopify_draft_order_from_quote(
+                                order_id=order_id,
+                                order=order,
+                                shop_domain=shop_domain,
+                                access_token=access_token,
+                                customer_email=customer_email,
+                                shopify_shipping=shopify_shipping,
+                                currency_code=currency_code,
+                                pricing_quote_meta=pricing_quote_meta,
+                                shopify_tags=shopify_tags,
+                                discount_note_attributes=discount_note_attributes,
+                            )
+                        except Exception as e:
+                            last_error = f"Draft Order error: {type(e).__name__}: {str(e)}"
+                            await log_order_event(
+                                event_type="shopify_draft_order_failed",
+                                order_id=order_id,
+                                merchant_id=order["merchant_id"],
+                                metadata={
+                                    "store_id": store_id,
+                                    "domain": shop_domain,
+                                    "api_key_fp": token_fp,
+                                    "error": last_error,
+                                    "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                                    "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                                    "representation_status": shopify_write_policy.get("representation_status"),
+                                },
+                            )
+                            continue
+
+                        return await _finalize_success(
+                            shopify_order_id=str(draft_result.get("shopify_order_id") or "").strip(),
+                            store_used=store,
+                            shop_domain=shop_domain,
+                            access_token=access_token,
+                            event_type="shopify_order_created",
+                            shopify_order_payload=draft_result.get("order_payload"),
+                        )
+
                     url = f"https://{shop_domain}/admin/api/2024-01/orders.json"
                     headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
 
@@ -3892,6 +4471,9 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                                     "token_refreshed": bool((token_meta or {}).get("refreshed")),
                                     "token_refresh_error": (token_meta or {}).get("refresh_error"),
                                     "error": last_error,
+                                    "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                                    "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                                    "representation_status": shopify_write_policy.get("representation_status"),
                                 },
                             )
                             return False
@@ -3926,6 +4508,9 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                                     "domain": shop_domain,
                                     "api_key_fp": token_fp,
                                     "error": error_msg,
+                                    "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                                    "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                                    "representation_status": shopify_write_policy.get("representation_status"),
                                 },
                             )
                             last_error = f"Auth failed {response.status_code}"
@@ -3946,6 +4531,9 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                                 "domain": shop_domain,
                                 "api_key_fp": token_fp,
                                 "error": error_msg,
+                                "shopify_write_strategy": shopify_write_policy.get("shopify_write_strategy"),
+                                "receipt_policy": shopify_write_policy.get("receipt_policy"),
+                                "representation_status": shopify_write_policy.get("representation_status"),
                             },
                         )
                         last_error = f"Shopify API error {response.status_code}"

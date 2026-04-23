@@ -133,6 +133,7 @@ def _install_create_new_order_harness(monkeypatch: pytest.MonkeyPatch, module) -
         "should_require_quote_for_order_create",
         fake_should_require_quote_for_order_create,
     )
+    monkeypatch.setattr(module, "ensure_database_ready", noop_async)
     monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
     monkeypatch.setattr(module, "check_inventory_availability", fake_check_inventory_availability)
     monkeypatch.setattr(module.PaymentRoutingService, "select_psp", fake_select_psp)
@@ -230,3 +231,28 @@ async def test_create_new_order_allows_platform_checkout_fallback_only_when_expl
         },
     }
     assert any(event_type == "payment_fallback_platform_checkout" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_create_new_order_checkout_ui_requires_quote_id_even_when_global_quote_requirement_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    req = _build_order_request()
+    req.metadata = {"ui_source": "checkout_ui"}
+
+    async def fake_get_merchant_onboarding(_merchant_id: str):
+        return {"merchant_id": _merchant_id, "psp_connected": True}
+
+    async def noop_async(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(module, "ensure_database_ready", noop_async)
+    monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+
+    with pytest.raises(module.HTTPException) as exc_info:
+        await module.create_new_order(req, BackgroundTasks(), current_user={})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["error"] == "CHECKOUT_QUOTE_REQUIRED"
