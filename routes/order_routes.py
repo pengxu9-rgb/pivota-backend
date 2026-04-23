@@ -1735,6 +1735,97 @@ def _apply_pricing_quote_line_item_overrides(
     return line_item
 
 
+def _pricing_quote_line_discount_total(pricing_quote_meta: Dict[str, Any]) -> Decimal:
+    if not isinstance(pricing_quote_meta, dict):
+        return Decimal("0.00")
+
+    total = Decimal("0.00")
+    for line in pricing_quote_meta.get("line_items") or []:
+        if not isinstance(line, dict):
+            continue
+        total += _money2(line.get("line_discount_total")).copy_abs()
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _pricing_quote_shipping_fee(pricing_quote_meta: Dict[str, Any], *, fallback: Any = None) -> Decimal:
+    pricing = pricing_quote_meta.get("pricing") if isinstance(pricing_quote_meta, dict) else None
+    if isinstance(pricing, dict):
+        return _money2(pricing.get("shipping_fee"))
+    return _money2(fallback)
+
+
+def _pricing_quote_supports_custom_line_item_rest_encoding(pricing_quote_meta: Dict[str, Any]) -> bool:
+    """
+    Determine whether we can faithfully encode the authoritative quote into Shopify REST
+    using custom line items plus explicit shipping_lines.
+
+    This path is intentionally conservative:
+    - every non-shipping discount must already be allocated at the line level
+    - no unverified shipping quote
+    """
+    if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
+        return False
+    if _pricing_quote_has_unverified_shipping(pricing_quote_meta):
+        return False
+
+    line_discount_total = _pricing_quote_line_discount_total(pricing_quote_meta)
+    discount_total = _pricing_quote_discount_total(pricing_quote_meta)
+    if line_discount_total <= 0 or discount_total <= 0:
+        return False
+    if line_discount_total != discount_total:
+        return False
+
+    for line in pricing_quote_meta.get("line_items") or []:
+        if not isinstance(line, dict):
+            continue
+        quantity = int(line.get("quantity") or 0)
+        unit_price_original = _money2(line.get("unit_price_original"))
+        line_discount = _money2(line.get("line_discount_total")).copy_abs()
+        if quantity <= 0 or unit_price_original <= 0:
+            return False
+        # REST custom line items only accept a total_discount value. Keep the scope narrow
+        # to shapes that can be represented without inventing order-level discount math.
+        if line_discount <= 0:
+            return False
+
+    return True
+
+
+def _shopify_shipping_line_title(pricing_quote_meta: Dict[str, Any]) -> str:
+    evidence = pricing_quote_meta.get("discount_evidence") if isinstance(pricing_quote_meta, dict) else None
+    shipping_evidence = evidence.get("shipping_evidence") if isinstance(evidence, dict) else None
+    if isinstance(shipping_evidence, dict):
+        for key in ("selected_delivery_option_title", "selected_delivery_option_name", "selected_delivery_option"):
+            raw = shipping_evidence.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+            if isinstance(raw, dict):
+                value = str(raw.get("title") or raw.get("name") or "").strip()
+                if value:
+                    return value
+    return "Shipping"
+
+
+def _build_shopify_shipping_lines(
+    *,
+    order: Dict[str, Any],
+    pricing_quote_meta: Dict[str, Any],
+    currency_code: str,
+) -> List[Dict[str, Any]]:
+    shipping_fee = _pricing_quote_shipping_fee(pricing_quote_meta, fallback=order.get("shipping_fee"))
+    if shipping_fee < 0:
+        shipping_fee = Decimal("0.00")
+
+    return [
+        {
+            "title": _shopify_shipping_line_title(pricing_quote_meta),
+            "code": "pivota_shipping",
+            "price": str(shipping_fee.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            **({"currency": currency_code} if currency_code and len(currency_code) == 3 else {}),
+        }
+    ]
+
+
 async def _fetch_shopify_order_reconciliation_payload_best_effort(
     *,
     shop_domain: str,
@@ -3418,14 +3509,20 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 continue
             candidates.append(s)
 
+        rest_receipt_blockers = _shopify_receipt_representation_blockers(pricing_quote_meta)
+        force_custom_line_items = bool(rest_receipt_blockers) and _pricing_quote_supports_custom_line_item_rest_encoding(
+            pricing_quote_meta
+        )
+
         # 构造 Shopify 订单数据
-        # Priority: Use variant_id if available (from real Shopify products)
-        # Fallback: Use title-based custom line items (for testing/manual orders)
+        # Default path prefers variant_id for real Shopify products.
+        # For authoritative quotes that REST order-discount fields cannot faithfully express,
+        # force custom line items so Shopify receives explicit price/total_discount values.
         line_items = []
         for item in order["items"]:
             # Check if item has a real Shopify variant_id
             has_variant = False
-            if item.get("variant_id"):
+            if item.get("variant_id") and not force_custom_line_items:
                 try:
                     variant_id = int(item["variant_id"])
                     # Real Shopify variant IDs are typically > 10000000000
@@ -3454,6 +3551,9 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                     "price": str(item["unit_price"]),
                     "taxable": False  # Custom items, tax already calculated
                 }
+                sku = str(item.get("sku") or "").strip()
+                if sku:
+                    line_item["sku"] = sku
                 if pricing_quote_meta:
                     line_item = _apply_pricing_quote_line_item_overrides(
                         line_item=line_item,
@@ -3553,9 +3653,18 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             pricing_quote_meta=pricing_quote_meta,
         )
         shopify_discount_codes = _build_shopify_order_discount_codes(pricing_quote_meta)
-        receipt_blockers = _shopify_receipt_representation_blockers(pricing_quote_meta)
+        if force_custom_line_items:
+            shopify_discount_codes = []
+        receipt_blockers = [] if force_custom_line_items else rest_receipt_blockers
         send_receipt = bool(customer_email) and not receipt_blockers
         shopify_tags = ["pivota", "agent-order", pivota_tag, *discount_tags]
+        if force_custom_line_items:
+            shopify_tags.append("pivota-custom-line-items")
+        shopify_shipping_lines = _build_shopify_shipping_lines(
+            order=order,
+            pricing_quote_meta=pricing_quote_meta,
+            currency_code=currency_code,
+        )
 
         shopify_order_data = {
             "order": {
@@ -3572,6 +3681,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 "send_receipt": send_receipt,
                 "send_fulfillment_receipt": send_receipt,
                 "line_items": line_items,
+                "shipping_lines": shopify_shipping_lines,
                 "shipping_address": shopify_shipping,
                 # Many templates reference billing_address.* for the buyer identity.
                 "billing_address": shopify_shipping,

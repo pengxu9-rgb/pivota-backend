@@ -117,6 +117,38 @@ def test_shopify_receipt_is_suppressed_when_quote_has_unrenderable_discount_shap
     ) is False
 
 
+def test_pricing_quote_supports_custom_line_item_rest_encoding_when_discount_is_fully_line_allocated():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["pricing"]["shipping_fee"] = "0.00"
+    pricing_quote_meta["discount_evidence"]["applications"].append(
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "amount": "-8.00",
+        }
+    )
+
+    assert order_routes._pricing_quote_supports_custom_line_item_rest_encoding(pricing_quote_meta) is True
+
+
+def test_pricing_quote_rejects_custom_line_item_rest_encoding_when_discount_has_unallocated_remainder():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["pricing"]["discount_total"] = "13.00"
+    pricing_quote_meta["discount_evidence"]["applications"].append(
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "amount": "-8.00",
+        }
+    )
+
+    assert order_routes._pricing_quote_supports_custom_line_item_rest_encoding(pricing_quote_meta) is False
+
+
 def test_apply_pricing_quote_line_item_overrides_sets_price_and_total_discount():
     line_item = {"variant_id": 123, "quantity": 1}
     order_item = {"product_id": "prod_1", "variant_id": "var_1", "quantity": 1}
