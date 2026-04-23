@@ -352,6 +352,7 @@ async def _load_replayable_agent_order_create_response(
             idempotency_key=getattr(order_request, "idempotency_key", None),
             quote_id=getattr(order_request, "quote_id", None),
             agent_session_id=getattr(order_request, "agent_session_id", None),
+            preferred_psp=getattr(order_request, "preferred_psp", None),
         )
     except Exception:
         return None

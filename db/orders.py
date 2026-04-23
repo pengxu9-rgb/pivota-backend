@@ -297,6 +297,7 @@ async def find_replayable_order_for_create(
     idempotency_key: Optional[str] = None,
     quote_id: Optional[str] = None,
     agent_session_id: Optional[str] = None,
+    preferred_psp: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Find the most recent order that is safe to replay for order-create recovery.
@@ -310,6 +311,25 @@ async def find_replayable_order_for_create(
     if not merchant_id:
         return None
 
+    def _normalize_preferred_psp(value: Optional[str]) -> Optional[str]:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return None
+        if normalized == "stripe_checkout":
+            return "stripe"
+        return normalized
+
+    def _replay_matches_preferred_psp(row: Dict[str, Any], preferred: Optional[str]) -> bool:
+        if not preferred:
+            return True
+        actual = _normalize_preferred_psp(
+            (row or {}).get("psp_used")
+            or ((row or {}).get("metadata") or {}).get("preferred_psp")
+            or ((row or {}).get("metadata") or {}).get("selected_psp")
+        )
+        return actual == preferred
+
+    normalized_preferred_psp = _normalize_preferred_psp(preferred_psp)
     candidate_queries = []
     if idempotency_key:
         candidate_queries.append(
@@ -324,6 +344,7 @@ async def find_replayable_order_for_create(
                 LIMIT 1
                 """,
                 str(idempotency_key).strip(),
+                "idempotency_key",
             )
         )
     if quote_id:
@@ -339,6 +360,7 @@ async def find_replayable_order_for_create(
                 LIMIT 1
                 """,
                 str(quote_id).strip(),
+                "quote_id",
             )
         )
     if agent_session_id:
@@ -354,10 +376,11 @@ async def find_replayable_order_for_create(
                 LIMIT 1
                 """,
                 str(agent_session_id).strip(),
+                "agent_session_id",
             )
         )
 
-    for query, match_value in candidate_queries:
+    for query, match_value, replay_scope in candidate_queries:
         if not match_value:
             continue
         row = await database.fetch_one(
@@ -365,7 +388,13 @@ async def find_replayable_order_for_create(
             {"merchant_id": merchant_id, "match_value": match_value},
         )
         if row:
-            return dict(row)
+            row_dict = dict(row)
+            if replay_scope != "idempotency_key" and not _replay_matches_preferred_psp(
+                row_dict,
+                normalized_preferred_psp,
+            ):
+                continue
+            return row_dict
     return None
 
 
