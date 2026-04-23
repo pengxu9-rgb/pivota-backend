@@ -188,6 +188,7 @@ from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_route
 from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
 from routes.employee_agent_mgmt import router as employee_agent_mgmt_router
 from routes.employee_products import router as employee_products_router
+from routes.employee_pdp_governance import router as employee_pdp_governance_router
 from routes.employee_content import router as employee_content_router
 from routes.employee_kb_monitoring import router as employee_kb_monitoring_router
 from routes.employee_agents_management import router as employee_agents_management_router
@@ -261,6 +262,7 @@ from routes.agent_keys import router as agent_keys_router
 from routes.agent_webhooks import router as agent_webhooks_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.merchant_products import router as merchant_products_router
+from routes.merchant_pdp import router as merchant_pdp_router
 from routes.product_quality_routes import router as product_quality_router
 from routes.product_enrichment_routes import router as product_enrichment_router
 if DEBUG_MODE:
@@ -802,6 +804,7 @@ app.include_router(init_orders_router)  # Orders initialization
 app.include_router(employee_dashboard_router)  # Employee dashboard endpoints
 app.include_router(employee_finance_router)  # Employee finance endpoints
 app.include_router(employee_products_router)  # Employee products endpoints (MVP)
+app.include_router(employee_pdp_governance_router)  # Employee PDP governance projection/review
 app.include_router(employee_kb_monitoring_router)  # Aurora KB v0 monitoring summary
 app.include_router(employees_security_router)  # Employees and security
 app.include_router(mcp_mgmt_router)  # MCP management
@@ -879,6 +882,7 @@ app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(agent_webhooks_router)  # Agent webhook management and deliveries
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
+app.include_router(merchant_pdp_router)  # Merchant PDP status and contribution APIs
 app.include_router(merchant_promotions_router)  # Merchant/agent promotions API (DB-backed)
 app.include_router(agent_promotions_router)  # Agent-facing promotions list (/agent/v1/promotions/*)
 app.include_router(merchant_risk_router)  # Internal risk APIs (disputes/returns)

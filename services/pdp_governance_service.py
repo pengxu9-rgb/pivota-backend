@@ -1,0 +1,1685 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from db.database import IS_POSTGRES, database
+from db.pdp_governance import (
+    merchant_pdp_contributions,
+    pdp_audit_log,
+    pdp_module_versions,
+    pdp_subject_index,
+)
+from db.products import products_cache
+
+
+DEFAULT_MARKET = "US"
+GPT55_REVIEW_MODEL = "gpt-5.5"
+
+REVIEW_ACTOR_HUMAN = "human_employee"
+REVIEW_ACTOR_GPT55 = "gpt55_quality_gate"
+REVIEW_ACTOR_SYSTEM = "system_policy"
+
+PDP_MODULE_KEYS: Tuple[str, ...] = (
+    "identity",
+    "copy",
+    "gallery",
+    "variants",
+    "offers",
+    "reviews",
+    "pivota_insights",
+    "external_sources",
+    "quality",
+)
+
+MACHINE_PUBLISH_MODULES = {
+    "identity",
+    "copy",
+    "variants",
+    "offers",
+    "pivota_insights",
+    "external_sources",
+    "quality",
+}
+
+HUMAN_CO_REVIEW_MODULES = {
+    "gallery",
+    "reviews",
+}
+
+HIGH_RISK_PAYLOAD_KEYS = {
+    "third_party_rights",
+    "rights_status",
+    "external_proof_badges",
+    "proof_badges",
+    "regulated_claims",
+    "merchant_dispute",
+    "review_import",
+    "featured_reviews",
+}
+
+UNSUPPORTED_CLAIM_PATTERNS = [
+    (r"\b(cure|treat|heal|prevent|diagnose|clinically proven)\b", "medical_or_regulated_claim"),
+    (r"\b(guaranteed|100%\s*guarantee|risk[- ]?free)\b", "guarantee_claim"),
+    (r"\b(best[- ]?selling|#\s*1|number\s*one|top\s*rated|viral)\b", "unverified_popularity_claim"),
+    (r"\b(limited\s*time|today\s*only|flash\s*sale|discount|free\s*shipping)\b", "promotion_or_time_sensitive_claim"),
+    (r"\b(everyone\s+loves|customers\s+love|buyers\s+say)\b", "unsupported_review_expression"),
+    (r"\b(sold\s+by\s+pivota|pivota\s+checkout|owned\s+by\s+pivota)\b", "seller_or_checkout_ownership_confusion"),
+]
+
+_TABLES_READY = False
+
+
+def parse_product_key(product_key: str) -> Tuple[str, str, str]:
+    parts = [part.strip() for part in (product_key or "").split("|")]
+    if len(parts) != 3 or not all(parts):
+        raise ValueError("INVALID_PRODUCT_KEY")
+    return parts[0], parts[1], parts[2]
+
+
+def is_external_seed_product_key(product_key: str) -> bool:
+    try:
+        merchant_id, platform, _ = parse_product_key(product_key)
+    except ValueError:
+        return False
+    return merchant_id == "external_seed" and platform == "external"
+
+
+def make_pdp_id(subject_type: str, subject_ref: str, market: str = DEFAULT_MARKET) -> str:
+    raw = f"{market.strip().upper()}|{subject_type.strip().lower()}|{subject_ref.strip()}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"pdp_{digest}"
+
+
+def module_requires_human_review(module_key: str, payload: Optional[Dict[str, Any]] = None) -> bool:
+    if module_key in HUMAN_CO_REVIEW_MODULES:
+        return True
+    payload = payload if isinstance(payload, dict) else {}
+    if module_key == "gallery":
+        return True
+    if module_key == "pivota_insights":
+        external_badges = payload.get("external_proof_badges") or payload.get("proof_badges")
+        if external_badges and not payload.get("seller_grounded_only"):
+            return True
+    return any(key in payload and payload.get(key) not in (None, "", [], {}) for key in HIGH_RISK_PAYLOAD_KEYS)
+
+
+def module_risk_level(module_key: str, payload: Optional[Dict[str, Any]] = None) -> str:
+    if module_requires_human_review(module_key, payload):
+        return "high"
+    if module_key in {"pivota_insights", "quality"}:
+        return "medium"
+    return "low"
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    iso = getattr(value, "isoformat", None)
+    if callable(iso):
+        try:
+            return iso()
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _json(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return value
+    return value
+
+
+def _json_dict(value: Any) -> Dict[str, Any]:
+    parsed = _json(value)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_list(value: Any) -> List[Any]:
+    parsed = _json(value)
+    return parsed if isinstance(parsed, list) else []
+
+
+def _row_dict(row: Any) -> Dict[str, Any]:
+    return dict(row) if row else {}
+
+
+def _text_blob(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _extract_product_summary(product_data: Dict[str, Any]) -> Dict[str, Any]:
+    title = (
+        product_data.get("title")
+        or product_data.get("name")
+        or product_data.get("product_title")
+        or product_data.get("display_name")
+    )
+    description = (
+        product_data.get("description_text")
+        or product_data.get("description")
+        or product_data.get("body_html")
+        or product_data.get("summary")
+    )
+    images = product_data.get("images")
+    if isinstance(images, list):
+        image_url = product_data.get("image_url") or product_data.get("main_image_url") or (images[0] if images else None)
+    else:
+        image_url = product_data.get("image_url") or product_data.get("main_image_url")
+    variants = product_data.get("variants") if isinstance(product_data.get("variants"), list) else []
+    return {
+        "title": title,
+        "description": description,
+        "image_url": image_url,
+        "variants": variants,
+        "currency": product_data.get("currency") or product_data.get("price_currency"),
+        "price": product_data.get("price") or product_data.get("price_amount"),
+    }
+
+
+async def ensure_pdp_governance_tables() -> None:
+    global _TABLES_READY
+    if _TABLES_READY:
+        return
+
+    json_type = "JSONB" if IS_POSTGRES else "JSON"
+    now_expr = "NOW()" if IS_POSTGRES else "CURRENT_TIMESTAMP"
+    timestamp_type = "TIMESTAMPTZ" if IS_POSTGRES else "DATETIME"
+
+    await database.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS pdp_subject_index (
+          pdp_id TEXT PRIMARY KEY,
+          subject_type TEXT NOT NULL,
+          subject_ref TEXT NOT NULL,
+          market TEXT NOT NULL DEFAULT 'US',
+          product_group_id TEXT NULL,
+          external_product_id TEXT NULL,
+          representative_product_key TEXT NULL,
+          title TEXT NULL,
+          image_url TEXT NULL,
+          seller_count INTEGER NOT NULL DEFAULT 0,
+          external_only BOOLEAN NOT NULL DEFAULT FALSE,
+          status TEXT NOT NULL DEFAULT 'active',
+          created_at {timestamp_type} NOT NULL DEFAULT {now_expr},
+          updated_at {timestamp_type} NOT NULL DEFAULT {now_expr}
+        );
+        """
+    )
+    await database.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS pdp_module_versions (
+          id TEXT PRIMARY KEY,
+          pdp_id TEXT NOT NULL,
+          module_key TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          version INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL DEFAULT 'draft',
+          payload {json_type} NOT NULL,
+          source_refs {json_type} NULL,
+          review_actor_type TEXT NULL,
+          review_actor_id TEXT NULL,
+          review_model TEXT NULL,
+          review_decision TEXT NULL,
+          review_confidence DOUBLE PRECISION NULL,
+          review_rubric {json_type} NULL,
+          risk_level TEXT NOT NULL DEFAULT 'low',
+          requires_human BOOLEAN NOT NULL DEFAULT FALSE,
+          generated_by TEXT NULL,
+          generation_ref TEXT NULL,
+          created_by_employee_id TEXT NULL,
+          created_at {timestamp_type} NOT NULL DEFAULT {now_expr},
+          published_at {timestamp_type} NULL,
+          superseded_at {timestamp_type} NULL
+        );
+        """
+    )
+    await database.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS pdp_audit_log (
+          id TEXT PRIMARY KEY,
+          pdp_id TEXT NOT NULL,
+          module_key TEXT NULL,
+          action TEXT NOT NULL,
+          actor_type TEXT NOT NULL,
+          actor_id TEXT NULL,
+          details {json_type} NULL,
+          created_at {timestamp_type} NOT NULL DEFAULT {now_expr}
+        );
+        """
+    )
+    await database.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS merchant_pdp_contributions (
+          id TEXT PRIMARY KEY,
+          pdp_id TEXT NOT NULL,
+          product_key TEXT NOT NULL,
+          merchant_id TEXT NOT NULL,
+          module_key TEXT NOT NULL,
+          payload {json_type} NOT NULL,
+          notes TEXT NULL,
+          status TEXT NOT NULL DEFAULT 'submitted',
+          reviewed_by_actor_type TEXT NULL,
+          reviewed_by_actor_id TEXT NULL,
+          review_decision TEXT NULL,
+          review_notes TEXT NULL,
+          created_at {timestamp_type} NOT NULL DEFAULT {now_expr},
+          updated_at {timestamp_type} NOT NULL DEFAULT {now_expr}
+        );
+        """
+    )
+
+    index_statements = [
+        "CREATE INDEX IF NOT EXISTS idx_pdp_subject_index_subject ON pdp_subject_index(subject_type, subject_ref);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_subject_index_updated ON pdp_subject_index(updated_at);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_subject_index_market ON pdp_subject_index(market);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_module_versions_lookup ON pdp_module_versions(pdp_id, module_key, stage);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_module_versions_created ON pdp_module_versions(created_at);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_audit_log_created ON pdp_audit_log(created_at);",
+        "CREATE INDEX IF NOT EXISTS idx_merchant_pdp_contributions_status ON merchant_pdp_contributions(status, created_at);",
+    ]
+    for statement in index_statements:
+        await database.execute(statement)
+
+    _TABLES_READY = True
+
+
+async def _audit(
+    *,
+    pdp_id: str,
+    module_key: Optional[str],
+    action: str,
+    actor_type: str,
+    actor_id: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    await database.execute(
+        pdp_audit_log.insert().values(
+            id=f"audit_{uuid.uuid4().hex}",
+            pdp_id=pdp_id,
+            module_key=module_key,
+            action=action,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            details=details or {},
+            created_at=_now(),
+        )
+    )
+
+
+async def _fetch_latest_cache_row(merchant_id: str, platform: str, platform_product_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        row = await database.fetch_one(
+            products_cache.select()
+            .where(
+                (products_cache.c.merchant_id == merchant_id)
+                & (products_cache.c.platform == platform)
+                & (products_cache.c.platform_product_id == platform_product_id)
+            )
+            .order_by(products_cache.c.cached_at.desc(), products_cache.c.id.desc())
+            .limit(1)
+        )
+    except Exception:
+        return None
+    return _row_dict(row) if row else None
+
+
+async def _resolve_product_group(merchant_id: str, platform: str, platform_product_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT product_group_id
+            FROM product_group_members
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND platform_product_id = :platform_product_id
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+            },
+        )
+    except Exception:
+        return None
+    if not row or not row["product_group_id"]:
+        return None
+
+    product_group_id = str(row["product_group_id"])
+    try:
+        count_row = await database.fetch_one(
+            """
+            SELECT COUNT(DISTINCT merchant_id) AS seller_count
+            FROM product_group_members
+            WHERE product_group_id = :product_group_id
+            """,
+            {"product_group_id": product_group_id},
+        )
+        count_data = _row_dict(count_row)
+        seller_count = int(count_data.get("seller_count") or 0)
+    except Exception:
+        seller_count = 0
+
+    try:
+        primary = await database.fetch_one(
+            """
+            SELECT merchant_id, platform, platform_product_id
+            FROM product_group_members
+            WHERE product_group_id = :product_group_id
+            ORDER BY is_primary DESC, updated_at DESC
+            LIMIT 1
+            """,
+            {"product_group_id": product_group_id},
+        )
+    except Exception:
+        primary = None
+
+    return {
+        "product_group_id": product_group_id,
+        "seller_count": max(1, seller_count),
+        "representative_product_key": (
+            f"{primary['merchant_id']}|{primary['platform']}|{primary['platform_product_id']}"
+            if primary
+            else f"{merchant_id}|{platform}|{platform_product_id}"
+        ),
+    }
+
+
+async def _fetch_external_seed_by_product_id(external_product_id: str, market: str) -> Optional[Dict[str, Any]]:
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT *
+            FROM external_product_seeds
+            WHERE external_product_id = :external_product_id
+              AND market = :market
+              AND status = 'active'
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            {"external_product_id": external_product_id, "market": market},
+        )
+    except Exception:
+        return None
+    return _row_dict(row) if row else None
+
+
+async def _fetch_external_seed_by_id(seed_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        row = await database.fetch_one(
+            "SELECT * FROM external_product_seeds WHERE id = :id LIMIT 1",
+            {"id": seed_id},
+        )
+    except Exception:
+        return None
+    return _row_dict(row) if row else None
+
+
+async def _upsert_subject(subject: Dict[str, Any]) -> Dict[str, Any]:
+    existing = await database.fetch_one(
+        "SELECT * FROM pdp_subject_index WHERE pdp_id = :pdp_id",
+        {"pdp_id": subject["pdp_id"]},
+    )
+    row_values = {
+        "pdp_id": subject["pdp_id"],
+        "subject_type": subject["subject_type"],
+        "subject_ref": subject["subject_ref"],
+        "market": subject.get("market") or DEFAULT_MARKET,
+        "product_group_id": subject.get("product_group_id"),
+        "external_product_id": subject.get("external_product_id"),
+        "representative_product_key": subject.get("representative_product_key"),
+        "title": subject.get("title"),
+        "image_url": subject.get("image_url"),
+        "seller_count": int(subject.get("seller_count") or 0),
+        "external_only": bool(subject.get("external_only")),
+        "status": subject.get("status") or "active",
+    }
+    now = _now()
+    if existing:
+        await database.execute(
+            pdp_subject_index.update()
+            .where(pdp_subject_index.c.pdp_id == subject["pdp_id"])
+            .values(**row_values, updated_at=now)
+        )
+    else:
+        await database.execute(
+            pdp_subject_index.insert().values(**row_values, created_at=now, updated_at=now)
+        )
+        await _audit(
+            pdp_id=subject["pdp_id"],
+            module_key=None,
+            action="pdp_subject_created",
+            actor_type=REVIEW_ACTOR_SYSTEM,
+            details={"subject_type": subject["subject_type"], "subject_ref": subject["subject_ref"]},
+        )
+    latest = await database.fetch_one("SELECT * FROM pdp_subject_index WHERE pdp_id = :pdp_id", {"pdp_id": subject["pdp_id"]})
+    return _serialize_subject(_row_dict(latest))
+
+
+async def resolve_pdp_subject(
+    *,
+    pdp_id: Optional[str] = None,
+    product_key: Optional[str] = None,
+    external_seed_id: Optional[str] = None,
+    market: str = DEFAULT_MARKET,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    market = (market or DEFAULT_MARKET).strip().upper()
+
+    if pdp_id:
+        row = await database.fetch_one("SELECT * FROM pdp_subject_index WHERE pdp_id = :pdp_id", {"pdp_id": pdp_id})
+        if not row:
+            raise LookupError("PDP_NOT_FOUND")
+        return _serialize_subject(_row_dict(row))
+
+    if external_seed_id:
+        seed = await _fetch_external_seed_by_id(external_seed_id)
+        if not seed:
+            raise LookupError("EXTERNAL_SEED_NOT_FOUND")
+        external_product_id = str(seed.get("external_product_id") or seed.get("id"))
+        subject = _subject_from_external_seed(seed, external_product_id=external_product_id, market=market)
+        return await _upsert_subject(subject)
+
+    if not product_key:
+        raise ValueError("PDP_RESOLUTION_REQUIRES_PRODUCT_KEY_OR_SEED")
+
+    merchant_id, platform, platform_product_id = parse_product_key(product_key)
+    if merchant_id == "external_seed" and platform == "external":
+        seed = await _fetch_external_seed_by_product_id(platform_product_id, market)
+        if seed:
+            subject = _subject_from_external_seed(seed, external_product_id=platform_product_id, market=market)
+        else:
+            subject = {
+                "pdp_id": make_pdp_id("external_product", platform_product_id, market),
+                "subject_type": "external_product",
+                "subject_ref": platform_product_id,
+                "market": market,
+                "external_product_id": platform_product_id,
+                "representative_product_key": product_key,
+                "title": platform_product_id,
+                "image_url": None,
+                "seller_count": 0,
+                "external_only": True,
+                "status": "active",
+            }
+        return await _upsert_subject(subject)
+
+    product_group = await _resolve_product_group(merchant_id, platform, platform_product_id)
+    cache_row = await _fetch_latest_cache_row(merchant_id, platform, platform_product_id)
+    product_data = _json_dict(cache_row.get("product_data")) if cache_row else {}
+    summary = _extract_product_summary(product_data)
+
+    if product_group:
+        subject_type = "product_group"
+        subject_ref = product_group["product_group_id"]
+        pdp_ref_id = product_group["product_group_id"]
+        representative_product_key = product_group.get("representative_product_key") or product_key
+        seller_count = int(product_group.get("seller_count") or 1)
+        product_group_id = product_group["product_group_id"]
+    else:
+        subject_type = "merchant_product"
+        subject_ref = product_key
+        pdp_ref_id = product_key
+        representative_product_key = product_key
+        seller_count = 1
+        product_group_id = None
+
+    subject = {
+        "pdp_id": make_pdp_id(subject_type, pdp_ref_id, market),
+        "subject_type": subject_type,
+        "subject_ref": subject_ref,
+        "market": market,
+        "product_group_id": product_group_id,
+        "external_product_id": None,
+        "representative_product_key": representative_product_key,
+        "title": summary.get("title") or platform_product_id,
+        "image_url": summary.get("image_url"),
+        "seller_count": seller_count,
+        "external_only": False,
+        "status": "active",
+    }
+    return await _upsert_subject(subject)
+
+
+def _subject_from_external_seed(seed: Dict[str, Any], *, external_product_id: str, market: str) -> Dict[str, Any]:
+    return {
+        "pdp_id": make_pdp_id("external_product", external_product_id, market),
+        "subject_type": "external_product",
+        "subject_ref": external_product_id,
+        "market": market,
+        "product_group_id": None,
+        "external_product_id": external_product_id,
+        "representative_product_key": f"external_seed|external|{external_product_id}",
+        "title": seed.get("title") or external_product_id,
+        "image_url": seed.get("image_url"),
+        "seller_count": 0,
+        "external_only": True,
+        "status": "active",
+    }
+
+
+def _serialize_subject(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "pdp_id": row.get("pdp_id"),
+        "subject_type": row.get("subject_type"),
+        "subject_ref": row.get("subject_ref"),
+        "market": row.get("market") or DEFAULT_MARKET,
+        "product_group_id": row.get("product_group_id"),
+        "external_product_id": row.get("external_product_id"),
+        "representative_product_key": row.get("representative_product_key"),
+        "title": row.get("title"),
+        "image_url": row.get("image_url"),
+        "seller_count": int(row.get("seller_count") or 0),
+        "external_only": bool(row.get("external_only")),
+        "status": row.get("status") or "active",
+        "created_at": _iso(row.get("created_at")),
+        "updated_at": _iso(row.get("updated_at")),
+    }
+
+
+async def _representative_product_data(subject: Dict[str, Any]) -> Dict[str, Any]:
+    product_key = subject.get("representative_product_key")
+    if not product_key or is_external_seed_product_key(product_key):
+        return {}
+    try:
+        merchant_id, platform, platform_product_id = parse_product_key(product_key)
+    except ValueError:
+        return {}
+    row = await _fetch_latest_cache_row(merchant_id, platform, platform_product_id)
+    return _json_dict(row.get("product_data")) if row else {}
+
+
+async def _external_seed_payload(subject: Dict[str, Any]) -> Dict[str, Any]:
+    external_product_id = subject.get("external_product_id")
+    if not external_product_id:
+        return {}
+    seed = await _fetch_external_seed_by_product_id(str(external_product_id), subject.get("market") or DEFAULT_MARKET)
+    if not seed:
+        return {}
+    return {
+        "seed_id": seed.get("id"),
+        "external_product_id": external_product_id,
+        "destination_url": seed.get("destination_url"),
+        "canonical_url": seed.get("canonical_url"),
+        "domain": seed.get("domain"),
+        "title": seed.get("title"),
+        "image_url": seed.get("image_url"),
+        "availability": seed.get("availability"),
+        "disclosure_text": seed.get("disclosure_text"),
+    }
+
+
+async def _baseline_payloads(subject: Dict[str, Any]) -> Dict[str, Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+    product_data = await _representative_product_data(subject)
+    product_summary = _extract_product_summary(product_data)
+    external_seed = await _external_seed_payload(subject)
+
+    title = subject.get("title") or product_summary.get("title") or external_seed.get("title")
+    image_url = subject.get("image_url") or product_summary.get("image_url") or external_seed.get("image_url")
+    source_refs = [
+        {
+            "type": "pdp_subject",
+            "id": subject.get("pdp_id"),
+            "subject_type": subject.get("subject_type"),
+            "subject_ref": subject.get("subject_ref"),
+        }
+    ]
+    if subject.get("representative_product_key"):
+        source_refs.append({"type": "product_key", "id": subject.get("representative_product_key")})
+    if external_seed:
+        source_refs.append({"type": "external_seed", "id": external_seed.get("seed_id"), "url": external_seed.get("canonical_url") or external_seed.get("destination_url")})
+
+    return {
+        "identity": (
+            {
+                "pdp_id": subject.get("pdp_id"),
+                "title": title,
+                "image_url": image_url,
+                "market": subject.get("market") or DEFAULT_MARKET,
+                "subject_type": subject.get("subject_type"),
+                "product_group_id": subject.get("product_group_id"),
+                "external_product_id": subject.get("external_product_id"),
+                "seller_count": subject.get("seller_count") or 0,
+                "external_only": bool(subject.get("external_only")),
+            },
+            source_refs,
+        ),
+        "copy": (
+            {
+                "title": title,
+                "description": product_summary.get("description") or external_seed.get("title") or "",
+                "summary": product_summary.get("description") or "",
+                "generated_source": "baseline_projection",
+            },
+            source_refs,
+        ),
+        "variants": (
+            {
+                "variants": product_summary.get("variants") or [],
+                "variant_source": "representative_product" if product_data else "external_seed",
+            },
+            source_refs,
+        ),
+        "offers": (
+            {
+                "offer_policy": "mixed_internal_external" if not subject.get("external_only") else "external_redirect_only",
+                "checkout_integrated_allowed": not bool(subject.get("external_only")),
+                "external_redirect_allowed": True,
+                "external_disclosure_required": True,
+                "representative_product_key": subject.get("representative_product_key"),
+                "external_product_id": subject.get("external_product_id"),
+            },
+            source_refs,
+        ),
+        "external_sources": (
+            {
+                "sources": [external_seed] if external_seed else [],
+                "external_only": bool(subject.get("external_only")),
+            },
+            source_refs,
+        ),
+        "quality": (
+            {
+                "status": "baseline_ready",
+                "checks": [
+                    "projection_unified",
+                    "published_payload_audited",
+                    "llm_candidate_requires_review_gate",
+                ],
+            },
+            source_refs,
+        ),
+    }
+
+
+async def ensure_baseline_modules(subject: Dict[str, Any]) -> None:
+    payloads = await _baseline_payloads(subject)
+    for module_key, (payload, source_refs) in payloads.items():
+        current = await _current_published_version(subject["pdp_id"], module_key)
+        if current:
+            continue
+        version_id = f"pdpmod_{uuid.uuid4().hex}"
+        await database.execute(
+            pdp_module_versions.insert().values(
+                id=version_id,
+                pdp_id=subject["pdp_id"],
+                module_key=module_key,
+                stage="published",
+                version=1,
+                status="published",
+                payload=payload,
+                source_refs=source_refs,
+                review_actor_type=REVIEW_ACTOR_SYSTEM,
+                review_actor_id="baseline_projection",
+                review_model=None,
+                review_decision="pass",
+                review_confidence=1.0,
+                review_rubric={"policy": "system_baseline", "reason": "Low-risk deterministic baseline projection."},
+                risk_level=module_risk_level(module_key, payload),
+                requires_human=False,
+                generated_by="system_baseline",
+                generation_ref=None,
+                created_by_employee_id=None,
+                created_at=_now(),
+                published_at=_now(),
+                superseded_at=None,
+            )
+        )
+        await _audit(
+            pdp_id=subject["pdp_id"],
+            module_key=module_key,
+            action="module_baseline_published",
+            actor_type=REVIEW_ACTOR_SYSTEM,
+            actor_id="baseline_projection",
+            details={"version_id": version_id},
+        )
+
+
+async def _current_published_version(pdp_id: str, module_key: str) -> Optional[Dict[str, Any]]:
+    row = await database.fetch_one(
+        """
+        SELECT *
+        FROM pdp_module_versions
+        WHERE pdp_id = :pdp_id
+          AND module_key = :module_key
+          AND stage = 'published'
+          AND status = 'published'
+          AND superseded_at IS NULL
+        ORDER BY version DESC, created_at DESC
+        LIMIT 1
+        """,
+        {"pdp_id": pdp_id, "module_key": module_key},
+    )
+    return _serialize_module(row) if row else None
+
+
+async def _latest_staged_version(pdp_id: str, module_key: str) -> Optional[Dict[str, Any]]:
+    row = await database.fetch_one(
+        """
+        SELECT *
+        FROM pdp_module_versions
+        WHERE pdp_id = :pdp_id
+          AND module_key = :module_key
+          AND stage = 'staged'
+          AND superseded_at IS NULL
+        ORDER BY version DESC, created_at DESC
+        LIMIT 1
+        """,
+        {"pdp_id": pdp_id, "module_key": module_key},
+    )
+    return _serialize_module(row) if row else None
+
+
+async def _module_history(pdp_id: str, module_key: str) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT *
+        FROM pdp_module_versions
+        WHERE pdp_id = :pdp_id
+          AND module_key = :module_key
+        ORDER BY version DESC, created_at DESC
+        LIMIT 20
+        """,
+        {"pdp_id": pdp_id, "module_key": module_key},
+    )
+    return [_serialize_module(row) for row in rows]
+
+
+def _serialize_module(row: Any) -> Dict[str, Any]:
+    data = _row_dict(row)
+    if not data:
+        return {}
+    return {
+        "id": data.get("id"),
+        "pdp_id": data.get("pdp_id"),
+        "module_key": data.get("module_key"),
+        "stage": data.get("stage"),
+        "version": int(data.get("version") or 0),
+        "status": data.get("status"),
+        "payload": _json(data.get("payload")) or {},
+        "published_payload": (_json(data.get("payload")) or {}) if data.get("stage") == "published" and data.get("status") == "published" else None,
+        "source_refs": _json(data.get("source_refs")) or [],
+        "review_actor_type": data.get("review_actor_type"),
+        "review_actor_id": data.get("review_actor_id"),
+        "review_model": data.get("review_model"),
+        "review_decision": data.get("review_decision"),
+        "review_confidence": data.get("review_confidence"),
+        "review_rubric": _json(data.get("review_rubric")) or {},
+        "risk_level": data.get("risk_level") or "low",
+        "requires_human": bool(data.get("requires_human")),
+        "generated_by": data.get("generated_by"),
+        "generation_ref": data.get("generation_ref"),
+        "created_by_employee_id": data.get("created_by_employee_id"),
+        "created_at": _iso(data.get("created_at")),
+        "published_at": _iso(data.get("published_at")),
+        "superseded_at": _iso(data.get("superseded_at")),
+        "last_reviewer": {
+            "actor_type": data.get("review_actor_type"),
+            "actor_id": data.get("review_actor_id"),
+            "model": data.get("review_model"),
+        }
+        if data.get("review_actor_type")
+        else None,
+    }
+
+
+def _empty_module_summary(module_key: str) -> Dict[str, Any]:
+    requires_human = module_key in HUMAN_CO_REVIEW_MODULES
+    return {
+        "module_key": module_key,
+        "status": "needs_human_review" if requires_human else "not_started",
+        "risk_level": "high" if requires_human else "low",
+        "requires_human": requires_human,
+        "current": None,
+        "staged": None,
+        "published_payload": None,
+        "source_refs": [],
+        "last_reviewer": None,
+        "review_actor_type": None,
+        "review_decision": None,
+    }
+
+
+async def get_pdp_projection(
+    *,
+    pdp_id: Optional[str] = None,
+    product_key: Optional[str] = None,
+    external_seed_id: Optional[str] = None,
+    market: str = DEFAULT_MARKET,
+) -> Dict[str, Any]:
+    subject = await resolve_pdp_subject(
+        pdp_id=pdp_id,
+        product_key=product_key,
+        external_seed_id=external_seed_id,
+        market=market,
+    )
+    await ensure_baseline_modules(subject)
+    baseline_refs = (await _baseline_payloads(subject)).get("identity", ({}, []))[1]
+
+    modules: List[Dict[str, Any]] = []
+    for module_key in PDP_MODULE_KEYS:
+        current = await _current_published_version(subject["pdp_id"], module_key)
+        staged = await _latest_staged_version(subject["pdp_id"], module_key)
+        history = await _module_history(subject["pdp_id"], module_key)
+        if not current and not staged:
+            empty = _empty_module_summary(module_key)
+            empty["history"] = history
+            empty["source_refs"] = baseline_refs
+            modules.append(empty)
+            continue
+        active = staged or current
+        modules.append(
+            {
+                "module_key": module_key,
+                "status": (staged or current or {}).get("status") or "not_started",
+                "risk_level": (active or {}).get("risk_level") or module_risk_level(module_key),
+                "requires_human": bool((active or {}).get("requires_human") or module_key in HUMAN_CO_REVIEW_MODULES),
+                "current": current,
+                "staged": staged,
+                "published_payload": current.get("published_payload") if current else None,
+                "source_refs": (active or {}).get("source_refs") or [],
+                "last_reviewer": (current or staged or {}).get("last_reviewer"),
+                "review_actor_type": (current or staged or {}).get("review_actor_type"),
+                "review_decision": (current or staged or {}).get("review_decision"),
+                "history": history,
+            }
+        )
+
+    activity_rows = await database.fetch_all(
+        """
+        SELECT *
+        FROM pdp_audit_log
+        WHERE pdp_id = :pdp_id
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        {"pdp_id": subject["pdp_id"]},
+    )
+    activity = [
+        {
+            "id": row["id"],
+            "module_key": row["module_key"],
+            "action": row["action"],
+            "actor_type": row["actor_type"],
+            "actor_id": row["actor_id"],
+            "details": _json(row["details"]) or {},
+            "created_at": _iso(row["created_at"]),
+        }
+        for row in activity_rows
+    ]
+
+    return {
+        "status": "success",
+        "pdp": subject,
+        "modules": modules,
+        "published_payload": {
+            module["module_key"]: module["published_payload"]
+            for module in modules
+            if module.get("published_payload") is not None
+        },
+        "activity": activity,
+    }
+
+
+async def list_pdp_subjects(
+    *,
+    module_status: Optional[str] = None,
+    review_actor: Optional[str] = None,
+    risk: Optional[str] = None,
+    external_only: Optional[bool] = None,
+    market: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    await seed_recent_pdp_subjects(limit=limit)
+    clauses = ["1 = 1"]
+    params: Dict[str, Any] = {"limit": max(1, min(limit, 200))}
+    if external_only is not None:
+        clauses.append("external_only = :external_only")
+        params["external_only"] = external_only
+    if market:
+        clauses.append("market = :market")
+        params["market"] = market.strip().upper()
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT *
+        FROM pdp_subject_index
+        WHERE {' AND '.join(clauses)}
+        ORDER BY updated_at DESC
+        LIMIT :limit
+        """,
+        params,
+    )
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        subject = _serialize_subject(_row_dict(row))
+        projection = await get_pdp_projection(pdp_id=subject["pdp_id"])
+        modules = projection["modules"]
+        if module_status and not any(module.get("status") == module_status for module in modules):
+            continue
+        if review_actor and not any(module.get("review_actor_type") == review_actor for module in modules):
+            continue
+        if risk and not any(module.get("risk_level") == risk for module in modules):
+            continue
+        items.append(
+            {
+                **subject,
+                "modules": [
+                    {
+                        "module_key": module["module_key"],
+                        "status": module["status"],
+                        "risk_level": module["risk_level"],
+                        "requires_human": module["requires_human"],
+                        "review_actor_type": module["review_actor_type"],
+                        "review_decision": module["review_decision"],
+                    }
+                    for module in modules
+                ],
+            }
+        )
+    return {"status": "success", "items": items, "count": len(items)}
+
+
+async def seed_recent_pdp_subjects(limit: int = 50) -> None:
+    """Best-effort dashboard hydration from existing product groups and external seeds."""
+    safe_limit = max(1, min(limit, 200))
+    try:
+        groups = await database.fetch_all(
+            """
+            SELECT product_group_id,
+                   COUNT(DISTINCT merchant_id) AS seller_count,
+                   MAX(updated_at) AS updated_at
+            FROM product_group_members
+            WHERE product_group_id IS NOT NULL
+            GROUP BY product_group_id
+            ORDER BY MAX(updated_at) DESC
+            LIMIT :limit
+            """,
+            {"limit": safe_limit},
+        )
+    except Exception:
+        groups = []
+
+    for group in groups or []:
+        group_data = _row_dict(group)
+        product_group_id = str(group_data.get("product_group_id") or "")
+        if not product_group_id:
+            continue
+        try:
+            primary = await database.fetch_one(
+                """
+                SELECT merchant_id, platform, platform_product_id
+                FROM product_group_members
+                WHERE product_group_id = :product_group_id
+                ORDER BY is_primary DESC, updated_at DESC
+                LIMIT 1
+                """,
+                {"product_group_id": product_group_id},
+            )
+        except Exception:
+            primary = None
+        if not primary:
+            continue
+        representative_product_key = f"{primary['merchant_id']}|{primary['platform']}|{primary['platform_product_id']}"
+        product_data = {}
+        try:
+            cache_row = await _fetch_latest_cache_row(
+                str(primary["merchant_id"]),
+                str(primary["platform"]),
+                str(primary["platform_product_id"]),
+            )
+            product_data = _json_dict(cache_row.get("product_data")) if cache_row else {}
+        except Exception:
+            product_data = {}
+        summary = _extract_product_summary(product_data)
+        try:
+            await _upsert_subject(
+                {
+                    "pdp_id": make_pdp_id("product_group", product_group_id, DEFAULT_MARKET),
+                    "subject_type": "product_group",
+                    "subject_ref": product_group_id,
+                    "market": DEFAULT_MARKET,
+                    "product_group_id": product_group_id,
+                    "external_product_id": None,
+                    "representative_product_key": representative_product_key,
+                    "title": summary.get("title") or product_group_id,
+                    "image_url": summary.get("image_url"),
+                    "seller_count": int(group_data.get("seller_count") or 1),
+                    "external_only": False,
+                    "status": "active",
+                }
+            )
+        except Exception:
+            continue
+
+    try:
+        external_rows = await database.fetch_all(
+            """
+            SELECT *
+            FROM external_product_seeds
+            WHERE external_product_id IS NOT NULL
+              AND status = 'active'
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """,
+            {"limit": safe_limit},
+        )
+    except Exception:
+        external_rows = []
+
+    for seed in external_rows or []:
+        seed_data = _row_dict(seed)
+        external_product_id = str(seed_data.get("external_product_id") or seed_data.get("id") or "")
+        if not external_product_id:
+            continue
+        try:
+            await _upsert_subject(
+                _subject_from_external_seed(
+                    seed_data,
+                    external_product_id=external_product_id,
+                    market=str(seed_data.get("market") or DEFAULT_MARKET).upper(),
+                )
+            )
+        except Exception:
+            continue
+
+
+async def _next_module_version(pdp_id: str, module_key: str) -> int:
+    row = await database.fetch_one(
+        """
+        SELECT MAX(version) AS max_version
+        FROM pdp_module_versions
+        WHERE pdp_id = :pdp_id AND module_key = :module_key
+        """,
+        {"pdp_id": pdp_id, "module_key": module_key},
+    )
+    data = _row_dict(row)
+    return int(data.get("max_version") or 0) + 1
+
+
+def _validate_module_key(module_key: str) -> None:
+    if module_key not in PDP_MODULE_KEYS:
+        raise ValueError("INVALID_PDP_MODULE")
+
+
+async def create_module_draft(
+    *,
+    pdp_id: str,
+    module_key: str,
+    payload: Dict[str, Any],
+    source_refs: Optional[List[Dict[str, Any]]] = None,
+    generated_by: Optional[str] = None,
+    generation_ref: Optional[str] = None,
+    actor_type: str = REVIEW_ACTOR_HUMAN,
+    actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    _validate_module_key(module_key)
+    subject = await resolve_pdp_subject(pdp_id=pdp_id)
+    payload = payload if isinstance(payload, dict) else {}
+    source_refs = source_refs if isinstance(source_refs, list) else []
+    version = await _next_module_version(subject["pdp_id"], module_key)
+    requires_human = module_requires_human_review(module_key, payload)
+    row = {
+        "id": f"pdpmod_{uuid.uuid4().hex}",
+        "pdp_id": subject["pdp_id"],
+        "module_key": module_key,
+        "stage": "staged",
+        "version": version,
+        "status": "needs_human_review" if requires_human else "draft",
+        "payload": payload,
+        "source_refs": source_refs,
+        "review_actor_type": None,
+        "review_actor_id": None,
+        "review_model": None,
+        "review_decision": None,
+        "review_confidence": None,
+        "review_rubric": None,
+        "risk_level": module_risk_level(module_key, payload),
+        "requires_human": requires_human,
+        "generated_by": generated_by,
+        "generation_ref": generation_ref,
+        "created_by_employee_id": actor_id if actor_type == REVIEW_ACTOR_HUMAN else None,
+        "created_at": _now(),
+        "published_at": None,
+        "superseded_at": None,
+    }
+    await database.execute(pdp_module_versions.insert().values(**row))
+    await _audit(
+        pdp_id=subject["pdp_id"],
+        module_key=module_key,
+        action="module_draft_created",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        details={"version_id": row["id"], "generated_by": generated_by},
+    )
+    return _serialize_module(row)
+
+
+def run_gpt55_quality_gate(
+    *,
+    module_key: str,
+    payload: Dict[str, Any],
+    source_refs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    _validate_module_key(module_key)
+    payload = payload if isinstance(payload, dict) else {}
+    source_refs = source_refs if isinstance(source_refs, list) else []
+    reasons: List[str] = []
+    checks: Dict[str, Any] = {
+        "source_grounded": bool(source_refs),
+        "seller_entity_checkout_not_confused": True,
+        "variant_market_consistent": True,
+        "no_medical_regulated_promo_or_fake_review_claim": True,
+        "machine_publish_allowed_module": module_key in MACHINE_PUBLISH_MODULES,
+    }
+
+    text = _text_blob(payload).lower()
+    for pattern, reason in UNSUPPORTED_CLAIM_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            reasons.append(reason)
+            checks["no_medical_regulated_promo_or_fake_review_claim"] = False
+
+    if not checks["source_grounded"]:
+        reasons.append("missing_source_refs")
+
+    if module_requires_human_review(module_key, payload):
+        reasons.append("module_or_payload_requires_human_co_review")
+
+    if module_key not in MACHINE_PUBLISH_MODULES:
+        reasons.append("module_not_machine_publishable")
+
+    if any(reason in reasons for reason in {"medical_or_regulated_claim", "guarantee_claim", "unverified_popularity_claim", "promotion_or_time_sensitive_claim", "unsupported_review_expression", "seller_or_checkout_ownership_confusion"}):
+        decision = "reject"
+        confidence = 0.96
+    elif "missing_source_refs" in reasons:
+        decision = "reject"
+        confidence = 0.9
+    elif "module_or_payload_requires_human_co_review" in reasons or "module_not_machine_publishable" in reasons:
+        decision = "needs_human_review"
+        confidence = 0.92
+    else:
+        decision = "pass"
+        confidence = 0.91
+
+    return {
+        "review_actor_type": REVIEW_ACTOR_GPT55,
+        "review_model": GPT55_REVIEW_MODEL,
+        "decision": decision,
+        "confidence": confidence,
+        "reasons": reasons,
+        "checks": checks,
+        "evidence_refs": source_refs,
+    }
+
+
+def _force_codex_artifact_required(local: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    decision = "reject" if local.get("decision") == "reject" else "needs_human_review"
+    reasons = list(dict.fromkeys([*(local.get("reasons") or []), reason]))
+    return {
+        **local,
+        "decision": decision,
+        "confidence": min(float(local.get("confidence") or 0.0), 0.85) or 0.85,
+        "reasons": reasons,
+        "codex_review_artifact_required": True,
+        "local_policy_artifact": local,
+    }
+
+
+def _normalize_codex_gpt55_rubric(rubric: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(rubric, dict):
+        raise ValueError("GPT55_RUBRIC_MUST_BE_OBJECT")
+    decision = str(rubric.get("decision") or "").strip()
+    if decision not in {"pass", "reject", "needs_human_review"}:
+        raise ValueError("GPT55_RUBRIC_INVALID_DECISION")
+    confidence_raw = rubric.get("confidence")
+    try:
+        confidence = float(confidence_raw)
+    except Exception as exc:
+        raise ValueError("GPT55_RUBRIC_INVALID_CONFIDENCE") from exc
+    if confidence < 0 or confidence > 1:
+        raise ValueError("GPT55_RUBRIC_INVALID_CONFIDENCE")
+
+    reasons = rubric.get("reasons") or []
+    if not isinstance(reasons, list):
+        raise ValueError("GPT55_RUBRIC_REASONS_MUST_BE_LIST")
+
+    checks = rubric.get("checks") or {}
+    if not isinstance(checks, dict):
+        raise ValueError("GPT55_RUBRIC_CHECKS_MUST_BE_OBJECT")
+    required_checks = {
+        "source_grounded",
+        "seller_entity_checkout_not_confused",
+        "variant_market_consistent",
+        "no_medical_regulated_promo_or_fake_review_claim",
+        "machine_publish_allowed_module",
+    }
+    missing = sorted(required_checks - set(checks.keys()))
+    if missing:
+        raise ValueError(f"GPT55_RUBRIC_MISSING_CHECKS:{','.join(missing)}")
+
+    evidence_refs = rubric.get("evidence_refs") or []
+    if not isinstance(evidence_refs, list):
+        raise ValueError("GPT55_RUBRIC_EVIDENCE_REFS_MUST_BE_LIST")
+
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "reasons": [str(reason) for reason in reasons],
+        "checks": {key: bool(value) for key, value in checks.items()},
+        "evidence_refs": evidence_refs,
+        "review_notes": rubric.get("review_notes"),
+        "reviewed_in": rubric.get("reviewed_in") or "codex_external_window",
+    }
+
+
+def _merge_codex_rubric_with_local_gate(local: Dict[str, Any], codex_rubric: Dict[str, Any]) -> Dict[str, Any]:
+    decision_rank = {"pass": 0, "needs_human_review": 1, "reject": 2}
+    local_decision = str(local.get("decision") or "reject")
+    codex_decision = str(codex_rubric.get("decision") or "reject")
+    stricter_decision = local_decision
+    if decision_rank.get(codex_decision, 2) > decision_rank.get(local_decision, 2):
+        stricter_decision = codex_decision
+
+    local_reasons = [str(reason) for reason in local.get("reasons") or []]
+    codex_reasons = [str(reason) for reason in codex_rubric.get("reasons") or []]
+    reasons = list(dict.fromkeys([*local_reasons, *codex_reasons]))
+
+    local_checks = local.get("checks") if isinstance(local.get("checks"), dict) else {}
+    codex_checks = codex_rubric.get("checks") if isinstance(codex_rubric.get("checks"), dict) else {}
+    checks = {**codex_checks}
+    for key, value in local_checks.items():
+        checks[key] = bool(checks.get(key, True)) and bool(value)
+
+    if stricter_decision == local_decision and local_decision != codex_decision:
+        confidence = float(local.get("confidence") or 0.0)
+    else:
+        confidence = min(
+            float(local.get("confidence") or 0.0),
+            float(codex_rubric.get("confidence") or local.get("confidence") or 0.0),
+        ) or float(codex_rubric.get("confidence") or local.get("confidence") or 0.0)
+    return {
+        "review_actor_type": REVIEW_ACTOR_GPT55,
+        "review_model": GPT55_REVIEW_MODEL,
+        "decision": stricter_decision,
+        "confidence": confidence,
+        "reasons": reasons,
+        "checks": checks,
+        "evidence_refs": codex_rubric.get("evidence_refs") or local.get("evidence_refs") or [],
+        "codex_gpt55_artifact": {
+            "decision": codex_decision,
+            "confidence": codex_rubric.get("confidence"),
+            "reasons": codex_reasons,
+            "checks": codex_checks,
+            "review_notes": codex_rubric.get("review_notes"),
+            "reviewed_in": codex_rubric.get("reviewed_in"),
+        },
+        "local_policy_artifact": local,
+    }
+
+
+def build_codex_gpt55_quality_gate_result(
+    *,
+    module_key: str,
+    payload: Dict[str, Any],
+    source_refs: Optional[List[Dict[str, Any]]] = None,
+    external_rubric: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    local = run_gpt55_quality_gate(module_key=module_key, payload=payload, source_refs=source_refs)
+    if external_rubric is None:
+        return _force_codex_artifact_required(local, "codex_gpt55_review_artifact_required")
+    try:
+        normalized = _normalize_codex_gpt55_rubric(external_rubric)
+    except Exception as exc:
+        return _force_codex_artifact_required(local, str(exc)[:120] or "invalid_codex_gpt55_review_artifact")
+    return _merge_codex_rubric_with_local_gate(local, normalized)
+
+
+async def _fetch_module_version(pdp_id: str, module_key: str, version_id: Optional[str] = None) -> Dict[str, Any]:
+    if version_id:
+        row = await database.fetch_one(
+            """
+            SELECT *
+            FROM pdp_module_versions
+            WHERE id = :id AND pdp_id = :pdp_id AND module_key = :module_key
+            LIMIT 1
+            """,
+            {"id": version_id, "pdp_id": pdp_id, "module_key": module_key},
+        )
+    else:
+        row = await database.fetch_one(
+            """
+            SELECT *
+            FROM pdp_module_versions
+            WHERE pdp_id = :pdp_id
+              AND module_key = :module_key
+              AND stage = 'staged'
+              AND superseded_at IS NULL
+            ORDER BY version DESC, created_at DESC
+            LIMIT 1
+            """,
+            {"pdp_id": pdp_id, "module_key": module_key},
+        )
+    if not row:
+        raise LookupError("PDP_MODULE_VERSION_NOT_FOUND")
+    return _serialize_module(row)
+
+
+async def review_module_version(
+    *,
+    pdp_id: str,
+    module_key: str,
+    version_id: Optional[str] = None,
+    actor_type: str,
+    actor_id: Optional[str] = None,
+    decision: Optional[str] = None,
+    notes: Optional[str] = None,
+    external_rubric: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    _validate_module_key(module_key)
+    version = await _fetch_module_version(pdp_id, module_key, version_id)
+    payload = _json_dict(version.get("payload"))
+    source_refs = _json_list(version.get("source_refs"))
+
+    if actor_type == REVIEW_ACTOR_GPT55:
+        rubric = build_codex_gpt55_quality_gate_result(
+            module_key=module_key,
+            payload=payload,
+            source_refs=source_refs,
+            external_rubric=external_rubric,
+        )
+        review_decision = rubric["decision"]
+        confidence = rubric["confidence"]
+        actor_id = actor_id or GPT55_REVIEW_MODEL
+        review_model = GPT55_REVIEW_MODEL
+    else:
+        review_decision = decision or "needs_human_review"
+        confidence = 1.0 if review_decision == "pass" else None
+        review_model = None
+        rubric = {
+            "decision": review_decision,
+            "notes": notes,
+            "reviewer_standard": "human_employee_quality_gate",
+        }
+
+    if review_decision not in {"pass", "reject", "needs_human_review"}:
+        raise ValueError("INVALID_REVIEW_DECISION")
+
+    status = "approved" if review_decision == "pass" else review_decision
+    await database.execute(
+        pdp_module_versions.update()
+        .where(pdp_module_versions.c.id == version["id"])
+        .values(
+            status=status,
+            review_actor_type=actor_type,
+            review_actor_id=actor_id,
+            review_model=review_model,
+            review_decision=review_decision,
+            review_confidence=confidence,
+            review_rubric=rubric,
+            risk_level=module_risk_level(module_key, payload),
+            requires_human=module_requires_human_review(module_key, payload),
+        )
+    )
+    await _audit(
+        pdp_id=pdp_id,
+        module_key=module_key,
+        action="module_reviewed",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        details={"version_id": version["id"], "decision": review_decision, "notes": notes},
+    )
+
+    can_publish = review_decision == "pass" and (
+        actor_type == REVIEW_ACTOR_HUMAN
+        or (
+            actor_type == REVIEW_ACTOR_GPT55
+            and module_key in MACHINE_PUBLISH_MODULES
+            and not module_requires_human_review(module_key, payload)
+        )
+    )
+
+    if can_publish:
+        published = await publish_module_version(
+            pdp_id=pdp_id,
+            module_key=module_key,
+            version_id=version["id"],
+            actor_type=actor_type,
+            actor_id=actor_id,
+            review_model=review_model,
+            review_rubric=rubric,
+            review_confidence=confidence,
+        )
+        return {"status": "success", "decision": review_decision, "published": True, "module": published, "rubric": rubric}
+
+    return {
+        "status": "success",
+        "decision": review_decision,
+        "published": False,
+        "module": await _fetch_module_version(pdp_id, module_key, version["id"]),
+        "rubric": rubric,
+    }
+
+
+async def publish_module_version(
+    *,
+    pdp_id: str,
+    module_key: str,
+    version_id: str,
+    actor_type: str,
+    actor_id: Optional[str],
+    review_model: Optional[str] = None,
+    review_rubric: Optional[Dict[str, Any]] = None,
+    review_confidence: Optional[float] = None,
+) -> Dict[str, Any]:
+    version = await _fetch_module_version(pdp_id, module_key, version_id)
+    payload = _json_dict(version.get("payload"))
+    source_refs = _json_list(version.get("source_refs"))
+    if actor_type == REVIEW_ACTOR_GPT55 and module_requires_human_review(module_key, payload):
+        raise PermissionError("PDP_MODULE_REQUIRES_HUMAN_REVIEW")
+
+    now = _now()
+    await database.execute(
+        pdp_module_versions.update()
+        .where(
+            (pdp_module_versions.c.pdp_id == pdp_id)
+            & (pdp_module_versions.c.module_key == module_key)
+            & (pdp_module_versions.c.stage == "published")
+            & (pdp_module_versions.c.superseded_at.is_(None))
+        )
+        .values(status="superseded", superseded_at=now)
+    )
+    published_row = {
+        "id": f"pdpmod_{uuid.uuid4().hex}",
+        "pdp_id": pdp_id,
+        "module_key": module_key,
+        "stage": "published",
+        "version": await _next_module_version(pdp_id, module_key),
+        "status": "published",
+        "payload": payload,
+        "source_refs": source_refs,
+        "review_actor_type": actor_type,
+        "review_actor_id": actor_id,
+        "review_model": review_model,
+        "review_decision": "pass",
+        "review_confidence": review_confidence,
+        "review_rubric": review_rubric or {},
+        "risk_level": module_risk_level(module_key, payload),
+        "requires_human": module_requires_human_review(module_key, payload),
+        "generated_by": version.get("generated_by"),
+        "generation_ref": version.get("generation_ref"),
+        "created_by_employee_id": version.get("created_by_employee_id"),
+        "created_at": now,
+        "published_at": now,
+        "superseded_at": None,
+    }
+    await database.execute(pdp_module_versions.insert().values(**published_row))
+    await database.execute(
+        pdp_module_versions.update()
+        .where(pdp_module_versions.c.id == version_id)
+        .values(status="published_from_staged", superseded_at=now)
+    )
+    await _audit(
+        pdp_id=pdp_id,
+        module_key=module_key,
+        action="module_published",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        details={"source_version_id": version_id, "published_version_id": published_row["id"]},
+    )
+    return _serialize_module(published_row)
+
+
+async def rollback_module(
+    *,
+    pdp_id: str,
+    module_key: str,
+    target_version_id: str,
+    actor_type: str = REVIEW_ACTOR_HUMAN,
+    actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    _validate_module_key(module_key)
+    target = await _fetch_module_version(pdp_id, module_key, target_version_id)
+    if target.get("stage") != "published":
+        raise ValueError("ROLLBACK_TARGET_MUST_BE_PUBLISHED")
+    now = _now()
+    await database.execute(
+        pdp_module_versions.update()
+        .where(
+            (pdp_module_versions.c.pdp_id == pdp_id)
+            & (pdp_module_versions.c.module_key == module_key)
+            & (pdp_module_versions.c.stage == "published")
+            & (pdp_module_versions.c.superseded_at.is_(None))
+        )
+        .values(status="superseded", superseded_at=now)
+    )
+    rollback_row = {
+        "id": f"pdpmod_{uuid.uuid4().hex}",
+        "pdp_id": pdp_id,
+        "module_key": module_key,
+        "stage": "published",
+        "version": await _next_module_version(pdp_id, module_key),
+        "status": "published",
+        "payload": _json_dict(target.get("payload")),
+        "source_refs": _json_list(target.get("source_refs")),
+        "review_actor_type": actor_type,
+        "review_actor_id": actor_id,
+        "review_model": None,
+        "review_decision": "pass",
+        "review_confidence": 1.0,
+        "review_rubric": {"rollback_from_version_id": target_version_id},
+        "risk_level": target.get("risk_level") or module_risk_level(module_key, _json_dict(target.get("payload"))),
+        "requires_human": bool(target.get("requires_human")),
+        "generated_by": target.get("generated_by"),
+        "generation_ref": target.get("generation_ref"),
+        "created_by_employee_id": actor_id if actor_type == REVIEW_ACTOR_HUMAN else None,
+        "created_at": now,
+        "published_at": now,
+        "superseded_at": None,
+    }
+    await database.execute(pdp_module_versions.insert().values(**rollback_row))
+    await _audit(
+        pdp_id=pdp_id,
+        module_key=module_key,
+        action="module_rolled_back",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        details={"target_version_id": target_version_id, "published_version_id": rollback_row["id"]},
+    )
+    return _serialize_module(rollback_row)
+
+
+async def create_merchant_contribution(
+    *,
+    product_key: str,
+    merchant_id: str,
+    module_key: str,
+    payload: Dict[str, Any],
+    notes: Optional[str] = None,
+    market: str = DEFAULT_MARKET,
+) -> Dict[str, Any]:
+    _validate_module_key(module_key)
+    product_merchant_id, _, _ = parse_product_key(product_key)
+    if product_merchant_id != merchant_id:
+        raise PermissionError("MERCHANT_PRODUCT_FORBIDDEN")
+    projection = await get_pdp_projection(product_key=product_key, market=market)
+    pdp_id = projection["pdp"]["pdp_id"]
+    contribution_id = f"pdpcontrib_{uuid.uuid4().hex}"
+    now = _now()
+    await database.execute(
+        merchant_pdp_contributions.insert().values(
+            id=contribution_id,
+            pdp_id=pdp_id,
+            product_key=product_key,
+            merchant_id=merchant_id,
+            module_key=module_key,
+            payload=payload,
+            notes=notes,
+            status="submitted",
+            reviewed_by_actor_type=None,
+            reviewed_by_actor_id=None,
+            review_decision=None,
+            review_notes=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    draft = await create_module_draft(
+        pdp_id=pdp_id,
+        module_key=module_key,
+        payload=payload,
+        source_refs=[{"type": "merchant_contribution", "id": contribution_id, "product_key": product_key}],
+        generated_by="merchant_contribution",
+        generation_ref=contribution_id,
+        actor_type="merchant",
+        actor_id=merchant_id,
+    )
+    await _audit(
+        pdp_id=pdp_id,
+        module_key=module_key,
+        action="merchant_contribution_submitted",
+        actor_type="merchant",
+        actor_id=merchant_id,
+        details={"contribution_id": contribution_id, "draft_version_id": draft["id"]},
+    )
+    return {
+        "status": "success",
+        "contribution": {
+            "id": contribution_id,
+            "pdp_id": pdp_id,
+            "product_key": product_key,
+            "merchant_id": merchant_id,
+            "module_key": module_key,
+            "status": "submitted",
+            "notes": notes,
+            "created_at": _iso(now),
+        },
+        "draft": draft,
+    }
