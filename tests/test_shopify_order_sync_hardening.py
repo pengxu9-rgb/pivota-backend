@@ -542,6 +542,199 @@ async def test_create_shopify_order_suppresses_receipt_for_unrenderable_quote_di
 
 
 @pytest.mark.asyncio
+async def test_create_shopify_order_uses_custom_line_items_and_shipping_lines_for_quote_snapshot(monkeypatch):
+    import httpx
+
+    from routes import order_routes
+
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe")
+    order_id = "ORD_CUSTOM_LINE_ITEMS"
+    captured_payloads = []
+    captured_events = []
+
+    async def fake_get_order(_order_id: str):
+        assert _order_id == order_id
+        return {
+            "order_id": order_id,
+            "merchant_id": "merch_1",
+            "store_id": "store_1",
+            "payment_status": "paid",
+            "shopify_order_id": None,
+            "customer_email": "buyer@example.com",
+            "customer_name": "Buyer",
+            "shipping_address": {
+                "name": "Buyer",
+                "address_line1": "1 Main St",
+                "address_line2": "",
+                "city": "San Francisco",
+                "state": "CA",
+                "postal_code": "94105",
+                "country": "US",
+                "phone": None,
+            },
+            "items": [
+                {
+                    "product_id": "p_1",
+                    "variant_id": "123",
+                    "product_title": "Test Product",
+                    "quantity": 1,
+                    "unit_price": 1.09,
+                }
+            ],
+            "subtotal": 1.69,
+            "discount_total": 0.60,
+            "shipping_fee": 0.00,
+            "tax": 0.00,
+            "total": 1.09,
+            "currency": "USD",
+            "payment_intent_id": "CNV_ADYEN_OK",
+            "psp_used": "adyen",
+            "metadata": {
+                "pricing_quote": {
+                    "quote_id": "q_combo_encodable",
+                    "pricing": {
+                        "subtotal": "1.69",
+                        "discount_total": "0.60",
+                        "shipping_fee": "0.00",
+                        "tax": "0.00",
+                        "total": "1.09",
+                    },
+                    "line_items": [
+                        {
+                            "product_id": "p_1",
+                            "variant_id": "123",
+                            "quantity": 1,
+                            "unit_price_original": "1.69",
+                            "unit_price_effective": "1.09",
+                            "line_discount_total": "0.60",
+                        }
+                    ],
+                    "discount_evidence": {
+                        "pricing_confidence": "authoritative",
+                        "shipping_evidence": {
+                            "status": "authoritative",
+                            "selected_delivery_option_title": "Free Shipping",
+                        },
+                        "codes": [
+                            {
+                                "code": "FIX60",
+                                "applicable": True,
+                                "source": "shopify_storefront_cart",
+                            }
+                        ],
+                        "applications": [
+                            {
+                                "source": "shopify",
+                                "method": "code",
+                                "discount_class": "product",
+                                "code": "FIX60",
+                                "amount": "-0.60",
+                            },
+                            {
+                                "source": "shopify",
+                                "method": "automatic",
+                                "discount_class": "shipping",
+                                "code": None,
+                                "amount": "-8.00",
+                            },
+                        ],
+                    },
+                }
+            },
+        }
+
+    async def fake_get_merchant_onboarding(_merchant_id: str):
+        return {"merchant_id": _merchant_id, "psp_type": "adyen"}
+
+    async def fake_get_active_stores(_merchant_id: str):
+        return [
+            {
+                "store_id": "store_1",
+                "merchant_id": _merchant_id,
+                "platform": "shopify",
+                "domain": "shop.myshopify.com",
+                "api_key_raw": "good_token",
+                "api_key": "good_token",
+                "status": "active",
+                "source": "merchant_stores",
+            }
+        ]
+
+    async def fake_update_fulfillment_info(**_kwargs):
+        return True
+
+    async def fake_log_order_event(*_args, **kwargs):
+        captured_events.append(dict(kwargs))
+        return None
+
+    async def fake_shopify_admin_graphql(**_kwargs):
+        return {"orders": {"edges": []}}
+
+    async def fake_ensure_external_payment_transaction_best_effort(**_kwargs):
+        return {"ok": True, "created": False, "transaction_id": 777}
+
+    async def fake_fetch_shopify_order_reconciliation_payload_best_effort(**_kwargs):
+        return {
+            "id": 999,
+            "total_price": "1.09",
+            "total_discounts": "0.60",
+            "transactions": [{"kind": "sale", "status": "success", "amount": "1.09"}],
+        }
+
+    class DummyResponse:
+        def __init__(self, status_code: int, payload=None, text: str = ""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+            self.content = b"{}"
+
+        def json(self):
+            return self._payload
+
+    async def fake_post(self, url, **kwargs):
+        captured_payloads.append(dict(kwargs.get("json") or {}))
+        return DummyResponse(201, payload={"order": {"id": 999}}, text="201")
+
+    monkeypatch.setattr(order_routes, "get_order", fake_get_order)
+    monkeypatch.setattr(order_routes, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(order_routes, "get_merchant_active_stores", fake_get_active_stores)
+    monkeypatch.setattr(order_routes, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(order_routes, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(
+        order_routes,
+        "ensure_external_payment_transaction_best_effort",
+        fake_ensure_external_payment_transaction_best_effort,
+    )
+    monkeypatch.setattr(
+        order_routes,
+        "_fetch_shopify_order_reconciliation_payload_best_effort",
+        fake_fetch_shopify_order_reconciliation_payload_best_effort,
+    )
+
+    import services.shopify_graphql_client as gql
+
+    monkeypatch.setattr(gql, "shopify_admin_graphql", fake_shopify_admin_graphql)
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post, raising=True)
+
+    ok = await order_routes._create_shopify_order_impl(order_id)
+
+    assert ok is True
+    assert captured_payloads
+    order_payload = captured_payloads[0]["order"]
+    assert order_payload["send_receipt"] is True
+    assert order_payload["send_fulfillment_receipt"] is True
+    assert order_payload["shipping_lines"][0]["price"] == "0.00"
+    assert order_payload["shipping_lines"][0]["title"] == "Free Shipping"
+    assert order_payload["line_items"][0]["title"] == "Test Product"
+    assert "variant_id" not in order_payload["line_items"][0]
+    assert order_payload["line_items"][0]["price"] == "1.69"
+    assert order_payload["line_items"][0]["total_discount"] == "0.60"
+    assert "discount_codes" not in order_payload
+    assert "pivota-custom-line-items" in order_payload["tags"]
+    assert not any(e.get("event_type") == "shopify_receipt_suppressed" for e in captured_events)
+
+
+@pytest.mark.asyncio
 async def test_reconcile_missing_shopify_dry_run_handles_row_without_get(monkeypatch):
     from routes import order_routes
 
