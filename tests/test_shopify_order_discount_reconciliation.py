@@ -117,6 +117,58 @@ def test_shopify_receipt_is_suppressed_when_quote_has_unrenderable_discount_shap
     ) is False
 
 
+def test_select_shopify_write_policy_uses_rest_simple_for_quote_snapshot_without_blockers():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["line_items"] = []
+    pricing_quote_meta["discount_evidence"]["applications"][0]["discount_class"] = "order"
+    pricing_quote_meta["promotion_lines"][0]["discount_class"] = "order"
+
+    result = order_routes._select_shopify_write_policy(
+        order={"merchant_id": "merch_1", "metadata": {"amounts_source": "quote_snapshot"}},
+        pricing_quote_meta=pricing_quote_meta,
+    )
+
+    assert result["shopify_write_strategy"] == order_routes.SHOPIFY_WRITE_STRATEGY_REST_SIMPLE
+    assert result["receipt_policy"] == order_routes.SHOPIFY_RECEIPT_POLICY_SEND
+    assert result["representation_status"] == "rest_simple_representable"
+
+
+def test_select_shopify_write_policy_requires_draft_order_for_complex_quote_when_enabled(monkeypatch):
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["pricing"]["shipping_fee"] = "0.00"
+    pricing_quote_meta["discount_evidence"]["applications"].append(
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "amount": "-8.00",
+        }
+    )
+
+    monkeypatch.setenv("SHOPIFY_DRAFT_ORDER_QUOTE_SYNC_ENABLED", "1")
+
+    result = order_routes._select_shopify_write_policy(
+        order={"merchant_id": "merch_1", "metadata": {"amounts_source": "quote_snapshot"}},
+        pricing_quote_meta=pricing_quote_meta,
+    )
+
+    assert result["shopify_write_strategy"] == order_routes.SHOPIFY_WRITE_STRATEGY_DRAFT_ORDER_QUOTE
+    assert result["write_path"] == "draft_order"
+    assert result["receipt_policy"] == order_routes.SHOPIFY_RECEIPT_POLICY_DRAFT_SUPPRESSED
+
+
+def test_select_shopify_write_policy_suppresses_non_quote_snapshot_rows():
+    result = order_routes._select_shopify_write_policy(
+        order={"merchant_id": "merch_1", "metadata": {"amounts_source": "legacy_incomplete"}},
+        pricing_quote_meta={},
+    )
+
+    assert result["shopify_write_strategy"] == order_routes.SHOPIFY_WRITE_STRATEGY_REST_LEGACY_SUPPRESSED
+    assert result["receipt_policy"] == order_routes.SHOPIFY_RECEIPT_POLICY_SUPPRESSED
+    assert result["representation_status"] == "legacy_not_authoritative"
+
+
 def test_pricing_quote_disables_custom_line_item_rest_encoding_even_when_discount_is_fully_line_allocated():
     pricing_quote_meta = _pricing_quote_meta()
     pricing_quote_meta["pricing"]["shipping_fee"] = "0.00"
@@ -161,6 +213,69 @@ def test_apply_pricing_quote_line_item_overrides_sets_price_and_total_discount()
 
     assert out["price"] == "100.00"
     assert out["total_discount"] == "5.00"
+
+
+def test_build_shopify_draft_order_input_maps_variant_discounts_and_shipping():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["pricing"].update(
+        {
+            "subtotal": "100.00",
+            "discount_total": "5.00",
+            "shipping_fee": "0.00",
+            "tax": "0.00",
+            "total": "95.00",
+        }
+    )
+    pricing_quote_meta["discount_evidence"]["applications"].append(
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "amount": "-8.00",
+        }
+    )
+    pricing_quote_meta["discount_evidence"]["shipping_evidence"] = {
+        "status": "authoritative",
+        "selected_delivery_option_title": "Free Shipping",
+    }
+
+    draft_input = order_routes._build_shopify_draft_order_input(
+        order_id="ORD_1",
+        order={
+            "items": [
+                {
+                    "product_id": "prod_1",
+                    "variant_id": "123",
+                    "product_title": "Test Product",
+                    "quantity": 1,
+                    "unit_price": "95.00",
+                }
+            ],
+            "shipping_fee": "0.00",
+        },
+        pricing_quote_meta=pricing_quote_meta,
+        customer_email="buyer@example.com",
+        shopify_shipping={
+            "first_name": "Buyer",
+            "last_name": "Test",
+            "address1": "1 Main St",
+            "city": "San Francisco",
+            "province": "CA",
+            "zip": "94105",
+            "country": "US",
+        },
+        currency_code="USD",
+        shopify_tags=["pivota", "agent-order"],
+        discount_note_attributes=[{"name": "pivota_quote_id", "value": "q_123"}],
+    )
+
+    assert draft_input["presentmentCurrencyCode"] == "USD"
+    assert draft_input["shippingLine"]["title"] == "Free Shipping"
+    assert draft_input["shippingLine"]["price"] == "0.00"
+    assert draft_input["lineItems"][0]["variantId"] == "gid://shopify/ProductVariant/123"
+    assert draft_input["lineItems"][0]["priceOverride"]["amount"] == "100.00"
+    assert draft_input["lineItems"][0]["appliedDiscount"]["amountWithCurrency"]["amount"] == "5.00"
 
 
 def test_shopify_order_tag_sanitizes_and_bounds_values():

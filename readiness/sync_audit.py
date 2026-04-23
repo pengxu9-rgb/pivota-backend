@@ -179,6 +179,17 @@ async def build_order_sync_audit_snapshot(
 
     webhook_topics = [str(row.get("topic") or "") for row in webhook_events if row.get("topic")]
     order_event_types = [str(row.get("event_type") or "") for row in order_events if row.get("event_type")]
+    latest_reconciliation_event = next(
+        (row for row in order_events if str(row.get("event_type") or "") == "shopify_discount_reconciliation"),
+        None,
+    )
+    latest_reconciliation_metadata = _metadata_dict(latest_reconciliation_event or {})
+    latest_receipt_suppressed_event = next(
+        (row for row in order_events if str(row.get("event_type") or "") == "shopify_receipt_suppressed"),
+        None,
+    )
+    latest_receipt_suppressed_metadata = _metadata_dict(latest_receipt_suppressed_event or {})
+    order_metadata = _metadata_dict(order_state)
     refund_transaction_events = [
         {**row, "metadata": _metadata_dict(row)}
         for row in order_events
@@ -311,11 +322,24 @@ async def build_order_sync_audit_snapshot(
             "total_refunded": total_refunded,
             "updated_at": order_state.get("updated_at"),
         },
+        "shopify_sync": {
+            "shopify_write_strategy": order_metadata.get("shopify_write_strategy"),
+            "receipt_policy": order_metadata.get("receipt_policy"),
+            "representation_status": order_metadata.get("representation_status"),
+            "reconciliation_status": order_metadata.get("reconciliation_status"),
+            "latest_reconciliation_mismatches": latest_reconciliation_metadata.get("mismatches"),
+            "latest_receipt_suppressed_reason": latest_receipt_suppressed_metadata.get("reason"),
+            "latest_receipt_suppressed_blockers": latest_receipt_suppressed_metadata.get("blockers"),
+        },
         "sync_signals": {
             "merchant_writeback": {
                 "status": merchant_writeback_status,
                 "shopify_order_id": shopify_order_id,
                 "latest_readiness_event_at": _latest_at([_json_safe(event) for event in readiness_events], "created_at"),
+                "shopify_write_strategy": order_metadata.get("shopify_write_strategy"),
+                "receipt_policy": order_metadata.get("receipt_policy"),
+                "representation_status": order_metadata.get("representation_status"),
+                "reconciliation_status": order_metadata.get("reconciliation_status"),
             },
             "webhook_ingest": {
                 "status": webhook_ingest_status,
