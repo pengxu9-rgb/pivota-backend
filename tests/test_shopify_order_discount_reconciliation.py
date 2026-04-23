@@ -64,6 +64,59 @@ def test_shopify_order_discount_codes_skip_product_level_allocations():
     assert order_routes._build_shopify_order_discount_codes(pricing_quote_meta) == []
 
 
+def test_shopify_receipt_representation_blockers_flag_product_and_automatic_discounts():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["pricing"]["shipping_fee"] = "0.00"
+    pricing_quote_meta["promotion_lines"].append(
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "amount": "-8.00",
+        }
+    )
+    pricing_quote_meta["discount_evidence"]["applications"].append(
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "amount": "-8.00",
+        }
+    )
+
+    blockers = order_routes._shopify_receipt_representation_blockers(pricing_quote_meta)
+
+    assert "product_level_discount" in blockers
+    assert "automatic_discount" in blockers
+    assert "code_less_shipping_discount" in blockers
+    assert (
+        "discount_not_encodable_as_rest_order_discount_code" in blockers
+    )
+
+
+def test_shopify_receipt_can_be_auto_sent_when_quote_uses_single_order_discount_code():
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["line_items"] = []
+    pricing_quote_meta["discount_evidence"]["applications"][0]["discount_class"] = "order"
+    pricing_quote_meta["promotion_lines"][0]["discount_class"] = "order"
+
+    assert order_routes._shopify_receipt_can_be_auto_sent(
+        customer_email="buyer@example.com",
+        pricing_quote_meta=pricing_quote_meta,
+    ) is True
+
+
+def test_shopify_receipt_is_suppressed_when_quote_has_unrenderable_discount_shape():
+    pricing_quote_meta = _pricing_quote_meta()
+
+    assert order_routes._shopify_receipt_can_be_auto_sent(
+        customer_email="buyer@example.com",
+        pricing_quote_meta=pricing_quote_meta,
+    ) is False
+
+
 def test_apply_pricing_quote_line_item_overrides_sets_price_and_total_discount():
     line_item = {"variant_id": 123, "quantity": 1}
     order_item = {"product_id": "prod_1", "variant_id": "var_1", "quantity": 1}
