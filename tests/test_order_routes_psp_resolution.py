@@ -16,7 +16,7 @@ def test_normalize_order_provider_hint_prefers_explicit_provider_override() -> N
     assert module._normalize_order_provider_hint("stripe", "adyen") == "adyen"
 
 
-def test_build_order_preferred_psps_prepends_explicit_provider_and_dedupes() -> None:
+def test_build_order_preferred_psps_treats_explicit_provider_as_strict_subset() -> None:
     import routes.order_routes as module
 
     assert module._build_order_preferred_psps(
@@ -28,7 +28,7 @@ def test_build_order_preferred_psps_prepends_explicit_provider_and_dedupes() -> 
             ]
         },
         "adyen",
-    ) == ["adyen", "stripe", "checkout"]
+    ) == ["adyen"]
 
 
 def test_build_order_preferred_psps_ignores_stripe_checkout_as_provider_override() -> None:
@@ -38,6 +38,44 @@ def test_build_order_preferred_psps_ignores_stripe_checkout_as_provider_override
         {"psp_priority": [{"psp": "stripe", "priority": 1}]},
         "stripe_checkout",
     ) == ["stripe"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_explicit_preferred_psp_available_rejects_non_live_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+    from fastapi import HTTPException
+
+    async def fake_fetch_active_merchant_psps(*, merchant_id: str, provider=None):
+        assert merchant_id == "merch_1"
+        assert provider == "adyen"
+        return [
+            {
+                "provider": "adyen",
+                "status": "active",
+                "api_key": "AQE_test_123",
+                "account_id": "WoopayECOM",
+                "provider_config": {"client_key": "test_client_key"},
+                "environment": "test",
+                "validation_status": "valid",
+                "validation_error": None,
+            }
+        ]
+
+    monkeypatch.setattr(module, "fetch_active_merchant_psps", fake_fetch_active_merchant_psps)
+
+    with pytest.raises(HTTPException) as exc:
+        await module._ensure_explicit_preferred_psp_available(
+            merchant_id="merch_1",
+            preferred_psp="adyen",
+            enforce_live_readiness=True,
+        )
+
+    assert exc.value.status_code == 409
+    detail = exc.value.detail
+    assert detail["error"] == "PREFERRED_PSP_UNAVAILABLE"
+    assert detail["preferred_psp"] == "adyen"
 
 
 def test_finalize_order_psp_used_uses_safe_fallback() -> None:

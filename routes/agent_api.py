@@ -492,6 +492,24 @@ def _get_order_create_lock(key: str) -> asyncio.Lock:
     return lock
 
 
+def _default_order_create_idempotency_key(
+    *,
+    merchant_id: Optional[str],
+    quote_id: Optional[str],
+    preferred_psp: Optional[str],
+) -> Optional[str]:
+    merchant = str(merchant_id or "").strip()
+    quote = str(quote_id or "").strip()
+    if not merchant or not quote:
+        return None
+
+    parts = [merchant, quote]
+    preferred = str(preferred_psp or "").strip().lower()
+    if preferred:
+        parts.append(preferred)
+    return ":".join(parts)
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -7692,9 +7710,15 @@ async def agent_create_order(
                 },
             )
 
-        # Quote-first idempotency: default idempotency_key to merchant_id:quote_id when quote_id is present.
+        # Quote-first idempotency: scope the default replay key by preferred_psp as well.
+        # This prevents a first PSP-specific checkout attempt from silently replaying into
+        # later attempts that reuse the same quote with a different explicit provider choice.
         if order_request.quote_id and not order_request.idempotency_key:
-            order_request.idempotency_key = f"{order_request.merchant_id}:{order_request.quote_id}"
+            order_request.idempotency_key = _default_order_create_idempotency_key(
+                merchant_id=order_request.merchant_id,
+                quote_id=order_request.quote_id,
+                preferred_psp=order_request.preferred_psp,
+            )
 
         # Idempotency (best-effort): if provided and already processed, replay the cached response.
         if order_request.idempotency_key:
