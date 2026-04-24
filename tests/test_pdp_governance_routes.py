@@ -279,6 +279,13 @@ def test_published_monitor_uses_read_only_synthetic_rows():
         assert "view" in item["allowed_actions"]
         assert "rollback" in item["allowed_actions"]
         assert "publish" not in item["allowed_actions"]
+        assert "assign" not in item["allowed_actions"]
+        assert "escalate" not in item["allowed_actions"]
+
+        task_detail = client.get(f"/employee/pdps/review-queue/{item['task_id']}")
+        assert task_detail.status_code == 200
+        assert task_detail.json()["task"]["task_id"] == item["task_id"]
+        assert task_detail.json()["module"]["module_key"] == "copy"
 
 
 def test_outsourced_publish_requires_checklist_and_blocks_high_risk():

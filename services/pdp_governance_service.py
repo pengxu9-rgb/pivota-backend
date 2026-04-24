@@ -1353,6 +1353,15 @@ async def _build_review_queue_item(
     task = await _ensure_review_task_for_module(subject, module) if ensure_task else _synthetic_published_monitor_task(subject, module, str(risk))
     if not task:
         return None
+    allowed_actions = allowed_pdp_review_actions(
+        actor_role=actor_role,
+        module_key=module["module_key"],
+        risk_level=str(risk),
+        requires_human=requires_human,
+        module_status=module_status,
+    )
+    if not ensure_task:
+        allowed_actions = [action for action in allowed_actions if action in {"view", "rollback"}]
     return {
         **task,
         "pdp_title": subject.get("title") or subject.get("subject_ref"),
@@ -1371,13 +1380,7 @@ async def _build_review_queue_item(
         "source_summary": _source_summary(refs),
         "diff_summary": _diff_summary((current or {}).get("payload"), (staged or {}).get("payload") if staged else None),
         "risk_reasons": _review_risk_reasons(module["module_key"], risk, requires_human, (active or {}).get("payload")),
-        "allowed_actions": allowed_pdp_review_actions(
-            actor_role=actor_role,
-            module_key=module["module_key"],
-            risk_level=str(risk),
-            requires_human=requires_human,
-            module_status=module_status,
-        ),
+        "allowed_actions": allowed_actions,
     }
 
 
@@ -1573,6 +1576,46 @@ async def get_pdp_review_task(
     task_id: str,
     actor_role: Optional[str],
 ) -> Dict[str, Any]:
+    if task_id.startswith("published:"):
+        try:
+            _, pdp_id, module_key, version_id = task_id.split(":", 3)
+        except ValueError as exc:
+            raise LookupError("PDP_REVIEW_TASK_NOT_FOUND") from exc
+        projection = await get_pdp_projection(pdp_id=pdp_id, actor_role=actor_role)
+        module = next((mod for mod in projection.get("modules", []) if mod.get("module_key") == module_key), None)
+        current = (module or {}).get("current") or {}
+        if not module or not current:
+            raise LookupError("PDP_REVIEW_TASK_NOT_FOUND")
+        if version_id and current.get("id") and version_id != current.get("id"):
+            raise LookupError("PDP_REVIEW_TASK_NOT_FOUND")
+        item = await _build_review_queue_item(
+            subject=projection["pdp"],
+            module={
+                "module_key": module_key,
+                "version_id": current.get("id"),
+                "status": "published",
+                "risk_level": current.get("risk_level") or module_risk_level(module_key),
+                "requires_human": bool(current.get("requires_human") or module_key in HUMAN_CO_REVIEW_MODULES),
+                "review_actor_type": current.get("review_actor_type"),
+                "review_decision": current.get("review_decision"),
+                "created_at": current.get("created_at"),
+                "published_at": current.get("published_at"),
+                "source_refs": current.get("source_refs") or [],
+                "current_payload": current.get("payload") or {},
+                "staged_payload": None,
+            },
+            actor_role=actor_role,
+            ensure_task=False,
+        )
+        return {
+            "status": "success",
+            "task": item,
+            "pdp": projection["pdp"],
+            "module": module,
+            "published_payload": projection.get("published_payload") or {},
+            "activity": projection.get("activity") or [],
+        }
+
     task = await _review_task_by_id(task_id)
     projection = await get_pdp_projection(pdp_id=task["pdp_id"], actor_role=actor_role)
     module = next((mod for mod in projection.get("modules", []) if mod.get("module_key") == task["module_key"]), None)
