@@ -1054,6 +1054,10 @@ async def list_pdp_subjects(
 async def seed_recent_pdp_subjects(limit: int = 50) -> None:
     """Best-effort dashboard hydration from existing product groups and external seeds."""
     safe_limit = max(1, min(limit, 2000))
+    if IS_POSTGRES:
+        await _seed_recent_pdp_subjects_postgres(safe_limit)
+        return
+
     try:
         groups = await database.fetch_all(
             """
@@ -1153,6 +1157,156 @@ async def seed_recent_pdp_subjects(limit: int = 50) -> None:
             )
         except Exception:
             continue
+
+
+async def _seed_recent_pdp_subjects_postgres(safe_limit: int) -> None:
+    """Hydrate the PDP dashboard index without per-subject DB round-trips."""
+    group_rows = await database.fetch_all(
+        """
+        WITH ranked_groups AS (
+            SELECT product_group_id,
+                   COUNT(DISTINCT merchant_id) AS seller_count,
+                   MAX(updated_at) AS updated_at
+            FROM product_group_members
+            WHERE product_group_id IS NOT NULL
+            GROUP BY product_group_id
+            ORDER BY MAX(updated_at) DESC
+            LIMIT :limit
+        ),
+        primary_members AS (
+            SELECT DISTINCT ON (pgm.product_group_id)
+                   pgm.product_group_id,
+                   pgm.merchant_id,
+                   pgm.platform,
+                   pgm.platform_product_id
+            FROM product_group_members pgm
+            JOIN ranked_groups rg ON rg.product_group_id = pgm.product_group_id
+            ORDER BY pgm.product_group_id, pgm.is_primary DESC, pgm.updated_at DESC
+        ),
+        latest_cache AS (
+            SELECT DISTINCT ON (pc.merchant_id, pc.platform, pc.platform_product_id)
+                   pc.merchant_id,
+                   pc.platform,
+                   pc.platform_product_id,
+                   pc.product_data
+            FROM products_cache pc
+            JOIN primary_members pm
+              ON pm.merchant_id = pc.merchant_id
+             AND pm.platform = pc.platform
+             AND pm.platform_product_id = pc.platform_product_id
+            ORDER BY pc.merchant_id, pc.platform, pc.platform_product_id, pc.cached_at DESC, pc.id DESC
+        )
+        SELECT rg.product_group_id,
+               rg.seller_count,
+               pm.merchant_id,
+               pm.platform,
+               pm.platform_product_id,
+               lc.product_data
+        FROM ranked_groups rg
+        JOIN primary_members pm ON pm.product_group_id = rg.product_group_id
+        LEFT JOIN latest_cache lc
+          ON lc.merchant_id = pm.merchant_id
+         AND lc.platform = pm.platform
+         AND lc.platform_product_id = pm.platform_product_id
+        ORDER BY rg.updated_at DESC
+        """,
+        {"limit": safe_limit},
+    )
+
+    subjects: List[Dict[str, Any]] = []
+    for row in group_rows or []:
+        group_data = _row_dict(row)
+        product_group_id = str(group_data.get("product_group_id") or "")
+        merchant_id = str(group_data.get("merchant_id") or "")
+        platform = str(group_data.get("platform") or "")
+        platform_product_id = str(group_data.get("platform_product_id") or "")
+        if not product_group_id or not merchant_id or not platform or not platform_product_id:
+            continue
+        product_data = _json_dict(group_data.get("product_data"))
+        summary = _extract_product_summary(product_data)
+        representative_product_key = f"{merchant_id}|{platform}|{platform_product_id}"
+        subjects.append(
+            {
+                "pdp_id": make_pdp_id("product_group", product_group_id, DEFAULT_MARKET),
+                "subject_type": "product_group",
+                "subject_ref": product_group_id,
+                "market": DEFAULT_MARKET,
+                "product_group_id": product_group_id,
+                "external_product_id": None,
+                "representative_product_key": representative_product_key,
+                "title": summary.get("title") or product_group_id,
+                "image_url": summary.get("image_url"),
+                "seller_count": int(group_data.get("seller_count") or 1),
+                "external_only": False,
+                "status": "active",
+            }
+        )
+
+    external_rows = await database.fetch_all(
+        """
+        SELECT *
+        FROM external_product_seeds
+        WHERE external_product_id IS NOT NULL
+          AND status = 'active'
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT :limit
+        """,
+        {"limit": safe_limit},
+    )
+
+    for seed in external_rows or []:
+        seed_data = _row_dict(seed)
+        external_product_id = str(seed_data.get("external_product_id") or seed_data.get("id") or "")
+        if not external_product_id:
+            continue
+        subjects.append(
+            _subject_from_external_seed(
+                seed_data,
+                external_product_id=external_product_id,
+                market=str(seed_data.get("market") or DEFAULT_MARKET).upper(),
+            )
+        )
+
+    await _bulk_upsert_subjects_postgres(subjects)
+
+
+async def _bulk_upsert_subjects_postgres(subjects: List[Dict[str, Any]]) -> None:
+    if not subjects:
+        return
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    now = _now()
+    rows = [
+        {
+            "pdp_id": subject["pdp_id"],
+            "subject_type": subject["subject_type"],
+            "subject_ref": subject["subject_ref"],
+            "market": subject.get("market") or DEFAULT_MARKET,
+            "product_group_id": subject.get("product_group_id"),
+            "external_product_id": subject.get("external_product_id"),
+            "representative_product_key": subject.get("representative_product_key"),
+            "title": subject.get("title"),
+            "image_url": subject.get("image_url"),
+            "seller_count": int(subject.get("seller_count") or 0),
+            "external_only": bool(subject.get("external_only")),
+            "status": subject.get("status") or "active",
+            "created_at": now,
+            "updated_at": now,
+        }
+        for subject in subjects
+    ]
+    insert_stmt = pg_insert(pdp_subject_index).values(rows)
+    update_columns = {
+        column.name: getattr(insert_stmt.excluded, column.name)
+        for column in pdp_subject_index.c
+        if column.name not in {"pdp_id", "created_at"}
+    }
+    await database.execute(
+        insert_stmt.on_conflict_do_update(
+            index_elements=[pdp_subject_index.c.pdp_id],
+            set_=update_columns,
+        )
+    )
 
 
 async def _next_module_version(pdp_id: str, module_key: str) -> int:
