@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -68,6 +69,16 @@ HIGH_RISK_PAYLOAD_KEYS = {
     "merchant_dispute",
     "review_import",
     "featured_reviews",
+}
+
+GALLERY_IMAGE_ROLES = {"primary", "gallery", "variant", "detail", "packaging", "swatch"}
+GALLERY_RIGHTS_STATUSES = {
+    "owned_or_licensed",
+    "merchant_provided",
+    "third_party_permission_verified",
+    "permission_pending",
+    "evidence_only",
+    "unknown",
 }
 
 UNSUPPORTED_CLAIM_PATTERNS = [
@@ -166,6 +177,30 @@ def _json_list(value: Any) -> List[Any]:
 
 def _row_dict(row: Any) -> Dict[str, Any]:
     return dict(row) if row else {}
+
+
+def _first_env(*names: str, default: str = "") -> str:
+    for name in names:
+        val = (os.getenv(name) or "").strip()
+        if val:
+            return val
+    return (default or "").strip()
+
+
+def merge_source_refs(*groups: Any) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+    seen = set()
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for ref in group:
+            normalized = ref if isinstance(ref, dict) else {"type": "source_ref", "id": str(ref)}
+            key = json.dumps(normalized, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(normalized)
+    return refs
 
 
 def _text_blob(value: Any) -> str:
@@ -1124,6 +1159,217 @@ async def hydrate_pdp_subject_index(
         "after": after,
         "delta_total": int(after.get("total") or 0) - int(before.get("total") or 0),
     }
+
+
+def _pdp_gallery_bucket() -> str:
+    return _first_env("PDP_GALLERY_S3_BUCKET", "PHOTO_UPLOAD_BUCKET", "S3_BUCKET", "AWS_S3_BUCKET", default="")
+
+
+def _pdp_gallery_prefix() -> str:
+    return _first_env("PDP_GALLERY_S3_PREFIX", default="pdp-gallery").strip().strip("/")
+
+
+def _pdp_gallery_public_base_url() -> str:
+    return _first_env("PDP_GALLERY_PUBLIC_BASE_URL", "PHOTO_UPLOAD_PUBLIC_BASE_URL", "S3_PUBLIC_BASE_URL", default="").rstrip("/")
+
+
+def _pdp_gallery_s3_endpoint_url() -> Optional[str]:
+    value = _first_env("PDP_GALLERY_S3_ENDPOINT_URL", "PHOTO_UPLOAD_ENDPOINT_URL", "AWS_ENDPOINT_URL", "S3_ENDPOINT_URL", default="")
+    return value or None
+
+
+def _pdp_gallery_s3_region() -> Optional[str]:
+    return _first_env("PDP_GALLERY_S3_REGION", "PHOTO_UPLOAD_REGION", "AWS_REGION", "AWS_DEFAULT_REGION", default="") or None
+
+
+def _pdp_gallery_s3_client():
+    try:
+        import boto3
+        from botocore.client import Config
+    except Exception:
+        return None
+
+    endpoint_url = _pdp_gallery_s3_endpoint_url()
+    endpoint_lc = (endpoint_url or "").lower()
+    is_r2 = bool(endpoint_url and ("cloudflarestorage.com" in endpoint_lc or ".r2." in endpoint_lc))
+
+    try:
+        config_kwargs: Dict[str, Any] = {"signature_version": "s3v4"}
+        if endpoint_url:
+            config_kwargs["s3"] = {"addressing_style": "path"}
+
+        access_key_id = _first_env("PDP_GALLERY_S3_ACCESS_KEY_ID", "PHOTO_UPLOAD_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", default="")
+        secret_access_key = _first_env("PDP_GALLERY_S3_SECRET_ACCESS_KEY", "PHOTO_UPLOAD_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", default="")
+        session_token = _first_env("PDP_GALLERY_S3_SESSION_TOKEN", "PHOTO_UPLOAD_SESSION_TOKEN", "AWS_SESSION_TOKEN", default="") or None
+        if is_r2:
+            session_token = None
+
+        region_name = _pdp_gallery_s3_region()
+        if is_r2:
+            region_name = "auto"
+
+        client_kwargs: Dict[str, Any] = {
+            "region_name": region_name,
+            "endpoint_url": endpoint_url,
+            "config": Config(**config_kwargs),
+        }
+        if access_key_id and secret_access_key:
+            client_kwargs.update(
+                {
+                    "aws_access_key_id": access_key_id,
+                    "aws_secret_access_key": secret_access_key,
+                    **({"aws_session_token": session_token} if session_token else {}),
+                }
+            )
+        return boto3.client("s3", **client_kwargs)
+    except Exception:
+        return None
+
+
+def _gallery_file_ext(filename: str, content_type: str) -> str:
+    name = (filename or "").lower()
+    ct = (content_type or "").lower()
+    for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"):
+        if name.endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+    if "png" in ct:
+        return ".png"
+    if "webp" in ct:
+        return ".webp"
+    if "gif" in ct:
+        return ".gif"
+    if "heic" in ct or "heif" in ct:
+        return ".heic"
+    return ".jpg"
+
+
+def _gallery_images_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = payload.get("images") or payload.get("gallery") or []
+    images: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        for index, item in enumerate(raw):
+            if isinstance(item, str):
+                url = item.strip()
+                if url:
+                    images.append({"id": f"gallery_img_existing_{index}", "url": url, "role": "gallery"})
+            elif isinstance(item, dict):
+                url = str(item.get("url") or item.get("image_url") or item.get("src") or "").strip()
+                if url:
+                    images.append({**item, "id": item.get("id") or f"gallery_img_existing_{index}", "url": url})
+    primary_url = str(payload.get("primary_image_url") or payload.get("image_url") or "").strip()
+    if primary_url and not any(str(img.get("url")) == primary_url for img in images):
+        images.insert(0, {"id": "gallery_img_primary_existing", "url": primary_url, "role": "primary", "is_primary": True})
+    return images
+
+
+async def upload_pdp_gallery_image(
+    *,
+    pdp_id: str,
+    filename: str,
+    content_type: str,
+    blob: bytes,
+    alt_text: Optional[str] = None,
+    role: str = "gallery",
+    variant_id: Optional[str] = None,
+    rights_status: str = "owned_or_licensed",
+    source_note: Optional[str] = None,
+    actor_type: str = REVIEW_ACTOR_HUMAN,
+    actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    subject = await resolve_pdp_subject(pdp_id=pdp_id)
+
+    ct = (content_type or "").strip().lower()
+    if not ct.startswith("image/"):
+        raise ValueError("UNSUPPORTED_GALLERY_IMAGE_TYPE")
+    max_bytes = int(os.getenv("PDP_GALLERY_IMAGE_MAX_BYTES") or str(10 * 1024 * 1024))
+    if len(blob or b"") <= 0:
+        raise ValueError("EMPTY_GALLERY_IMAGE")
+    if len(blob) > max_bytes:
+        raise ValueError("GALLERY_IMAGE_TOO_LARGE")
+
+    bucket = _pdp_gallery_bucket()
+    public_base = _pdp_gallery_public_base_url()
+    if not bucket or not public_base:
+        raise RuntimeError("PDP_GALLERY_STORAGE_NOT_CONFIGURED")
+    client = _pdp_gallery_s3_client()
+    if client is None:
+        raise RuntimeError("PDP_GALLERY_STORAGE_CLIENT_UNAVAILABLE")
+
+    image_id = f"gallery_img_{uuid.uuid4().hex}"
+    ext = _gallery_file_ext(filename, ct)
+    prefix = _pdp_gallery_prefix()
+    key = f"{prefix}/{subject['pdp_id']}/{image_id}{ext}" if prefix else f"{subject['pdp_id']}/{image_id}{ext}"
+
+    try:
+        client.put_object(Bucket=bucket, Key=key, Body=blob, ContentType=ct)
+    except Exception as exc:
+        raise RuntimeError(f"PDP_GALLERY_STORAGE_UPLOAD_FAILED:{type(exc).__name__}") from exc
+
+    image_url = f"{public_base}/{key}"
+    normalized_role = role if role in GALLERY_IMAGE_ROLES else "gallery"
+    normalized_rights = rights_status if rights_status in GALLERY_RIGHTS_STATUSES else "unknown"
+
+    staged = await _latest_staged_version(subject["pdp_id"], "gallery")
+    current = await _current_published_version(subject["pdp_id"], "gallery")
+    base_payload = _json_dict((staged or current or {}).get("payload"))
+    images = _gallery_images_from_payload(base_payload)
+
+    make_primary = normalized_role == "primary" or not images
+    if make_primary:
+        images = [{**img, "is_primary": False, "role": "gallery" if img.get("role") == "primary" else img.get("role", "gallery")} for img in images]
+
+    image = {
+        "id": image_id,
+        "url": image_url,
+        "alt": (alt_text or "").strip(),
+        "role": normalized_role,
+        "is_primary": make_primary,
+        "variant_id": (variant_id or "").strip() or None,
+        "source_type": "employee_upload",
+        "rights_status": normalized_rights,
+        "source_note": (source_note or "").strip() or None,
+        "uploaded_by_actor_type": actor_type,
+        "uploaded_by_actor_id": actor_id,
+        "uploaded_at": _now().isoformat(),
+        "storage": {
+            "bucket": bucket,
+            "object_key": key,
+            "content_type": ct,
+            "byte_size": len(blob),
+        },
+    }
+    images.append(image)
+    primary = next((img for img in images if img.get("is_primary")), images[0] if images else image)
+    payload = {
+        **base_payload,
+        "images": images,
+        "primary_image_url": primary.get("url"),
+        "gallery_source": "employee_curated",
+    }
+    source_refs = merge_source_refs(
+        (staged or current or {}).get("source_refs") or [],
+        [
+            {
+                "type": "employee_gallery_upload",
+                "id": image_id,
+                "url": image_url,
+                "rights_status": normalized_rights,
+                "source_note": (source_note or "").strip() or None,
+            }
+        ],
+    )
+    module = await create_module_draft(
+        pdp_id=subject["pdp_id"],
+        module_key="gallery",
+        payload=payload,
+        source_refs=source_refs,
+        generated_by="employee_gallery_upload",
+        generation_ref=image_id,
+        actor_type=actor_type,
+        actor_id=actor_id,
+    )
+    return {"status": "success", "image": image, "module": module}
 
 
 def _empty_module_summaries() -> List[Dict[str, Any]]:
