@@ -25,6 +25,12 @@ from utils.auth import (
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 logger = logging.getLogger("auth_routes")
 
+# Keep the historical demo merchant usable when a canonical users row exists
+# without a merchant_id binding in older production databases.
+DEMO_MERCHANT_IDS = {
+    "merchant@test.com": "merch_6b90dc9838d5fd9c",
+}
+
 # Backward-compat shim for tests and historical imports.
 # Some code/tests patch `routes.auth.require_admin_user`.
 require_admin_user = require_admin
@@ -257,6 +263,8 @@ async def login(data: LoginRequest):
             )
             if merchant_record:
                 merchant_id = merchant_record['merchant_id']
+        if user['role'] == 'merchant' and not merchant_id:
+            merchant_id = DEMO_MERCHANT_IDS.get(normalized_email)
         
         # [Phase 6.2] For agents, get their agent_id from agents table
         agent_id = None
