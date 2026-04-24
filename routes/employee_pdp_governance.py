@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from services.pdp_governance_service import (
@@ -11,6 +11,7 @@ from services.pdp_governance_service import (
     REVIEW_ACTOR_HUMAN,
     create_module_draft,
     get_pdp_projection,
+    get_pdp_gallery_asset,
     get_pdp_subject_index_stats,
     hydrate_pdp_subject_index,
     list_pdp_subjects,
@@ -60,7 +61,7 @@ def _employee_actor(current_user: Dict[str, Any]) -> str:
 
 def _map_error(exc: Exception) -> HTTPException:
     message = str(exc)
-    if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND"}:
+    if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND", "PDP_GALLERY_ASSET_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)
     if message in {
         "INVALID_PRODUCT_KEY",
@@ -155,6 +156,25 @@ async def hydrate_pdp_subjects(
             limit=body.limit,
             actor_type=REVIEW_ACTOR_HUMAN,
             actor_id=actor_id,
+        )
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.get("/gallery-assets/{asset_id}")
+async def get_gallery_asset(asset_id: str) -> Response:
+    try:
+        asset = await get_pdp_gallery_asset(asset_id)
+        data = asset.get("data") or b""
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        return Response(
+            content=data,
+            media_type=str(asset.get("content_type") or "application/octet-stream"),
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "Content-Length": str(asset.get("byte_size") or 0),
+            },
         )
     except Exception as exc:
         raise _map_error(exc)

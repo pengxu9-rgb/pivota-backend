@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Index, Integer, String, Table, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, Index, Integer, LargeBinary, String, Table, Text
 from sqlalchemy.sql import func
 
 from db.database import JSONB_TYPE, metadata
@@ -97,3 +97,20 @@ merchant_pdp_contributions = Table(
 )
 
 Index("idx_merchant_pdp_contributions_status", merchant_pdp_contributions.c.status, merchant_pdp_contributions.c.created_at.desc())
+
+
+pdp_gallery_assets = Table(
+    "pdp_gallery_assets",
+    metadata,
+    Column("id", String(96), primary_key=True),
+    Column("pdp_id", String(96), nullable=False, index=True),
+    Column("filename", Text, nullable=True),
+    Column("content_type", String(128), nullable=False),
+    Column("byte_size", Integer, nullable=False),
+    Column("data", LargeBinary, nullable=False),
+    Column("created_by_actor_type", String(32), nullable=True),
+    Column("created_by_actor_id", String(128), nullable=True),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+Index("idx_pdp_gallery_assets_pdp_created", pdp_gallery_assets.c.pdp_id, pdp_gallery_assets.c.created_at.desc())
