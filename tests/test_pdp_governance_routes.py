@@ -128,6 +128,54 @@ def test_employee_pdp_hydration_status_and_sync_refresh():
         assert refreshed_body["after"]["total"] >= status_body["total"]
 
 
+def test_employee_gallery_image_upload_creates_human_review_draft(monkeypatch):
+    import services.pdp_governance_service as pdp_service
+
+    class FakeS3:
+        def __init__(self):
+            self.objects = {}
+
+        def put_object(self, Bucket, Key, Body, ContentType):
+            self.objects[(Bucket, Key)] = {"body": Body, "content_type": ContentType}
+
+    fake_s3 = FakeS3()
+    monkeypatch.setattr(pdp_service, "_pdp_gallery_bucket", lambda: "gallery-bucket")
+    monkeypatch.setattr(pdp_service, "_pdp_gallery_public_base_url", lambda: "https://cdn.example.com")
+    monkeypatch.setattr(pdp_service, "_pdp_gallery_s3_client", lambda: fake_s3)
+
+    with _client() as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-gallery-upload", "market": "US"},
+        )
+        assert resolved.status_code == 200
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+
+        uploaded = client.post(
+            f"/employee/pdps/{pdp_id}/modules/gallery/images",
+            data={
+                "alt_text": "Front product image",
+                "role": "primary",
+                "rights_status": "owned_or_licensed",
+                "source_note": "Employee uploaded licensed image",
+            },
+            files={"file": ("front.png", b"fake-image-bytes", "image/png")},
+        )
+        assert uploaded.status_code == 200
+        body = uploaded.json()
+        assert body["image"]["url"].startswith("https://cdn.example.com/pdp-gallery/")
+        assert body["image"]["is_primary"] is True
+        assert body["module"]["module_key"] == "gallery"
+        assert body["module"]["status"] == "needs_human_review"
+        assert body["module"]["requires_human"] is True
+        assert fake_s3.objects
+
+        detail = client.get(f"/employee/pdps/{pdp_id}")
+        gallery = next(module for module in detail.json()["modules"] if module["module_key"] == "gallery")
+        assert gallery["staged"]["payload"]["images"][0]["alt"] == "Front product image"
+        assert gallery["staged"]["payload"]["primary_image_url"] == body["image"]["url"]
+
+
 def test_gpt55_gate_can_publish_low_risk_llm_candidate_after_review():
     with _client() as client:
         resolved = client.get(

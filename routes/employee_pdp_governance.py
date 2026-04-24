@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from services.pdp_governance_service import (
@@ -17,6 +17,7 @@ from services.pdp_governance_service import (
     resolve_pdp_subject,
     review_module_version,
     rollback_module,
+    upload_pdp_gallery_image,
 )
 from utils.auth import get_current_employee
 
@@ -61,10 +62,20 @@ def _map_error(exc: Exception) -> HTTPException:
     message = str(exc)
     if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)
-    if message in {"INVALID_PRODUCT_KEY", "INVALID_PDP_MODULE", "INVALID_REVIEW_DECISION", "ROLLBACK_TARGET_MUST_BE_PUBLISHED"}:
+    if message in {
+        "INVALID_PRODUCT_KEY",
+        "INVALID_PDP_MODULE",
+        "INVALID_REVIEW_DECISION",
+        "ROLLBACK_TARGET_MUST_BE_PUBLISHED",
+        "UNSUPPORTED_GALLERY_IMAGE_TYPE",
+        "EMPTY_GALLERY_IMAGE",
+        "GALLERY_IMAGE_TOO_LARGE",
+    }:
         return HTTPException(status_code=400, detail=message)
     if message == "PDP_MODULE_REQUIRES_HUMAN_REVIEW":
         return HTTPException(status_code=403, detail=message)
+    if message in {"PDP_GALLERY_STORAGE_NOT_CONFIGURED", "PDP_GALLERY_STORAGE_CLIENT_UNAVAILABLE"} or message.startswith("PDP_GALLERY_STORAGE_UPLOAD_FAILED"):
+        return HTTPException(status_code=503, detail=message)
     return HTTPException(status_code=500, detail=message[:300])
 
 
@@ -179,6 +190,36 @@ async def save_module_draft(
             actor_id=_employee_actor(current_user),
         )
         return {"status": "success", "module": module}
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.post("/{pdp_id}/modules/gallery/images")
+async def upload_gallery_image(
+    pdp_id: str,
+    file: UploadFile = File(...),
+    alt_text: Optional[str] = Form(default=None),
+    role: str = Form(default="gallery"),
+    variant_id: Optional[str] = Form(default=None),
+    rights_status: str = Form(default="owned_or_licensed"),
+    source_note: Optional[str] = Form(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    try:
+        blob = await file.read()
+        return await upload_pdp_gallery_image(
+            pdp_id=pdp_id,
+            filename=file.filename or "gallery-image",
+            content_type=file.content_type or "application/octet-stream",
+            blob=blob,
+            alt_text=alt_text,
+            role=role,
+            variant_id=variant_id,
+            rights_status=rights_status,
+            source_note=source_note,
+            actor_type=REVIEW_ACTOR_HUMAN,
+            actor_id=_employee_actor(current_user),
+        )
     except Exception as exc:
         raise _map_error(exc)
 
