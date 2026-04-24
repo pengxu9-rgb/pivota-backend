@@ -966,7 +966,6 @@ async def list_pdp_subjects(
     await ensure_pdp_governance_tables()
     safe_limit = max(1, min(limit, 200))
     safe_offset = max(0, offset)
-    await seed_recent_pdp_subjects(limit=safe_offset + safe_limit)
     clauses = ["1 = 1"]
     params: Dict[str, Any] = {}
     if external_only is not None:
@@ -975,6 +974,18 @@ async def list_pdp_subjects(
     if market:
         clauses.append("market = :market")
         params["market"] = market.strip().upper()
+
+    existing_count_row = await database.fetch_one(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM pdp_subject_index
+        WHERE {' AND '.join(clauses)}
+        """,
+        params,
+    )
+    existing_total = int((_row_dict(existing_count_row)).get("total") or 0)
+    if safe_offset == 0 and existing_total == 0:
+        await seed_recent_pdp_subjects(limit=safe_limit)
 
     count_row = await database.fetch_one(
         f"""
@@ -1009,10 +1020,12 @@ async def list_pdp_subjects(
             break
         cursor += len(rows)
         scanned += len(rows)
-        for row in rows:
-            subject = _serialize_subject(_row_dict(row))
-            projection = await get_pdp_projection(pdp_id=subject["pdp_id"])
-            modules = projection["modules"]
+        subjects = [_serialize_subject(_row_dict(row)) for row in rows]
+        module_summaries_by_pdp = await _list_module_summaries_for_pdp_ids(
+            [str(subject["pdp_id"]) for subject in subjects if subject.get("pdp_id")]
+        )
+        for subject in subjects:
+            modules = module_summaries_by_pdp.get(str(subject["pdp_id"])) or _empty_module_summaries()
             if module_status and not any(module.get("status") == module_status for module in modules):
                 continue
             if review_actor and not any(module.get("review_actor_type") == review_actor for module in modules):
@@ -1049,6 +1062,78 @@ async def list_pdp_subjects(
         "total": total,
         "scanned": scanned,
     }
+
+
+def _empty_module_summaries() -> List[Dict[str, Any]]:
+    return [
+        {
+            "module_key": module_key,
+            "status": "needs_human_review" if module_key in HUMAN_CO_REVIEW_MODULES else "not_started",
+            "risk_level": "high" if module_key in HUMAN_CO_REVIEW_MODULES else "low",
+            "requires_human": module_key in HUMAN_CO_REVIEW_MODULES,
+            "review_actor_type": None,
+            "review_decision": None,
+        }
+        for module_key in PDP_MODULE_KEYS
+    ]
+
+
+async def _list_module_summaries_for_pdp_ids(pdp_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    clean_ids = [pdp_id for pdp_id in dict.fromkeys(pdp_ids) if pdp_id]
+    if not clean_ids:
+        return {}
+
+    params: Dict[str, Any]
+    if IS_POSTGRES:
+        where = "pdp_id = ANY(:pdp_ids)"
+        params = {"pdp_ids": clean_ids}
+    else:
+        params = {f"pdp_id_{idx}": pdp_id for idx, pdp_id in enumerate(clean_ids)}
+        where = "pdp_id IN (" + ", ".join(f":pdp_id_{idx}" for idx in range(len(clean_ids))) + ")"
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT *
+        FROM pdp_module_versions
+        WHERE {where}
+          AND (
+            stage = 'staged'
+            OR (stage = 'published' AND status = 'published' AND superseded_at IS NULL)
+          )
+        ORDER BY pdp_id, module_key, stage, version DESC, created_at DESC
+        """,
+        params,
+    )
+    selected: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for row in rows or []:
+        data = _serialize_module(row)
+        key = (str(data.get("pdp_id") or ""), str(data.get("module_key") or ""), str(data.get("stage") or ""))
+        if key[0] and key[1] and key[2] and key not in selected:
+            selected[key] = data
+
+    summaries: Dict[str, List[Dict[str, Any]]] = {}
+    empty_summaries = {summary["module_key"]: summary for summary in _empty_module_summaries()}
+    for pdp_id in clean_ids:
+        module_summaries: List[Dict[str, Any]] = []
+        for module_key in PDP_MODULE_KEYS:
+            current = selected.get((pdp_id, module_key, "published"))
+            staged = selected.get((pdp_id, module_key, "staged"))
+            active = staged or current
+            if not active:
+                module_summaries.append(dict(empty_summaries[module_key]))
+                continue
+            module_summaries.append(
+                {
+                    "module_key": module_key,
+                    "status": active.get("status") or "not_started",
+                    "risk_level": active.get("risk_level") or module_risk_level(module_key),
+                    "requires_human": bool(active.get("requires_human") or module_key in HUMAN_CO_REVIEW_MODULES),
+                    "review_actor_type": (current or staged or {}).get("review_actor_type"),
+                    "review_decision": (current or staged or {}).get("review_decision"),
+                }
+            )
+        summaries[pdp_id] = module_summaries
+    return summaries
 
 
 async def seed_recent_pdp_subjects(limit: int = 50) -> None:
