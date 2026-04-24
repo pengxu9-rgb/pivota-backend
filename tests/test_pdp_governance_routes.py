@@ -78,6 +78,33 @@ def test_employee_external_only_projection_exposes_module_governance_fields():
             assert "published_payload" in module
 
 
+def test_employee_pdp_list_exposes_pagination_metadata():
+    with _client() as client:
+        for seed_id in ("external-route-page-1", "external-route-page-2", "external-route-page-3"):
+            resolved = client.get(
+                "/employee/pdps/resolve",
+                params={"product_key": f"external_seed|external|{seed_id}", "market": "US"},
+            )
+            assert resolved.status_code == 200
+
+        first = client.get("/employee/pdps", params={"limit": 1, "market": "US"})
+        assert first.status_code == 200
+        body = first.json()
+        assert body["count"] == 1
+        assert body["limit"] == 1
+        assert body["offset"] == 0
+        assert body["next_offset"] >= 1
+        assert body["total"] >= 3
+        assert body["has_more"] is True
+
+        second = client.get("/employee/pdps", params={"limit": 1, "offset": body["next_offset"], "market": "US"})
+        assert second.status_code == 200
+        second_body = second.json()
+        assert second_body["offset"] == body["next_offset"]
+        assert second_body["count"] == 1
+        assert second_body["next_offset"] > second_body["offset"]
+
+
 def test_gpt55_gate_can_publish_low_risk_llm_candidate_after_review():
     with _client() as client:
         resolved = client.get(

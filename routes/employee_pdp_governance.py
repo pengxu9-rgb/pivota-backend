@@ -69,6 +69,7 @@ async def list_pdps(
     external_only: Optional[bool] = Query(default=None),
     market: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     try:
@@ -79,6 +80,7 @@ async def list_pdps(
             external_only=external_only,
             market=market,
             limit=limit,
+            offset=offset,
         )
     except Exception as exc:
         raise _map_error(exc)
