@@ -267,7 +267,47 @@ def _extract_product_summary(product_data: Dict[str, Any]) -> Dict[str, Any]:
         "variants": variants,
         "currency": product_data.get("currency") or product_data.get("price_currency"),
         "price": product_data.get("price") or product_data.get("price_amount"),
+        "brand": product_data.get("brand") or product_data.get("vendor") or product_data.get("manufacturer"),
+        "availability": product_data.get("availability") or product_data.get("available"),
     }
+
+
+def _product_key(merchant_id: Any, platform: Any, platform_product_id: Any) -> str:
+    return f"{merchant_id}|{platform}|{platform_product_id}"
+
+
+def _tokenize_match_text(value: Any) -> List[str]:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    stop = {"the", "and", "with", "for", "from", "size", "product", "new", "set", "kit", "a", "an", "of", "to"}
+    return [token for token in text.split() if len(token) >= 3 and token not in stop]
+
+
+def _match_score(target: Any, candidate: Any) -> Tuple[float, List[str]]:
+    target_tokens = set(_tokenize_match_text(target))
+    candidate_tokens = set(_tokenize_match_text(candidate))
+    if not target_tokens or not candidate_tokens:
+        return 0.0, []
+    overlap = sorted(target_tokens & candidate_tokens)
+    union = target_tokens | candidate_tokens
+    score = len(overlap) / max(1, len(union))
+    reasons = [f"title_token_overlap:{token}" for token in overlap[:5]]
+    if str(target or "").strip().lower() == str(candidate or "").strip().lower():
+        score = max(score, 0.98)
+        reasons.insert(0, "exact_title_match")
+    return min(1.0, score), reasons
+
+
+def _score_candidate(target_title: Any, candidate_title: Any, target_brand: Any = None, candidate_brand: Any = None) -> Tuple[float, List[str]]:
+    score, reasons = _match_score(target_title, candidate_title)
+    if target_brand and candidate_brand and str(target_brand).strip().lower() == str(candidate_brand).strip().lower():
+        score = min(1.0, score + 0.18)
+        reasons.append("brand_match")
+    return score, reasons
+
+
+def _named_in(prefix: str, values: List[str]) -> Tuple[str, Dict[str, str]]:
+    params = {f"{prefix}_{idx}": value for idx, value in enumerate(values)}
+    return ", ".join(f":{name}" for name in params), params
 
 
 async def ensure_pdp_governance_tables() -> None:
@@ -1256,6 +1296,302 @@ async def get_pdp_projection(
             if module.get("published_payload") is not None
         },
         "activity": activity,
+    }
+
+
+def _offer_price(amount: Any, currency: Any) -> Dict[str, Any]:
+    return {
+        "amount": amount if amount not in ("", None) else None,
+        "currency": str(currency or "USD").strip().upper() or "USD",
+    }
+
+
+def _seed_data(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _json_dict(row.get("seed_data"))
+
+
+def _seed_title(row: Dict[str, Any]) -> Optional[str]:
+    seed_data = _seed_data(row)
+    return seed_data.get("title") or row.get("title") or row.get("canonical_url") or row.get("destination_url")
+
+
+def _seed_brand(row: Dict[str, Any]) -> Optional[str]:
+    seed_data = _seed_data(row)
+    return seed_data.get("brand") or seed_data.get("vendor") or seed_data.get("merchant_display_name") or row.get("domain")
+
+
+def _seed_offer_row(row: Dict[str, Any], *, match_status: str = "confirmed") -> Dict[str, Any]:
+    seed_data = _seed_data(row)
+    variants = seed_data.get("variants") if isinstance(seed_data.get("variants"), list) else []
+    return {
+        "id": row.get("id"),
+        "source": "external_seed",
+        "match_status": match_status,
+        "external_product_id": row.get("external_product_id") or seed_data.get("external_product_id"),
+        "attached_product_key": row.get("attached_product_key"),
+        "attached_variant_id": row.get("attached_variant_id") or "∅",
+        "market": row.get("market") or DEFAULT_MARKET,
+        "tool": row.get("tool"),
+        "domain": row.get("domain"),
+        "title": _seed_title(row),
+        "brand": _seed_brand(row),
+        "image_url": seed_data.get("image_url") or row.get("image_url"),
+        "price": _offer_price(row.get("price_amount") or seed_data.get("price_amount") or seed_data.get("price"), row.get("price_currency") or seed_data.get("price_currency")),
+        "availability": seed_data.get("availability") or row.get("availability"),
+        "variants_count": len(variants),
+        "canonical_url": row.get("canonical_url"),
+        "destination_url": row.get("destination_url"),
+        "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text"),
+        "updated_at": _iso(row.get("updated_at")),
+        "created_at": _iso(row.get("created_at")),
+    }
+
+
+def _merchant_offer_row(product_key: str, merchant_id: str, platform: str, platform_product_id: str, product_data: Dict[str, Any], *, match_status: str = "confirmed") -> Dict[str, Any]:
+    summary = _extract_product_summary(product_data)
+    variants = summary.get("variants") if isinstance(summary.get("variants"), list) else []
+    return {
+        "id": product_key,
+        "source": "merchant_product",
+        "match_status": match_status,
+        "product_key": product_key,
+        "merchant_id": merchant_id,
+        "platform": platform,
+        "platform_product_id": platform_product_id,
+        "title": summary.get("title") or platform_product_id,
+        "brand": summary.get("brand"),
+        "image_url": summary.get("image_url"),
+        "price": _offer_price(summary.get("price"), summary.get("currency")),
+        "availability": summary.get("availability"),
+        "variants_count": len(variants),
+    }
+
+
+async def _subject_internal_product_keys(subject: Dict[str, Any]) -> List[str]:
+    product_keys: List[str] = []
+    product_group_id = subject.get("product_group_id")
+    if product_group_id:
+        try:
+            rows = await database.fetch_all(
+                """
+                SELECT merchant_id, platform, platform_product_id
+                FROM product_group_members
+                WHERE product_group_id = :product_group_id
+                ORDER BY is_primary DESC, updated_at DESC
+                """,
+                {"product_group_id": product_group_id},
+            )
+            for row in rows or []:
+                data = _row_dict(row)
+                product_keys.append(_product_key(data.get("merchant_id"), data.get("platform"), data.get("platform_product_id")))
+        except Exception:
+            product_keys = []
+
+    representative = str(subject.get("representative_product_key") or "").strip()
+    if representative and not is_external_seed_product_key(representative):
+        product_keys.append(representative)
+
+    seen = set()
+    return [key for key in product_keys if key and not (key in seen or seen.add(key))]
+
+
+async def _confirmed_internal_seller_offers(subject: Dict[str, Any]) -> List[Dict[str, Any]]:
+    offers: List[Dict[str, Any]] = []
+    for product_key in await _subject_internal_product_keys(subject):
+        try:
+            merchant_id, platform, platform_product_id = parse_product_key(product_key)
+        except ValueError:
+            continue
+        cache_row = await _fetch_latest_cache_row(merchant_id, platform, platform_product_id)
+        product_data = _json_dict(cache_row.get("product_data")) if cache_row else {}
+        offers.append(_merchant_offer_row(product_key, merchant_id, platform, platform_product_id, product_data))
+    return offers
+
+
+async def _confirmed_external_seed_offers(subject: Dict[str, Any], product_keys: List[str]) -> List[Dict[str, Any]]:
+    clauses: List[str] = ["status = 'active'"]
+    params: Dict[str, Any] = {"market": subject.get("market") or DEFAULT_MARKET}
+    market_clause = "(market = :market OR market IS NULL)"
+    clauses.append(market_clause)
+    external_product_id = str(subject.get("external_product_id") or "").strip()
+    or_clauses: List[str] = []
+    if external_product_id:
+        params["external_product_id"] = external_product_id
+        or_clauses.append("external_product_id = :external_product_id")
+    if product_keys:
+        in_clause, in_params = _named_in("product_key", product_keys)
+        params.update(in_params)
+        or_clauses.append(f"attached_product_key IN ({in_clause})")
+    if not or_clauses:
+        return []
+    clauses.append("(" + " OR ".join(or_clauses) + ")")
+    try:
+        rows = await database.fetch_all(
+            f"""
+            SELECT *
+            FROM external_product_seeds
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 200
+            """,
+            params,
+        )
+    except Exception:
+        return []
+    return [_seed_offer_row(_row_dict(row)) for row in rows or []]
+
+
+async def _external_seed_near_match_candidates(subject: Dict[str, Any], exclude_seed_ids: set) -> List[Dict[str, Any]]:
+    title = subject.get("title") or subject.get("subject_ref")
+    tokens = _tokenize_match_text(title)[:4]
+    if not tokens:
+        return []
+    clauses = ["status = 'active'", "(market = :market OR market IS NULL)"]
+    params: Dict[str, Any] = {"market": subject.get("market") or DEFAULT_MARKET}
+    token_clauses: List[str] = []
+    for idx, token in enumerate(tokens):
+        params[f"tok_{idx}"] = f"%{token}%"
+        token_clauses.append(f"LOWER(COALESCE(title, '')) LIKE :tok_{idx}")
+    clauses.append("(" + " OR ".join(token_clauses) + ")")
+    try:
+        rows = await database.fetch_all(
+            f"""
+            SELECT *
+            FROM external_product_seeds
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 200
+            """,
+            params,
+        )
+    except Exception:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    target_brand = None
+    for row in rows or []:
+        data = _row_dict(row)
+        if data.get("id") in exclude_seed_ids:
+            continue
+        if subject.get("external_product_id") and data.get("external_product_id") == subject.get("external_product_id"):
+            continue
+        score, reasons = _score_candidate(title, _seed_title(data), target_brand, _seed_brand(data))
+        if score < 0.22:
+            continue
+        offer = _seed_offer_row(data, match_status="candidate")
+        offer.update(
+            {
+                "candidate_type": "external_seed_near_match",
+                "confidence": round(score, 3),
+                "match_reasons": reasons or ["title_similarity"],
+                "recommended_action": "review_attach_external_offer_or_reject",
+                "requires_human": True,
+            }
+        )
+        candidates.append(offer)
+    candidates.sort(key=lambda item: float(item.get("confidence") or 0), reverse=True)
+    return candidates[:20]
+
+
+async def _merchant_product_near_match_candidates(subject: Dict[str, Any], exclude_product_keys: set) -> List[Dict[str, Any]]:
+    title = subject.get("title") or subject.get("subject_ref")
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT *
+            FROM products_cache
+            ORDER BY cached_at DESC, id DESC
+            LIMIT 500
+            """
+        )
+    except Exception:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    target_brand = None
+    for row in rows or []:
+        data = _row_dict(row)
+        product_key = _product_key(data.get("merchant_id"), data.get("platform"), data.get("platform_product_id"))
+        if product_key in exclude_product_keys:
+            continue
+        product_data = _json_dict(data.get("product_data"))
+        summary = _extract_product_summary(product_data)
+        score, reasons = _score_candidate(title, summary.get("title") or data.get("platform_product_id"), target_brand, summary.get("brand"))
+        if score < 0.22:
+            continue
+        offer = _merchant_offer_row(
+            product_key,
+            str(data.get("merchant_id")),
+            str(data.get("platform")),
+            str(data.get("platform_product_id")),
+            product_data,
+            match_status="candidate",
+        )
+        offer.update(
+            {
+                "candidate_type": "merchant_product_near_match",
+                "confidence": round(score, 3),
+                "match_reasons": reasons or ["title_similarity"],
+                "recommended_action": "review_product_group_merge_or_reject",
+                "requires_human": True,
+            }
+        )
+        candidates.append(offer)
+    candidates.sort(key=lambda item: float(item.get("confidence") or 0), reverse=True)
+    return candidates[:20]
+
+
+async def get_pdp_offer_reconciliation(
+    *,
+    pdp_id: str,
+    actor_role: Optional[str] = None,
+) -> Dict[str, Any]:
+    subject = await resolve_pdp_subject(pdp_id=pdp_id)
+    internal_offers = await _confirmed_internal_seller_offers(subject)
+    product_keys = [str(offer.get("product_key")) for offer in internal_offers if offer.get("product_key")]
+    external_offers = await _confirmed_external_seed_offers(subject, product_keys)
+    exclude_seed_ids = {offer.get("id") for offer in external_offers if offer.get("id")}
+    exclude_product_keys = {offer.get("product_key") for offer in internal_offers if offer.get("product_key")}
+    external_candidates = await _external_seed_near_match_candidates(subject, exclude_seed_ids)
+    merchant_candidates = await _merchant_product_near_match_candidates(subject, exclude_product_keys)
+
+    seller_count = len({offer.get("merchant_id") for offer in internal_offers if offer.get("merchant_id")})
+    candidate_count = len(external_candidates) + len(merchant_candidates)
+    return {
+        "status": "success",
+        "pdp": subject,
+        "summary": {
+            "seller_count": seller_count,
+            "pdp_index_seller_count": int(subject.get("seller_count") or 0),
+            "external_only": bool(subject.get("external_only")),
+            "confirmed_internal_seller_count": seller_count,
+            "confirmed_external_offer_count": len(external_offers),
+            "confirmed_offer_count": len(internal_offers) + len(external_offers),
+            "near_match_candidate_count": candidate_count,
+            "needs_identity_review": candidate_count > 0,
+            "product_group_id": subject.get("product_group_id"),
+            "external_product_id": subject.get("external_product_id"),
+        },
+        "confirmed": {
+            "internal_sellers": internal_offers,
+            "external_offers": external_offers,
+        },
+        "candidates": {
+            "merchant_products": merchant_candidates,
+            "external_seeds": external_candidates,
+        },
+        "review_guidance": [
+            "Confirmed internal sellers come from product_group_members for the PDP product_group_id.",
+            "Confirmed external offers come from attached external seeds or matching external_product_id.",
+            "Near-match candidates are evidence only until employee/senior identity review attaches or rejects them.",
+        ],
+        "allowed_actions": allowed_pdp_review_actions(
+            actor_role=actor_role,
+            module_key="offers",
+            risk_level="medium" if candidate_count else "low",
+            requires_human=bool(candidate_count),
+            module_status="needs_human_review" if candidate_count else "published",
+        ),
     }
 
 

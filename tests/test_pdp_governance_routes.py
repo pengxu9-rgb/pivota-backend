@@ -78,6 +78,30 @@ def test_employee_external_only_projection_exposes_module_governance_fields():
             assert "published_payload" in module
 
 
+def test_employee_offer_reconciliation_exposes_confirmed_and_candidate_sections():
+    with _client() as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-offer-reconciliation", "market": "US"},
+        )
+        assert resolved.status_code == 200
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+
+        reconciliation = client.get(f"/employee/pdps/{pdp_id}/offers/reconciliation")
+        assert reconciliation.status_code == 200
+        body = reconciliation.json()
+        assert body["status"] == "success"
+        assert body["pdp"]["pdp_id"] == pdp_id
+        assert "confirmed_internal_seller_count" in body["summary"]
+        assert "confirmed_external_offer_count" in body["summary"]
+        assert "near_match_candidate_count" in body["summary"]
+        assert isinstance(body["confirmed"]["internal_sellers"], list)
+        assert isinstance(body["confirmed"]["external_offers"], list)
+        assert isinstance(body["candidates"]["merchant_products"], list)
+        assert isinstance(body["candidates"]["external_seeds"], list)
+        assert "view" in body["allowed_actions"]
+
+
 def test_employee_pdp_list_exposes_pagination_metadata():
     with _client() as client:
         for seed_id in ("external-route-page-1", "external-route-page-2", "external-route-page-3"):
