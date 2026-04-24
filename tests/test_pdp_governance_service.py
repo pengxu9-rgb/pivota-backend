@@ -1,6 +1,7 @@
 from services.pdp_governance_service import (
     GPT55_REVIEW_MODEL,
     REVIEW_ACTOR_GPT55,
+    build_codex_gpt55_quality_gate_result,
     make_pdp_id,
     module_requires_human_review,
     run_gpt55_quality_gate,
@@ -78,3 +79,55 @@ def test_gpt55_quality_gate_rejects_missing_source_refs() -> None:
 
     assert result["decision"] == "reject"
     assert "missing_source_refs" in result["reasons"]
+
+
+def test_codex_gpt55_pass_with_failed_required_check_stays_human_review() -> None:
+    result = build_codex_gpt55_quality_gate_result(
+        module_key="copy",
+        payload={"title": "Plain Cotton Tee", "description": "Soft everyday shirt."},
+        source_refs=[{"type": "external_seed", "id": "seed-1"}],
+        external_rubric={
+            "decision": "pass",
+            "confidence": 0.94,
+            "reasons": ["reviewed in Codex window"],
+            "checks": {
+                "source_grounded": False,
+                "seller_entity_checkout_not_confused": True,
+                "variant_market_consistent": True,
+                "no_medical_regulated_promo_or_fake_review_claim": True,
+                "machine_publish_allowed_module": True,
+            },
+            "evidence_refs": ["external_seed:seed-1"],
+            "reviewed_in": "codex_external_window",
+        },
+    )
+
+    assert result["decision"] == "needs_human_review"
+    assert "codex_pass_failed_checks:source_grounded" in result["reasons"]
+    assert result["codex_gpt55_artifact"]["decision"] == "pass"
+    assert result["codex_gpt55_artifact"]["publish_blockers"] == ["codex_pass_failed_checks:source_grounded"]
+
+
+def test_codex_gpt55_pass_without_evidence_refs_stays_human_review() -> None:
+    result = build_codex_gpt55_quality_gate_result(
+        module_key="copy",
+        payload={"title": "Plain Cotton Tee", "description": "Soft everyday shirt."},
+        source_refs=[{"type": "external_seed", "id": "seed-1"}],
+        external_rubric={
+            "decision": "pass",
+            "confidence": 0.94,
+            "reasons": ["reviewed in Codex window"],
+            "checks": {
+                "source_grounded": True,
+                "seller_entity_checkout_not_confused": True,
+                "variant_market_consistent": True,
+                "no_medical_regulated_promo_or_fake_review_claim": True,
+                "machine_publish_allowed_module": True,
+            },
+            "evidence_refs": [],
+            "reviewed_in": "codex_external_window",
+        },
+    )
+
+    assert result["decision"] == "needs_human_review"
+    assert "codex_pass_missing_evidence_refs" in result["reasons"]
