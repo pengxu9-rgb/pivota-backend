@@ -1310,9 +1310,20 @@ async def _build_review_queue_item(
     task = await _ensure_review_task_for_module(subject, module)
     if not task:
         return None
-    current = await _current_published_version(subject["pdp_id"], module["module_key"])
-    staged = await _latest_staged_version(subject["pdp_id"], module["module_key"])
-    active = staged or current or {}
+    if "current_payload" in module or "staged_payload" in module:
+        current = {"payload": module.get("current_payload") or {}}
+        staged = {"payload": module.get("staged_payload") or {}} if module.get("staged_payload") is not None else None
+        active = {
+            "payload": module.get("staged_payload") if module.get("staged_payload") is not None else module.get("current_payload") or {},
+            "source_refs": module.get("source_refs") or [],
+            "risk_level": module.get("risk_level"),
+            "requires_human": module.get("requires_human"),
+            "status": module.get("status"),
+        }
+    else:
+        current = await _current_published_version(subject["pdp_id"], module["module_key"])
+        staged = await _latest_staged_version(subject["pdp_id"], module["module_key"])
+        active = staged or current or {}
     refs = active.get("source_refs") or []
     risk = module.get("risk_level") or active.get("risk_level") or module_risk_level(module["module_key"])
     requires_human = bool(module.get("requires_human") or active.get("requires_human") or module["module_key"] in HUMAN_CO_REVIEW_MODULES)
@@ -1432,6 +1443,13 @@ async def list_pdp_review_queue(
             if module_key and module.get("module_key") != module_key:
                 continue
             if risk and module.get("risk_level") != risk:
+                continue
+            module_status = str(module.get("status") or "")
+            if (
+                selected_tab != "published_monitor"
+                and module_status == "published"
+                and not module.get("has_staged")
+            ):
                 continue
             item = await _build_review_queue_item(subject=subject, module=module, actor_role=actor_role)
             if not item:
@@ -2112,8 +2130,13 @@ async def _list_module_summaries_for_pdp_ids(pdp_ids: List[str]) -> Dict[str, Li
                     "requires_human": bool(active.get("requires_human") or module_key in HUMAN_CO_REVIEW_MODULES),
                     "review_actor_type": (current or staged or {}).get("review_actor_type"),
                     "review_decision": (current or staged or {}).get("review_decision"),
+                    "last_reviewer": (current or staged or {}).get("last_reviewer"),
                     "created_at": active.get("created_at"),
                     "source_count": len(active.get("source_refs") or []),
+                    "source_refs": active.get("source_refs") or [],
+                    "current_payload": (current or {}).get("payload") or {},
+                    "staged_payload": (staged or {}).get("payload") if staged else None,
+                    "has_staged": bool(staged),
                 }
             )
         summaries[pdp_id] = module_summaries
