@@ -269,6 +269,28 @@ def _check_gpt55_gate_sample(
     failures.append(f"GPT-5.5 quality-gate sample has no low-risk published module: {candidate_ids}")
 
 
+def _check_hydration_status(api_base: str, token: str, failures: List[str]) -> None:
+    payload = _api_json(api_base, "/employee/pdps/hydration", token=token)
+    if payload.get("status") != "success":
+        failures.append(f"PDP hydration status returned non-success: {payload}")
+    total = int(payload.get("total") or 0)
+    if total <= 0:
+        failures.append(f"PDP hydration status has empty subject index: {payload}")
+    print(
+        json.dumps(
+            {
+                "event": "pdp_subject_index_hydration_status_checked",
+                "total": total,
+                "external_only": payload.get("external_only"),
+                "internal_or_multi_merchant": payload.get("internal_or_multi_merchant"),
+                "last_updated_at": payload.get("last_updated_at"),
+            },
+            default=_json_default,
+            sort_keys=True,
+        )
+    )
+
+
 def _check_portal_bundles(
     pages: Sequence[str],
     failures: List[str],
@@ -385,6 +407,8 @@ def run(args: argparse.Namespace) -> int:
     merchant_id = ((merchant_login.get("user") or {}) if isinstance(merchant_login.get("user"), dict) else {}).get("merchant_id")
     if not merchant_id:
         failures.append("merchant login did not return merchant_id")
+
+    _check_hydration_status(api_base, employee_token, failures)
 
     external_pdp_id = _find_pdp_id(
         api_base,
