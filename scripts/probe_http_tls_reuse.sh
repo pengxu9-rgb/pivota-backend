@@ -8,9 +8,9 @@ set -euo pipefail
 #   scripts/probe_http_tls_reuse.sh <URL> [COUNT]
 #
 # Examples:
-#   scripts/probe_http_tls_reuse.sh https://web-production-fedb.up.railway.app/health 5
+#   scripts/probe_http_tls_reuse.sh https://api.pivota.cc/health 5
 #   METHOD=POST BODY_JSON='{"alias":"test-product"}' \
-#     scripts/probe_http_tls_reuse.sh https://web-production-fedb.up.railway.app/v1/subject/resolve 5
+#     scripts/probe_http_tls_reuse.sh https://api.pivota.cc/v1/subject/resolve 5
 #
 # Optional env:
 #   METHOD=GET|POST|PUT|PATCH|DELETE   (default: GET)

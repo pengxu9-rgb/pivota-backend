@@ -101,7 +101,7 @@ ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \
 python3 scripts/run_pivot_release_bundle.py \
   --base-url "$BASE_URL" \
   --release-gate-base-url https://api.pivota.cc \
-  --smoke-base-url https://web-production-fedb.up.railway.app \
+  --smoke-base-url https://api.pivota.cc \
   --corpus scripts/fixtures/pivot_release_gate/prod_corpus.json \
   --merchant-id "$MERCHANT_ID" \
   --output-dir output/pivot-release/prod-shadow \
@@ -191,7 +191,7 @@ python3 scripts/pivot_multi_release_gate.py \
 
 python3 scripts/commerce_shadow_audit.py \
   --gateway-base-url https://api.pivota.cc \
-  --pivot-base-url https://web-production-fedb.up.railway.app \
+  --pivot-base-url https://api.pivota.cc \
   --pivot-header "Authorization: Bearer $ADMIN_JWT" \
   --corpus scripts/fixtures/generic_commerce_shadow_corpus.json \
   --timeout-seconds 20 \
@@ -239,7 +239,7 @@ ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \
 
 python3 scripts/beauty_ranking_audit.py \
   --gateway-base-url https://api.pivota.cc \
-  --pivot-base-url https://web-production-fedb.up.railway.app \
+  --pivot-base-url https://api.pivota.cc \
   --gateway-header "Authorization: Bearer $SHOP_GATEWAY_AGENT_API_KEY" \
   --pivot-header "Authorization: Bearer $ADMIN_JWT" \
   --database-url "$DATABASE_PUBLIC_URL" \
@@ -279,7 +279,7 @@ Before deploy, capture a generic-commerce baseline:
 ```bash
 python3 scripts/commerce_shadow_audit.py \
   --gateway-base-url https://api.pivota.cc \
-  --pivot-base-url https://web-production-fedb.up.railway.app \
+  --pivot-base-url https://api.pivota.cc \
   --pivot-header "Authorization: Bearer $ADMIN_JWT" \
   --corpus scripts/fixtures/generic_commerce_shadow_corpus.json \
   --timeout-seconds 6 \

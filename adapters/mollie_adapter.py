@@ -9,6 +9,7 @@ import httpx
 from datetime import datetime
 
 from .base_psp_adapter import BasePSPAdapter, PaymentStatus
+from config.settings import resolve_public_api_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,11 @@ class MollieAdapter(BasePSPAdapter):
         
         # Mollie API base URL
         self.base_url = 'https://api.mollie.com/v2'
+        self.webhook_base_url = str(
+            config.get("webhook_base_url")
+            or config.get("public_api_base_url")
+            or resolve_public_api_base_url()
+        ).rstrip("/")
         
         self.headers = {
             'Authorization': f'Bearer {self.api_key}',
@@ -64,7 +70,7 @@ class MollieAdapter(BasePSPAdapter):
                 },
                 "description": f"Order {order_id}",
                 "redirectUrl": f"https://pivota.cc/order/{order_id}/complete",
-                "webhookUrl": f"https://web-production-fedb.up.railway.app/webhooks/mollie/{order_id}",
+                "webhookUrl": f"{self.webhook_base_url}/webhooks/mollie/{order_id}",
                 "metadata": metadata or {}
             }
             
@@ -338,6 +344,5 @@ class MollieAdapter(BasePSPAdapter):
                 'success': False,
                 'error': str(e)
             }
-
 
 

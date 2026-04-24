@@ -2,9 +2,9 @@
 
 ## App Overview
 - App name: Pivota Merchant
-- App URL: https://web-production-fedb.up.railway.app
+- App URL: https://api.pivota.cc
 - OAuth redirect URL:
-  - https://web-production-fedb.up.railway.app/integrations/shopify/oauth/callback
+  - https://api.pivota.cc/integrations/shopify/oauth/callback
 
 ## Installation Instructions
 1) Provide your Shopify MyShopify domain (e.g. `your-store.myshopify.com`).
@@ -37,7 +37,7 @@ Configured in Partner Dashboard to the static endpoint below:
 - customers/redact
 - shop/redact
 Endpoint:
-  https://web-production-fedb.up.railway.app/webhooks/shopify/gdpr
+  https://api.pivota.cc/webhooks/shopify/gdpr
 
 ## Uninstall Handling
 - We listen to `app/uninstalled` webhook and:

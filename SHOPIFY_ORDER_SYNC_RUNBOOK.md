@@ -34,7 +34,7 @@
 示例：
 
 ```bash
-export API_BASE="https://web-production-fedb.up.railway.app"
+export API_BASE="https://api.pivota.cc"
 export ADMIN_API_KEY="***"
 export ORDER_ID="ORD_XXXX"
 

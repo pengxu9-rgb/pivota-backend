@@ -5,7 +5,7 @@ set -euo pipefail
 # then exchange -> create -> approve -> verify visible on read path.
 #
 # Env:
-# - REVIEWS_BASE_URL (required)  e.g. https://pivota-backend-production.up.railway.app
+# - REVIEWS_BASE_URL (required)  e.g. https://api.pivota.cc
 # - ORDER_ID (required)
 # - PLATFORM_PRODUCT_ID (optional; if set, request is scoped to this item)
 # - VARIANT_ID (optional)

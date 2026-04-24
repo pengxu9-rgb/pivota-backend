@@ -7,6 +7,10 @@ from urllib.parse import urlparse
 from pydantic_settings import BaseSettings
 
 DEFAULT_PUBLIC_API_BASE_URL = "https://api.pivota.cc"
+LEGACY_PUBLIC_API_HOSTS = {
+    "web-production-fedb.up.railway.app",
+    "pivota-backend-production.up.railway.app",
+}
 
 
 def _normalize_public_url(value: Optional[str]) -> str:
@@ -21,6 +25,14 @@ def _is_local_public_host(value: str) -> bool:
     return host in {"127.0.0.1", "0.0.0.0", "localhost"}
 
 
+def _is_legacy_public_api_host(value: str) -> bool:
+    try:
+        host = (urlparse(value).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in LEGACY_PUBLIC_API_HOSTS
+
+
 def resolve_public_api_base_url() -> str:
     for candidate in (
         os.getenv("PUBLIC_API_BASE_URL"),
@@ -30,7 +42,11 @@ def resolve_public_api_base_url() -> str:
         DEFAULT_PUBLIC_API_BASE_URL,
     ):
         normalized = _normalize_public_url(candidate)
-        if normalized and not _is_local_public_host(normalized):
+        if (
+            normalized
+            and not _is_local_public_host(normalized)
+            and not _is_legacy_public_api_host(normalized)
+        ):
             return normalized
     return DEFAULT_PUBLIC_API_BASE_URL
 

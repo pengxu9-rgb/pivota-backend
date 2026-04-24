@@ -4,7 +4,7 @@ set -euo pipefail
 # Smoke: enqueue an invitation send job and wait for the worker to mark it sent/cancelled/error.
 #
 # Required env:
-# - REVIEWS_BASE_URL (e.g. https://web-production-fedb.up.railway.app)
+# - REVIEWS_BASE_URL (e.g. https://api.pivota.cc)
 # - MERCHANT_ID
 # - ORDER_ID
 # - X_INTERNAL_KEY (invitation issuer internal key)
