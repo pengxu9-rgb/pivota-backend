@@ -6,7 +6,7 @@
 - The email uses a short link (`/r/{code}`) that redirects (302) to the buyer write page with the token in the URL fragment.
 
 ## Required services
-- Web backend (production): `https://web-production-fedb.up.railway.app`
+- Web backend (production): `https://api.pivota.cc`
 - Proof issuer (production): `https://reviews-proof-issuer-production.up.railway.app`
 - Invitation worker (production): runs `scripts/run_reviews_invitation_send_loop.sh`
 
@@ -31,7 +31,7 @@
 
 ## Environment variables (invitation worker)
 - `DATABASE_URL` (same Postgres as web backend)
-- `REVIEWS_BASE_URL=https://web-production-fedb.up.railway.app` (recommended; avoids env drift)
+- `REVIEWS_BASE_URL=https://api.pivota.cc` (recommended; avoids env drift)
 - `REVIEWS_INVITATION_ISSUER_INTERNAL_KEY` (same as web backend)
 - `REVIEWS_INVITATION_WORKER_ENABLED=true` and/or `REVIEWS_INVITATION_SEND_DELAY_SECONDS>0`
 - `SLEEP_SECONDS` (default `60`)
@@ -41,7 +41,7 @@
 
 ## Verification (no SQL)
 - Health/build:
-  - `curl --http1.1 -sS https://web-production-fedb.up.railway.app/__build`
+  - `curl --http1.1 -sS https://api.pivota.cc/__build`
   - `curl --http1.1 -sS https://reviews-proof-issuer-production.up.railway.app/__build`
 - Enqueue + send (requires internal key):
   - `POST /internal/reviews/v1/invitation/issue-from-order`

@@ -55,7 +55,7 @@ Validated:
   - `403bc7b`: persisted `platform_refund_id` into `refund_records`
   - `fc7a63b`: hardened Shopify parent/refund transaction handling and soft-skip behavior
   - `9458e06`: added readiness return-sync route
-- production summary-only smoke against `https://web-production-fedb.up.railway.app`
+- production summary-only smoke against `https://api.pivota.cc`
   - readiness report summary: `200`
   - UCP export summary: `200`
   - blocked checkout probe: `409`

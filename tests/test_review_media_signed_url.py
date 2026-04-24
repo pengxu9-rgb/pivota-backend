@@ -27,12 +27,12 @@ def test_build_signed_review_media_url_returns_relative_by_default(monkeypatch) 
 
 
 def test_build_signed_review_media_url_returns_absolute_when_public_base_configured(monkeypatch) -> None:
-    monkeypatch.setenv("REVIEW_MEDIA_PUBLIC_BASE_URL", "https://web-production-fedb.up.railway.app")
+    monkeypatch.setenv("REVIEW_MEDIA_PUBLIC_BASE_URL", "https://api.pivota.cc")
     monkeypatch.setenv("REVIEWS_MEDIA_SIGNING_SECRET", "unit-test-secret")
     _freeze_now(monkeypatch)
 
     url = reviews_service.build_signed_review_media_url(public_id="pub_456", ttl_seconds=300)
-    assert url.startswith("https://web-production-fedb.up.railway.app/agent/shop/v1/review-media/pub_456?")
+    assert url.startswith("https://api.pivota.cc/agent/shop/v1/review-media/pub_456?")
 
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
@@ -42,9 +42,9 @@ def test_build_signed_review_media_url_returns_absolute_when_public_base_configu
 
 
 def test_build_signed_review_media_url_sanitizes_public_base_value(monkeypatch) -> None:
-    monkeypatch.setenv("REVIEW_MEDIA_PUBLIC_BASE_URL", " \"https://web-production-fedb.up.railway.app/\\n\" ")
+    monkeypatch.setenv("REVIEW_MEDIA_PUBLIC_BASE_URL", " \"https://api.pivota.cc/\\n\" ")
     monkeypatch.setenv("REVIEWS_MEDIA_SIGNING_SECRET", "unit-test-secret")
     _freeze_now(monkeypatch)
 
     url = reviews_service.build_signed_review_media_url(public_id="pub_789", ttl_seconds=300)
-    assert url.startswith("https://web-production-fedb.up.railway.app/agent/shop/v1/review-media/pub_789?")
+    assert url.startswith("https://api.pivota.cc/agent/shop/v1/review-media/pub_789?")

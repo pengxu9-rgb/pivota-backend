@@ -47,7 +47,7 @@ Security note:
 Run from repo root:
 
 ```bash
-REVIEWS_BASE_URL="https://pivota-backend-production.up.railway.app" \
+REVIEWS_BASE_URL="https://api.pivota.cc" \
 PROOF_ISSUER_BASE_URL="https://proof-issuer-production.up.railway.app" \
 MERCHANT_ID="<merchant_id>" \
 PLATFORM="shopify" \
@@ -73,7 +73,7 @@ Optional invitation flow:
 
 ```bash
 RUN_INVITATION_FLOW=true \
-REVIEWS_BASE_URL="https://pivota-backend-production.up.railway.app" \
+REVIEWS_BASE_URL="https://api.pivota.cc" \
 PROOF_ISSUER_BASE_URL="https://proof-issuer-production.up.railway.app" \
 MERCHANT_ID="<merchant_id>" \
 PLATFORM="shopify" \

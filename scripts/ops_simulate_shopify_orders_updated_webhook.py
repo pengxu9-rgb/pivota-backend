@@ -253,7 +253,7 @@ def _post_shopify_webhook(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Simulate Shopify orders/updated webhook using real Shopify order payload.")
-    ap.add_argument("--base-url", required=True, help="Backend base URL, e.g. https://web-production-fedb.up.railway.app")
+    ap.add_argument("--base-url", required=True, help="Backend base URL, e.g. https://api.pivota.cc")
     ap.add_argument("--order-id", required=True, help="Pivota order id, e.g. ORD_...")
     ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""), help="Postgres DATABASE_URL (overrides --database-url-file)")
     ap.add_argument("--database-url-file", default=os.getenv("DATABASE_URL_FILE", ""), help="File containing postgresql://... (can include extra text)")

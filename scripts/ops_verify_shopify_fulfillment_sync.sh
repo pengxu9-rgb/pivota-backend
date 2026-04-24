@@ -8,7 +8,7 @@ if [[ -z "${ORDER_ID}" ]]; then
   exit 2
 fi
 
-BASE_URL="${BASE_URL:-https://web-production-fedb.up.railway.app}"
+BASE_URL="${BASE_URL:-https://api.pivota.cc}"
 DATABASE_URL_FILE="${DATABASE_URL_FILE:-$HOME/Desktop/prod_DATABASE_URL.txt}"
 
 db_args=()

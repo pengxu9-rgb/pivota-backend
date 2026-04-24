@@ -6,7 +6,7 @@ set -euo pipefail
 # Requires an authenticated Pivota JWT (admin/employee, or merchant for self).
 #
 # Usage:
-#   BASE_URL="https://web-production-fedb.up.railway.app" \
+#   BASE_URL="https://api.pivota.cc" \
 #   TOKEN="..." \
 #   MERCHANT_ID="merch_..." \
 #   SHOP_DOMAIN="your-shop.myshopify.com" \

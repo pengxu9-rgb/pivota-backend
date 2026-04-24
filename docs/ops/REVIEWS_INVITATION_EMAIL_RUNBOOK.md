@@ -4,7 +4,7 @@ This runbook covers sending buyer review invitation emails after delivery/shippi
 
 ## Components
 
-- **Reviews backend (prod):** `https://web-production-fedb.up.railway.app`
+- **Reviews backend (prod):** `https://api.pivota.cc`
   - Mints `invitation_token` from paid orders (server-side only)
   - Sends email via SendGrid (server-side only)
 - **Proof issuer (prod):** `https://reviews-proof-issuer-production.up.railway.app`
@@ -13,7 +13,7 @@ This runbook covers sending buyer review invitation emails after delivery/shippi
   - The invitation token should be passed via **URL fragment** (not query) to reduce Referer leakage:
     - `https://agent.pivota.cc/reviews/write#invitation_token=<token>`
 
-## Required env (Reviews backend: `web-production-fedb`)
+## Required env (Reviews backend: `api.pivota.cc`)
 
 **Invitation link**
 - `REVIEWS_BUYER_INVITATION_LINK_BASE_URL=https://agent.pivota.cc/reviews/write`
@@ -49,7 +49,7 @@ This runbook covers sending buyer review invitation emails after delivery/shippi
 From repo root (`pivota-backend-clean`):
 
 - Send email (does not print buyer email nor tokens):
-  - `REVIEWS_BASE_URL="https://web-production-fedb.up.railway.app" MERCHANT_ID="<...>" ORDER_ID="<...>" /bin/bash scripts/smoke_send_reviews_invitation_email_from_order.sh`
+  - `REVIEWS_BASE_URL="https://api.pivota.cc" MERCHANT_ID="<...>" ORDER_ID="<...>" /bin/bash scripts/smoke_send_reviews_invitation_email_from_order.sh`
 
 ## Automated sending (Railway loop worker)
 
@@ -60,7 +60,7 @@ Railway doesn’t provide cron, so we run a small loop service.
 
 **Worker env**
 - `DATABASE_URL=<prod postgres url>`
-- `REVIEWS_BASE_URL=https://web-production-fedb.up.railway.app`
+- `REVIEWS_BASE_URL=https://api.pivota.cc`
 - `REVIEWS_INVITATION_ISSUER_INTERNAL_KEY=<same as backend>`
 - Optional tuning:
   - `SLEEP_SECONDS=3600`
@@ -81,4 +81,3 @@ Railway doesn’t provide cron, so we run a small loop service.
    - `reviews_buyer_create_total`
    - `reviews_buyer_media_upload_total`
 4) Expand allowlist gradually; clear allowlist only when ready for broader exposure.
-

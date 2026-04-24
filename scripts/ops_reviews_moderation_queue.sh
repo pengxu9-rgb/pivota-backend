@@ -7,7 +7,7 @@ set -euo pipefail
 #   /bin/bash scripts/ops_reviews_moderation_queue.sh
 #
 # Env (optional):
-# - BASE_URL (default: https://web-production-fedb.up.railway.app)
+# - BASE_URL (default: https://api.pivota.cc)
 # - MERCHANT_ID (optional filter)
 # - LIMIT (default: 50)
 # - SET_REVIEW_ID (optional; if set, call employee status update)
@@ -17,7 +17,7 @@ set -euo pipefail
 # Prompts (no echo):
 # - JWT_SECRET_KEY (to mint an employee JWT)
 
-BASE_URL="${BASE_URL:-https://web-production-fedb.up.railway.app}"
+BASE_URL="${BASE_URL:-https://api.pivota.cc}"
 MERCHANT_ID="${MERCHANT_ID:-}"
 LIMIT="${LIMIT:-50}"
 SET_REVIEW_ID="${SET_REVIEW_ID:-}"
