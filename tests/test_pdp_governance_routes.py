@@ -256,6 +256,31 @@ def test_review_queue_exposes_module_tasks_and_permissions():
         assert any(row["pdp_id"] == pdp_id and row["module_key"] == "copy" for row in filtered.json()["items"])
 
 
+def test_published_monitor_uses_read_only_synthetic_rows():
+    with _client(role="admin") as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-published-monitor", "market": "US"},
+        )
+        assert resolved.status_code == 200
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+        detail = client.get(f"/employee/pdps/{pdp_id}")
+        assert detail.status_code == 200
+
+        queue = client.get(
+            "/employee/pdps/review-queue",
+            params={"tab": "published_monitor", "module_key": "copy", "market": "US"},
+        )
+        assert queue.status_code == 200
+        item = next(row for row in queue.json()["items"] if row["pdp_id"] == pdp_id and row["module_key"] == "copy")
+        assert item["task_id"].startswith("published:")
+        assert item["status"] == "published_monitor"
+        assert item["module_status"] == "published"
+        assert "view" in item["allowed_actions"]
+        assert "rollback" in item["allowed_actions"]
+        assert "publish" not in item["allowed_actions"]
+
+
 def test_outsourced_publish_requires_checklist_and_blocks_high_risk():
     with _client(role="outsourced") as client:
         resolved = client.get(
