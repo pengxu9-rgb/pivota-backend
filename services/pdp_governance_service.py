@@ -15,6 +15,7 @@ from db.pdp_governance import (
     pdp_gallery_assets,
     pdp_audit_log,
     pdp_module_versions,
+    pdp_review_tasks,
     pdp_subject_index,
 )
 from db.products import products_cache
@@ -60,6 +61,30 @@ GPT55_RUBRIC_REQUIRED_CHECKS = {
 HUMAN_CO_REVIEW_MODULES = {
     "gallery",
     "reviews",
+}
+
+SENIOR_REVIEW_ROLES = {"senior_employee", "admin", "super_admin", "superadmin"}
+EMPLOYEE_REVIEW_ROLES = {"employee", *SENIOR_REVIEW_ROLES}
+OUTSOURCED_REVIEW_ROLES = {"outsourced"}
+LOW_RISK_OUTSOURCED_MODULES = {"copy", "pivota_insights", "offers", "external_sources", "quality", "variants"}
+HIGH_RISK_REVIEW_MODULES = {
+    "gallery",
+    "reviews",
+    "external_proof",
+    "highlight_badges",
+    "regulated_claims",
+    "safety_claims",
+    "merchant_disputes",
+    "rollback_recovery",
+}
+PDP_REVIEW_QUEUE_TABS = {
+    "needs_review",
+    "my_queue",
+    "publish_ready",
+    "escalated",
+    "senior_review",
+    "qa_sample",
+    "published_monitor",
 }
 
 HIGH_RISK_PAYLOAD_KEYS = {
@@ -352,6 +377,30 @@ async def ensure_pdp_governance_tables() -> None:
         );
         """
     )
+    await database.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS pdp_review_tasks (
+          id TEXT PRIMARY KEY,
+          pdp_id TEXT NOT NULL,
+          module_key TEXT NOT NULL,
+          version_id TEXT NULL,
+          status TEXT NOT NULL DEFAULT 'needs_review',
+          assignee_actor_id TEXT NULL,
+          assignee_role TEXT NULL,
+          priority TEXT NOT NULL DEFAULT 'normal',
+          qa_sample BOOLEAN NOT NULL DEFAULT FALSE,
+          checklist {json_type} NULL,
+          policy_labels {json_type} NULL,
+          decision_tree_path {json_type} NULL,
+          escalation_reason TEXT NULL,
+          override_reason TEXT NULL,
+          review_duration_ms INTEGER NULL,
+          created_at {timestamp_type} NOT NULL DEFAULT {now_expr},
+          updated_at {timestamp_type} NOT NULL DEFAULT {now_expr},
+          resolved_at {timestamp_type} NULL
+        );
+        """
+    )
 
     index_statements = [
         "CREATE INDEX IF NOT EXISTS idx_pdp_subject_index_subject ON pdp_subject_index(subject_type, subject_ref);",
@@ -362,6 +411,9 @@ async def ensure_pdp_governance_tables() -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdp_audit_log_created ON pdp_audit_log(created_at);",
         "CREATE INDEX IF NOT EXISTS idx_merchant_pdp_contributions_status ON merchant_pdp_contributions(status, created_at);",
         "CREATE INDEX IF NOT EXISTS idx_pdp_gallery_assets_pdp_created ON pdp_gallery_assets(pdp_id, created_at);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_review_tasks_lookup ON pdp_review_tasks(pdp_id, module_key, version_id);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_review_tasks_status_updated ON pdp_review_tasks(status, updated_at);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_review_tasks_assignee ON pdp_review_tasks(assignee_actor_id, status);",
     ]
     for statement in index_statements:
         await database.execute(statement)
@@ -913,6 +965,7 @@ def _empty_module_summary(module_key: str) -> Dict[str, Any]:
     requires_human = module_key in HUMAN_CO_REVIEW_MODULES
     return {
         "module_key": module_key,
+        "version_id": None,
         "status": "needs_human_review" if requires_human else "not_started",
         "risk_level": "high" if requires_human else "low",
         "requires_human": requires_human,
@@ -923,6 +976,166 @@ def _empty_module_summary(module_key: str) -> Dict[str, Any]:
         "last_reviewer": None,
         "review_actor_type": None,
         "review_decision": None,
+        "created_at": None,
+        "source_count": 0,
+    }
+
+
+def normalize_employee_role(role: Optional[str]) -> str:
+    normalized = str(role or "employee").strip().lower()
+    if normalized == "superadmin":
+        return "super_admin"
+    return normalized or "employee"
+
+
+def is_senior_employee_role(role: Optional[str]) -> bool:
+    return normalize_employee_role(role) in SENIOR_REVIEW_ROLES
+
+
+def is_employee_review_role(role: Optional[str]) -> bool:
+    return normalize_employee_role(role) in EMPLOYEE_REVIEW_ROLES
+
+
+def is_outsourced_review_role(role: Optional[str]) -> bool:
+    return normalize_employee_role(role) in OUTSOURCED_REVIEW_ROLES
+
+
+def checklist_passed(checklist: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(checklist, dict) or not checklist:
+        return False
+    return all(bool(value) for value in checklist.values())
+
+
+def allowed_pdp_review_actions(
+    *,
+    actor_role: Optional[str],
+    module_key: str,
+    risk_level: str,
+    requires_human: bool,
+    module_status: Optional[str] = None,
+) -> List[str]:
+    role = normalize_employee_role(actor_role)
+    risk = str(risk_level or "low").lower()
+    status = str(module_status or "")
+    actions = {"view", "assign", "skip", "escalate"}
+
+    senior = is_senior_employee_role(role)
+    employee = is_employee_review_role(role)
+    outsourced = is_outsourced_review_role(role)
+    low_risk_outsourced = (
+        outsourced
+        and risk == "low"
+        and not requires_human
+        and module_key in LOW_RISK_OUTSOURCED_MODULES
+    )
+
+    if senior:
+        actions.update(
+            {
+                "edit_draft",
+                "publish",
+                "reject",
+                "needs_human_review",
+                "rollback",
+                "override",
+                "qa_sample",
+                "reassign",
+                "version_restore",
+            }
+        )
+    elif employee:
+        actions.update({"edit_draft", "reject", "needs_human_review", "reassign", "qa_sample"})
+        if risk != "high":
+            actions.add("publish")
+    elif low_risk_outsourced:
+        actions.update({"edit_draft", "publish", "reject", "needs_human_review"})
+
+    if status == "published":
+        actions.discard("publish")
+        if senior:
+            actions.add("rollback")
+    return sorted(actions)
+
+
+def _source_summary(source_refs: Any) -> Dict[str, Any]:
+    refs = source_refs if isinstance(source_refs, list) else []
+    by_type: Dict[str, int] = {}
+    for ref in refs:
+        ref_type = str((ref or {}).get("type") if isinstance(ref, dict) else "source_ref")
+        by_type[ref_type] = by_type.get(ref_type, 0) + 1
+    return {"count": len(refs), "by_type": by_type}
+
+
+def _flatten_payload(value: Any, prefix: str = "$") -> Dict[str, Any]:
+    if value is None or not isinstance(value, (dict, list)):
+        return {prefix: value}
+    if isinstance(value, list):
+        if not value:
+            return {prefix: []}
+        merged: Dict[str, Any] = {}
+        for index, item in enumerate(value):
+            merged.update(_flatten_payload(item, f"{prefix}[{index}]"))
+        return merged
+    if not value:
+        return {prefix: {}}
+    merged: Dict[str, Any] = {}
+    for key, item in value.items():
+        merged.update(_flatten_payload(item, str(key) if prefix == "$" else f"{prefix}.{key}"))
+    return merged
+
+
+def _diff_summary(current_payload: Any, staged_payload: Any) -> Dict[str, Any]:
+    if staged_payload is None:
+        return {"changed_paths": 0, "added": 0, "removed": 0, "changed": 0}
+    current_flat = _flatten_payload(current_payload or {})
+    staged_flat = _flatten_payload(staged_payload or {})
+    paths = sorted(set(current_flat.keys()) | set(staged_flat.keys()))
+    added = removed = changed = 0
+    for path in paths:
+        if path not in current_flat:
+            added += 1
+        elif path not in staged_flat:
+            removed += 1
+        elif json.dumps(current_flat[path], sort_keys=True, default=str) != json.dumps(staged_flat[path], sort_keys=True, default=str):
+            changed += 1
+    return {"changed_paths": added + removed + changed, "added": added, "removed": removed, "changed": changed}
+
+
+def _hours_since(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (_now() - dt).total_seconds() / 3600)
+    except Exception:
+        return None
+
+
+def _serialize_review_task(row: Any) -> Dict[str, Any]:
+    data = _row_dict(row)
+    if not data:
+        return {}
+    return {
+        "task_id": data.get("id"),
+        "pdp_id": data.get("pdp_id"),
+        "module_key": data.get("module_key"),
+        "version_id": data.get("version_id"),
+        "status": data.get("status") or "needs_review",
+        "assignee": data.get("assignee_actor_id"),
+        "assignee_role": data.get("assignee_role"),
+        "priority": data.get("priority") or "normal",
+        "qa_sample": bool(data.get("qa_sample")),
+        "checklist": _json(data.get("checklist")) or {},
+        "policy_labels": _json(data.get("policy_labels")) or [],
+        "decision_tree_path": _json(data.get("decision_tree_path")) or [],
+        "escalation_reason": data.get("escalation_reason"),
+        "override_reason": data.get("override_reason"),
+        "review_duration_ms": data.get("review_duration_ms"),
+        "created_at": _iso(data.get("created_at")),
+        "updated_at": _iso(data.get("updated_at")),
+        "resolved_at": _iso(data.get("resolved_at")),
     }
 
 
@@ -932,6 +1145,7 @@ async def get_pdp_projection(
     product_key: Optional[str] = None,
     external_seed_id: Optional[str] = None,
     market: str = DEFAULT_MARKET,
+    actor_role: Optional[str] = None,
 ) -> Dict[str, Any]:
     subject = await resolve_pdp_subject(
         pdp_id=pdp_id,
@@ -951,6 +1165,13 @@ async def get_pdp_projection(
             empty = _empty_module_summary(module_key)
             empty["history"] = history
             empty["source_refs"] = baseline_refs
+            empty["allowed_actions"] = allowed_pdp_review_actions(
+                actor_role=actor_role,
+                module_key=module_key,
+                risk_level=empty["risk_level"],
+                requires_human=bool(empty["requires_human"]),
+                module_status=empty["status"],
+            )
             modules.append(empty)
             continue
         active = staged or current
@@ -967,6 +1188,13 @@ async def get_pdp_projection(
                 "last_reviewer": (current or staged or {}).get("last_reviewer"),
                 "review_actor_type": (current or staged or {}).get("review_actor_type"),
                 "review_decision": (current or staged or {}).get("review_decision"),
+                "allowed_actions": allowed_pdp_review_actions(
+                    actor_role=actor_role,
+                    module_key=module_key,
+                    risk_level=(active or {}).get("risk_level") or module_risk_level(module_key),
+                    requires_human=bool((active or {}).get("requires_human") or module_key in HUMAN_CO_REVIEW_MODULES),
+                    module_status=(staged or current or {}).get("status") or "not_started",
+                ),
                 "history": history,
             }
         )
@@ -1005,6 +1233,363 @@ async def get_pdp_projection(
         },
         "activity": activity,
     }
+
+
+def _initial_review_task_status(module_status: str) -> str:
+    if module_status == "published":
+        return "published_monitor"
+    if module_status in {"approved", "draft", "needs_human_review"}:
+        return "needs_review"
+    if module_status in {"reject", "rejected"}:
+        return "resolved"
+    return "needs_review"
+
+
+async def _ensure_review_task_for_module(subject: Dict[str, Any], module: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    version_id = module.get("version_id")
+    if not version_id:
+        return None
+    existing = await database.fetch_one(
+        """
+        SELECT *
+        FROM pdp_review_tasks
+        WHERE pdp_id = :pdp_id
+          AND module_key = :module_key
+          AND version_id = :version_id
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        {"pdp_id": subject["pdp_id"], "module_key": module["module_key"], "version_id": version_id},
+    )
+    if existing:
+        return _serialize_review_task(existing)
+
+    now = _now()
+    task = {
+        "id": f"pdptask_{uuid.uuid4().hex}",
+        "pdp_id": subject["pdp_id"],
+        "module_key": module["module_key"],
+        "version_id": version_id,
+        "status": _initial_review_task_status(str(module.get("status") or "")),
+        "assignee_actor_id": None,
+        "assignee_role": None,
+        "priority": "high" if module.get("risk_level") == "high" else "normal",
+        "qa_sample": False,
+        "checklist": {},
+        "policy_labels": [],
+        "decision_tree_path": [],
+        "escalation_reason": None,
+        "override_reason": None,
+        "review_duration_ms": None,
+        "created_at": now,
+        "updated_at": now,
+        "resolved_at": now if str(module.get("status")) == "published" else None,
+    }
+    await database.execute(pdp_review_tasks.insert().values(**task))
+    return _serialize_review_task(task)
+
+
+async def _review_task_by_id(task_id: str) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    row = await database.fetch_one(
+        "SELECT * FROM pdp_review_tasks WHERE id = :task_id LIMIT 1",
+        {"task_id": task_id},
+    )
+    task = _serialize_review_task(row)
+    if not task:
+        raise LookupError("PDP_REVIEW_TASK_NOT_FOUND")
+    return task
+
+
+async def _build_review_queue_item(
+    *,
+    subject: Dict[str, Any],
+    module: Dict[str, Any],
+    actor_role: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    task = await _ensure_review_task_for_module(subject, module)
+    if not task:
+        return None
+    current = await _current_published_version(subject["pdp_id"], module["module_key"])
+    staged = await _latest_staged_version(subject["pdp_id"], module["module_key"])
+    active = staged or current or {}
+    refs = active.get("source_refs") or []
+    risk = module.get("risk_level") or active.get("risk_level") or module_risk_level(module["module_key"])
+    requires_human = bool(module.get("requires_human") or active.get("requires_human") or module["module_key"] in HUMAN_CO_REVIEW_MODULES)
+    module_status = module.get("status") or active.get("status") or "not_started"
+    return {
+        **task,
+        "pdp_title": subject.get("title") or subject.get("subject_ref"),
+        "pdp_image_url": subject.get("image_url"),
+        "subject_type": subject.get("subject_type"),
+        "subject_ref": subject.get("subject_ref"),
+        "market": subject.get("market"),
+        "external_only": bool(subject.get("external_only")),
+        "seller_count": int(subject.get("seller_count") or 0),
+        "risk_level": risk,
+        "requires_human": requires_human,
+        "module_status": module_status,
+        "review_actor_type": module.get("review_actor_type"),
+        "review_decision": module.get("review_decision"),
+        "sla_age_hours": _hours_since(task.get("created_at") or module.get("created_at")),
+        "source_summary": _source_summary(refs),
+        "diff_summary": _diff_summary((current or {}).get("payload"), (staged or {}).get("payload") if staged else None),
+        "risk_reasons": _review_risk_reasons(module["module_key"], risk, requires_human, (active or {}).get("payload")),
+        "allowed_actions": allowed_pdp_review_actions(
+            actor_role=actor_role,
+            module_key=module["module_key"],
+            risk_level=str(risk),
+            requires_human=requires_human,
+            module_status=module_status,
+        ),
+    }
+
+
+def _review_risk_reasons(module_key: str, risk_level: str, requires_human: bool, payload: Any = None) -> List[str]:
+    reasons: List[str] = []
+    if requires_human:
+        reasons.append("human_co_review_required")
+    if module_key in HIGH_RISK_REVIEW_MODULES:
+        reasons.append(f"{module_key}_high_risk_module")
+    if str(risk_level) == "high":
+        reasons.append("high_risk")
+    text = _text_blob(payload).lower()
+    for key in HIGH_RISK_PAYLOAD_KEYS:
+        if key in text and f"payload:{key}" not in reasons:
+            reasons.append(f"payload:{key}")
+    return reasons[:6]
+
+
+def _queue_item_matches_tab(item: Dict[str, Any], tab: str, actor_id: Optional[str]) -> bool:
+    status = str(item.get("status") or "")
+    if tab == "my_queue":
+        return bool(actor_id and item.get("assignee") == actor_id)
+    if tab == "publish_ready":
+        return "publish" in (item.get("allowed_actions") or []) and item.get("module_status") != "published"
+    if tab == "escalated":
+        return status == "escalated"
+    if tab == "senior_review":
+        return status == "escalated" or bool(item.get("requires_human")) or item.get("risk_level") == "high"
+    if tab == "qa_sample":
+        return bool(item.get("qa_sample"))
+    if tab == "published_monitor":
+        return item.get("module_status") == "published" or status == "published_monitor"
+    return status in {"needs_review", "assigned"} and item.get("module_status") != "published"
+
+
+async def list_pdp_review_queue(
+    *,
+    actor_role: Optional[str],
+    actor_id: Optional[str],
+    tab: str = "needs_review",
+    module_key: Optional[str] = None,
+    risk: Optional[str] = None,
+    status: Optional[str] = None,
+    assignee: Optional[str] = None,
+    external_only: Optional[bool] = None,
+    market: Optional[str] = None,
+    seller_count: Optional[str] = None,
+    source_type: Optional[str] = None,
+    last_reviewer: Optional[str] = None,
+    staleness: Optional[str] = None,
+    priority: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    safe_limit = max(1, min(limit, 200))
+    safe_offset = max(0, offset)
+    selected_tab = tab if tab in PDP_REVIEW_QUEUE_TABS else "needs_review"
+
+    clauses = ["1 = 1"]
+    params: Dict[str, Any] = {}
+    if external_only is not None:
+        clauses.append("external_only = :external_only")
+        params["external_only"] = external_only
+    if market:
+        clauses.append("market = :market")
+        params["market"] = market.strip().upper()
+
+    subject_rows = await database.fetch_all(
+        f"""
+        SELECT *
+        FROM pdp_subject_index
+        WHERE {' AND '.join(clauses)}
+        ORDER BY updated_at DESC
+        LIMIT :limit
+        """,
+        {**params, "limit": 500},
+    )
+    subjects = [_serialize_subject(_row_dict(row)) for row in subject_rows]
+    module_summaries_by_pdp = await _list_module_summaries_for_pdp_ids([str(subject["pdp_id"]) for subject in subjects])
+
+    all_items: List[Dict[str, Any]] = []
+    for subject in subjects:
+        modules = module_summaries_by_pdp.get(str(subject["pdp_id"])) or _empty_module_summaries()
+        for module in modules:
+            if not module.get("version_id"):
+                continue
+            if module_key and module.get("module_key") != module_key:
+                continue
+            if risk and module.get("risk_level") != risk:
+                continue
+            item = await _build_review_queue_item(subject=subject, module=module, actor_role=actor_role)
+            if not item:
+                continue
+            if status and item.get("status") != status and item.get("module_status") != status:
+                continue
+            if assignee and item.get("assignee") != assignee:
+                continue
+            if seller_count:
+                sellers = int(item.get("seller_count") or 0)
+                if seller_count == "external_only" and sellers != 0:
+                    continue
+                if seller_count == "single" and sellers != 1:
+                    continue
+                if seller_count == "multi" and sellers < 2:
+                    continue
+            if source_type and source_type not in (item.get("source_summary") or {}).get("by_type", {}):
+                continue
+            if last_reviewer:
+                reviewer_match = {
+                    str(item.get("review_actor_type") or ""),
+                    str(item.get("review_decision") or ""),
+                    str(item.get("assignee_role") or ""),
+                    str(item.get("assignee") or ""),
+                }
+                if last_reviewer not in reviewer_match:
+                    continue
+            if priority and item.get("priority") != priority:
+                continue
+            if staleness:
+                age = float(item.get("sla_age_hours") or 0.0)
+                if staleness == "fresh" and age >= 24:
+                    continue
+                if staleness == "over_24h" and age < 24:
+                    continue
+                if staleness == "over_72h" and age < 72:
+                    continue
+            if not _queue_item_matches_tab(item, selected_tab, actor_id):
+                continue
+            all_items.append(item)
+
+    all_items.sort(
+        key=lambda item: (
+            0 if item.get("risk_level") == "high" else 1 if item.get("risk_level") == "medium" else 2,
+            -(float(item.get("sla_age_hours") or 0.0)),
+            str(item.get("pdp_title") or ""),
+        )
+    )
+    items = all_items[safe_offset : safe_offset + safe_limit]
+    summary = {
+        "tasks": len(all_items),
+        "needs_review": sum(1 for item in all_items if item.get("status") in {"needs_review", "assigned"}),
+        "publish_ready": sum(1 for item in all_items if "publish" in (item.get("allowed_actions") or []) and item.get("module_status") != "published"),
+        "high_risk": sum(1 for item in all_items if item.get("risk_level") == "high"),
+        "escalated": sum(1 for item in all_items if item.get("status") == "escalated"),
+        "qa_sample": sum(1 for item in all_items if item.get("qa_sample")),
+        "gpt55_reviewed": sum(1 for item in all_items if item.get("review_actor_type") == REVIEW_ACTOR_GPT55),
+    }
+    return {
+        "status": "success",
+        "tab": selected_tab,
+        "items": items,
+        "summary": summary,
+        "count": len(items),
+        "total": len(all_items),
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "next_offset": safe_offset + len(items),
+        "has_more": safe_offset + len(items) < len(all_items),
+        "scanned_subjects": len(subjects),
+    }
+
+
+async def get_pdp_review_task(
+    *,
+    task_id: str,
+    actor_role: Optional[str],
+) -> Dict[str, Any]:
+    task = await _review_task_by_id(task_id)
+    projection = await get_pdp_projection(pdp_id=task["pdp_id"], actor_role=actor_role)
+    module = next((mod for mod in projection.get("modules", []) if mod.get("module_key") == task["module_key"]), None)
+    if not module:
+        raise LookupError("PDP_REVIEW_TASK_NOT_FOUND")
+    item = await _build_review_queue_item(subject=projection["pdp"], module={**module, "version_id": task.get("version_id") or module.get("staged", {}).get("id") or module.get("current", {}).get("id")}, actor_role=actor_role)
+    return {"status": "success", "task": item or task, "pdp": projection["pdp"], "module": module, "published_payload": projection.get("published_payload") or {}, "activity": projection.get("activity") or []}
+
+
+async def assign_pdp_review_task(
+    *,
+    task_id: str,
+    assignee_actor_id: Optional[str],
+    assignee_role: Optional[str],
+    actor_role: Optional[str],
+    actor_id: Optional[str],
+) -> Dict[str, Any]:
+    task = await _review_task_by_id(task_id)
+    allowed = allowed_pdp_review_actions(actor_role=actor_role, module_key=task["module_key"], risk_level="low", requires_human=False)
+    if "assign" not in allowed:
+        raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
+    now = _now()
+    assignee = assignee_actor_id or actor_id
+    await database.execute(
+        pdp_review_tasks.update()
+        .where(pdp_review_tasks.c.id == task_id)
+        .values(
+            status="assigned",
+            assignee_actor_id=assignee,
+            assignee_role=normalize_employee_role(assignee_role or actor_role),
+            updated_at=now,
+        )
+    )
+    await _audit(
+        pdp_id=task["pdp_id"],
+        module_key=task["module_key"],
+        action="review_task_assigned",
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        details={"task_id": task_id, "assignee": assignee},
+    )
+    return {"status": "success", "task": await _review_task_by_id(task_id)}
+
+
+async def update_pdp_review_task_status(
+    *,
+    task_id: str,
+    next_status: str,
+    actor_role: Optional[str],
+    actor_id: Optional[str],
+    reason: Optional[str] = None,
+    qa_sample: Optional[bool] = None,
+) -> Dict[str, Any]:
+    task = await _review_task_by_id(task_id)
+    if next_status not in {"needs_review", "assigned", "escalated", "skipped", "qa_sample", "resolved"}:
+        raise ValueError("INVALID_PDP_REVIEW_TASK_STATUS")
+    if next_status == "escalated" and not (reason or "").strip():
+        raise ValueError("PDP_REVIEW_ESCALATION_REASON_REQUIRED")
+    if next_status == "qa_sample" and not is_senior_employee_role(actor_role) and not is_employee_review_role(actor_role):
+        raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
+    now = _now()
+    values: Dict[str, Any] = {
+        "status": next_status,
+        "updated_at": now,
+        "resolved_at": now if next_status in {"skipped", "resolved"} else None,
+    }
+    if next_status == "escalated":
+        values["escalation_reason"] = (reason or "").strip()
+    if qa_sample is not None or next_status == "qa_sample":
+        values["qa_sample"] = True if qa_sample is None else bool(qa_sample)
+    await database.execute(pdp_review_tasks.update().where(pdp_review_tasks.c.id == task_id).values(**values))
+    await _audit(
+        pdp_id=task["pdp_id"],
+        module_key=task["module_key"],
+        action=f"review_task_{next_status}",
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        details={"task_id": task_id, "reason": reason},
+    )
+    return {"status": "success", "task": await _review_task_by_id(task_id)}
 
 
 async def list_pdp_subjects(
@@ -1348,6 +1933,7 @@ async def upload_pdp_gallery_image(
     source_note: Optional[str] = None,
     actor_type: str = REVIEW_ACTOR_HUMAN,
     actor_id: Optional[str] = None,
+    actor_role: Optional[str] = None,
 ) -> Dict[str, Any]:
     await ensure_pdp_governance_tables()
     subject = await resolve_pdp_subject(pdp_id=pdp_id)
@@ -1454,6 +2040,7 @@ async def upload_pdp_gallery_image(
         generation_ref=image_id,
         actor_type=actor_type,
         actor_id=actor_id,
+        actor_role=actor_role,
     )
     return {"status": "success", "image": image, "module": module}
 
@@ -1519,11 +2106,14 @@ async def _list_module_summaries_for_pdp_ids(pdp_ids: List[str]) -> Dict[str, Li
             module_summaries.append(
                 {
                     "module_key": module_key,
+                    "version_id": active.get("id"),
                     "status": active.get("status") or "not_started",
                     "risk_level": active.get("risk_level") or module_risk_level(module_key),
                     "requires_human": bool(active.get("requires_human") or module_key in HUMAN_CO_REVIEW_MODULES),
                     "review_actor_type": (current or staged or {}).get("review_actor_type"),
                     "review_decision": (current or staged or {}).get("review_decision"),
+                    "created_at": active.get("created_at"),
+                    "source_count": len(active.get("source_refs") or []),
                 }
             )
         summaries[pdp_id] = module_summaries
@@ -1816,6 +2406,7 @@ async def create_module_draft(
     generation_ref: Optional[str] = None,
     actor_type: str = REVIEW_ACTOR_HUMAN,
     actor_id: Optional[str] = None,
+    actor_role: Optional[str] = None,
 ) -> Dict[str, Any]:
     await ensure_pdp_governance_tables()
     _validate_module_key(module_key)
@@ -1824,6 +2415,17 @@ async def create_module_draft(
     source_refs = source_refs if isinstance(source_refs, list) else []
     version = await _next_module_version(subject["pdp_id"], module_key)
     requires_human = module_requires_human_review(module_key, payload)
+    risk_level = module_risk_level(module_key, payload)
+    if actor_type == REVIEW_ACTOR_HUMAN:
+        allowed = allowed_pdp_review_actions(
+            actor_role=actor_role,
+            module_key=module_key,
+            risk_level=risk_level,
+            requires_human=requires_human,
+            module_status="draft",
+        )
+        if "edit_draft" not in allowed:
+            raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
     row = {
         "id": f"pdpmod_{uuid.uuid4().hex}",
         "pdp_id": subject["pdp_id"],
@@ -1839,7 +2441,7 @@ async def create_module_draft(
         "review_decision": None,
         "review_confidence": None,
         "review_rubric": None,
-        "risk_level": module_risk_level(module_key, payload),
+        "risk_level": risk_level,
         "requires_human": requires_human,
         "generated_by": generated_by,
         "generation_ref": generation_ref,
@@ -2089,9 +2691,16 @@ async def review_module_version(
     version_id: Optional[str] = None,
     actor_type: str,
     actor_id: Optional[str] = None,
+    actor_role: Optional[str] = None,
     decision: Optional[str] = None,
     notes: Optional[str] = None,
     external_rubric: Optional[Dict[str, Any]] = None,
+    checklist: Optional[Dict[str, Any]] = None,
+    policy_labels: Optional[List[str]] = None,
+    decision_tree_path: Optional[List[str]] = None,
+    escalation_reason: Optional[str] = None,
+    review_duration_ms: Optional[int] = None,
+    override_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     await ensure_pdp_governance_tables()
     _validate_module_key(module_key)
@@ -2123,7 +2732,40 @@ async def review_module_version(
     if review_decision not in {"pass", "reject", "needs_human_review"}:
         raise ValueError("INVALID_REVIEW_DECISION")
 
+    if actor_type == REVIEW_ACTOR_HUMAN:
+        risk = module_risk_level(module_key, payload)
+        requires_human = module_requires_human_review(module_key, payload)
+        allowed = allowed_pdp_review_actions(
+            actor_role=actor_role,
+            module_key=module_key,
+            risk_level=risk,
+            requires_human=requires_human,
+            module_status=version.get("status"),
+        )
+        if review_decision == "pass" and "publish" not in allowed:
+            raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
+        if review_decision == "reject" and "reject" not in allowed:
+            raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
+        if override_reason and "override" not in allowed:
+            raise PermissionError("PDP_REVIEW_OVERRIDE_FORBIDDEN")
+        if review_decision == "pass" and is_outsourced_review_role(actor_role):
+            if not checklist_passed(checklist):
+                raise ValueError("PDP_REVIEW_CHECKLIST_REQUIRED")
+            if not policy_labels:
+                raise ValueError("PDP_REVIEW_POLICY_LABEL_REQUIRED")
+
     status = "approved" if review_decision == "pass" else review_decision
+    audit_review_context = {
+        "checklist": checklist if isinstance(checklist, dict) else {},
+        "policy_labels": policy_labels if isinstance(policy_labels, list) else [],
+        "decision_tree_path": decision_tree_path if isinstance(decision_tree_path, list) else [],
+        "escalation_reason": escalation_reason,
+        "override_reason": override_reason,
+        "review_duration_ms": review_duration_ms,
+        "actor_role": normalize_employee_role(actor_role),
+    }
+    if actor_type == REVIEW_ACTOR_HUMAN:
+        rubric = {**rubric, **audit_review_context}
     await database.execute(
         pdp_module_versions.update()
         .where(pdp_module_versions.c.id == version["id"])
@@ -2145,7 +2787,22 @@ async def review_module_version(
         action="module_reviewed",
         actor_type=actor_type,
         actor_id=actor_id,
-        details={"version_id": version["id"], "decision": review_decision, "notes": notes},
+        details={"version_id": version["id"], "decision": review_decision, "notes": notes, **audit_review_context},
+    )
+    await database.execute(
+        pdp_review_tasks.update()
+        .where(pdp_review_tasks.c.version_id == version["id"])
+        .values(
+            checklist=audit_review_context["checklist"],
+            policy_labels=audit_review_context["policy_labels"],
+            decision_tree_path=audit_review_context["decision_tree_path"],
+            escalation_reason=escalation_reason,
+            override_reason=override_reason,
+            review_duration_ms=review_duration_ms,
+            status="resolved" if review_decision in {"pass", "reject"} else "needs_review",
+            resolved_at=_now() if review_decision in {"pass", "reject"} else None,
+            updated_at=_now(),
+        )
     )
 
     can_publish = review_decision == "pass" and (
@@ -2255,9 +2912,12 @@ async def rollback_module(
     target_version_id: str,
     actor_type: str = REVIEW_ACTOR_HUMAN,
     actor_id: Optional[str] = None,
+    actor_role: Optional[str] = None,
 ) -> Dict[str, Any]:
     await ensure_pdp_governance_tables()
     _validate_module_key(module_key)
+    if actor_type == REVIEW_ACTOR_HUMAN and not is_senior_employee_role(actor_role):
+        raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
     target = await _fetch_module_version(pdp_id, module_key, target_version_id)
     if target.get("stage") != "published":
         raise ValueError("ROLLBACK_TARGET_MUST_BE_PUBLISHED")

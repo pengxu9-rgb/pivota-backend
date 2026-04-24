@@ -114,3 +114,31 @@ pdp_gallery_assets = Table(
 )
 
 Index("idx_pdp_gallery_assets_pdp_created", pdp_gallery_assets.c.pdp_id, pdp_gallery_assets.c.created_at.desc())
+
+
+pdp_review_tasks = Table(
+    "pdp_review_tasks",
+    metadata,
+    Column("id", String(96), primary_key=True),
+    Column("pdp_id", String(96), nullable=False, index=True),
+    Column("module_key", String(40), nullable=False, index=True),
+    Column("version_id", String(96), nullable=True, index=True),
+    Column("status", String(32), nullable=False, default="needs_review"),
+    Column("assignee_actor_id", String(128), nullable=True),
+    Column("assignee_role", String(64), nullable=True),
+    Column("priority", String(24), nullable=False, default="normal"),
+    Column("qa_sample", Boolean, nullable=False, default=False),
+    Column("checklist", JSONB_TYPE, nullable=True),
+    Column("policy_labels", JSONB_TYPE, nullable=True),
+    Column("decision_tree_path", JSONB_TYPE, nullable=True),
+    Column("escalation_reason", Text, nullable=True),
+    Column("override_reason", Text, nullable=True),
+    Column("review_duration_ms", Integer, nullable=True),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column("resolved_at", DateTime(timezone=True), nullable=True),
+)
+
+Index("idx_pdp_review_tasks_lookup", pdp_review_tasks.c.pdp_id, pdp_review_tasks.c.module_key, pdp_review_tasks.c.version_id)
+Index("idx_pdp_review_tasks_status_updated", pdp_review_tasks.c.status, pdp_review_tasks.c.updated_at.desc())
+Index("idx_pdp_review_tasks_assignee", pdp_review_tasks.c.assignee_actor_id, pdp_review_tasks.c.status)
