@@ -8,9 +8,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from config.settings import resolve_public_api_base_url
 from db.database import IS_POSTGRES, database
 from db.pdp_governance import (
     merchant_pdp_contributions,
+    pdp_gallery_assets,
     pdp_audit_log,
     pdp_module_versions,
     pdp_subject_index,
@@ -249,6 +251,7 @@ async def ensure_pdp_governance_tables() -> None:
         return
 
     json_type = "JSONB" if IS_POSTGRES else "JSON"
+    binary_type = "BYTEA" if IS_POSTGRES else "BLOB"
     now_expr = "NOW()" if IS_POSTGRES else "CURRENT_TIMESTAMP"
     timestamp_type = "TIMESTAMPTZ" if IS_POSTGRES else "DATETIME"
 
@@ -334,6 +337,21 @@ async def ensure_pdp_governance_tables() -> None:
         );
         """
     )
+    await database.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS pdp_gallery_assets (
+          id TEXT PRIMARY KEY,
+          pdp_id TEXT NOT NULL,
+          filename TEXT NULL,
+          content_type TEXT NOT NULL,
+          byte_size INTEGER NOT NULL,
+          data {binary_type} NOT NULL,
+          created_by_actor_type TEXT NULL,
+          created_by_actor_id TEXT NULL,
+          created_at {timestamp_type} NOT NULL DEFAULT {now_expr}
+        );
+        """
+    )
 
     index_statements = [
         "CREATE INDEX IF NOT EXISTS idx_pdp_subject_index_subject ON pdp_subject_index(subject_type, subject_ref);",
@@ -343,6 +361,7 @@ async def ensure_pdp_governance_tables() -> None:
         "CREATE INDEX IF NOT EXISTS idx_pdp_module_versions_created ON pdp_module_versions(created_at);",
         "CREATE INDEX IF NOT EXISTS idx_pdp_audit_log_created ON pdp_audit_log(created_at);",
         "CREATE INDEX IF NOT EXISTS idx_merchant_pdp_contributions_status ON merchant_pdp_contributions(status, created_at);",
+        "CREATE INDEX IF NOT EXISTS idx_pdp_gallery_assets_pdp_created ON pdp_gallery_assets(pdp_id, created_at);",
     ]
     for statement in index_statements:
         await database.execute(statement)
@@ -1173,6 +1192,15 @@ def _pdp_gallery_public_base_url() -> str:
     return _first_env("PDP_GALLERY_PUBLIC_BASE_URL", "PHOTO_UPLOAD_PUBLIC_BASE_URL", "S3_PUBLIC_BASE_URL", default="").rstrip("/")
 
 
+def _pdp_gallery_asset_public_base_url() -> str:
+    return _first_env(
+        "PDP_GALLERY_ASSET_PUBLIC_BASE_URL",
+        "PUBLIC_API_BASE_URL",
+        "PUBLIC_BASE_URL",
+        default=resolve_public_api_base_url(),
+    ).rstrip("/")
+
+
 def _pdp_gallery_s3_endpoint_url() -> Optional[str]:
     value = _first_env("PDP_GALLERY_S3_ENDPOINT_URL", "PHOTO_UPLOAD_ENDPOINT_URL", "AWS_ENDPOINT_URL", "S3_ENDPOINT_URL", default="")
     return value or None
@@ -1262,6 +1290,51 @@ def _gallery_images_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]
     return images
 
 
+async def store_pdp_gallery_asset(
+    *,
+    pdp_id: str,
+    filename: str,
+    content_type: str,
+    blob: bytes,
+    actor_type: str,
+    actor_id: Optional[str],
+) -> Dict[str, Any]:
+    asset_id = f"pdp_gallery_asset_{uuid.uuid4().hex}"
+    await database.execute(
+        pdp_gallery_assets.insert().values(
+            id=asset_id,
+            pdp_id=pdp_id,
+            filename=filename,
+            content_type=content_type,
+            byte_size=len(blob),
+            data=blob,
+            created_by_actor_type=actor_type,
+            created_by_actor_id=actor_id,
+            created_at=_now(),
+        )
+    )
+    base_url = _pdp_gallery_asset_public_base_url()
+    return {
+        "id": asset_id,
+        "url": f"{base_url}/employee/pdps/gallery-assets/{asset_id}",
+        "storage": {
+            "type": "database",
+            "asset_id": asset_id,
+            "content_type": content_type,
+            "byte_size": len(blob),
+        },
+    }
+
+
+async def get_pdp_gallery_asset(asset_id: str) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    row = await database.fetch_one(pdp_gallery_assets.select().where(pdp_gallery_assets.c.id == asset_id))
+    asset = _row_dict(row)
+    if not asset:
+        raise ValueError("PDP_GALLERY_ASSET_NOT_FOUND")
+    return asset
+
+
 async def upload_pdp_gallery_image(
     *,
     pdp_id: str,
@@ -1288,25 +1361,43 @@ async def upload_pdp_gallery_image(
     if len(blob) > max_bytes:
         raise ValueError("GALLERY_IMAGE_TOO_LARGE")
 
+    image_id = f"gallery_img_{uuid.uuid4().hex}"
     bucket = _pdp_gallery_bucket()
     public_base = _pdp_gallery_public_base_url()
-    if not bucket or not public_base:
-        raise RuntimeError("PDP_GALLERY_STORAGE_NOT_CONFIGURED")
-    client = _pdp_gallery_s3_client()
-    if client is None:
-        raise RuntimeError("PDP_GALLERY_STORAGE_CLIENT_UNAVAILABLE")
+    if bucket and public_base:
+        client = _pdp_gallery_s3_client()
+        if client is None:
+            raise RuntimeError("PDP_GALLERY_STORAGE_CLIENT_UNAVAILABLE")
 
-    image_id = f"gallery_img_{uuid.uuid4().hex}"
-    ext = _gallery_file_ext(filename, ct)
-    prefix = _pdp_gallery_prefix()
-    key = f"{prefix}/{subject['pdp_id']}/{image_id}{ext}" if prefix else f"{subject['pdp_id']}/{image_id}{ext}"
+        ext = _gallery_file_ext(filename, ct)
+        prefix = _pdp_gallery_prefix()
+        key = f"{prefix}/{subject['pdp_id']}/{image_id}{ext}" if prefix else f"{subject['pdp_id']}/{image_id}{ext}"
 
-    try:
-        client.put_object(Bucket=bucket, Key=key, Body=blob, ContentType=ct)
-    except Exception as exc:
-        raise RuntimeError(f"PDP_GALLERY_STORAGE_UPLOAD_FAILED:{type(exc).__name__}") from exc
+        try:
+            client.put_object(Bucket=bucket, Key=key, Body=blob, ContentType=ct)
+        except Exception as exc:
+            raise RuntimeError(f"PDP_GALLERY_STORAGE_UPLOAD_FAILED:{type(exc).__name__}") from exc
 
-    image_url = f"{public_base}/{key}"
+        image_url = f"{public_base}/{key}"
+        storage = {
+            "type": "s3",
+            "bucket": bucket,
+            "object_key": key,
+            "content_type": ct,
+            "byte_size": len(blob),
+        }
+    else:
+        stored = await store_pdp_gallery_asset(
+            pdp_id=subject["pdp_id"],
+            filename=filename,
+            content_type=ct,
+            blob=blob,
+            actor_type=actor_type,
+            actor_id=actor_id,
+        )
+        image_url = stored["url"]
+        storage = stored["storage"]
+
     normalized_role = role if role in GALLERY_IMAGE_ROLES else "gallery"
     normalized_rights = rights_status if rights_status in GALLERY_RIGHTS_STATUSES else "unknown"
 
@@ -1332,12 +1423,7 @@ async def upload_pdp_gallery_image(
         "uploaded_by_actor_type": actor_type,
         "uploaded_by_actor_id": actor_id,
         "uploaded_at": _now().isoformat(),
-        "storage": {
-            "bucket": bucket,
-            "object_key": key,
-            "content_type": ct,
-            "byte_size": len(blob),
-        },
+        "storage": storage,
     }
     images.append(image)
     primary = next((img for img in images if img.get("is_primary")), images[0] if images else image)

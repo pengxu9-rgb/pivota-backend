@@ -128,6 +128,44 @@ def test_employee_pdp_hydration_status_and_sync_refresh():
         assert refreshed_body["after"]["total"] >= status_body["total"]
 
 
+def test_employee_gallery_image_upload_uses_database_asset_storage(monkeypatch):
+    import services.pdp_governance_service as pdp_service
+
+    monkeypatch.setattr(pdp_service, "_pdp_gallery_bucket", lambda: "")
+    monkeypatch.setattr(pdp_service, "_pdp_gallery_public_base_url", lambda: "")
+    monkeypatch.setattr(pdp_service, "_pdp_gallery_asset_public_base_url", lambda: "https://api.example.com")
+
+    with _client() as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-gallery-db-upload", "market": "US"},
+        )
+        assert resolved.status_code == 200
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+
+        uploaded = client.post(
+            f"/employee/pdps/{pdp_id}/modules/gallery/images",
+            data={
+                "alt_text": "Database stored image",
+                "role": "gallery",
+                "rights_status": "owned_or_licensed",
+            },
+            files={"file": ("front.png", b"fake-db-image-bytes", "image/png")},
+        )
+        assert uploaded.status_code == 200
+        body = uploaded.json()
+        image = body["image"]
+        assert image["url"].startswith("https://api.example.com/employee/pdps/gallery-assets/pdp_gallery_asset_")
+        assert image["storage"]["type"] == "database"
+        assert body["module"]["status"] == "needs_human_review"
+
+        asset_id = image["storage"]["asset_id"]
+        asset = client.get(f"/employee/pdps/gallery-assets/{asset_id}")
+        assert asset.status_code == 200
+        assert asset.headers["content-type"].startswith("image/png")
+        assert asset.content == b"fake-db-image-bytes"
+
+
 def test_employee_gallery_image_upload_creates_human_review_draft(monkeypatch):
     import services.pdp_governance_service as pdp_service
 
