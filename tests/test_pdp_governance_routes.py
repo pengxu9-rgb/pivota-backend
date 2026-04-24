@@ -105,6 +105,29 @@ def test_employee_pdp_list_exposes_pagination_metadata():
         assert second_body["next_offset"] > second_body["offset"]
 
 
+def test_employee_pdp_hydration_status_and_sync_refresh():
+    with _client() as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-hydration", "market": "US"},
+        )
+        assert resolved.status_code == 200
+
+        status = client.get("/employee/pdps/hydration")
+        assert status.status_code == 200
+        status_body = status.json()
+        assert status_body["status"] == "success"
+        assert status_body["total"] >= 1
+        assert "markets" in status_body
+
+        refreshed = client.post("/employee/pdps/hydration", json={"limit": 10, "background": False})
+        assert refreshed.status_code == 200
+        refreshed_body = refreshed.json()
+        assert refreshed_body["status"] == "success"
+        assert refreshed_body["limit"] == 10
+        assert refreshed_body["after"]["total"] >= status_body["total"]
+
+
 def test_gpt55_gate_can_publish_low_risk_llm_candidate_after_review():
     with _client() as client:
         resolved = client.get(

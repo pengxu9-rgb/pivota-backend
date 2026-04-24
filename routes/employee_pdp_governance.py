@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from services.pdp_governance_service import (
@@ -11,6 +11,8 @@ from services.pdp_governance_service import (
     REVIEW_ACTOR_HUMAN,
     create_module_draft,
     get_pdp_projection,
+    get_pdp_subject_index_stats,
+    hydrate_pdp_subject_index,
     list_pdp_subjects,
     resolve_pdp_subject,
     review_module_version,
@@ -44,6 +46,11 @@ class ModuleVersionRequest(BaseModel):
 class ModuleRollbackRequest(BaseModel):
     target_version_id: str
     notes: Optional[str] = None
+
+
+class HydrationRequest(BaseModel):
+    limit: int = Field(default=500, ge=1, le=2000)
+    background: bool = True
 
 
 def _employee_actor(current_user: Dict[str, Any]) -> str:
@@ -102,6 +109,42 @@ async def resolve_pdp(
             market=market,
         )
         return {"status": "success", "pdp": subject}
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.get("/hydration")
+async def get_hydration_status(
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    try:
+        return await get_pdp_subject_index_stats()
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.post("/hydration")
+async def hydrate_pdp_subjects(
+    body: HydrationRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    actor_id = _employee_actor(current_user)
+    try:
+        if body.background:
+            background_tasks.add_task(
+                hydrate_pdp_subject_index,
+                limit=body.limit,
+                actor_type=REVIEW_ACTOR_HUMAN,
+                actor_id=actor_id,
+            )
+            current = await get_pdp_subject_index_stats()
+            return {"status": "queued", "limit": body.limit, "current": current}
+        return await hydrate_pdp_subject_index(
+            limit=body.limit,
+            actor_type=REVIEW_ACTOR_HUMAN,
+            actor_id=actor_id,
+        )
     except Exception as exc:
         raise _map_error(exc)
 

@@ -975,18 +975,6 @@ async def list_pdp_subjects(
         clauses.append("market = :market")
         params["market"] = market.strip().upper()
 
-    existing_count_row = await database.fetch_one(
-        f"""
-        SELECT COUNT(*) AS total
-        FROM pdp_subject_index
-        WHERE {' AND '.join(clauses)}
-        """,
-        params,
-    )
-    existing_total = int((_row_dict(existing_count_row)).get("total") or 0)
-    if safe_offset == 0 and existing_total == 0:
-        await seed_recent_pdp_subjects(limit=safe_limit)
-
     count_row = await database.fetch_one(
         f"""
         SELECT COUNT(*) AS total
@@ -1061,6 +1049,80 @@ async def list_pdp_subjects(
         "has_more": cursor < total,
         "total": total,
         "scanned": scanned,
+    }
+
+
+async def get_pdp_subject_index_stats() -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    totals_row = await database.fetch_one(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN external_only THEN 1 ELSE 0 END) AS external_only,
+               SUM(CASE WHEN external_only THEN 0 ELSE 1 END) AS internal_or_multi_merchant,
+               MAX(updated_at) AS last_updated_at
+        FROM pdp_subject_index
+        """
+    )
+    market_rows = await database.fetch_all(
+        """
+        SELECT market,
+               COUNT(*) AS total,
+               SUM(CASE WHEN external_only THEN 1 ELSE 0 END) AS external_only,
+               SUM(CASE WHEN external_only THEN 0 ELSE 1 END) AS internal_or_multi_merchant
+        FROM pdp_subject_index
+        GROUP BY market
+        ORDER BY COUNT(*) DESC, market ASC
+        """
+    )
+    totals = _row_dict(totals_row)
+    return {
+        "status": "success",
+        "total": int(totals.get("total") or 0),
+        "external_only": int(totals.get("external_only") or 0),
+        "internal_or_multi_merchant": int(totals.get("internal_or_multi_merchant") or 0),
+        "last_updated_at": _iso(totals.get("last_updated_at")),
+        "markets": [
+            {
+                "market": row_data.get("market") or DEFAULT_MARKET,
+                "total": int(row_data.get("total") or 0),
+                "external_only": int(row_data.get("external_only") or 0),
+                "internal_or_multi_merchant": int(row_data.get("internal_or_multi_merchant") or 0),
+            }
+            for row_data in (_row_dict(row) for row in market_rows or [])
+        ],
+    }
+
+
+async def hydrate_pdp_subject_index(
+    *,
+    limit: int = 500,
+    actor_type: str = REVIEW_ACTOR_SYSTEM,
+    actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    safe_limit = max(1, min(int(limit or 500), 2000))
+    before = await get_pdp_subject_index_stats()
+    await seed_recent_pdp_subjects(limit=safe_limit)
+    after = await get_pdp_subject_index_stats()
+    await _audit(
+        pdp_id="pdp_subject_index",
+        module_key=None,
+        action="pdp_subject_index_hydrated",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        details={
+            "limit": safe_limit,
+            "before_total": before.get("total"),
+            "after_total": after.get("total"),
+            "delta_total": int(after.get("total") or 0) - int(before.get("total") or 0),
+        },
+    )
+    return {
+        "status": "success",
+        "limit": safe_limit,
+        "before": before,
+        "after": after,
+        "delta_total": int(after.get("total") or 0) - int(before.get("total") or 0),
     }
 
 
