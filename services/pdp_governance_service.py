@@ -1139,6 +1139,30 @@ def _serialize_review_task(row: Any) -> Dict[str, Any]:
     }
 
 
+def _synthetic_published_monitor_task(subject: Dict[str, Any], module: Dict[str, Any], risk_level: str) -> Dict[str, Any]:
+    timestamp = module.get("published_at") or module.get("created_at")
+    return {
+        "task_id": f"published:{subject['pdp_id']}:{module['module_key']}:{module.get('version_id')}",
+        "pdp_id": subject["pdp_id"],
+        "module_key": module["module_key"],
+        "version_id": module.get("version_id"),
+        "status": "published_monitor",
+        "assignee": None,
+        "assignee_role": None,
+        "priority": "high" if risk_level == "high" else "normal",
+        "qa_sample": False,
+        "checklist": {},
+        "policy_labels": [],
+        "decision_tree_path": [],
+        "escalation_reason": None,
+        "override_reason": None,
+        "review_duration_ms": None,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "resolved_at": timestamp,
+    }
+
+
 async def get_pdp_projection(
     *,
     pdp_id: Optional[str] = None,
@@ -1306,10 +1330,8 @@ async def _build_review_queue_item(
     subject: Dict[str, Any],
     module: Dict[str, Any],
     actor_role: Optional[str],
+    ensure_task: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    task = await _ensure_review_task_for_module(subject, module)
-    if not task:
-        return None
     if "current_payload" in module or "staged_payload" in module:
         current = {"payload": module.get("current_payload") or {}}
         staged = {"payload": module.get("staged_payload") or {}} if module.get("staged_payload") is not None else None
@@ -1328,6 +1350,9 @@ async def _build_review_queue_item(
     risk = module.get("risk_level") or active.get("risk_level") or module_risk_level(module["module_key"])
     requires_human = bool(module.get("requires_human") or active.get("requires_human") or module["module_key"] in HUMAN_CO_REVIEW_MODULES)
     module_status = module.get("status") or active.get("status") or "not_started"
+    task = await _ensure_review_task_for_module(subject, module) if ensure_task else _synthetic_published_monitor_task(subject, module, str(risk))
+    if not task:
+        return None
     return {
         **task,
         "pdp_title": subject.get("title") or subject.get("subject_ref"),
@@ -1451,7 +1476,27 @@ async def list_pdp_review_queue(
                 and not module.get("has_staged")
             ):
                 continue
-            item = await _build_review_queue_item(subject=subject, module=module, actor_role=actor_role)
+            if selected_tab == "published_monitor":
+                if not module.get("has_current"):
+                    continue
+                module = {
+                    **module,
+                    "version_id": module.get("current_version_id") or module.get("version_id"),
+                    "status": "published",
+                    "risk_level": module.get("current_risk_level") or module.get("risk_level"),
+                    "requires_human": bool(module.get("current_requires_human") or module.get("module_key") in HUMAN_CO_REVIEW_MODULES),
+                    "review_actor_type": module.get("current_review_actor_type"),
+                    "review_decision": module.get("current_review_decision"),
+                    "created_at": module.get("current_created_at") or module.get("created_at"),
+                    "source_refs": module.get("current_source_refs") or [],
+                    "staged_payload": None,
+                }
+            item = await _build_review_queue_item(
+                subject=subject,
+                module=module,
+                actor_role=actor_role,
+                ensure_task=selected_tab != "published_monitor",
+            )
             if not item:
                 continue
             if status and item.get("status") != status and item.get("module_status") != status:
@@ -2130,12 +2175,21 @@ async def _list_module_summaries_for_pdp_ids(pdp_ids: List[str]) -> Dict[str, Li
                     "requires_human": bool(active.get("requires_human") or module_key in HUMAN_CO_REVIEW_MODULES),
                     "review_actor_type": (current or staged or {}).get("review_actor_type"),
                     "review_decision": (current or staged or {}).get("review_decision"),
+                    "current_review_actor_type": (current or {}).get("review_actor_type"),
+                    "current_review_decision": (current or {}).get("review_decision"),
                     "last_reviewer": (current or staged or {}).get("last_reviewer"),
                     "created_at": active.get("created_at"),
+                    "current_created_at": (current or {}).get("created_at"),
                     "source_count": len(active.get("source_refs") or []),
                     "source_refs": active.get("source_refs") or [],
+                    "current_source_refs": (current or {}).get("source_refs") or [],
+                    "current_version_id": (current or {}).get("id"),
+                    "current_risk_level": (current or {}).get("risk_level"),
+                    "current_requires_human": (current or {}).get("requires_human"),
                     "current_payload": (current or {}).get("payload") or {},
                     "staged_payload": (staged or {}).get("payload") if staged else None,
+                    "published_at": (current or {}).get("published_at"),
+                    "has_current": bool(current),
                     "has_staged": bool(staged),
                 }
             )
