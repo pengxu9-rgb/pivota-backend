@@ -16,11 +16,11 @@ from routes.merchant_pdp import router as merchant_pdp_router
 from utils.auth import get_current_employee, get_current_user
 
 
-def _employee_user():
+def _employee_user(role: str = "admin"):
     return {
         "sub": "employee-test",
         "email": "employee@example.com",
-        "role": "admin",
+        "role": role,
     }
 
 
@@ -33,7 +33,7 @@ def _merchant_user():
     }
 
 
-def _client() -> TestClient:
+def _client(role: str = "admin") -> TestClient:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if not database.is_connected:
@@ -48,7 +48,7 @@ def _client() -> TestClient:
 
     app.include_router(employee_pdp_router)
     app.include_router(merchant_pdp_router)
-    app.dependency_overrides[get_current_employee] = _employee_user
+    app.dependency_overrides[get_current_employee] = lambda: _employee_user(role)
     app.dependency_overrides[get_current_user] = _merchant_user
     return TestClient(app)
 
@@ -212,6 +212,146 @@ def test_employee_gallery_image_upload_creates_human_review_draft(monkeypatch):
         gallery = next(module for module in detail.json()["modules"] if module["module_key"] == "gallery")
         assert gallery["staged"]["payload"]["images"][0]["alt"] == "Front product image"
         assert gallery["staged"]["payload"]["primary_image_url"] == body["image"]["url"]
+
+
+def test_review_queue_exposes_module_tasks_and_permissions():
+    with _client(role="outsourced") as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-review-queue", "market": "US"},
+        )
+        assert resolved.status_code == 200
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+        draft = client.post(
+            f"/employee/pdps/{pdp_id}/modules/copy/draft",
+            json={
+                "payload": {"title": "Queue ready title", "description": "Source-grounded draft."},
+                "source_refs": [{"type": "external_seed", "id": "external-route-review-queue"}],
+                "generated_by": "employee_edit",
+            },
+        )
+        assert draft.status_code == 200
+
+        queue = client.get("/employee/pdps/review-queue", params={"tab": "publish_ready", "module_key": "copy"})
+        assert queue.status_code == 200
+        items = queue.json()["items"]
+        item = next(row for row in items if row["pdp_id"] == pdp_id and row["module_key"] == "copy")
+        assert item["version_id"] == draft.json()["module"]["id"]
+        assert "publish" in item["allowed_actions"]
+        assert item["source_summary"]["count"] == 1
+        assert "changed_paths" in item["diff_summary"]
+
+        filtered = client.get(
+            "/employee/pdps/review-queue",
+            params={
+                "tab": "publish_ready",
+                "module_key": "copy",
+                "seller_count": "external_only",
+                "source_type": "external_seed",
+                "staleness": "fresh",
+                "priority": "normal",
+            },
+        )
+        assert filtered.status_code == 200
+        assert any(row["pdp_id"] == pdp_id and row["module_key"] == "copy" for row in filtered.json()["items"])
+
+
+def test_outsourced_publish_requires_checklist_and_blocks_high_risk():
+    with _client(role="outsourced") as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-outsourced-permission", "market": "US"},
+        )
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+        draft = client.post(
+            f"/employee/pdps/{pdp_id}/modules/copy/draft",
+            json={
+                "payload": {"title": "Reviewed low risk", "description": "Plain sourced description."},
+                "source_refs": [{"type": "external_seed", "id": "external-route-outsourced-permission"}],
+            },
+        )
+        assert draft.status_code == 200
+        blocked = client.post(
+            f"/employee/pdps/{pdp_id}/modules/copy/review",
+            json={"version_id": draft.json()["module"]["id"], "decision": "pass"},
+        )
+        assert blocked.status_code == 400
+        assert blocked.json()["detail"] == "PDP_REVIEW_CHECKLIST_REQUIRED"
+
+        reviewed = client.post(
+            f"/employee/pdps/{pdp_id}/modules/copy/review",
+            json={
+                "version_id": draft.json()["module"]["id"],
+                "decision": "pass",
+                "checklist": {"source_grounded": True, "no_forbidden_claim": True},
+                "policy_labels": ["low_risk_copy"],
+                "decision_tree_path": ["copy", "low_risk", "publish"],
+            },
+        )
+        assert reviewed.status_code == 200
+        assert reviewed.json()["published"] is True
+
+        gallery = client.post(
+            f"/employee/pdps/{pdp_id}/modules/gallery/draft",
+            json={"payload": {"images": [{"url": "https://example.com/a.png", "rights_status": "unknown"}]}},
+        )
+        assert gallery.status_code == 403
+        assert gallery.json()["detail"] == "PDP_REVIEW_ACTION_FORBIDDEN"
+
+
+def test_employee_high_risk_publish_blocked_but_senior_can_publish():
+    with _client(role="admin") as admin_client:
+        resolved = admin_client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-senior-permission", "market": "US"},
+        )
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+        gallery = admin_client.post(
+            f"/employee/pdps/{pdp_id}/modules/gallery/draft",
+            json={
+                "payload": {
+                    "images": [
+                        {
+                            "url": "https://example.com/gallery.png",
+                            "rights_status": "owned_or_licensed",
+                        }
+                    ]
+                },
+                "source_refs": [{"type": "employee_gallery_url", "url": "https://example.com/gallery.png"}],
+            },
+        )
+        assert gallery.status_code == 200
+        version_id = gallery.json()["module"]["id"]
+
+    with _client(role="employee") as employee_client:
+        blocked = employee_client.post(
+            f"/employee/pdps/{pdp_id}/modules/gallery/review",
+            json={
+                "version_id": version_id,
+                "decision": "pass",
+                "checklist": {"rights_verified": True},
+                "policy_labels": ["gallery_rights_verified"],
+            },
+        )
+        assert blocked.status_code == 403
+        assert blocked.json()["detail"] == "PDP_REVIEW_ACTION_FORBIDDEN"
+
+    with _client(role="senior_employee") as senior_client:
+        reviewed = senior_client.post(
+            f"/employee/pdps/{pdp_id}/modules/gallery/review",
+            json={
+                "version_id": version_id,
+                "decision": "pass",
+                "checklist": {"rights_verified": True},
+                "policy_labels": ["gallery_rights_verified"],
+                "override_reason": "Senior verified image rights for high-risk gallery publish.",
+            },
+        )
+        assert reviewed.status_code == 200
+        assert reviewed.json()["published"] is True
+        detail = senior_client.get(f"/employee/pdps/{pdp_id}").json()
+        gallery_module = next(module for module in detail["modules"] if module["module_key"] == "gallery")
+        assert "override" in gallery_module["allowed_actions"]
 
 
 def test_gpt55_gate_can_publish_low_risk_llm_candidate_after_review():
