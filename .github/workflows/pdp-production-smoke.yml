@@ -1,0 +1,35 @@
+name: PDP Production Smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * *"
+
+jobs:
+  production-main-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PIVOTA_API_BASE_URL: ${{ vars.PIVOTA_API_BASE_URL || 'https://api.pivota.cc' }}
+      PIVOTA_EMPLOYEE_BASE_URL: ${{ vars.PIVOTA_EMPLOYEE_BASE_URL || 'https://employee.pivota.cc' }}
+      PIVOTA_MERCHANT_BASE_URL: ${{ vars.PIVOTA_MERCHANT_BASE_URL || 'https://merchant.pivota.cc' }}
+      PIVOTA_SMOKE_EMPLOYEE_EMAIL: ${{ secrets.PIVOTA_SMOKE_EMPLOYEE_EMAIL || 'employee@pivota.com' }}
+      PIVOTA_SMOKE_EMPLOYEE_PASSWORD: ${{ secrets.PIVOTA_SMOKE_EMPLOYEE_PASSWORD || 'Admin123!' }}
+      PIVOTA_SMOKE_MERCHANT_EMAIL: ${{ secrets.PIVOTA_SMOKE_MERCHANT_EMAIL || 'merchant@test.com' }}
+      PIVOTA_SMOKE_MERCHANT_PASSWORD: ${{ secrets.PIVOTA_SMOKE_MERCHANT_PASSWORD || 'Admin123!' }}
+      PDP_SMOKE_EXTERNAL_PDP_ID: ${{ vars.PDP_SMOKE_EXTERNAL_PDP_ID }}
+      PDP_SMOKE_INTERNAL_PDP_ID: ${{ vars.PDP_SMOKE_INTERNAL_PDP_ID }}
+      PDP_SMOKE_GPT55_PDP_ID: ${{ vars.PDP_SMOKE_GPT55_PDP_ID }}
+      PDP_SMOKE_MERCHANT_PLATFORM: ${{ vars.PDP_SMOKE_MERCHANT_PLATFORM || 'shopify' }}
+      PDP_SMOKE_MERCHANT_PRODUCT_ID: ${{ vars.PDP_SMOKE_MERCHANT_PRODUCT_ID || 'live_acceptance_merchant_pdp_1776996856' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run PDP production smoke
+        run: python3 scripts/smoke_pdp_governance_production.py

@@ -38,6 +38,8 @@ quick_tests=(
   "tests/test_shopify_order_sync_hardening.py"
   "tests/test_debug_shopify_api_token_parsing.py"
   "tests/test_products_cache_dedupe.py"
+  "tests/test_public_api_base_url.py"
+  "tests/test_legacy_backend_url_guard.py"
 )
 
 full_extra_tests=(
