@@ -132,6 +132,54 @@ def test_gpt55_gate_can_publish_low_risk_llm_candidate_after_review():
         assert detail["published_payload"]["copy"]["title"] == "Plain Cotton Tee"
 
 
+def test_gpt55_gate_does_not_publish_codex_pass_with_failed_check():
+    with _client() as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-failed-codex-check", "market": "US"},
+        )
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+
+        draft = client.post(
+            f"/employee/pdps/{pdp_id}/modules/copy/draft",
+            json={
+                "payload": {
+                    "title": "Plain Cotton Tee",
+                    "description": "Soft everyday shirt for casual wear.",
+                },
+                "source_refs": [{"type": "external_seed", "id": "external-route-failed-codex-check"}],
+                "generated_by": "llm_candidate",
+            },
+        )
+        assert draft.status_code == 200
+
+        reviewed = client.post(
+            f"/employee/pdps/{pdp_id}/modules/copy/gpt55-review",
+            json={
+                "version_id": draft.json()["module"]["id"],
+                "rubric": {
+                    "decision": "pass",
+                    "confidence": 0.94,
+                    "reasons": ["Codex reviewer found source grounding incomplete."],
+                    "checks": {
+                        "source_grounded": False,
+                        "seller_entity_checkout_not_confused": True,
+                        "variant_market_consistent": True,
+                        "no_medical_regulated_promo_or_fake_review_claim": True,
+                        "machine_publish_allowed_module": True,
+                    },
+                    "evidence_refs": ["external_seed:external-route-failed-codex-check"],
+                    "reviewed_in": "codex_external_window",
+                },
+            },
+        )
+        assert reviewed.status_code == 200
+        body = reviewed.json()
+        assert body["decision"] == "needs_human_review"
+        assert body["published"] is False
+        assert "codex_pass_failed_checks:source_grounded" in body["rubric"]["reasons"]
+
+
 def test_gpt55_gate_requires_codex_rubric_artifact_for_low_risk_publish():
     with _client() as client:
         resolved = client.get(

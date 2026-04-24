@@ -46,6 +46,14 @@ MACHINE_PUBLISH_MODULES = {
     "quality",
 }
 
+GPT55_RUBRIC_REQUIRED_CHECKS = {
+    "source_grounded",
+    "seller_entity_checkout_not_confused",
+    "variant_market_consistent",
+    "no_medical_regulated_promo_or_fake_review_claim",
+    "machine_publish_allowed_module",
+}
+
 HUMAN_CO_REVIEW_MODULES = {
     "gallery",
     "reviews",
@@ -1272,14 +1280,7 @@ def _normalize_codex_gpt55_rubric(rubric: Dict[str, Any]) -> Dict[str, Any]:
     checks = rubric.get("checks") or {}
     if not isinstance(checks, dict):
         raise ValueError("GPT55_RUBRIC_CHECKS_MUST_BE_OBJECT")
-    required_checks = {
-        "source_grounded",
-        "seller_entity_checkout_not_confused",
-        "variant_market_consistent",
-        "no_medical_regulated_promo_or_fake_review_claim",
-        "machine_publish_allowed_module",
-    }
-    missing = sorted(required_checks - set(checks.keys()))
+    missing = sorted(GPT55_RUBRIC_REQUIRED_CHECKS - set(checks.keys()))
     if missing:
         raise ValueError(f"GPT55_RUBRIC_MISSING_CHECKS:{','.join(missing)}")
 
@@ -1298,6 +1299,22 @@ def _normalize_codex_gpt55_rubric(rubric: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _codex_gpt55_pass_blockers(codex_rubric: Dict[str, Any]) -> List[str]:
+    if codex_rubric.get("decision") != "pass":
+        return []
+
+    checks = codex_rubric.get("checks") if isinstance(codex_rubric.get("checks"), dict) else {}
+    failed = sorted(key for key in GPT55_RUBRIC_REQUIRED_CHECKS if checks.get(key) is not True)
+    blockers: List[str] = []
+    if failed:
+        blockers.append(f"codex_pass_failed_checks:{','.join(failed)}")
+    if not codex_rubric.get("evidence_refs"):
+        blockers.append("codex_pass_missing_evidence_refs")
+    if codex_rubric.get("reviewed_in") != "codex_external_window":
+        blockers.append("codex_pass_invalid_review_channel")
+    return blockers
+
+
 def _merge_codex_rubric_with_local_gate(local: Dict[str, Any], codex_rubric: Dict[str, Any]) -> Dict[str, Any]:
     decision_rank = {"pass": 0, "needs_human_review": 1, "reject": 2}
     local_decision = str(local.get("decision") or "reject")
@@ -1308,7 +1325,10 @@ def _merge_codex_rubric_with_local_gate(local: Dict[str, Any], codex_rubric: Dic
 
     local_reasons = [str(reason) for reason in local.get("reasons") or []]
     codex_reasons = [str(reason) for reason in codex_rubric.get("reasons") or []]
-    reasons = list(dict.fromkeys([*local_reasons, *codex_reasons]))
+    pass_blockers = _codex_gpt55_pass_blockers(codex_rubric)
+    if pass_blockers and stricter_decision == "pass":
+        stricter_decision = "needs_human_review"
+    reasons = list(dict.fromkeys([*local_reasons, *codex_reasons, *pass_blockers]))
 
     local_checks = local.get("checks") if isinstance(local.get("checks"), dict) else {}
     codex_checks = codex_rubric.get("checks") if isinstance(codex_rubric.get("checks"), dict) else {}
@@ -1336,6 +1356,7 @@ def _merge_codex_rubric_with_local_gate(local: Dict[str, Any], codex_rubric: Dic
             "confidence": codex_rubric.get("confidence"),
             "reasons": codex_reasons,
             "checks": codex_checks,
+            "publish_blockers": pass_blockers,
             "review_notes": codex_rubric.get("review_notes"),
             "reviewed_in": codex_rubric.get("reviewed_in"),
         },
