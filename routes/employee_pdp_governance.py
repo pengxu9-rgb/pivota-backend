@@ -11,6 +11,7 @@ from services.pdp_governance_service import (
     REVIEW_ACTOR_HUMAN,
     assign_pdp_review_task,
     create_module_draft,
+    get_pdp_offer_reconciliation,
     get_pdp_projection,
     get_pdp_gallery_asset,
     get_pdp_review_task,
@@ -295,6 +296,17 @@ async def update_review_task_status(
             reason=body.reason,
             qa_sample=body.qa_sample,
         )
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.get("/{pdp_id}/offers/reconciliation")
+async def get_offer_reconciliation(
+    pdp_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    try:
+        return await get_pdp_offer_reconciliation(pdp_id=pdp_id, actor_role=_employee_role(current_user))
     except Exception as exc:
         raise _map_error(exc)
 
