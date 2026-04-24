@@ -6,7 +6,7 @@ Supports the Lovable admin approval system
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 import jwt
 import hashlib
 import secrets
@@ -26,6 +26,12 @@ from config.settings import settings
 JWT_SECRET = settings.jwt_secret_key
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
+
+# Keep the historical demo merchant usable when a canonical users row exists
+# without a merchant_id binding in older production databases.
+DEMO_MERCHANT_IDS = {
+    "merchant@test.com": "merch_6b90dc9838d5fd9c",
+}
 
 # User Role Types
 from enum import Enum
@@ -96,7 +102,12 @@ def verify_password(password: str, hashed: str) -> bool:
     """Verify password against hash"""
     return hash_password(password) == hashed
 
-def create_jwt_token(user_id: str, role: str, email: str = None) -> str:
+def create_jwt_token(
+    user_id: str,
+    role: str,
+    email: str = None,
+    extra_claims: Optional[Dict[str, Any]] = None,
+) -> str:
     """Create JWT token for user"""
     payload = {
         "sub": user_id,  # Standard JWT claim for subject
@@ -106,6 +117,8 @@ def create_jwt_token(user_id: str, role: str, email: str = None) -> str:
         "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
         "iat": datetime.utcnow()
     }
+    if extra_claims:
+        payload.update(extra_claims)
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -287,15 +300,23 @@ async def signin(login_data: UserLogin):
                     detail="Account has been deactivated",
                 )
 
-            token = create_jwt_token(user_row["email"], user_row["role"], user_row["email"])
+            merchant_id = user_row.get("merchant_id")
+            if user_row.get("role") == "merchant" and not merchant_id:
+                merchant_id = DEMO_MERCHANT_IDS.get(normalized_email)
+            token = create_jwt_token(
+                user_row["email"],
+                user_row["role"],
+                user_row["email"],
+                {"merchant_id": merchant_id} if merchant_id else None,
+            )
             user_payload = {
                 "id": str(user_row["id"]),
                 "email": user_row["email"],
                 "full_name": user_row.get("full_name") or user_row["email"],
                 "role": user_row["role"],
             }
-            if user_row.get("merchant_id"):
-                user_payload["merchant_id"] = user_row["merchant_id"]
+            if merchant_id:
+                user_payload["merchant_id"] = merchant_id
 
             return {
                 "status": "success",
