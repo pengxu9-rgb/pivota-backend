@@ -961,11 +961,14 @@ async def list_pdp_subjects(
     external_only: Optional[bool] = None,
     market: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     await ensure_pdp_governance_tables()
-    await seed_recent_pdp_subjects(limit=limit)
+    safe_limit = max(1, min(limit, 200))
+    safe_offset = max(0, offset)
+    await seed_recent_pdp_subjects(limit=safe_offset + safe_limit)
     clauses = ["1 = 1"]
-    params: Dict[str, Any] = {"limit": max(1, min(limit, 200))}
+    params: Dict[str, Any] = {}
     if external_only is not None:
         clauses.append("external_only = :external_only")
         params["external_only"] = external_only
@@ -973,49 +976,84 @@ async def list_pdp_subjects(
         clauses.append("market = :market")
         params["market"] = market.strip().upper()
 
-    rows = await database.fetch_all(
+    count_row = await database.fetch_one(
         f"""
+        SELECT COUNT(*) AS total
+        FROM pdp_subject_index
+        WHERE {' AND '.join(clauses)}
+        """,
+        params,
+    )
+    total = int((_row_dict(count_row)).get("total") or 0)
+
+    module_filters = bool(module_status or review_actor or risk)
+    batch_size = safe_limit if not module_filters else min(max(safe_limit * 2, 50), 200)
+    cursor = safe_offset
+    items: List[Dict[str, Any]] = []
+    scanned = 0
+
+    while len(items) < safe_limit and cursor < total:
+        query_params = {**params, "limit": batch_size, "offset": cursor}
+        rows = await database.fetch_all(
+            f"""
         SELECT *
         FROM pdp_subject_index
         WHERE {' AND '.join(clauses)}
         ORDER BY updated_at DESC
         LIMIT :limit
+        OFFSET :offset
         """,
-        params,
-    )
-    items: List[Dict[str, Any]] = []
-    for row in rows:
-        subject = _serialize_subject(_row_dict(row))
-        projection = await get_pdp_projection(pdp_id=subject["pdp_id"])
-        modules = projection["modules"]
-        if module_status and not any(module.get("status") == module_status for module in modules):
-            continue
-        if review_actor and not any(module.get("review_actor_type") == review_actor for module in modules):
-            continue
-        if risk and not any(module.get("risk_level") == risk for module in modules):
-            continue
-        items.append(
-            {
-                **subject,
-                "modules": [
-                    {
-                        "module_key": module["module_key"],
-                        "status": module["status"],
-                        "risk_level": module["risk_level"],
-                        "requires_human": module["requires_human"],
-                        "review_actor_type": module["review_actor_type"],
-                        "review_decision": module["review_decision"],
-                    }
-                    for module in modules
-                ],
-            }
+            query_params,
         )
-    return {"status": "success", "items": items, "count": len(items)}
+        if not rows:
+            break
+        cursor += len(rows)
+        scanned += len(rows)
+        for row in rows:
+            subject = _serialize_subject(_row_dict(row))
+            projection = await get_pdp_projection(pdp_id=subject["pdp_id"])
+            modules = projection["modules"]
+            if module_status and not any(module.get("status") == module_status for module in modules):
+                continue
+            if review_actor and not any(module.get("review_actor_type") == review_actor for module in modules):
+                continue
+            if risk and not any(module.get("risk_level") == risk for module in modules):
+                continue
+            items.append(
+                {
+                    **subject,
+                    "modules": [
+                        {
+                            "module_key": module["module_key"],
+                            "status": module["status"],
+                            "risk_level": module["risk_level"],
+                            "requires_human": module["requires_human"],
+                            "review_actor_type": module["review_actor_type"],
+                            "review_decision": module["review_decision"],
+                        }
+                        for module in modules
+                    ],
+                }
+            )
+            if len(items) >= safe_limit:
+                break
+
+    return {
+        "status": "success",
+        "items": items,
+        "count": len(items),
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "next_offset": cursor,
+        "has_more": cursor < total,
+        "total": total,
+        "scanned": scanned,
+    }
 
 
 async def seed_recent_pdp_subjects(limit: int = 50) -> None:
     """Best-effort dashboard hydration from existing product groups and external seeds."""
-    safe_limit = max(1, min(limit, 200))
+    safe_limit = max(1, min(limit, 2000))
     try:
         groups = await database.fetch_all(
             """
