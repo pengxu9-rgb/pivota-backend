@@ -65,7 +65,7 @@ class ModuleRollbackRequest(BaseModel):
 
 
 class HydrationRequest(BaseModel):
-    limit: int = Field(default=500, ge=1, le=2000)
+    limit: int = Field(default=10000, ge=0, le=50000)
     background: bool = True
 
 

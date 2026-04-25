@@ -8,12 +8,12 @@ set -euo pipefail
 # Env:
 # - DATABASE_URL (required)
 # - SLEEP_SECONDS (optional, default: 1800)
-# - PDP_HYDRATION_LIMIT (optional, default: 1000)
+# - PDP_HYDRATION_LIMIT (optional, default: 10000; set 0 for all rows)
 # - PDP_HYDRATION_ACTOR_ID (optional, default: pdp_subject_hydration_loop)
 # - PORT (optional, default: 8080) healthcheck port
 
 SLEEP_SECONDS="${SLEEP_SECONDS:-1800}"
-PDP_HYDRATION_LIMIT="${PDP_HYDRATION_LIMIT:-1000}"
+PDP_HYDRATION_LIMIT="${PDP_HYDRATION_LIMIT:-10000}"
 PDP_HYDRATION_ACTOR_ID="${PDP_HYDRATION_ACTOR_ID:-pdp_subject_hydration_loop}"
 PORT="${PORT:-8080}"
 
