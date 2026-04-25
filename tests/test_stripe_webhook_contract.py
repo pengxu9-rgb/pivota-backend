@@ -111,6 +111,67 @@ async def test_stripe_webhook_psp_path_uses_merchant_specific_secret(
 
 
 @pytest.mark.asyncio
+async def test_stripe_webhook_accepts_stripe_object_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as database_module
+    import routes.webhook_routes as webhook_routes_module
+
+    class StripeLikeObject:
+        def __init__(self, payload: Dict[str, Any]) -> None:
+            self._payload = payload
+
+        def __getattr__(self, name: str) -> Any:
+            raise KeyError(name)
+
+        def to_dict_recursive(self) -> Dict[str, Any]:
+            return self._payload
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        if "FROM merchant_psps" in query:
+            assert values["psp_id"] == "psp_stripe_live_object"
+            return {
+                "provider_config": {
+                    "webhook_endpoint_secret": "whsec_merchant_specific",
+                }
+            }
+        raise AssertionError(f"Unexpected query: {query}")
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> StripeLikeObject:
+        assert secret == "whsec_merchant_specific"
+        return StripeLikeObject(
+            _stripe_event(
+                "checkout.session.completed",
+                StripeLikeObject(
+                    {
+                        "id": "cs_object_payload",
+                        "metadata": StripeLikeObject({"order_id": "ORD_OBJECT"}),
+                    }
+                ),
+            )
+        )
+
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "", raising=False)
+    monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe/psp_stripe_live_object",
+            content=b'{"id":"evt_object_payload"}',
+            headers={"stripe-signature": "sig_object_payload"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "event": "checkout.session.completed"}
+
+
+@pytest.mark.asyncio
 async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_shopify_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

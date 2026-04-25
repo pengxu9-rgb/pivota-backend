@@ -484,6 +484,21 @@ async def _stripe_webhook_secret_candidates(psp_id: Optional[str]) -> list[str]:
     return candidates
 
 
+def _stripe_object_to_dict(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _stripe_object_to_dict(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_stripe_object_to_dict(item) for item in value]
+    for method_name in ("to_dict_recursive", "to_dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _stripe_object_to_dict(method())
+            except Exception:
+                continue
+    return value
+
+
 async def _emit_stripe_merchant_webhook_best_effort(
     order: Dict[str, Any],
     *,
@@ -587,17 +602,28 @@ async def handle_stripe_webhook(
         else:
             # 开发环境：不验证签名
             event = json.loads(payload)
+        event = _stripe_object_to_dict(event)
+        if not isinstance(event, dict):
+            logger.error("Invalid Stripe webhook event shape: %s", type(event).__name__)
+            raise HTTPException(status_code=400, detail="Invalid event")
         
         # 处理事件
         event_type = event.get("type")
-        data = event.get("data", {}).get("object", {})
+        data_container = _stripe_object_to_dict(event.get("data") or {})
+        data = (
+            _stripe_object_to_dict(data_container.get("object"))
+            if isinstance(data_container, dict)
+            else {}
+        )
+        if not isinstance(data, dict):
+            data = {}
         
         logger.info(f"Received Stripe webhook: {event_type}")
         
         if event_type == "payment_intent.succeeded":
             # 支付成功
             payment_intent_id = data.get("id")
-            payment_meta = data.get("metadata") or {}
+            payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
             result = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
@@ -661,8 +687,13 @@ async def handle_stripe_webhook(
         elif event_type == "payment_intent.payment_failed":
             # 支付失败
             payment_intent_id = data.get("id")
-            error_message = data.get("last_payment_error", {}).get("message", "Unknown error")
-            payment_meta = data.get("metadata") or {}
+            last_payment_error = _stripe_object_to_dict(data.get("last_payment_error") or {})
+            error_message = (
+                last_payment_error.get("message", "Unknown error")
+                if isinstance(last_payment_error, dict)
+                else "Unknown error"
+            )
+            payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
             result = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
@@ -733,7 +764,7 @@ async def handle_stripe_webhook(
             payment_intent_id = data.get("payment_intent")
             refund_amount = data.get("amount")
             currency = (data.get("currency") or "").strip().lower() or None
-            refund_meta = data.get("metadata") or {}
+            refund_meta = _stripe_object_to_dict(data.get("metadata") or {})
             refund_snapshot = extract_stripe_refund_snapshot(
                 data,
                 source_event="refund.created",
@@ -769,7 +800,7 @@ async def handle_stripe_webhook(
             payment_intent_id = data.get("payment_intent")
             refund_amount = data.get("amount")
             currency = (data.get("currency") or "").strip().lower() or None
-            refund_meta = data.get("metadata") or {}
+            refund_meta = _stripe_object_to_dict(data.get("metadata") or {})
             pending_reason = data.get("pending_reason")
             refund_snapshot = extract_stripe_refund_snapshot(
                 data,
