@@ -45,7 +45,12 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hydrate the PDP subject index for the employee governance dashboard.")
-    parser.add_argument("--limit", type=int, default=int(os.getenv("PDP_HYDRATION_LIMIT", "1000")), help="Max recent internal groups and external seeds to materialize.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=int(os.getenv("PDP_HYDRATION_LIMIT", "10000")),
+        help="Max subjects per source type to materialize. Use 0 for all rows.",
+    )
     parser.add_argument("--actor-id", default=os.getenv("PDP_HYDRATION_ACTOR_ID", "pdp_subject_hydration_job"), help="Audit actor id.")
     parser.add_argument("--apply", action="store_true", help="Write refreshed subjects. Without this flag, only current stats are printed.")
     return parser.parse_args(argv)

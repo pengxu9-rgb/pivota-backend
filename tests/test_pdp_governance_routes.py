@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 from contextlib import asynccontextmanager
 
@@ -9,10 +10,12 @@ os.environ.setdefault(
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from db.database import database
 from routes.employee_pdp_governance import router as employee_pdp_router
 from routes.merchant_pdp import router as merchant_pdp_router
+from services.pdp_governance_service import hydrate_pdp_subject_index, list_pdp_subjects
 from utils.auth import get_current_employee, get_current_user
 
 
@@ -410,6 +413,130 @@ def test_published_monitor_uses_read_only_synthetic_rows():
         assert task_detail.status_code == 200
         assert task_detail.json()["task"]["task_id"] == item["task_id"]
         assert task_detail.json()["module"]["module_key"] == "copy"
+
+
+@pytest.mark.asyncio
+async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
+    if not database.is_connected:
+        await database.connect()
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_group_members (
+              product_group_id TEXT,
+              merchant_id TEXT,
+              platform TEXT,
+              platform_product_id TEXT,
+              is_primary BOOLEAN DEFAULT FALSE,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products_cache (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              merchant_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              platform_product_id TEXT NOT NULL,
+              product_data JSON NOT NULL,
+              cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              expires_at DATETIME NULL
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS canonical_products (
+              canonical_product_id TEXT PRIMARY KEY,
+              merchant_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              platform_product_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              default_image_url TEXT NULL,
+              standard_product_data JSON NOT NULL,
+              expires_at DATETIME NULL,
+              source_recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_product_seeds (
+              id TEXT PRIMARY KEY,
+              external_product_id TEXT NULL,
+              market TEXT NOT NULL,
+              tool TEXT DEFAULT '*',
+              destination_url TEXT,
+              canonical_url TEXT NULL,
+              domain TEXT NULL,
+              title TEXT NULL,
+              image_url TEXT NULL,
+              status TEXT DEFAULT 'active',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute("DELETE FROM product_group_members WHERE merchant_id = 'hydrate-merchant'")
+        await database.execute("DELETE FROM products_cache WHERE merchant_id = 'hydrate-merchant'")
+        await database.execute("DELETE FROM canonical_products WHERE merchant_id = 'hydrate-merchant'")
+        await database.execute("DELETE FROM external_product_seeds WHERE id LIKE :seed_prefix", {"seed_prefix": "hydrate-seed-%"})
+
+        await database.execute(
+            """
+            INSERT INTO product_group_members (product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at)
+            VALUES ('pg_hydrate_1', 'hydrate-merchant', 'shopify', 'grouped-product', TRUE, CURRENT_TIMESTAMP)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, expires_at)
+            VALUES ('hydrate-merchant', 'shopify', 'grouped-product', :grouped_payload, '2999-01-01 00:00:00')
+            """,
+            {"grouped_payload": json.dumps({"title": "Grouped Hydration Product"})},
+        )
+        await database.execute(
+            """
+            INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, expires_at)
+            VALUES ('hydrate-merchant', 'shopify', 'ungrouped-product', :ungrouped_payload, '2999-01-01 00:00:00')
+            """,
+            {"ungrouped_payload": json.dumps({"title": "Ungrouped Hydration Product"})},
+        )
+        await database.execute(
+            """
+            INSERT INTO canonical_products (
+              canonical_product_id, merchant_id, platform, platform_product_id, title,
+              standard_product_data, expires_at
+            )
+            VALUES (
+              'canonical-hydrate-1', 'hydrate-merchant', 'shopify', 'canonical-product',
+              'Canonical Hydration Product', :canonical_payload, '2999-01-01 00:00:00'
+            )
+            """,
+            {"canonical_payload": json.dumps({"title": "Canonical Hydration Product"})},
+        )
+        await database.execute(
+            """
+            INSERT INTO external_product_seeds (id, external_product_id, market, destination_url, title, status)
+            VALUES ('hydrate-seed-1', NULL, 'US', 'https://example.com/hydrate', 'External Hydration Product', 'active')
+            """
+        )
+
+        result = await hydrate_pdp_subject_index(limit=0, actor_id="test")
+        assert result["limit_mode"] == "all"
+
+        listing = await list_pdp_subjects(limit=200, market="US")
+        subjects = {(item["subject_type"], item["subject_ref"]) for item in listing["items"]}
+
+        assert ("product_group", "pg_hydrate_1") in subjects
+        assert ("merchant_product", "hydrate-merchant|shopify|ungrouped-product") in subjects
+        assert ("merchant_product", "hydrate-merchant|shopify|canonical-product") in subjects
+        assert ("external_product", "hydrate-seed-1") in subjects
+    finally:
+        if database.is_connected:
+            await database.disconnect()
 
 
 def test_outsourced_publish_requires_checklist_and_blocks_high_risk():
