@@ -3341,6 +3341,61 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
             continue
 
     try:
+        canonical_rows = await database.fetch_all(
+            f"""
+            SELECT *
+            FROM canonical_products cp
+            WHERE cp.merchant_id IS NOT NULL
+              AND cp.platform IS NOT NULL
+              AND cp.platform_product_id IS NOT NULL
+              AND (cp.expires_at IS NULL OR cp.expires_at > CURRENT_TIMESTAMP)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM product_group_members pgm
+                WHERE pgm.merchant_id = cp.merchant_id
+                  AND pgm.platform = cp.platform
+                  AND pgm.platform_product_id = cp.platform_product_id
+                  AND pgm.product_group_id IS NOT NULL
+              )
+            ORDER BY cp.source_recorded_at DESC, cp.updated_at DESC
+            {limit_clause}
+            """,
+            limit_params,
+        )
+    except Exception:
+        canonical_rows = []
+
+    for row in canonical_rows or []:
+        product = _row_dict(row)
+        merchant_id = str(product.get("merchant_id") or "")
+        platform = str(product.get("platform") or "")
+        platform_product_id = str(product.get("platform_product_id") or "")
+        if not merchant_id or not platform or not platform_product_id:
+            continue
+        product_key = f"{merchant_id}|{platform}|{platform_product_id}"
+        product_data = _json_dict(product.get("standard_product_data"))
+        summary = _extract_product_summary(product_data)
+        try:
+            await _upsert_subject(
+                {
+                    "pdp_id": make_pdp_id("merchant_product", product_key, DEFAULT_MARKET),
+                    "subject_type": "merchant_product",
+                    "subject_ref": product_key,
+                    "market": DEFAULT_MARKET,
+                    "product_group_id": None,
+                    "external_product_id": None,
+                    "representative_product_key": product_key,
+                    "title": product.get("title") or summary.get("title") or platform_product_id,
+                    "image_url": product.get("default_image_url") or summary.get("image_url"),
+                    "seller_count": 1,
+                    "external_only": False,
+                    "status": "active",
+                }
+            )
+        except Exception:
+            continue
+
+    try:
         merchant_rows = await database.fetch_all(
             f"""
             SELECT pc.*
@@ -3349,6 +3404,14 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
               AND pc.platform IS NOT NULL
               AND pc.platform_product_id IS NOT NULL
               AND (pc.expires_at IS NULL OR pc.expires_at > CURRENT_TIMESTAMP)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM canonical_products cp
+                WHERE cp.merchant_id = pc.merchant_id
+                  AND cp.platform = pc.platform
+                  AND cp.platform_product_id = pc.platform_product_id
+                  AND (cp.expires_at IS NULL OR cp.expires_at > CURRENT_TIMESTAMP)
+              )
               AND NOT EXISTS (
                 SELECT 1
                 FROM product_group_members pgm
@@ -3408,8 +3471,7 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
             f"""
             SELECT *
             FROM external_product_seeds
-            WHERE external_product_id IS NOT NULL
-              AND status = 'active'
+            WHERE status = 'active'
             ORDER BY updated_at DESC, created_at DESC
             {limit_clause}
             """,
@@ -3521,6 +3583,55 @@ async def _seed_recent_pdp_subjects_postgres(safe_limit: Optional[int]) -> None:
             }
         )
 
+    canonical_rows = await database.fetch_all(
+        f"""
+        SELECT cp.*
+        FROM canonical_products cp
+        WHERE cp.merchant_id IS NOT NULL
+          AND cp.platform IS NOT NULL
+          AND cp.platform_product_id IS NOT NULL
+          AND (cp.expires_at IS NULL OR cp.expires_at > NOW())
+          AND NOT EXISTS (
+            SELECT 1
+            FROM product_group_members pgm
+            WHERE pgm.merchant_id = cp.merchant_id
+              AND pgm.platform = cp.platform
+              AND pgm.platform_product_id = cp.platform_product_id
+              AND pgm.product_group_id IS NOT NULL
+          )
+        ORDER BY cp.source_recorded_at DESC NULLS LAST, cp.updated_at DESC NULLS LAST
+        {limit_clause}
+        """,
+        limit_params,
+    )
+
+    for row in canonical_rows or []:
+        product = _row_dict(row)
+        merchant_id = str(product.get("merchant_id") or "")
+        platform = str(product.get("platform") or "")
+        platform_product_id = str(product.get("platform_product_id") or "")
+        if not merchant_id or not platform or not platform_product_id:
+            continue
+        product_key = f"{merchant_id}|{platform}|{platform_product_id}"
+        product_data = _json_dict(product.get("standard_product_data"))
+        summary = _extract_product_summary(product_data)
+        subjects.append(
+            {
+                "pdp_id": make_pdp_id("merchant_product", product_key, DEFAULT_MARKET),
+                "subject_type": "merchant_product",
+                "subject_ref": product_key,
+                "market": DEFAULT_MARKET,
+                "product_group_id": None,
+                "external_product_id": None,
+                "representative_product_key": product_key,
+                "title": product.get("title") or summary.get("title") or platform_product_id,
+                "image_url": product.get("default_image_url") or summary.get("image_url"),
+                "seller_count": 1,
+                "external_only": False,
+                "status": "active",
+            }
+        )
+
     merchant_rows = await database.fetch_all(
         f"""
         WITH latest_products AS (
@@ -3536,6 +3647,14 @@ async def _seed_recent_pdp_subjects_postgres(safe_limit: Optional[int]) -> None:
               AND pc.platform IS NOT NULL
               AND pc.platform_product_id IS NOT NULL
               AND (pc.expires_at IS NULL OR pc.expires_at > NOW())
+              AND NOT EXISTS (
+                SELECT 1
+                FROM canonical_products cp
+                WHERE cp.merchant_id = pc.merchant_id
+                  AND cp.platform = pc.platform
+                  AND cp.platform_product_id = pc.platform_product_id
+                  AND (cp.expires_at IS NULL OR cp.expires_at > NOW())
+              )
               AND NOT EXISTS (
                 SELECT 1
                 FROM product_group_members pgm
@@ -3584,8 +3703,7 @@ async def _seed_recent_pdp_subjects_postgres(safe_limit: Optional[int]) -> None:
         f"""
         SELECT *
         FROM external_product_seeds
-        WHERE external_product_id IS NOT NULL
-          AND status = 'active'
+        WHERE status = 'active'
         ORDER BY updated_at DESC, created_at DESC
         {limit_clause}
         """,
@@ -3613,6 +3731,14 @@ async def _bulk_upsert_subjects_postgres(subjects: List[Dict[str, Any]]) -> None
         return
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+    deduped_subjects = {
+        str(subject.get("pdp_id") or ""): subject
+        for subject in subjects
+        if subject.get("pdp_id")
+    }
+    if not deduped_subjects:
+        return
+
     now = _now()
     rows = [
         {
@@ -3631,7 +3757,7 @@ async def _bulk_upsert_subjects_postgres(subjects: List[Dict[str, Any]]) -> None
             "created_at": now,
             "updated_at": now,
         }
-        for subject in subjects
+        for subject in deduped_subjects.values()
     ]
     insert_stmt = pg_insert(pdp_subject_index).values(rows)
     update_columns = {
