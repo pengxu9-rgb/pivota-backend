@@ -1297,6 +1297,8 @@ async def get_pdp_projection(
         external_seed_id=external_seed_id,
         market=market,
     )
+    subject_internal_offers = await _confirmed_internal_seller_offers(subject)
+    subject = _subject_with_effective_internal_offers(subject, subject_internal_offers)
     await ensure_baseline_modules(subject)
     baseline_refs = (await _baseline_payloads(subject)).get("identity", ({}, []))[1]
 
@@ -1447,6 +1449,48 @@ def _merchant_offer_row(product_key: str, merchant_id: str, platform: str, platf
     }
 
 
+def _merchant_offer_quality_score(offer: Dict[str, Any]) -> int:
+    title = str(offer.get("title") or "").strip()
+    platform_product_id = str(offer.get("platform_product_id") or "").strip()
+    score = 0
+    if title and title != platform_product_id:
+        score += 20
+    if offer.get("image_url"):
+        score += 12
+    price = offer.get("price") if isinstance(offer.get("price"), dict) else {}
+    if price.get("amount") is not None:
+        score += 4
+    if int(offer.get("variants_count") or 0) > 0:
+        score += 4
+    if offer.get("availability") is not None:
+        score += 2
+    return score
+
+
+def _best_merchant_offer(offers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not offers:
+        return None
+    return sorted(offers, key=_merchant_offer_quality_score, reverse=True)[0]
+
+
+def _subject_with_effective_internal_offers(subject: Dict[str, Any], offers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if subject.get("external_only") or not offers:
+        return subject
+    best_offer = _best_merchant_offer(offers)
+    seller_count = len({offer.get("merchant_id") for offer in offers if offer.get("merchant_id")})
+    updated = dict(subject)
+    updated["seller_count"] = seller_count
+    if best_offer:
+        current_title = str(updated.get("title") or "").strip()
+        if not current_title or current_title.startswith("pg:auto:title:") or current_title == str(updated.get("subject_ref") or ""):
+            updated["title"] = best_offer.get("title") or current_title
+        if not updated.get("image_url") and best_offer.get("image_url"):
+            updated["image_url"] = best_offer.get("image_url")
+        if best_offer.get("product_key"):
+            updated["representative_product_key"] = best_offer.get("product_key")
+    return updated
+
+
 async def _subject_internal_product_keys(subject: Dict[str, Any]) -> List[str]:
     product_keys: List[str] = []
     product_group_id = subject.get("product_group_id")
@@ -1483,7 +1527,11 @@ async def _confirmed_internal_seller_offers(subject: Dict[str, Any]) -> List[Dic
         except ValueError:
             continue
         cache_row = await _fetch_latest_cache_row(merchant_id, platform, platform_product_id)
-        product_data = _json_dict(cache_row.get("product_data")) if cache_row else {}
+        if not cache_row:
+            continue
+        product_data = _json_dict(cache_row.get("product_data"))
+        if not product_data:
+            continue
         offers.append(_merchant_offer_row(product_key, merchant_id, platform, platform_product_id, product_data))
     return offers
 
@@ -2189,7 +2237,9 @@ async def get_pdp_offer_reconciliation(
     actor_role: Optional[str] = None,
 ) -> Dict[str, Any]:
     subject = await resolve_pdp_subject(pdp_id=pdp_id)
+    indexed_seller_count = int(subject.get("seller_count") or 0)
     internal_offers = await _confirmed_internal_seller_offers(subject)
+    subject = _subject_with_effective_internal_offers(subject, internal_offers)
     product_keys = [str(offer.get("product_key")) for offer in internal_offers if offer.get("product_key")]
     external_offers = await _confirmed_external_seed_offers(subject, product_keys)
     exclude_seed_ids = {offer.get("id") for offer in external_offers if offer.get("id")}
@@ -2219,7 +2269,7 @@ async def get_pdp_offer_reconciliation(
         "pdp": subject,
         "summary": {
             "seller_count": seller_count,
-            "pdp_index_seller_count": int(subject.get("seller_count") or 0),
+            "pdp_index_seller_count": indexed_seller_count,
             "external_only": bool(subject.get("external_only")),
             "confirmed_internal_seller_count": seller_count,
             "confirmed_external_offer_count": len(external_offers),
