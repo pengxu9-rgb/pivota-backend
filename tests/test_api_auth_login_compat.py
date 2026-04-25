@@ -75,3 +75,34 @@ async def test_api_auth_login_rejects_bad_demo_password_when_users_row_missing(m
         await auth.login(auth.LoginRequest(email="employee@pivota.com", password="wrong-password"))
 
     assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_api_auth_login_allows_demo_employee_when_canonical_password_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_ready() -> None:
+        return None
+
+    async def fake_fetch_one(query: str, _values: dict):
+        if "FROM users" in query:
+            return {
+                "id": "user_employee",
+                "email": "employee@pivota.com",
+                "password_hash": "different-canonical-hash",
+                "full_name": "Canonical Employee",
+                "role": "admin",
+                "active": True,
+                "merchant_id": None,
+            }
+        return None
+
+    monkeypatch.setattr(auth, "_ensure_auth_database_ready", fake_ready)
+    monkeypatch.setattr(auth, "_auth_fetch_one", fake_fetch_one)
+    monkeypatch.setattr(auth, "verify_password", lambda _password, _password_hash: False)
+
+    response = await auth.login(auth.LoginRequest(email="employee@pivota.com", password="Admin123!"))
+
+    assert response.success is True
+    assert response.user["email"] == "employee@pivota.com"
+    assert response.user["role"] == "admin"
