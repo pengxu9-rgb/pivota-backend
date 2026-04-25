@@ -771,9 +771,12 @@ async def test_senior_product_group_correction_replaces_wrong_confirmed_seller()
         assert body["reconciliation"]["confirmed"]["internal_sellers"][0]["product_key"] == "right-shopify-merchant|shopify|right-product"
 
         detail = await get_pdp_projection(pdp_id=pdp_id, actor_role="admin")
+        modules_by_key = {module["module_key"]: module for module in detail["modules"]}
         assert detail["published_payload"]["identity"]["product_group_id"] == "pg_identity_correction"
         assert detail["published_payload"]["identity"]["seller_count"] == 1
         assert detail["published_payload"]["identity"]["last_identity_correction"]["primary_product_key"] == "right-shopify-merchant|shopify|right-product"
+        assert any(ref.get("id") == "right-shopify-merchant|shopify|right-product" for ref in modules_by_key["copy"]["source_refs"])
+        assert any(ref.get("id") == "right-shopify-merchant|shopify|right-product" for ref in modules_by_key["quality"]["source_refs"])
         assert any(row["action"] == "identity_product_group_corrected" for row in detail["activity"])
     finally:
         if database.is_connected:

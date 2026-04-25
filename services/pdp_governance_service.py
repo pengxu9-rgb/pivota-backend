@@ -2222,8 +2222,17 @@ async def _publish_identity_correction_projection(
         "actor_id": actor_id,
         "reason": reason,
     }
+    always_refresh_modules = {"identity", "offers"}
+    system_refresh_modules = {"copy", "variants", "external_sources", "quality"}
     published_modules: List[Dict[str, Any]] = []
-    for module_key in ("identity", "offers"):
+    for module_key in ("identity", "copy", "variants", "offers", "external_sources", "quality"):
+        current = await _current_published_version(subject["pdp_id"], module_key)
+        if module_key in system_refresh_modules and current:
+            generated_by = str(current.get("generated_by") or "")
+            if generated_by not in {"system_baseline", "employee_identity_correction"}:
+                continue
+        if module_key not in always_refresh_modules and module_key not in payloads:
+            continue
         payload, source_refs = payloads[module_key]
         payload = {
             **payload,
