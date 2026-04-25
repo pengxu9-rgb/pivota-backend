@@ -316,6 +316,10 @@ def _distinctive_match_tokens(tokens: Iterable[str]) -> List[str]:
     return [token for token in tokens if token not in GENERIC_PRODUCT_MATCH_TOKENS]
 
 
+def _product_form_tokens(tokens: Iterable[str]) -> List[str]:
+    return sorted({token for token in tokens if token in GENERIC_PRODUCT_MATCH_TOKENS})
+
+
 def _match_score(target: Any, candidate: Any) -> Tuple[float, List[str]]:
     target_token_list = _tokenize_match_text(target)
     candidate_token_list = _tokenize_match_text(candidate)
@@ -339,6 +343,11 @@ def _match_score(target: Any, candidate: Any) -> Tuple[float, List[str]]:
         if normalized_target and normalized_candidate
         else 0.0
     )
+
+    target_forms = _product_form_tokens(target_tokens)
+    candidate_forms = _product_form_tokens(candidate_tokens)
+    if target_forms and candidate_forms and not (set(target_forms) & set(candidate_forms)) and title_similarity < 0.9:
+        return 0.0, [f"product_form_mismatch:{','.join(target_forms)}!={','.join(candidate_forms)}"]
 
     if not distinctive_overlap and title_similarity < 0.82:
         return 0.0, [f"generic_only_overlap:{token}" for token in overlap[:5]]
