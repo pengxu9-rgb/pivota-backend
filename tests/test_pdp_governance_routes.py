@@ -15,7 +15,7 @@ import pytest
 from db.database import database
 from routes.employee_pdp_governance import router as employee_pdp_router
 from routes.merchant_pdp import router as merchant_pdp_router
-from services.pdp_governance_service import hydrate_pdp_subject_index, list_pdp_subjects
+from services.pdp_governance_service import get_pdp_offer_reconciliation, get_pdp_projection, hydrate_pdp_subject_index, list_pdp_subjects
 from utils.auth import get_current_employee, get_current_user
 
 
@@ -440,11 +440,25 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
               platform TEXT NOT NULL,
               platform_product_id TEXT NOT NULL,
               product_data JSON NOT NULL,
+              cache_status TEXT DEFAULT 'fresh',
               cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-              expires_at DATETIME NULL
+              expires_at DATETIME NULL,
+              ttl_seconds INTEGER DEFAULT 3600,
+              access_count INTEGER DEFAULT 0,
+              last_accessed_at DATETIME NULL
             )
             """
         )
+        for ddl in [
+            "ALTER TABLE products_cache ADD COLUMN cache_status TEXT DEFAULT 'fresh'",
+            "ALTER TABLE products_cache ADD COLUMN ttl_seconds INTEGER DEFAULT 3600",
+            "ALTER TABLE products_cache ADD COLUMN access_count INTEGER DEFAULT 0",
+            "ALTER TABLE products_cache ADD COLUMN last_accessed_at DATETIME NULL",
+        ]:
+            try:
+                await database.execute(ddl)
+            except Exception:
+                pass
         await database.execute(
             """
             CREATE TABLE IF NOT EXISTS canonical_products (
@@ -541,6 +555,116 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
         assert ("merchant_product", "hydrate-merchant|shopify|canonical-product") in subjects
         assert ("external_product", "hydrate-seed-1") in subjects
         assert ("external_product", "hydrate-seed-55") in subjects
+    finally:
+        if database.is_connected:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_offer_reconciliation_counts_only_live_internal_seller_offers():
+    if not database.is_connected:
+        await database.connect()
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_group_members (
+              product_group_id TEXT,
+              merchant_id TEXT,
+              platform TEXT,
+              platform_product_id TEXT,
+              is_primary BOOLEAN DEFAULT FALSE,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products_cache (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              merchant_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              platform_product_id TEXT NOT NULL,
+              product_data JSON NOT NULL,
+              cache_status TEXT DEFAULT 'fresh',
+              cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              expires_at DATETIME NULL,
+              ttl_seconds INTEGER DEFAULT 3600,
+              access_count INTEGER DEFAULT 0,
+              last_accessed_at DATETIME NULL
+            )
+            """
+        )
+        for ddl in [
+            "ALTER TABLE products_cache ADD COLUMN cache_status TEXT DEFAULT 'fresh'",
+            "ALTER TABLE products_cache ADD COLUMN ttl_seconds INTEGER DEFAULT 3600",
+            "ALTER TABLE products_cache ADD COLUMN access_count INTEGER DEFAULT 0",
+            "ALTER TABLE products_cache ADD COLUMN last_accessed_at DATETIME NULL",
+        ]:
+            try:
+                await database.execute(ddl)
+            except Exception:
+                pass
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_product_seeds (
+              id TEXT PRIMARY KEY,
+              external_product_id TEXT NULL,
+              market TEXT NOT NULL,
+              tool TEXT DEFAULT '*',
+              destination_url TEXT,
+              canonical_url TEXT NULL,
+              domain TEXT NULL,
+              title TEXT NULL,
+              image_url TEXT NULL,
+              status TEXT DEFAULT 'active',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute("DELETE FROM product_group_members WHERE product_group_id = 'pg_offer_live_only'")
+        await database.execute("DELETE FROM products_cache WHERE merchant_id IN ('stale-offer-merchant', 'live-offer-merchant')")
+
+        await database.execute(
+            """
+            INSERT INTO product_group_members (product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at)
+            VALUES
+              ('pg_offer_live_only', 'stale-offer-merchant', 'shopify', 'missing-cache-product', TRUE, CURRENT_TIMESTAMP),
+              ('pg_offer_live_only', 'live-offer-merchant', 'wix', 'checkout-product', FALSE, CURRENT_TIMESTAMP)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, expires_at)
+            VALUES ('live-offer-merchant', 'wix', 'checkout-product', :payload, '2999-01-01 00:00:00')
+            """,
+            {
+                "payload": json.dumps(
+                    {
+                        "title": "Checkout Ready Harness",
+                        "image_url": "https://example.com/harness.jpg",
+                        "price": 36,
+                        "currency": "EUR",
+                        "variants": [{"variant_id": "v1"}],
+                        "orderable": True,
+                    }
+                )
+            },
+        )
+
+        detail = await get_pdp_projection(product_key="live-offer-merchant|wix|checkout-product", actor_role="admin")
+        pdp_id = detail["pdp"]["pdp_id"]
+        assert detail["pdp"]["seller_count"] == 1
+        assert detail["pdp"]["representative_product_key"] == "live-offer-merchant|wix|checkout-product"
+        assert detail["pdp"]["title"] == "Checkout Ready Harness"
+
+        reconciliation = await get_pdp_offer_reconciliation(pdp_id=pdp_id, actor_role="admin")
+        assert reconciliation["summary"]["confirmed_internal_seller_count"] == 1
+        assert reconciliation["summary"]["seller_count"] == 1
+        assert reconciliation["summary"]["pdp_index_seller_count"] == 2
+        assert [row["product_key"] for row in reconciliation["confirmed"]["internal_sellers"]] == [
+            "live-offer-merchant|wix|checkout-product"
+        ]
     finally:
         if database.is_connected:
             await database.disconnect()
