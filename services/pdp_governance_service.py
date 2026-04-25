@@ -2866,7 +2866,7 @@ async def hydrate_pdp_subject_index(
     await ensure_pdp_governance_tables()
     safe_limit = _normalize_hydration_limit(limit)
     before = await get_pdp_subject_index_stats()
-    await seed_recent_pdp_subjects(limit=safe_limit)
+    await seed_recent_pdp_subjects(limit=0 if safe_limit is None else safe_limit)
     after = await get_pdp_subject_index_stats()
     await _audit(
         pdp_id="pdp_subject_index",
