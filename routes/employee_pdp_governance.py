@@ -11,6 +11,7 @@ from services.pdp_governance_service import (
     REVIEW_ACTOR_HUMAN,
     apply_pdp_identity_review_action,
     assign_pdp_review_task,
+    correct_pdp_product_group_membership,
     create_module_draft,
     create_pdp_identity_review_task,
     get_pdp_offer_reconciliation,
@@ -98,6 +99,17 @@ class IdentityReviewActionRequest(BaseModel):
     target_product_key: Optional[str] = None
 
 
+class ProductGroupCorrectionRequest(BaseModel):
+    add_product_key: Optional[str] = None
+    remove_product_keys: List[str] = Field(default_factory=list)
+    set_primary_product_key: Optional[str] = None
+    reason: str = Field(min_length=1)
+    policy_labels: List[str] = Field(default_factory=list)
+    checklist: Optional[Dict[str, Any]] = None
+    decision_tree_path: Optional[List[str]] = None
+    override_reason: Optional[str] = None
+
+
 def _employee_actor(current_user: Dict[str, Any]) -> str:
     return str(current_user.get("sub") or current_user.get("email") or "employee")
 
@@ -108,7 +120,7 @@ def _employee_role(current_user: Dict[str, Any]) -> str:
 
 def _map_error(exc: Exception) -> HTTPException:
     message = str(exc)
-    if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND", "PDP_GALLERY_ASSET_NOT_FOUND", "PDP_REVIEW_TASK_NOT_FOUND", "PDP_IDENTITY_CANDIDATE_NOT_FOUND"}:
+    if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND", "PDP_GALLERY_ASSET_NOT_FOUND", "PDP_REVIEW_TASK_NOT_FOUND", "PDP_IDENTITY_CANDIDATE_NOT_FOUND", "PDP_PRODUCT_GROUP_MEMBER_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)
     if message in {
         "INVALID_PRODUCT_KEY",
@@ -130,6 +142,12 @@ def _map_error(exc: Exception) -> HTTPException:
         "PDP_IDENTITY_CANDIDATE_ALREADY_RESOLVED",
         "PDP_IDENTITY_TASK_ALREADY_RESOLVED",
         "PDP_IDENTITY_TASK_REQUIRED",
+        "PDP_PRODUCT_GROUP_REQUIRED",
+        "PDP_IDENTITY_CORRECTION_REASON_REQUIRED",
+        "PDP_IDENTITY_CORRECTION_POLICY_LABEL_REQUIRED",
+        "PDP_IDENTITY_CORRECTION_TARGET_REQUIRED",
+        "PDP_IDENTITY_CORRECTION_PRIMARY_REMOVED",
+        "PDP_IDENTITY_CORRECTION_PRODUCT_NOT_LIVE",
     }:
         return HTTPException(status_code=400, detail=message)
     if message in {"PDP_MODULE_REQUIRES_HUMAN_REVIEW", "PDP_REVIEW_ACTION_FORBIDDEN", "PDP_REVIEW_OVERRIDE_FORBIDDEN"}:
@@ -376,6 +394,30 @@ async def create_identity_review_task(
             candidate_type=body.candidate_type,
             candidate_ref=body.candidate_ref,
             notes=body.notes,
+            actor_role=_employee_role(current_user),
+            actor_id=_employee_actor(current_user),
+        )
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.post("/{pdp_id}/identity/product-group-correction")
+async def correct_product_group_membership(
+    pdp_id: str,
+    body: ProductGroupCorrectionRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    try:
+        return await correct_pdp_product_group_membership(
+            pdp_id=pdp_id,
+            add_product_key=body.add_product_key,
+            remove_product_keys=body.remove_product_keys,
+            set_primary_product_key=body.set_primary_product_key,
+            reason=body.reason,
+            policy_labels=body.policy_labels,
+            checklist=body.checklist,
+            decision_tree_path=body.decision_tree_path,
+            override_reason=body.override_reason,
             actor_role=_employee_role(current_user),
             actor_id=_employee_actor(current_user),
         )
