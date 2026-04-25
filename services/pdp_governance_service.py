@@ -1770,7 +1770,8 @@ async def _existing_identity_candidate_task(
             and review.get("candidate_type") == candidate_type
             and review.get("candidate_ref") == candidate_ref
         ):
-            task = await _ensure_review_task_for_module(subject, module)
+            module_with_version = {**module, "version_id": module.get("id")}
+            task = await _ensure_review_task_for_module(subject, module_with_version)
             return {"module": module, "task": task}
     return None
 
@@ -1793,18 +1794,35 @@ async def create_pdp_identity_review_task(
     if normalized_type not in {"external_seed_near_match", "merchant_product_near_match"} or not normalized_ref:
         raise ValueError("INVALID_PDP_IDENTITY_CANDIDATE")
 
+    decisions = await _identity_candidate_decision_index(subject["pdp_id"])
+    prior = decisions.get(normalized_ref)
+    if prior and prior.get("status") in {"accepted", "rejected"}:
+        raise ValueError("PDP_IDENTITY_CANDIDATE_ALREADY_RESOLVED")
+
     existing = await _existing_identity_candidate_task(
         subject=subject,
         candidate_type=normalized_type,
         candidate_ref=normalized_ref,
     )
     if existing:
+        task = existing.get("task") or {}
+        if task.get("task_id") and not (prior or {}).get("task_id"):
+            await _audit(
+                pdp_id=subject["pdp_id"],
+                module_key="identity",
+                action="identity_candidate_task_created",
+                actor_type=REVIEW_ACTOR_HUMAN,
+                actor_id=actor_id,
+                details={
+                    "task_id": task.get("task_id"),
+                    "version_id": (existing.get("module") or {}).get("id"),
+                    "candidate_type": normalized_type,
+                    "candidate_ref": normalized_ref,
+                    "recovered": True,
+                    "notes": notes,
+                },
+            )
         return {"status": "success", "created": False, **existing}
-
-    decisions = await _identity_candidate_decision_index(subject["pdp_id"])
-    prior = decisions.get(normalized_ref)
-    if prior and prior.get("status") in {"accepted", "rejected"}:
-        raise ValueError("PDP_IDENTITY_CANDIDATE_ALREADY_RESOLVED")
 
     candidate = await _find_offer_reconciliation_candidate(
         subject=subject,
@@ -1843,7 +1861,7 @@ async def create_pdp_identity_review_task(
         actor_id=actor_id,
         actor_role=actor_role,
     )
-    task = await _ensure_review_task_for_module(subject, module)
+    task = await _ensure_review_task_for_module(subject, {**module, "version_id": module.get("id")})
     await _audit(
         pdp_id=subject["pdp_id"],
         module_key="identity",
