@@ -391,6 +391,9 @@ async def login(data: LoginRequest):
         
         # Verify password
         if not verify_password(data.password, user['password_hash']):
+            legacy_response = await _legacy_employee_login_response(normalized_email, data.password)
+            if legacy_response is not None:
+                return legacy_response
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
