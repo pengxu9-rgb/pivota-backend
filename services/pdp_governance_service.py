@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from config.settings import resolve_public_api_base_url
@@ -96,6 +97,35 @@ HIGH_RISK_PAYLOAD_KEYS = {
     "merchant_dispute",
     "review_import",
     "featured_reviews",
+}
+
+GENERIC_PRODUCT_MATCH_TOKENS = {
+    "balm",
+    "blush",
+    "cleanser",
+    "conditioner",
+    "cream",
+    "essence",
+    "foundation",
+    "gel",
+    "gloss",
+    "highlighter",
+    "lotion",
+    "mask",
+    "mirror",
+    "mist",
+    "moisturizer",
+    "oil",
+    "palette",
+    "serum",
+    "shampoo",
+    "soap",
+    "spray",
+    "stick",
+    "sunscreen",
+    "toner",
+    "treatment",
+    "wash",
 }
 
 GALLERY_IMAGE_ROLES = {"primary", "gallery", "variant", "detail", "packaging", "swatch"}
@@ -282,25 +312,60 @@ def _tokenize_match_text(value: Any) -> List[str]:
     return [token for token in text.split() if len(token) >= 3 and token not in stop]
 
 
+def _distinctive_match_tokens(tokens: Iterable[str]) -> List[str]:
+    return [token for token in tokens if token not in GENERIC_PRODUCT_MATCH_TOKENS]
+
+
 def _match_score(target: Any, candidate: Any) -> Tuple[float, List[str]]:
-    target_tokens = set(_tokenize_match_text(target))
-    candidate_tokens = set(_tokenize_match_text(candidate))
+    target_token_list = _tokenize_match_text(target)
+    candidate_token_list = _tokenize_match_text(candidate)
+    target_tokens = set(target_token_list)
+    candidate_tokens = set(candidate_token_list)
     if not target_tokens or not candidate_tokens:
         return 0.0, []
+
     overlap = sorted(target_tokens & candidate_tokens)
+    distinctive_overlap = _distinctive_match_tokens(overlap)
+    normalized_target = " ".join(target_token_list)
+    normalized_candidate = " ".join(candidate_token_list)
+
+    if normalized_target and normalized_target == normalized_candidate:
+        reasons = ["exact_title_match"]
+        reasons.extend(f"title_distinctive_overlap:{token}" for token in distinctive_overlap[:5])
+        return 0.98, reasons
+
+    title_similarity = (
+        SequenceMatcher(None, normalized_target, normalized_candidate).ratio()
+        if normalized_target and normalized_candidate
+        else 0.0
+    )
+
+    if not distinctive_overlap and title_similarity < 0.82:
+        return 0.0, [f"generic_only_overlap:{token}" for token in overlap[:5]]
+
     union = target_tokens | candidate_tokens
-    score = len(overlap) / max(1, len(union))
-    reasons = [f"title_token_overlap:{token}" for token in overlap[:5]]
-    if str(target or "").strip().lower() == str(candidate or "").strip().lower():
-        score = max(score, 0.98)
-        reasons.insert(0, "exact_title_match")
+    token_jaccard = len(overlap) / max(1, len(union))
+    target_distinctive = set(_distinctive_match_tokens(target_tokens))
+    distinctive_coverage = len(set(distinctive_overlap)) / max(1, len(target_distinctive))
+    score = max(
+        token_jaccard,
+        distinctive_coverage * 0.72,
+        title_similarity if title_similarity >= 0.82 else 0.0,
+    )
+
+    reasons = [f"title_distinctive_overlap:{token}" for token in distinctive_overlap[:5]]
+    generic_overlap = [token for token in overlap if token in GENERIC_PRODUCT_MATCH_TOKENS]
+    if generic_overlap and distinctive_overlap:
+        reasons.extend(f"title_generic_overlap:{token}" for token in generic_overlap[:3])
+    if title_similarity >= 0.82:
+        reasons.append(f"title_similarity:{title_similarity:.2f}")
     return min(1.0, score), reasons
 
 
 def _score_candidate(target_title: Any, candidate_title: Any, target_brand: Any = None, candidate_brand: Any = None) -> Tuple[float, List[str]]:
     score, reasons = _match_score(target_title, candidate_title)
-    if target_brand and candidate_brand and str(target_brand).strip().lower() == str(candidate_brand).strip().lower():
-        score = min(1.0, score + 0.18)
+    if score > 0 and target_brand and candidate_brand and str(target_brand).strip().lower() == str(candidate_brand).strip().lower():
+        score = min(1.0, score + 0.12)
         reasons.append("brand_match")
     return score, reasons
 
@@ -1443,7 +1508,8 @@ async def _confirmed_external_seed_offers(subject: Dict[str, Any], product_keys:
 
 async def _external_seed_near_match_candidates(subject: Dict[str, Any], exclude_seed_ids: set) -> List[Dict[str, Any]]:
     title = subject.get("title") or subject.get("subject_ref")
-    tokens = _tokenize_match_text(title)[:4]
+    raw_tokens = _tokenize_match_text(title)
+    tokens = _distinctive_match_tokens(raw_tokens)[:4] or raw_tokens[:2]
     if not tokens:
         return []
     clauses = ["status = 'active'", "(market = :market OR market IS NULL)"]
@@ -1476,7 +1542,7 @@ async def _external_seed_near_match_candidates(subject: Dict[str, Any], exclude_
         if subject.get("external_product_id") and data.get("external_product_id") == subject.get("external_product_id"):
             continue
         score, reasons = _score_candidate(title, _seed_title(data), target_brand, _seed_brand(data))
-        if score < 0.22:
+        if score < 0.45:
             continue
         offer = _seed_offer_row(data, match_status="candidate")
         offer.update(
@@ -1517,7 +1583,7 @@ async def _merchant_product_near_match_candidates(subject: Dict[str, Any], exclu
         product_data = _json_dict(data.get("product_data"))
         summary = _extract_product_summary(product_data)
         score, reasons = _score_candidate(title, summary.get("title") or data.get("platform_product_id"), target_brand, summary.get("brand"))
-        if score < 0.22:
+        if score < 0.45:
             continue
         offer = _merchant_offer_row(
             product_key,
