@@ -447,6 +447,22 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
         )
         await database.execute(
             """
+            CREATE TABLE IF NOT EXISTS canonical_products (
+              canonical_product_id TEXT PRIMARY KEY,
+              merchant_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              platform_product_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              default_image_url TEXT NULL,
+              standard_product_data JSON NOT NULL,
+              expires_at DATETIME NULL,
+              source_recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute(
+            """
             CREATE TABLE IF NOT EXISTS external_product_seeds (
               id TEXT PRIMARY KEY,
               external_product_id TEXT NULL,
@@ -465,6 +481,7 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
         )
         await database.execute("DELETE FROM product_group_members WHERE merchant_id = 'hydrate-merchant'")
         await database.execute("DELETE FROM products_cache WHERE merchant_id = 'hydrate-merchant'")
+        await database.execute("DELETE FROM canonical_products WHERE merchant_id = 'hydrate-merchant'")
         await database.execute("DELETE FROM external_product_seeds WHERE id LIKE :seed_prefix", {"seed_prefix": "hydrate-seed-%"})
 
         await database.execute(
@@ -489,8 +506,21 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
         )
         await database.execute(
             """
+            INSERT INTO canonical_products (
+              canonical_product_id, merchant_id, platform, platform_product_id, title,
+              standard_product_data, expires_at
+            )
+            VALUES (
+              'canonical-hydrate-1', 'hydrate-merchant', 'shopify', 'canonical-product',
+              'Canonical Hydration Product', :canonical_payload, '2999-01-01 00:00:00'
+            )
+            """,
+            {"canonical_payload": json.dumps({"title": "Canonical Hydration Product"})},
+        )
+        await database.execute(
+            """
             INSERT INTO external_product_seeds (id, external_product_id, market, destination_url, title, status)
-            VALUES ('hydrate-seed-1', 'hydrate_external_1', 'US', 'https://example.com/hydrate', 'External Hydration Product', 'active')
+            VALUES ('hydrate-seed-1', NULL, 'US', 'https://example.com/hydrate', 'External Hydration Product', 'active')
             """
         )
 
@@ -502,7 +532,8 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
 
         assert ("product_group", "pg_hydrate_1") in subjects
         assert ("merchant_product", "hydrate-merchant|shopify|ungrouped-product") in subjects
-        assert ("external_product", "hydrate_external_1") in subjects
+        assert ("merchant_product", "hydrate-merchant|shopify|canonical-product") in subjects
+        assert ("external_product", "hydrate-seed-1") in subjects
     finally:
         if database.is_connected:
             await database.disconnect()
