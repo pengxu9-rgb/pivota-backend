@@ -39,6 +39,13 @@ def test_offer_candidate_scoring_keeps_distinctive_overlap() -> None:
     assert "title_distinctive_overlap:pdrn" in reasons
 
 
+def test_offer_candidate_scoring_rejects_product_form_mismatch() -> None:
+    score, reasons = _score_candidate("PDRN Serum", "Camellia Deep Collagen Milky PDRN Toner 150ml")
+
+    assert score == 0.0
+    assert "product_form_mismatch:serum!=toner" in reasons
+
+
 def test_offer_candidate_scoring_keeps_exact_title_match() -> None:
     score, reasons = _score_candidate("PDRN Serum", "PDRN Serum")
 
