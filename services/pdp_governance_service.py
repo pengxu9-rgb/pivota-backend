@@ -3759,18 +3759,21 @@ async def _bulk_upsert_subjects_postgres(subjects: List[Dict[str, Any]]) -> None
         }
         for subject in deduped_subjects.values()
     ]
-    insert_stmt = pg_insert(pdp_subject_index).values(rows)
-    update_columns = {
-        column.name: getattr(insert_stmt.excluded, column.name)
-        for column in pdp_subject_index.c
-        if column.name not in {"pdp_id", "created_at"}
-    }
-    await database.execute(
-        insert_stmt.on_conflict_do_update(
-            index_elements=[pdp_subject_index.c.pdp_id],
-            set_=update_columns,
+    chunk_size = 1000
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        insert_stmt = pg_insert(pdp_subject_index).values(chunk)
+        update_columns = {
+            column.name: getattr(insert_stmt.excluded, column.name)
+            for column in pdp_subject_index.c
+            if column.name not in {"pdp_id", "created_at"}
+        }
+        await database.execute(
+            insert_stmt.on_conflict_do_update(
+                index_elements=[pdp_subject_index.c.pdp_id],
+                set_=update_columns,
+            )
         )
-    )
 
 
 async def _next_module_version(pdp_id: str, module_key: str) -> int:
