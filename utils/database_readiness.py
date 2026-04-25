@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import HTTPException, status
 
 from db.database import database
+from utils.transient_errors import is_asyncpg_busy_error
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,28 @@ def database_unavailable_http_exception(*, retry_after_seconds: int = 1) -> HTTP
             "message": "Temporary database unavailable. Please retry shortly.",
         },
     )
+
+
+def _force_mark_database_disconnected() -> None:
+    """
+    Repair local `databases.Database` state after asyncpg reports a closed pool.
+
+    `databases` leaves `is_connected=True` if backend disconnect times out or fails.
+    In that state future `connect()` calls are skipped while requests keep raising
+    `InterfaceError: pool is closed`. Force the wrapper back to disconnected so the
+    next readiness pass creates a fresh pool.
+    """
+    try:
+        database.is_connected = False
+    except Exception:
+        pass
+
+    backend = getattr(database, "_backend", None)
+    if backend is not None and hasattr(backend, "_pool"):
+        try:
+            backend._pool = None
+        except Exception:
+            pass
 
 
 async def ensure_database_ready(
@@ -82,8 +105,14 @@ async def ensure_database_ready(
             await asyncio.wait_for(database.disconnect(), timeout=disconnect_timeout_seconds)
     except Exception as exc:
         logger.warning(f"Database disconnect during recovery failed: {exc}")
+    finally:
+        _force_mark_database_disconnected()
 
-    if not getattr(database, "is_connected", False):
-        await _connect_once()
+    await _connect_once()
 
-    await _probe_once("reconnect_probe")
+    try:
+        await _probe_once("reconnect_probe")
+    except DatabaseUnavailableError as exc:
+        if is_asyncpg_busy_error(exc.__cause__ or exc):
+            _force_mark_database_disconnected()
+        raise

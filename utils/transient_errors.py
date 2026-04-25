@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 _ASYNC_PG_BUSY_SUBSTR = "another operation is in progress"
 _ASYNC_PG_POOL_CLOSING_SUBSTR = "pool is closing"
+_ASYNC_PG_POOL_CLOSED_SUBSTR = "pool is closed"
 
 
 def is_asyncpg_busy_error(err: BaseException) -> bool:
@@ -23,6 +24,8 @@ def is_asyncpg_busy_error(err: BaseException) -> bool:
         if _ASYNC_PG_BUSY_SUBSTR in cur_text:
             return True
         if _ASYNC_PG_POOL_CLOSING_SUBSTR in cur_text:
+            return True
+        if _ASYNC_PG_POOL_CLOSED_SUBSTR in cur_text:
             return True
         cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
     return False

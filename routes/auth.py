@@ -4,6 +4,7 @@ Clean and simple authentication system for Pivota
 """
 
 import logging
+import asyncio
 import json
 from datetime import datetime
 from textwrap import dedent
@@ -21,6 +22,12 @@ from utils.auth import (
     get_current_user,
     require_admin,
 )
+from utils.database_readiness import (
+    DatabaseUnavailableError,
+    database_unavailable_http_exception,
+    ensure_database_ready,
+)
+from utils.transient_errors import is_asyncpg_busy_error
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 logger = logging.getLogger("auth_routes")
@@ -91,6 +98,57 @@ class MessageResponse(BaseModel):
 
 def _normalize_email(raw_email: str) -> str:
     return (raw_email or "").strip().lower()
+
+
+_AUTH_DB_TIMEOUT_SECONDS = 5.0
+
+
+async def _ensure_auth_database_ready() -> None:
+    try:
+        await ensure_database_ready(
+            connect_timeout_seconds=2.0,
+            probe_timeout_seconds=2.0,
+            disconnect_timeout_seconds=1.0,
+        )
+    except DatabaseUnavailableError as exc:
+        logger.warning(
+            "[Auth] Database readiness failed phase=%s error=%s",
+            exc.phase,
+            exc.error_type,
+        )
+        raise database_unavailable_http_exception(retry_after_seconds=2) from exc
+
+
+async def _auth_fetch_one(query: str, values: dict):
+    for attempt in range(2):
+        try:
+            return await asyncio.wait_for(
+                database.fetch_one(query=query, values=values),
+                timeout=_AUTH_DB_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise database_unavailable_http_exception(retry_after_seconds=2) from exc
+        except Exception as exc:
+            if attempt == 0 and is_asyncpg_busy_error(exc):
+                await _ensure_auth_database_ready()
+                continue
+            raise
+
+
+async def _auth_execute(query: str, values: dict):
+    for attempt in range(2):
+        try:
+            return await asyncio.wait_for(
+                database.execute(query=query, values=values),
+                timeout=_AUTH_DB_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise database_unavailable_http_exception(retry_after_seconds=2) from exc
+        except Exception as exc:
+            if attempt == 0 and is_asyncpg_busy_error(exc):
+                await _ensure_auth_database_ready()
+                continue
+            raise
 
 
 def _send_reset_password_email(email: str, reset_link: str) -> None:
@@ -212,6 +270,7 @@ async def login(data: LoginRequest):
     Returns JWT token and user information
     """
     try:
+        await _ensure_auth_database_ready()
         normalized_email = _normalize_email(data.email)
         # Find user by email
         query = """
@@ -219,7 +278,7 @@ async def login(data: LoginRequest):
             FROM users
             WHERE email = :email
         """
-        user = await database.fetch_one(query=query, values={"email": normalized_email})
+        user = await _auth_fetch_one(query, {"email": normalized_email})
         
         if not user:
             raise HTTPException(
@@ -247,17 +306,14 @@ async def login(data: LoginRequest):
             SET last_login = :last_login
             WHERE id = :user_id
         """
-        await database.execute(
-            query=update_query,
-            values={"last_login": datetime.utcnow(), "user_id": user['id']}
-        )
+        await _auth_execute(update_query, {"last_login": datetime.utcnow(), "user_id": user['id']})
         
         # For merchants, resolve their merchant_id
         # Prefer the explicit binding from users.merchant_id; fall back to
         # merchant_onboarding.contact_email only when not set.
         merchant_id = user["merchant_id"]
         if user['role'] == 'merchant' and not merchant_id:
-            merchant_record = await database.fetch_one(
+            merchant_record = await _auth_fetch_one(
                 "SELECT merchant_id FROM merchant_onboarding WHERE contact_email = :email",
                 {"email": user['email']}
             )
@@ -270,7 +326,7 @@ async def login(data: LoginRequest):
         agent_id = None
         if user['role'] == 'agent':
             try:
-                agent_record = await database.fetch_one(
+                agent_record = await _auth_fetch_one(
                     "SELECT agent_id FROM agents WHERE email = :email LIMIT 1",
                     {"email": user['email']}
                 )
@@ -279,10 +335,11 @@ async def login(data: LoginRequest):
                 # without an `email` column. Add it non-destructively and retry.
                 if 'column "email" does not exist' in str(e):
                     try:
-                        await database.execute(
-                            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS email VARCHAR(255)"
+                        await _auth_execute(
+                            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS email VARCHAR(255)",
+                            {},
                         )
-                        agent_record = await database.fetch_one(
+                        agent_record = await _auth_fetch_one(
                             "SELECT agent_id FROM agents WHERE email = :email LIMIT 1",
                             {"email": user['email']},
                         )
@@ -297,13 +354,14 @@ async def login(data: LoginRequest):
         employee_permissions: list = []
         if user['role'] in ['super_admin', 'admin', 'employee', 'outsourced']:
             try:
-                employee_record = await database.fetch_one(
+                employee_record = await _auth_fetch_one(
                     "SELECT employee_id, permissions FROM employees WHERE email = :email",
                     {"email": user['email']}
                 )
                 if employee_record:
-                    employee_id = employee_record.get('employee_id')
-                    raw_permissions = employee_record.get('permissions')
+                    employee_row = dict(employee_record)
+                    employee_id = employee_row.get('employee_id')
+                    raw_permissions = employee_row.get('permissions')
                     if raw_permissions is None:
                         employee_permissions = []
                     elif isinstance(raw_permissions, list):
@@ -321,12 +379,12 @@ async def login(data: LoginRequest):
             except Exception as e:
                 if 'permissions' in str(e) or 'employees' in str(e):
                     try:
-                        employee_record = await database.fetch_one(
+                        employee_record = await _auth_fetch_one(
                             "SELECT employee_id FROM employees WHERE email = :email",
                             {"email": user['email']}
                         )
                         if employee_record:
-                            employee_id = employee_record.get('employee_id')
+                            employee_id = dict(employee_record).get('employee_id')
                     except Exception:
                         pass
                 else:
