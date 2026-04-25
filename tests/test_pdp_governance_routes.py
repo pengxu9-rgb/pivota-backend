@@ -158,6 +158,50 @@ def test_identity_candidate_task_and_action_routes_delegate_with_employee_actor(
         assert captured["action"]["actor_id"] == "employee-test"
 
 
+def test_identity_candidate_task_creation_returns_real_task_id(monkeypatch):
+    import services.pdp_governance_service as pdp_service
+
+    async def fake_find_candidate(**_kwargs):
+        return {
+            "id": "eps_identity_task_real",
+            "source": "external_seed",
+            "candidate_type": "external_seed_near_match",
+            "title": "Candidate shade",
+            "confidence": 0.91,
+            "match_reasons": ["title_similarity:0.91"],
+            "canonical_url": "https://example.com/candidate",
+            "requires_human": True,
+        }
+
+    monkeypatch.setattr(pdp_service, "_find_offer_reconciliation_candidate", fake_find_candidate)
+
+    with _client(role="employee") as client:
+        resolved = client.get(
+            "/employee/pdps/resolve",
+            params={"product_key": "external_seed|external|external-route-identity-task-real", "market": "US"},
+        )
+        assert resolved.status_code == 200
+        pdp_id = resolved.json()["pdp"]["pdp_id"]
+
+        created = client.post(
+            f"/employee/pdps/{pdp_id}/identity-review-tasks",
+            json={
+                "candidate_type": "external_seed_near_match",
+                "candidate_ref": "eps_identity_task_real",
+                "notes": "Create formal identity task from candidate evidence.",
+            },
+        )
+        assert created.status_code == 200
+        body = created.json()
+        assert body["task"]["task_id"].startswith("pdptask_")
+        assert body["task"]["version_id"] == body["module"]["id"]
+
+        detail = client.get(f"/employee/pdps/review-queue/{body['task']['task_id']}")
+        assert detail.status_code == 200
+        assert detail.json()["module"]["module_key"] == "identity"
+        assert "attach_external_offer" in detail.json()["task"]["allowed_actions"]
+
+
 def test_employee_pdp_list_exposes_pagination_metadata():
     with _client() as client:
         for seed_id in ("external-route-page-1", "external-route-page-2", "external-route-page-3"):
