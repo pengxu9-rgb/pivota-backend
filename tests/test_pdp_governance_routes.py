@@ -102,6 +102,62 @@ def test_employee_offer_reconciliation_exposes_confirmed_and_candidate_sections(
         assert "view" in body["allowed_actions"]
 
 
+def test_identity_candidate_task_and_action_routes_delegate_with_employee_actor(monkeypatch):
+    import routes.employee_pdp_governance as pdp_routes
+
+    captured = {}
+
+    async def fake_create_identity_task(**kwargs):
+        captured["create"] = kwargs
+        return {
+            "status": "success",
+            "created": True,
+            "task": {"task_id": "pdptask_identity_1", "module_key": "identity"},
+        }
+
+    async def fake_apply_identity_action(**kwargs):
+        captured["action"] = kwargs
+        return {
+            "status": "success",
+            "decision": "pass",
+            "identity_action": kwargs["action"],
+        }
+
+    monkeypatch.setattr(pdp_routes, "create_pdp_identity_review_task", fake_create_identity_task)
+    monkeypatch.setattr(pdp_routes, "apply_pdp_identity_review_action", fake_apply_identity_action)
+
+    with _client(role="employee") as client:
+        created = client.post(
+            "/employee/pdps/pdp_identity_route/identity-review-tasks",
+            json={
+                "candidate_type": "external_seed_near_match",
+                "candidate_ref": "eps_candidate_1",
+                "notes": "Candidate looks like the same PDP offer.",
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["task"]["task_id"] == "pdptask_identity_1"
+        assert captured["create"]["pdp_id"] == "pdp_identity_route"
+        assert captured["create"]["actor_role"] == "employee"
+        assert captured["create"]["actor_id"] == "employee-test"
+
+        action = client.post(
+            "/employee/pdps/review-queue/pdptask_identity_1/identity-action",
+            json={
+                "action": "attach_external_offer",
+                "notes": "Evidence and source URL match.",
+                "checklist": {"source_grounded": True, "product_identity_match": True},
+                "policy_labels": ["identity_match", "external_offer_attach"],
+                "decision_tree_path": ["identity", "external_offer", "attach"],
+            },
+        )
+        assert action.status_code == 200
+        assert action.json()["identity_action"] == "attach_external_offer"
+        assert captured["action"]["task_id"] == "pdptask_identity_1"
+        assert captured["action"]["actor_role"] == "employee"
+        assert captured["action"]["actor_id"] == "employee-test"
+
+
 def test_employee_pdp_list_exposes_pagination_metadata():
     with _client() as client:
         for seed_id in ("external-route-page-1", "external-route-page-2", "external-route-page-3"):
