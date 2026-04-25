@@ -15,7 +15,13 @@ import pytest
 from db.database import database
 from routes.employee_pdp_governance import router as employee_pdp_router
 from routes.merchant_pdp import router as merchant_pdp_router
-from services.pdp_governance_service import get_pdp_offer_reconciliation, get_pdp_projection, hydrate_pdp_subject_index, list_pdp_subjects
+from services.pdp_governance_service import (
+    correct_pdp_product_group_membership,
+    get_pdp_offer_reconciliation,
+    get_pdp_projection,
+    hydrate_pdp_subject_index,
+    list_pdp_subjects,
+)
 from utils.auth import get_current_employee, get_current_user
 
 
@@ -668,6 +674,124 @@ async def test_offer_reconciliation_counts_only_live_internal_seller_offers():
     finally:
         if database.is_connected:
             await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_senior_product_group_correction_replaces_wrong_confirmed_seller():
+    if not database.is_connected:
+        await database.connect()
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_group_members (
+              product_group_id TEXT,
+              merchant_id TEXT,
+              platform TEXT,
+              platform_product_id TEXT,
+              is_primary BOOLEAN DEFAULT FALSE,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products_cache (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              merchant_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              platform_product_id TEXT NOT NULL,
+              product_data JSON NOT NULL,
+              cache_status TEXT DEFAULT 'fresh',
+              cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              expires_at DATETIME NULL,
+              ttl_seconds INTEGER DEFAULT 3600,
+              access_count INTEGER DEFAULT 0,
+              last_accessed_at DATETIME NULL
+            )
+            """
+        )
+        await database.execute("DELETE FROM product_group_members WHERE product_group_id = 'pg_identity_correction'")
+        await database.execute("DELETE FROM products_cache WHERE merchant_id IN ('wrong-wix-merchant', 'right-shopify-merchant')")
+        await database.execute(
+            """
+            INSERT INTO product_group_members (product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at)
+            VALUES ('pg_identity_correction', 'wrong-wix-merchant', 'wix', 'wrong-product', TRUE, CURRENT_TIMESTAMP)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, expires_at)
+            VALUES
+              ('wrong-wix-merchant', 'wix', 'wrong-product', :wrong_payload, '2999-01-01 00:00:00'),
+              ('right-shopify-merchant', 'shopify', 'right-product', :right_payload, '2999-01-01 00:00:00')
+            """,
+            {
+                "wrong_payload": json.dumps(
+                    {
+                        "title": "Wrong Wix Harness",
+                        "image_url": "https://example.com/wrong.jpg",
+                        "price": 12,
+                        "currency": "USD",
+                    }
+                ),
+                "right_payload": json.dumps(
+                    {
+                        "title": "Comfy Tactical Dog Harness for Small to Medium Dogs",
+                        "image_url": "https://example.com/shopify-harness.jpg",
+                        "price": 36,
+                        "currency": "USD",
+                        "variants": [{"id": "v1"}],
+                    }
+                ),
+            },
+        )
+
+        resolved = await get_pdp_projection(
+            product_key="wrong-wix-merchant|wix|wrong-product",
+            actor_role="admin",
+        )
+        pdp_id = resolved["pdp"]["pdp_id"]
+
+        body = await correct_pdp_product_group_membership(
+            pdp_id=pdp_id,
+            add_product_key="right-shopify-merchant|shopify|right-product",
+            set_primary_product_key="right-shopify-merchant|shopify|right-product",
+            remove_product_keys=["wrong-wix-merchant|wix|wrong-product"],
+            reason="Correct confirmed seller after merchant owner feedback.",
+            policy_labels=["identity:correct_confirmed_seller", "source:merchant_owner_feedback"],
+            checklist={"source_grounded": True, "product_identity_match": True},
+            decision_tree_path=["identity", "product_group_correction", "publish"],
+            override_reason="Senior correction replaces an incorrectly grouped seller.",
+            actor_role="admin",
+            actor_id="employee-test",
+        )
+        assert body["pdp"]["representative_product_key"] == "right-shopify-merchant|shopify|right-product"
+        assert body["pdp"]["seller_count"] == 1
+        assert body["published_modules"][0]["module_key"] == "identity"
+        assert body["reconciliation"]["confirmed"]["internal_sellers"][0]["product_key"] == "right-shopify-merchant|shopify|right-product"
+
+        detail = await get_pdp_projection(pdp_id=pdp_id, actor_role="admin")
+        assert detail["published_payload"]["identity"]["product_group_id"] == "pg_identity_correction"
+        assert detail["published_payload"]["identity"]["seller_count"] == 1
+        assert detail["published_payload"]["identity"]["last_identity_correction"]["primary_product_key"] == "right-shopify-merchant|shopify|right-product"
+        assert any(row["action"] == "identity_product_group_corrected" for row in detail["activity"])
+    finally:
+        if database.is_connected:
+            await database.disconnect()
+
+
+def test_product_group_correction_forbidden_for_non_senior():
+    with _client(role="outsourced") as client:
+        response = client.post(
+            "/employee/pdps/pdp_any/identity/product-group-correction",
+            json={
+                "add_product_key": "merchant|shopify|product",
+                "reason": "Attempted correction.",
+                "policy_labels": ["identity:test"],
+            },
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "PDP_REVIEW_ACTION_FORBIDDEN"
 
 
 def test_outsourced_publish_requires_checklist_and_blocks_high_risk():

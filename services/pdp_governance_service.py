@@ -2023,22 +2023,350 @@ async def _upsert_product_group_member(product_group_id: str, merchant_id: str, 
             },
         )
     except Exception:
-        await database.execute(
-            f"""
-            UPDATE product_group_members
-            SET product_group_id = :product_group_id,
-                updated_at = {now_expr}
+        existing = await database.fetch_one(
+            """
+            SELECT 1 AS ok
+            FROM product_group_members
             WHERE merchant_id = :merchant_id
               AND platform = :platform
               AND platform_product_id = :platform_product_id
+            LIMIT 1
             """,
             {
-                "product_group_id": product_group_id,
                 "merchant_id": merchant_id,
                 "platform": platform,
                 "platform_product_id": platform_product_id,
             },
         )
+        if existing:
+            await database.execute(
+                f"""
+                UPDATE product_group_members
+                SET product_group_id = :product_group_id,
+                    updated_at = {now_expr}
+                WHERE merchant_id = :merchant_id
+                  AND platform = :platform
+                  AND platform_product_id = :platform_product_id
+                """,
+                {
+                    "product_group_id": product_group_id,
+                    "merchant_id": merchant_id,
+                    "platform": platform,
+                    "platform_product_id": platform_product_id,
+                },
+            )
+        else:
+            await database.execute(
+                f"""
+                INSERT INTO product_group_members (
+                  product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at
+                ) VALUES (
+                  :product_group_id, :merchant_id, :platform, :platform_product_id, FALSE, {now_expr}
+                )
+                """,
+                {
+                    "product_group_id": product_group_id,
+                    "merchant_id": merchant_id,
+                    "platform": platform,
+                    "platform_product_id": platform_product_id,
+                },
+            )
+
+
+async def _product_group_member_exists(product_group_id: str, product_key: str) -> bool:
+    merchant_id, platform, platform_product_id = parse_product_key(product_key)
+    row = await database.fetch_one(
+        """
+        SELECT 1 AS ok
+        FROM product_group_members
+        WHERE product_group_id = :product_group_id
+          AND merchant_id = :merchant_id
+          AND platform = :platform
+          AND platform_product_id = :platform_product_id
+        LIMIT 1
+        """,
+        {
+            "product_group_id": product_group_id,
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+        },
+    )
+    return bool(row)
+
+
+async def _product_group_member_product_keys(product_group_id: str) -> List[str]:
+    rows = await database.fetch_all(
+        """
+        SELECT merchant_id, platform, platform_product_id
+        FROM product_group_members
+        WHERE product_group_id = :product_group_id
+        ORDER BY is_primary DESC, updated_at DESC
+        """,
+        {"product_group_id": product_group_id},
+    )
+    keys: List[str] = []
+    for row in rows or []:
+        data = _row_dict(row)
+        key = _product_key(data.get("merchant_id"), data.get("platform"), data.get("platform_product_id"))
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+async def _remove_product_group_member(product_group_id: str, product_key: str) -> None:
+    merchant_id, platform, platform_product_id = parse_product_key(product_key)
+    await database.execute(
+        """
+        DELETE FROM product_group_members
+        WHERE product_group_id = :product_group_id
+          AND merchant_id = :merchant_id
+          AND platform = :platform
+          AND platform_product_id = :platform_product_id
+        """,
+        {
+            "product_group_id": product_group_id,
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+        },
+    )
+
+
+async def _set_product_group_primary(product_group_id: str, product_key: str) -> None:
+    if not await _product_group_member_exists(product_group_id, product_key):
+        raise LookupError("PDP_PRODUCT_GROUP_MEMBER_NOT_FOUND")
+    merchant_id, platform, platform_product_id = parse_product_key(product_key)
+    now_expr = _sql_now_expr()
+    await database.execute(
+        f"""
+        UPDATE product_group_members
+        SET is_primary = FALSE,
+            updated_at = {now_expr}
+        WHERE product_group_id = :product_group_id
+        """,
+        {"product_group_id": product_group_id},
+    )
+    await database.execute(
+        f"""
+        UPDATE product_group_members
+        SET is_primary = TRUE,
+            updated_at = {now_expr}
+        WHERE product_group_id = :product_group_id
+          AND merchant_id = :merchant_id
+          AND platform = :platform
+          AND platform_product_id = :platform_product_id
+        """,
+        {
+            "product_group_id": product_group_id,
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "platform_product_id": platform_product_id,
+        },
+    )
+
+
+async def _product_summary_for_key(product_key: str) -> Dict[str, Any]:
+    merchant_id, platform, platform_product_id = parse_product_key(product_key)
+    row = await _fetch_latest_cache_row(merchant_id, platform, platform_product_id)
+    if not row:
+        raise LookupError("PDP_IDENTITY_CORRECTION_PRODUCT_NOT_LIVE")
+    product_data = _json_dict(row.get("product_data"))
+    if not product_data:
+        raise LookupError("PDP_IDENTITY_CORRECTION_PRODUCT_NOT_LIVE")
+    return _extract_product_summary(product_data)
+
+
+async def _refresh_subject_after_product_group_correction(
+    subject: Dict[str, Any],
+    *,
+    primary_product_key: Optional[str],
+) -> Dict[str, Any]:
+    product_group_id = str(subject.get("product_group_id") or "").strip()
+    primary_key = str(primary_product_key or "").strip() or await _primary_product_key_for_group(product_group_id)
+    refreshed = dict(subject)
+    if primary_key:
+        refreshed["representative_product_key"] = primary_key
+        try:
+            primary_summary = await _product_summary_for_key(primary_key)
+        except Exception:
+            primary_summary = {}
+        if primary_summary.get("title"):
+            refreshed["title"] = primary_summary.get("title")
+        if primary_summary.get("image_url"):
+            refreshed["image_url"] = primary_summary.get("image_url")
+
+    internal_offers = await _confirmed_internal_seller_offers(refreshed)
+    refreshed = _subject_with_effective_internal_offers(refreshed, internal_offers)
+    if primary_key:
+        refreshed["representative_product_key"] = primary_key
+    return await _upsert_subject(refreshed)
+
+
+async def _publish_identity_correction_projection(
+    subject: Dict[str, Any],
+    *,
+    actor_role: Optional[str],
+    actor_id: Optional[str],
+    reason: str,
+    policy_labels: List[str],
+    checklist: Optional[Dict[str, Any]],
+    decision_tree_path: Optional[List[str]],
+    override_reason: Optional[str],
+    correction_details: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    payloads = await _baseline_payloads(subject)
+    correction_ref = {
+        "type": "employee_identity_correction",
+        "product_group_id": subject.get("product_group_id"),
+        "actor_id": actor_id,
+        "reason": reason,
+    }
+    published_modules: List[Dict[str, Any]] = []
+    for module_key in ("identity", "offers"):
+        payload, source_refs = payloads[module_key]
+        payload = {
+            **payload,
+            "last_identity_correction": {
+                "reason": reason,
+                "policy_labels": policy_labels,
+                **correction_details,
+            },
+        }
+        module = await create_module_draft(
+            pdp_id=subject["pdp_id"],
+            module_key=module_key,
+            payload=payload,
+            source_refs=merge_source_refs(source_refs, [correction_ref]),
+            generated_by="employee_identity_correction",
+            generation_ref=str(correction_details.get("correction_id") or ""),
+            actor_type=REVIEW_ACTOR_HUMAN,
+            actor_id=actor_id,
+            actor_role=actor_role,
+        )
+        reviewed = await review_module_version(
+            pdp_id=subject["pdp_id"],
+            module_key=module_key,
+            version_id=module["id"],
+            actor_type=REVIEW_ACTOR_HUMAN,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            decision="pass",
+            notes=reason,
+            checklist=checklist or {"identity_corrected": True, "source_grounded": True},
+            policy_labels=policy_labels,
+            decision_tree_path=decision_tree_path or ["identity", "product_group_correction", module_key, "publish"],
+            override_reason=override_reason,
+        )
+        published_modules.append(reviewed["module"])
+    return published_modules
+
+
+async def correct_pdp_product_group_membership(
+    *,
+    pdp_id: str,
+    add_product_key: Optional[str] = None,
+    remove_product_keys: Optional[List[str]] = None,
+    set_primary_product_key: Optional[str] = None,
+    reason: Optional[str] = None,
+    policy_labels: Optional[List[str]] = None,
+    checklist: Optional[Dict[str, Any]] = None,
+    decision_tree_path: Optional[List[str]] = None,
+    override_reason: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    if not is_senior_employee_role(actor_role):
+        raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
+    normalized_reason = str(reason or "").strip()
+    if not normalized_reason:
+        raise ValueError("PDP_IDENTITY_CORRECTION_REASON_REQUIRED")
+    normalized_policy_labels = [str(label).strip() for label in (policy_labels or []) if str(label).strip()]
+    if not normalized_policy_labels:
+        raise ValueError("PDP_IDENTITY_CORRECTION_POLICY_LABEL_REQUIRED")
+
+    subject = await resolve_pdp_subject(pdp_id=pdp_id)
+    product_group_id = str(subject.get("product_group_id") or "").strip()
+    if not product_group_id:
+        raise ValueError("PDP_PRODUCT_GROUP_REQUIRED")
+
+    add_key = str(add_product_key or "").strip()
+    primary_key = str(set_primary_product_key or add_key or "").strip()
+    remove_keys = [str(key).strip() for key in (remove_product_keys or []) if str(key).strip()]
+    if not add_key and not primary_key and not remove_keys:
+        raise ValueError("PDP_IDENTITY_CORRECTION_TARGET_REQUIRED")
+
+    for key in [key for key in [add_key, primary_key, *remove_keys] if key]:
+        parse_product_key(key)
+    if primary_key and primary_key in set(remove_keys):
+        raise ValueError("PDP_IDENTITY_CORRECTION_PRIMARY_REMOVED")
+    current_member_keys = await _product_group_member_product_keys(product_group_id)
+    future_member_keys = set(current_member_keys) - set(remove_keys)
+    if add_key:
+        future_member_keys.add(add_key)
+    if not future_member_keys:
+        raise ValueError("PDP_IDENTITY_CORRECTION_TARGET_REQUIRED")
+    if not primary_key:
+        current_primary_key = await _primary_product_key_for_group(product_group_id)
+        primary_key = current_primary_key if current_primary_key in future_member_keys else sorted(future_member_keys)[0]
+    if add_key:
+        await _product_summary_for_key(add_key)
+    if primary_key and primary_key != add_key:
+        await _product_summary_for_key(primary_key)
+
+    correction_id = f"pdpident_{uuid.uuid4().hex}"
+    async with database.transaction():
+        if add_key:
+            merchant_id, platform, platform_product_id = parse_product_key(add_key)
+            await _upsert_product_group_member(product_group_id, merchant_id, platform, platform_product_id)
+        for remove_key in remove_keys:
+            await _remove_product_group_member(product_group_id, remove_key)
+        if primary_key:
+            await _set_product_group_primary(product_group_id, primary_key)
+
+    refreshed_subject = await _refresh_subject_after_product_group_correction(subject, primary_product_key=primary_key)
+    correction_details = {
+        "correction_id": correction_id,
+        "product_group_id": product_group_id,
+        "added_product_key": add_key or None,
+        "removed_product_keys": remove_keys,
+        "primary_product_key": primary_key or refreshed_subject.get("representative_product_key"),
+        "actor_role": normalize_employee_role(actor_role),
+    }
+    published_modules = await _publish_identity_correction_projection(
+        refreshed_subject,
+        actor_role=actor_role,
+        actor_id=actor_id,
+        reason=normalized_reason,
+        policy_labels=normalized_policy_labels,
+        checklist=checklist,
+        decision_tree_path=decision_tree_path,
+        override_reason=override_reason,
+        correction_details=correction_details,
+    )
+    await _audit(
+        pdp_id=refreshed_subject["pdp_id"],
+        module_key="identity",
+        action="identity_product_group_corrected",
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        details={
+            **correction_details,
+            "reason": normalized_reason,
+            "policy_labels": normalized_policy_labels,
+            "checklist": checklist if isinstance(checklist, dict) else {},
+            "decision_tree_path": decision_tree_path if isinstance(decision_tree_path, list) else [],
+            "override_reason": override_reason,
+        },
+    )
+    return {
+        "status": "success",
+        "correction": correction_details,
+        "pdp": refreshed_subject,
+        "published_modules": published_modules,
+        "reconciliation": await get_pdp_offer_reconciliation(pdp_id=refreshed_subject["pdp_id"], actor_role=actor_role),
+    }
 
 
 async def _apply_merchant_candidate_merge(subject: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
