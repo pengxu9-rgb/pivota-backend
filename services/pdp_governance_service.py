@@ -175,6 +175,8 @@ def module_requires_human_review(module_key: str, payload: Optional[Dict[str, An
     if module_key in HUMAN_CO_REVIEW_MODULES:
         return True
     payload = payload if isinstance(payload, dict) else {}
+    if module_key == "identity" and isinstance(payload.get("identity_review"), dict):
+        return True
     if module_key == "gallery":
         return True
     if module_key == "pivota_insights":
@@ -382,6 +384,10 @@ def _score_candidate(target_title: Any, candidate_title: Any, target_brand: Any 
 def _named_in(prefix: str, values: List[str]) -> Tuple[str, Dict[str, str]]:
     params = {f"{prefix}_{idx}": value for idx, value in enumerate(values)}
     return ", ".join(f":{name}" for name in params), params
+
+
+def _sql_now_expr() -> str:
+    return "NOW()" if IS_POSTGRES else "CURRENT_TIMESTAMP"
 
 
 async def ensure_pdp_governance_tables() -> None:
@@ -1616,6 +1622,549 @@ async def _merchant_product_near_match_candidates(subject: Dict[str, Any], exclu
     return candidates[:20]
 
 
+def _identity_candidate_ref(candidate: Dict[str, Any]) -> str:
+    return str(candidate.get("product_key") or candidate.get("id") or "").strip()
+
+
+def _identity_candidate_action_set(candidate: Dict[str, Any]) -> List[str]:
+    candidate_type = str(candidate.get("candidate_type") or "")
+    if candidate_type == "external_seed_near_match":
+        return ["attach_external_offer", "reject_candidate"]
+    if candidate_type == "merchant_product_near_match":
+        return ["merge_product_group", "reject_candidate"]
+    return ["reject_candidate"]
+
+
+def _identity_candidate_source_ref(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    candidate_type = str(candidate.get("candidate_type") or "")
+    if candidate_type == "external_seed_near_match":
+        return {
+            "type": "external_seed_candidate",
+            "id": candidate.get("id"),
+            "url": candidate.get("canonical_url") or candidate.get("destination_url"),
+            "candidate_type": candidate_type,
+            "confidence": candidate.get("confidence"),
+        }
+    return {
+        "type": "merchant_product_candidate",
+        "id": candidate.get("product_key") or candidate.get("id"),
+        "candidate_type": candidate_type,
+        "confidence": candidate.get("confidence"),
+    }
+
+
+async def _identity_candidate_decision_index(pdp_id: str) -> Dict[str, Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT action, actor_id, details, created_at
+        FROM pdp_audit_log
+        WHERE pdp_id = :pdp_id
+          AND module_key = 'identity'
+          AND action IN (
+            'identity_candidate_task_created',
+            'identity_candidate_attached',
+            'identity_candidate_merged',
+            'identity_candidate_rejected'
+          )
+        ORDER BY created_at DESC
+        LIMIT 300
+        """,
+        {"pdp_id": pdp_id},
+    )
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        data = _row_dict(row)
+        details = _json_dict(data.get("details"))
+        candidate_ref = str(details.get("candidate_ref") or "").strip()
+        if not candidate_ref or candidate_ref in decisions:
+            continue
+        action = str(data.get("action") or "")
+        if action == "identity_candidate_task_created":
+            status = "pending"
+            decision = "needs_review"
+        elif action == "identity_candidate_rejected":
+            status = "rejected"
+            decision = "reject"
+        else:
+            status = "accepted"
+            decision = "pass"
+        decisions[candidate_ref] = {
+            "status": status,
+            "decision": decision,
+            "task_id": details.get("task_id"),
+            "action": action,
+            "candidate_type": details.get("candidate_type"),
+            "candidate_ref": candidate_ref,
+            "actor_id": data.get("actor_id"),
+            "created_at": _iso(data.get("created_at")),
+        }
+    return decisions
+
+
+def _candidate_with_identity_review_state(
+    candidate: Dict[str, Any],
+    *,
+    decisions: Dict[str, Dict[str, Any]],
+    actor_role: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    candidate_ref = _identity_candidate_ref(candidate)
+    decision = decisions.get(candidate_ref)
+    if decision and decision.get("status") in {"accepted", "rejected"}:
+        return None
+    allowed_actions: List[str] = []
+    if is_employee_review_role(actor_role):
+        allowed_actions.append("create_identity_review_task")
+    return {
+        **candidate,
+        "identity_review": decision,
+        "allowed_actions": allowed_actions,
+    }
+
+
+async def _find_offer_reconciliation_candidate(
+    *,
+    subject: Dict[str, Any],
+    candidate_type: str,
+    candidate_ref: str,
+) -> Dict[str, Any]:
+    internal_offers = await _confirmed_internal_seller_offers(subject)
+    product_keys = [str(offer.get("product_key")) for offer in internal_offers if offer.get("product_key")]
+    external_offers = await _confirmed_external_seed_offers(subject, product_keys)
+    exclude_seed_ids = {offer.get("id") for offer in external_offers if offer.get("id")}
+    exclude_product_keys = {offer.get("product_key") for offer in internal_offers if offer.get("product_key")}
+    candidates = [
+        *await _external_seed_near_match_candidates(subject, exclude_seed_ids),
+        *await _merchant_product_near_match_candidates(subject, exclude_product_keys),
+    ]
+    for candidate in candidates:
+        if str(candidate.get("candidate_type") or "") == candidate_type and _identity_candidate_ref(candidate) == candidate_ref:
+            return candidate
+    raise LookupError("PDP_IDENTITY_CANDIDATE_NOT_FOUND")
+
+
+async def _existing_identity_candidate_task(
+    *,
+    subject: Dict[str, Any],
+    candidate_type: str,
+    candidate_ref: str,
+) -> Optional[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT *
+        FROM pdp_module_versions
+        WHERE pdp_id = :pdp_id
+          AND module_key = 'identity'
+          AND stage = 'staged'
+          AND superseded_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        {"pdp_id": subject["pdp_id"]},
+    )
+    for row in rows or []:
+        module = _serialize_module(row)
+        payload = _json_dict(module.get("payload"))
+        review = _json_dict(payload.get("identity_review"))
+        if (
+            review.get("status") == "pending"
+            and review.get("candidate_type") == candidate_type
+            and review.get("candidate_ref") == candidate_ref
+        ):
+            task = await _ensure_review_task_for_module(subject, module)
+            return {"module": module, "task": task}
+    return None
+
+
+async def create_pdp_identity_review_task(
+    *,
+    pdp_id: str,
+    candidate_type: str,
+    candidate_ref: str,
+    notes: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    if not is_employee_review_role(actor_role):
+        raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
+    subject = await resolve_pdp_subject(pdp_id=pdp_id)
+    normalized_type = str(candidate_type or "").strip()
+    normalized_ref = str(candidate_ref or "").strip()
+    if normalized_type not in {"external_seed_near_match", "merchant_product_near_match"} or not normalized_ref:
+        raise ValueError("INVALID_PDP_IDENTITY_CANDIDATE")
+
+    existing = await _existing_identity_candidate_task(
+        subject=subject,
+        candidate_type=normalized_type,
+        candidate_ref=normalized_ref,
+    )
+    if existing:
+        return {"status": "success", "created": False, **existing}
+
+    decisions = await _identity_candidate_decision_index(subject["pdp_id"])
+    prior = decisions.get(normalized_ref)
+    if prior and prior.get("status") in {"accepted", "rejected"}:
+        raise ValueError("PDP_IDENTITY_CANDIDATE_ALREADY_RESOLVED")
+
+    candidate = await _find_offer_reconciliation_candidate(
+        subject=subject,
+        candidate_type=normalized_type,
+        candidate_ref=normalized_ref,
+    )
+    current_identity = await _current_published_version(subject["pdp_id"], "identity")
+    current_payload = _json_dict((current_identity or {}).get("payload"))
+    source_refs = merge_source_refs(
+        (current_identity or {}).get("source_refs") or [],
+        [_identity_candidate_source_ref(candidate)],
+    )
+    payload = {
+        **current_payload,
+        "identity_review": {
+            "status": "pending",
+            "candidate_type": normalized_type,
+            "candidate_ref": normalized_ref,
+            "candidate": candidate,
+            "candidate_confidence": candidate.get("confidence"),
+            "match_reasons": candidate.get("match_reasons") or [],
+            "available_actions": _identity_candidate_action_set(candidate),
+            "created_from": "offer_reconciliation_candidate",
+            "created_by_actor_id": actor_id,
+            "notes": notes,
+        },
+    }
+    module = await create_module_draft(
+        pdp_id=subject["pdp_id"],
+        module_key="identity",
+        payload=payload,
+        source_refs=source_refs,
+        generated_by="identity_candidate_evidence",
+        generation_ref=f"{normalized_type}:{normalized_ref}",
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        actor_role=actor_role,
+    )
+    task = await _ensure_review_task_for_module(subject, module)
+    await _audit(
+        pdp_id=subject["pdp_id"],
+        module_key="identity",
+        action="identity_candidate_task_created",
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        details={
+            "task_id": (task or {}).get("task_id"),
+            "version_id": module.get("id"),
+            "candidate_type": normalized_type,
+            "candidate_ref": normalized_ref,
+            "candidate": candidate,
+            "notes": notes,
+        },
+    )
+    return {"status": "success", "created": True, "module": module, "task": task}
+
+
+async def _primary_product_key_for_group(product_group_id: Optional[str]) -> Optional[str]:
+    if not product_group_id:
+        return None
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT merchant_id, platform, platform_product_id
+            FROM product_group_members
+            WHERE product_group_id = :product_group_id
+            ORDER BY is_primary DESC, updated_at DESC
+            LIMIT 1
+            """,
+            {"product_group_id": product_group_id},
+        )
+    except Exception:
+        return None
+    data = _row_dict(row)
+    if not data:
+        return None
+    return _product_key(data.get("merchant_id"), data.get("platform"), data.get("platform_product_id"))
+
+
+async def _apply_external_candidate_attach(subject: Dict[str, Any], candidate: Dict[str, Any], target_product_key: Optional[str] = None) -> Dict[str, Any]:
+    seed_id = str(candidate.get("id") or "").strip()
+    if not seed_id:
+        raise ValueError("PDP_IDENTITY_CANDIDATE_NOT_FOUND")
+    seed = await _fetch_external_seed_by_id(seed_id)
+    if not seed:
+        raise LookupError("EXTERNAL_SEED_NOT_FOUND")
+
+    now_expr = _sql_now_expr()
+    attached_product_key = (target_product_key or "").strip()
+    if not attached_product_key and subject.get("product_group_id"):
+        attached_product_key = (
+            str(subject.get("representative_product_key") or "").strip()
+            if not is_external_seed_product_key(str(subject.get("representative_product_key") or ""))
+            else ""
+        )
+        attached_product_key = attached_product_key or (await _primary_product_key_for_group(str(subject.get("product_group_id")))) or ""
+
+    if attached_product_key:
+        await database.execute(
+            f"""
+            UPDATE external_product_seeds
+            SET attached_product_key = :attached_product_key,
+                attached_variant_id = :attached_variant_id,
+                updated_at = {now_expr}
+            WHERE id = :seed_id
+            """,
+            {
+                "seed_id": seed_id,
+                "attached_product_key": attached_product_key,
+                "attached_variant_id": str(candidate.get("attached_variant_id") or "∅"),
+            },
+        )
+        return {"attached_seed_id": seed_id, "attached_product_key": attached_product_key}
+
+    external_product_id = str(subject.get("external_product_id") or "").strip()
+    if not external_product_id:
+        raise ValueError("PDP_IDENTITY_ATTACH_REQUIRES_PRODUCT_KEY")
+    await database.execute(
+        f"""
+        UPDATE external_product_seeds
+        SET external_product_id = :external_product_id,
+            updated_at = {now_expr}
+        WHERE id = :seed_id
+        """,
+        {"seed_id": seed_id, "external_product_id": external_product_id},
+    )
+    return {"attached_seed_id": seed_id, "external_product_id": external_product_id}
+
+
+async def _upsert_product_group_member(product_group_id: str, merchant_id: str, platform: str, platform_product_id: str) -> None:
+    now_expr = _sql_now_expr()
+    try:
+        await database.execute(
+            f"""
+            INSERT INTO product_group_members (
+              product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at
+            ) VALUES (
+              :product_group_id, :merchant_id, :platform, :platform_product_id, FALSE, {now_expr}
+            )
+            ON CONFLICT (merchant_id, platform, platform_product_id)
+            DO UPDATE SET
+              product_group_id = EXCLUDED.product_group_id,
+              updated_at = {now_expr}
+            """,
+            {
+                "product_group_id": product_group_id,
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+            },
+        )
+    except Exception:
+        await database.execute(
+            f"""
+            UPDATE product_group_members
+            SET product_group_id = :product_group_id,
+                updated_at = {now_expr}
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND platform_product_id = :platform_product_id
+            """,
+            {
+                "product_group_id": product_group_id,
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+            },
+        )
+
+
+async def _apply_merchant_candidate_merge(subject: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
+    product_key = str(candidate.get("product_key") or candidate.get("id") or "").strip()
+    merchant_id, platform, platform_product_id = parse_product_key(product_key)
+    existing_group = await _resolve_product_group(merchant_id, platform, platform_product_id)
+    product_group_id = str(subject.get("product_group_id") or (existing_group or {}).get("product_group_id") or "").strip()
+    if not product_group_id:
+        product_group_id = f"pg_manual_{hashlib.sha256(product_key.encode('utf-8')).hexdigest()[:16]}"
+    await _upsert_product_group_member(product_group_id, merchant_id, platform, platform_product_id)
+
+    if subject.get("external_product_id"):
+        now_expr = _sql_now_expr()
+        await database.execute(
+            f"""
+            UPDATE external_product_seeds
+            SET attached_product_key = :product_key,
+                attached_variant_id = COALESCE(attached_variant_id, '∅'),
+                updated_at = {now_expr}
+            WHERE external_product_id = :external_product_id
+              AND status = 'active'
+            """,
+            {"product_key": product_key, "external_product_id": subject.get("external_product_id")},
+        )
+
+    try:
+        merged_subject = await _subject_from_product_key(product_key, subject.get("market") or DEFAULT_MARKET)
+    except Exception:
+        merged_subject = {
+            "pdp_id": make_pdp_id("product_group", product_group_id, subject.get("market") or DEFAULT_MARKET),
+            "subject_type": "product_group",
+            "subject_ref": product_group_id,
+            "market": subject.get("market") or DEFAULT_MARKET,
+            "product_group_id": product_group_id,
+            "external_product_id": None,
+            "representative_product_key": product_key,
+            "seller_count": 1,
+        }
+        merged_subject = await _upsert_subject(merged_subject)
+    return {
+        "merged_product_key": product_key,
+        "product_group_id": product_group_id,
+        "target_pdp_id": merged_subject.get("pdp_id"),
+    }
+
+
+async def apply_pdp_identity_review_action(
+    *,
+    task_id: str,
+    action: str,
+    notes: Optional[str] = None,
+    reason: Optional[str] = None,
+    checklist: Optional[Dict[str, Any]] = None,
+    policy_labels: Optional[List[str]] = None,
+    decision_tree_path: Optional[List[str]] = None,
+    review_duration_ms: Optional[int] = None,
+    override_reason: Optional[str] = None,
+    target_product_key: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    if not is_employee_review_role(actor_role):
+        raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
+    normalized_action = str(action or "").strip()
+    if normalized_action not in {"attach_external_offer", "merge_product_group", "reject_candidate"}:
+        raise ValueError("INVALID_PDP_IDENTITY_ACTION")
+    task = await _review_task_by_id(task_id)
+    if task.get("module_key") != "identity" or not task.get("version_id"):
+        raise ValueError("PDP_IDENTITY_TASK_REQUIRED")
+    version = await _fetch_module_version(task["pdp_id"], "identity", task.get("version_id"))
+    payload = _json_dict(version.get("payload"))
+    review = _json_dict(payload.get("identity_review"))
+    if review.get("status") != "pending":
+        raise ValueError("PDP_IDENTITY_TASK_ALREADY_RESOLVED")
+    candidate = _json_dict(review.get("candidate"))
+    candidate_type = str(review.get("candidate_type") or candidate.get("candidate_type") or "")
+    candidate_ref = str(review.get("candidate_ref") or _identity_candidate_ref(candidate))
+    if normalized_action not in _identity_candidate_action_set({"candidate_type": candidate_type}):
+        raise ValueError("PDP_IDENTITY_ACTION_NOT_ALLOWED_FOR_CANDIDATE")
+    if not policy_labels:
+        raise ValueError("PDP_REVIEW_POLICY_LABEL_REQUIRED")
+    if normalized_action != "reject_candidate" and not checklist_passed(checklist):
+        raise ValueError("PDP_REVIEW_CHECKLIST_REQUIRED")
+    if normalized_action == "reject_candidate" and not (reason or notes or "").strip():
+        raise ValueError("PDP_REVIEW_REJECTION_REASON_REQUIRED")
+
+    subject = await resolve_pdp_subject(pdp_id=task["pdp_id"])
+    action_result: Dict[str, Any] = {}
+    if normalized_action == "attach_external_offer":
+        action_result = await _apply_external_candidate_attach(subject, candidate, target_product_key=target_product_key)
+        audit_action = "identity_candidate_attached"
+        review_decision = "pass"
+        resolved_status = "accepted"
+    elif normalized_action == "merge_product_group":
+        action_result = await _apply_merchant_candidate_merge(subject, candidate)
+        audit_action = "identity_candidate_merged"
+        review_decision = "pass"
+        resolved_status = "accepted"
+    else:
+        audit_action = "identity_candidate_rejected"
+        review_decision = "reject"
+        resolved_status = "rejected"
+
+    now = _now()
+    review_payload = {
+        **review,
+        "status": resolved_status,
+        "decision": review_decision,
+        "applied_action": normalized_action,
+        "action_result": action_result,
+        "reviewed_by_actor_id": actor_id,
+        "reviewed_at": _iso(now),
+        "notes": notes,
+        "reason": reason,
+        "checklist": checklist if isinstance(checklist, dict) else {},
+        "policy_labels": policy_labels if isinstance(policy_labels, list) else [],
+        "decision_tree_path": decision_tree_path if isinstance(decision_tree_path, list) else [],
+        "review_duration_ms": review_duration_ms,
+        "override_reason": override_reason,
+    }
+    next_payload = {**payload, "identity_review": review_payload}
+    rubric = {
+        "decision": review_decision,
+        "identity_action": normalized_action,
+        "notes": notes,
+        "reason": reason,
+        "checklist": checklist if isinstance(checklist, dict) else {},
+        "policy_labels": policy_labels if isinstance(policy_labels, list) else [],
+        "decision_tree_path": decision_tree_path if isinstance(decision_tree_path, list) else [],
+        "review_duration_ms": review_duration_ms,
+        "override_reason": override_reason,
+        "action_result": action_result,
+    }
+    await database.execute(
+        pdp_module_versions.update()
+        .where(pdp_module_versions.c.id == version["id"])
+        .values(
+            status="approved" if review_decision == "pass" else "rejected",
+            payload=next_payload,
+            review_actor_type=REVIEW_ACTOR_HUMAN,
+            review_actor_id=actor_id,
+            review_decision=review_decision,
+            review_confidence=1.0 if review_decision == "pass" else None,
+            review_rubric=rubric,
+            risk_level=module_risk_level("identity", next_payload),
+            requires_human=module_requires_human_review("identity", next_payload),
+        )
+    )
+    await database.execute(
+        pdp_review_tasks.update()
+        .where(pdp_review_tasks.c.id == task_id)
+        .values(
+            status="resolved",
+            checklist=rubric["checklist"],
+            policy_labels=rubric["policy_labels"],
+            decision_tree_path=rubric["decision_tree_path"],
+            override_reason=override_reason,
+            review_duration_ms=review_duration_ms,
+            updated_at=now,
+            resolved_at=now,
+        )
+    )
+    await _audit(
+        pdp_id=task["pdp_id"],
+        module_key="identity",
+        action=audit_action,
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        details={
+            "task_id": task_id,
+            "version_id": version["id"],
+            "candidate_type": candidate_type,
+            "candidate_ref": candidate_ref,
+            "identity_action": normalized_action,
+            "decision": review_decision,
+            "notes": notes,
+            "reason": reason,
+            "policy_labels": rubric["policy_labels"],
+            "action_result": action_result,
+        },
+    )
+    return {
+        "status": "success",
+        "decision": review_decision,
+        "identity_action": normalized_action,
+        "action_result": action_result,
+        "task": await _review_task_by_id(task_id),
+        "module": await _fetch_module_version(task["pdp_id"], "identity", version["id"]),
+    }
+
+
 async def get_pdp_offer_reconciliation(
     *,
     pdp_id: str,
@@ -1627,8 +2176,23 @@ async def get_pdp_offer_reconciliation(
     external_offers = await _confirmed_external_seed_offers(subject, product_keys)
     exclude_seed_ids = {offer.get("id") for offer in external_offers if offer.get("id")}
     exclude_product_keys = {offer.get("product_key") for offer in internal_offers if offer.get("product_key")}
-    external_candidates = await _external_seed_near_match_candidates(subject, exclude_seed_ids)
-    merchant_candidates = await _merchant_product_near_match_candidates(subject, exclude_product_keys)
+    decisions = await _identity_candidate_decision_index(subject["pdp_id"])
+    external_candidates = [
+        candidate
+        for candidate in (
+            _candidate_with_identity_review_state(candidate, decisions=decisions, actor_role=actor_role)
+            for candidate in await _external_seed_near_match_candidates(subject, exclude_seed_ids)
+        )
+        if candidate is not None
+    ]
+    merchant_candidates = [
+        candidate
+        for candidate in (
+            _candidate_with_identity_review_state(candidate, decisions=decisions, actor_role=actor_role)
+            for candidate in await _merchant_product_near_match_candidates(subject, exclude_product_keys)
+        )
+        if candidate is not None
+    ]
 
     seller_count = len({offer.get("merchant_id") for offer in internal_offers if offer.get("merchant_id")})
     candidate_count = len(external_candidates) + len(merchant_candidates)
@@ -1658,7 +2222,7 @@ async def get_pdp_offer_reconciliation(
         "review_guidance": [
             "Confirmed internal sellers come from product_group_members for the PDP product_group_id.",
             "Confirmed external offers come from attached external seeds or matching external_product_id.",
-            "Near-match candidates are evidence only until employee/senior identity review attaches or rejects them.",
+            "Near-match candidates are evidence only until employee/senior identity review attaches, merges, or rejects them.",
         ],
         "allowed_actions": allowed_pdp_review_actions(
             actor_role=actor_role,
@@ -1771,6 +2335,17 @@ async def _build_review_queue_item(
         requires_human=requires_human,
         module_status=module_status,
     )
+    active_payload = _json_dict((active or {}).get("payload"))
+    identity_review = _json_dict(active_payload.get("identity_review"))
+    if (
+        module["module_key"] == "identity"
+        and identity_review.get("status") == "pending"
+        and is_employee_review_role(actor_role)
+    ):
+        allowed_actions = sorted(
+            set(allowed_actions)
+            | set(_identity_candidate_action_set({"candidate_type": identity_review.get("candidate_type")}))
+        )
     if not ensure_task:
         allowed_actions = [action for action in allowed_actions if action in {"view", "rollback"}]
     return {

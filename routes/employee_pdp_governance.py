@@ -9,8 +9,10 @@ from services.pdp_governance_service import (
     DEFAULT_MARKET,
     REVIEW_ACTOR_GPT55,
     REVIEW_ACTOR_HUMAN,
+    apply_pdp_identity_review_action,
     assign_pdp_review_task,
     create_module_draft,
+    create_pdp_identity_review_task,
     get_pdp_offer_reconciliation,
     get_pdp_projection,
     get_pdp_gallery_asset,
@@ -78,6 +80,24 @@ class ReviewTaskStatusRequest(BaseModel):
     qa_sample: Optional[bool] = None
 
 
+class IdentityCandidateTaskRequest(BaseModel):
+    candidate_type: str = Field(pattern="^(external_seed_near_match|merchant_product_near_match)$")
+    candidate_ref: str = Field(min_length=1)
+    notes: Optional[str] = None
+
+
+class IdentityReviewActionRequest(BaseModel):
+    action: str = Field(pattern="^(attach_external_offer|merge_product_group|reject_candidate)$")
+    notes: Optional[str] = None
+    reason: Optional[str] = None
+    checklist: Optional[Dict[str, Any]] = None
+    policy_labels: Optional[List[str]] = None
+    decision_tree_path: Optional[List[str]] = None
+    review_duration_ms: Optional[int] = None
+    override_reason: Optional[str] = None
+    target_product_key: Optional[str] = None
+
+
 def _employee_actor(current_user: Dict[str, Any]) -> str:
     return str(current_user.get("sub") or current_user.get("email") or "employee")
 
@@ -88,12 +108,14 @@ def _employee_role(current_user: Dict[str, Any]) -> str:
 
 def _map_error(exc: Exception) -> HTTPException:
     message = str(exc)
-    if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND", "PDP_GALLERY_ASSET_NOT_FOUND", "PDP_REVIEW_TASK_NOT_FOUND"}:
+    if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND", "PDP_GALLERY_ASSET_NOT_FOUND", "PDP_REVIEW_TASK_NOT_FOUND", "PDP_IDENTITY_CANDIDATE_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)
     if message in {
         "INVALID_PRODUCT_KEY",
         "INVALID_PDP_MODULE",
         "INVALID_REVIEW_DECISION",
+        "INVALID_PDP_IDENTITY_ACTION",
+        "INVALID_PDP_IDENTITY_CANDIDATE",
         "ROLLBACK_TARGET_MUST_BE_PUBLISHED",
         "UNSUPPORTED_GALLERY_IMAGE_TYPE",
         "EMPTY_GALLERY_IMAGE",
@@ -102,6 +124,12 @@ def _map_error(exc: Exception) -> HTTPException:
         "PDP_REVIEW_CHECKLIST_REQUIRED",
         "PDP_REVIEW_POLICY_LABEL_REQUIRED",
         "PDP_REVIEW_ESCALATION_REASON_REQUIRED",
+        "PDP_REVIEW_REJECTION_REASON_REQUIRED",
+        "PDP_IDENTITY_ACTION_NOT_ALLOWED_FOR_CANDIDATE",
+        "PDP_IDENTITY_ATTACH_REQUIRES_PRODUCT_KEY",
+        "PDP_IDENTITY_CANDIDATE_ALREADY_RESOLVED",
+        "PDP_IDENTITY_TASK_ALREADY_RESOLVED",
+        "PDP_IDENTITY_TASK_REQUIRED",
     }:
         return HTTPException(status_code=400, detail=message)
     if message in {"PDP_MODULE_REQUIRES_HUMAN_REVIEW", "PDP_REVIEW_ACTION_FORBIDDEN", "PDP_REVIEW_OVERRIDE_FORBIDDEN"}:
@@ -300,6 +328,31 @@ async def update_review_task_status(
         raise _map_error(exc)
 
 
+@router.post("/review-queue/{task_id}/identity-action")
+async def apply_identity_review_action(
+    task_id: str,
+    body: IdentityReviewActionRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    try:
+        return await apply_pdp_identity_review_action(
+            task_id=task_id,
+            action=body.action,
+            notes=body.notes,
+            reason=body.reason,
+            checklist=body.checklist,
+            policy_labels=body.policy_labels,
+            decision_tree_path=body.decision_tree_path,
+            review_duration_ms=body.review_duration_ms,
+            override_reason=body.override_reason,
+            target_product_key=body.target_product_key,
+            actor_role=_employee_role(current_user),
+            actor_id=_employee_actor(current_user),
+        )
+    except Exception as exc:
+        raise _map_error(exc)
+
+
 @router.get("/{pdp_id}/offers/reconciliation")
 async def get_offer_reconciliation(
     pdp_id: str,
@@ -307,6 +360,25 @@ async def get_offer_reconciliation(
 ) -> Dict[str, Any]:
     try:
         return await get_pdp_offer_reconciliation(pdp_id=pdp_id, actor_role=_employee_role(current_user))
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.post("/{pdp_id}/identity-review-tasks")
+async def create_identity_review_task(
+    pdp_id: str,
+    body: IdentityCandidateTaskRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    try:
+        return await create_pdp_identity_review_task(
+            pdp_id=pdp_id,
+            candidate_type=body.candidate_type,
+            candidate_ref=body.candidate_ref,
+            notes=body.notes,
+            actor_role=_employee_role(current_user),
+            actor_id=_employee_actor(current_user),
+        )
     except Exception as exc:
         raise _map_error(exc)
 

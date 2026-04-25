@@ -5,6 +5,8 @@ from services.pdp_governance_service import (
     make_pdp_id,
     module_requires_human_review,
     run_gpt55_quality_gate,
+    _candidate_with_identity_review_state,
+    _identity_candidate_action_set,
     _score_candidate,
 )
 
@@ -51,6 +53,42 @@ def test_offer_candidate_scoring_keeps_exact_title_match() -> None:
 
     assert score >= 0.95
     assert "exact_title_match" in reasons
+
+
+def test_identity_review_candidate_actions_and_human_gate() -> None:
+    assert module_requires_human_review("identity", {"identity_review": {"status": "pending"}})
+    assert _identity_candidate_action_set({"candidate_type": "external_seed_near_match"}) == [
+        "attach_external_offer",
+        "reject_candidate",
+    ]
+    assert _identity_candidate_action_set({"candidate_type": "merchant_product_near_match"}) == [
+        "merge_product_group",
+        "reject_candidate",
+    ]
+
+
+def test_identity_candidate_state_filters_resolved_and_allows_employee_task_creation() -> None:
+    candidate = {
+        "id": "eps_1",
+        "candidate_type": "external_seed_near_match",
+        "title": "PDRN Serum",
+    }
+
+    pending = _candidate_with_identity_review_state(
+        candidate,
+        decisions={"eps_1": {"status": "pending", "task_id": "pdptask_1"}},
+        actor_role="employee",
+    )
+    rejected = _candidate_with_identity_review_state(
+        candidate,
+        decisions={"eps_1": {"status": "rejected", "task_id": "pdptask_2"}},
+        actor_role="employee",
+    )
+
+    assert pending is not None
+    assert pending["identity_review"]["task_id"] == "pdptask_1"
+    assert "create_identity_review_task" in pending["allowed_actions"]
+    assert rejected is None
 
 
 def test_gpt55_quality_gate_passes_source_grounded_low_risk_copy() -> None:
