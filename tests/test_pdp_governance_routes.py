@@ -517,12 +517,18 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
             """,
             {"canonical_payload": json.dumps({"title": "Canonical Hydration Product"})},
         )
-        await database.execute(
-            """
-            INSERT INTO external_product_seeds (id, external_product_id, market, destination_url, title, status)
-            VALUES ('hydrate-seed-1', NULL, 'US', 'https://example.com/hydrate', 'External Hydration Product', 'active')
-            """
-        )
+        for idx in range(1, 56):
+            await database.execute(
+                """
+                INSERT INTO external_product_seeds (id, external_product_id, market, destination_url, title, status)
+                VALUES (:id, NULL, 'US', :url, :title, 'active')
+                """,
+                {
+                    "id": f"hydrate-seed-{idx}",
+                    "url": f"https://example.com/hydrate-{idx}",
+                    "title": f"External Hydration Product {idx}",
+                },
+            )
 
         result = await hydrate_pdp_subject_index(limit=0, actor_id="test")
         assert result["limit_mode"] == "all"
@@ -534,6 +540,7 @@ async def test_hydration_indexes_grouped_ungrouped_and_external_subjects():
         assert ("merchant_product", "hydrate-merchant|shopify|ungrouped-product") in subjects
         assert ("merchant_product", "hydrate-merchant|shopify|canonical-product") in subjects
         assert ("external_product", "hydrate-seed-1") in subjects
+        assert ("external_product", "hydrate-seed-55") in subjects
     finally:
         if database.is_connected:
             await database.disconnect()
