@@ -5,6 +5,7 @@ from services.pdp_governance_service import (
     make_pdp_id,
     module_requires_human_review,
     run_gpt55_quality_gate,
+    _score_candidate,
 )
 
 
@@ -21,6 +22,28 @@ def test_pdp_id_distinguishes_external_only_projection() -> None:
     external = make_pdp_id("external_product", "shared-123", "US")
 
     assert internal != external
+
+
+def test_offer_candidate_scoring_rejects_generic_only_overlap_even_same_brand() -> None:
+    score, reasons = _score_candidate("PDRN Serum", "Hydrating Serum", "The Inkey List", "The Inkey List")
+
+    assert score == 0.0
+    assert "generic_only_overlap:serum" in reasons
+    assert "brand_match" not in reasons
+
+
+def test_offer_candidate_scoring_keeps_distinctive_overlap() -> None:
+    score, reasons = _score_candidate("PDRN Serum", "Rose PDRN Soothing Serum")
+
+    assert score >= 0.45
+    assert "title_distinctive_overlap:pdrn" in reasons
+
+
+def test_offer_candidate_scoring_keeps_exact_title_match() -> None:
+    score, reasons = _score_candidate("PDRN Serum", "PDRN Serum")
+
+    assert score >= 0.95
+    assert "exact_title_match" in reasons
 
 
 def test_gpt55_quality_gate_passes_source_grounded_low_risk_copy() -> None:
