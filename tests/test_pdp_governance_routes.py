@@ -677,6 +677,103 @@ async def test_offer_reconciliation_counts_only_live_internal_seller_offers():
 
 
 @pytest.mark.asyncio
+async def test_offer_reconciliation_exposes_identity_signals_without_blocking_candidates():
+    if not database.is_connected:
+        await database.connect()
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_group_members (
+              product_group_id TEXT,
+              merchant_id TEXT,
+              platform TEXT,
+              platform_product_id TEXT,
+              is_primary BOOLEAN DEFAULT FALSE,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products_cache (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              merchant_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              platform_product_id TEXT NOT NULL,
+              product_data JSON NOT NULL,
+              cache_status TEXT DEFAULT 'fresh',
+              cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              expires_at DATETIME NULL,
+              ttl_seconds INTEGER DEFAULT 3600,
+              access_count INTEGER DEFAULT 0,
+              last_accessed_at DATETIME NULL
+            )
+            """
+        )
+        await database.execute("DELETE FROM product_group_members WHERE product_group_id = 'pg_identity_signals'")
+        await database.execute("DELETE FROM products_cache WHERE merchant_id = 'identity-signal-merchant'")
+        await database.execute(
+            """
+            INSERT INTO product_group_members (product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at)
+            VALUES ('pg_identity_signals', 'identity-signal-merchant', 'shopify', 'confirmed-harness', TRUE, CURRENT_TIMESTAMP)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, expires_at)
+            VALUES
+              ('identity-signal-merchant', 'shopify', 'confirmed-harness', :confirmed_payload, '2999-01-01 00:00:00'),
+              ('identity-signal-merchant', 'shopify', 'nearby-harness', :candidate_payload, '2999-01-01 00:00:00')
+            """,
+            {
+                "confirmed_payload": json.dumps(
+                    {
+                        "title": "Comfy Tactical Dog Harness for Small to Medium Dogs",
+                        "image_url": "https://example.com/confirmed.jpg",
+                        "price": 36,
+                        "currency": "USD",
+                        "variants": [{"id": "v1"}],
+                    }
+                ),
+                "candidate_payload": json.dumps(
+                    {
+                        "title": "Reflective Tactical Dog Harness for Small to Medium Dogs",
+                        "image_url": "https://example.com/candidate.jpg",
+                        "price": 32,
+                        "currency": "USD",
+                        "variants": [{"id": "v2"}],
+                    }
+                ),
+            },
+        )
+
+        resolved = await get_pdp_projection(
+            product_key="identity-signal-merchant|shopify|confirmed-harness",
+            actor_role="admin",
+        )
+        reconciliation = await get_pdp_offer_reconciliation(pdp_id=resolved["pdp"]["pdp_id"], actor_role="admin")
+
+        confirmed = reconciliation["confirmed"]["internal_sellers"][0]
+        assert confirmed["verification_status"] == "confirmed"
+        assert confirmed["identity_confidence"] >= 0.8
+        assert any(item["type"] == "product_group_member" for item in confirmed["identity_evidence"])
+
+        candidate = next(
+            row
+            for row in reconciliation["candidates"]["merchant_products"]
+            if row["product_key"] == "identity-signal-merchant|shopify|nearby-harness"
+        )
+        assert candidate["match_status"] == "candidate"
+        assert candidate["verification_status"] in {"suggested_match", "possible_match", "evidence_only"}
+        assert "title_based_candidate_only" in candidate["risk_flags"]
+        assert "same_merchant_distinct_product_candidate" in candidate["risk_flags"]
+        assert candidate["identity_evidence"]
+    finally:
+        if database.is_connected:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_senior_product_group_correction_replaces_wrong_confirmed_seller():
     if not database.is_connected:
         await database.connect()

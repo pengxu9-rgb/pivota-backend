@@ -381,6 +381,114 @@ def _score_candidate(target_title: Any, candidate_title: Any, target_brand: Any 
     return score, reasons
 
 
+def _identity_evidence(kind: str, label: str, value: Any = None, confidence: Optional[float] = None) -> Dict[str, Any]:
+    evidence: Dict[str, Any] = {"type": kind, "label": label}
+    if value not in (None, ""):
+        evidence["value"] = value
+    if confidence is not None:
+        evidence["confidence"] = round(float(confidence), 3)
+    return evidence
+
+
+def _append_unique(values: List[str], value: str) -> None:
+    if value and value not in values:
+        values.append(value)
+
+
+def _offer_identity_signals(
+    subject: Dict[str, Any],
+    offer: Dict[str, Any],
+    *,
+    confirmed_product_keys: Optional[set] = None,
+    confirmed_merchant_ids: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Attach explainability to offers/candidates without changing review decisions."""
+    confirmed_product_keys = confirmed_product_keys or set()
+    confirmed_merchant_ids = confirmed_merchant_ids or set()
+    match_status = str(offer.get("match_status") or "").strip().lower()
+    source = str(offer.get("source") or "").strip()
+    product_key = str(offer.get("product_key") or "").strip()
+    merchant_id = str(offer.get("merchant_id") or "").strip()
+    subject_title = subject.get("title") or subject.get("subject_ref")
+    offer_title = offer.get("title") or offer.get("external_product_id") or offer.get("id")
+    title_score, title_reasons = _match_score(subject_title, offer_title)
+    risk_flags: List[str] = []
+    evidence: List[Dict[str, Any]] = []
+    score = float(offer.get("confidence") or 0.0)
+
+    if match_status == "confirmed":
+        score = 0.74 if source == "external_seed" else 0.78
+        if product_key and product_key in confirmed_product_keys:
+            evidence.append(_identity_evidence("product_group_member", "Product key is attached to this PDP product group.", product_key, 0.9))
+            score += 0.08
+        if product_key and product_key == str(subject.get("representative_product_key") or ""):
+            evidence.append(_identity_evidence("representative_product_key", "Product key is the current representative PDP product.", product_key, 0.88))
+            score += 0.04
+        if source == "external_seed":
+            external_product_id = str(offer.get("external_product_id") or "").strip()
+            if external_product_id and external_product_id == str(subject.get("external_product_id") or "").strip():
+                evidence.append(_identity_evidence("external_product_id", "External product id matches this external-only PDP.", external_product_id, 0.9))
+                score += 0.1
+            attached_product_key = str(offer.get("attached_product_key") or "").strip()
+            if attached_product_key and attached_product_key in confirmed_product_keys:
+                evidence.append(_identity_evidence("attached_product_key", "External seed is attached to a confirmed merchant product.", attached_product_key, 0.86))
+                score += 0.08
+            if not offer.get("disclosure_text"):
+                _append_unique(risk_flags, "external_offer_missing_disclosure")
+        if title_score >= 0.82:
+            evidence.append(_identity_evidence("title_alignment", "Offer title aligns with PDP title.", f"{title_score:.2f}", title_score))
+            score += 0.03
+        elif title_score and title_score < 0.45:
+            _append_unique(risk_flags, "confirmed_title_weak_match")
+    else:
+        if not score:
+            score = title_score
+        evidence.append(_identity_evidence("candidate_state", "Candidate is evidence-only until employee review confirms it.", match_status or "candidate"))
+        if title_score:
+            evidence.append(_identity_evidence("title_similarity", "Candidate title similarity to PDP title.", f"{title_score:.2f}", title_score))
+        for reason in (offer.get("match_reasons") or title_reasons or [])[:5]:
+            evidence.append(_identity_evidence("match_reason", "Candidate retrieval signal.", reason))
+            if str(reason).startswith("product_form_mismatch"):
+                _append_unique(risk_flags, "product_form_mismatch")
+            if str(reason).startswith("generic_only_overlap"):
+                _append_unique(risk_flags, "generic_only_title_overlap")
+        if score < 0.65:
+            _append_unique(risk_flags, "low_identity_confidence")
+        if merchant_id and merchant_id in confirmed_merchant_ids:
+            _append_unique(risk_flags, "same_merchant_distinct_product_candidate")
+        strong_candidate_evidence = any(item["type"] in {"external_product_id", "attached_product_key", "product_group_member"} for item in evidence)
+        if not strong_candidate_evidence:
+            _append_unique(risk_flags, "title_based_candidate_only")
+
+    price = offer.get("price") if isinstance(offer.get("price"), dict) else {}
+    if not offer.get("image_url"):
+        _append_unique(risk_flags, "missing_image")
+    if source == "merchant_product" and price.get("amount") is None:
+        _append_unique(risk_flags, "missing_price")
+    if source == "merchant_product" and int(offer.get("variants_count") or 0) == 0:
+        _append_unique(risk_flags, "missing_variants")
+
+    if match_status == "confirmed":
+        verification_status = "confirmed_with_risk_flags" if risk_flags else "confirmed"
+    elif score >= 0.82:
+        verification_status = "suggested_match"
+    elif score >= 0.65:
+        verification_status = "possible_match"
+    else:
+        verification_status = "evidence_only"
+
+    enriched = dict(offer)
+    enriched.update(
+        {
+            "identity_confidence": round(min(0.98, max(0.0, score)), 3),
+            "identity_evidence": evidence,
+            "risk_flags": risk_flags,
+            "verification_status": verification_status,
+        }
+    )
+    return enriched
+
+
 def _named_in(prefix: str, values: List[str]) -> Tuple[str, Dict[str, str]]:
     params = {f"{prefix}_{idx}": value for idx, value in enumerate(values)}
     return ", ".join(f":{name}" for name in params), params
@@ -1521,7 +1629,17 @@ async def _subject_internal_product_keys(subject: Dict[str, Any]) -> List[str]:
 
 async def _confirmed_internal_seller_offers(subject: Dict[str, Any]) -> List[Dict[str, Any]]:
     offers: List[Dict[str, Any]] = []
-    for product_key in await _subject_internal_product_keys(subject):
+    product_keys = await _subject_internal_product_keys(subject)
+    confirmed_product_keys = set(product_keys)
+    confirmed_merchant_ids = set()
+    for key in product_keys:
+        try:
+            merchant_id, _, _ = parse_product_key(key)
+            confirmed_merchant_ids.add(merchant_id)
+        except ValueError:
+            continue
+
+    for product_key in product_keys:
         try:
             merchant_id, platform, platform_product_id = parse_product_key(product_key)
         except ValueError:
@@ -1532,7 +1650,15 @@ async def _confirmed_internal_seller_offers(subject: Dict[str, Any]) -> List[Dic
         product_data = _json_dict(cache_row.get("product_data"))
         if not product_data:
             continue
-        offers.append(_merchant_offer_row(product_key, merchant_id, platform, platform_product_id, product_data))
+        offer = _merchant_offer_row(product_key, merchant_id, platform, platform_product_id, product_data)
+        offers.append(
+            _offer_identity_signals(
+                subject,
+                offer,
+                confirmed_product_keys=confirmed_product_keys,
+                confirmed_merchant_ids=confirmed_merchant_ids,
+            )
+        )
     return offers
 
 
@@ -1566,7 +1692,11 @@ async def _confirmed_external_seed_offers(subject: Dict[str, Any], product_keys:
         )
     except Exception:
         return []
-    return [_seed_offer_row(_row_dict(row)) for row in rows or []]
+    confirmed_product_keys = set(product_keys)
+    return [
+        _offer_identity_signals(subject, _seed_offer_row(_row_dict(row)), confirmed_product_keys=confirmed_product_keys)
+        for row in rows or []
+    ]
 
 
 async def _external_seed_near_match_candidates(subject: Dict[str, Any], exclude_seed_ids: set) -> List[Dict[str, Any]]:
@@ -1617,7 +1747,7 @@ async def _external_seed_near_match_candidates(subject: Dict[str, Any], exclude_
                 "requires_human": True,
             }
         )
-        candidates.append(offer)
+        candidates.append(_offer_identity_signals(subject, offer))
     candidates.sort(key=lambda item: float(item.get("confidence") or 0), reverse=True)
     return candidates[:20]
 
@@ -1638,6 +1768,13 @@ async def _merchant_product_near_match_candidates(subject: Dict[str, Any], exclu
 
     candidates: List[Dict[str, Any]] = []
     target_brand = None
+    confirmed_merchant_ids = set()
+    for key in exclude_product_keys:
+        try:
+            confirmed_merchant_id, _, _ = parse_product_key(str(key))
+            confirmed_merchant_ids.add(confirmed_merchant_id)
+        except ValueError:
+            continue
     for row in rows or []:
         data = _row_dict(row)
         product_key = _product_key(data.get("merchant_id"), data.get("platform"), data.get("platform_product_id"))
@@ -1665,7 +1802,14 @@ async def _merchant_product_near_match_candidates(subject: Dict[str, Any], exclu
                 "requires_human": True,
             }
         )
-        candidates.append(offer)
+        candidates.append(
+            _offer_identity_signals(
+                subject,
+                offer,
+                confirmed_product_keys=exclude_product_keys,
+                confirmed_merchant_ids=confirmed_merchant_ids,
+            )
+        )
     candidates.sort(key=lambda item: float(item.get("confidence") or 0), reverse=True)
     return candidates[:20]
 
