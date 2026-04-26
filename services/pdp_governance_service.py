@@ -1956,6 +1956,8 @@ async def _existing_identity_candidate_task(
     )
     for row in rows or []:
         module = _serialize_module(row)
+        if str(module.get("status") or "") in {"reject", "rejected"}:
+            continue
         payload = _json_dict(module.get("payload"))
         review = _json_dict(payload.get("identity_review"))
         if (
@@ -1967,6 +1969,70 @@ async def _existing_identity_candidate_task(
             task = await _ensure_review_task_for_module(subject, module_with_version)
             return {"module": module, "task": task}
     return None
+
+
+async def _create_identity_candidate_task_from_candidate(
+    *,
+    subject: Dict[str, Any],
+    candidate_type: str,
+    candidate_ref: str,
+    candidate: Dict[str, Any],
+    notes: Optional[str],
+    actor_role: Optional[str],
+    actor_id: Optional[str],
+    created_from: str,
+) -> Dict[str, Any]:
+    current_identity = await _current_published_version(subject["pdp_id"], "identity")
+    current_payload = _json_dict((current_identity or {}).get("payload"))
+    candidate = {**candidate, "candidate_type": candidate_type}
+    source_refs = merge_source_refs(
+        (current_identity or {}).get("source_refs") or [],
+        [_identity_candidate_source_ref(candidate)],
+    )
+    payload = {
+        **current_payload,
+        "identity_review": {
+            "status": "pending",
+            "candidate_type": candidate_type,
+            "candidate_ref": candidate_ref,
+            "candidate": candidate,
+            "candidate_confidence": candidate.get("confidence") or candidate.get("identity_confidence"),
+            "match_reasons": candidate.get("match_reasons") or [],
+            "available_actions": _identity_candidate_action_set(candidate),
+            "created_from": created_from,
+            "created_by_actor_id": actor_id,
+            "notes": notes,
+        },
+    }
+    module = await create_module_draft(
+        pdp_id=subject["pdp_id"],
+        module_key="identity",
+        payload=payload,
+        source_refs=source_refs,
+        generated_by="identity_candidate_evidence",
+        generation_ref=f"{candidate_type}:{candidate_ref}",
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        actor_role=actor_role,
+    )
+    task = await _ensure_review_task_for_module(subject, {**module, "version_id": module.get("id")})
+    await _audit(
+        pdp_id=subject["pdp_id"],
+        module_key="identity",
+        action="identity_candidate_task_created",
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        details={
+            "task_id": (task or {}).get("task_id"),
+            "version_id": module.get("id"),
+            "candidate_type": candidate_type,
+            "candidate_ref": candidate_ref,
+            "candidate": candidate,
+            "notes": notes,
+            "created_from": created_from,
+        },
+    )
+    return {"status": "success", "created": True, "module": module, "task": task}
 
 
 async def create_pdp_identity_review_task(
@@ -2022,55 +2088,16 @@ async def create_pdp_identity_review_task(
         candidate_type=normalized_type,
         candidate_ref=normalized_ref,
     )
-    current_identity = await _current_published_version(subject["pdp_id"], "identity")
-    current_payload = _json_dict((current_identity or {}).get("payload"))
-    source_refs = merge_source_refs(
-        (current_identity or {}).get("source_refs") or [],
-        [_identity_candidate_source_ref(candidate)],
-    )
-    payload = {
-        **current_payload,
-        "identity_review": {
-            "status": "pending",
-            "candidate_type": normalized_type,
-            "candidate_ref": normalized_ref,
-            "candidate": candidate,
-            "candidate_confidence": candidate.get("confidence"),
-            "match_reasons": candidate.get("match_reasons") or [],
-            "available_actions": _identity_candidate_action_set(candidate),
-            "created_from": "offer_reconciliation_candidate",
-            "created_by_actor_id": actor_id,
-            "notes": notes,
-        },
-    }
-    module = await create_module_draft(
-        pdp_id=subject["pdp_id"],
-        module_key="identity",
-        payload=payload,
-        source_refs=source_refs,
-        generated_by="identity_candidate_evidence",
-        generation_ref=f"{normalized_type}:{normalized_ref}",
-        actor_type=REVIEW_ACTOR_HUMAN,
-        actor_id=actor_id,
+    return await _create_identity_candidate_task_from_candidate(
+        subject=subject,
+        candidate_type=normalized_type,
+        candidate_ref=normalized_ref,
+        candidate=candidate,
+        notes=notes,
         actor_role=actor_role,
-    )
-    task = await _ensure_review_task_for_module(subject, {**module, "version_id": module.get("id")})
-    await _audit(
-        pdp_id=subject["pdp_id"],
-        module_key="identity",
-        action="identity_candidate_task_created",
-        actor_type=REVIEW_ACTOR_HUMAN,
         actor_id=actor_id,
-        details={
-            "task_id": (task or {}).get("task_id"),
-            "version_id": module.get("id"),
-            "candidate_type": normalized_type,
-            "candidate_ref": normalized_ref,
-            "candidate": candidate,
-            "notes": notes,
-        },
+        created_from="offer_reconciliation_candidate",
     )
-    return {"status": "success", "created": True, "module": module, "task": task}
 
 
 async def _primary_product_key_for_group(product_group_id: Optional[str]) -> Optional[str]:
@@ -2567,6 +2594,173 @@ async def _apply_merchant_candidate_merge(subject: Dict[str, Any], candidate: Di
     }
 
 
+def _audit_snapshot_candidate(review: Dict[str, Any], candidate_type: str, candidate_ref: str) -> Dict[str, Any]:
+    pools = {
+        "merchant_product_near_match": review.get("merchant_candidates") or [],
+        "external_seed_near_match": review.get("external_candidates") or [],
+    }
+    for candidate in pools.get(candidate_type, []) or []:
+        candidate_dict = _json_dict(candidate)
+        candidate_dict["candidate_type"] = str(candidate_dict.get("candidate_type") or candidate_type)
+        if _identity_candidate_ref(candidate_dict) == candidate_ref:
+            return candidate_dict
+    raise LookupError("PDP_IDENTITY_CANDIDATE_NOT_FOUND")
+
+
+async def _apply_product_group_identity_audit_action(
+    *,
+    task: Dict[str, Any],
+    version: Dict[str, Any],
+    payload: Dict[str, Any],
+    review: Dict[str, Any],
+    action: str,
+    notes: Optional[str],
+    reason: Optional[str],
+    checklist: Optional[Dict[str, Any]],
+    policy_labels: Optional[List[str]],
+    decision_tree_path: Optional[List[str]],
+    review_duration_ms: Optional[int],
+    override_reason: Optional[str],
+    candidate_type: Optional[str],
+    candidate_ref: Optional[str],
+    actor_role: Optional[str],
+    actor_id: Optional[str],
+) -> Dict[str, Any]:
+    if action not in {"create_identity_candidate_task", "reject_staged_audit"}:
+        raise ValueError("PDP_IDENTITY_ACTION_NOT_ALLOWED_FOR_CANDIDATE")
+    normalized_policy_labels = [str(label).strip() for label in (policy_labels or []) if str(label).strip()]
+    if not normalized_policy_labels:
+        raise ValueError("PDP_REVIEW_POLICY_LABEL_REQUIRED")
+
+    subject = await resolve_pdp_subject(pdp_id=task["pdp_id"])
+    action_result: Dict[str, Any] = {}
+    audit_action = "identity_audit_rejected"
+    resolved_status = "rejected"
+    review_decision = "reject"
+    module_status = "rejected"
+
+    if action == "create_identity_candidate_task":
+        normalized_type = str(candidate_type or "").strip()
+        normalized_ref = str(candidate_ref or "").strip()
+        if normalized_type not in {"external_seed_near_match", "merchant_product_near_match"} or not normalized_ref:
+            raise ValueError("INVALID_PDP_IDENTITY_CANDIDATE")
+        decisions = await _identity_candidate_decision_index(subject["pdp_id"])
+        prior = decisions.get(normalized_ref)
+        if prior and prior.get("status") in {"accepted", "rejected"}:
+            raise ValueError("PDP_IDENTITY_CANDIDATE_ALREADY_RESOLVED")
+        existing = await _existing_identity_candidate_task(
+            subject=subject,
+            candidate_type=normalized_type,
+            candidate_ref=normalized_ref,
+        )
+        if existing:
+            action_result = {"created": False, **existing}
+        else:
+            candidate = _audit_snapshot_candidate(review, normalized_type, normalized_ref)
+            action_result = await _create_identity_candidate_task_from_candidate(
+                subject=subject,
+                candidate_type=normalized_type,
+                candidate_ref=normalized_ref,
+                candidate=candidate,
+                notes=notes,
+                actor_role=actor_role,
+                actor_id=actor_id,
+                created_from="product_group_identity_audit",
+            )
+        audit_action = "identity_audit_candidate_task_created"
+        resolved_status = "converted"
+        review_decision = "needs_human_review"
+        module_status = "resolved"
+    elif not (reason or notes or "").strip():
+        raise ValueError("PDP_REVIEW_REJECTION_REASON_REQUIRED")
+
+    now = _now()
+    review_payload = {
+        **review,
+        "status": resolved_status,
+        "decision": review_decision,
+        "applied_action": action,
+        "action_result": action_result,
+        "reviewed_by_actor_id": actor_id,
+        "reviewed_at": _iso(now),
+        "notes": notes,
+        "reason": reason,
+        "checklist": checklist if isinstance(checklist, dict) else {},
+        "policy_labels": normalized_policy_labels,
+        "decision_tree_path": decision_tree_path if isinstance(decision_tree_path, list) else [],
+        "review_duration_ms": review_duration_ms,
+        "override_reason": override_reason,
+    }
+    next_payload = {**payload, "identity_review": review_payload}
+    rubric = {
+        "decision": review_decision,
+        "identity_action": action,
+        "notes": notes,
+        "reason": reason,
+        "checklist": checklist if isinstance(checklist, dict) else {},
+        "policy_labels": normalized_policy_labels,
+        "decision_tree_path": decision_tree_path if isinstance(decision_tree_path, list) else [],
+        "review_duration_ms": review_duration_ms,
+        "override_reason": override_reason,
+        "action_result": action_result,
+    }
+    await database.execute(
+        pdp_module_versions.update()
+        .where(pdp_module_versions.c.id == version["id"])
+        .values(
+            status=module_status,
+            payload=next_payload,
+            review_actor_type=REVIEW_ACTOR_HUMAN,
+            review_actor_id=actor_id,
+            review_decision=review_decision,
+            review_confidence=None,
+            review_rubric=rubric,
+            risk_level=module_risk_level("identity", next_payload),
+            requires_human=module_requires_human_review("identity", next_payload),
+        )
+    )
+    await database.execute(
+        pdp_review_tasks.update()
+        .where(pdp_review_tasks.c.id == task["task_id"])
+        .values(
+            status="resolved",
+            checklist=rubric["checklist"],
+            policy_labels=normalized_policy_labels,
+            decision_tree_path=rubric["decision_tree_path"],
+            escalation_reason=reason if action == "reject_staged_audit" else None,
+            override_reason=override_reason,
+            review_duration_ms=review_duration_ms,
+            updated_at=now,
+            resolved_at=now,
+        )
+    )
+    await _audit(
+        pdp_id=task["pdp_id"],
+        module_key="identity",
+        action=audit_action,
+        actor_type=REVIEW_ACTOR_HUMAN,
+        actor_id=actor_id,
+        details={
+            "task_id": task["task_id"],
+            "version_id": version["id"],
+            "identity_action": action,
+            "decision": review_decision,
+            "notes": notes,
+            "reason": reason,
+            "policy_labels": normalized_policy_labels,
+            "action_result": action_result,
+        },
+    )
+    return {
+        "status": "success",
+        "decision": review_decision,
+        "identity_action": action,
+        "action_result": action_result,
+        "task": await _review_task_by_id(task["task_id"]),
+        "module": await _fetch_module_version(task["pdp_id"], "identity", version["id"]),
+    }
+
+
 async def apply_pdp_identity_review_action(
     *,
     task_id: str,
@@ -2579,6 +2773,8 @@ async def apply_pdp_identity_review_action(
     review_duration_ms: Optional[int] = None,
     override_reason: Optional[str] = None,
     target_product_key: Optional[str] = None,
+    candidate_type: Optional[str] = None,
+    candidate_ref: Optional[str] = None,
     actor_role: Optional[str] = None,
     actor_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -2586,7 +2782,7 @@ async def apply_pdp_identity_review_action(
     if not is_employee_review_role(actor_role):
         raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
     normalized_action = str(action or "").strip()
-    if normalized_action not in {"attach_external_offer", "merge_product_group", "reject_candidate"}:
+    if normalized_action not in {"attach_external_offer", "merge_product_group", "reject_candidate", "create_identity_candidate_task", "reject_staged_audit"}:
         raise ValueError("INVALID_PDP_IDENTITY_ACTION")
     task = await _review_task_by_id(task_id)
     if task.get("module_key") != "identity" or not task.get("version_id"):
@@ -2596,6 +2792,25 @@ async def apply_pdp_identity_review_action(
     review = _json_dict(payload.get("identity_review"))
     if review.get("status") != "pending":
         raise ValueError("PDP_IDENTITY_TASK_ALREADY_RESOLVED")
+    if review.get("candidate_type") == "product_group_identity_audit":
+        return await _apply_product_group_identity_audit_action(
+            task=task,
+            version=version,
+            payload=payload,
+            review=review,
+            action=normalized_action,
+            notes=notes,
+            reason=reason,
+            checklist=checklist,
+            policy_labels=policy_labels,
+            decision_tree_path=decision_tree_path,
+            review_duration_ms=review_duration_ms,
+            override_reason=override_reason,
+            candidate_type=candidate_type,
+            candidate_ref=candidate_ref,
+            actor_role=actor_role,
+            actor_id=actor_id,
+        )
     candidate = _json_dict(review.get("candidate"))
     candidate_type = str(review.get("candidate_type") or candidate.get("candidate_type") or "")
     candidate_ref = str(review.get("candidate_ref") or _identity_candidate_ref(candidate))
@@ -2863,10 +3078,12 @@ async def _existing_product_group_identity_audit_task(subject: Dict[str, Any], a
     )
     for row in rows or []:
         module = _serialize_module(row)
+        if str(module.get("status") or "") in {"reject", "rejected"}:
+            continue
         payload = _json_dict(module.get("payload"))
         review = _json_dict(payload.get("identity_review"))
         if (
-            review.get("status") == "pending"
+            review.get("status") in {"pending", "converted"}
             and review.get("candidate_type") == "product_group_identity_audit"
             and str(review.get("candidate_ref") or "") == audit_ref
         ):
@@ -3143,9 +3360,13 @@ async def _build_review_queue_item(
         and identity_review.get("status") == "pending"
         and is_employee_review_role(actor_role)
     ):
+        if identity_review.get("candidate_type") == "product_group_identity_audit":
+            identity_actions = {"create_identity_candidate_task", "reject_staged_audit"}
+        else:
+            identity_actions = set(_identity_candidate_action_set({"candidate_type": identity_review.get("candidate_type")}))
         allowed_actions = sorted(
             set(allowed_actions)
-            | set(_identity_candidate_action_set({"candidate_type": identity_review.get("candidate_type")}))
+            | identity_actions
         )
     if not ensure_task:
         allowed_actions = [action for action in allowed_actions if action in {"view", "rollback"}]
