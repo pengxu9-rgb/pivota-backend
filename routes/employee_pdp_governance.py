@@ -94,7 +94,7 @@ class IdentityCandidateTaskRequest(BaseModel):
 
 
 class IdentityReviewActionRequest(BaseModel):
-    action: str = Field(pattern="^(attach_external_offer|merge_product_group|reject_candidate)$")
+    action: str = Field(pattern="^(attach_external_offer|merge_product_group|reject_candidate|create_identity_candidate_task|reject_staged_audit)$")
     notes: Optional[str] = None
     reason: Optional[str] = None
     checklist: Optional[Dict[str, Any]] = None
@@ -103,6 +103,8 @@ class IdentityReviewActionRequest(BaseModel):
     review_duration_ms: Optional[int] = None
     override_reason: Optional[str] = None
     target_product_key: Optional[str] = None
+    candidate_type: Optional[str] = None
+    candidate_ref: Optional[str] = None
 
 
 class ProductGroupCorrectionRequest(BaseModel):
@@ -398,6 +400,8 @@ async def apply_identity_review_action(
             review_duration_ms=body.review_duration_ms,
             override_reason=body.override_reason,
             target_product_key=body.target_product_key,
+            candidate_type=body.candidate_type,
+            candidate_ref=body.candidate_ref,
             actor_role=_employee_role(current_user),
             actor_id=_employee_actor(current_user),
         )

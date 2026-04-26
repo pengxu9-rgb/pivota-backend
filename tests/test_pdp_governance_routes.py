@@ -16,6 +16,7 @@ from db.database import database
 from routes.employee_pdp_governance import router as employee_pdp_router
 from routes.merchant_pdp import router as merchant_pdp_router
 from services.pdp_governance_service import (
+    apply_pdp_identity_review_action,
     audit_pdp_identity_groups,
     correct_pdp_product_group_membership,
     get_pdp_offer_reconciliation,
@@ -850,6 +851,9 @@ async def test_identity_audit_job_creates_non_blocking_identity_review_task():
             actor_role="admin",
         )
         pdp_id = detail["pdp"]["pdp_id"]
+        await database.execute("DELETE FROM pdp_review_tasks WHERE pdp_id = :pdp_id", {"pdp_id": pdp_id})
+        await database.execute("DELETE FROM pdp_module_versions WHERE pdp_id = :pdp_id", {"pdp_id": pdp_id})
+        await database.execute("DELETE FROM pdp_audit_log WHERE pdp_id = :pdp_id", {"pdp_id": pdp_id})
 
         result = await audit_pdp_identity_groups(limit=20, actor_type="system_policy", actor_id="test_identity_audit")
         created = [item for item in result["created"] if item["pdp_id"] == pdp_id]
@@ -864,6 +868,34 @@ async def test_identity_audit_job_creates_non_blocking_identity_review_task():
         assert review["status"] == "pending"
         assert review["merchant_candidates"]
 
+        audit_task_id = created[0]["task_id"]
+        candidate = review["merchant_candidates"][0]
+        candidate_ref = candidate["product_key"]
+        converted = await apply_pdp_identity_review_action(
+            task_id=audit_task_id,
+            action="create_identity_candidate_task",
+            candidate_type="merchant_product_near_match",
+            candidate_ref=candidate_ref,
+            notes="Convert audit evidence into a formal identity review task.",
+            policy_labels=["identity:audit_to_review_task"],
+            decision_tree_path=["identity_audit", "create_identity_candidate_task"],
+            actor_role="admin",
+            actor_id="employee@example.com",
+        )
+        assert converted["identity_action"] == "create_identity_candidate_task"
+        assert converted["task"]["status"] == "resolved"
+        converted_review = converted["module"]["payload"]["identity_review"]
+        assert converted_review["status"] == "converted"
+        candidate_task = converted["action_result"]["task"]
+        assert candidate_task["module_key"] == "identity"
+
+        candidate_detail = await get_pdp_projection(pdp_id=pdp_id, actor_role="admin")
+        candidate_identity = next(module for module in candidate_detail["modules"] if module["module_key"] == "identity")
+        formal_review = candidate_identity["staged"]["payload"]["identity_review"]
+        assert formal_review["candidate_type"] == "merchant_product_near_match"
+        assert formal_review["candidate_ref"] == candidate_ref
+        assert formal_review["created_from"] == "product_group_identity_audit"
+
         queue = await list_pdp_review_queue(
             actor_role="admin",
             actor_id="employee@example.com",
@@ -871,9 +903,7 @@ async def test_identity_audit_job_creates_non_blocking_identity_review_task():
             limit=50,
         )
         audit_items = [item for item in queue["items"] if item["pdp_id"] == pdp_id]
-        assert audit_items
-        assert audit_items[0]["module_key"] == "identity"
-        assert "pdp_identity_audit" in audit_items[0]["source_summary"]["by_type"]
+        assert not audit_items
 
         rerun = await audit_pdp_identity_groups(limit=20, actor_type="system_policy", actor_id="test_identity_audit")
         assert any(item["pdp_id"] == pdp_id for item in rerun["existing"])
