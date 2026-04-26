@@ -86,6 +86,7 @@ PDP_REVIEW_QUEUE_TABS = {
     "senior_review",
     "qa_sample",
     "published_monitor",
+    "identity_audit",
 }
 
 HIGH_RISK_PAYLOAD_KEYS = {
@@ -2955,6 +2956,8 @@ async def audit_pdp_identity_groups(
     actor_role: Optional[str] = None,
 ) -> Dict[str, Any]:
     await ensure_pdp_governance_tables()
+    if actor_type == REVIEW_ACTOR_HUMAN and not is_employee_review_role(actor_role):
+        raise PermissionError("PDP_REVIEW_ACTION_FORBIDDEN")
     safe_limit = max(1, min(int(limit or 250), 5000))
     rows = await database.fetch_all(
         f"""
@@ -3185,6 +3188,7 @@ def _review_risk_reasons(module_key: str, risk_level: str, requires_human: bool,
 
 def _queue_item_matches_tab(item: Dict[str, Any], tab: str, actor_id: Optional[str]) -> bool:
     status = str(item.get("status") or "")
+    source_types = set(((item.get("source_summary") or {}).get("by_type") or {}).keys())
     if tab == "my_queue":
         return bool(actor_id and item.get("assignee") == actor_id)
     if tab == "publish_ready":
@@ -3197,6 +3201,13 @@ def _queue_item_matches_tab(item: Dict[str, Any], tab: str, actor_id: Optional[s
         return bool(item.get("qa_sample"))
     if tab == "published_monitor":
         return item.get("module_status") == "published" or status == "published_monitor"
+    if tab == "identity_audit":
+        return (
+            item.get("module_key") == "identity"
+            and "pdp_identity_audit" in source_types
+            and status in {"needs_review", "assigned", "escalated"}
+            and item.get("module_status") != "published"
+        )
     return status in {"needs_review", "assigned"} and item.get("module_status") != "published"
 
 
@@ -3337,6 +3348,7 @@ async def list_pdp_review_queue(
         "publish_ready": sum(1 for item in all_items if "publish" in (item.get("allowed_actions") or []) and item.get("module_status") != "published"),
         "high_risk": sum(1 for item in all_items if item.get("risk_level") == "high"),
         "escalated": sum(1 for item in all_items if item.get("status") == "escalated"),
+        "identity_audit": sum(1 for item in all_items if item.get("module_key") == "identity" and "pdp_identity_audit" in ((item.get("source_summary") or {}).get("by_type") or {})),
         "qa_sample": sum(1 for item in all_items if item.get("qa_sample")),
         "gpt55_reviewed": sum(1 for item in all_items if item.get("review_actor_type") == REVIEW_ACTOR_GPT55),
     }

@@ -21,6 +21,7 @@ from services.pdp_governance_service import (
     get_pdp_offer_reconciliation,
     get_pdp_projection,
     hydrate_pdp_subject_index,
+    list_pdp_review_queue,
     list_pdp_subjects,
 )
 from utils.auth import get_current_employee, get_current_user
@@ -863,8 +864,27 @@ async def test_identity_audit_job_creates_non_blocking_identity_review_task():
         assert review["status"] == "pending"
         assert review["merchant_candidates"]
 
+        queue = await list_pdp_review_queue(
+            actor_role="admin",
+            actor_id="employee@example.com",
+            tab="identity_audit",
+            limit=50,
+        )
+        audit_items = [item for item in queue["items"] if item["pdp_id"] == pdp_id]
+        assert audit_items
+        assert audit_items[0]["module_key"] == "identity"
+        assert "pdp_identity_audit" in audit_items[0]["source_summary"]["by_type"]
+
         rerun = await audit_pdp_identity_groups(limit=20, actor_type="system_policy", actor_id="test_identity_audit")
         assert any(item["pdp_id"] == pdp_id for item in rerun["existing"])
+
+        with pytest.raises(PermissionError, match="PDP_REVIEW_ACTION_FORBIDDEN"):
+            await audit_pdp_identity_groups(
+                limit=1,
+                actor_type="human_employee",
+                actor_id="outsourced@example.com",
+                actor_role="outsourced",
+            )
     finally:
         if database.is_connected:
             await database.disconnect()
