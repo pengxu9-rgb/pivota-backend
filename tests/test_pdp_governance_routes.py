@@ -16,6 +16,7 @@ from db.database import database
 from routes.employee_pdp_governance import router as employee_pdp_router
 from routes.merchant_pdp import router as merchant_pdp_router
 from services.pdp_governance_service import (
+    audit_pdp_identity_groups,
     correct_pdp_product_group_membership,
     get_pdp_offer_reconciliation,
     get_pdp_projection,
@@ -768,6 +769,102 @@ async def test_offer_reconciliation_exposes_identity_signals_without_blocking_ca
         assert "title_based_candidate_only" in candidate["risk_flags"]
         assert "same_merchant_distinct_product_candidate" in candidate["risk_flags"]
         assert candidate["identity_evidence"]
+    finally:
+        if database.is_connected:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_identity_audit_job_creates_non_blocking_identity_review_task():
+    if not database.is_connected:
+        await database.connect()
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_group_members (
+              product_group_id TEXT,
+              merchant_id TEXT,
+              platform TEXT,
+              platform_product_id TEXT,
+              is_primary BOOLEAN DEFAULT FALSE,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products_cache (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              merchant_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              platform_product_id TEXT NOT NULL,
+              product_data JSON NOT NULL,
+              cache_status TEXT DEFAULT 'fresh',
+              cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              expires_at DATETIME NULL,
+              ttl_seconds INTEGER DEFAULT 3600,
+              access_count INTEGER DEFAULT 0,
+              last_accessed_at DATETIME NULL
+            )
+            """
+        )
+        await database.execute("DELETE FROM product_group_members WHERE product_group_id = 'pg_identity_audit_job'")
+        await database.execute("DELETE FROM products_cache WHERE merchant_id = 'identity-audit-merchant'")
+        await database.execute(
+            """
+            INSERT INTO product_group_members (product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at)
+            VALUES ('pg_identity_audit_job', 'identity-audit-merchant', 'shopify', 'primary-harness', TRUE, CURRENT_TIMESTAMP)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, expires_at)
+            VALUES
+              ('identity-audit-merchant', 'shopify', 'primary-harness', :primary_payload, '2999-01-01 00:00:00'),
+              ('identity-audit-merchant', 'shopify', 'similar-harness', :candidate_payload, '2999-01-01 00:00:00')
+            """,
+            {
+                "primary_payload": json.dumps(
+                    {
+                        "title": "Comfy Tactical Dog Harness for Small to Medium Dogs",
+                        "image_url": "https://example.com/primary.jpg",
+                        "price": 36,
+                        "currency": "USD",
+                        "variants": [{"id": "v1"}],
+                    }
+                ),
+                "candidate_payload": json.dumps(
+                    {
+                        "title": "Reflective Tactical Dog Harness for Small to Medium Dogs",
+                        "image_url": "https://example.com/similar.jpg",
+                        "price": 30,
+                        "currency": "USD",
+                        "variants": [{"id": "v2"}],
+                    }
+                ),
+            },
+        )
+        detail = await get_pdp_projection(
+            product_key="identity-audit-merchant|shopify|primary-harness",
+            actor_role="admin",
+        )
+        pdp_id = detail["pdp"]["pdp_id"]
+
+        result = await audit_pdp_identity_groups(limit=20, actor_type="system_policy", actor_id="test_identity_audit")
+        created = [item for item in result["created"] if item["pdp_id"] == pdp_id]
+        assert created
+        assert "near_match_candidate_present" in created[0]["risk_flags"]
+        assert "candidate:same_merchant_distinct_product_candidate" in created[0]["risk_flags"]
+
+        refreshed = await get_pdp_projection(pdp_id=pdp_id, actor_role="admin")
+        identity = next(module for module in refreshed["modules"] if module["module_key"] == "identity")
+        review = identity["staged"]["payload"]["identity_review"]
+        assert review["candidate_type"] == "product_group_identity_audit"
+        assert review["status"] == "pending"
+        assert review["merchant_candidates"]
+
+        rerun = await audit_pdp_identity_groups(limit=20, actor_type="system_policy", actor_id="test_identity_audit")
+        assert any(item["pdp_id"] == pdp_id for item in rerun["existing"])
     finally:
         if database.is_connected:
             await database.disconnect()

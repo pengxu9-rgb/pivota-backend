@@ -9,6 +9,7 @@ from services.pdp_governance_service import (
     DEFAULT_MARKET,
     REVIEW_ACTOR_GPT55,
     REVIEW_ACTOR_HUMAN,
+    audit_pdp_identity_groups,
     apply_pdp_identity_review_action,
     assign_pdp_review_task,
     correct_pdp_product_group_membership,
@@ -67,6 +68,11 @@ class ModuleRollbackRequest(BaseModel):
 
 class HydrationRequest(BaseModel):
     limit: int = Field(default=10000, ge=0, le=50000)
+    background: bool = True
+
+
+class IdentityAuditRequest(BaseModel):
+    limit: int = Field(default=250, ge=1, le=5000)
     background: bool = True
 
 
@@ -233,6 +239,34 @@ async def hydrate_pdp_subjects(
             limit=body.limit,
             actor_type=REVIEW_ACTOR_HUMAN,
             actor_id=actor_id,
+        )
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+@router.post("/identity-audit")
+async def run_identity_audit(
+    body: IdentityAuditRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    actor_id = _employee_actor(current_user)
+    actor_role = _employee_role(current_user)
+    try:
+        if body.background:
+            background_tasks.add_task(
+                audit_pdp_identity_groups,
+                limit=body.limit,
+                actor_type=REVIEW_ACTOR_HUMAN,
+                actor_id=actor_id,
+                actor_role=actor_role,
+            )
+            return {"status": "queued", "limit": body.limit}
+        return await audit_pdp_identity_groups(
+            limit=body.limit,
+            actor_type=REVIEW_ACTOR_HUMAN,
+            actor_id=actor_id,
+            actor_role=actor_role,
         )
     except Exception as exc:
         raise _map_error(exc)

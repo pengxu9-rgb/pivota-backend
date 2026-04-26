@@ -2783,6 +2783,255 @@ async def get_pdp_offer_reconciliation(
     }
 
 
+def _identity_audit_report(reconciliation: Dict[str, Any]) -> Dict[str, Any]:
+    summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
+    confirmed = reconciliation.get("confirmed") if isinstance(reconciliation.get("confirmed"), dict) else {}
+    candidates = reconciliation.get("candidates") if isinstance(reconciliation.get("candidates"), dict) else {}
+    internal_sellers = confirmed.get("internal_sellers") if isinstance(confirmed.get("internal_sellers"), list) else []
+    external_offers = confirmed.get("external_offers") if isinstance(confirmed.get("external_offers"), list) else []
+    merchant_candidates = candidates.get("merchant_products") if isinstance(candidates.get("merchant_products"), list) else []
+    external_candidates = candidates.get("external_seeds") if isinstance(candidates.get("external_seeds"), list) else []
+    risk_flags: List[str] = []
+
+    indexed_count = int(summary.get("pdp_index_seller_count") or 0)
+    confirmed_count = int(summary.get("confirmed_internal_seller_count") or 0)
+    candidate_count = int(summary.get("near_match_candidate_count") or 0)
+    if indexed_count != confirmed_count:
+        _append_unique(risk_flags, "seller_count_index_live_mismatch")
+    if indexed_count and confirmed_count == 0:
+        _append_unique(risk_flags, "no_live_confirmed_seller_for_indexed_group")
+    if candidate_count:
+        _append_unique(risk_flags, "near_match_candidate_present")
+    if str(summary.get("product_group_id") or "").startswith("pg:auto:title:") and candidate_count:
+        _append_unique(risk_flags, "auto_title_group_has_near_matches")
+
+    for offer in [*internal_sellers, *external_offers]:
+        for flag in offer.get("risk_flags") or []:
+            _append_unique(risk_flags, f"confirmed:{flag}")
+        confidence = offer.get("identity_confidence")
+        try:
+            if confidence is not None and float(confidence) < 0.75:
+                _append_unique(risk_flags, "confirmed_low_identity_confidence")
+        except Exception:
+            pass
+
+    for candidate in [*merchant_candidates, *external_candidates]:
+        for flag in candidate.get("risk_flags") or []:
+            _append_unique(risk_flags, f"candidate:{flag}")
+        if candidate.get("verification_status") == "suggested_match":
+            _append_unique(risk_flags, "suggested_identity_match_needs_review")
+
+    def compact_offer(offer: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "source": offer.get("source"),
+            "match_status": offer.get("match_status"),
+            "product_key": offer.get("product_key"),
+            "id": offer.get("id"),
+            "external_product_id": offer.get("external_product_id"),
+            "merchant_id": offer.get("merchant_id"),
+            "title": offer.get("title"),
+            "verification_status": offer.get("verification_status"),
+            "identity_confidence": offer.get("identity_confidence"),
+            "risk_flags": offer.get("risk_flags") or [],
+            "match_reasons": offer.get("match_reasons") or [],
+        }
+
+    return {
+        "risk_flags": risk_flags,
+        "summary": summary,
+        "confirmed_internal_sellers": [compact_offer(offer) for offer in internal_sellers[:10]],
+        "confirmed_external_offers": [compact_offer(offer) for offer in external_offers[:10]],
+        "merchant_candidates": [compact_offer(candidate) for candidate in merchant_candidates[:10]],
+        "external_candidates": [compact_offer(candidate) for candidate in external_candidates[:10]],
+    }
+
+
+async def _existing_product_group_identity_audit_task(subject: Dict[str, Any], audit_ref: str) -> Optional[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT *
+        FROM pdp_module_versions
+        WHERE pdp_id = :pdp_id
+          AND module_key = 'identity'
+          AND stage = 'staged'
+          AND superseded_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        {"pdp_id": subject["pdp_id"]},
+    )
+    for row in rows or []:
+        module = _serialize_module(row)
+        payload = _json_dict(module.get("payload"))
+        review = _json_dict(payload.get("identity_review"))
+        if (
+            review.get("status") == "pending"
+            and review.get("candidate_type") == "product_group_identity_audit"
+            and str(review.get("candidate_ref") or "") == audit_ref
+        ):
+            task = await _ensure_review_task_for_module(subject, {**module, "version_id": module.get("id")})
+            return {"module": module, "task": task}
+    return None
+
+
+async def _create_product_group_identity_audit_task(
+    *,
+    subject: Dict[str, Any],
+    report: Dict[str, Any],
+    actor_type: str,
+    actor_id: Optional[str],
+    actor_role: Optional[str],
+) -> Dict[str, Any]:
+    current_identity = await _current_published_version(subject["pdp_id"], "identity")
+    current_payload = _json_dict((current_identity or {}).get("payload"))
+    audit_ref = str(subject.get("product_group_id") or subject.get("pdp_id") or "").strip()
+    source_refs = merge_source_refs(
+        (current_identity or {}).get("source_refs") or [],
+        [
+            {
+                "type": "pdp_identity_audit",
+                "id": audit_ref,
+                "pdp_id": subject.get("pdp_id"),
+                "product_group_id": subject.get("product_group_id"),
+            }
+        ],
+    )
+    payload = {
+        **current_payload,
+        "identity_review": {
+            "status": "pending",
+            "candidate_type": "product_group_identity_audit",
+            "candidate_ref": audit_ref,
+            "audit_summary": report.get("summary") or {},
+            "risk_flags": report.get("risk_flags") or [],
+            "confirmed_internal_sellers": report.get("confirmed_internal_sellers") or [],
+            "confirmed_external_offers": report.get("confirmed_external_offers") or [],
+            "merchant_candidates": report.get("merchant_candidates") or [],
+            "external_candidates": report.get("external_candidates") or [],
+            "available_actions": [
+                "open_pdp_detail",
+                "create_identity_candidate_task",
+                "product_group_correction",
+                "reject_staged_audit",
+            ],
+            "created_from": "identity_audit_job",
+            "created_by_actor_id": actor_id,
+        },
+    }
+    module = await create_module_draft(
+        pdp_id=subject["pdp_id"],
+        module_key="identity",
+        payload=payload,
+        source_refs=source_refs,
+        generated_by="identity_audit_job",
+        generation_ref=f"product_group_identity_audit:{audit_ref}",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        actor_role=actor_role,
+    )
+    task = await _ensure_review_task_for_module(subject, {**module, "version_id": module.get("id")})
+    await _audit(
+        pdp_id=subject["pdp_id"],
+        module_key="identity",
+        action="identity_audit_task_created",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        details={
+            "task_id": (task or {}).get("task_id"),
+            "version_id": module.get("id"),
+            "audit_ref": audit_ref,
+            "risk_flags": report.get("risk_flags") or [],
+            "summary": report.get("summary") or {},
+        },
+    )
+    return {"module": module, "task": task}
+
+
+async def audit_pdp_identity_groups(
+    *,
+    limit: int = 250,
+    actor_type: str = REVIEW_ACTOR_SYSTEM,
+    actor_id: Optional[str] = "identity_audit_job",
+    actor_role: Optional[str] = None,
+) -> Dict[str, Any]:
+    await ensure_pdp_governance_tables()
+    safe_limit = max(1, min(int(limit or 250), 5000))
+    rows = await database.fetch_all(
+        f"""
+        SELECT *
+        FROM pdp_subject_index
+        WHERE status = 'active'
+          AND subject_type = 'product_group'
+          AND product_group_id IS NOT NULL
+        ORDER BY updated_at DESC, created_at DESC
+        {_sql_limit_clause(safe_limit)}
+        """,
+        _sql_limit_params(safe_limit),
+    )
+    scanned = 0
+    created: List[Dict[str, Any]] = []
+    existing: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    risk_counts: Dict[str, int] = {}
+
+    for row in rows or []:
+        subject = _serialize_subject(_row_dict(row))
+        if not subject:
+            continue
+        scanned += 1
+        try:
+            await ensure_baseline_modules(subject)
+            reconciliation = await get_pdp_offer_reconciliation(pdp_id=subject["pdp_id"], actor_role=actor_role)
+            report = _identity_audit_report(reconciliation)
+            risk_flags = [str(flag) for flag in report.get("risk_flags") or [] if str(flag)]
+            for flag in risk_flags:
+                risk_counts[flag] = risk_counts.get(flag, 0) + 1
+            audit_ref = str(subject.get("product_group_id") or subject.get("pdp_id") or "").strip()
+            if not risk_flags:
+                skipped.append({"pdp_id": subject["pdp_id"], "product_group_id": subject.get("product_group_id"), "reason": "no_identity_risk_flags"})
+                continue
+            existing_task = await _existing_product_group_identity_audit_task(subject, audit_ref)
+            if existing_task:
+                existing.append(
+                    {
+                        "pdp_id": subject["pdp_id"],
+                        "product_group_id": subject.get("product_group_id"),
+                        "task_id": (existing_task.get("task") or {}).get("task_id"),
+                        "risk_flags": risk_flags,
+                    }
+                )
+                continue
+            created_task = await _create_product_group_identity_audit_task(
+                subject=subject,
+                report=report,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                actor_role=actor_role,
+            )
+            created.append(
+                {
+                    "pdp_id": subject["pdp_id"],
+                    "product_group_id": subject.get("product_group_id"),
+                    "task_id": (created_task.get("task") or {}).get("task_id"),
+                    "risk_flags": risk_flags,
+                }
+            )
+        except Exception as exc:
+            skipped.append({"pdp_id": subject.get("pdp_id"), "product_group_id": subject.get("product_group_id"), "reason": str(exc)[:120]})
+
+    return {
+        "status": "success",
+        "scanned": scanned,
+        "created_count": len(created),
+        "existing_count": len(existing),
+        "skipped_count": len(skipped),
+        "created": created,
+        "existing": existing,
+        "skipped": skipped[:100],
+        "risk_counts": risk_counts,
+    }
+
+
 def _initial_review_task_status(module_status: str) -> str:
     if module_status == "published":
         return "published_monitor"
