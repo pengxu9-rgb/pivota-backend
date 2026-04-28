@@ -473,6 +473,67 @@ def test_ensure_stripe_webhook_endpoint_handles_getattr_keyerror(monkeypatch) ->
     assert provider_config["webhook_url"].endswith("/webhooks/stripe/psp_stripe_live_keyerror")
 
 
+def test_ensure_stripe_webhook_endpoint_disables_duplicate_url_endpoints(monkeypatch) -> None:
+    _, module = _build_client()
+
+    target_url = module._stripe_webhook_target_url("psp_stripe_dedupe")
+    disabled_endpoint_ids = []
+
+    class FakeStripeObject:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeWebhookEndpoint:
+        @staticmethod
+        def create(**kwargs):
+            return FakeStripeObject(
+                id="we_new",
+                secret="whsec_new",
+                url=kwargs["url"],
+                status="enabled",
+            )
+
+        @staticmethod
+        def list(**kwargs):
+            return FakeStripeObject(
+                data=[
+                    FakeStripeObject(id="we_old_enabled", url=target_url, status="enabled"),
+                    FakeStripeObject(id="we_new", url=target_url, status="enabled"),
+                    FakeStripeObject(id="we_old_disabled", url=target_url, status="disabled"),
+                    FakeStripeObject(
+                        id="we_other",
+                        url="https://api.pivota.cc/webhooks/stripe/other",
+                        status="enabled",
+                    ),
+                ]
+            )
+
+        @staticmethod
+        def modify(endpoint_id, **kwargs):
+            disabled_endpoint_ids.append((endpoint_id, kwargs))
+            return FakeStripeObject(id=endpoint_id, disabled=kwargs.get("disabled"))
+
+    class FakeStripeSDK:
+        api_key = None
+        WebhookEndpoint = FakeWebhookEndpoint
+
+    monkeypatch.setitem(sys.modules, "stripe", FakeStripeSDK)
+
+    provider_config, created = module.asyncio.run(
+        module._ensure_stripe_webhook_endpoint(
+            psp_id="psp_stripe_dedupe",
+            api_key="sk_live_stripe_secret",
+            provider_config={"mode": "payment_intent"},
+            account_id=None,
+            environment="live",
+        )
+    )
+
+    assert created is True
+    assert provider_config["webhook_endpoint_id"] == "we_new"
+    assert disabled_endpoint_ids == [("we_old_enabled", {"disabled": True})]
+
+
 def test_merchant_order_backed_canary_route_uses_authenticated_merchant(monkeypatch) -> None:
     client, module = _build_client()
 

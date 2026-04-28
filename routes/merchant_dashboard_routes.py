@@ -82,6 +82,71 @@ def _stripe_object_field(obj: Any, field: str) -> Any:
     return getattr(obj, field, None)
 
 
+def _stripe_list_data(obj: Any) -> List[Any]:
+    pager = getattr(obj, "auto_paging_iter", None)
+    if callable(pager):
+        try:
+            return list(pager())
+        except Exception:
+            pass
+    data = _stripe_object_field(obj, "data") or []
+    return list(data) if isinstance(data, list) else []
+
+
+def _stripe_endpoint_is_disabled(endpoint: Any) -> bool:
+    status = str(_stripe_object_field(endpoint, "status") or "").strip().lower()
+    disabled = _stripe_object_field(endpoint, "disabled")
+    return status == "disabled" or disabled is True
+
+
+async def _disable_duplicate_stripe_webhook_endpoints(
+    *,
+    stripe_sdk: Any,
+    desired_url: str,
+    active_endpoint_id: str,
+    stripe_kwargs: Dict[str, Any],
+) -> int:
+    list_endpoint = getattr(stripe_sdk.WebhookEndpoint, "list", None)
+    if not callable(list_endpoint):
+        return 0
+
+    try:
+        endpoints = _stripe_list_data(list_endpoint(limit=100, **stripe_kwargs))
+    except Exception as exc:
+        logger.warning(
+            "stripe_webhook_duplicate_scan_failed",
+            extra={"active_endpoint_id": active_endpoint_id, "error": str(exc)},
+        )
+        return 0
+
+    disabled_count = 0
+    for endpoint in endpoints:
+        endpoint_id = str(_stripe_object_field(endpoint, "id") or "").strip()
+        endpoint_url = str(_stripe_object_field(endpoint, "url") or "").strip()
+        if not endpoint_id or endpoint_id == active_endpoint_id or endpoint_url != desired_url:
+            continue
+        if _stripe_endpoint_is_disabled(endpoint):
+            continue
+        try:
+            stripe_sdk.WebhookEndpoint.modify(endpoint_id, disabled=True, **stripe_kwargs)
+            disabled_count += 1
+        except Exception as exc:
+            logger.warning(
+                "stripe_webhook_duplicate_disable_failed",
+                extra={
+                    "active_endpoint_id": active_endpoint_id,
+                    "duplicate_endpoint_id": endpoint_id,
+                    "error": str(exc),
+                },
+            )
+    if disabled_count:
+        logger.info(
+            "stripe_webhook_duplicate_endpoints_disabled",
+            extra={"active_endpoint_id": active_endpoint_id, "disabled_count": disabled_count},
+        )
+    return disabled_count
+
+
 async def _ensure_stripe_webhook_endpoint(
     *,
     psp_id: str,
@@ -117,6 +182,12 @@ async def _ensure_stripe_webhook_endpoint(
             next_config["webhook_endpoint_id"] = existing_endpoint_id
             next_config["webhook_endpoint_secret"] = existing_secret
             next_config["webhook_url"] = desired_url
+            await _disable_duplicate_stripe_webhook_endpoints(
+                stripe_sdk=stripe_sdk,
+                desired_url=desired_url,
+                active_endpoint_id=existing_endpoint_id,
+                stripe_kwargs=stripe_kwargs,
+            )
             return next_config, False
         except Exception:
             pass
@@ -136,6 +207,12 @@ async def _ensure_stripe_webhook_endpoint(
     next_config["webhook_endpoint_id"] = created_id
     next_config["webhook_endpoint_secret"] = created_secret
     next_config["webhook_url"] = desired_url
+    await _disable_duplicate_stripe_webhook_endpoints(
+        stripe_sdk=stripe_sdk,
+        desired_url=desired_url,
+        active_endpoint_id=created_id,
+        stripe_kwargs=stripe_kwargs,
+    )
     return next_config, True
 
 
