@@ -148,6 +148,27 @@ def _stripe_metadata_flag(value: Any) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _db_row_to_dict(row: Any) -> Any:
+    if row is None or isinstance(row, dict):
+        return row
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except Exception:
+            pass
+    keys = getattr(row, "keys", None)
+    if callable(keys):
+        try:
+            return {key: row[key] for key in keys()}
+        except Exception:
+            pass
+    try:
+        return dict(row)
+    except Exception:
+        return row
+
+
 def _can_apply_stripe_payment_success(order: Optional[Dict[str, Any]]) -> bool:
     if not order:
         return False
@@ -208,12 +229,12 @@ async def _resolve_stripe_order_for_refund(
     if payment_intent_id:
         result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
         if result:
-            return result
+            return _db_row_to_dict(result)
 
     if isinstance(refund_meta, dict):
         order_hint = str(refund_meta.get("order_id") or "").strip()
         if order_hint:
-            return await get_order(order_hint)
+            return _db_row_to_dict(await get_order(order_hint))
     return None
 
 
@@ -247,7 +268,7 @@ async def _resolve_stripe_order_for_payment_event(
     if payment_intent_id:
         result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
         if result:
-            return result
+            return _db_row_to_dict(result)
 
     order_hint = ""
     if isinstance(payment_meta, dict):
@@ -258,6 +279,7 @@ async def _resolve_stripe_order_for_payment_event(
     order = await get_order(order_hint)
     if not order:
         return None
+    order = _db_row_to_dict(order)
 
     current_payment_intent_id = str(order.get("payment_intent_id") or "").strip()
     if payment_intent_id and current_payment_intent_id != payment_intent_id:

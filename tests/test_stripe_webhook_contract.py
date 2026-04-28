@@ -65,7 +65,7 @@ async def test_stripe_webhook_psp_path_uses_merchant_specific_secret(
 
     used_secrets: list[str] = []
 
-    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Any:
         if "FROM merchant_psps" in query:
             assert values["psp_id"] == "psp_stripe_live_123"
             return {
@@ -777,14 +777,25 @@ async def test_stripe_webhook_refund_updated_pending_logs_without_mutating_order
         },
     )
 
+    class DbRowLike:
+        get = None
+
+        def __init__(self, values: Dict[str, Any]) -> None:
+            self._mapping = values
+
+        def __getitem__(self, key: str) -> Any:
+            return self._mapping[key]
+
     async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
         assert values["payment_intent_id"] == "pi_refund_updated_pending"
-        return {
-            "order_id": "ORD_STRIPE_REFUND_UPDATED_PENDING",
-            "merchant_id": "m_stripe",
-            "payment_intent_id": "pi_refund_updated_pending",
-            "currency": "USD",
-        }
+        return DbRowLike(
+            {
+                "order_id": "ORD_STRIPE_REFUND_UPDATED_PENDING",
+                "merchant_id": "m_stripe",
+                "payment_intent_id": "pi_refund_updated_pending",
+                "currency": "USD",
+            }
+        )
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
