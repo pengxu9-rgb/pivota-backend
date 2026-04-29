@@ -4,9 +4,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 from models.order import CreateOrderRequest
+from services.quote_service import QuoteError
 
 
 @pytest.mark.asyncio
@@ -70,6 +71,11 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
             },
         )
 
+    async def fake_validate_quote_snapshot_live(self, quote, *, customer_email: str | None = None):
+        assert quote.quote_id == "q_test"
+        assert customer_email == "peng@chydan.com"
+        return {"status": "validated", "engine": "shopify_storefront_cart", "engine_ref": "cart_ref_live"}
+
     async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
         return "stripe", {"route_id": "route_test"}
 
@@ -92,6 +98,7 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
     monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
     monkeypatch.setattr(module, "check_inventory_availability", fake_check_inventory)
     monkeypatch.setattr(module.QuoteService, "load_active_quote_or_raise", fake_load_active_quote_or_raise)
+    monkeypatch.setattr(module.QuoteService, "validate_quote_snapshot_live", fake_validate_quote_snapshot_live)
     monkeypatch.setattr(module, "compute_request_fingerprint", lambda **_: "fp_1")
     monkeypatch.setattr(module.PaymentRoutingService, "select_psp", fake_select_psp)
     monkeypatch.setattr(module, "_resolve_active_order_psp", fake_resolve_active_order_psp)
@@ -133,7 +140,112 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
     assert order_data["total"] == pytest.approx(9.09)
     assert order_data["metadata"]["amounts_source"] == "quote_snapshot"
     assert order_data["metadata"]["pricing_quote"]["quote_id"] == "q_test"
+    assert order_data["metadata"]["pricing_quote"]["live_validation"]["status"] == "validated"
     assert order_data["items"][0]["product_title"] == "Winona Soothing Repair Serum"
     assert Decimal(order_data["items"][0]["unit_price"]) == Decimal("1.09")
     assert Decimal(order_data["items"][0]["subtotal"]) == Decimal("1.09")
     assert resp.discount_total == Decimal("0.60")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "quote_error_code",
+    ["QUOTE_STALE_REPRICE_REQUIRED", "INSUFFICIENT_INVENTORY"],
+)
+async def test_live_revalidation_failure_blocks_order_and_psp(
+    monkeypatch: pytest.MonkeyPatch,
+    quote_error_code: str,
+) -> None:
+    import routes.order_routes as module
+
+    async def fake_get_merchant_onboarding(_merchant_id: str):
+        return {"merchant_id": _merchant_id}
+
+    async def fake_check_inventory(_merchant_id: str, _items):
+        return True, {}
+
+    async def fake_load_active_quote_or_raise(self, *, quote_id: str):
+        return SimpleNamespace(
+            quote_id=quote_id,
+            expires_at=None,
+            engine="shopify_storefront_cart",
+            engine_ref="cart_ref",
+            request_fingerprint="fp_1",
+            quote_hash_sha256="h" * 64,
+            debug_id="debug_1",
+            merchant_id="merch_1",
+            request_json={
+                "items": [{"product_id": "p_1", "variant_id": "v_1", "quantity": 1}],
+                "discount_codes": [],
+                "shipping_address": {
+                    "country": "US",
+                    "postal_code": "94105",
+                    "city": "San Francisco",
+                    "state": "CA",
+                },
+            },
+            snapshot_json={
+                "currency": "USD",
+                "pricing": {
+                    "subtotal": "10.00",
+                    "discount_total": "0.00",
+                    "shipping_fee": "0.00",
+                    "tax": "0.00",
+                    "total": "10.00",
+                },
+                "line_items": [
+                    {
+                        "product_id": "p_1",
+                        "variant_id": "v_1",
+                        "quantity": 1,
+                        "unit_price_original": "10.00",
+                        "unit_price_effective": "10.00",
+                        "line_discount_total": "0.00",
+                    }
+                ],
+            },
+        )
+
+    async def fake_validate_quote_snapshot_live(self, quote, *, customer_email: str | None = None):
+        raise QuoteError(
+            quote_error_code,
+            "Quote no longer matches live store pricing or availability. Refresh the quote before checkout.",
+            details={"quote_id": quote.quote_id, "mismatches": [{"field": "pricing.total"}]},
+        )
+
+    async def fail_create_order(*args, **kwargs):
+        raise AssertionError("stale quote must not create a Pivota order")
+
+    async def fail_create_payment_with_failover(*args, **kwargs):
+        raise AssertionError("stale quote must not call PSP")
+
+    monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(module, "check_inventory_availability", fake_check_inventory)
+    monkeypatch.setattr(module.QuoteService, "load_active_quote_or_raise", fake_load_active_quote_or_raise)
+    monkeypatch.setattr(module.QuoteService, "validate_quote_snapshot_live", fake_validate_quote_snapshot_live)
+    monkeypatch.setattr(module, "compute_request_fingerprint", lambda **_: "fp_1")
+    monkeypatch.setattr(module, "create_order", fail_create_order)
+    monkeypatch.setattr(module, "create_payment_with_failover", fail_create_payment_with_failover)
+
+    req = CreateOrderRequest(
+        merchant_id="merch_1",
+        customer_email="buyer@example.com",
+        quote_id="q_stale",
+        items=[{"product_id": "p_1", "variant_id": "v_1", "quantity": 1}],
+        shipping_address={
+            "name": "Buyer",
+            "address_line1": "1 Market St",
+            "city": "San Francisco",
+            "state": "CA",
+            "postal_code": "94105",
+            "country": "US",
+        },
+        currency="USD",
+        metadata={},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await module.create_new_order(req, BackgroundTasks(), current_user={"user_id": "test"})
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == quote_error_code

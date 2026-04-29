@@ -11,6 +11,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
@@ -613,6 +614,7 @@ def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client
 def test_create_checkout_intent_uses_verified_agent_user_ref(app, client, monkeypatch):
     from routes import agent_checkout_intents
     from routes.agent_user_auth import AgentUserContext, get_agent_user_context
+    import services.merchant_store_service as merchant_store_service
 
     async def fake_get_agent_user_context():  # noqa: ANN001
         return AgentUserContext(agent_user_ref="https://agent.tools.example:user_123")
@@ -622,7 +624,19 @@ def test_create_checkout_intent_uses_verified_agent_user_ref(app, client, monkey
     async def fake_execute(_query, _values=None):  # noqa: ANN001
         return 1
 
+    async def fake_load_active_quote_or_raise(self, *, quote_id: str):  # noqa: ANN001
+        return SimpleNamespace(quote_id=quote_id, merchant_id="merch_test")
+
+    async def fake_get_primary_store(_merchant_id: str):  # noqa: ANN001
+        return {"platform": "shopify", "store_id": "store_test"}
+
     monkeypatch.setattr(agent_checkout_intents.database, "execute", fake_execute)
+    monkeypatch.setattr(merchant_store_service, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(
+        agent_checkout_intents.QuoteService,
+        "load_active_quote_or_raise",
+        fake_load_active_quote_or_raise,
+    )
 
     res = client.post(
         "/agent/v1/checkout/intents",
@@ -631,6 +645,7 @@ def test_create_checkout_intent_uses_verified_agent_user_ref(app, client, monkey
             "items": [
                 {"product_id": "prod_1", "variant_id": "var_1", "merchant_id": "merch_test", "quantity": 1}
             ],
+            "quote_id": "q_checkout_intent",
         },
     )
     assert res.status_code == 200
@@ -642,6 +657,7 @@ def test_create_checkout_intent_uses_verified_agent_user_ref(app, client, monkey
     padded = payload_b64 + "=" * (-len(payload_b64) % 4)
     token_payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8"))
     assert token_payload.get("agent_user_ref") == "https://agent.tools.example:user_123"
+    assert token_payload.get("quote_id") == "q_checkout_intent"
 
 
 def test_create_checkout_intent_rejects_agent_user_ref_mismatch(app, client):
@@ -663,6 +679,20 @@ def test_create_checkout_intent_rejects_agent_user_ref_mismatch(app, client):
         },
     )
     assert res.status_code == 403
+
+
+def test_create_checkout_intent_requires_quote_for_raw_items(client):
+    res = client.post(
+        "/agent/v1/checkout/intents",
+        headers={"X-API-Key": "test-agent-key"},
+        json={
+            "items": [
+                {"product_id": "prod_1", "variant_id": "var_1", "merchant_id": "merch_test", "quantity": 1}
+            ],
+        },
+    )
+    assert res.status_code == 400
+    assert res.json()["detail"]["error"] == "QUOTE_REQUIRED_BEFORE_PURCHASE"
 
 
 def test_save_from_checkout_redeem_saves_address_into_vault(client, monkeypatch):

@@ -234,6 +234,48 @@ async def test_create_new_order_allows_platform_checkout_fallback_only_when_expl
 
 
 @pytest.mark.asyncio
+async def test_create_new_order_blocks_platform_checkout_fallback_for_direct_quote_first_orders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.setenv("ORDER_PLATFORM_CHECKOUT_FALLBACK_ENABLED", "1")
+    events = _install_create_new_order_harness(monkeypatch, module)
+    req = _build_order_request()
+    req.metadata = {
+        "commerce_path": "pivota_direct_quote_first",
+        "validation_authority": "pivota_live_quote",
+        "execution_policy_version": "test",
+    }
+
+    async def fake_create_payment_with_failover(*args, **kwargs):
+        return False, None, "psp unavailable", "stripe"
+
+    async def fail_platform_checkout_fallback(**kwargs):
+        raise AssertionError("direct quote-first order must not call platform checkout fallback")
+
+    monkeypatch.setattr(module, "create_payment_with_failover", fake_create_payment_with_failover)
+    monkeypatch.setattr(
+        module,
+        "_get_platform_checkout_fallback_url_best_effort",
+        fail_platform_checkout_fallback,
+    )
+
+    response = await module.create_new_order(
+        req,
+        BackgroundTasks(),
+        current_user={},
+    )
+
+    assert response.psp == "stripe"
+    assert response.client_secret is None
+    assert response.payment_action is None
+    assert response.commerce_path == "pivota_direct_quote_first"
+    assert any(event_type == "fallback_pollution_attempt" for event_type, _ in events)
+    assert all(event_type != "payment_fallback_platform_checkout" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
 async def test_create_new_order_checkout_ui_requires_quote_id_even_when_global_quote_requirement_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

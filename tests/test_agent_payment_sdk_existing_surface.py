@@ -9,6 +9,26 @@ import httpx
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _shopify_store_policy_context(monkeypatch: pytest.MonkeyPatch):
+    import routes.agent_payment_sdk as payment_module
+
+    async def fake_get_primary_store(_merchant_id: str):
+        return {"platform": "shopify", "store_id": "store_test"}
+
+    monkeypatch.setattr(payment_module, "get_primary_store", fake_get_primary_store)
+
+
+def _live_quote_metadata() -> Dict[str, Any]:
+    return {
+        "pricing_quote": {
+            "quote_id": "q_payment_sdk",
+            "live_validation": {"status": "validated"},
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+    }
+
+
 def test_resolve_order_merchant_id_falls_back_to_unique_item_merchant() -> None:
     import routes.agent_payment_sdk as payment_module
 
@@ -85,6 +105,56 @@ def test_build_existing_order_payment_surface_rejects_awaiting_payment_when_redi
 
 
 @pytest.mark.asyncio
+async def test_agent_payment_non_shopify_direct_purchase_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_payment_sdk as payment_module
+    from fastapi import BackgroundTasks
+
+    class _Context:
+        agent_id = "agent_test"
+        session_id = "sess_test"
+
+        def can_access_merchant(self, merchant_id: Optional[str]) -> bool:
+            return merchant_id == "merch_test_123"
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "merchant_id": "merch_test_123",
+            "payment_status": "unpaid",
+            "total": 25.22,
+            "currency": "USD",
+            "metadata": _live_quote_metadata(),
+        }
+
+    async def fake_get_primary_store(_merchant_id: str):
+        return {"platform": "bigcommerce", "store_id": "store_big"}
+
+    async def fail_create_payment_with_failover(*args: Any, **kwargs: Any):
+        raise AssertionError("non-Shopify direct purchase must not create a PSP payment")
+
+    monkeypatch.setattr(payment_module, "get_order", fake_get_order)
+    monkeypatch.setattr(payment_module, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(payment_module, "create_payment_with_failover", fail_create_payment_with_failover)
+
+    with pytest.raises(payment_module.HTTPException) as exc_info:
+        await payment_module.create_payment(
+            payment_module.PaymentRequest(
+                order_id="ORD_BIGCOMMERCE",
+                payment_method=payment_module.PaymentMethod(type="dynamic"),
+            ),
+            BackgroundTasks(),
+            context=_Context(),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "UNSUPPORTED_COMMERCE_PATH"
+    assert exc_info.value.detail["commerce_path"] == "unsupported"
+    assert exc_info.value.detail["execution_policy"]["allows_psp_creation"] is False
+
+
+@pytest.mark.asyncio
 async def test_agent_payments_reuses_existing_order_payment_surface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -128,7 +198,7 @@ async def test_agent_payments_reuses_existing_order_payment_surface(
                     "merchant_id": "merch_test_123",
                 }
             ],
-            "metadata": {},
+            "metadata": _live_quote_metadata(),
         }
 
     async def fake_fetch_active_runtime_merchant_psp(*args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -239,7 +309,7 @@ async def test_agent_payments_refreshes_awaiting_stripe_surface_when_return_url_
                     "merchant_id": "merch_test_123",
                 }
             ],
-            "metadata": {},
+            "metadata": _live_quote_metadata(),
         }
 
     async def fake_fetch_active_runtime_merchant_psp(*args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -337,7 +407,7 @@ async def test_agent_payments_retries_transient_db_busy_after_psp_without_double
                 "city": "San Francisco",
                 "state": "CA",
             },
-            "metadata": {},
+            "metadata": _live_quote_metadata(),
         }
 
     async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:

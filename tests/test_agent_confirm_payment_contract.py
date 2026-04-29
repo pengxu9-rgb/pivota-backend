@@ -277,3 +277,82 @@ async def test_agent_confirm_payment_backend_owned_still_marks_paid(
     assert "fake_create_shopify_order" in queued_task_names
     assert "log_agent_request" in queued_task_names
     assert "emit_agent_webhook_event" in queued_task_names
+
+
+@pytest.mark.asyncio
+async def test_agent_confirm_payment_paypal_auth_first_authorizes_before_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api
+    import routes.order_routes as order_routes_module
+    import services.merchant_store_service as merchant_store_module
+
+    calls: list[tuple[str, Any]] = []
+
+    class _FakePayPalAdapter:
+        async def confirm_payment(self, payment_intent_id: str, payment_method_id: str | None = None):
+            calls.append(("paypal_authorize", payment_intent_id, payment_method_id))
+            return True, "requires_capture", None
+
+    async def fake_validate_request(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def fake_log_agent_request(**kwargs: Any) -> None:
+        return None
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any] | None:
+        return _order(
+            order_id,
+            psp_used="paypal",
+            payment_intent_id="PAYPAL_ORDER_AUTH",
+            client_secret="https://paypal.test/approve",
+            payment_status="awaiting_payment",
+            metadata={
+                "payment_flow": {
+                    "mode": "authorization_first",
+                    "psp": "paypal",
+                    "store_platform": "shopify",
+                    "capture_method": "manual",
+                }
+            },
+        )
+
+    async def fake_resolve_order_psp_adapter(order: Dict[str, Any]):
+        return "paypal", _FakePayPalAdapter()
+
+    async def fake_finalize(order_id: str, *, order: Dict[str, Any], source_event: str):
+        calls.append(("finalize", order_id, source_event))
+        return {
+            "status": "success",
+            "linked_merchant_order": {
+                "platform": "shopify",
+                "platform_order_id": "shopify_123",
+            },
+        }
+
+    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        return {"platform": "shopify", "api_key": "shp_key"}
+
+    monkeypatch.setattr(agent_api, "validate_request_compat", fake_validate_request)
+    monkeypatch.setattr(agent_api, "log_agent_request", fake_log_agent_request)
+    monkeypatch.setattr(order_routes_module, "get_order", fake_get_order)
+    monkeypatch.setattr(order_routes_module, "_resolve_order_psp_adapter", fake_resolve_order_psp_adapter)
+    monkeypatch.setattr(order_routes_module, "finalize_authorized_payment_order", fake_finalize)
+    monkeypatch.setattr(merchant_store_module, "get_primary_store", fake_get_primary_store)
+
+    body = await agent_api.agent_confirm_payment(
+        order_id="ORD_PAYPAL_AUTH_FIRST",
+        background_tasks=BackgroundTasks(),
+        context=_TestAgentContext(),
+    )
+
+    assert body["status"] == "success"
+    assert body["payment_status"] == "paid"
+    assert body["authorization_first"] is True
+    assert body["linked_merchant_order"]["platform_order_id"] == "shopify_123"
+    assert calls[0] == (
+        "paypal_authorize",
+        "PAYPAL_ORDER_AUTH",
+        "agent_confirm_payment:ORD_PAYPAL_AUTH_FIRST",
+    )
+    assert calls[1] == ("finalize", "ORD_PAYPAL_AUTH_FIRST", "agent_confirm_payment")
