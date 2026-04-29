@@ -174,6 +174,10 @@ class OrderResponse(BaseModel):
     # 元数据
     agent_session_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    commerce_path: Optional[str] = None
+    execution_policy: Optional[Dict[str, Any]] = None
+    legacy_or_fallback: Optional[bool] = None
+    validation_authority: Optional[str] = None
     
     class Config:
         json_encoders = {

@@ -78,6 +78,11 @@ async def preview_quote(
         # Settlement currency is determined by merchant/PSP contract and can be configured
         # via employee settlement rules; it may not be known at quote time.
         "settlement_currency": settlement_currency,
+        "availability_status": result.get("availability_status") or "available_confirmed",
+        "available_quantity": result.get("available_quantity"),
+        "is_final": bool(result.get("is_final", True)),
+        "source_updated_at": result.get("source_updated_at"),
+        "warnings": result.get("warnings") or [],
         "pricing": {
             "subtotal": parse_decimal_money(pricing.get("subtotal")),
             "discount_total": parse_decimal_money(pricing.get("discount_total")),

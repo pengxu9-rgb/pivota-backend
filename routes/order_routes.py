@@ -18,6 +18,7 @@ import json
 import re
 from contextlib import asynccontextmanager
 from sqlalchemy import and_, or_, select, text
+from config.feature_flags import is_feature_enabled
 
 from models.order import (
     CreateOrderRequest, OrderResponse, PaymentConfirmRequest, 
@@ -65,6 +66,12 @@ from services.quote_service import (
     normalize_items_for_fingerprint,
     normalize_shipping_for_fingerprint,
     parse_decimal_money,
+)
+from services.commerce_execution_policy import (
+    COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST,
+    SURFACE_LEGACY_ADMIN,
+    SURFACE_PUBLIC_AGENT_PURCHASE,
+    resolve_commerce_execution_policy,
 )
 from services.shopify_transactions_service import (
     extract_shopify_access_token,
@@ -131,6 +138,60 @@ def _platform_checkout_fallback_enabled() -> bool:
         "true",
         "yes",
         "on",
+    }
+
+
+def _order_commerce_path(metadata: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("commerce_path") or "").strip().lower()
+
+
+def _is_pivota_direct_quote_first_order(metadata: Optional[Dict[str, Any]]) -> bool:
+    return _order_commerce_path(metadata) == COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST
+
+
+def _order_allows_platform_checkout_fallback(metadata: Optional[Dict[str, Any]]) -> bool:
+    return _platform_checkout_fallback_enabled() and not _is_pivota_direct_quote_first_order(metadata)
+
+
+async def _log_fallback_pollution_attempt_best_effort(
+    *,
+    order_id: str,
+    merchant_id: str,
+    total: Decimal,
+    currency: str,
+    metadata: Optional[Dict[str, Any]],
+    reason: str,
+    source: str,
+) -> None:
+    if not _platform_checkout_fallback_enabled() or not _is_pivota_direct_quote_first_order(metadata):
+        return
+    try:
+        await log_order_event(
+            event_type="fallback_pollution_attempt",
+            order_id=order_id,
+            merchant_id=merchant_id,
+            total_amount=float(total),
+            currency=currency,
+            metadata={
+                "commerce_path": _order_commerce_path(metadata),
+                "validation_authority": (metadata or {}).get("validation_authority") if isinstance(metadata, dict) else None,
+                "execution_policy_version": (metadata or {}).get("execution_policy_version") if isinstance(metadata, dict) else None,
+                "reason": reason,
+                "source": source,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _order_live_quote_revalidation_enabled() -> bool:
+    return str(os.getenv("ORDER_CREATE_LIVE_QUOTE_REVALIDATION_ENABLED", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
     }
 
 
@@ -454,9 +515,89 @@ _PSP_SUCCEEDED_STATUSES = {
     "success",
     "settled",
     "captured",
-    "authorised",
-    "authorized",
 }
+
+_PSP_AUTHORIZED_UNCAPTURED_STATUSES = {
+    "requires_capture",
+    "authorized",
+    "authorised",
+}
+
+
+def _csv_env_contains(name: str, value: str) -> bool:
+    raw = os.getenv(name, "") or ""
+    values = {part.strip() for part in raw.split(",") if part.strip()}
+    return "*" in values or value in values
+
+
+def _authorization_first_feature_enabled_for_merchant(merchant_id: str) -> bool:
+    if not is_feature_enabled("enable_authorization_first_orders"):
+        return False
+    allowlist = os.getenv("FF_AUTH_FIRST_MERCHANT_IDS", "") or ""
+    if allowlist.strip():
+        return _csv_env_contains("FF_AUTH_FIRST_MERCHANT_IDS", str(merchant_id or "").strip())
+    return True
+
+
+def _order_auth_first_flow_metadata(
+    *,
+    psp: str,
+    store_platform: str,
+) -> Dict[str, Any]:
+    return {
+        "mode": "authorization_first",
+        "psp": str(psp or "").strip().lower(),
+        "store_platform": str(store_platform or "").strip().lower(),
+        "capture_method": "manual",
+        "capture_after": "merchant_order_writeback",
+        "inventory_strategy": "merchant_platform_order_write_before_capture",
+        "void_on_merchant_order_failure": True,
+        "enabled_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def _should_use_authorization_first_order_flow(
+    *,
+    merchant_id: str,
+    psp_type: str,
+    psp_mode: Optional[str],
+    store_info: Optional[Dict[str, Any]],
+) -> bool:
+    if not _authorization_first_feature_enabled_for_merchant(merchant_id):
+        return False
+    normalized_psp = str(psp_type or "").strip().lower()
+    if normalized_psp == "stripe":
+        if not is_feature_enabled("enable_stripe_manual_capture"):
+            return False
+    elif normalized_psp == "paypal":
+        if not is_feature_enabled("enable_paypal_authorization_first"):
+            return False
+    else:
+        return False
+    platform = str((store_info or {}).get("platform") or "").strip().lower()
+    return platform == "shopify"
+
+
+def order_uses_authorization_first_payment(order: Optional[Dict[str, Any]]) -> bool:
+    metadata = _coerce_order_metadata(order or {})
+    payment_flow = metadata.get("payment_flow") if isinstance(metadata.get("payment_flow"), dict) else {}
+    return (
+        str((payment_flow or {}).get("mode") or "").strip().lower() == "authorization_first"
+        and str((payment_flow or {}).get("psp") or (order or {}).get("psp_used") or "").strip().lower()
+        in {"stripe", "paypal"}
+        and str((payment_flow or {}).get("store_platform") or "").strip().lower() == "shopify"
+    )
+
+
+def _order_payment_allows_merchant_order_write(order: Dict[str, Any], *, platform: str) -> bool:
+    payment_status = str((order or {}).get("payment_status") or "").strip().lower()
+    if payment_status == "paid":
+        return True
+    return (
+        payment_status in {"authorized", "requires_capture"}
+        and str(platform or "").strip().lower() == "shopify"
+        and order_uses_authorization_first_payment(order)
+    )
 
 
 def _normalize_psp_status_result(result: Any) -> Tuple[bool, str, Optional[str]]:
@@ -559,6 +700,284 @@ async def verify_order_payment_succeeded(order: Dict[str, Any]) -> Tuple[bool, s
     if normalized_status not in _PSP_SUCCEEDED_STATUSES:
         return False, normalized_status, None
     return True, normalized_status, None
+
+
+async def verify_order_payment_succeeded_or_authorized(order: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
+    """
+    Verify payment state for authorization-first flows.
+
+    Captured payments are still accepted as succeeded. Uncaptured authorizations
+    are accepted only for orders explicitly marked with `metadata.payment_flow`
+    authorization-first, so normal capture-first flows cannot use an authorization
+    as a paid transition.
+    """
+    payment_reference = str(order.get("payment_intent_id") or "").strip()
+    if not payment_reference:
+        return False, "missing_payment_reference", "Order has no PSP payment reference"
+
+    psp_type, psp_adapter = await _resolve_order_psp_adapter(order)
+    fail_closed = _psp_payment_verification_fail_closed()
+    accepted_statuses = set(_PSP_SUCCEEDED_STATUSES)
+    if order_uses_authorization_first_payment(order):
+        accepted_statuses.update(_PSP_AUTHORIZED_UNCAPTURED_STATUSES)
+
+    status_details = await _get_order_payment_status_details(psp_adapter, payment_reference)
+    if status_details is not None:
+        ok, details, error = status_details
+        normalized_status = str(details.get("status") or "").strip().lower() or "unknown"
+        if not ok:
+            return False, normalized_status, error or f"{psp_type} status lookup failed"
+        if normalized_status not in accepted_statuses:
+            return False, normalized_status, None
+
+        expected_amount = _normalize_psp_amount(order.get("total"))
+        observed_amount = _normalize_psp_amount(details.get("amount"))
+        expected_currency = str(order.get("currency") or "").strip().upper()
+        observed_currency = str(details.get("currency") or "").strip().upper()
+        if fail_closed and expected_amount is None:
+            return False, normalized_status, "Order total is unavailable for fail-closed PSP verification"
+        if expected_amount is not None and observed_amount is None:
+            return False, normalized_status, "PSP payment amount is unavailable"
+        if expected_amount is not None and observed_amount != expected_amount:
+            return (
+                False,
+                normalized_status,
+                f"PSP payment amount mismatch: expected {expected_amount} {expected_currency or 'UNKNOWN'}, got {observed_amount} {observed_currency or 'UNKNOWN'}",
+            )
+        if expected_currency and observed_currency and observed_currency != expected_currency:
+            return False, normalized_status, f"PSP payment currency mismatch: expected {expected_currency}, got {observed_currency}"
+        if expected_currency and not observed_currency:
+            return False, normalized_status, "PSP payment currency is unavailable"
+        if fail_closed and not expected_currency:
+            return False, normalized_status, "Order currency is unavailable for fail-closed PSP verification"
+        return True, normalized_status, None
+
+    if fail_closed:
+        return (
+            False,
+            "details_unavailable",
+            f"{psp_type} does not provide PSP amount/currency details required by fail-closed verification",
+        )
+
+    ok, normalized_status, error = _normalize_psp_status_result(await psp_adapter.get_payment_status(payment_reference))
+    if not ok:
+        return False, normalized_status, error or f"{psp_type} status lookup failed"
+    if normalized_status not in accepted_statuses:
+        return False, normalized_status, None
+    return True, normalized_status, None
+
+
+async def finalize_authorized_payment_order(
+    order_id: str,
+    *,
+    order: Optional[Dict[str, Any]] = None,
+    source_event: str = "authorization_first_finalize",
+) -> Dict[str, Any]:
+    """
+    For authorization-first orders, write the merchant/platform order before PSP capture.
+
+    The only currently enabled direct path is Stripe PaymentIntent manual capture
+    with Shopify order writeback. Other PSP/platform pairs remain capability-gated.
+    """
+    current_order = await get_order(order_id)
+    if not current_order:
+        current_order = order
+    if not current_order:
+        return {"status": "order_missing", "order_id": order_id, "captured": False}
+    if str(current_order.get("payment_status") or "").strip().lower() == "paid":
+        return {"status": "already_paid", "order_id": order_id, "captured": True}
+    if not order_uses_authorization_first_payment(current_order):
+        return {"status": "not_authorization_first", "order_id": order_id, "captured": False}
+
+    verified, psp_status, psp_error = await verify_order_payment_succeeded_or_authorized(current_order)
+    if not verified:
+        return {
+            "status": "payment_not_authorized",
+            "order_id": order_id,
+            "psp_status": psp_status,
+            **({"error": psp_error} if psp_error else {}),
+            "captured": False,
+        }
+
+    if psp_status in _PSP_SUCCEEDED_STATUSES:
+        await mark_order_paid(order_id)
+        latest_paid_order = await get_order(order_id) or current_order
+        linked_order = _get_linked_platform_order(latest_paid_order)
+        if not linked_order:
+            await sync_order_to_connected_store(order_id)
+            latest_paid_order = await get_order(order_id) or latest_paid_order
+            linked_order = _get_linked_platform_order(latest_paid_order)
+        return {
+            "status": "already_captured",
+            "order_id": order_id,
+            "captured": True,
+            "psp_status": psp_status,
+            "linked_merchant_order": linked_order,
+        }
+
+    metadata = _coerce_order_metadata(current_order)
+    payment_flow = metadata.get("payment_flow") if isinstance(metadata.get("payment_flow"), dict) else {}
+    payment_flow = {
+        **(payment_flow or {}),
+        "authorization_status": "authorized",
+        "authorized_at": datetime.utcnow().isoformat() + "Z",
+        "last_finalize_source": source_event,
+    }
+    metadata["payment_flow"] = payment_flow
+    await update_order_row(
+        order_id,
+        {
+            "status": "authorized",
+            "payment_status": "authorized",
+            "metadata": metadata,
+        },
+    )
+    await log_order_event(
+        event_type="payment_authorized",
+        order_id=order_id,
+        merchant_id=str(current_order.get("merchant_id") or ""),
+        total_amount=float(current_order.get("total") or 0),
+        currency=str(current_order.get("currency") or "USD"),
+        metadata={
+            "source": source_event,
+            "psp_status": psp_status,
+            "payment_intent_id": current_order.get("payment_intent_id"),
+            "capture_after": "merchant_order_writeback",
+        },
+    )
+
+    latest_order = await get_order(order_id) or current_order
+    linked_order = _get_linked_platform_order(latest_order)
+    if not linked_order:
+        merchant_ok = await sync_order_to_connected_store(order_id)
+        latest_order = await get_order(order_id) or latest_order
+        linked_order = _get_linked_platform_order(latest_order)
+        if not merchant_ok or not linked_order:
+            psp_type, psp_adapter = await _resolve_order_psp_adapter(latest_order)
+            cancel_ok, cancel_ref, cancel_error = await psp_adapter.cancel_payment_authorization(
+                str(latest_order.get("payment_intent_id") or ""),
+                reason="requested_by_customer",
+                idempotency_key=f"auth_first_void:{order_id}",
+            )
+            recovery_fields = {
+                "status": "authorization_voided" if cancel_ok else "authorization_void_failed",
+                "refund_required": False,
+                "auto_void_attempted": True,
+                "auto_void_succeeded": bool(cancel_ok),
+                "void_reference": cancel_ref,
+                "void_error": cancel_error,
+                "operator_action": "refresh_quote_or_retry_order" if cancel_ok else "manual_psp_void_or_refund_review",
+                "reason": "merchant_order_writeback_failed_before_capture",
+            }
+            await _update_payment_recovery_metadata_best_effort(
+                order_id=order_id,
+                order=latest_order,
+                fields=recovery_fields,
+            )
+            await update_order_row(
+                order_id,
+                {
+                    "status": "merchant_order_failed",
+                    "payment_status": "authorization_voided" if cancel_ok else "authorization_void_failed",
+                },
+            )
+            await log_order_event(
+                event_type="payment_authorization_voided" if cancel_ok else "payment_authorization_void_failed",
+                order_id=order_id,
+                merchant_id=str(latest_order.get("merchant_id") or ""),
+                total_amount=float(latest_order.get("total") or 0),
+                currency=str(latest_order.get("currency") or "USD"),
+                metadata={
+                    "source": source_event,
+                    "psp": psp_type,
+                    "void_reference": cancel_ref,
+                    "error": cancel_error,
+                },
+            )
+            return {
+                "status": "merchant_order_failed_authorization_voided" if cancel_ok else "merchant_order_failed_authorization_void_failed",
+                "order_id": order_id,
+                "captured": False,
+                "voided": bool(cancel_ok),
+                "linked_merchant_order": linked_order,
+                **({"error": cancel_error} if cancel_error else {}),
+            }
+
+    psp_type, psp_adapter = await _resolve_order_psp_adapter(latest_order)
+    capture_ok, capture_ref, capture_error = await psp_adapter.capture_payment(
+        str(latest_order.get("payment_intent_id") or ""),
+        amount=None,
+        idempotency_key=f"auth_first_capture:{order_id}",
+    )
+    if not capture_ok:
+        await _update_payment_recovery_metadata_best_effort(
+            order_id=order_id,
+            order=latest_order,
+            fields={
+                "status": "payment_capture_failed",
+                "refund_required": False,
+                "capture_required": True,
+                "operator_action": "retry_capture_or_cancel_merchant_order",
+                "capture_error": capture_error,
+                "linked_merchant_order": linked_order,
+            },
+        )
+        await update_order_row(order_id, {"status": "payment_capture_failed", "payment_status": "capture_failed"})
+        await log_order_event(
+            event_type="payment_capture_failed",
+            order_id=order_id,
+            merchant_id=str(latest_order.get("merchant_id") or ""),
+            total_amount=float(latest_order.get("total") or 0),
+            currency=str(latest_order.get("currency") or "USD"),
+            metadata={
+                "source": source_event,
+                "psp": psp_type,
+                "capture_reference": capture_ref,
+                "error": capture_error,
+                "linked_merchant_order": linked_order,
+            },
+        )
+        return {
+            "status": "payment_capture_failed",
+            "order_id": order_id,
+            "captured": False,
+            "linked_merchant_order": linked_order,
+            **({"error": capture_error} if capture_error else {}),
+        }
+
+    await mark_order_paid(order_id)
+    await _update_payment_recovery_metadata_best_effort(
+        order_id=order_id,
+        order=latest_order,
+        fields={
+            "status": "captured_after_merchant_order",
+            "refund_required": False,
+            "capture_required": False,
+            "operator_action": "none",
+            "capture_reference": capture_ref,
+            "linked_merchant_order": linked_order,
+        },
+    )
+    await log_order_event(
+        event_type="payment_captured_after_merchant_order",
+        order_id=order_id,
+        merchant_id=str(latest_order.get("merchant_id") or ""),
+        total_amount=float(latest_order.get("total") or 0),
+        currency=str(latest_order.get("currency") or "USD"),
+        metadata={
+            "source": source_event,
+            "psp": psp_type,
+            "capture_reference": capture_ref,
+            "linked_merchant_order": linked_order,
+        },
+    )
+    return {
+        "status": "success",
+        "order_id": order_id,
+        "captured": True,
+        "capture_reference": capture_ref,
+        "linked_merchant_order": linked_order,
+    }
 
 
 # ============================================================================
@@ -885,6 +1304,7 @@ def _merge_linked_platform_order_metadata(
 ) -> Dict[str, Any]:
     metadata = _coerce_order_metadata(order)
     metadata["merchant_order"] = {
+        "status": "merchant_order_created",
         "platform": platform,
         "platform_order_id": platform_order_id,
         "platform_order_name": platform_order_name,
@@ -1251,7 +1671,7 @@ async def check_inventory_availability(
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     检查 Shopify 库存是否充足
-    
+
     返回: (是否有库存, 库存详情)
     """
     try:
@@ -2392,6 +2812,290 @@ async def _update_order_shopify_sync_metadata_best_effort(
         pass
 
 
+async def _mark_merchant_order_sync_failed_best_effort(
+    *,
+    order_id: str,
+    order: Dict[str, Any],
+    platform: Optional[str],
+    error: str,
+    reason: str,
+    retryable: bool = True,
+) -> None:
+    latest = await get_order(order_id)
+    base_order = latest if isinstance(latest, dict) else order
+    if not isinstance(base_order, dict):
+        return
+    if str(base_order.get("payment_status") or "").strip().lower() != "paid":
+        return
+    if _get_linked_platform_order(base_order):
+        return
+
+    metadata = _coerce_dict(base_order.get("metadata"))
+    merchant_order = metadata.get("merchant_order") if isinstance(metadata.get("merchant_order"), dict) else {}
+    merchant_order = dict(merchant_order or {})
+    try:
+        retry_count = int(merchant_order.get("retry_count") or 0) + 1
+    except Exception:
+        retry_count = 1
+    merchant_order.update(
+        {
+            "status": "paid_merchant_order_failed",
+            "requires_action": "requires_refund_or_retry",
+            "platform": str(platform or "unknown").strip().lower() or "unknown",
+            "last_error": str(error or "")[:1000],
+            "last_failure_reason": reason,
+            "last_attempt_at": datetime.utcnow().isoformat() + "Z",
+            "retryable": bool(retryable),
+            "retry_count": retry_count,
+        }
+    )
+    metadata["merchant_order"] = merchant_order
+    payment_recovery = metadata.get("payment_recovery") if isinstance(metadata.get("payment_recovery"), dict) else {}
+    payment_recovery = dict(payment_recovery or {})
+    payment_recovery.update(
+        {
+            "status": "requires_operator_action",
+            "refund_required": True,
+            "auto_void_attempted": False,
+            "auto_refund_attempted": False,
+            "operator_action": "retry_merchant_order_or_issue_refund",
+            "reason": "payment_captured_or_unknown_before_merchant_order_write_failed",
+            "last_updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+    )
+    metadata["payment_recovery"] = payment_recovery
+
+    try:
+        await update_order_row(order_id, {"metadata": metadata})
+    except Exception:
+        pass
+    try:
+        await log_order_event(
+            event_type="merchant_order_sync_failed",
+            order_id=order_id,
+            merchant_id=str(base_order.get("merchant_id") or ""),
+            total_amount=float(base_order.get("total") or 0),
+            currency=str(base_order.get("currency") or "USD"),
+            metadata={
+                "platform": merchant_order.get("platform"),
+                "status": merchant_order.get("status"),
+                "requires_action": merchant_order.get("requires_action"),
+                "retryable": merchant_order.get("retryable"),
+                "retry_count": merchant_order.get("retry_count"),
+                "reason": reason,
+                "error": str(error or "")[:1000],
+            },
+        )
+    except Exception:
+        pass
+
+
+def _row_to_plain_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except Exception:
+            pass
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _json_safe_order_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat() + ("Z" if value.tzinfo is None else "")
+    return value
+
+
+def _merchant_order_failure_summary(order: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _coerce_order_metadata(order)
+    merchant_order = metadata.get("merchant_order") if isinstance(metadata.get("merchant_order"), dict) else {}
+    payment_recovery = metadata.get("payment_recovery") if isinstance(metadata.get("payment_recovery"), dict) else {}
+    linked_order = _get_linked_platform_order(order)
+    return {
+        "order_id": order.get("order_id"),
+        "merchant_id": order.get("merchant_id"),
+        "order_status": order.get("status"),
+        "payment_status": order.get("payment_status"),
+        "fulfillment_status": order.get("fulfillment_status"),
+        "total": _json_safe_order_value(order.get("total")),
+        "currency": order.get("currency"),
+        "payment_intent_id": order.get("payment_intent_id"),
+        "psp_used": order.get("psp_used"),
+        "created_at": _json_safe_order_value(order.get("created_at")),
+        "paid_at": _json_safe_order_value(order.get("paid_at")),
+        "store_id": order.get("store_id"),
+        "shopify_order_id": order.get("shopify_order_id"),
+        "linked_merchant_order": linked_order,
+        "merchant_order": dict(merchant_order or {}),
+        "payment_recovery": dict(payment_recovery or {}),
+        "operator_action": (
+            (payment_recovery or {}).get("operator_action")
+            or (merchant_order or {}).get("requires_action")
+            or "retry_merchant_order_or_issue_refund"
+        ),
+    }
+
+
+async def _fetch_paid_orders_missing_merchant_order(
+    *,
+    merchant_id: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    conditions = [
+        or_(orders_table.c.is_deleted.is_(False), orders_table.c.is_deleted.is_(None)),
+        orders_table.c.payment_status == "paid",
+        or_(orders_table.c.shopify_order_id.is_(None), orders_table.c.shopify_order_id == ""),
+    ]
+    if merchant_id:
+        conditions.append(orders_table.c.merchant_id == merchant_id)
+
+    try:
+        base_query = select(orders_table)
+    except Exception:
+        base_query = select([orders_table])
+
+    query = (
+        base_query.where(and_(*conditions))
+        .order_by(orders_table.c.created_at.desc())
+        .limit(max(1, min(int(limit), 1000)))
+    )
+    rows = await database.fetch_all(query)
+    return [_row_to_plain_dict(row) for row in (rows or [])]
+
+
+async def _log_merchant_order_retry_event_best_effort(
+    *,
+    event_type: str,
+    order: Dict[str, Any],
+    order_id: str,
+    metadata: Dict[str, Any],
+) -> None:
+    try:
+        await log_order_event(
+            event_type=event_type,
+            order_id=order_id,
+            merchant_id=str((order or {}).get("merchant_id") or ""),
+            total_amount=float((order or {}).get("total") or 0),
+            currency=str((order or {}).get("currency") or "USD"),
+            metadata=metadata,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to log %s for merchant order retry: order_id=%s error=%s",
+            event_type,
+            order_id,
+            exc,
+        )
+
+
+async def _update_payment_recovery_metadata_best_effort(
+    *,
+    order_id: str,
+    order: Dict[str, Any],
+    fields: Dict[str, Any],
+) -> Dict[str, Any]:
+    latest = await get_order(order_id)
+    base_order = latest if isinstance(latest, dict) else order
+    metadata = _coerce_order_metadata(base_order)
+    payment_recovery = metadata.get("payment_recovery") if isinstance(metadata.get("payment_recovery"), dict) else {}
+    payment_recovery = dict(payment_recovery or {})
+    payment_recovery.update(fields or {})
+    payment_recovery["last_updated_at"] = datetime.utcnow().isoformat() + "Z"
+    metadata["payment_recovery"] = payment_recovery
+    try:
+        await update_order_row(order_id, {"metadata": metadata})
+    except Exception as exc:
+        logger.warning(
+            "Failed to update payment recovery metadata: order_id=%s error=%s",
+            order_id,
+            exc,
+        )
+    return payment_recovery
+
+
+def _remaining_refundable_amount(order: Dict[str, Any]) -> Decimal:
+    try:
+        total = Decimal(str((order or {}).get("total") or "0"))
+    except Exception:
+        total = Decimal("0")
+    try:
+        refunded = Decimal(str((order or {}).get("total_refunded") or "0"))
+    except Exception:
+        refunded = Decimal("0")
+    remaining = (total - refunded).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return max(Decimal("0.00"), remaining)
+
+
+async def _count_sql_best_effort(sql: str, values: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        row = await database.fetch_one(text(sql), values)
+        count_value = 0
+        if row is not None:
+            try:
+                count_value = row["count"]
+            except Exception:
+                count_value = getattr(row, "count", 0)
+        return {"count": int(count_value or 0), "available": True}
+    except Exception as exc:
+        return {"count": None, "available": False, "error": str(exc)[:300]}
+
+
+async def _count_order_events_best_effort(
+    *,
+    event_type: str,
+    merchant_id: Optional[str],
+) -> Dict[str, Any]:
+    sql = "SELECT COUNT(*) AS count FROM order_events WHERE event_type = :event_type"
+    values: Dict[str, Any] = {"event_type": event_type}
+    if merchant_id:
+        sql += " AND merchant_id = :merchant_id"
+        values["merchant_id"] = merchant_id
+    return await _count_sql_best_effort(sql, values)
+
+
+async def _count_paid_merchant_order_failed_best_effort(
+    *,
+    merchant_id: Optional[str],
+) -> Dict[str, Any]:
+    if IS_POSTGRES:
+        sql = """
+            SELECT COUNT(*) AS count
+            FROM orders
+            WHERE COALESCE(is_deleted, false) = false
+              AND payment_status = 'paid'
+              AND COALESCE(shopify_order_id, '') = ''
+              AND metadata -> 'merchant_order' ->> 'status' = 'paid_merchant_order_failed'
+        """
+        values: Dict[str, Any] = {}
+        if merchant_id:
+            sql += " AND merchant_id = :merchant_id"
+            values["merchant_id"] = merchant_id
+        result = await _count_sql_best_effort(sql, values)
+        if result.get("available"):
+            return result
+
+    try:
+        rows = await _fetch_paid_orders_missing_merchant_order(merchant_id=merchant_id, limit=1000)
+    except Exception as exc:
+        return {"count": None, "available": False, "error": str(exc)[:300]}
+    count = 0
+    for order in rows:
+        metadata = _coerce_order_metadata(order)
+        merchant_order = metadata.get("merchant_order") if isinstance(metadata.get("merchant_order"), dict) else {}
+        if str((merchant_order or {}).get("status") or "").strip().lower() == "paid_merchant_order_failed":
+            count += 1
+    return {"count": count, "available": True, "sampled": len(rows) >= 1000}
+
+
 # ============================================================================
 # 订单创建（Agent 调用）
 # ============================================================================
@@ -2404,14 +3108,14 @@ async def create_new_order(
 ):
     """
     **创建新订单（Agent → Pivota）**
-    
+
     流程：
     1. 验证商户存在且已连接 PSP
     2. 计算订单总价
     3. 创建订单记录
     4. 创建 Stripe Payment Intent
     5. 返回订单详情和支付密钥
-    
+
     防御性设计：
     - 订单创建后立即记录事件日志
     - 金额使用 Decimal 精确计算
@@ -2467,6 +3171,7 @@ async def create_new_order(
         pricing_quote_meta: Optional[Dict[str, Any]] = None
         if order_request.quote_id:
             quote_service = QuoteService()
+            live_validation_meta: Optional[Dict[str, Any]] = None
             try:
                 quote = await quote_service.load_active_quote_or_raise(
                     quote_id=order_request.quote_id
@@ -2564,6 +3269,12 @@ async def create_new_order(
                         details=drift_details,
                     )
 
+                if _order_live_quote_revalidation_enabled():
+                    live_validation_meta = await quote_service.validate_quote_snapshot_live(
+                        quote,
+                        customer_email=order_request.customer_email,
+                    )
+
                 snap = quote.snapshot_json or {}
                 pricing = (snap.get("pricing") or {}) if isinstance(snap, dict) else {}
                 quote_currency = None
@@ -2646,6 +3357,8 @@ async def create_new_order(
                     "savings_presentation": snap.get("savings_presentation") or {},
                     "line_items": snap.get("line_items") or [],
                 }
+                if live_validation_meta:
+                    pricing_quote_meta["live_validation"] = live_validation_meta
                 if (
                     _shopify_discount_reconciliation_mode() == "fail_closed"
                     and _pricing_quote_has_unverified_shipping(pricing_quote_meta)
@@ -2766,6 +3479,8 @@ async def create_new_order(
             )
         
         logger.info(f"✅ PSP determined: {psp_type} (ID: {psp_id_value})")
+
+        requested_psp_mode = "stripe_checkout" if (order_request.preferred_psp or "").lower() == "stripe_checkout" else None
         
         # 合并订单元数据并记录促销信息（如果有）
         order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
@@ -2819,12 +3534,51 @@ async def create_new_order(
         # Bind order to the current store connection (if any) so downstream Shopify sync
         # does not accidentally use a different store after a merchant connects another store.
         store_id_value: Optional[str] = None
+        primary_store: Optional[Dict[str, Any]] = None
         try:
             primary_store = await get_primary_store(order_request.merchant_id)
             if primary_store and primary_store.get("store_id"):
                 store_id_value = str(primary_store.get("store_id"))
         except Exception:
             store_id_value = None
+
+        store_platform_for_policy = str((primary_store or {}).get("platform") or "").strip().lower() or None
+        if not order_metadata.get("commerce_path"):
+            legacy_policy = resolve_commerce_execution_policy(
+                platform=store_platform_for_policy,
+                surface=SURFACE_LEGACY_ADMIN,
+            )
+            order_metadata.setdefault("commerce_path", legacy_policy.commerce_path)
+            order_metadata.setdefault("execution_policy", legacy_policy.as_dict())
+            order_metadata.setdefault("execution_policy_version", legacy_policy.execution_policy_version)
+            order_metadata.setdefault("validation_authority", legacy_policy.validation_authority)
+            order_metadata.setdefault("legacy_or_fallback", legacy_policy.legacy_or_fallback)
+        elif not isinstance(order_metadata.get("execution_policy"), dict):
+            policy_surface = (
+                SURFACE_LEGACY_ADMIN
+                if order_metadata.get("legacy_or_fallback")
+                else SURFACE_PUBLIC_AGENT_PURCHASE
+            )
+            execution_policy = resolve_commerce_execution_policy(
+                platform=store_platform_for_policy,
+                surface=policy_surface,
+            )
+            order_metadata.setdefault("execution_policy", execution_policy.as_dict())
+            order_metadata.setdefault("execution_policy_version", execution_policy.execution_policy_version)
+            order_metadata.setdefault("validation_authority", execution_policy.validation_authority)
+            order_metadata.setdefault("legacy_or_fallback", execution_policy.legacy_or_fallback)
+
+        if _should_use_authorization_first_order_flow(
+            merchant_id=order_request.merchant_id,
+            psp_type=psp_type,
+            psp_mode=requested_psp_mode,
+            store_info=primary_store,
+        ):
+            store_platform = str((primary_store or {}).get("platform") or "").strip().lower()
+            order_metadata["payment_flow"] = _order_auth_first_flow_metadata(
+                psp=psp_type,
+                store_platform=store_platform,
+            )
 
         order_metadata["amounts_source"] = "quote_snapshot" if pricing_quote_meta else (
             "legacy_promotions" if discount_total > 0 else "legacy_incomplete"
@@ -3005,11 +3759,28 @@ async def create_new_order(
             # Agent / 对话场景下，如果前端传了 preferred_psp = "stripe_checkout"，
             # 则通过 metadata.psp_mode 告诉 Stripe 适配器走 Checkout Session 流程，
             # 但 PSP provider 仍然是 "stripe"（由 routing 决定）。
-            psp_mode = None
-            if (order_request.preferred_psp or "").lower() == "stripe_checkout":
-                psp_mode = "stripe_checkout"
+            psp_mode = requested_psp_mode
             enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
             payment_return_url = _build_order_payment_return_url(order_id, order_metadata)
+            auth_first_payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
+            auth_first_psp = str((auth_first_payment_flow or {}).get("psp") or "").strip().lower()
+            auth_first_manual_capture = (
+                str((auth_first_payment_flow or {}).get("mode") or "").strip().lower() == "authorization_first"
+                and auth_first_psp in {"stripe", "paypal"}
+            )
+            if auth_first_manual_capture:
+                preferred_psps = [auth_first_psp]
+            auth_first_payment_metadata = {}
+            if auth_first_manual_capture:
+                auth_first_payment_metadata = {
+                    "payment_flow": "authorization_first",
+                    "capture_method": "manual",
+                    "payment_capture_method": "manual",
+                }
+                if auth_first_psp == "stripe":
+                    auth_first_payment_metadata["stripe_capture_method"] = "manual"
+                elif auth_first_psp == "paypal":
+                    auth_first_payment_metadata["paypal_intent"] = "AUTHORIZE"
             success, payment_intent, error, psp_used = await create_payment_with_failover(
                 merchant_id=order_request.merchant_id,
                 amount=total,
@@ -3042,10 +3813,11 @@ async def create_new_order(
                         else {}
                     ),
                     **({"psp_mode": psp_mode} if psp_mode else {}),
+                    **auth_first_payment_metadata,
                     **({"return_url": payment_return_url} if payment_return_url else {}),
                 },
                 preferred_psps=preferred_psps,
-                restrict_to_preferred_psps=bool(explicit_preferred_provider),
+                restrict_to_preferred_psps=bool(explicit_preferred_provider or auth_first_manual_capture),
                 canonical_psp_required=True,
                 enforce_live_readiness=enforce_live_readiness,
             )
@@ -3110,7 +3882,7 @@ async def create_new_order(
                 )
             else:
                 logger.error(f"Payment intent creation failed via MultiPSP: {error}")
-                if _platform_checkout_fallback_enabled():
+                if _order_allows_platform_checkout_fallback(order_metadata):
                     fallback_checkout_url = None
                     try:
                         if isinstance(pricing_quote_meta, dict):
@@ -3146,6 +3918,16 @@ async def create_new_order(
                             currency=order_request.currency,
                             metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                         )
+                elif _platform_checkout_fallback_enabled():
+                    await _log_fallback_pollution_attempt_best_effort(
+                        order_id=order_id,
+                        merchant_id=order_request.merchant_id,
+                        total=total,
+                        currency=order_request.currency,
+                        metadata=order_metadata,
+                        reason="psp_unavailable",
+                        source="create_new_order.payment_failure",
+                    )
                 else:
                     logger.warning(
                         "[OrderRoutes] platform checkout fallback disabled; keeping PSP-first failure visible for order %s",
@@ -3162,7 +3944,7 @@ async def create_new_order(
                 )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
-            if _platform_checkout_fallback_enabled():
+            if _order_allows_platform_checkout_fallback(order_metadata):
                 fallback_checkout_url = None
                 try:
                     if isinstance(pricing_quote_meta, dict):
@@ -3202,6 +3984,16 @@ async def create_new_order(
                         currency=order_request.currency,
                         metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                     )
+            elif _platform_checkout_fallback_enabled():
+                await _log_fallback_pollution_attempt_best_effort(
+                    order_id=order_id,
+                    merchant_id=order_request.merchant_id,
+                    total=total,
+                    currency=order_request.currency,
+                    metadata=order_metadata,
+                    reason="psp_error",
+                    source="create_new_order.payment_exception",
+                )
             else:
                 logger.warning(
                     "[OrderRoutes] platform checkout fallback disabled after PSP error; keeping failure visible for order %s",
@@ -3218,7 +4010,7 @@ async def create_new_order(
             )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
-            if _platform_checkout_fallback_enabled():
+            if _order_allows_platform_checkout_fallback(order_metadata):
                 fallback_checkout_url = None
                 try:
                     if isinstance(pricing_quote_meta, dict):
@@ -3258,6 +4050,16 @@ async def create_new_order(
                         currency=order_request.currency,
                         metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                     )
+            elif _platform_checkout_fallback_enabled():
+                await _log_fallback_pollution_attempt_best_effort(
+                    order_id=order_id,
+                    merchant_id=order_request.merchant_id,
+                    total=total,
+                    currency=order_request.currency,
+                    metadata=order_metadata,
+                    reason="psp_error",
+                    source="create_new_order.payment_exception_secondary",
+                )
             else:
                 logger.warning(
                     "[OrderRoutes] platform checkout fallback disabled after PSP error; keeping failure visible for order %s",
@@ -3289,10 +4091,23 @@ async def create_new_order(
             payment_status="awaiting_payment" if payment_intent_id else "pending",
             payment_intent_id=payment_intent_id,
             client_secret=client_secret,
-             psp=psp_type,
-             payment_action=payment_action or None,
+            psp=psp_type,
+            payment_action=payment_action or None,
             created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
+            updated_at=datetime.utcnow(),
+            metadata=order_metadata,
+            commerce_path=order_metadata.get("commerce_path"),
+            execution_policy=(
+                order_metadata.get("execution_policy")
+                if isinstance(order_metadata.get("execution_policy"), dict)
+                else None
+            ),
+            legacy_or_fallback=(
+                bool(order_metadata.get("legacy_or_fallback"))
+                if "legacy_or_fallback" in order_metadata
+                else None
+            ),
+            validation_authority=order_metadata.get("validation_authority"),
         )
     except DatabaseUnavailableError:
         raise database_unavailable_http_exception()
@@ -3348,6 +4163,36 @@ async def confirm_payment(
         
         if not success:
             raise HTTPException(status_code=400, detail=f"Payment confirmation failed: {error}")
+
+        normalized_confirm_status = str(status or "").strip().lower()
+        if (
+            normalized_confirm_status in _PSP_AUTHORIZED_UNCAPTURED_STATUSES
+            and order_uses_authorization_first_payment(order)
+        ):
+            auth_result = await finalize_authorized_payment_order(
+                payment_request.order_id,
+                order=order,
+                source_event="admin_confirm_payment",
+            )
+            if auth_result.get("status") == "success":
+                return {
+                    "status": "success",
+                    "message": "Payment authorized, merchant order created, and payment captured",
+                    "order_id": payment_request.order_id,
+                    "payment_intent_id": order["payment_intent_id"],
+                    "psp_type": psp_type,
+                    "authorization_first": True,
+                    "linked_merchant_order": auth_result.get("linked_merchant_order"),
+                }
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "AUTHORIZATION_FIRST_FINALIZATION_FAILED",
+                    "message": "Payment was authorized but merchant-order writeback or capture did not complete.",
+                    "order_id": payment_request.order_id,
+                    "result": auth_result,
+                },
+            )
         
         if status == "succeeded":
             # 标记订单已支付
@@ -3431,6 +4276,403 @@ async def confirm_payment(
 # ============================================================================
 # 订单查询
 # ============================================================================
+
+@router.get("/ops/transaction-safety/metrics")
+async def get_transaction_safety_metrics(
+    merchant_id: Optional[str] = Query(None, description="Optional merchant_id filter for order-scoped metrics"),
+    _: dict = Depends(require_admin_or_key),
+):
+    """
+    Ops counters for transaction-safety alerting.
+
+    These counters are intentionally read-only and best-effort. Missing optional
+    event tables are reported with `available=false` so ops can distinguish zero
+    events from missing instrumentation.
+    """
+    metrics = {
+        "paid_merchant_order_failed_count": await _count_paid_merchant_order_failed_best_effort(
+            merchant_id=merchant_id,
+        ),
+        "merchant_order_retry_success_count": await _count_order_events_best_effort(
+            event_type="merchant_order_retry_success",
+            merchant_id=merchant_id,
+        ),
+        "merchant_order_retry_failed_count": await _count_order_events_best_effort(
+            event_type="merchant_order_retry_failed",
+            merchant_id=merchant_id,
+        ),
+        "quote_revalidation_failure_count": await _count_order_events_best_effort(
+            event_type="quote_revalidation_failed",
+            merchant_id=merchant_id,
+        ),
+        "reconciliation_drift_count": await _count_order_events_best_effort(
+            event_type="reconciliation_drift_detected",
+            merchant_id=merchant_id,
+        ),
+        "payment_authorized_count": await _count_order_events_best_effort(
+            event_type="payment_authorized",
+            merchant_id=merchant_id,
+        ),
+        "payment_captured_after_merchant_order_count": await _count_order_events_best_effort(
+            event_type="payment_captured_after_merchant_order",
+            merchant_id=merchant_id,
+        ),
+        "payment_capture_failed_count": await _count_order_events_best_effort(
+            event_type="payment_capture_failed",
+            merchant_id=merchant_id,
+        ),
+        "payment_authorization_void_failed_count": await _count_order_events_best_effort(
+            event_type="payment_authorization_void_failed",
+            merchant_id=merchant_id,
+        ),
+        "webhook_duplicate_count": await _count_sql_best_effort(
+            "SELECT COUNT(*) AS count FROM webhook_events WHERE status = :status",
+            {"status": "duplicate"},
+        ),
+        "webhook_failed_count": await _count_sql_best_effort(
+            "SELECT COUNT(*) AS count FROM webhook_events WHERE status = :status",
+            {"status": "failed"},
+        ),
+        "fallback_pollution_attempt_count": await _count_order_events_best_effort(
+            event_type="fallback_pollution_attempt",
+            merchant_id=merchant_id,
+        ),
+    }
+    return {
+        "status": "success",
+        "merchant_id": merchant_id,
+        "metrics": metrics,
+        "alert_recommendations": {
+            "paid_merchant_order_failed_count": "page_if_greater_than_zero_for_live_merchants",
+            "payment_capture_failed_count": "page_if_greater_than_zero_for_authorization_first_merchants",
+            "payment_authorization_void_failed_count": "page_if_greater_than_zero_for_authorization_first_merchants",
+            "webhook_failed_count": "alert_if_nonzero_for_more_than_one_webhook_retry_interval",
+            "reconciliation_drift_count": "alert_if_nonzero_for_more_than_one_reconciliation_interval",
+            "fallback_pollution_attempt_count": "page_if_greater_than_zero_direct_purchase_attempted_cache_or_external_checkout_fallback",
+        },
+    }
+
+
+@router.get("/ops/merchant-order-failures")
+async def list_paid_merchant_order_failures(
+    merchant_id: Optional[str] = Query(None, description="Optional merchant_id filter"),
+    limit: int = Query(50, ge=1, le=200),
+    include_all_paid_missing: bool = Query(
+        False,
+        description="Include paid orders missing a merchant order even if no failure marker was written yet",
+    ),
+    _: dict = Depends(require_admin_or_key),
+):
+    """
+    Ops view for paid Pivota orders that are missing merchant-platform orders.
+
+    These orders require either an idempotent merchant-order retry or a refund/void
+    decision. The endpoint intentionally exposes recovery metadata without mutating
+    the order.
+    """
+    scan_limit = min(max(int(limit) * 5, int(limit)), 1000)
+    rows = await _fetch_paid_orders_missing_merchant_order(merchant_id=merchant_id, limit=scan_limit)
+    failures: List[Dict[str, Any]] = []
+    for order in rows:
+        if _get_linked_platform_order(order):
+            continue
+        metadata = _coerce_order_metadata(order)
+        merchant_order = metadata.get("merchant_order") if isinstance(metadata.get("merchant_order"), dict) else {}
+        merchant_status = str((merchant_order or {}).get("status") or "").strip().lower()
+        if merchant_status == "paid_merchant_order_failed" or include_all_paid_missing:
+            failures.append(_merchant_order_failure_summary(order))
+        if len(failures) >= int(limit):
+            break
+
+    return {
+        "status": "success",
+        "merchant_id": merchant_id,
+        "count": len(failures),
+        "include_all_paid_missing": include_all_paid_missing,
+        "operator_action": "retry_merchant_order_or_issue_refund",
+        "auto_void_supported": False,
+        "auto_refund_supported": False,
+        "orders": failures,
+    }
+
+
+@router.post("/ops/merchant-order-failures/{order_id}/retry")
+async def retry_paid_merchant_order_failure(
+    order_id: str,
+    _: dict = Depends(require_admin_or_key),
+):
+    """
+    Idempotently retry merchant order writeback for a paid Pivota order.
+
+    Duplicate retries are safe: linked orders return `already_linked`, and Shopify
+    writeback still uses the existing advisory lock + Pivota order tag lookup.
+    """
+    order = await get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if str(order.get("payment_status") or "").strip().lower() != "paid":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ORDER_NOT_PAID",
+                "message": "Merchant order retry is only allowed after payment is paid.",
+                "payment_status": order.get("payment_status"),
+            },
+        )
+
+    linked_order = _get_linked_platform_order(order)
+    if linked_order:
+        return {
+            "status": "already_linked",
+            "order_id": order_id,
+            "linked_merchant_order": linked_order,
+            "message": "Merchant order is already linked; retry skipped.",
+        }
+
+    try:
+        ok = await sync_order_to_connected_store(order_id)
+    except Exception as exc:
+        ok = False
+        logger.error(
+            "Merchant order retry exception: order_id=%s error=%s",
+            order_id,
+            exc,
+            exc_info=True,
+        )
+
+    updated_order = await get_order(order_id) or order
+    linked_order = _get_linked_platform_order(updated_order)
+    summary = _merchant_order_failure_summary(updated_order)
+
+    if ok and linked_order:
+        await _log_merchant_order_retry_event_best_effort(
+            event_type="merchant_order_retry_success",
+            order_id=order_id,
+            order=updated_order,
+            metadata={
+                "source": "ops_retry_endpoint",
+                "linked_merchant_order": linked_order,
+            },
+        )
+        return {
+            "status": "success",
+            "order_id": order_id,
+            "linked_merchant_order": linked_order,
+            "message": "Merchant order writeback succeeded.",
+        }
+
+    if ok:
+        await _log_merchant_order_retry_event_best_effort(
+            event_type="merchant_order_retry_pending",
+            order_id=order_id,
+            order=updated_order,
+            metadata={
+                "source": "ops_retry_endpoint",
+                "reason": "retry_returned_true_but_no_linked_merchant_order_observed",
+            },
+        )
+        return {
+            "status": "pending",
+            "order_id": order_id,
+            "message": "Merchant order retry was suppressed or is still in progress; no linked merchant order observed yet.",
+            "order": summary,
+        }
+
+    await _log_merchant_order_retry_event_best_effort(
+        event_type="merchant_order_retry_failed",
+        order_id=order_id,
+        order=updated_order,
+        metadata={
+            "source": "ops_retry_endpoint",
+            "merchant_order": summary.get("merchant_order"),
+            "payment_recovery": summary.get("payment_recovery"),
+        },
+    )
+    return {
+        "status": "failed",
+        "order_id": order_id,
+        "message": "Merchant order writeback still failed; retry or refund decision required.",
+        "order": summary,
+    }
+
+
+@router.post("/ops/merchant-order-failures/{order_id}/refund")
+async def refund_paid_merchant_order_failure(
+    order_id: str,
+    _: dict = Depends(require_admin_or_key),
+):
+    """
+    Idempotently refund a paid order that failed merchant order writeback.
+
+    This is the safe captured-payment recovery path until authorization-first
+    capture/void is fully wired. It refuses orders that already have a linked
+    merchant order.
+    """
+    if not is_feature_enabled("enable_merchant_order_failure_refund"):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "MERCHANT_ORDER_FAILURE_REFUND_DISABLED",
+                "message": "Merchant-order failure refund recovery is disabled.",
+            },
+        )
+
+    order = await get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    linked_order = _get_linked_platform_order(order)
+    if linked_order:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "MERCHANT_ORDER_ALREADY_LINKED",
+                "message": "Refund recovery is blocked because the merchant order is already linked.",
+                "linked_merchant_order": linked_order,
+            },
+        )
+
+    metadata = _coerce_order_metadata(order)
+    merchant_order = metadata.get("merchant_order") if isinstance(metadata.get("merchant_order"), dict) else {}
+    merchant_status = str((merchant_order or {}).get("status") or "").strip().lower()
+    if merchant_status != "paid_merchant_order_failed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "MERCHANT_ORDER_FAILURE_REQUIRED",
+                "message": "Refund recovery is only allowed for paid_merchant_order_failed orders.",
+                "merchant_order_status": merchant_status or None,
+            },
+        )
+
+    payment_recovery = metadata.get("payment_recovery") if isinstance(metadata.get("payment_recovery"), dict) else {}
+    if str((payment_recovery or {}).get("status") or "").strip().lower() == "refund_completed":
+        return {
+            "status": "already_refunded",
+            "order_id": order_id,
+            "payment_recovery": payment_recovery,
+            "message": "Merchant-order failure refund was already completed.",
+        }
+
+    payment_status = str(order.get("payment_status") or "").strip().lower()
+    if payment_status not in {"paid", "completed", "partially_refunded"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ORDER_NOT_REFUNDABLE",
+                "message": "Order payment status is not refundable through merchant-order failure recovery.",
+                "payment_status": order.get("payment_status"),
+            },
+        )
+
+    refundable_amount = _remaining_refundable_amount(order)
+    if refundable_amount <= Decimal("0.00"):
+        recovery = await _update_payment_recovery_metadata_best_effort(
+            order_id=order_id,
+            order=order,
+            fields={
+                "status": "refund_completed",
+                "refund_required": False,
+                "operator_action": "none",
+                "reason": "no_remaining_refundable_amount",
+            },
+        )
+        return {
+            "status": "already_refunded",
+            "order_id": order_id,
+            "payment_recovery": recovery,
+            "message": "No remaining refundable amount.",
+        }
+
+    from services.refund_service import refund_service
+
+    idempotency_key = f"merchant_order_failure_refund:{order_id}"
+    refund_result = await refund_service.create_refund(
+        order_id=order_id,
+        amount=float(refundable_amount),
+        reason="merchant_order_writeback_failed",
+        source="pivota_ops_merchant_order_recovery",
+        created_by="ops:merchant_order_failure",
+        idempotency_key=idempotency_key,
+    )
+    refund_status = str((refund_result or {}).get("status") or "").strip().lower()
+    success = refund_status in {"success", "duplicate"}
+
+    if success:
+        recovery = await _update_payment_recovery_metadata_best_effort(
+            order_id=order_id,
+            order=order,
+            fields={
+                "status": "refund_completed",
+                "refund_required": False,
+                "operator_action": "none",
+                "reason": "merchant_order_writeback_failed_refunded",
+                "refund_id": (refund_result or {}).get("refund_id"),
+                "psp_refund_id": (refund_result or {}).get("psp_refund_id")
+                or (refund_result or {}).get("platform_refund_id"),
+                "refund_amount": str(refundable_amount),
+                "refund_idempotency_key": idempotency_key,
+                "refund_completed_at": datetime.utcnow().isoformat() + "Z",
+            },
+        )
+        await _log_merchant_order_retry_event_best_effort(
+            event_type="merchant_order_failure_refund_succeeded",
+            order_id=order_id,
+            order=order,
+            metadata={
+                "source": "ops_refund_endpoint",
+                "refund_status": refund_status,
+                "refund_id": (refund_result or {}).get("refund_id"),
+                "psp_refund_id": (refund_result or {}).get("psp_refund_id")
+                or (refund_result or {}).get("platform_refund_id"),
+                "amount": str(refundable_amount),
+                "idempotency_key": idempotency_key,
+            },
+        )
+        return {
+            "status": "success" if refund_status == "success" else "duplicate",
+            "order_id": order_id,
+            "refund": refund_result,
+            "payment_recovery": recovery,
+            "message": "Merchant-order failure refund completed.",
+        }
+
+    recovery = await _update_payment_recovery_metadata_best_effort(
+        order_id=order_id,
+        order=order,
+        fields={
+            "status": "refund_failed",
+            "refund_required": True,
+            "operator_action": "retry_refund_or_manual_psp_refund",
+            "reason": "merchant_order_writeback_failed_refund_failed",
+            "last_refund_error": str((refund_result or {}).get("error") or "unknown_refund_error")[:1000],
+            "refund_id": (refund_result or {}).get("refund_id"),
+            "refund_amount": str(refundable_amount),
+            "refund_idempotency_key": idempotency_key,
+        },
+    )
+    await _log_merchant_order_retry_event_best_effort(
+        event_type="merchant_order_failure_refund_failed",
+        order_id=order_id,
+        order=order,
+        metadata={
+            "source": "ops_refund_endpoint",
+            "refund_status": refund_status or "unknown",
+            "refund_id": (refund_result or {}).get("refund_id"),
+            "error": str((refund_result or {}).get("error") or "unknown_refund_error")[:1000],
+            "amount": str(refundable_amount),
+            "idempotency_key": idempotency_key,
+        },
+    )
+    return {
+        "status": "failed",
+        "order_id": order_id,
+        "refund": refund_result,
+        "payment_recovery": recovery,
+        "message": "Merchant-order failure refund failed; manual PSP refund may be required.",
+    }
+
 
 @router.get("/{order_id}", response_model=OrderResponse)
 async def get_order_details(
@@ -3538,7 +4780,7 @@ async def create_woocommerce_order(order_id: str) -> bool:
             return False
         if _get_linked_platform_order(order):
             return True
-        if order.get("payment_status") != "paid":
+        if not _order_payment_allows_merchant_order_write(order, platform="woocommerce"):
             logger.warning(
                 "[WooCommerce] Skip create (not paid): order_id=%s payment_status=%s",
                 order_id,
@@ -3686,7 +4928,7 @@ async def create_bigcommerce_order(order_id: str) -> bool:
             return False
         if _get_linked_platform_order(order):
             return True
-        if order.get("payment_status") != "paid":
+        if not _order_payment_allows_merchant_order_write(order, platform="bigcommerce"):
             logger.warning(
                 "[BigCommerce] Skip create (not paid): order_id=%s payment_status=%s",
                 order_id,
@@ -3837,12 +5079,25 @@ async def sync_order_to_connected_store(order_id: str) -> bool:
         store_info = await get_primary_store(str(order.get("merchant_id") or "").strip())
     platform = str((store_info or {}).get("platform") or "").strip().lower()
     if platform == "shopify":
-        return await _create_shopify_order_impl(order_id)
-    if platform == "woocommerce":
-        return await create_woocommerce_order(order_id)
-    if platform == "bigcommerce":
-        return await create_bigcommerce_order(order_id)
-    logger.info("[MerchantSync] No supported store connected for order_id=%s platform=%s", order_id, platform or None)
+        success = await _create_shopify_order_impl(order_id)
+    elif platform == "woocommerce":
+        success = await create_woocommerce_order(order_id)
+    elif platform == "bigcommerce":
+        success = await create_bigcommerce_order(order_id)
+    else:
+        logger.info("[MerchantSync] No supported store connected for order_id=%s platform=%s", order_id, platform or None)
+        success = False
+
+    if success:
+        return True
+    await _mark_merchant_order_sync_failed_best_effort(
+        order_id=order_id,
+        order=order,
+        platform=platform or None,
+        reason="merchant_order_create_returned_false",
+        error="merchant order creation failed or no supported store connection was available",
+        retryable=True,
+    )
     return False
 
 
@@ -3890,7 +5145,7 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             )
             return True
 
-        if order.get("payment_status") != "paid":
+        if not _order_payment_allows_merchant_order_write(order, platform="shopify"):
             logger.warning(
                 "[Shopify] Skip create (not paid): order_id=%s payment_status=%s",
                 order_id,
@@ -4650,7 +5905,7 @@ async def trigger_shopify_order(
     if order.get("shopify_order_id"):
         return {"status": "already_exists", "shopify_order_id": order["shopify_order_id"]}
     
-    if order.get("payment_status") != "paid":
+    if not _order_payment_allows_merchant_order_write(order, platform="shopify"):
         return {"status": "not_paid", "payment_status": order.get("payment_status")}
     
     try:

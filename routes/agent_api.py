@@ -41,6 +41,12 @@ from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
 from services.quote_service import QuoteError
+from services.commerce_execution_policy import (
+    COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST,
+    SURFACE_PUBLIC_AGENT_PURCHASE,
+    cache_estimate_execution_policy,
+    resolve_commerce_execution_policy,
+)
 from services.agent_governance import validate_request_compat
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
@@ -324,6 +330,16 @@ async def _build_agent_order_create_response_from_order(order: Dict[str, Any]) -
         q_settlement = pricing_quote.get("settlement_currency")
         if q_settlement:
             response["settlement_currency"] = q_settlement
+
+    execution_policy = metadata.get("execution_policy") if isinstance(metadata.get("execution_policy"), dict) else None
+    if metadata.get("commerce_path"):
+        response["commerce_path"] = metadata.get("commerce_path")
+    if execution_policy:
+        response["execution_policy"] = execution_policy
+    if "legacy_or_fallback" in metadata:
+        response["legacy_or_fallback"] = bool(metadata.get("legacy_or_fallback"))
+    if metadata.get("validation_authority"):
+        response["validation_authority"] = metadata.get("validation_authority")
 
     return response
 
@@ -7403,7 +7419,11 @@ async def agent_validate_cart(
                 "quantity": quantity,
                 "unit_price": str(unit_price),
                 "subtotal": str(item_subtotal),
-                "in_stock": True
+                "in_stock": True,
+                "availability_status": "unknown_requires_validation",
+                "availability_source": "products_cache_estimate",
+                "inventory_guarantee": "not_guaranteed",
+                "price_source": "products_cache_estimate",
             })
         
         # 计算运费（简单示例）
@@ -7418,6 +7438,14 @@ async def agent_validate_cart(
         # 总计
         total = subtotal + shipping_fee + tax
         
+        cache_policy = cache_estimate_execution_policy(
+            platform=(
+                (validated_items[0].get("platform") if validated_items and isinstance(validated_items[0], dict) else None)
+                or ((products[0] or {}).get("platform") if products else None)
+            ),
+            surface="agent_cart_validate",
+        )
+
         # 记录请求
         background_tasks.add_task(
             log_agent_request,
@@ -7429,6 +7457,11 @@ async def agent_validate_cart(
         return {
             "status": "success",
             "valid": len(validation_errors) == 0,
+            "validation_source": "products_cache_estimate",
+            "requires_quote": True,
+            "quote_required_before_purchase": True,
+            "inventory_guarantee": "not_guaranteed",
+            **cache_policy.response_fields(),
             "items": validated_items,
             "errors": validation_errors,
             "pricing": {
@@ -7436,12 +7469,18 @@ async def agent_validate_cart(
                 "shipping_fee": str(shipping_fee),
                 "tax": str(tax),
                 "total": str(total),
-                "currency": "USD"
+                "currency": "USD",
+                "price_source": "products_cache_estimate",
+                "is_final": False,
+                "requires_quote": True,
+                "validation_authority": cache_policy.validation_authority,
             },
             "shipping": {
                 "country": shipping_country,
                 "free_shipping_threshold": 100,
-                "estimated_delivery": "3-5 business days" if shipping_country == "US" else "7-14 business days"
+                "estimated_delivery": "3-5 business days" if shipping_country == "US" else "7-14 business days",
+                "source": "local_estimate",
+                "is_final": False,
             }
         }
         
@@ -7662,13 +7701,17 @@ async def agent_create_order(
         if not context.can_access_merchant(order_request.merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
-        # Quote-first enforcement (PCS v0.2-a):
-        # - Keep existing global flag behavior (FF_ENABLE_QUOTE_FIRST_ORDER_CREATE).
-        # - Add tiered enforcement for L1C/L2+ (FF_ENABLE_QUOTE_FIRST_TIERED_ENFORCEMENT).
+        # Agent-facing purchase APIs must fail closed: cached product/cart data is
+        # discovery-only and cannot create an order or PSP surface without a live quote.
         from services.quote_first_enforcement import should_require_quote_for_order_create
 
         require_quote, require_ctx = await should_require_quote_for_order_create(merchant_id=order_request.merchant_id)
-        if require_quote and not order_request.quote_id:
+        agent_quote_required_ctx = {
+            **(require_ctx or {}),
+            "agent_purchase_path": True,
+            "enforcement": "always_require_live_quote_for_agent_order_create",
+        }
+        if not order_request.quote_id:
             # Quote-first enforcement: explicit telemetry signal for rollout / debugging.
             try:
                 from mvp.constants import EVENT_QUOTE_REQUIRED_BLOCKED, SURFACE_BACKEND
@@ -7690,7 +7733,7 @@ async def agent_create_order(
                         "stage": "order_create",
                         "merchant_id": getattr(order_request, "merchant_id", None),
                         "agent_id": getattr(context, "agent_id", None),
-                        "context": require_ctx,
+                        "context": agent_quote_required_ctx,
                     },
                     merchant_id=getattr(order_request, "merchant_id", None),
                     geo=geo,
@@ -7705,9 +7748,56 @@ async def agent_create_order(
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "error": "QUOTE_REQUIRED",
-                    "message": "quote_id is required",
-                    "context": require_ctx,
+                    "error": "QUOTE_REQUIRED_BEFORE_PURCHASE",
+                    "message": "quote_id is required before creating an agent-facing order or PSP payment",
+                    "context": agent_quote_required_ctx,
+                },
+            )
+
+        store_info_for_policy = None
+        platform_for_policy = None
+        try:
+            store_info_for_policy = await get_primary_store(order_request.merchant_id)
+            platform_for_policy = str((store_info_for_policy or {}).get("platform") or "").strip().lower() or None
+        except Exception:
+            store_info_for_policy = None
+            platform_for_policy = None
+
+        if not platform_for_policy and order_request.quote_id:
+            try:
+                from services.quote_service import QuoteService
+
+                quote_for_policy = await QuoteService().load_active_quote_or_raise(quote_id=order_request.quote_id)
+                snap_for_policy = quote_for_policy.snapshot_json if isinstance(quote_for_policy.snapshot_json, dict) else {}
+                platform_for_policy = str(
+                    snap_for_policy.get("platform")
+                    or snap_for_policy.get("engine")
+                    or getattr(quote_for_policy, "engine", None)
+                    or ""
+                ).strip().lower() or None
+            except QuoteError as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": e.code,
+                        "message": e.message,
+                        **({"details": e.details} if getattr(e, "details", None) else {}),
+                    },
+                )
+            except Exception:
+                platform_for_policy = None
+
+        commerce_policy = resolve_commerce_execution_policy(
+            platform=platform_for_policy,
+            surface=SURFACE_PUBLIC_AGENT_PURCHASE,
+        )
+        if commerce_policy.commerce_path != COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "UNSUPPORTED_COMMERCE_PATH",
+                    "message": "Agent-facing direct purchase requires a live quote-capable Pivota direct path.",
+                    **commerce_policy.response_fields(),
                 },
             )
 
@@ -7891,6 +7981,12 @@ async def agent_create_order(
         # 添加 Agent 元数据
         if not order_request.metadata:
             order_request.metadata = {}
+        if isinstance(order_request.metadata, dict):
+            order_request.metadata.setdefault("commerce_path", commerce_policy.commerce_path)
+            order_request.metadata.setdefault("execution_policy", commerce_policy.as_dict())
+            order_request.metadata.setdefault("execution_policy_version", commerce_policy.execution_policy_version)
+            order_request.metadata.setdefault("validation_authority", commerce_policy.validation_authority)
+            order_request.metadata.setdefault("legacy_or_fallback", commerce_policy.legacy_or_fallback)
 
         # Checkout token: if present, hydrate identity/context fields into order metadata.
         # This prevents footguns where callers forget to pass buyer_ref/job_id while still
@@ -7962,10 +8058,12 @@ async def agent_create_order(
             order_request.agent_session_id = f"{context.agent_id}_{int(datetime.utcnow().timestamp())}"
 
         # Safety: prevent silent default-SKU checkout for Shopify.
-        try:
-            store_info = await get_primary_store(order_request.merchant_id)
-        except Exception:
-            store_info = None
+        store_info = store_info_for_policy
+        if store_info is None:
+            try:
+                store_info = await get_primary_store(order_request.merchant_id)
+            except Exception:
+                store_info = None
         if str((store_info or {}).get("platform") or "").lower() == "shopify":
             missing_variant = False
             for item in (order_request.items or []):
@@ -8260,7 +8358,8 @@ async def agent_create_order(
             "tracking": {
                 "agent_session_id": order_request.agent_session_id,
                 "created_at": order_response.created_at.isoformat()
-            }
+            },
+            **commerce_policy.response_fields(),
         }
 
         # Attach computed offers + preflight to response when available (additive; safe for existing clients).
@@ -8278,6 +8377,15 @@ async def agent_create_order(
 
             raw = await get_order(order_response.order_id)
             meta = (raw or {}).get("metadata") or {}
+            execution_policy = meta.get("execution_policy") if isinstance(meta.get("execution_policy"), dict) else None
+            if meta.get("commerce_path"):
+                response["commerce_path"] = meta.get("commerce_path")
+            if execution_policy:
+                response["execution_policy"] = execution_policy
+            if "legacy_or_fallback" in meta:
+                response["legacy_or_fallback"] = bool(meta.get("legacy_or_fallback"))
+            if meta.get("validation_authority"):
+                response["validation_authority"] = meta.get("validation_authority")
             pricing_quote = meta.get("pricing_quote")
             if pricing_quote:
                 response["pricing"] = pricing_quote.get("pricing")
@@ -8518,10 +8626,13 @@ async def agent_confirm_payment(
     try:
         from services.agent_governance import agent_governance
         from routes.order_routes import (
+            _resolve_order_psp_adapter,
             create_shopify_order,
+            finalize_authorized_payment_order,
             get_order,
             log_order_event,
             mark_order_paid,
+            order_uses_authorization_first_payment,
             verify_order_payment_succeeded,
         )
         from services.merchant_store_service import get_primary_store
@@ -8542,6 +8653,7 @@ async def agent_confirm_payment(
         )
 
         normalized_payment_status, payment_status_raw, payment_action, surface_contract = _resolve_confirm_payment_contract(order)
+        auth_first_flow = order_uses_authorization_first_payment(order)
 
         if normalized_payment_status in _TERMINAL_CONFIRM_PAYMENT_STATUSES:
             background_tasks.add_task(
@@ -8566,6 +8678,64 @@ async def agent_confirm_payment(
                 "payment_action": None,
                 "shopify_sync": "not_started",
             }
+
+        if auth_first_flow and normalized_payment_status != "paid":
+            order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+            payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
+            auth_first_psp = str((payment_flow or {}).get("psp") or order.get("psp_used") or "").strip().lower()
+            if auth_first_psp == "paypal":
+                psp_type, psp_adapter = await _resolve_order_psp_adapter(order)
+                confirm_ok, confirm_status, confirm_error = await psp_adapter.confirm_payment(
+                    payment_intent_id=str(order.get("payment_intent_id") or ""),
+                    payment_method_id=f"agent_confirm_payment:{order_id}",
+                )
+                if not confirm_ok:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "PAYPAL_AUTHORIZATION_CONFIRMATION_FAILED",
+                            "message": "PayPal approval could not be converted into an authorization.",
+                            "order_id": order_id,
+                            "payment_intent_id": order.get("payment_intent_id"),
+                            "psp_type": psp_type,
+                            "psp_status": confirm_status,
+                            **({"psp_error": confirm_error} if confirm_error else {}),
+                        },
+                    )
+            auth_result = await finalize_authorized_payment_order(
+                order_id,
+                order=order,
+                source_event="agent_confirm_payment",
+            )
+            auth_status = str(auth_result.get("status") or "").strip().lower()
+            if auth_status in {"success", "already_captured", "already_paid"}:
+                background_tasks.add_task(
+                    log_agent_request,
+                    context=context,
+                    status_code=200,
+                    merchant_id=order["merchant_id"],
+                    order_id=order_id,
+                )
+                return {
+                    "status": "success",
+                    "message": "Payment authorized, merchant order created, and payment captured",
+                    "order_id": order_id,
+                    "payment_intent_id": order.get("payment_intent_id"),
+                    "payment_status": "paid",
+                    "authorization_first": True,
+                    "shopify_sync": "completed",
+                    "linked_merchant_order": auth_result.get("linked_merchant_order"),
+                }
+            if auth_status.startswith("merchant_order_failed") or auth_status == "payment_capture_failed":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "AUTHORIZATION_FIRST_FINALIZATION_FAILED",
+                        "message": "Payment was authorized, but merchant-order writeback or capture did not complete.",
+                        "order_id": order_id,
+                        "result": auth_result,
+                    },
+                )
 
         if surface_contract.get("confirmation_owner") == "client" and normalized_payment_status != "paid":
             background_tasks.add_task(

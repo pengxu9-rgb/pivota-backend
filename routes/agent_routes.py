@@ -112,6 +112,16 @@ async def agent_pay(req: AgentPayRequest):
         stacklevel=2
     )
     logger.warning("⚠️ DEPRECATED API CALL: POST /agent/pay - Use /agent/v1/orders/create")
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "QUOTE_REQUIRED_BEFORE_PURCHASE",
+            "message": (
+                "Deprecated direct payment endpoint is disabled. Use /agent/v1/quotes/preview "
+                "then /agent/v1/orders/create with quote_id."
+            ),
+        },
+    )
     
     start_time = time.time()
     
@@ -189,6 +199,16 @@ async def agent_pay_simple(req: SimpleAgentPaymentRequest):
         stacklevel=2
     )
     logger.warning("⚠️ DEPRECATED API CALL: POST /agent/pay-simple - Use /agent/v1/orders/create")
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "QUOTE_REQUIRED_BEFORE_PURCHASE",
+            "message": (
+                "Deprecated direct payment endpoint is disabled. Use /agent/v1/quotes/preview "
+                "then /agent/v1/orders/create with quote_id."
+            ),
+        },
+    )
     start_time = time.time()
     
     try:
