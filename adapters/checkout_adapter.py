@@ -152,7 +152,7 @@ class CheckoutAdapter(PSPAdapter):
                     
                     # Checkout status mapping
                     status_map = {
-                        "authorized": "succeeded",
+                        "authorized": "requires_capture",
                         "captured": "succeeded",
                         "card_verified": "succeeded",
                         "declined": "failed",
@@ -191,7 +191,7 @@ class CheckoutAdapter(PSPAdapter):
                     
                     # Map to standard statuses
                     status_map = {
-                        "authorized": "succeeded",
+                        "authorized": "requires_capture",
                         "captured": "succeeded",
                         "card_verified": "succeeded",
                         "declined": "failed",
@@ -206,12 +206,88 @@ class CheckoutAdapter(PSPAdapter):
                     
         except Exception as e:
             return False, "unknown", str(e)
+
+    async def capture_payment(
+        self,
+        payment_intent_id: str,
+        amount: Optional[Decimal] = None,
+        currency: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Capture an authorized Checkout.com payment."""
+        try:
+            headers = {
+                "Authorization": self.api_key,
+                "Content-Type": "application/json",
+            }
+            if idempotency_key:
+                headers["Cko-Idempotency-Key"] = str(idempotency_key)[:100]
+
+            payload: Dict[str, Any] = {
+                "reference": str(idempotency_key or f"capture_{payment_intent_id[:16]}")[:80],
+            }
+            if amount is not None:
+                payload["amount"] = int(amount * 100)
+            if currency:
+                payload["currency"] = str(currency).upper()
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/payments/{payment_intent_id}/captures",
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0,
+                )
+                if response.status_code in [200, 201, 202]:
+                    data = response.json() if response.text else {}
+                    return True, data.get("action_id") or data.get("id") or payment_intent_id, None
+                error_data = response.json() if response.text else {}
+                return False, None, f"Checkout capture error: {response.status_code} - {error_data.get('error_type', response.text)}"
+        except Exception as e:
+            return False, None, str(e)
+
+    async def cancel_payment_authorization(
+        self,
+        payment_intent_id: str,
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Void an authorized Checkout.com payment before capture."""
+        try:
+            headers = {
+                "Authorization": self.api_key,
+                "Content-Type": "application/json",
+            }
+            if idempotency_key:
+                headers["Cko-Idempotency-Key"] = str(idempotency_key)[:100]
+
+            payload: Dict[str, Any] = {
+                "reference": str(idempotency_key or reason or f"void_{payment_intent_id[:16]}")[:80],
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/payments/{payment_intent_id}/voids",
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0,
+                )
+                if response.status_code in [200, 201, 202]:
+                    data = response.json() if response.text else {}
+                    return True, data.get("action_id") or data.get("id") or payment_intent_id, None
+                error_data = response.json() if response.text else {}
+                return False, None, f"Checkout void error: {response.status_code} - {error_data.get('error_type', response.text)}"
+        except Exception as e:
+            return False, None, str(e)
     
     async def refund_payment(
         self,
         payment_intent_id: str,
         amount: Optional[Decimal] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        currency: Optional[str] = None,
+        full_refund: Optional[bool] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Process a Checkout.com refund"""
         try:
@@ -219,6 +295,8 @@ class CheckoutAdapter(PSPAdapter):
                 "Authorization": self.api_key,
                 "Content-Type": "application/json"
             }
+            if idempotency_key:
+                headers["Cko-Idempotency-Key"] = str(idempotency_key)[:100]
             
             payload = {
                 "reference": f"refund_{payment_intent_id[:16]}"

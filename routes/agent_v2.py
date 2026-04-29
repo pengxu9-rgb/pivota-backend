@@ -29,6 +29,8 @@ from routes.quote_routes import preview_quote as agent_v1_preview_quote
 from routes.refund_api import RefundRequest, process_refund as process_refund_route
 from services.pcs_tier_service import get_merchant_pcs_tier
 from services.agent_governance import validate_request_compat
+from services.platform_capabilities import get_store_platform_capabilities
+from services.psp_capabilities import get_psp_capabilities
 from services.quote_service import QuoteError, QuoteService
 from services.refund_observability import build_order_refund_tracking_payload
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
@@ -1111,23 +1113,35 @@ async def list_merchant_capabilities_v2(
         )
         access_scope_set = {scope.lower() for scope in access_scopes}
         state = _merchant_capability_state(str(row.get("status") or ""), row.get("last_checked_at"))
+        connector = row.get("mcp_platform") or "unknown"
+        platform_capabilities = get_store_platform_capabilities(str(connector))
+        psp_capabilities = get_psp_capabilities(str(row.get("psp_type") or "unknown"))
+        connector_ready = bool(row.get("mcp_connected"))
+        psp_ready = bool(row.get("psp_connected"))
+        platform_checkout_ready = connector_ready and platform_capabilities.supports_platform_checkout
+        pivota_direct_checkout_ready = connector_ready and psp_ready and platform_capabilities.supports_live_quote
         merchants.append(
             {
                 "merchant_id": row.get("merchant_id"),
                 "merchant_name": row.get("business_name"),
-                "connector": row.get("mcp_platform") or "unknown",
+                "connector": connector,
                 "capability_state": state["verification_state"],
                 "verification_state": state["verification_state"],
                 "degradation_state": state["degradation_state"],
                 "supported_flows": {
-                    "catalog_search": bool(row.get("mcp_connected")),
-                    "quote_refresh": bool(row.get("mcp_connected")),
-                    "hosted_checkout": bool(row.get("psp_connected")),
+                    "catalog_search": connector_ready,
+                    "quote_refresh": connector_ready and platform_capabilities.supports_live_quote,
+                    "hosted_checkout": platform_checkout_ready or pivota_direct_checkout_ready,
+                    "external_platform_checkout": platform_checkout_ready,
+                    "pivota_direct_checkout": pivota_direct_checkout_ready,
                     "tracking": True,
                     "refunds": bool(row.get("has_returns_api")),
-                    "live_connector": bool(row.get("mcp_connected")),
-                    "ucp": bool(row.get("mcp_connected")),
+                    "payment_refunds": psp_ready and psp_capabilities.supports_auto_refund,
+                    "live_connector": connector_ready and platform_capabilities.supports_live_quote,
+                    "ucp": connector_ready and platform_capabilities.supports_live_quote,
                 },
+                "commerce_capabilities": platform_capabilities.as_dict(),
+                "psp_capabilities": psp_capabilities.as_dict(),
                 "policy_flags": {
                     "missing_required_scopes": scopes_json.get("missing_required_scopes") or [],
                     "missing_optional_scopes": scopes_json.get("missing_optional_scopes") or [],

@@ -267,6 +267,7 @@ class RefundService:
 
             psp_key: Optional[str] = None
             adapter_kwargs: Dict[str, Any] = {}
+            merchant_psp_row = None
 
             order_psp_id = str(order.get("psp_id") or "").strip()
             if merchant_id:
