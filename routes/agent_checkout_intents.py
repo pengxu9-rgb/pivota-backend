@@ -21,6 +21,13 @@ from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from db.buyer_vault import buyer_addresses, buyer_identity_links, hash_agent_user_ref
 from routes.accounts_orders_api import get_accounts_principal
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
+from services.commerce_execution_policy import (
+    COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST,
+    SURFACE_EXTERNAL_PLATFORM_CHECKOUT,
+    SURFACE_PUBLIC_AGENT_PURCHASE,
+    resolve_commerce_execution_policy,
+)
+from services.quote_service import QuoteError, QuoteService
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 from sqlalchemy.sql import func
@@ -424,6 +431,7 @@ class CreateCheckoutIntentRequest(BaseModel):
     items: List[CheckoutIntentItem]
     return_url: Optional[str] = None
     order_id: Optional[str] = None
+    quote_id: Optional[str] = None
     buyer_ref: Optional[str] = None
     agent_user_ref: Optional[str] = None
     brief_id: Optional[str] = None
@@ -435,6 +443,123 @@ class CreateCheckoutIntentRequest(BaseModel):
     source: Optional[str] = None
     customer_email: Optional[str] = None
     shipping_address: Optional[Dict[str, Any]] = None
+
+
+def _order_items_from_checkout_intent_items(items: List[CheckoutIntentItem]):
+    from models.order import OrderItem
+
+    converted = []
+    for item in items or []:
+        converted.append(
+            OrderItem(
+                product_id=str(item.product_id),
+                product_title=item.title,
+                variant_id=item.variant_id,
+                sku=item.sku,
+                quantity=int(item.quantity),
+                unit_price=item.unit_price,
+            )
+        )
+    return converted
+
+
+def _single_checkout_merchant_or_raise(items: List[CheckoutIntentItem]) -> str:
+    merchant_ids = sorted({str(it.merchant_id).strip() for it in items or [] if str(it.merchant_id or "").strip()})
+    if not merchant_ids:
+        raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "items[] must include merchant_id"})
+    if len(merchant_ids) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MULTI_MERCHANT_NOT_SUPPORTED",
+                "message": "Create one checkout request per merchant_id (split the cart by merchant).",
+                "merchant_ids": merchant_ids,
+            },
+        )
+    return merchant_ids[0]
+
+
+@router.post("/external-platform")
+async def create_external_platform_checkout(
+    req: CreateCheckoutIntentRequest,
+    context: AgentContext = Depends(get_agent_context),
+):
+    """
+    Create a merchant/platform-hosted checkout redirect without creating a Pivota order or PSP payment.
+
+    This is the safe non-Shopify fallback when Pivota does not have a live quote adapter:
+    the platform checkout remains responsible for final price, tax, shipping, payment,
+    inventory availability, and inventory decrement.
+    """
+    if not req.items:
+        raise HTTPException(status_code=400, detail={"error": "INVALID_REQUEST", "message": "items[] is required"})
+    merchant_id = _single_checkout_merchant_or_raise(req.items)
+    if not context.can_access_merchant(merchant_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+
+    from routes import order_routes as order_routes_module
+    from services.merchant_store_service import get_primary_store
+
+    store = await get_primary_store(merchant_id)
+    platform = str((store or {}).get("platform") or "").strip().lower()
+    policy = resolve_commerce_execution_policy(
+        platform=platform,
+        surface=SURFACE_EXTERNAL_PLATFORM_CHECKOUT,
+    )
+
+    if not policy.allows_external_redirect:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "EXTERNAL_PLATFORM_CHECKOUT_UNSUPPORTED",
+                "message": "This store platform does not have a verified external checkout redirect path.",
+                "merchant_id": merchant_id,
+                "platform": platform or None,
+                **policy.response_fields(),
+            },
+        )
+
+    checkout_payload = await order_routes_module._get_platform_checkout_fallback_url_best_effort(
+        merchant_id=merchant_id,
+        items=_order_items_from_checkout_intent_items(req.items),
+    )
+    if not checkout_payload or not checkout_payload.get("url"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "EXTERNAL_PLATFORM_CHECKOUT_UNAVAILABLE",
+                "message": "Pivota could not build a safe platform checkout URL for this cart shape. Use merchant checkout directly or add a platform live quote/checkout adapter.",
+                "merchant_id": merchant_id,
+                "platform": platform or None,
+                "supported_semantics": "single_simple_product_redirect_only",
+                **policy.response_fields(),
+            },
+        )
+
+    return {
+        "status": "requires_external_platform_checkout",
+        "checkout_source": "external_platform_checkout",
+        "checkout_url": str(checkout_payload["url"]),
+        "platform": checkout_payload.get("platform") or platform,
+        "method": checkout_payload.get("method"),
+        "merchant_id": merchant_id,
+        "creates_pivota_order": False,
+        "creates_psp_payment": False,
+        "requires_platform_checkout_validation": True,
+        "quote_required_before_pivota_purchase": True,
+        "inventory_guarantee": "not_guaranteed_by_pivota",
+        "availability_status": "unknown_requires_validation",
+        **policy.response_fields(),
+        "pricing": {
+            "price_source": "merchant_platform_checkout",
+            "is_final": False,
+            "finalized_by": "merchant_platform_checkout",
+        },
+        "warnings": [
+            "Pivota did not create an order or PSP payment for this response.",
+            "Final price, tax, shipping, payment, and inventory availability are validated by the merchant platform checkout.",
+        ],
+    }
 
 
 @router.post("/intents")
@@ -481,9 +606,65 @@ async def create_checkout_intent(
     market = (req.market or "").strip().upper() or None
     locale = (req.locale or "").strip().lower() or None
     source = (req.source or "").strip().lower() or None
+    quote_id = (req.quote_id or "").strip() or None
     requested_scopes: Optional[List[str]] = None
     if isinstance(req.requested_scopes, list):
         requested_scopes = sorted({str(s).strip().lower() for s in req.requested_scopes if str(s or "").strip()}) or None
+
+    # This endpoint mints a buyer-facing checkout surface. For raw item payloads,
+    # require an active live quote so cached product price/inventory never becomes
+    # purchase-authoritative. Existing-order checkout resume is allowed because the
+    # order path already performed quote validation before creating any PSP surface.
+    if not req.order_id and not quote_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "QUOTE_REQUIRED_BEFORE_PURCHASE",
+                "message": "quote_id is required before creating a checkout intent from cart items",
+            },
+        )
+    if quote_id:
+        try:
+            quote = await QuoteService().load_active_quote_or_raise(quote_id=quote_id)
+        except QuoteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": exc.code,
+                    "message": exc.message,
+                    **({"details": exc.details} if getattr(exc, "details", None) else {}),
+                },
+            )
+        if str(quote.merchant_id or "").strip() != merchant_ids[0]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "QUOTE_MERCHANT_MISMATCH",
+                    "message": "quote_id does not belong to checkout intent merchant_id",
+                },
+            )
+
+    commerce_policy = None
+    if not req.order_id:
+        from services.merchant_store_service import get_primary_store
+
+        store = await get_primary_store(merchant_ids[0])
+        platform = str((store or {}).get("platform") or "").strip().lower()
+        commerce_policy = resolve_commerce_execution_policy(
+            platform=platform,
+            surface=SURFACE_PUBLIC_AGENT_PURCHASE,
+        )
+        if commerce_policy.commerce_path != COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "UNSUPPORTED_COMMERCE_PATH",
+                    "message": "This platform is not enabled for Pivota-direct checkout; use external platform checkout when available.",
+                    "merchant_id": merchant_ids[0],
+                    "platform": platform or None,
+                    **commerce_policy.response_fields(),
+                },
+            )
 
     intent_id = f"ci_{uuid.uuid4().hex}"
     expires_at_sec = int(time.time()) + _checkout_intent_ttl_seconds()
@@ -505,6 +686,9 @@ async def create_checkout_intent(
         "merchant_ids": merchant_ids,
         "scopes": ["checkout"],
         "intent_id": intent_id,
+        "quote_id": quote_id,
+        **({"commerce_path": commerce_policy.commerce_path} if commerce_policy else {}),
+        **({"execution_policy_version": commerce_policy.execution_policy_version} if commerce_policy else {}),
         # Bind items to the token (merchant-scoped enforcement is applied at auth;
         # item-level enforcement can be added later if needed).
         "items": [it.model_dump() for it in req.items],
@@ -585,6 +769,8 @@ async def create_checkout_intent(
     }
     if req.return_url:
         query["return"] = str(req.return_url)
+    if quote_id:
+        query["quote_id"] = quote_id
     if market:
         query["market"] = market
     if locale:
@@ -604,7 +790,9 @@ async def create_checkout_intent(
         "checkout_token": token,
         "checkout_url": checkout_url,
         "expires_at": expires_at_sec,
+        **(commerce_policy.response_fields() if commerce_policy else {}),
         **({"order_id": req.order_id} if req.order_id else {}),
+        **({"quote_id": quote_id} if quote_id else {}),
         **({"brief_id": brief_id} if brief_id else {}),
         **({"brief_schema_version": brief_schema_version} if brief_schema_version else {}),
     }

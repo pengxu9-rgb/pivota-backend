@@ -134,8 +134,14 @@ async def test_preview_quote_returns_nested_discount_evidence_json_safe(monkeypa
     assert result["payment_offer_evidence"]["offers"][0]["estimated_savings"] == "0.50"
     assert result["line_items"][0]["line_discount_total"] == "1.00"
     assert result["delivery_options"][0]["amount"] == "0.00"
+    assert result["availability_status"] == "available_confirmed"
+    assert result["is_final"] is True
+    assert result["source_updated_at"] is not None
+    assert result["warnings"] == []
 
     snapshot = captured_quote["snapshot_json"]
+    assert snapshot["availability_status"] == "available_confirmed"
+    assert snapshot["is_final"] is True
     assert snapshot["discount_evidence"]["applications"][0]["amount"] == "1.00"
     assert snapshot["payment_offer_evidence"]["offers"][0]["estimated_savings"] == "0.50"
     assert snapshot["delivery_options"][0]["amount"] == "0.00"
@@ -192,7 +198,14 @@ async def test_preview_quote_dedupes_store_discount_evidence_across_targets(monk
             ],
             delivery_options=[],
             debug={},
-            discount_evidence={"source": "shopify_storefront_cart", "pricing_confidence": "authoritative", "codes": [], "applications": [], "decisions": []},
+            discount_evidence={
+                "source": "shopify_storefront_cart",
+                "pricing_confidence": "authoritative",
+                "codes": [],
+                "applications": [],
+                "decisions": [],
+                "shipping_evidence": {"status": "authoritative"},
+            },
         )
 
     async def fake_insert_quote(_row):

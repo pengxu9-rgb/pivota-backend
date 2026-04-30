@@ -36,6 +36,18 @@ async def _override_get_agent_context() -> _TestAgentContext:
     return _TestAgentContext()
 
 
+@pytest.fixture(autouse=True)
+def _shopify_store_policy_context(monkeypatch: pytest.MonkeyPatch):
+    import routes.agent_api as agent_api_module
+    import routes.agent_payment_sdk as payment_module
+
+    async def fake_get_primary_store(_merchant_id: str):
+        return {"platform": "shopify", "store_id": "store_test"}
+
+    monkeypatch.setattr(agent_api_module, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(payment_module, "get_primary_store", fake_get_primary_store)
+
+
 def test_agent_order_payment_instructions_do_not_claim_client_secret_when_missing() -> None:
     import routes.agent_api as agent_api_module
 
@@ -47,6 +59,132 @@ def test_agent_order_payment_instructions_do_not_claim_client_secret_when_missin
         agent_api_module._format_agent_order_payment_instructions("stripe", None, "cs_live")
         == "Use client_secret for Stripe payment confirmation"
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_without_quote_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        import mvp.events as mvp_events
+        import routes.agent_api as agent_api_module
+        import routes.order_routes as order_routes_module
+        import services.agent_governance as governance_module
+
+        monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+
+        async def noop_validate_request(agent_id: str) -> None:
+            return None
+
+        async def noop_record_response(agent_id: str, latency_ms: int, success: bool) -> None:
+            return None
+
+        async def fail_create_new_order(*_: Any, **__: Any):
+            raise AssertionError("unquoted agent purchase path must not create an order")
+
+        monkeypatch.setattr(governance_module.agent_governance, "validate_request", noop_validate_request)
+        monkeypatch.setattr(governance_module.agent_governance, "record_response", noop_record_response)
+        monkeypatch.setattr(order_routes_module, "create_new_order", fail_create_new_order)
+
+        payload = {
+            "merchant_id": "m_test",
+            "customer_email": "test@example.com",
+            "items": [
+                {
+                    "product_id": "p_1",
+                    "product_title": "Test Product",
+                    "variant_id": "v_1",
+                    "quantity": 1,
+                    "unit_price": "10.00",
+                    "subtotal": "10.00",
+                }
+            ],
+            "shipping_address": {
+                "name": "Test",
+                "address_line1": "1 Test St",
+                "city": "SF",
+                "state": "CA",
+                "postal_code": "94107",
+                "country": "US",
+            },
+            "currency": "USD",
+            "metadata": {},
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/agent/v1/orders/create", json=payload)
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"] == "QUOTE_REQUIRED_BEFORE_PURCHASE"
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_non_shopify_direct_purchase_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        import mvp.events as mvp_events
+        import routes.agent_api as agent_api_module
+        import routes.order_routes as order_routes_module
+        import services.agent_governance as governance_module
+
+        monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+
+        async def noop_validate_request(agent_id: str) -> None:
+            return None
+
+        async def noop_record_response(agent_id: str, latency_ms: int, success: bool) -> None:
+            return None
+
+        async def fake_get_primary_store(_merchant_id: str):
+            return {"platform": "woocommerce", "store_id": "store_woo"}
+
+        async def fail_create_new_order(*_: Any, **__: Any):
+            raise AssertionError("non-Shopify direct purchase must not create a Pivota order")
+
+        monkeypatch.setattr(governance_module.agent_governance, "validate_request", noop_validate_request)
+        monkeypatch.setattr(governance_module.agent_governance, "record_response", noop_record_response)
+        monkeypatch.setattr(agent_api_module, "get_primary_store", fake_get_primary_store)
+        monkeypatch.setattr(order_routes_module, "create_new_order", fail_create_new_order)
+
+        payload = {
+            "merchant_id": "m_test",
+            "quote_id": "q_test",
+            "customer_email": "test@example.com",
+            "items": [{"product_id": "p_1", "variant_id": "v_1", "quantity": 1}],
+            "shipping_address": {
+                "name": "Test",
+                "address_line1": "1 Test St",
+                "city": "SF",
+                "state": "CA",
+                "postal_code": "94107",
+                "country": "US",
+            },
+            "currency": "USD",
+            "metadata": {},
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/agent/v1/orders/create", json=payload)
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["error"] == "UNSUPPORTED_COMMERCE_PATH"
+        assert detail["commerce_path"] == "unsupported"
+        assert detail["execution_policy"]["allows_pivota_order"] is False
+        assert detail["execution_policy"]["allows_psp_creation"] is False
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
 
 
 @pytest.mark.asyncio
@@ -155,6 +293,7 @@ async def test_agent_create_order_replay_returns_cached_response(monkeypatch: py
 
         payload = {
             "merchant_id": "m_test",
+            "quote_id": "q_test",
             "customer_email": "test@example.com",
             "items": [
                 {
@@ -543,6 +682,7 @@ async def test_agent_create_order_busy_retries_once_when_no_existing_order(monke
 
         payload = {
             "merchant_id": "m_test",
+            "quote_id": "q_test",
             "customer_email": "test@example.com",
             "items": [
                 {
@@ -632,7 +772,7 @@ async def test_agent_create_order_success_ignores_usage_logging_busy_error(monke
         monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
 
         async def fake_get_primary_store(merchant_id: str):
-            return None
+            return {"platform": "shopify", "store_id": "store_test"}
 
         monkeypatch.setattr(agent_api_module, "get_primary_store", fake_get_primary_store)
 
@@ -670,6 +810,7 @@ async def test_agent_create_order_success_ignores_usage_logging_busy_error(monke
 
         payload = {
             "merchant_id": "m_test",
+            "quote_id": "q_test",
             "customer_email": "test@example.com",
             "items": [
                 {
@@ -738,6 +879,13 @@ async def test_agent_payments_replay_does_not_double_execute(monkeypatch: pytest
                 "payment_status": "unpaid",
                 "total": 10.0,
                 "currency": "USD",
+                "metadata": {
+                    "pricing_quote": {
+                        "quote_id": "q_payment_test",
+                        "expires_at": "2099-01-01T00:00:00+00:00",
+                        "live_validation": {"status": "validated"},
+                    }
+                },
                 "shipping_address": {
                     "country": "US",
                     "postal_code": "94107",
@@ -824,5 +972,48 @@ async def test_agent_payments_replay_does_not_double_execute(monkeypatch: pytest
         assert payload1["payment_intent_id"] == payload2["payment_intent_id"]
         assert payload1["status"] == payload2["status"]
         assert calls["count"] == 1
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_payment_without_live_validated_quote_blocks_psp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from main import app
+    from routes.agent_auth import get_agent_context
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    try:
+        import routes.agent_payment_sdk as payment_module
+
+        async def fake_get_order(order_id: str) -> Optional[Dict[str, Any]]:
+            return {
+                "order_id": order_id,
+                "merchant_id": "m_test",
+                "payment_status": "unpaid",
+                "total": 10.0,
+                "currency": "USD",
+                "metadata": {},
+            }
+
+        async def fail_create_payment_with_failover(*_: Any, **__: Any):
+            raise AssertionError("PSP creation must not run without live quote validation")
+
+        monkeypatch.setattr(payment_module, "get_order", fake_get_order)
+        monkeypatch.setattr(payment_module, "create_payment_with_failover", fail_create_payment_with_failover)
+
+        body = {
+            "order_id": "ord_without_quote",
+            "payment_method": {"type": "card", "token": "tok_test"},
+            "idempotency_key": "idem_pay_without_quote",
+        }
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/agent/v1/payments", json=body)
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "QUOTE_REQUIRED_BEFORE_PAYMENT"
     finally:
         app.dependency_overrides.pop(get_agent_context, None)

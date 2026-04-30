@@ -33,6 +33,16 @@ FEATURE_FLAGS = {
     #   or on an allowlist (FF_QUOTE_FIRST_REQUIRED_MERCHANT_IDS).
     "enable_quote_first_tiered_enforcement": os.getenv("FF_ENABLE_QUOTE_FIRST_TIERED_ENFORCEMENT", "false").lower()
     == "true",
+
+    # Transaction safety next phase. These are intentionally off until the
+    # order/payment state machine is migrated and validated per merchant.
+    "enable_authorization_first_orders": os.getenv("FF_ENABLE_AUTHORIZATION_FIRST_ORDERS", "false").lower()
+    == "true",
+    "enable_stripe_manual_capture": os.getenv("FF_ENABLE_STRIPE_MANUAL_CAPTURE", "false").lower() == "true",
+    "enable_paypal_authorization_first": os.getenv("FF_ENABLE_PAYPAL_AUTHORIZATION_FIRST", "false").lower()
+    == "true",
+    "enable_merchant_order_failure_refund": os.getenv("FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND", "true").lower()
+    == "true",
 }
 
 
@@ -74,3 +84,7 @@ ENABLE_PLATFORM_SYNC_OUTBOUND = FEATURE_FLAGS["enable_platform_sync_outbound"]
 ENABLE_DISPUTE_MANAGEMENT = FEATURE_FLAGS["enable_dispute_management"]
 ENABLE_QUOTE_FIRST_ORDER_CREATE = FEATURE_FLAGS["enable_quote_first_order_create"]
 ENABLE_QUOTE_FIRST_TIERED_ENFORCEMENT = FEATURE_FLAGS["enable_quote_first_tiered_enforcement"]
+ENABLE_AUTHORIZATION_FIRST_ORDERS = FEATURE_FLAGS["enable_authorization_first_orders"]
+ENABLE_STRIPE_MANUAL_CAPTURE = FEATURE_FLAGS["enable_stripe_manual_capture"]
+ENABLE_PAYPAL_AUTHORIZATION_FIRST = FEATURE_FLAGS["enable_paypal_authorization_first"]
+ENABLE_MERCHANT_ORDER_FAILURE_REFUND = FEATURE_FLAGS["enable_merchant_order_failure_refund"]

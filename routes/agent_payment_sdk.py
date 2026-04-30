@@ -22,6 +22,12 @@ from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import MultiPSPOrchestrator, create_payment_with_failover
 from services.payment_routing_service import PaymentRoutingService
 from services.merchant_payment_initiation_service import build_payment_action
+from services.commerce_execution_policy import (
+    COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST,
+    SURFACE_PUBLIC_AGENT_PURCHASE,
+    resolve_commerce_execution_policy,
+)
+from services.merchant_store_service import get_primary_store
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
@@ -115,6 +121,10 @@ class PaymentResponse(BaseModel):
     # (kept flat for backward compatibility; Shopping Gateway may wrap into `payment` object)
     psp: Optional[str] = None
     payment_action: Optional[Dict[str, Any]] = None
+    commerce_path: Optional[str] = None
+    execution_policy: Optional[Dict[str, Any]] = None
+    legacy_or_fallback: Optional[bool] = None
+    validation_authority: Optional[str] = None
     next_action: Optional[NextAction] = None
     error: Optional[str] = None
     created_at: str
@@ -179,6 +189,67 @@ def _coerce_json_list(value: Any) -> List[Any]:
             return []
         return parsed if isinstance(parsed, list) else []
     return []
+
+
+def _coerce_datetime_utc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _pricing_quote_meta_from_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _coerce_json_object((order or {}).get("metadata"))
+    pricing_quote = metadata.get("pricing_quote")
+    return pricing_quote if isinstance(pricing_quote, dict) else {}
+
+
+def _ensure_agent_payment_order_has_live_quote(order: Dict[str, Any]) -> Dict[str, Any]:
+    pricing_quote = _pricing_quote_meta_from_order(order)
+    quote_id = _first_non_empty_string(pricing_quote.get("quote_id"))
+    live_validation = pricing_quote.get("live_validation") if isinstance(pricing_quote, dict) else None
+    live_status = (
+        str((live_validation or {}).get("status") or "").strip().lower()
+        if isinstance(live_validation, dict)
+        else ""
+    )
+    if not quote_id or live_status != "validated":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "QUOTE_REQUIRED_BEFORE_PAYMENT",
+                "message": (
+                    "Agent payment creation requires an order created from a live-validated quote. "
+                    "Refresh the quote and recreate the order before creating a PSP payment surface."
+                ),
+                "quote_required_before_purchase": True,
+            },
+        )
+
+    expires_at = _coerce_datetime_utc(pricing_quote.get("expires_at"))
+    if expires_at and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "QUOTE_EXPIRED",
+                "message": "Quote expired before payment creation. Refresh the quote before purchase.",
+                "quote_id": quote_id,
+                "expires_at": expires_at.isoformat(),
+                "quote_required_before_purchase": True,
+            },
+        )
+
+    return pricing_quote
 
 
 def _resolve_order_merchant_id(order: Dict[str, Any]) -> Optional[str]:
@@ -356,6 +427,28 @@ async def create_payment(
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
+        store = await _with_asyncpg_busy_retry(
+            "primary store lookup",
+            lambda: get_primary_store(str(merchant_id)),
+        )
+        commerce_policy = resolve_commerce_execution_policy(
+            platform=str((store or {}).get("platform") or "").strip().lower(),
+            surface=SURFACE_PUBLIC_AGENT_PURCHASE,
+        )
+        if commerce_policy.commerce_path != COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "UNSUPPORTED_COMMERCE_PATH",
+                    "message": "This order cannot create a public agent PSP payment without a Pivota live quote path.",
+                    "order_id": request.order_id,
+                    "merchant_id": merchant_id,
+                    **commerce_policy.response_fields(),
+                },
+            )
+
+        _ensure_agent_payment_order_has_live_quote(order)
+
         # MVP governance (ACE v0.1): risk-tier evaluation + optional HIL enforcement (configurable).
         # Always emits immutable audit events for intent → approval → execution → receipt (best-effort).
         decision = None
@@ -505,6 +598,7 @@ async def create_payment(
                     amount=order_total,
                     currency=order.get("currency", "USD"),
                     psp_used="cached",
+                    **commerce_policy.response_fields(),
                     created_at=datetime.now().isoformat()
                 )
 
@@ -528,6 +622,7 @@ async def create_payment(
                 psp_used=existing_payment_surface["psp_used"],
                 psp=existing_payment_surface["psp_used"],
                 payment_action=existing_payment_surface["payment_action"],
+                **commerce_policy.response_fields(),
                 created_at=datetime.now().isoformat(),
             )
 
@@ -595,6 +690,13 @@ async def create_payment(
 
         amount = Decimal(str(order_total))
         currency = currency_code
+        order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+        payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
+        auth_first_psp = str((payment_flow or {}).get("psp") or "").strip().lower()
+        auth_first_manual_capture = (
+            str((payment_flow or {}).get("mode") or "").strip().lower() == "authorization_first"
+            and auth_first_psp in {"stripe", "paypal"}
+        )
 
         # Build preferred PSP ordering from routing config for MultiPSPOrchestrator
         preferred_psps: Optional[List[str]] = None
@@ -619,6 +721,19 @@ async def create_payment(
                 f"[AgentPayments] Failed to build preferred_psps list from route_config: {pref_err}"
             )
             preferred_psps = None
+        if auth_first_manual_capture:
+            preferred_psps = [auth_first_psp]
+        auth_first_payment_metadata = {}
+        if auth_first_manual_capture:
+            auth_first_payment_metadata = {
+                "payment_flow": "authorization_first",
+                "capture_method": "manual",
+                "payment_capture_method": "manual",
+            }
+            if auth_first_psp == "stripe":
+                auth_first_payment_metadata["stripe_capture_method"] = "manual"
+            elif auth_first_psp == "paypal":
+                auth_first_payment_metadata["paypal_intent"] = "AUTHORIZE"
 
         # Use MultiPSPOrchestrator for real payment creation with failover
         try:
@@ -661,9 +776,11 @@ async def create_payment(
                         "agent_id": context.agent_id,
                         "payment_method_type": request.payment_method.type,
                         "idempotency_key": request.idempotency_key,
+                        **auth_first_payment_metadata,
                         **({"return_url": request.return_url} if request.return_url else {}),
                     },
                     preferred_psps=preferred_psps,
+                    restrict_to_preferred_psps=bool(auth_first_manual_capture),
                     canonical_psp_required=True,
                     enforce_live_readiness=True,
                 ),
@@ -900,6 +1017,7 @@ async def create_payment(
             psp_used=psp_used,
             psp=psp_used,
             payment_action=payment_action,
+            **commerce_policy.response_fields(),
             next_action=next_action,
             created_at=datetime.now().isoformat()
         )

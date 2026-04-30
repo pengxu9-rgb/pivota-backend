@@ -172,6 +172,284 @@ async def test_stripe_webhook_accepts_stripe_object_payload(
 
 
 @pytest.mark.asyncio
+async def test_stripe_webhook_duplicate_event_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.webhook_routes as webhook_routes_module
+
+    event = {
+        **_stripe_event(
+            "payment_intent.succeeded",
+            {
+                "id": "pi_duplicate_contract",
+                "amount": 1000,
+                "currency": "usd",
+            },
+        ),
+        "id": "evt_duplicate_contract",
+    }
+    duplicate_checks: list[str] = []
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
+        return event
+
+    async def fake_check_duplicate_event(event_id: str, order_id: str | None = None):
+        duplicate_checks.append(event_id)
+        return True, {"event_id": event_id, "status": "processed"}
+
+    async def fail_record_webhook_event(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("duplicate event should not be recorded again")
+
+    async def fail_mark_order_paid(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("duplicate event should not mutate order state")
+
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+    monkeypatch.setattr(
+        webhook_routes_module.WebhookService,
+        "check_duplicate_event",
+        staticmethod(fake_check_duplicate_event),
+    )
+    monkeypatch.setattr(
+        webhook_routes_module.WebhookService,
+        "record_webhook_event",
+        staticmethod(fail_record_webhook_event),
+    )
+    monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fail_mark_order_paid)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe",
+            content=b'{"id":"evt_duplicate_contract"}',
+            headers={"stripe-signature": "sig_duplicate"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "success",
+        "event": "payment_intent.succeeded",
+        "duplicate": True,
+    }
+    assert duplicate_checks == ["evt_duplicate_contract"]
+
+
+@pytest.mark.asyncio
+async def test_stripe_checkout_session_completed_finalizes_auth_first_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as database_module
+    import routes.order_routes as order_routes_module
+    import routes.webhook_routes as webhook_routes_module
+
+    finalize_calls: list[Dict[str, Any]] = []
+
+    event = {
+        **_stripe_event(
+            "checkout.session.completed",
+            {
+                "id": "cs_auth_first_contract",
+                "metadata": {
+                    "order_id": "ORD_STRIPE_CHECKOUT_AUTH",
+                    "payment_flow": "authorization_first",
+                    "capture_method": "manual",
+                },
+            },
+        ),
+        "id": "evt_checkout_auth_first_contract",
+    }
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        if values.get("payment_intent_id") == "cs_auth_first_contract":
+            return {
+                "order_id": "ORD_STRIPE_CHECKOUT_AUTH",
+                "merchant_id": "m_stripe",
+                "payment_intent_id": "cs_auth_first_contract",
+                "payment_status": "awaiting_payment",
+                "psp_used": "stripe",
+                "metadata": {
+                    "payment_flow": {
+                        "mode": "authorization_first",
+                        "psp": "stripe",
+                        "store_platform": "shopify",
+                        "capture_method": "manual",
+                    }
+                },
+            }
+        return None
+
+    async def fake_finalize_authorized_payment_order(order_id: str, *, order=None, source_event: str):
+        finalize_calls.append(
+            {
+                "order_id": order_id,
+                "order": order,
+                "source_event": source_event,
+            }
+        )
+        return {"status": "success"}
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
+        return event
+
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+    monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(order_routes_module, "finalize_authorized_payment_order", fake_finalize_authorized_payment_order)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe",
+            content=b'{"id":"evt_checkout_auth_first_contract"}',
+            headers={"stripe-signature": "sig_checkout_auth_first"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "event": "checkout.session.completed"}
+    assert finalize_calls == [
+        {
+            "order_id": "ORD_STRIPE_CHECKOUT_AUTH",
+            "order": {
+                "order_id": "ORD_STRIPE_CHECKOUT_AUTH",
+                "merchant_id": "m_stripe",
+                "payment_intent_id": "cs_auth_first_contract",
+                "payment_status": "awaiting_payment",
+                "psp_used": "stripe",
+                "metadata": {
+                    "payment_flow": {
+                        "mode": "authorization_first",
+                        "psp": "stripe",
+                        "store_platform": "shopify",
+                        "capture_method": "manual",
+                    }
+                },
+            },
+            "source_event": "stripe_checkout_session_completed_webhook",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("topic,event_type", [
+    ("products/update", "product_webhook"),
+    ("inventory_levels/update", "inventory_webhook"),
+])
+async def test_shopify_product_inventory_webhooks_enqueue_catalog_reconcile(
+    monkeypatch: pytest.MonkeyPatch,
+    topic: str,
+    event_type: str,
+) -> None:
+    import routes.webhook_routes as webhook_routes_module
+
+    ingested: list[str] = []
+    catalog_events: list[Dict[str, Any]] = []
+    catalog_jobs: list[Dict[str, Any]] = []
+
+    async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+        return {"merchant_id": merchant_id}
+
+    async def fake_get_merchant_active_stores(_merchant_id: str):
+        return []
+
+    async def fake_ingest_shopify_webhook(**kwargs: Any):
+        ingested.append(kwargs["topic"])
+        return False, {"event_id": "evt_shopify"}
+
+    async def fake_record_catalog_sync_event(**kwargs: Any):
+        catalog_events.append(kwargs)
+        return {"event_id": "cat_evt_1"}
+
+    async def fake_create_catalog_sync_job(**kwargs: Any):
+        catalog_jobs.append(kwargs)
+        return {"job_id": "cat_job_1"}
+
+    async def noop_run_shopify_catalog_webhook_reconcile(**kwargs: Any):
+        return None
+
+    monkeypatch.setattr(webhook_routes_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(webhook_routes_module, "get_merchant_active_stores", fake_get_merchant_active_stores)
+    monkeypatch.setattr(webhook_routes_module, "ingest_shopify_webhook", fake_ingest_shopify_webhook)
+    monkeypatch.setattr(webhook_routes_module, "record_catalog_sync_event", fake_record_catalog_sync_event)
+    monkeypatch.setattr(webhook_routes_module, "create_catalog_sync_job", fake_create_catalog_sync_job)
+    monkeypatch.setattr(
+        webhook_routes_module,
+        "_run_shopify_catalog_webhook_reconcile",
+        noop_run_shopify_catalog_webhook_reconcile,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/shopify/merch_shopify",
+            content=b'{"id":123}',
+            headers={
+                "x-shopify-topic": topic,
+                "x-shopify-shop-domain": "example.myshopify.com",
+                "x-shopify-webhook-id": "wh_product_inventory",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    assert ingested == [topic]
+    assert catalog_events[0]["event_type"] == event_type
+    assert catalog_events[0]["topic"] == topic
+    assert catalog_jobs[0]["mode"] == "webhook"
+    assert catalog_jobs[0]["scope"]["trigger_topic"] == topic
+
+
+@pytest.mark.asyncio
+async def test_shopify_duplicate_webhook_skips_catalog_reconcile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.webhook_routes as webhook_routes_module
+
+    async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+        return {"merchant_id": merchant_id}
+
+    async def fake_get_merchant_active_stores(_merchant_id: str):
+        return []
+
+    async def fake_ingest_shopify_webhook(**kwargs: Any):
+        return True, {"event_id": "evt_shopify", "status": "processed"}
+
+    async def fail_create_catalog_sync_job(**kwargs: Any):
+        raise AssertionError("duplicate Shopify webhook must not enqueue a new catalog job")
+
+    monkeypatch.setattr(webhook_routes_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(webhook_routes_module, "get_merchant_active_stores", fake_get_merchant_active_stores)
+    monkeypatch.setattr(webhook_routes_module, "ingest_shopify_webhook", fake_ingest_shopify_webhook)
+    monkeypatch.setattr(webhook_routes_module, "create_catalog_sync_job", fail_create_catalog_sync_job)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/shopify/merch_shopify",
+            content=b'{"id":123}',
+            headers={
+                "x-shopify-topic": "inventory_levels/update",
+                "x-shopify-shop-domain": "example.myshopify.com",
+                "x-shopify-webhook-id": "wh_duplicate_inventory",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "success",
+        "topic": "inventory_levels/update",
+        "duplicate": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_shopify_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

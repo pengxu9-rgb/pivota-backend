@@ -195,6 +195,8 @@ class QuoteService:
         payment_context: Optional[Any] = None,
         brief_id: Optional[str] = None,
         brief_schema_version: Optional[str] = None,
+        persist: bool = True,
+        emit_analytics: bool = True,
     ) -> Dict[str, Any]:
         codes = normalize_discount_codes(discount_codes)
         fingerprint = compute_request_fingerprint(
@@ -393,16 +395,18 @@ class QuoteService:
             payment_offer_evidence=payment_offer_evidence,
             payment_pricing=payment_pricing,
         )
-        emit_payment_offer_analytics_event(
-            event_type="payment_offer.displayed",
-            merchant_id=merchant_id,
-            surface="quote_preview",
-            evidence=payment_offer_evidence,
-            payment_context=payment_context,
-            quote_id=quote_id,
-            idempotency_key=f"payment_offer.displayed:{quote_id}",
-        )
+        if emit_analytics:
+            emit_payment_offer_analytics_event(
+                event_type="payment_offer.displayed",
+                merchant_id=merchant_id,
+                surface="quote_preview",
+                evidence=payment_offer_evidence,
+                payment_context=payment_context,
+                quote_id=quote_id,
+                idempotency_key=f"payment_offer.displayed:{quote_id}",
+            )
 
+        source_updated_at = datetime.now(timezone.utc)
         snapshot_json: Dict[str, Any] = {
             "engine": result.engine,
             "engine_ref": result.engine_ref,
@@ -410,6 +414,11 @@ class QuoteService:
             "presentment_currency": presentment_currency,
             "charge_currency": charge_currency,
             "settlement_currency": settlement_currency,
+            "availability_status": "available_confirmed",
+            "available_quantity": None,
+            "is_final": True,
+            "source_updated_at": source_updated_at.isoformat(),
+            "warnings": [],
             "checkout_url": (result.debug or {}).get("checkout_url"),
             "pricing": {
                 "subtotal": str(result.pricing["subtotal"]),
@@ -447,7 +456,7 @@ class QuoteService:
             or None,
         }
 
-        now = datetime.now(timezone.utc)
+        now = source_updated_at
         quote_hash_sha256 = sha256_json(
             {
                 "request": request_json,
@@ -469,35 +478,36 @@ class QuoteService:
                 snapshot_json["metadata"] = meta
             except Exception:
                 pass
-        try:
-            await insert_quote(
-                {
-                    "quote_id": quote_id,
-                    "merchant_id": merchant_id,
-                    "agent_id": agent_id,
-                    "engine": result.engine,
-                    "engine_ref": str(result.engine_ref),
-                    "request_fingerprint": fingerprint,
-                    "request_json": request_json,
-                    "snapshot_json": snapshot_json,
-                    "quote_hash_sha256": quote_hash_sha256,
-                    "status": "active",
-                    "expires_at": expires_at,
-                    "consumed_at": None,
-                    "created_at": now,
-                    "updated_at": now,
-                    "debug_id": (result.debug or {}).get("debug_id"),
-                    "notes": None,
-                }
-            )
-        except Exception as e:
-            # Fail-open: quote persistence should not take down checkout/preview flows.
-            # Order create may still be gated by quote-first enforcement; ops should
-            # apply migration 033_quote_first.sql if persistence is required.
-            logger.warning(
-                "Failed to persist quote (best-effort)",
-                extra={"merchant_id": merchant_id, "quote_id": quote_id, "error": str(e)},
-            )
+        if persist:
+            try:
+                await insert_quote(
+                    {
+                        "quote_id": quote_id,
+                        "merchant_id": merchant_id,
+                        "agent_id": agent_id,
+                        "engine": result.engine,
+                        "engine_ref": str(result.engine_ref),
+                        "request_fingerprint": fingerprint,
+                        "request_json": request_json,
+                        "snapshot_json": snapshot_json,
+                        "quote_hash_sha256": quote_hash_sha256,
+                        "status": "active",
+                        "expires_at": expires_at,
+                        "consumed_at": None,
+                        "created_at": now,
+                        "updated_at": now,
+                        "debug_id": (result.debug or {}).get("debug_id"),
+                        "notes": None,
+                    }
+                )
+            except Exception as e:
+                # Fail-open: quote persistence should not take down checkout/preview flows.
+                # Order create may still be gated by quote-first enforcement; ops should
+                # apply migration 033_quote_first.sql if persistence is required.
+                logger.warning(
+                    "Failed to persist quote (best-effort)",
+                    extra={"merchant_id": merchant_id, "quote_id": quote_id, "error": str(e)},
+                )
 
         return {
             "quote_id": quote_id,
@@ -508,6 +518,11 @@ class QuoteService:
             "presentment_currency": presentment_currency,
             "charge_currency": charge_currency,
             "settlement_currency": settlement_currency,
+            "availability_status": "available_confirmed",
+            "available_quantity": None,
+            "is_final": True,
+            "source_updated_at": source_updated_at,
+            "warnings": [],
             "pricing": result.pricing,
             "promotion_lines": self._serialize_promotion_lines(result.promotion_lines),
             "discount_evidence": self._serialize_discount_evidence(discount_evidence),
@@ -521,6 +536,144 @@ class QuoteService:
             "debug_id": (result.debug or {}).get("debug_id"),
             "attempts": self._json_safe(attempts or []),
         }
+
+    async def validate_quote_snapshot_live(
+        self,
+        quote: QuoteSnapshot,
+        *,
+        customer_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Re-price/re-check an active quote against the source-of-truth platform just before order creation.
+
+        This intentionally does not persist or emit analytics for the transient quote. If the live
+        platform state differs from the stored quote snapshot, callers must ask the agent/buyer to
+        refresh the quote instead of charging against stale commercial terms.
+        """
+        request_json = quote.request_json if isinstance(quote.request_json, dict) else {}
+        snapshot_json = quote.snapshot_json if isinstance(quote.snapshot_json, dict) else {}
+
+        live = await self.preview_quote(
+            merchant_id=quote.merchant_id,
+            agent_id=quote.agent_id,
+            items=request_json.get("items") or [],
+            discount_codes=request_json.get("discount_codes") or [],
+            customer_email=customer_email,
+            shipping_address=request_json.get("shipping_address"),
+            selected_delivery_option=request_json.get("selected_delivery_option"),
+            payment_context=request_json.get("payment_context"),
+            persist=False,
+            emit_analytics=False,
+        )
+
+        mismatches = self._quote_snapshot_mismatches(snapshot_json=snapshot_json, live_quote=live)
+        if mismatches:
+            raise QuoteError(
+                "QUOTE_STALE_REPRICE_REQUIRED",
+                "Quote no longer matches live store pricing or availability. Refresh the quote before checkout.",
+                debug_id=quote.debug_id or live.get("debug_id"),
+                details={
+                    "quote_id": quote.quote_id,
+                    "quote_expires_at": quote.expires_at.isoformat() if quote.expires_at else None,
+                    "live_engine": live.get("engine"),
+                    "live_engine_ref": live.get("engine_ref"),
+                    "mismatches": mismatches,
+                },
+            )
+
+        return {
+            "status": "validated",
+            "validated_at": datetime.now(timezone.utc).isoformat(),
+            "engine": live.get("engine"),
+            "engine_ref": live.get("engine_ref"),
+            "debug_id": live.get("debug_id"),
+        }
+
+    def _quote_snapshot_mismatches(
+        self,
+        *,
+        snapshot_json: Dict[str, Any],
+        live_quote: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        mismatches: List[Dict[str, Any]] = []
+
+        snapshot_currency = str(
+            snapshot_json.get("charge_currency")
+            or snapshot_json.get("presentment_currency")
+            or snapshot_json.get("currency")
+            or ""
+        ).strip().upper()
+        live_currency = str(
+            live_quote.get("charge_currency")
+            or live_quote.get("presentment_currency")
+            or live_quote.get("currency")
+            or ""
+        ).strip().upper()
+        if snapshot_currency and live_currency and snapshot_currency != live_currency:
+            mismatches.append(
+                {
+                    "field": "currency",
+                    "quote": snapshot_currency,
+                    "live": live_currency,
+                }
+            )
+
+        snapshot_pricing = snapshot_json.get("pricing") if isinstance(snapshot_json.get("pricing"), dict) else {}
+        live_pricing = live_quote.get("pricing") if isinstance(live_quote.get("pricing"), dict) else {}
+        for field in ("subtotal", "discount_total", "shipping_fee", "tax", "total"):
+            quoted = self._money_for_validation(snapshot_pricing.get(field))
+            live = self._money_for_validation(live_pricing.get(field))
+            if quoted != live:
+                mismatches.append(
+                    {
+                        "field": f"pricing.{field}",
+                        "quote": str(quoted),
+                        "live": str(live),
+                    }
+                )
+
+        snapshot_lines = self._quote_lines_for_validation(snapshot_json.get("line_items") or [])
+        live_lines = self._quote_lines_for_validation(live_quote.get("line_items") or [])
+        if snapshot_lines != live_lines:
+            mismatches.append(
+                {
+                    "field": "line_items",
+                    "quote": snapshot_lines,
+                    "live": live_lines,
+                }
+            )
+
+        return mismatches
+
+    def _money_for_validation(self, value: Any) -> Decimal:
+        try:
+            return Decimal(str(value or "0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except Exception:
+            return Decimal("0.00")
+
+    def _quote_lines_for_validation(self, raw_lines: Any) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not isinstance(raw_lines, list):
+            return rows
+        for line in raw_lines:
+            if not isinstance(line, dict):
+                continue
+            try:
+                quantity = int(line.get("quantity") or 0)
+            except Exception:
+                quantity = 0
+            rows.append(
+                {
+                    "product_id": str(line.get("product_id") or "").strip(),
+                    "variant_id": str(line.get("variant_id") or "").strip(),
+                    "quantity": quantity,
+                    "unit_price_original": str(self._money_for_validation(line.get("unit_price_original"))),
+                    "unit_price_effective": str(self._money_for_validation(line.get("unit_price_effective"))),
+                    "line_discount_total": str(self._money_for_validation(line.get("line_discount_total"))),
+                }
+            )
+        rows.sort(key=lambda row: (row["product_id"], row["variant_id"], row["quantity"]))
+        return rows
 
     def _raise_if_shipping_unverified(
         self,

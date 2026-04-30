@@ -69,6 +69,16 @@ class QuoteLineItem(BaseModel):
     compare_at_savings: Decimal = Decimal("0")  # informational only; not included in discount_total
 
 
+AvailabilityStatus = Literal[
+    "available_confirmed",
+    "available_estimated",
+    "low_stock_confirmed",
+    "unavailable_confirmed",
+    "unknown_requires_validation",
+    "stale_requires_refresh",
+]
+
+
 class QuotePreviewResponse(BaseModel):
     quote_id: str
     expires_at: datetime
@@ -86,6 +96,11 @@ class QuotePreviewResponse(BaseModel):
     charge_currency: str
     settlement_currency: Optional[str] = None
     pricing: QuotePricing
+    availability_status: AvailabilityStatus = "available_confirmed"
+    available_quantity: Optional[int] = None
+    is_final: bool = True
+    source_updated_at: Optional[datetime] = None
+    warnings: List[str] = Field(default_factory=list)
     promotion_lines: List[PromotionLine]
     discount_evidence: Optional[Dict[str, Any]] = None
     store_discount_evidence: Optional[Dict[str, Any]] = None

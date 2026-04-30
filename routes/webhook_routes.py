@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import stripe
 import os
 import hmac
+import hashlib
 import json
 import socket
 from datetime import datetime
@@ -44,6 +45,7 @@ from services.refund_observability import (
     merge_refund_metadata,
     stripe_refund_metadata_patch,
 )
+from services.webhook_service import WebhookService
 from observability.reviews_metrics import record_shopify_webhook
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
@@ -521,6 +523,70 @@ def _stripe_object_to_dict(value: Any) -> Any:
     return value
 
 
+def _stripe_webhook_event_id(event: Dict[str, Any], payload: bytes, event_type: Optional[str]) -> str:
+    event_id = str((event or {}).get("id") or "").strip()
+    if event_id:
+        return event_id
+    digest = hashlib.sha256(payload or b"").hexdigest()
+    return f"stripe:{event_type or 'unknown'}:{digest}"
+
+
+async def _record_stripe_webhook_event_best_effort(
+    *,
+    event_id: str,
+    event_type: Optional[str],
+    payload: Dict[str, Any],
+    request_headers: Dict[str, str],
+    signature_verified: bool,
+    signature_header: Optional[str],
+) -> bool:
+    """
+    Returns True when this event was already processed and should be skipped.
+    Stripe already retries failed deliveries, so event persistence is best-effort and must not
+    turn a valid PSP event into a 500 solely because the audit table is unavailable.
+    """
+    try:
+        is_duplicate, _existing = await WebhookService.check_duplicate_event(event_id)
+        if is_duplicate:
+            return True
+        await WebhookService.record_webhook_event(
+            event_id=event_id,
+            event_type=str(event_type or "unknown"),
+            psp_type="stripe",
+            order_id=None,
+            payload=payload,
+            headers=request_headers,
+            signature_verified=signature_verified,
+            signature_header=signature_header,
+            status="pending",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Stripe webhook idempotency persistence unavailable; continuing event_id=%s err=%s",
+            event_id,
+            exc,
+        )
+    return False
+
+
+async def _mark_stripe_webhook_event_status_best_effort(
+    event_id: Optional[str],
+    status: str,
+    error_message: Optional[str] = None,
+) -> None:
+    if not event_id:
+        return
+    try:
+        await WebhookService.update_event_status(event_id, status, error_message)
+    except Exception as exc:
+        logger.warning(
+            "Stripe webhook status update failed event_id=%s status=%s err=%s",
+            event_id,
+            status,
+            exc,
+        )
+
+
 async def _emit_stripe_merchant_webhook_best_effort(
     order: Dict[str, Any],
     *,
@@ -591,11 +657,13 @@ async def handle_stripe_webhook(
     
     支持的事件：
     - payment_intent.succeeded: 支付成功
+    - payment_intent.amount_capturable_updated: manual-capture authorization ready
     - payment_intent.payment_failed: 支付失败
     - refund.created / refund.updated / refund.failed: 退款时间线
     - charge.refunded: 退款成功
     - charge.dispute.*: 争议/拒付（chargeback）信号（best-effort 记录，不自动变更订单状态）
     """
+    stripe_webhook_event_id: Optional[str] = None
     try:
         payload = await request.body()
         event = None
@@ -641,6 +709,19 @@ async def handle_stripe_webhook(
             data = {}
         
         logger.info(f"Received Stripe webhook: {event_type}")
+
+        stripe_webhook_event_id = _stripe_webhook_event_id(event, payload, event_type)
+        is_duplicate = await _record_stripe_webhook_event_best_effort(
+            event_id=stripe_webhook_event_id,
+            event_type=event_type,
+            payload=event,
+            request_headers=dict(request.headers),
+            signature_verified=bool(secret_candidates),
+            signature_header=stripe_signature,
+        )
+        if is_duplicate:
+            logger.info("Duplicate Stripe webhook skipped: %s", stripe_webhook_event_id)
+            return {"status": "success", "event": event_type, "duplicate": True}
         
         if event_type == "payment_intent.succeeded":
             # 支付成功
@@ -704,6 +785,69 @@ async def handle_stripe_webhook(
                     logger.info(
                         "Stripe payment success replay skipped for order %s due to settled or terminal state",
                         order_id,
+                    )
+
+        elif event_type == "payment_intent.amount_capturable_updated":
+            payment_intent_id = data.get("id")
+            payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
+            result = await _resolve_stripe_order_for_payment_event(
+                payment_intent_id=payment_intent_id,
+                payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+            )
+            if result:
+                from routes.order_routes import finalize_authorized_payment_order
+
+                auth_result = await finalize_authorized_payment_order(
+                    str(result["order_id"]),
+                    order=result,
+                    source_event="stripe_amount_capturable_webhook",
+                )
+                logger.info(
+                    "Stripe auth-first finalization for order %s returned %s",
+                    result["order_id"],
+                    auth_result.get("status"),
+                )
+
+        elif event_type == "checkout.session.completed":
+            # Stripe Checkout manual-capture sessions can complete before the
+            # amount_capturable webhook is processed. For explicitly marked
+            # auth-first orders, run the same merchant-order-before-capture
+            # finalizer; normal capture-first Checkout Sessions remain on the
+            # existing payment_intent.succeeded path.
+            session_id = data.get("id")
+            payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
+            auth_first_hint = (
+                isinstance(payment_meta, dict)
+                and (
+                    str(payment_meta.get("payment_flow") or "").strip().lower() == "authorization_first"
+                    or str(payment_meta.get("capture_method") or "").strip().lower() == "manual"
+                    or str(payment_meta.get("payment_capture_method") or "").strip().lower() == "manual"
+                    or str(payment_meta.get("stripe_capture_method") or "").strip().lower() == "manual"
+                )
+            )
+            if auth_first_hint:
+                result = await _resolve_stripe_order_for_payment_event(
+                    payment_intent_id=session_id,
+                    payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                )
+            else:
+                result = None
+            if result:
+                from routes.order_routes import (
+                    finalize_authorized_payment_order,
+                    order_uses_authorization_first_payment,
+                )
+
+                if order_uses_authorization_first_payment(result):
+                    auth_result = await finalize_authorized_payment_order(
+                        str(result["order_id"]),
+                        order=result,
+                        source_event="stripe_checkout_session_completed_webhook",
+                    )
+                    logger.info(
+                        "Stripe Checkout auth-first finalization for order %s returned %s",
+                        result["order_id"],
+                        auth_result.get("status"),
                     )
                 
         elif event_type == "payment_intent.payment_failed":
@@ -998,11 +1142,18 @@ async def handle_stripe_webhook(
             except Exception:
                 pass
         
+        await _mark_stripe_webhook_event_status_best_effort(stripe_webhook_event_id, "processed")
         return {"status": "success", "event": event_type}
         
-    except HTTPException:
+    except HTTPException as exc:
+        await _mark_stripe_webhook_event_status_best_effort(
+            stripe_webhook_event_id,
+            "failed",
+            str(getattr(exc, "detail", None) or exc),
+        )
         raise
     except Exception as e:
+        await _mark_stripe_webhook_event_status_best_effort(stripe_webhook_event_id, "failed", str(e))
         logger.exception(f"Error handling Stripe webhook: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -1297,11 +1448,11 @@ async def handle_shopify_webhook(
         record_shopify_webhook(result="success", reason="ok", topic=topic)
         logger.info(f"Received Shopify webhook for {merchant_id}: {topic}")
 
-        if topic.startswith("products/"):
+        if topic.startswith("products/") or topic == "inventory_levels/update":
             catalog_event = await record_catalog_sync_event(
                 merchant_id=merchant_id,
                 connector="shopify",
-                event_type="product_webhook",
+                event_type="inventory_webhook" if topic == "inventory_levels/update" else "product_webhook",
                 topic=topic,
                 payload_json=data if isinstance(data, dict) else {"raw": data},
                 source_ref=x_shopify_webhook_id or f"{merchant_id}:{topic}",
@@ -1889,6 +2040,11 @@ async def register_shopify_webhooks(
             "orders/updated",
             "orders/paid",
             "orders/cancelled",
+            # Catalog and inventory cache/index updates
+            "products/create",
+            "products/update",
+            "products/delete",
+            "inventory_levels/update",
             # Fulfillments
             "fulfillments/create",
             "fulfillments/update",

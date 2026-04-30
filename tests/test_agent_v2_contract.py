@@ -234,6 +234,66 @@ async def test_agent_v2_merchant_capabilities_exposes_access_scope_flags(
     assert merchant["policy_flags"]["has_write_discounts"] is True
     assert merchant["policy_flags"]["has_read_customers"] is True
     assert merchant["policy_flags"]["missing_optional_scopes"] == ["read_returns"]
+    assert merchant["commerce_capabilities"]["supports_live_quote"] is True
+    assert merchant["commerce_capabilities"]["supports_platform_order_writeback"] is True
+    assert merchant["psp_capabilities"]["provider"] == "stripe"
+    assert merchant["psp_capabilities"]["supports_auto_refund"] is True
+    assert merchant["psp_capabilities"]["order_flow_auth_first_enabled"] is False
+    assert merchant["supported_flows"]["payment_refunds"] is True
+    assert merchant["supported_flows"]["pivota_direct_checkout"] is True
+    assert merchant["supported_flows"]["external_platform_checkout"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_v2_merchant_capabilities_distinguishes_external_checkout_from_direct_purchase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_v2 as agent_v2
+    from routes.agent_auth import get_agent_context
+
+    async def fake_fetch_all(_query: str, _values: Dict[str, Any]) -> list[Dict[str, Any]]:
+        return [
+            {
+                "merchant_id": "m_contract",
+                "business_name": "Woo Merchant",
+                "status": "active",
+                "mcp_connected": True,
+                "mcp_platform": "woocommerce",
+                "psp_connected": False,
+                "psp_type": None,
+                "shopify_api_version": None,
+                "scopes_json": {"access_scopes": [], "missing_required_scopes": [], "missing_optional_scopes": []},
+                "has_shopify_payments": False,
+                "has_returns_api": False,
+                "last_checked_at": datetime.now(timezone.utc),
+            }
+        ]
+
+    async def fake_get_merchant_pcs_tier(*, merchant_id: str) -> str:
+        assert merchant_id == "m_contract"
+        return "tier_0"
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    monkeypatch.setattr(agent_v2.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_v2, "get_merchant_pcs_tier", fake_get_merchant_pcs_tier)
+
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/agent/v2/merchants/capabilities", params={"merchant_id": "m_contract"})
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+    assert resp.status_code == 200
+    merchant = resp.json()["merchants"][0]
+    assert merchant["connector"] == "woocommerce"
+    assert merchant["supported_flows"]["hosted_checkout"] is True
+    assert merchant["supported_flows"]["external_platform_checkout"] is True
+    assert merchant["supported_flows"]["pivota_direct_checkout"] is False
+    assert merchant["supported_flows"]["quote_refresh"] is False
+    assert merchant["commerce_capabilities"]["supports_live_quote"] is False
+    assert merchant["commerce_capabilities"]["supports_platform_checkout"] is True
+    assert merchant["commerce_capabilities"]["purchase_status"] == "requires_external_platform_checkout_validation"
 
 
 @pytest.mark.asyncio

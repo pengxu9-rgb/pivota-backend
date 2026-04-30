@@ -54,6 +54,17 @@ def test_agent_cart_validate_uses_cached_products_and_returns_variant_id(client)
     assert isinstance(payload.get("items"), list) and payload["items"]
     assert payload["items"][0]["product_id"] == product_id
     assert payload["items"][0]["variant_id"] == variant_id
+    assert payload["requires_quote"] is True
+    assert payload["inventory_guarantee"] == "not_guaranteed"
+    assert payload["commerce_path"] == "unsupported"
+    assert payload["legacy_or_fallback"] is True
+    assert payload["validation_authority"] == "cache_estimate"
+    assert payload["execution_policy"]["allows_pivota_order"] is False
+    assert payload["execution_policy"]["allows_psp_creation"] is False
+    assert payload["pricing"]["price_source"] == "products_cache_estimate"
+    assert payload["pricing"]["is_final"] is False
+    assert payload["pricing"]["validation_authority"] == "cache_estimate"
+    assert payload["items"][0]["availability_status"] == "unknown_requires_validation"
 
 
 def test_agent_cart_validate_accepts_variant_id_as_product_id(client):
@@ -98,3 +109,4 @@ def test_agent_cart_validate_accepts_variant_id_as_product_id(client):
     assert isinstance(payload.get("items"), list) and payload["items"]
     assert payload["items"][0]["product_id"] == product_id
     assert payload["items"][0]["variant_id"] == variant_id
+    assert payload["quote_required_before_purchase"] is True

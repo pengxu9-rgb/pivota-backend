@@ -100,6 +100,25 @@ class PSPAdapter(ABC):
         """退款"""
         pass
 
+    async def capture_payment(
+        self,
+        payment_intent_id: str,
+        amount: Optional[Decimal] = None,
+        currency: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Capture a previously authorized payment when the PSP supports it."""
+        return False, None, f"{self.__class__.__name__} does not support capture_payment"
+
+    async def cancel_payment_authorization(
+        self,
+        payment_intent_id: str,
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Void/cancel a previously authorized payment when the PSP supports it."""
+        return False, None, f"{self.__class__.__name__} does not support cancel_payment_authorization"
+
 
 class StripeAdapter(PSPAdapter):
     """Stripe PSP 适配器"""
@@ -143,6 +162,40 @@ class StripeAdapter(PSPAdapter):
             return "always"
 
         return "never"
+
+    def _resolve_capture_method(self, metadata: Dict[str, Any]) -> Optional[str]:
+        capture_method = str(
+            metadata.get("stripe_capture_method")
+            or metadata.get("capture_method")
+            or metadata.get("payment_capture_method")
+            or ""
+        ).strip().lower()
+        if capture_method in {"manual", "automatic"}:
+            return capture_method
+        return None
+
+    async def _resolve_payment_intent_ref(self, payment_reference: str) -> Tuple[Optional[str], Optional[str]]:
+        payment_reference = str(payment_reference or "").strip()
+        if not payment_reference:
+            return None, "payment_intent_id is required"
+        if not payment_reference.startswith("cs_"):
+            return payment_reference, None
+
+        session = await asyncio.to_thread(
+            self._client.v1.checkout.sessions.retrieve,
+            payment_reference,
+            {"expand": ["payment_intent"]},
+        )
+        session_payment_intent = getattr(session, "payment_intent", None)
+        if isinstance(session_payment_intent, dict):
+            payment_intent_ref = str(session_payment_intent.get("id") or "").strip()
+        elif hasattr(session_payment_intent, "id"):
+            payment_intent_ref = str(session_payment_intent.id or "").strip()
+        else:
+            payment_intent_ref = str(session_payment_intent or "").strip()
+        if not payment_intent_ref:
+            return None, f"Checkout Session {payment_reference} has no payment_intent"
+        return payment_intent_ref, None
     
     async def create_payment_intent(
         self,
@@ -164,6 +217,11 @@ class StripeAdapter(PSPAdapter):
 
             # Agent / Checkout 场景：返回可跳转的支付链接
             if stripe_mode == "checkout_session":
+                payment_intent_data: Dict[str, Any] = {"metadata": metadata}
+                capture_method = self._resolve_capture_method(metadata)
+                if capture_method:
+                    payment_intent_data["capture_method"] = capture_method
+
                 session = await asyncio.to_thread(
                     self._client.v1.checkout.sessions.create,
                     {
@@ -186,7 +244,7 @@ class StripeAdapter(PSPAdapter):
                         "success_url": "https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
                         "cancel_url": "https://merchant.pivota.cc/payment/cancel",
                         "metadata": metadata,
-                        "payment_intent_data": {"metadata": metadata},
+                        "payment_intent_data": payment_intent_data,
                     },
                     request_options,
                 )
@@ -209,17 +267,22 @@ class StripeAdapter(PSPAdapter):
 
             # 默认：PaymentIntent + client_secret（传统前端使用）
             redirect_policy = self._resolve_redirect_policy(metadata)
+            payment_payload = {
+                "amount": int(amount * 100),  # Stripe 使用分为单位
+                "currency": currency.lower(),
+                "metadata": metadata,
+                "automatic_payment_methods": {
+                    "enabled": True,
+                    "allow_redirects": redirect_policy,
+                },
+            }
+            capture_method = self._resolve_capture_method(metadata)
+            if capture_method:
+                payment_payload["capture_method"] = capture_method
+
             payment_intent = await asyncio.to_thread(
                 self._client.v1.payment_intents.create,
-                {
-                    "amount": int(amount * 100),  # Stripe 使用分为单位
-                    "currency": currency.lower(),
-                    "metadata": metadata,
-                    "automatic_payment_methods": {
-                        "enabled": True,
-                        "allow_redirects": redirect_policy,
-                    },
-                },
+                payment_payload,
                 request_options,
             )
 
@@ -237,6 +300,7 @@ class StripeAdapter(PSPAdapter):
                         "status": payment_intent.status,
                         "amount": payment_intent.amount,
                         "currency": payment_intent.currency,
+                        **({"capture_method": capture_method} if capture_method else {}),
                         **({"public_key": self.public_key} if self.public_key else {}),
                         **({"stripe_account": self.account_id} if self.account_id else {}),
                         **({"account_id": self.account_id} if self.account_id else {}),
@@ -249,6 +313,68 @@ class StripeAdapter(PSPAdapter):
             )
         except Exception as e:
             # Fall back to generic exception to avoid dependency on stripe.error namespace
+            return False, None, str(e)
+
+    async def capture_payment(
+        self,
+        payment_intent_id: str,
+        amount: Optional[Decimal] = None,
+        currency: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Capture a Stripe PaymentIntent created with capture_method=manual."""
+        try:
+            payment_intent_ref, resolve_error = await self._resolve_payment_intent_ref(payment_intent_id)
+            if resolve_error or not payment_intent_ref:
+                return False, None, resolve_error or "Unable to resolve payment_intent"
+
+            capture_data: Dict[str, Any] = {}
+            if amount:
+                capture_data["amount_to_capture"] = int(amount * 100)
+
+            request_options = None
+            if idempotency_key:
+                request_options = {"idempotency_key": str(idempotency_key)}
+
+            payment_intent = await asyncio.to_thread(
+                self._client.v1.payment_intents.capture,
+                payment_intent_ref,
+                capture_data,
+                request_options,
+            )
+            return True, str(getattr(payment_intent, "id", payment_intent_ref)), None
+        except Exception as e:
+            return False, None, str(e)
+
+    async def cancel_payment_authorization(
+        self,
+        payment_intent_id: str,
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Cancel an uncaptured Stripe PaymentIntent authorization."""
+        try:
+            payment_intent_ref, resolve_error = await self._resolve_payment_intent_ref(payment_intent_id)
+            if resolve_error or not payment_intent_ref:
+                return False, None, resolve_error or "Unable to resolve payment_intent"
+
+            cancel_data: Dict[str, Any] = {}
+            reason_norm = str(reason or "").strip().lower()
+            if reason_norm in {"duplicate", "fraudulent", "requested_by_customer", "abandoned"}:
+                cancel_data["cancellation_reason"] = reason_norm
+
+            request_options = None
+            if idempotency_key:
+                request_options = {"idempotency_key": str(idempotency_key)}
+
+            payment_intent = await asyncio.to_thread(
+                self._client.v1.payment_intents.cancel,
+                payment_intent_ref,
+                cancel_data,
+                request_options,
+            )
+            return True, str(getattr(payment_intent, "id", payment_intent_ref)), None
+        except Exception as e:
             return False, None, str(e)
     
     async def confirm_payment(
@@ -320,11 +446,16 @@ class StripeAdapter(PSPAdapter):
                 payment_status = str(_get(session, "payment_status", "") or "").lower()
                 intent_status = str(_get(payment_intent, "status", "") or "").lower()
                 status = intent_status or ("succeeded" if payment_status == "paid" else payment_status or "unknown")
-                amount_minor = (
-                    _get(payment_intent, "amount_received")
-                    if payment_intent is not None
-                    else None
-                )
+                if intent_status == "requires_capture":
+                    amount_minor = None
+                    if payment_intent is not None:
+                        amount_minor = _get(payment_intent, "amount") or _get(payment_intent, "amount_capturable")
+                else:
+                    amount_minor = (
+                        _get(payment_intent, "amount_received")
+                        if payment_intent is not None
+                        else None
+                    )
                 if amount_minor is None:
                     amount_minor = _get(session, "amount_total")
                 currency = _get(payment_intent, "currency") if payment_intent is not None else None
@@ -344,16 +475,20 @@ class StripeAdapter(PSPAdapter):
                 self._client.v1.payment_intents.retrieve,
                 payment_intent_id,
             )
+            status = str(_get(payment_intent, "status", "") or "").lower() or "unknown"
             amount_minor = _get(payment_intent, "amount_received")
+            if status == "requires_capture":
+                amount_minor = _get(payment_intent, "amount") or _get(payment_intent, "amount_capturable")
             if amount_minor is None:
                 amount_minor = _get(payment_intent, "amount")
             return (
                 True,
                 {
-                    "status": str(_get(payment_intent, "status", "") or "").lower() or "unknown",
+                    "status": status,
                     "amount": _minor_to_major(amount_minor),
                     "currency": str(_get(payment_intent, "currency", "") or "").upper() or None,
                     "payment_reference_type": "stripe_payment_intent",
+                    "capture_method": _get(payment_intent, "capture_method"),
                 },
                 None,
             )
@@ -478,6 +613,29 @@ class AdyenAdapter(PSPAdapter):
             "ops_order_backed_canary",
             "merchant_order_backed_canary",
         }
+
+    @staticmethod
+    def _resolve_adyen_capture_delay_hours(metadata: Dict[str, Any]) -> Optional[int]:
+        capture_method = str(
+            metadata.get("adyen_capture_method")
+            or metadata.get("capture_method")
+            or metadata.get("payment_capture_method")
+            or ""
+        ).strip().lower()
+        payment_flow = str(metadata.get("payment_flow") or "").strip().lower()
+        explicit_delay = metadata.get("adyen_capture_delay_hours")
+        if explicit_delay is not None:
+            try:
+                delay = int(explicit_delay)
+                return max(1, min(delay, 672))
+            except Exception:
+                return None
+        if capture_method == "manual" or payment_flow == "authorization_first":
+            # Adyen Checkout Sessions expose captureDelayHours in-request. True
+            # manual capture may also require merchant-account configuration, so
+            # order-flow auth-first stays disabled until merchant setup is proven.
+            return 672
+        return None
     
     async def create_payment_intent(
         self,
@@ -511,6 +669,9 @@ class AdyenAdapter(PSPAdapter):
                 "shopperLocale": "en_US",
                 "channel": "Web"
             }
+            capture_delay_hours = self._resolve_adyen_capture_delay_hours(metadata)
+            if capture_delay_hours is not None:
+                payload["captureDelayHours"] = capture_delay_hours
 
             if self._should_force_card_only_for_canary(metadata):
                 # Adyen test accounts can default to wallet-only methods for sessions.
@@ -614,6 +775,81 @@ class AdyenAdapter(PSPAdapter):
         # Adyen 需要通过 webhook 或 polling 查询状态
         # 简化实现：返回 pending
         return True, "pending", None
+
+    async def capture_payment(
+        self,
+        payment_intent_id: str,
+        amount: Optional[Decimal] = None,
+        currency: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Capture an authorised Adyen payment by its pspReference."""
+        try:
+            headers = {
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json",
+            }
+            if idempotency_key:
+                headers["Idempotency-Key"] = str(idempotency_key)[:64]
+
+            payload: Dict[str, Any] = {
+                "merchantAccount": self.merchant_account,
+                "reference": str(idempotency_key or f"capture_{payment_intent_id[:16]}")[:80],
+            }
+            if amount is None or not currency:
+                return False, None, "Adyen capture requires amount and currency"
+            payload["amount"] = {
+                "value": int(amount * 100),
+                "currency": str(currency).upper(),
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/payments/{payment_intent_id}/captures",
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0,
+                )
+                if response.status_code in (200, 201, 202):
+                    data = response.json()
+                    return True, data.get("pspReference") or data.get("paymentPspReference"), None
+                return False, None, f"Adyen capture error: {response.status_code} - {response.text}"
+        except Exception as e:
+            return False, None, str(e)
+
+    async def cancel_payment_authorization(
+        self,
+        payment_intent_id: str,
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Cancel an authorised Adyen payment before capture by its pspReference."""
+        try:
+            headers = {
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json",
+            }
+            if idempotency_key:
+                headers["Idempotency-Key"] = str(idempotency_key)[:64]
+
+            payload = {
+                "merchantAccount": self.merchant_account,
+                "reference": str(idempotency_key or reason or f"cancel_{payment_intent_id[:16]}")[:80],
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/payments/{payment_intent_id}/cancels",
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0,
+                )
+                if response.status_code in (200, 201, 202):
+                    data = response.json()
+                    return True, data.get("pspReference") or data.get("paymentPspReference") or payment_intent_id, None
+                return False, None, f"Adyen cancel error: {response.status_code} - {response.text}"
+        except Exception as e:
+            return False, None, str(e)
     
     async def refund_payment(
         self,

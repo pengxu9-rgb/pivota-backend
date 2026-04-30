@@ -216,6 +216,41 @@ async def test_stripe_payment_status_details_from_checkout_session(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_stripe_payment_status_details_from_manual_capture_checkout_session_uses_authorized_amount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import adapters.psp_adapter as psp_adapter
+
+    adapter = psp_adapter.StripeAdapter("sk_test_fake")
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return SimpleNamespace(
+            id="cs_verify_auth",
+            payment_status="unpaid",
+            amount_total=5510,
+            currency="eur",
+            payment_intent=SimpleNamespace(
+                id="pi_verify_auth",
+                status="requires_capture",
+                amount=5510,
+                amount_capturable=5510,
+                amount_received=0,
+                currency="eur",
+            ),
+        )
+
+    monkeypatch.setattr(psp_adapter.asyncio, "to_thread", fake_to_thread)
+
+    ok, details, error = await adapter.get_payment_status_details("cs_verify_auth")
+
+    assert ok is True
+    assert error is None
+    assert details["status"] == "requires_capture"
+    assert details["amount"] == "55.10"
+    assert details["currency"] == "EUR"
+
+
+@pytest.mark.asyncio
 async def test_stripe_refund_resolves_checkout_session_to_payment_intent(monkeypatch: pytest.MonkeyPatch) -> None:
     import adapters.psp_adapter as psp_adapter
 
