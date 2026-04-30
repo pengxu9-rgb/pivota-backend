@@ -53,9 +53,9 @@ def _quote_snapshot() -> SimpleNamespace:
     )
 
 
-def _live_quote(*, total: str = "13.00") -> dict:
+def _live_quote(*, total: str = "13.00", quote_id: str = "q_transient") -> dict:
     return {
-        "quote_id": "q_transient",
+        "quote_id": quote_id,
         "engine": "shopify_storefront_cart",
         "engine_ref": "cart_live",
         "currency": "USD",
@@ -116,6 +116,40 @@ async def test_validate_quote_snapshot_live_rejects_changed_price(monkeypatch: p
 
     assert exc.value.code == "QUOTE_STALE_REPRICE_REQUIRED"
     assert any(row["field"] == "pricing.total" for row in exc.value.details["mismatches"])
+    assert "replacement_quote" not in exc.value.details
+
+
+@pytest.mark.asyncio
+async def test_validate_quote_snapshot_live_returns_replacement_quote_for_user_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = QuoteService()
+    calls: list[dict] = []
+
+    async def fake_preview_quote(**kwargs):
+        calls.append(kwargs)
+        quote_id = "q_repriced" if kwargs.get("persist") else "q_transient"
+        return _live_quote(total="14.00", quote_id=quote_id)
+
+    monkeypatch.setattr(svc, "preview_quote", fake_preview_quote)
+
+    with pytest.raises(QuoteError) as exc:
+        await svc.validate_quote_snapshot_live(
+            _quote_snapshot(),
+            create_replacement_quote_on_mismatch=True,
+        )
+
+    assert exc.value.code == "QUOTE_STALE_REPRICE_REQUIRED"
+    assert [call["persist"] for call in calls] == [False, True]
+    assert [call["emit_analytics"] for call in calls] == [False, False]
+    assert calls[1]["require_persistence"] is True
+    assert exc.value.details["action"] == "review_repriced_quote"
+    assert exc.value.details["requires_user_confirmation"] is True
+    replacement = exc.value.details["replacement_quote"]
+    assert replacement["quote_id"] == "q_repriced"
+    assert replacement["quote_required_before_purchase"] is True
+    assert replacement["requires_user_confirmation"] is True
+    assert replacement["pricing"]["total"] == "14.00"
 
 
 @pytest.mark.asyncio

@@ -71,9 +71,16 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
             },
         )
 
-    async def fake_validate_quote_snapshot_live(self, quote, *, customer_email: str | None = None):
+    async def fake_validate_quote_snapshot_live(
+        self,
+        quote,
+        *,
+        customer_email: str | None = None,
+        create_replacement_quote_on_mismatch: bool = False,
+    ):
         assert quote.quote_id == "q_test"
         assert customer_email == "peng@chydan.com"
+        assert create_replacement_quote_on_mismatch is True
         return {"status": "validated", "engine": "shopify_storefront_cart", "engine_ref": "cart_ref_live"}
 
     async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
@@ -206,11 +213,35 @@ async def test_live_revalidation_failure_blocks_order_and_psp(
             },
         )
 
-    async def fake_validate_quote_snapshot_live(self, quote, *, customer_email: str | None = None):
+    async def fake_validate_quote_snapshot_live(
+        self,
+        quote,
+        *,
+        customer_email: str | None = None,
+        create_replacement_quote_on_mismatch: bool = False,
+    ):
+        assert create_replacement_quote_on_mismatch is True
+        details = {"quote_id": quote.quote_id, "mismatches": [{"field": "pricing.total"}]}
+        if quote_error_code == "QUOTE_STALE_REPRICE_REQUIRED":
+            details["replacement_quote"] = {
+                "quote_id": "q_repriced",
+                "expires_at": "2026-04-30T06:00:00+00:00",
+                "currency": "USD",
+                "availability_status": "available_confirmed",
+                "is_final": True,
+                "pricing": {
+                    "subtotal": "11.00",
+                    "discount_total": "0.00",
+                    "shipping_fee": "0.00",
+                    "tax": "0.00",
+                    "total": "11.00",
+                },
+                "requires_user_confirmation": True,
+            }
         raise QuoteError(
             quote_error_code,
             "Quote no longer matches live store pricing or availability. Refresh the quote before checkout.",
-            details={"quote_id": quote.quote_id, "mismatches": [{"field": "pricing.total"}]},
+            details=details,
         )
 
     async def fail_create_order(*args, **kwargs):
@@ -249,3 +280,11 @@ async def test_live_revalidation_failure_blocks_order_and_psp(
 
     assert exc.value.status_code == 409
     assert exc.value.detail["error"] == quote_error_code
+    if quote_error_code == "QUOTE_STALE_REPRICE_REQUIRED":
+        assert exc.value.detail["status"] == "reprice_required"
+        assert exc.value.detail["action"] == "review_repriced_quote"
+        assert exc.value.detail["requires_user_confirmation"] is True
+        assert exc.value.detail["payment_created"] is False
+        assert exc.value.detail["order_created"] is False
+        assert exc.value.detail["replacement_quote_id"] == "q_repriced"
+        assert exc.value.detail["details"]["replacement_quote"]["pricing"]["total"] == "11.00"

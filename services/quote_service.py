@@ -197,6 +197,7 @@ class QuoteService:
         brief_schema_version: Optional[str] = None,
         persist: bool = True,
         emit_analytics: bool = True,
+        require_persistence: bool = False,
     ) -> Dict[str, Any]:
         codes = normalize_discount_codes(discount_codes)
         fingerprint = compute_request_fingerprint(
@@ -508,6 +509,13 @@ class QuoteService:
                     "Failed to persist quote (best-effort)",
                     extra={"merchant_id": merchant_id, "quote_id": quote_id, "error": str(e)},
                 )
+                if require_persistence:
+                    raise QuoteError(
+                        "QUOTE_PERSISTENCE_FAILED",
+                        "Unable to persist the replacement quote. Please refresh quote again.",
+                        debug_id=(result.debug or {}).get("debug_id"),
+                        details={"quote_id": quote_id, "error": str(e)[:500]},
+                    )
 
         return {
             "quote_id": quote_id,
@@ -542,6 +550,7 @@ class QuoteService:
         quote: QuoteSnapshot,
         *,
         customer_email: Optional[str] = None,
+        create_replacement_quote_on_mismatch: bool = False,
     ) -> Dict[str, Any]:
         """
         Re-price/re-check an active quote against the source-of-truth platform just before order creation.
@@ -553,32 +562,60 @@ class QuoteService:
         request_json = quote.request_json if isinstance(quote.request_json, dict) else {}
         snapshot_json = quote.snapshot_json if isinstance(quote.snapshot_json, dict) else {}
 
+        quote_kwargs = {
+            "merchant_id": quote.merchant_id,
+            "agent_id": quote.agent_id,
+            "items": request_json.get("items") or [],
+            "discount_codes": request_json.get("discount_codes") or [],
+            "customer_email": customer_email,
+            "shipping_address": request_json.get("shipping_address"),
+            "selected_delivery_option": request_json.get("selected_delivery_option"),
+            "payment_context": request_json.get("payment_context"),
+        }
+
         live = await self.preview_quote(
-            merchant_id=quote.merchant_id,
-            agent_id=quote.agent_id,
-            items=request_json.get("items") or [],
-            discount_codes=request_json.get("discount_codes") or [],
-            customer_email=customer_email,
-            shipping_address=request_json.get("shipping_address"),
-            selected_delivery_option=request_json.get("selected_delivery_option"),
-            payment_context=request_json.get("payment_context"),
+            **quote_kwargs,
             persist=False,
             emit_analytics=False,
         )
 
         mismatches = self._quote_snapshot_mismatches(snapshot_json=snapshot_json, live_quote=live)
         if mismatches:
+            details: Dict[str, Any] = {
+                "quote_id": quote.quote_id,
+                "quote_expires_at": quote.expires_at.isoformat() if quote.expires_at else None,
+                "live_engine": live.get("engine"),
+                "live_engine_ref": live.get("engine_ref"),
+                "mismatches": mismatches,
+                "action": "review_repriced_quote",
+                "requires_user_confirmation": True,
+            }
+            if create_replacement_quote_on_mismatch:
+                try:
+                    replacement_quote = await self.preview_quote(
+                        **quote_kwargs,
+                        persist=True,
+                        emit_analytics=False,
+                        require_persistence=True,
+                    )
+                    details["replacement_quote"] = self._quote_for_confirmation_response(replacement_quote)
+                except QuoteError as replacement_err:
+                    details["replacement_quote_error"] = {
+                        "error": replacement_err.code,
+                        "message": replacement_err.message,
+                        "debug_id": replacement_err.debug_id,
+                        "details": replacement_err.details,
+                    }
+                except Exception as replacement_err:
+                    details["replacement_quote_error"] = {
+                        "error": "REPLACEMENT_QUOTE_FAILED",
+                        "message": str(replacement_err)[:500],
+                    }
             raise QuoteError(
                 "QUOTE_STALE_REPRICE_REQUIRED",
-                "Quote no longer matches live store pricing or availability. Refresh the quote before checkout.",
+                "Quote changed. Review the updated quote before checkout.",
                 debug_id=quote.debug_id or live.get("debug_id"),
-                details={
-                    "quote_id": quote.quote_id,
-                    "quote_expires_at": quote.expires_at.isoformat() if quote.expires_at else None,
-                    "live_engine": live.get("engine"),
-                    "live_engine_ref": live.get("engine_ref"),
-                    "mismatches": mismatches,
-                },
+                details=details,
             )
 
         return {
@@ -588,6 +625,37 @@ class QuoteService:
             "engine_ref": live.get("engine_ref"),
             "debug_id": live.get("debug_id"),
         }
+
+    def _quote_for_confirmation_response(self, quote: Dict[str, Any]) -> Dict[str, Any]:
+        fields = [
+            "quote_id",
+            "expires_at",
+            "engine",
+            "engine_ref",
+            "currency",
+            "presentment_currency",
+            "charge_currency",
+            "settlement_currency",
+            "availability_status",
+            "available_quantity",
+            "is_final",
+            "source_updated_at",
+            "warnings",
+            "pricing",
+            "line_items",
+            "delivery_options",
+            "checkout_url",
+            "debug_id",
+        ]
+        out = {field: quote.get(field) for field in fields if field in quote}
+        out.update(
+            {
+                "requires_user_confirmation": True,
+                "quote_required_before_purchase": True,
+                "validation_authority": "pivota_live_quote",
+            }
+        )
+        return self._json_safe(out)
 
     def _quote_snapshot_mismatches(
         self,
@@ -1254,6 +1322,8 @@ class QuoteService:
     def _json_safe(self, value: Any) -> Any:
         if isinstance(value, Decimal):
             return str(value)
+        if isinstance(value, datetime):
+            return value.isoformat()
         if isinstance(value, dict):
             return {k: self._json_safe(v) for k, v in value.items()}
         if isinstance(value, list):
