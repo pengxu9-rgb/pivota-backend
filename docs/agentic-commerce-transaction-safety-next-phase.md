@@ -173,11 +173,13 @@ Production alerts/metrics to add:
 - `reconciliation_drift_count`
 - `webhook_duplicate_count`
 - `webhook_failed_count`
+- `webhook_failed_order_impacting_count`
+- `webhook_failed_non_order_count`
 
 Recommended alert thresholds:
 
 - Page immediately when `paid_merchant_order_failed_count > 0` for live merchants.
-- Alert when webhook failure count or reconciliation drift count is non-zero for more than one scheduled interval.
+- Alert when order-impacting webhook failure count or reconciliation drift count is non-zero for more than one scheduled interval. Raw `webhook_failed_count` should be investigated by event type because PSP report or dispute notifications can be non-order-impacting.
 - Alert when merchant order retry failures increase after deployment.
 
 ## Rollout Plan
@@ -222,7 +224,7 @@ This branch now implements the P0 recovery surface:
 - Store capability responses now also distinguish `supports_platform_checkout` from `supports_platform_order_writeback`; WooCommerce and BigCommerce can have order writeback without being live-quote purchase-ready.
 - PSP capability responses now distinguish Stripe, Adyen, Checkout.com, and PayPal. Stripe, PayPal, Adyen, and Checkout.com expose lifecycle primitives where implemented; authorization-first remains disabled in the default order flow and requires explicit provider/platform wiring.
 - Non-Stripe refund recovery now passes idempotency keys through Adyen, Checkout.com, and PayPal adapters; PayPal payment creation, confirmation, status, authorization, capture, void, and token-cache behavior now follow the common PSP interface expectations.
-- `GET /orders/ops/transaction-safety/metrics` exposes best-effort counters for paid merchant-order failures, retry success/failure, quote revalidation failure, reconciliation drift, webhook duplicate, and webhook failure alerting.
+- `GET /orders/ops/transaction-safety/metrics` exposes best-effort counters for paid merchant-order failures, retry success/failure, quote revalidation failure, reconciliation drift, webhook duplicate, and webhook failure alerting. Webhook failure alerting is split into raw failure count, order-impacting failures, and non-order failures.
 - The same metrics endpoint now exposes auth-first lifecycle counters for authorized payments, captures after merchant-order writeback, capture failures, and authorization void failures.
 - Stripe PaymentIntent and Checkout Session support now includes manual capture primitives behind adapter metadata (`capture_method=manual`) plus idempotent capture and cancel-authorization methods. Stripe Checkout Session auth-first can finalize from either `payment_intent.amount_capturable_updated` or `checkout.session.completed`. PayPal support now includes Orders v2 `AUTHORIZE`, authorization capture, and authorization void. Adyen and Checkout.com now include idempotent capture/cancel adapter primitives but are not wired into order-level auth-first. Stripe and PayPal are wired only into the feature-flagged Shopify auth-first order flow.
 - `POST /agent/v1/checkout/external-platform` adds a store-platform-hosted checkout path for platforms without Pivota live quote adapters. The endpoint returns a merchant checkout redirect, creates no Pivota order, creates no PSP payment, and marks price/inventory as non-final from Pivota's perspective.
