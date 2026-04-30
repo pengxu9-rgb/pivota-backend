@@ -74,6 +74,7 @@ from services.commerce_execution_policy import (
     resolve_commerce_execution_policy,
 )
 from services.shopify_transactions_service import (
+    annotate_shopify_order_best_effort,
     extract_shopify_access_token,
     ensure_external_payment_transaction_best_effort,
     list_shopify_order_transactions,
@@ -2812,6 +2813,90 @@ async def _update_order_shopify_sync_metadata_best_effort(
         pass
 
 
+async def _cancel_orphan_shopify_order_without_refund_best_effort(
+    *,
+    order_id: str,
+    order: Dict[str, Any],
+    shop_domain: str,
+    access_token: str,
+    shopify_order_id: str,
+    reason: str,
+) -> Dict[str, Any]:
+    if not (shop_domain and access_token and shopify_order_id):
+        return {"ok": False, "skipped": True, "reason": "missing_shopify_cancel_context"}
+
+    annotation_result: Dict[str, Any] = {}
+    try:
+        annotation_result = await annotate_shopify_order_best_effort(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            shopify_order_id=shopify_order_id,
+            note_attributes={
+                "pivota_order_id": str(order_id),
+                "pivota_orphan_reason": str(reason or "merchant_order_link_blocked")[:255],
+                "pivota_recovery_required": "refund_or_manual_review",
+            },
+            tags=["pivota-orphan-order", "pivota-order-link-blocked"],
+        )
+    except Exception as exc:
+        annotation_result = {"ok": False, "error": str(exc)[:500]}
+
+    cancel_result: Dict[str, Any] = {
+        "ok": False,
+        "shopify_order_id": shopify_order_id,
+        "annotation": annotation_result,
+    }
+    try:
+        url = f"https://{shop_domain}/admin/api/2024-01/orders/{shopify_order_id}/cancel.json"
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "reason": "other",
+                    "email": False,
+                    # Funds are handled by Pivota/PSP recovery. Do not trigger a Shopify refund here.
+                    "refund": False,
+                    "restock": True,
+                },
+            )
+        cancel_result.update(
+            {
+                "ok": response.status_code in (200, 201),
+                "status_code": response.status_code,
+                "body": None if response.status_code in (200, 201) else (response.text or "")[:500],
+            }
+        )
+    except Exception as exc:
+        cancel_result.update({"ok": False, "error": str(exc)[:500]})
+
+    try:
+        await log_order_event(
+            event_type=(
+                "shopify_orphan_order_cancelled"
+                if cancel_result.get("ok")
+                else "shopify_orphan_order_cancel_failed"
+            ),
+            order_id=order_id,
+            merchant_id=str((order or {}).get("merchant_id") or ""),
+            total_amount=float((order or {}).get("total") or 0),
+            currency=str((order or {}).get("currency") or "USD"),
+            metadata={
+                "shopify_order_id": shopify_order_id,
+                "domain": shop_domain,
+                "reason": reason,
+                "cancel_result": cancel_result,
+            },
+        )
+    except Exception:
+        pass
+
+    return cancel_result
+
+
 async def _mark_merchant_order_sync_failed_best_effort(
     *,
     order_id: str,
@@ -2849,6 +2934,14 @@ async def _mark_merchant_order_sync_failed_best_effort(
             "retry_count": retry_count,
         }
     )
+    orphan_order = metadata.get("shopify_orphan_order") if isinstance(metadata.get("shopify_orphan_order"), dict) else {}
+    if orphan_order:
+        merchant_order["orphan_platform_order"] = orphan_order
+        merchant_order["orphan_platform_order_id"] = (
+            orphan_order.get("shopify_order_id")
+            or orphan_order.get("platform_order_id")
+        )
+        merchant_order["orphan_platform_order_recovery"] = orphan_order.get("recovery_status")
     metadata["merchant_order"] = merchant_order
     payment_recovery = metadata.get("payment_recovery") if isinstance(metadata.get("payment_recovery"), dict) else {}
     payment_recovery = dict(payment_recovery or {})
@@ -5221,10 +5314,11 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
         ) -> Optional[str]:
             query = """
             query($query: String!) {
-              orders(first: 1, query: $query) {
+              orders(first: 5, query: $query) {
                 edges {
                   node {
                     legacyResourceId
+                    cancelledAt
                   }
                 }
               }
@@ -5242,10 +5336,14 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                 orders_node = data.get("orders") if isinstance(data, dict) else None
                 edges = orders_node.get("edges") if isinstance(orders_node, dict) else None
                 if isinstance(edges, list) and edges:
-                    node = (edges[0] or {}).get("node") or {}
-                    legacy = node.get("legacyResourceId")
-                    legacy_str = str(legacy).strip() if legacy is not None else ""
-                    return legacy_str or None
+                    for edge in edges:
+                        node = (edge or {}).get("node") or {}
+                        if node.get("cancelledAt"):
+                            continue
+                        legacy = node.get("legacyResourceId")
+                        legacy_str = str(legacy).strip() if legacy is not None else ""
+                        if legacy_str:
+                            return legacy_str
             except Exception:
                 return None
             return None
@@ -5583,6 +5681,35 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
                         reconciliation.get("status"),
                         reconciliation.get("mismatches"),
                         reconciliation.get("unverified"),
+                    )
+                    cancel_result = await _cancel_orphan_shopify_order_without_refund_best_effort(
+                        order_id=order_id,
+                        order=order,
+                        shop_domain=shop_domain,
+                        access_token=access_token,
+                        shopify_order_id=shopify_order_id,
+                        reason="shopify_reconciliation_failed_after_write",
+                    )
+                    await _update_order_shopify_sync_metadata_best_effort(
+                        order_id=order_id,
+                        order=order,
+                        fields={
+                            "shopify_orphan_order": {
+                                "platform": "shopify",
+                                "shopify_order_id": shopify_order_id,
+                                "store_id": str((store_used or {}).get("store_id") or "").strip() or None,
+                                "domain": shop_domain,
+                                "reason": "shopify_reconciliation_failed_after_write",
+                                "reconciliation": reconciliation,
+                                "recovery_status": (
+                                    "cancelled_without_shopify_refund"
+                                    if cancel_result.get("ok")
+                                    else "requires_operator_cancel"
+                                ),
+                                "cancel_result": cancel_result,
+                                "recorded_at": datetime.utcnow().isoformat() + "Z",
+                            }
+                        },
                     )
                     return False
 
