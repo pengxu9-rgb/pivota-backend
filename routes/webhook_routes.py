@@ -898,6 +898,7 @@ async def handle_stripe_webhook(
             query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
             from db.database import database
             result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
+            result = _db_row_to_dict(result)
             
             if result:
                 order_id = result["order_id"]

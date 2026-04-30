@@ -888,17 +888,33 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
         },
     )
 
-    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+    class FakeDatabaseRecord:
+        """Mimic production database records where `.get` is not a dict method."""
+
+        get = None
+
+        def __init__(self, data: Dict[str, Any]) -> None:
+            self._data = data
+
+        def keys(self):
+            return self._data.keys()
+
+        def __getitem__(self, key: str) -> Any:
+            return self._data[key]
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Any:
         assert values["payment_intent_id"] == "pi_refund_contract"
-        return {
-            "order_id": "ORD_STRIPE_REFUND",
-            "merchant_id": "m_stripe",
-            "payment_intent_id": "pi_refund_contract",
-            "total": "20.00",
-            "total_refunded": "0.00",
-            "currency": "USD",
-            "metadata": {},
-        }
+        return FakeDatabaseRecord(
+            {
+                "order_id": "ORD_STRIPE_REFUND",
+                "merchant_id": "m_stripe",
+                "payment_intent_id": "pi_refund_contract",
+                "total": "20.00",
+                "total_refunded": "0.00",
+                "currency": "USD",
+                "metadata": {},
+            }
+        )
 
     async def fake_update_order_status(order_id: str, status: str, **kwargs: Any) -> None:
         status_updates.append({"order_id": order_id, "status": status, **kwargs})
