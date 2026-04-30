@@ -862,6 +862,67 @@ async def test_cancel_internal_order_backed_canary_cancels_unpaid_ops_order(
     assert updates[0]["additional_fields"]["cancelled_at"] is not None
 
 
+@pytest.mark.asyncio
+async def test_cancel_internal_order_backed_canary_accepts_verified_update_when_rowcount_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.payment_execution_routes as module
+
+    reads = [
+        {
+            "order_id": "ORD_CANARY_LIVE_1",
+            "merchant_id": "merch_test_payment",
+            "status": "pending",
+            "payment_status": "awaiting_payment",
+            "metadata": {
+                "ops_canary": True,
+                "source": "ops_order_backed_canary",
+            },
+        },
+        {
+            "order_id": "ORD_CANARY_LIVE_1",
+            "merchant_id": "merch_test_payment",
+            "status": "cancelled",
+            "payment_status": "cancelled",
+            "metadata": {
+                "ops_canary": True,
+                "source": "ops_order_backed_canary",
+                "cleanup_source": "ops_order_backed_canary_cleanup",
+                "cleanup_reason": "ops_canary_cleanup",
+            },
+        },
+    ]
+
+    async def fake_get_order(order_id: str):
+        assert order_id == "ORD_CANARY_LIVE_1"
+        return reads.pop(0)
+
+    async def fake_update_order_status(order_id: str, status: str, **additional_fields):
+        assert order_id == "ORD_CANARY_LIVE_1"
+        assert status == "cancelled"
+        assert additional_fields["payment_status"] == "cancelled"
+        return False
+
+    monkeypatch.setattr(module.settings, "readiness_internal_api_key", "internal_test_key", raising=False)
+    monkeypatch.setattr(module, "get_order", fake_get_order)
+    monkeypatch.setattr(module, "update_order_status", fake_update_order_status)
+
+    response = await module.cancel_internal_order_backed_canary(
+        merchant_id="merch_test_payment",
+        order_id="ORD_CANARY_LIVE_1",
+        request=_build_request("/payment/internal/canary/merchants/merch_test_payment/orders/ORD_CANARY_LIVE_1/cancel"),
+        x_pivota_internal_key="internal_test_key",
+    )
+
+    assert response == {
+        "success": True,
+        "order_id": "ORD_CANARY_LIVE_1",
+        "status": "cancelled",
+        "message": "Order cancelled",
+    }
+    assert reads == []
+
+
 def test_build_payment_initiation_result_normalizes_decimal_raw_payload() -> None:
     from services.merchant_payment_initiation_service import build_payment_initiation_result
 
