@@ -1897,10 +1897,12 @@ def _pricing_quote_has_unverified_shipping(pricing_quote_meta: Dict[str, Any]) -
 
 def _pricing_quote_discount_total(pricing_quote_meta: Dict[str, Any]) -> Decimal:
     pricing = pricing_quote_meta.get("pricing") if isinstance(pricing_quote_meta, dict) else None
-    if isinstance(pricing, dict):
-        total = _money2(pricing.get("discount_total"))
-        if total > 0:
-            return total
+    if isinstance(pricing, dict) and pricing.get("discount_total") is not None:
+        # `pricing.discount_total` is the authoritative product/order discount
+        # total used for Shopify order reconciliation. Shipping discounts are
+        # represented through `shipping_fee` / shipping evidence, and must not
+        # be folded into Shopify `total_discounts`.
+        return _money2(pricing.get("discount_total"))
 
     total = Decimal("0.00")
     for collection_key in ("promotion_lines",):
