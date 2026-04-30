@@ -285,6 +285,7 @@ async def test_transaction_safety_metrics_expose_required_counters(
         ]
 
     async def fake_fetch_one(query: Any, values: Dict[str, Any]):
+        assert isinstance(query, str)
         sql = str(query)
         if "webhook_events" in sql and values.get("status") == "duplicate":
             return {"count": 7}

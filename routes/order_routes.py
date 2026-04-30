@@ -3037,7 +3037,7 @@ def _remaining_refundable_amount(order: Dict[str, Any]) -> Decimal:
 
 async def _count_sql_best_effort(sql: str, values: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        row = await database.fetch_one(text(sql), values)
+        row = await database.fetch_one(query=sql, values=values)
         count_value = 0
         if row is not None:
             try:
