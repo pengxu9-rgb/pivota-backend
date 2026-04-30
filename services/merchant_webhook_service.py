@@ -514,6 +514,24 @@ async def _persist_delivery_attempt(
         "last_error": last_error,
     }
     if existing:
+        update_params = {
+            key: params[key]
+            for key in (
+                "delivery_id",
+                "status",
+                "http_status",
+                "attempt_count",
+                "latency_ms",
+                "delivered_at",
+                "next_retry_at",
+                "request_id",
+                "destination_url",
+                "payload",
+                "request_headers",
+                "response_body",
+                "last_error",
+            )
+        }
         await database.execute(
             """
             UPDATE merchant_webhook_deliveries
@@ -531,7 +549,7 @@ async def _persist_delivery_attempt(
                 last_error = :last_error
             WHERE delivery_id = :delivery_id
             """,
-            params,
+            update_params,
         )
     else:
         await database.execute(
