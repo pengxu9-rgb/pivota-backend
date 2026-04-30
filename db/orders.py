@@ -482,21 +482,61 @@ async def update_order_status(
     
     result = await database.execute(query)
     ok = result is not None and result > 0
+    after = None
+
+    async def _fetch_after_update():
+        return await database.fetch_one(
+            """
+            SELECT merchant_id, status, fulfillment_status, payment_status, shopify_order_id
+            FROM orders
+            WHERE order_id = :order_id
+            LIMIT 1
+            """,
+            {"order_id": order_id},
+        )
+
+    if not ok:
+        # Some DB drivers/environments return no reliable rowcount for UPDATE
+        # even when the write committed. Verify the intended state before
+        # treating the update as failed.
+        try:
+            after = await _fetch_after_update()
+        except Exception:
+            after = None
+        if after:
+            try:
+                status_matches = str(after.get("status") or "").strip() == str(status).strip()
+                payment_status_matches = (
+                    "payment_status" not in update_data
+                    or str(after.get("payment_status") or "").strip()
+                    == str(update_data.get("payment_status") or "").strip()
+                )
+                fulfillment_status_matches = (
+                    "fulfillment_status" not in update_data
+                    or str(after.get("fulfillment_status") or "").strip()
+                    == str(update_data.get("fulfillment_status") or "").strip()
+                )
+                shopify_order_matches = (
+                    "shopify_order_id" not in update_data
+                    or str(after.get("shopify_order_id") or "").strip()
+                    == str(update_data.get("shopify_order_id") or "").strip()
+                )
+                ok = bool(
+                    status_matches
+                    and payment_status_matches
+                    and fulfillment_status_matches
+                    and shopify_order_matches
+                )
+            except Exception:
+                ok = False
 
     # Best-effort invitation enqueue on completion/shipping transitions.
     if ok:
-        try:
-            after = await database.fetch_one(
-                """
-                SELECT merchant_id, status, fulfillment_status, payment_status
-                FROM orders
-                WHERE order_id = :order_id
-                LIMIT 1
-                """,
-                {"order_id": order_id},
-            )
-        except Exception:
-            after = None
+        if after is None:
+            try:
+                after = await _fetch_after_update()
+            except Exception:
+                after = None
 
         try:
             if before and after:
