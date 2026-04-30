@@ -289,6 +289,10 @@ async def test_transaction_safety_metrics_expose_required_counters(
         sql = str(query)
         if "webhook_events" in sql and values.get("status") == "duplicate":
             return {"count": 7}
+        if "webhook_events" in sql and values.get("status") == "failed" and "NOT" in sql:
+            return {"count": 10}
+        if "webhook_events" in sql and values.get("status") == "failed" and "LOWER" in sql:
+            return {"count": 0}
         if "webhook_events" in sql and values.get("status") == "failed":
             return {"count": 2}
         event_counts = {
@@ -326,7 +330,13 @@ async def test_transaction_safety_metrics_expose_required_counters(
     assert metrics["payment_authorization_void_failed_count"]["count"] == 1
     assert metrics["webhook_duplicate_count"]["count"] == 7
     assert metrics["webhook_failed_count"]["count"] == 2
+    assert metrics["webhook_failed_order_impacting_count"]["count"] == 0
+    assert metrics["webhook_failed_non_order_count"]["count"] == 10
     assert metrics["fallback_pollution_attempt_count"]["count"] == 9
+    assert (
+        result["alert_recommendations"]["webhook_failed_order_impacting_count"]
+        == "alert_if_nonzero_for_more_than_one_webhook_retry_interval"
+    )
 
 
 @pytest.mark.asyncio

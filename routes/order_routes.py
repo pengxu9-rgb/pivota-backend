@@ -3062,6 +3062,31 @@ async def _count_order_events_best_effort(
     return await _count_sql_best_effort(sql, values)
 
 
+_WEBHOOK_ORDER_IMPACTING_PREDICATE = """
+(
+    COALESCE(order_id, '') <> ''
+    OR LOWER(COALESCE(event_type, '')) LIKE '%payment%'
+    OR LOWER(COALESCE(event_type, '')) LIKE '%charge%'
+    OR LOWER(COALESCE(event_type, '')) LIKE '%capture%'
+    OR LOWER(COALESCE(event_type, '')) LIKE '%authorization%'
+    OR LOWER(COALESCE(event_type, '')) LIKE '%refund%'
+    OR LOWER(COALESCE(event_type, '')) LIKE '%order%'
+)
+"""
+
+
+async def _count_webhook_failed_best_effort(
+    *,
+    order_impacting: Optional[bool] = None,
+) -> Dict[str, Any]:
+    sql = "SELECT COUNT(*) AS count FROM webhook_events WHERE status = :status"
+    if order_impacting is True:
+        sql += f" AND {_WEBHOOK_ORDER_IMPACTING_PREDICATE}"
+    elif order_impacting is False:
+        sql += f" AND NOT {_WEBHOOK_ORDER_IMPACTING_PREDICATE}"
+    return await _count_sql_best_effort(sql, {"status": "failed"})
+
+
 async def _count_paid_merchant_order_failed_best_effort(
     *,
     merchant_id: Optional[str],
@@ -4333,6 +4358,12 @@ async def get_transaction_safety_metrics(
             "SELECT COUNT(*) AS count FROM webhook_events WHERE status = :status",
             {"status": "failed"},
         ),
+        "webhook_failed_order_impacting_count": await _count_webhook_failed_best_effort(
+            order_impacting=True,
+        ),
+        "webhook_failed_non_order_count": await _count_webhook_failed_best_effort(
+            order_impacting=False,
+        ),
         "fallback_pollution_attempt_count": await _count_order_events_best_effort(
             event_type="fallback_pollution_attempt",
             merchant_id=merchant_id,
@@ -4346,7 +4377,8 @@ async def get_transaction_safety_metrics(
             "paid_merchant_order_failed_count": "page_if_greater_than_zero_for_live_merchants",
             "payment_capture_failed_count": "page_if_greater_than_zero_for_authorization_first_merchants",
             "payment_authorization_void_failed_count": "page_if_greater_than_zero_for_authorization_first_merchants",
-            "webhook_failed_count": "alert_if_nonzero_for_more_than_one_webhook_retry_interval",
+            "webhook_failed_count": "investigate_by_event_type_not_page_by_itself",
+            "webhook_failed_order_impacting_count": "alert_if_nonzero_for_more_than_one_webhook_retry_interval",
             "reconciliation_drift_count": "alert_if_nonzero_for_more_than_one_reconciliation_interval",
             "fallback_pollution_attempt_count": "page_if_greater_than_zero_direct_purchase_attempted_cache_or_external_checkout_fallback",
         },
