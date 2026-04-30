@@ -6307,6 +6307,7 @@ async def cancel_order(
         order_id=order_id,
         status="cancelled",
         cancelled_at=datetime.now(),
+        payment_status="cancelled",
         metadata={**(order.get("metadata") or {}), "cancellation_reason": reason}
     )
     
