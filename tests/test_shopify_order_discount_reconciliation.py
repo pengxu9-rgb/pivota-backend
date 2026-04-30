@@ -330,6 +330,67 @@ def test_shopify_order_reconciliation_passes_when_totals_match(monkeypatch):
     assert result["mismatches"] == []
 
 
+def test_shopify_order_reconciliation_does_not_count_shipping_discount_as_order_discount(monkeypatch):
+    monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
+    pricing_quote_meta = _pricing_quote_meta()
+    pricing_quote_meta["pricing"].update(
+        {
+            "subtotal": "1.69",
+            "discount_total": "0.00",
+            "shipping_fee": "0.00",
+            "tax": "0.00",
+            "total": "1.69",
+        }
+    )
+    pricing_quote_meta["line_items"] = [
+        {
+            "product_id": "prod_1",
+            "variant_id": "var_1",
+            "quantity": 1,
+            "unit_price_original": "1.69",
+            "unit_price_effective": "1.69",
+            "line_discount_total": "0.00",
+        }
+    ]
+    pricing_quote_meta["promotion_lines"] = [
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "label": "Free Shipping",
+            "amount": "-8.00",
+        }
+    ]
+    pricing_quote_meta["discount_evidence"]["applications"] = [
+        {
+            "source": "shopify",
+            "method": "automatic",
+            "discount_class": "shipping",
+            "code": None,
+            "label": "Free Shipping",
+            "amount": "-8.00",
+        }
+    ]
+
+    result = order_routes._reconcile_shopify_discount_order(
+        order={"total": "1.69"},
+        pricing_quote_meta=pricing_quote_meta,
+        shopify_order={
+            "total_price": "1.69",
+            "total_discounts": "0.00",
+            "transactions": [{"kind": "sale", "status": "success", "amount": "1.69"}],
+        },
+        transaction_amount=Decimal("1.69"),
+    )
+
+    assert order_routes._pricing_quote_discount_total(pricing_quote_meta) == Decimal("0.00")
+    assert result["passed"] is True
+    assert result["status"] == "passed"
+    assert result["mismatches"] == []
+    assert result["expected"]["pivota_discount_total"] == "0.00"
+
+
 def test_shopify_order_reconciliation_fails_closed_on_discount_mismatch(monkeypatch):
     monkeypatch.setenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "fail_closed")
     result = order_routes._reconcile_shopify_discount_order(
