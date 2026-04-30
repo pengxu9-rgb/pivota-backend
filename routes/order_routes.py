@@ -4467,18 +4467,27 @@ async def get_transaction_safety_metrics(
     event tables are reported with `available=false` so ops can distinguish zero
     events from missing instrumentation.
     """
+    paid_merchant_order_failed_metric = await _count_paid_merchant_order_failed_best_effort(
+        merchant_id=merchant_id,
+    )
+    merchant_order_retry_success_event_metric = await _count_order_events_best_effort(
+        event_type="merchant_order_retry_success",
+        merchant_id=merchant_id,
+    )
+    merchant_order_retry_failed_event_metric = await _count_order_events_best_effort(
+        event_type="merchant_order_retry_failed",
+        merchant_id=merchant_id,
+    )
+
     metrics = {
-        "paid_merchant_order_failed_count": await _count_paid_merchant_order_failed_best_effort(
-            merchant_id=merchant_id,
-        ),
-        "merchant_order_retry_success_count": await _count_order_events_best_effort(
-            event_type="merchant_order_retry_success",
-            merchant_id=merchant_id,
-        ),
-        "merchant_order_retry_failed_count": await _count_order_events_best_effort(
-            event_type="merchant_order_retry_failed",
-            merchant_id=merchant_id,
-        ),
+        # Active unresolved risk: paid Pivota orders that still lack a merchant-platform order.
+        "paid_merchant_order_failed_count": paid_merchant_order_failed_metric,
+        "paid_merchant_order_failed_active_count": dict(paid_merchant_order_failed_metric),
+        # Historical event counters. These do not imply an active unresolved order.
+        "merchant_order_retry_success_count": merchant_order_retry_success_event_metric,
+        "merchant_order_retry_success_event_count": dict(merchant_order_retry_success_event_metric),
+        "merchant_order_retry_failed_count": merchant_order_retry_failed_event_metric,
+        "merchant_order_retry_failed_event_count": dict(merchant_order_retry_failed_event_metric),
         "quote_revalidation_failure_count": await _count_order_events_best_effort(
             event_type="quote_revalidation_failed",
             merchant_id=merchant_id,
@@ -4528,12 +4537,35 @@ async def get_transaction_safety_metrics(
         "metrics": metrics,
         "alert_recommendations": {
             "paid_merchant_order_failed_count": "page_if_greater_than_zero_for_live_merchants",
+            "paid_merchant_order_failed_active_count": "same_as_paid_merchant_order_failed_count_current_unresolved_risk",
+            "merchant_order_retry_failed_count": "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count",
+            "merchant_order_retry_failed_event_count": "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count",
             "payment_capture_failed_count": "page_if_greater_than_zero_for_authorization_first_merchants",
             "payment_authorization_void_failed_count": "page_if_greater_than_zero_for_authorization_first_merchants",
             "webhook_failed_count": "investigate_by_event_type_not_page_by_itself",
             "webhook_failed_order_impacting_count": "alert_if_nonzero_for_more_than_one_webhook_retry_interval",
             "reconciliation_drift_count": "alert_if_nonzero_for_more_than_one_reconciliation_interval",
             "fallback_pollution_attempt_count": "page_if_greater_than_zero_direct_purchase_attempted_cache_or_external_checkout_fallback",
+        },
+        "metric_semantics": {
+            "active_unresolved_risk": [
+                "paid_merchant_order_failed_count",
+                "paid_merchant_order_failed_active_count",
+                "payment_capture_failed_count",
+                "payment_authorization_void_failed_count",
+                "webhook_failed_order_impacting_count",
+                "fallback_pollution_attempt_count",
+            ],
+            "historical_event_counts": [
+                "merchant_order_retry_success_count",
+                "merchant_order_retry_success_event_count",
+                "merchant_order_retry_failed_count",
+                "merchant_order_retry_failed_event_count",
+                "quote_revalidation_failure_count",
+                "reconciliation_drift_count",
+                "payment_authorized_count",
+                "payment_captured_after_merchant_order_count",
+            ],
         },
     }
 

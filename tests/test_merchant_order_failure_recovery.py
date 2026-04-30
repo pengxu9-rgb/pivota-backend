@@ -320,8 +320,11 @@ async def test_transaction_safety_metrics_expose_required_counters(
 
     metrics = result["metrics"]
     assert metrics["paid_merchant_order_failed_count"]["count"] == 1
+    assert metrics["paid_merchant_order_failed_active_count"]["count"] == 1
     assert metrics["merchant_order_retry_success_count"]["count"] == 3
+    assert metrics["merchant_order_retry_success_event_count"]["count"] == 3
     assert metrics["merchant_order_retry_failed_count"]["count"] == 1
+    assert metrics["merchant_order_retry_failed_event_count"]["count"] == 1
     assert metrics["quote_revalidation_failure_count"]["count"] == 4
     assert metrics["reconciliation_drift_count"]["count"] == 5
     assert metrics["payment_authorized_count"]["count"] == 6
@@ -336,6 +339,46 @@ async def test_transaction_safety_metrics_expose_required_counters(
     assert (
         result["alert_recommendations"]["webhook_failed_order_impacting_count"]
         == "alert_if_nonzero_for_more_than_one_webhook_retry_interval"
+    )
+    assert (
+        result["alert_recommendations"]["merchant_order_retry_failed_event_count"]
+        == "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count"
+    )
+    assert "active_unresolved_risk" in result["metric_semantics"]
+
+
+@pytest.mark.asyncio
+async def test_transaction_safety_metrics_distinguish_historical_retry_failures_from_active_risk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    async def fake_fetch_paid_orders_missing_merchant_order(*_args: Any, **_kwargs: Any):
+        return []
+
+    async def fake_fetch_one(query: Any, values: Dict[str, Any]):
+        if values.get("event_type") == "merchant_order_retry_failed":
+            return {"count": 2}
+        return {"count": 0}
+
+    monkeypatch.setattr(module, "IS_POSTGRES", False)
+    monkeypatch.setattr(
+        module,
+        "_fetch_paid_orders_missing_merchant_order",
+        fake_fetch_paid_orders_missing_merchant_order,
+    )
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+
+    result = await module.get_transaction_safety_metrics(merchant_id="merch_1")
+
+    metrics = result["metrics"]
+    assert metrics["paid_merchant_order_failed_count"]["count"] == 0
+    assert metrics["paid_merchant_order_failed_active_count"]["count"] == 0
+    assert metrics["merchant_order_retry_failed_count"]["count"] == 2
+    assert metrics["merchant_order_retry_failed_event_count"]["count"] == 2
+    assert (
+        result["alert_recommendations"]["merchant_order_retry_failed_count"]
+        == "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count"
     )
 
 
