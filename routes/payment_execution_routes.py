@@ -679,7 +679,14 @@ async def _cancel_order_backed_canary_order(
         },
     )
     if not update_success:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to cancel canary order")
+        # Some DB drivers/environments return no reliable rowcount for UPDATE
+        # even when the write committed. Treat the route as successful only if a
+        # read-after-write verifies the canary is actually cancelled.
+        after = await get_order(order_id)
+        after_status = str((after or {}).get("status") or "").strip().lower()
+        after_payment_status = str((after or {}).get("payment_status") or "").strip().lower()
+        if after_status != "cancelled" or after_payment_status != "cancelled":
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to cancel canary order")
 
     return {
         "success": True,
