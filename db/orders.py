@@ -445,7 +445,7 @@ async def update_order_status(
     try:
         before = await database.fetch_one(
             """
-            SELECT merchant_id, status, fulfillment_status, payment_status
+            SELECT merchant_id, status, fulfillment_status, payment_status, metadata
             FROM orders
             WHERE order_id = :order_id
             LIMIT 1
@@ -457,6 +457,18 @@ async def update_order_status(
 
     update_data = {"status": status, "updated_at": datetime.now()}
     update_data.update(additional_fields)
+    if isinstance(update_data.get("metadata"), dict):
+        existing_metadata = {}
+        try:
+            existing_raw = before["metadata"] if before else None
+            if isinstance(existing_raw, dict):
+                existing_metadata = dict(existing_raw)
+        except Exception:
+            existing_metadata = {}
+        # Metadata updates are additive by default. This prevents webhook/aftercare
+        # handlers using an older order snapshot from erasing recovery/audit keys
+        # such as merchant_order or payment_recovery.
+        update_data["metadata"] = {**existing_metadata, **update_data["metadata"]}
 
     # Defensive: ignore fields not present in the SQLAlchemy table definition.
     # Some environments have divergent schemas; passing unknown keys raises:
