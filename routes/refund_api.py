@@ -48,6 +48,31 @@ class RefundRequest(BaseModel):
     idempotency_key: Optional[str] = None  # Best-effort duplicate protection
 
 
+_SHOPIFY_CANCEL_REASONS = {"customer", "inventory", "fraud", "declined", "other"}
+
+
+def _shopify_external_refund_cancel_payload(
+    *,
+    reason: Optional[str],
+    restore_inventory: bool,
+) -> Dict[str, Any]:
+    """
+    Build a Shopify order-cancel payload after Pivota/PSP already processed funds.
+
+    Do not include amount/currency here: those fields ask Shopify to reason about
+    refund money, while this path only needs merchant-side cancel/restock state.
+    """
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_reason not in _SHOPIFY_CANCEL_REASONS:
+        normalized_reason = "other"
+    return {
+        "reason": normalized_reason,
+        "email": False,
+        "refund": False,
+        "restock": bool(restore_inventory),
+    }
+
+
 async def _resolve_refund_adapter(order: Dict[str, Any]) -> tuple[str, str, Dict[str, Any]]:
     order_psp_type = infer_runtime_provider(
         psp_used=order.get("psp_used"),
@@ -450,13 +475,10 @@ async def process_refund(
                         "X-Shopify-Access-Token": access_token,
                         "Content-Type": "application/json",
                     }
-                    cancel_data = {
-                        "amount": str(refund_amount),
-                        "currency": str(order.get("currency") or "USD"),
-                        "reason": refund_request.reason or "customer_request",
-                        "email": True,
-                        "refund": False,
-                    }
+                    cancel_data = _shopify_external_refund_cancel_payload(
+                        reason=refund_request.reason,
+                        restore_inventory=refund_request.restore_inventory,
+                    )
 
                     async with httpx.AsyncClient() as client:
                         response = await client.post(
@@ -469,7 +491,10 @@ async def process_refund(
                             logger.info(f"Shopify order {order['shopify_order_id']} cancelled")
                         else:
                             logger.warning(
-                                f"Failed to cancel Shopify order: {response.status_code}"
+                                "Failed to cancel Shopify order after external refund: "
+                                "%s body=%s",
+                                response.status_code,
+                                (response.text or "")[:500],
                             )
                                 
             except Exception as e:
