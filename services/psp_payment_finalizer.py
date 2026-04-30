@@ -96,6 +96,13 @@ def _build_refund_key(psp: str, refund_reference: Optional[str]) -> str:
     return f"{psp}:{ref}" if ref else psp
 
 
+def _full_refund_fulfillment_status(order: Dict[str, Any]) -> Optional[str]:
+    fulfillment_status = str((order or {}).get("fulfillment_status") or "").strip().lower()
+    if fulfillment_status in {"", "pending", "processing", "not_fulfilled", "unfulfilled", "open"}:
+        return "cancelled"
+    return None
+
+
 async def finalize_payment_success(
     order: Dict[str, Any],
     *,
@@ -278,20 +285,29 @@ async def finalize_refund_success(
         **(metadata_extra or {}),
     }
 
-    await _safe_update_order_status(
-        update_order_status_fn,
-        order_id,
-        next_status,
-        payment_status=next_status,
-        total_refunded=next_total_refunded,
-        refunded_at=datetime.now() if next_status == "refunded" else None,
-        metadata={
+    update_fields = {
+        "payment_status": next_status,
+        "total_refunded": next_total_refunded,
+        "refunded_at": datetime.now() if next_status == "refunded" else None,
+        "metadata": {
             **existing_metadata,
             "psp_refund_refs": next_refs,
             "psp_refund_records": refund_records,
             "last_refund": refund_records[refund_key],
             **(metadata_patch or {}),
         },
+    }
+    terminal_fulfillment_status = (
+        _full_refund_fulfillment_status(order) if next_status == "refunded" else None
+    )
+    if terminal_fulfillment_status:
+        update_fields["fulfillment_status"] = terminal_fulfillment_status
+
+    await _safe_update_order_status(
+        update_order_status_fn,
+        order_id,
+        next_status,
+        **update_fields,
     )
     await log_order_event_fn(
         event_type=source_event,

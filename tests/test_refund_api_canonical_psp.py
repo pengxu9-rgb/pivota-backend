@@ -1,6 +1,38 @@
 import pytest
 
 
+def test_shopify_external_refund_cancel_payload_is_cancel_only() -> None:
+    import routes.refund_api as module
+
+    payload = module._shopify_external_refund_cancel_payload(
+        reason="Agent requested refund",
+        restore_inventory=True,
+    )
+
+    assert payload == {
+        "reason": "other",
+        "email": False,
+        "refund": False,
+        "restock": True,
+    }
+    assert "amount" not in payload
+    assert "currency" not in payload
+
+
+def test_shopify_external_refund_cancel_payload_allows_shopify_reason() -> None:
+    import routes.refund_api as module
+
+    assert module._shopify_external_refund_cancel_payload(
+        reason="customer",
+        restore_inventory=False,
+    ) == {
+        "reason": "customer",
+        "email": False,
+        "refund": False,
+        "restock": False,
+    }
+
+
 @pytest.mark.asyncio
 async def test_resolve_refund_adapter_prefers_canonical_merchant_psps(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.refund_api as module
