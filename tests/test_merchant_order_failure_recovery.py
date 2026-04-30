@@ -340,6 +340,119 @@ async def test_transaction_safety_metrics_expose_required_counters(
 
 
 @pytest.mark.asyncio
+async def test_list_webhook_failures_exposes_failed_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    async def fake_fetch_all(query: Any, values: Dict[str, Any]):
+        assert "FROM webhook_events" in str(query)
+        assert values["status"] == "failed"
+        return [
+            {
+                "id": 10,
+                "event_id": "evt_failed_1",
+                "event_type": "charge.refunded",
+                "psp_type": "stripe",
+                "order_id": None,
+                "reference": None,
+                "payload": {
+                    "id": "evt_failed_1",
+                    "data": {
+                        "object": {
+                            "id": "ch_1",
+                            "payment_intent": "pi_1",
+                            "metadata": {"order_id": "ord_1"},
+                        }
+                    },
+                },
+                "headers": {},
+                "status": "failed",
+                "processed_at": None,
+                "error_message": "boom",
+                "retry_count": 2,
+                "last_retry_at": None,
+                "received_at": None,
+                "created_at": None,
+                "updated_at": None,
+            }
+        ]
+
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+
+    result = await module.list_webhook_failures(limit=5, order_impacting=True, _={})
+
+    assert result["status"] == "success"
+    assert result["count"] == 1
+    event = result["events"][0]
+    assert event["event_id"] == "evt_failed_1"
+    assert event["status"] == "failed"
+    assert event["payload_refs"]["payment_intent"] == "pi_1"
+    assert event["payload_refs"]["metadata_order_id"] == "ord_1"
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_webhook_failure_marks_failed_event_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    updates: list[Dict[str, Any]] = []
+    event = {
+        "id": 11,
+        "event_id": "evt_failed_ack",
+        "event_type": "charge.refunded",
+        "psp_type": "stripe",
+        "order_id": None,
+        "reference": None,
+        "payload": {"id": "evt_failed_ack"},
+        "headers": {},
+        "status": "failed",
+        "processed_at": None,
+        "error_message": "'NoneType' object is not callable",
+        "retry_count": 1,
+        "last_retry_at": None,
+        "received_at": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+    async def fake_fetch_one(query: Any, values: Dict[str, Any]):
+        assert values["event_id"] == "evt_failed_ack"
+        if updates:
+            return {**event, "status": "ignored", "error_message": updates[-1]["error_message"]}
+        return dict(event)
+
+    async def fake_update_event_status(event_id: str, status: str, error_message: str | None = None) -> None:
+        updates.append({"event_id": event_id, "status": status, "error_message": error_message})
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(
+        module.WebhookService,
+        "update_event_status",
+        staticmethod(fake_update_event_status),
+    )
+
+    result = await module.acknowledge_webhook_failure(
+        "evt_failed_ack",
+        reason="refund.updated already converged the order",
+        _={},
+    )
+
+    assert result["status"] == "acknowledged"
+    assert result["new_status"] == "ignored"
+    assert updates == [
+        {
+            "event_id": "evt_failed_ack",
+            "status": "ignored",
+            "error_message": updates[0]["error_message"],
+        }
+    ]
+    assert "previous_error" in updates[0]["error_message"]
+    assert result["event"]["status"] == "ignored"
+
+
+@pytest.mark.asyncio
 async def test_refund_paid_merchant_order_failure_is_idempotent_and_updates_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
