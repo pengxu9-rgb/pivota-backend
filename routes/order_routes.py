@@ -81,6 +81,7 @@ from services.shopify_transactions_service import (
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.merchant_webhook_service import emit_merchant_webhook_event
+from services.webhook_service import WebhookService
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from adapters.bigcommerce_adapter import (
     build_bigcommerce_domain,
@@ -3182,6 +3183,63 @@ async def _count_webhook_failed_best_effort(
     return await _count_sql_best_effort(sql, {"status": "failed"})
 
 
+def _decode_webhook_json_field(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _webhook_event_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _decode_webhook_json_field(row.get("payload"))
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    obj = data.get("object") if isinstance(data.get("object"), dict) else {}
+    return {
+        "id": row.get("id"),
+        "event_id": row.get("event_id"),
+        "event_type": row.get("event_type"),
+        "psp_type": row.get("psp_type"),
+        "order_id": row.get("order_id"),
+        "reference": row.get("reference"),
+        "status": row.get("status"),
+        "error_message": row.get("error_message"),
+        "retry_count": row.get("retry_count"),
+        "received_at": _json_safe_order_value(row.get("received_at")),
+        "processed_at": _json_safe_order_value(row.get("processed_at")),
+        "last_retry_at": _json_safe_order_value(row.get("last_retry_at")),
+        "payload_refs": {
+            "object_id": obj.get("id") or payload.get("id"),
+            "payment_intent": obj.get("payment_intent"),
+            "metadata_order_id": (
+                (obj.get("metadata") or {}).get("order_id")
+                if isinstance(obj.get("metadata"), dict)
+                else None
+            ),
+        },
+    }
+
+
+async def _fetch_webhook_event_by_event_id(event_id: str) -> Optional[Dict[str, Any]]:
+    row = await database.fetch_one(
+        """
+        SELECT id, event_id, event_type, psp_type, order_id, reference,
+               payload, headers, status, processed_at, error_message,
+               retry_count, last_retry_at, received_at, created_at, updated_at
+        FROM webhook_events
+        WHERE event_id = :event_id
+        ORDER BY received_at DESC
+        LIMIT 1
+        """,
+        {"event_id": event_id},
+    )
+    return _row_to_plain_dict(row) if row else None
+
+
 async def _count_paid_merchant_order_failed_best_effort(
     *,
     merchant_id: Optional[str],
@@ -4477,6 +4535,118 @@ async def get_transaction_safety_metrics(
             "reconciliation_drift_count": "alert_if_nonzero_for_more_than_one_reconciliation_interval",
             "fallback_pollution_attempt_count": "page_if_greater_than_zero_direct_purchase_attempted_cache_or_external_checkout_fallback",
         },
+    }
+
+
+@router.get("/ops/webhook-failures")
+async def list_webhook_failures(
+    limit: int = Query(50, ge=1, le=200),
+    order_impacting: Optional[bool] = Query(None),
+    psp_type: Optional[str] = Query(None),
+    event_type: Optional[str] = Query(None),
+    _: dict = Depends(require_admin_or_key),
+):
+    """
+    Read-only ops view for webhook rows that still have failed status.
+
+    Operators can use this alongside transaction-safety metrics to inspect
+    historical failures before deciding whether a row is still actionable or has
+    been superseded by a later successful event/order terminal state.
+    """
+    sql = """
+        SELECT id, event_id, event_type, psp_type, order_id, reference,
+               payload, headers, status, processed_at, error_message,
+               retry_count, last_retry_at, received_at, created_at, updated_at
+        FROM webhook_events
+        WHERE status = :status
+    """
+    values: Dict[str, Any] = {"status": "failed", "limit": int(limit)}
+    if order_impacting is True:
+        sql += f" AND {_WEBHOOK_ORDER_IMPACTING_PREDICATE}"
+    elif order_impacting is False:
+        sql += f" AND NOT {_WEBHOOK_ORDER_IMPACTING_PREDICATE}"
+    if psp_type:
+        sql += " AND LOWER(COALESCE(psp_type, '')) = :psp_type"
+        values["psp_type"] = str(psp_type).strip().lower()
+    if event_type:
+        sql += " AND event_type = :event_type"
+        values["event_type"] = event_type
+    sql += " ORDER BY received_at DESC LIMIT :limit"
+
+    try:
+        rows = await database.fetch_all(query=sql, values=values)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "available": False,
+            "error": str(exc)[:300],
+            "count": None,
+            "events": [],
+        }
+
+    events = [_webhook_event_summary(_row_to_plain_dict(row)) for row in (rows or [])]
+    return {
+        "status": "success",
+        "available": True,
+        "count": len(events),
+        "filters": {
+            "order_impacting": order_impacting,
+            "psp_type": psp_type,
+            "event_type": event_type,
+            "limit": int(limit),
+        },
+        "events": events,
+    }
+
+
+@router.post("/ops/webhook-failures/{event_id}/ack")
+async def acknowledge_webhook_failure(
+    event_id: str,
+    reason: str = Query(..., min_length=3, max_length=500),
+    _: dict = Depends(require_admin_or_key),
+):
+    """
+    Mark a failed webhook row as `ignored` after operator review.
+
+    This is intentionally explicit and narrow: it does not replay the webhook or
+    mutate orders. It only removes a reviewed historical failure from failed
+    alert counters while preserving the row and original error in the audit log.
+    """
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        raise HTTPException(status_code=400, detail="event_id is required")
+
+    event = await _fetch_webhook_event_by_event_id(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Webhook event not found")
+
+    current_status = str(event.get("status") or "").strip().lower()
+    if current_status != "failed":
+        return {
+            "status": "already_not_failed",
+            "event": _webhook_event_summary(event),
+            "message": "Webhook event was not in failed status.",
+        }
+
+    ack_message = json.dumps(
+        {
+            "acknowledged_by": "ops",
+            "acknowledged_at": datetime.utcnow().isoformat() + "Z",
+            "reason": str(reason or "").strip(),
+            "previous_error": event.get("error_message"),
+            "previous_status": current_status,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    await WebhookService.update_event_status(event_id, "ignored", ack_message)
+    updated = await _fetch_webhook_event_by_event_id(event_id)
+    return {
+        "status": "acknowledged",
+        "event_id": event_id,
+        "previous_status": current_status,
+        "new_status": "ignored",
+        "event": _webhook_event_summary(updated or event),
     }
 
 

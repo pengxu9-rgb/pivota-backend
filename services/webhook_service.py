@@ -289,7 +289,7 @@ class WebhookService:
         values = {
             "event_id": event_id,
             "status": status,
-            "processed_at": datetime.utcnow() if status == "processed" else None,
+            "processed_at": datetime.utcnow() if status in {"processed", "ignored"} else None,
             "error_message": error_message
         }
         
