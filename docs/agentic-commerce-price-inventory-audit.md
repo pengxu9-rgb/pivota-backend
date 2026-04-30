@@ -173,7 +173,7 @@ Discovery should continue to use local cache/index for speed. Cached price and i
 
 Quote should be the authoritative pre-purchase validation step. The quote response should include TTL, source timestamp, explicit availability status, and final-vs-estimated flags. Shopify can use Storefront Cart plus Admin inventory policy checks. Wix/WooCommerce/BigCommerce need platform-specific live quote/availability adapters before they can be treated as purchase-ready.
 
-Checkout/order creation must live-revalidate the quote/cart immediately before creating a Pivota order/payment attempt. If the live quote differs from the active quote snapshot, the request should fail with a refresh/requote error rather than charging.
+Checkout/order creation must live-revalidate the quote/cart immediately before creating a Pivota order/payment attempt. If the live quote differs from the active quote snapshot, the current payment attempt should be blocked and the response should provide refresh/requote information rather than charging.
 
 Payment should move toward authorization-first or platform-native checkout where possible. If Pivota keeps creating PSP payment before merchant order, it must fail closed on final validation and provide recovery/void/refund workflows for payment success + merchant order failure.
 
@@ -188,7 +188,7 @@ Reconciliation should run on a schedule and compare catalog price/inventory/orde
 1. Add final live quote validation before quote-first order creation uses the stored snapshot.
    - Reuse `QuoteService.preview_quote` in a non-persisting validation mode.
    - Compare live pricing/currency/line quantities with the stored quote snapshot.
-   - Reject with a clear quote stale/reprice error if price, discount, tax, shipping, line price, or availability changed.
+   - Block the current payment attempt with a clear quote stale/reprice response if price, discount, tax, shipping, line price, or availability changed. For repricing drift, return a replacement live quote when possible so the user can decide whether to proceed with the new terms.
 
 2. Mark `/agent/v1/cart/validate` as cache-only/estimated.
    - Add response fields such as `price_source=products_cache_estimate`, `is_final=false`, `requires_quote=true`, and item `availability_status=unknown_requires_validation`.
@@ -220,7 +220,7 @@ Reconciliation should run on a schedule and compare catalog price/inventory/orde
 
 Implemented after this audit:
 
-- Quote-first order creation now performs a live source-of-truth quote revalidation before using the stored quote snapshot to create the Pivota order/payment attempt. If live price, shipping, tax, discount, currency, line item price, or availability no longer matches the stored quote, order creation fails with `QUOTE_STALE_REPRICE_REQUIRED` or the platform inventory error.
+- Quote-first order creation now performs a live source-of-truth quote revalidation before using the stored quote snapshot to create the Pivota order/payment attempt. If live price, shipping, tax, discount, currency, line item price, or availability no longer matches the stored quote, the current order/payment attempt is blocked with `QUOTE_STALE_REPRICE_REQUIRED` or the platform inventory error. For repricing drift, the response includes a replacement live quote when available and requires user confirmation before payment retry.
 - `QuoteService.preview_quote` supports non-persisting/non-analytics validation calls so final checkout validation does not create an extra active quote.
 - `/agent/v1/cart/validate` remains backward compatible but now explicitly marks its output as cached estimates:
   - top-level `validation_source=products_cache_estimate`
@@ -354,7 +354,7 @@ What is now fixed:
 - `/agent/v1/checkout/intents` now requires an active quote for raw item payloads; existing-order checkout resume remains allowed.
 - Deprecated `/agent/pay` and `/agent/pay-simple` are disabled with `410` and `QUOTE_REQUIRED_BEFORE_PURCHASE`.
 - `/agent/v1/payments` refuses PSP payment creation unless the order metadata contains a live-validated pricing quote that has not expired.
-- Quote-first order creation still performs final live validation before order/PSP creation; failed price, currency, quantity, line, or inventory validation blocks PSP calls.
+- Quote-first order creation still performs final live validation before order/PSP creation; changed price, currency, quantity, line, or inventory validation blocks PSP calls. Repricing drift returns `action=review_repriced_quote` plus a replacement quote when available, so payment can resume only after explicit confirmation of the new quote.
 - Paid orders that fail merchant order creation are marked in `metadata.merchant_order` as `paid_merchant_order_failed` with `requires_action=requires_refund_or_retry`; `metadata.payment_recovery` now marks `refund_required=true` and gives the operator action `retry_merchant_order_or_issue_refund`.
 - Ops can query paid-without-merchant-order failures through `GET /orders/ops/merchant-order-failures` and retry one order through `POST /orders/ops/merchant-order-failures/{order_id}/retry`.
 - Ops can trigger an idempotent PSP refund for captured paid-without-merchant-order failures through `POST /orders/ops/merchant-order-failures/{order_id}/refund`.
@@ -455,7 +455,7 @@ Known local environment gap: `tests/test_runtime_interface_drift.py` was not rer
 
 ## Example Scenarios
 
-- Price changed after agent recommendation: order create reloads the quote, performs live quote validation, detects pricing mismatch, returns `QUOTE_STALE_REPRICE_REQUIRED`, and does not call PSP.
+- Price changed after agent recommendation: order create reloads the quote, performs live quote validation, detects pricing mismatch, returns `QUOTE_STALE_REPRICE_REQUIRED` with `action=review_repriced_quote` and a replacement quote when available, and does not call PSP until the buyer/agent confirms the new quote.
 - Inventory changed after agent recommendation: live quote/Shopify inventory rejection propagates as `OUT_OF_STOCK` or `INSUFFICIENT_INVENTORY`, and PSP is not called.
 - Last item bought by another buyer: same as inventory changed; Shopify remains the source of truth and Pivota does not trust cache.
 - Payment succeeds but merchant order creation fails: order metadata is marked `paid_merchant_order_failed`, payment recovery is marked `refund_required`, ops can query the failure, retry is idempotent, and captured payment can be refunded through the idempotent ops recovery endpoint.

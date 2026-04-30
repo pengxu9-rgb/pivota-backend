@@ -3451,6 +3451,7 @@ async def create_new_order(
                     live_validation_meta = await quote_service.validate_quote_snapshot_live(
                         quote,
                         customer_email=order_request.customer_email,
+                        create_replacement_quote_on_mismatch=True,
                     )
 
                 snap = quote.snapshot_json or {}
@@ -3555,14 +3556,36 @@ async def create_new_order(
                         },
                     )
             except QuoteError as e:
+                detail: Dict[str, Any] = {
+                    "error": e.code,
+                    "message": e.message,
+                    "debug_id": e.debug_id,
+                    **({"details": e.details} if getattr(e, "details", None) else {}),
+                }
+                if e.code == "QUOTE_STALE_REPRICE_REQUIRED":
+                    replacement_quote = (
+                        (e.details or {}).get("replacement_quote")
+                        if isinstance(getattr(e, "details", None), dict)
+                        else None
+                    )
+                    detail.update(
+                        {
+                            "status": "reprice_required",
+                            "action": "review_repriced_quote",
+                            "requires_user_confirmation": True,
+                            "quote_required_before_purchase": True,
+                            "order_created": False,
+                            "payment_created": False,
+                            "message": (
+                                "Quote changed. Review the updated quote and confirm before payment."
+                            ),
+                        }
+                    )
+                    if isinstance(replacement_quote, dict) and replacement_quote.get("quote_id"):
+                        detail["replacement_quote_id"] = replacement_quote.get("quote_id")
                 raise HTTPException(
                     status_code=409,
-                    detail={
-                        "error": e.code,
-                        "message": e.message,
-                        "debug_id": e.debug_id,
-                        **({"details": e.details} if getattr(e, "details", None) else {}),
-                    },
+                    detail=detail,
                 )
 
         else:
