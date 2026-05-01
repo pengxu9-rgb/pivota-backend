@@ -25,6 +25,13 @@ def _request(path: str = "/agent/v2/commerce/checkouts") -> Request:
     return Request(scope)
 
 
+def test_internal_trusted_api_key_env_names_include_photo_backend_agent_keys() -> None:
+    import routes.agent_auth as module
+
+    assert "PIVOTA_BACKEND_AGENT_API_KEY" in module._INTERNAL_TRUSTED_KEY_ENV_NAMES
+    assert "PIVOTA_AGENT_API_KEY" in module._INTERNAL_TRUSTED_KEY_ENV_NAMES
+
+
 @pytest.mark.asyncio
 async def test_get_agent_context_accepts_internal_trusted_api_key_without_db_lookup(
     monkeypatch: pytest.MonkeyPatch,

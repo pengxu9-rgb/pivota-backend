@@ -40,20 +40,46 @@ PHOTO_UPLOAD_ENDPOINT_URL = (
 PHOTO_PRESIGN_TTL_SECONDS = int(os.getenv("PHOTO_PRESIGN_TTL_SECONDS") or "900")
 PHOTO_UPLOAD_TTL_HOURS = int(os.getenv("PHOTO_UPLOAD_TTL_HOURS") or "24")
 PHOTO_UPLOAD_MAX_BYTES = int(os.getenv("PHOTO_UPLOAD_MAX_BYTES") or str(10 * 1024 * 1024))
+PHOTO_DOWNLOAD_TTL_SECONDS = int(os.getenv("PHOTO_DOWNLOAD_TTL_SECONDS") or "300")
 
 PHOTO_CLEANUP_LOOP_ENABLED = (os.getenv("PHOTO_CLEANUP_LOOP_ENABLED") or "").strip().lower() in {"1", "true", "yes", "y"}
 PHOTO_CLEANUP_INTERVAL_SECONDS = int(os.getenv("PHOTO_CLEANUP_INTERVAL_SECONDS") or str(15 * 60))
 PHOTO_CLEANUP_BATCH_SIZE = int(os.getenv("PHOTO_CLEANUP_BATCH_SIZE") or "200")
 PHOTO_CLEANUP_STARTUP_DELAY_SECONDS = int(os.getenv("PHOTO_CLEANUP_STARTUP_DELAY_SECONDS") or "30")
+PHOTO_SCHEMA_ENSURE_TIMEOUT_SECONDS = float(os.getenv("PHOTO_SCHEMA_ENSURE_TIMEOUT_SECONDS") or "2.0")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _is_production_env() -> bool:
+    env = (os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or os.getenv("RAILWAY_ENVIRONMENT_NAME") or "").strip().lower()
+    return env in {"production", "prod"}
+
+
+PHOTO_SCHEMA_ENSURE_ON_REQUEST = _env_bool("PHOTO_SCHEMA_ENSURE_ON_REQUEST", default=not _is_production_env())
 
 _photo_cleanup_task: Optional[asyncio.Task] = None
+_photo_schema_ready = not PHOTO_SCHEMA_ENSURE_ON_REQUEST
+_photo_schema_lock: Optional[asyncio.Lock] = None
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _ensure_photo_uploads_table() -> None:
+def _get_photo_schema_lock() -> asyncio.Lock:
+    global _photo_schema_lock
+    if _photo_schema_lock is None:
+        _photo_schema_lock = asyncio.Lock()
+    return _photo_schema_lock
+
+
+async def _ensure_photo_uploads_table_inner() -> None:
     """
     Best-effort portable schema. We avoid JSONB so sqlite dev/test doesn't break.
     """
@@ -88,6 +114,31 @@ async def _ensure_photo_uploads_table() -> None:
         await database.execute("CREATE INDEX IF NOT EXISTS idx_photo_uploads_status ON photo_uploads(status);")
     except Exception:
         pass
+
+
+async def _ensure_photo_uploads_table() -> None:
+    """
+    Avoid running DDL in the production request hot path.
+
+    Production deploys should create this table via migration/runbook. In dev and
+    tests, the historical auto-ensure behavior remains available. When auto-ensure
+    is enabled, it is one-shot and bounded so photo presign cannot hang behind a
+    long DDL lock.
+    """
+    global _photo_schema_ready
+    if _photo_schema_ready or not PHOTO_SCHEMA_ENSURE_ON_REQUEST:
+        return
+    async with _get_photo_schema_lock():
+        if _photo_schema_ready:
+            return
+        try:
+            await asyncio.wait_for(
+                _ensure_photo_uploads_table_inner(),
+                timeout=max(0.1, float(PHOTO_SCHEMA_ENSURE_TIMEOUT_SECONDS or 2.0)),
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=503, detail="PHOTO_SCHEMA_ENSURE_TIMEOUT")
+        _photo_schema_ready = True
 
 
 def _s3_client():
@@ -632,6 +683,10 @@ class PhotoConfirmRequest(BaseModel):
     byte_size: Optional[int] = Field(None, ge=1)
 
 
+class PhotoDownloadUrlRequest(BaseModel):
+    upload_id: str = Field(..., min_length=8)
+
+
 @router.post("/confirm")
 async def confirm_photo_upload(
     body: PhotoConfirmRequest,
@@ -731,6 +786,98 @@ async def get_photo_qc(
         "qc": {"state": "pending", "qc_status": None, "advice": _qc_advice("pending")},
         "next_poll_ms": 1000,
     }
+
+
+async def _build_photo_download_url_response(upload_id: str, context: AgentContext) -> Dict[str, Any]:
+    row = await _load_upload(upload_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="UPLOAD_NOT_FOUND")
+    if row.get("agent_id") and str(row.get("agent_id")) != str(context.agent_id):
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+    if row.get("deleted_at"):
+        raise HTTPException(status_code=410, detail="UPLOAD_DELETED")
+
+    expires_at = row.get("expires_at")
+    if expires_at:
+        try:
+            expires_at_dt = (
+                datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                if isinstance(expires_at, str)
+                else expires_at
+            )
+            if expires_at_dt and expires_at_dt.tzinfo is None:
+                expires_at_dt = expires_at_dt.replace(tzinfo=timezone.utc)
+            if expires_at_dt and _utcnow() > expires_at_dt:
+                await _update_upload(upload_id, {"status": "expired"})
+                raise HTTPException(status_code=410, detail="UPLOAD_EXPIRED")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    bucket = str(row.get("bucket") or "")
+    key = str(row.get("object_key") or "")
+    if not bucket or not key:
+        raise HTTPException(status_code=404, detail="OBJECT_NOT_FOUND")
+
+    client = _s3_client()
+    if not client:
+        raise HTTPException(status_code=500, detail="STORAGE_CLIENT_UNAVAILABLE")
+    try:
+        download_url = client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": key,
+            },
+            ExpiresIn=PHOTO_DOWNLOAD_TTL_SECONDS,
+        )
+    except Exception as e:
+        err_type = type(e).__name__
+        safe_msg = (str(e) or "").strip()
+        if len(safe_msg) > 240:
+            safe_msg = safe_msg[:240]
+        logger.error("photos.download_url.failed", extra={"error": safe_msg, "type": err_type})
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "DOWNLOAD_URL_FAILED",
+                "type": err_type,
+                "message": safe_msg or None,
+                "storage": {
+                    "bucket": bucket,
+                    "endpoint_url_configured": bool(PHOTO_UPLOAD_ENDPOINT_URL),
+                },
+            },
+        )
+
+    return {
+        "status": "success",
+        "upload_id": upload_id,
+        "download": {
+            "method": "GET",
+            "url": download_url,
+            "headers": {},
+            "expires_in_seconds": PHOTO_DOWNLOAD_TTL_SECONDS,
+        },
+        "content_type": row.get("content_type") or None,
+    }
+
+
+@router.get("/download-url")
+async def get_photo_download_url(
+    upload_id: str,
+    context: AgentContext = Depends(get_agent_context),
+):
+    return await _build_photo_download_url_response(upload_id, context)
+
+
+@router.post("/download-url")
+async def post_photo_download_url(
+    body: PhotoDownloadUrlRequest,
+    context: AgentContext = Depends(get_agent_context),
+):
+    return await _build_photo_download_url_response(body.upload_id, context)
 
 
 @router.delete("")
