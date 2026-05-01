@@ -1,4 +1,5 @@
 import os
+import asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -25,7 +26,8 @@ class FakeS3:
         # that presign returns a URL and then simulate the object existing via FakeS3.objects.
         bucket = Params.get("Bucket")
         key = Params.get("Key")
-        return f"https://storage.example/{bucket}/{key}?sig=fake"
+        method = "download" if ClientMethod == "get_object" else "upload"
+        return f"https://storage.example/{bucket}/{key}?sig=fake&method={method}"
 
     def head_object(self, Bucket, Key):
         if (Bucket, Key) not in self.objects:
@@ -172,7 +174,28 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     assert "tips" in qc["advice"]
     assert qc["advice"]["retryable"] is True
 
-    # 4) delete
+    # 4) download URL supports both GET and POST contracts
+    res_dl = client.get(
+        "/photos/download-url",
+        headers={"X-API-Key": "test-api-key"},
+        params={"upload_id": upload_id},
+    )
+    assert res_dl.status_code == 200
+    dl_body = res_dl.json()
+    assert dl_body["download"]["method"] == "GET"
+    assert dl_body["download"]["url"].startswith("https://storage.example/")
+    assert "method=download" in dl_body["download"]["url"]
+    assert dl_body["content_type"] == "image/jpeg"
+
+    res_dl_post = client.post(
+        "/photos/download-url",
+        headers={"X-API-Key": "test-api-key"},
+        json={"upload_id": upload_id},
+    )
+    assert res_dl_post.status_code == 200
+    assert res_dl_post.json()["download"]["url"].startswith("https://storage.example/")
+
+    # 5) delete
     res4 = client.delete(
         "/photos",
         headers={"X-API-Key": "test-api-key"},
@@ -181,7 +204,7 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     assert res4.status_code == 200
     assert res4.json()["deleted"] is True
 
-    # 5) cleanup (expired rows)
+    # 6) cleanup (expired rows)
     res5 = client.post(
         "/photos/presign",
         headers={"X-API-Key": "test-api-key"},
@@ -209,3 +232,21 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     assert store[upload_id_2]["deleted_at"] is not None
     assert store[upload_id_2]["status"] == "deleted"
     assert (photos.PHOTO_UPLOAD_BUCKET, key2) not in fake_s3.objects
+
+
+def test_photo_schema_auto_ensure_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.photos as photos
+
+    async def fail_execute(*_args, **_kwargs):
+        raise AssertionError("schema DDL should not run when request auto-ensure is disabled")
+
+    previous_ready = photos._photo_schema_ready
+    previous_enabled = photos.PHOTO_SCHEMA_ENSURE_ON_REQUEST
+    monkeypatch.setattr(photos.database, "execute", fail_execute)
+    photos._photo_schema_ready = False
+    photos.PHOTO_SCHEMA_ENSURE_ON_REQUEST = False
+    try:
+        asyncio.run(photos._ensure_photo_uploads_table())
+    finally:
+        photos._photo_schema_ready = previous_ready
+        photos.PHOTO_SCHEMA_ENSURE_ON_REQUEST = previous_enabled

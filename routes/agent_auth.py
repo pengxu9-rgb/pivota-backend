@@ -37,6 +37,8 @@ bearer_scheme = HTTPBearer(auto_error=False)
 _INTERNAL_TRUSTED_KEY_ENV_NAMES = (
     "SHOP_GATEWAY_AGENT_API_KEY",
     "PIVOTA_API_KEY",
+    "PIVOTA_BACKEND_AGENT_API_KEY",
+    "PIVOTA_AGENT_API_KEY",
 )
 
 
