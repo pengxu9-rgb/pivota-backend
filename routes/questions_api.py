@@ -212,6 +212,7 @@ async def post_question_reply(
 
     Rules:
     - must be logged in
+    - accepted replies are held for moderation before public display
     - basic anti-abuse: per user+question rate limit (30s)
     """
     response.headers["Cache-Control"] = "private, no-store"
@@ -258,4 +259,9 @@ async def post_question_reply(
             headers=no_store_headers,
         )
 
-    return {"status": "success", "reply_id": int(rid), "question_id": int(question_id)}
+    return {
+        "status": "success",
+        "reply_id": int(rid),
+        "question_id": int(question_id),
+        "moderation_status": "under_review",
+    }

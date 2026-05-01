@@ -795,7 +795,7 @@ async def is_reply_rate_limited(
             .where(
                 (ugc_question_replies.c.user_id == uid)
                 & (ugc_question_replies.c.question_id == qid)
-                & (ugc_question_replies.c.status == "active")
+                & (ugc_question_replies.c.status.in_(["active", "under_review"]))
             )
             .order_by(ugc_question_replies.c.created_at.desc())
             .limit(1)
@@ -853,7 +853,7 @@ async def create_question_reply(
                 question_id=qid,
                 user_id=uid,
                 body=b,
-                status="active",
+                status="under_review",
                 created_at=datetime.now(timezone.utc),
             )
         )
