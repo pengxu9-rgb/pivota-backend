@@ -200,6 +200,28 @@ def _required_setup_ok() -> bool:
     return bool(PHOTO_UPLOAD_BUCKET)
 
 
+def _photo_upload_credentials_configured() -> bool:
+    photo_access_key = _first_env("PHOTO_UPLOAD_ACCESS_KEY_ID", default="")
+    photo_secret_key = _first_env("PHOTO_UPLOAD_SECRET_ACCESS_KEY", default="")
+    if photo_access_key and photo_secret_key:
+        return True
+
+    aws_access_key = _first_env("AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", default="")
+    aws_secret_key = _first_env("AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", default="")
+    if aws_access_key and aws_secret_key:
+        return True
+
+    if _first_env("AWS_WEB_IDENTITY_TOKEN_FILE", default="") and _first_env("AWS_ROLE_ARN", default=""):
+        return True
+
+    if _first_env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", default="") or _first_env(
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI", default=""
+    ):
+        return True
+
+    return False
+
+
 def _object_key(upload_id: str, content_type: str) -> str:
     ext = ".jpg"
     ct = (content_type or "").lower()
@@ -569,6 +591,8 @@ async def presign_photo_upload(
 ):
     if not _required_setup_ok():
         raise HTTPException(status_code=500, detail="PHOTO_UPLOAD_BUCKET_NOT_CONFIGURED")
+    if not _photo_upload_credentials_configured():
+        raise HTTPException(status_code=500, detail="STORAGE_CREDENTIALS_NOT_CONFIGURED")
     if not body.consent:
         raise HTTPException(status_code=400, detail="USER_CONSENT_REQUIRED")
     if not str(body.content_type or "").lower().startswith("image/"):

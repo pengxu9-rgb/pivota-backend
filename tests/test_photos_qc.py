@@ -57,6 +57,8 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     # Configure module globals
     photos.PHOTO_UPLOAD_BUCKET = "bucket-test"
     os.environ["ADMIN_API_KEY"] = "test-admin-key"
+    monkeypatch.setenv("PHOTO_UPLOAD_ACCESS_KEY_ID", "test-photo-ak")
+    monkeypatch.setenv("PHOTO_UPLOAD_SECRET_ACCESS_KEY", "test-photo-sk")
 
     fake_s3 = FakeS3()
     monkeypatch.setattr(photos, "_s3_client", lambda: fake_s3)
@@ -232,6 +234,38 @@ def test_photos_presign_confirm_qc_delete(monkeypatch: pytest.MonkeyPatch, clien
     assert store[upload_id_2]["deleted_at"] is not None
     assert store[upload_id_2]["status"] == "deleted"
     assert (photos.PHOTO_UPLOAD_BUCKET, key2) not in fake_s3.objects
+
+
+def test_photos_presign_fails_fast_when_storage_credentials_missing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.photos as photos
+
+    photos.PHOTO_UPLOAD_BUCKET = "bucket-test"
+    monkeypatch.delenv("PHOTO_UPLOAD_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("PHOTO_UPLOAD_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AWS_WEB_IDENTITY_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("AWS_ROLE_ARN", raising=False)
+    monkeypatch.delenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", raising=False)
+    monkeypatch.delenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", raising=False)
+
+    def _unexpected_s3_client():
+        raise AssertionError("_s3_client should not be called when credentials are missing")
+
+    monkeypatch.setattr(photos, "_s3_client", _unexpected_s3_client)
+
+    res = client.post(
+        "/photos/presign",
+        headers={"X-API-Key": "test-api-key"},
+        json={"content_type": "image/jpeg", "consent": True, "byte_size": 1234, "user_id": "u_1"},
+    )
+
+    assert res.status_code == 500
+    assert res.json()["detail"] == "STORAGE_CREDENTIALS_NOT_CONFIGURED"
 
 
 def test_photo_schema_auto_ensure_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
