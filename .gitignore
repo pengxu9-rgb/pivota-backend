@@ -29,6 +29,11 @@ yarn-error.log*
 # local env files
 .env*.local
 
+# local sqlite scratch DB created by some dev scripts
+pivota.db
+*.sqlite
+*.sqlite3
+
 # vercel
 .vercel
 
