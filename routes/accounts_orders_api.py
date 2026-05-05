@@ -336,7 +336,8 @@ def _send_login_otp_email(email: str, otp_code: str):
     Email sender for login OTP codes.
 
     Provider is selected by utils.email_sender:
-    - EMAIL_PROVIDER override (`ses` | `sendgrid`)
+    - EMAIL_PROVIDER override (`ses` | `sendgrid` | `smtp2go`)
+    - Otherwise SMTP2GO when `SMTP2GO_EMAIL_API_KEY` or `SMTP2GO_API_KEY` exists
     - Otherwise SendGrid when `SENDGRID_API_KEY` exists, else SES.
     Returns an EmailSendResult.
     """

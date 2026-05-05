@@ -67,6 +67,8 @@ class ProductionSettings(BaseSettings):
     
     # Email
     sendgrid_api_key: Optional[str] = Field(None, env="SENDGRID_API_KEY")
+    smtp2go_api_key: Optional[str] = Field(None, env="SMTP2GO_API_KEY")
+    smtp2go_email_api_key: Optional[str] = Field(None, env="SMTP2GO_EMAIL_API_KEY")
     from_email: str = Field("noreply@pivota.ai", env="FROM_EMAIL")
     support_email: str = Field("support@pivota.ai", env="SUPPORT_EMAIL")
     

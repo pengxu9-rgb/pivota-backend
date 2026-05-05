@@ -144,6 +144,8 @@ class Settings(BaseSettings):
     
     # Email / notifications
     sendgrid_api_key: Optional[str] = os.getenv("SENDGRID_API_KEY")
+    smtp2go_api_key: Optional[str] = os.getenv("SMTP2GO_API_KEY")
+    smtp2go_email_api_key: Optional[str] = os.getenv("SMTP2GO_EMAIL_API_KEY")
     from_email: str = os.getenv("FROM_EMAIL", "noreply@pivota.ai")
     support_email: str = os.getenv("SUPPORT_EMAIL", "support@pivota.ai")
     # Merchant Portal base URL (used for password reset links)

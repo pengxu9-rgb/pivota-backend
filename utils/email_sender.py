@@ -51,16 +51,30 @@ def _email_provider() -> str:
     Resolve which email provider to use.
 
     Precedence:
-    - EMAIL_PROVIDER env var ("ses" | "sendgrid")
+    - EMAIL_PROVIDER env var ("ses" | "sendgrid" | "smtp2go")
+    - SMTP2GO when `SMTP2GO_EMAIL_API_KEY` or `SMTP2GO_API_KEY` exists
     - SendGrid when `SENDGRID_API_KEY` exists
     - Default: "ses"
     """
     raw = (os.getenv("EMAIL_PROVIDER") or "").strip().lower()
     if raw:
         return raw
+    if ((os.getenv("SMTP2GO_EMAIL_API_KEY") or "").strip() or (os.getenv("SMTP2GO_API_KEY") or "").strip()):
+        return "smtp2go"
     if (os.getenv("SENDGRID_API_KEY") or "").strip():
         return "sendgrid"
     return "ses"
+
+
+def _smtp2go_api_key() -> str:
+    return (
+        (os.getenv("SMTP2GO_EMAIL_API_KEY") or "").strip()
+        or (os.getenv("SMTP2GO_API_KEY") or "").strip()
+    )
+
+
+def _smtp2go_email_endpoint() -> str:
+    return (os.getenv("SMTP2GO_EMAIL_ENDPOINT") or "").strip() or "https://api.smtp2go.com/v3/email/send"
 
 
 def _aws_region() -> Optional[str]:
@@ -274,6 +288,134 @@ def _send_via_sendgrid(
     return EmailSendResult(ok=True, provider="sendgrid", message_id=msg_id or None)
 
 
+def _smtp2go_payload_failed(payload: Dict[str, Any]) -> bool:
+    result = str(payload.get("result") or "").strip().lower()
+    if result in {"error", "failure", "failed"}:
+        return True
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    failed = data.get("failed", payload.get("failed"))
+    succeeded = data.get("succeeded", payload.get("succeeded"))
+    try:
+        failed_count = int(failed)
+    except Exception:
+        failed_count = 0
+    try:
+        succeeded_count = int(succeeded)
+    except Exception:
+        succeeded_count = 0
+    return failed_count > 0 and succeeded_count <= 0
+
+
+def _smtp2go_message_id(payload: Dict[str, Any]) -> Optional[str]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    candidates = [
+        data.get("email_id"),
+        data.get("message_id"),
+        data.get("id"),
+        payload.get("email_id"),
+        payload.get("message_id"),
+        payload.get("request_id"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _send_via_smtp2go(
+    *,
+    to_email: str,
+    subject: str,
+    text_body: str,
+    html_body: Optional[str],
+    from_email: str,
+    reply_to: Optional[str],
+    tags: Optional[Dict[str, str]],
+) -> EmailSendResult:
+    api_key = _smtp2go_api_key()
+    if not api_key:
+        return EmailSendResult(ok=False, provider="smtp2go", error="SMTP2GO_API_KEY_MISSING")
+
+    sender = (from_email or "").strip()
+    if not sender:
+        return EmailSendResult(ok=False, provider="smtp2go", error="FROM_EMAIL_MISSING")
+
+    try:
+        import requests
+    except Exception:
+        return EmailSendResult(ok=False, provider="smtp2go", error="REQUESTS_MISSING")
+
+    payload: Dict[str, Any] = {
+        "sender": sender,
+        "to": [to_email],
+        "subject": subject or "",
+        "text_body": text_body or "",
+    }
+    if html_body:
+        payload["html_body"] = html_body
+    custom_headers = []
+    if reply_to:
+        custom_headers.append({"header": "Reply-To", "value": reply_to})
+    if tags:
+        for key, value in tags.items():
+            safe_key = str(key or "").strip().replace("_", "-")
+            safe_value = str(value or "").strip()
+            if safe_key and safe_value:
+                custom_headers.append({"header": f"X-Pivota-{safe_key}", "value": safe_value})
+    if custom_headers:
+        payload["custom_headers"] = custom_headers
+
+    try:
+        resp = requests.post(
+            _smtp2go_email_endpoint(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Smtp2go-Api-Key": api_key,
+                "accept": "application/json",
+            },
+            json=payload,
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("email.send_failed provider=smtp2go error=%s", type(exc).__name__)
+        return EmailSendResult(ok=False, provider="smtp2go", error="SMTP2GO_UNAVAILABLE")
+
+    if resp.status_code not in {200, 201, 202}:
+        logger.warning("email.send_failed provider=smtp2go status=%s", resp.status_code)
+        return EmailSendResult(
+            ok=False,
+            provider="smtp2go",
+            error="SMTP2GO_UNAVAILABLE",
+            details={"status_code": resp.status_code},
+        )
+
+    try:
+        response_payload = resp.json()
+    except Exception:
+        response_payload = {}
+    if not isinstance(response_payload, dict):
+        response_payload = {}
+
+    if _smtp2go_payload_failed(response_payload):
+        logger.warning("email.send_failed provider=smtp2go status=%s provider_failed=true", resp.status_code)
+        return EmailSendResult(
+            ok=False,
+            provider="smtp2go",
+            error="SMTP2GO_SEND_FAILED",
+            details={"status_code": resp.status_code},
+        )
+
+    logger.info("email.sent provider=smtp2go to=%s", mask_email(to_email))
+    return EmailSendResult(
+        ok=True,
+        provider="smtp2go",
+        message_id=_smtp2go_message_id(response_payload),
+        details={"status_code": resp.status_code},
+    )
+
+
 def send_email(
     *,
     to_email: str,
@@ -311,5 +453,15 @@ def send_email(
             from_email=(from_email or "").strip(),
             from_name=from_name,
             reply_to=reply_to,
+        )
+    if provider == "smtp2go":
+        return _send_via_smtp2go(
+            to_email=to_email,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            from_email=(from_email or "").strip(),
+            reply_to=reply_to,
+            tags=tags,
         )
     return EmailSendResult(ok=False, provider=provider, error="EMAIL_PROVIDER_UNCONFIGURED")
