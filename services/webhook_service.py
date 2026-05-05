@@ -14,6 +14,9 @@ import hashlib
 import logging
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
+
+import stripe
+
 from db.database import database
 
 logger = logging.getLogger(__name__)
@@ -399,9 +402,18 @@ async def verify_webhook_signature(
             payload, signature_header, secret
         )
     elif psp_type == "stripe":
-        # TODO: Implement Stripe signature verification
-        logger.warning("Stripe signature verification not yet implemented")
-        return False
+        if not secret:
+            logger.warning("Stripe webhook secret not configured")
+            return False
+        try:
+            # Stripe signs the raw body using HMAC-SHA256 with the endpoint
+            # secret and includes a timestamp; construct_event raises if
+            # either the signature or the timestamp tolerance check fails.
+            stripe.Webhook.construct_event(payload, signature_header, secret)
+            return True
+        except Exception as exc:
+            logger.warning(f"Stripe webhook signature verification failed: {exc}")
+            return False
     else:
         logger.warning(f"Signature verification not supported for PSP: {psp_type}")
         return False
