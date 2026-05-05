@@ -3,6 +3,7 @@ Payment Routes
 API endpoints for payment processing and orchestration
 """
 
+import hashlib
 import logging
 from datetime import datetime
 from typing import Dict, List, Any, Optional
@@ -280,13 +281,17 @@ async def checkout_webhook(
         event_type = payload.get("type") or payload.get("event_type") or ""
         data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else payload
         
-        # Extract event ID for idempotency
+        # Extract event ID for idempotency.
+        # Fallback uses sha256 of the raw body — Python's built-in hash() is
+        # randomised per process (PEP 456), so two gunicorn workers would
+        # compute different "ids" for the same payload and the dedup against
+        # webhook_events.event_id would be useless.
         event_id = (
-            data.get("id") 
+            data.get("id")
             or data.get("event_id")
             or payload.get("id")
             or payload.get("event_id")
-            or f"checkout_{hash(str(payload))}"  # Fallback
+            or f"checkout_{hashlib.sha256(body).hexdigest()[:32]}"
         )
         
         # Try to resolve order_id from multiple potential fields
