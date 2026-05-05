@@ -1654,6 +1654,10 @@ async def _subject_internal_product_keys(subject: Dict[str, Any]) -> List[str]:
                 data = _row_dict(row)
                 product_keys.append(_product_key(data.get("merchant_id"), data.get("platform"), data.get("platform_product_id")))
         except Exception:
+            logger.warning(
+                "_subject_internal_product_keys query failed; treating as empty",
+                exc_info=True,
+            )
             product_keys = []
 
     representative = str(subject.get("representative_product_key") or "").strip()
@@ -1728,6 +1732,10 @@ async def _confirmed_external_seed_offers(subject: Dict[str, Any], product_keys:
             params,
         )
     except Exception:
+        logger.warning(
+            "_confirmed_external_seed_offers query failed; treating as empty",
+            exc_info=True,
+        )
         return []
     confirmed_product_keys = set(product_keys)
     return [
@@ -1761,6 +1769,10 @@ async def _external_seed_near_match_candidates(subject: Dict[str, Any], exclude_
             params,
         )
     except Exception:
+        logger.warning(
+            "_external_seed_near_match_candidates query failed; treating as empty",
+            exc_info=True,
+        )
         return []
 
     candidates: List[Dict[str, Any]] = []
@@ -1801,6 +1813,10 @@ async def _merchant_product_near_match_candidates(subject: Dict[str, Any], exclu
             """
         )
     except Exception:
+        logger.warning(
+            "_merchant_product_near_match_candidates products_cache scan failed; treating as empty",
+            exc_info=True,
+        )
         return []
 
     candidates: List[Dict[str, Any]] = []
@@ -2151,6 +2167,11 @@ async def _primary_product_key_for_group(product_group_id: Optional[str]) -> Opt
             {"product_group_id": product_group_id},
         )
     except Exception:
+        logger.warning(
+            "_primary_product_key_for_group query failed for product_group_id=%s",
+            product_group_id,
+            exc_info=True,
+        )
         return None
     data = _row_dict(row)
     if not data:
@@ -2398,6 +2419,11 @@ async def _refresh_subject_after_product_group_correction(
         try:
             primary_summary = await _product_summary_for_key(primary_key)
         except Exception:
+            logger.warning(
+                "_product_summary_for_key failed in subject refresh for primary_key=%s",
+                primary_key,
+                exc_info=True,
+            )
             primary_summary = {}
         if primary_summary.get("title"):
             refreshed["title"] = primary_summary.get("title")
@@ -2612,6 +2638,11 @@ async def _apply_merchant_candidate_merge(subject: Dict[str, Any], candidate: Di
     try:
         merged_subject = await _subject_from_product_key(product_key, subject.get("market") or DEFAULT_MARKET)
     except Exception:
+        logger.warning(
+            "_subject_from_product_key failed in candidate merge for product_key=%s; falling back to synthesized subject",
+            product_key,
+            exc_info=True,
+        )
         merged_subject = {
             "pdp_id": make_pdp_id("product_group", product_group_id, subject.get("market") or DEFAULT_MARKET),
             "subject_type": "product_group",
@@ -4335,6 +4366,10 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
             limit_params,
         )
     except Exception:
+        logger.warning(
+            "seed_recent_pdp_subjects: product_group_members aggregate failed; treating as empty",
+            exc_info=True,
+        )
         groups = []
 
     for group in groups or []:
@@ -4354,6 +4389,11 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
                 {"product_group_id": product_group_id},
             )
         except Exception:
+            logger.warning(
+                "seed_recent_pdp_subjects: primary-member lookup failed for product_group_id=%s",
+                product_group_id,
+                exc_info=True,
+            )
             primary = None
         if not primary:
             continue
@@ -4367,6 +4407,11 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
             )
             product_data = _json_dict(cache_row.get("product_data")) if cache_row else {}
         except Exception:
+            logger.warning(
+                "seed_recent_pdp_subjects: product cache lookup failed for primary=%s",
+                representative_product_key,
+                exc_info=True,
+            )
             product_data = {}
         summary = _extract_product_summary(product_data)
         try:
@@ -4412,6 +4457,10 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
             limit_params,
         )
     except Exception:
+        logger.warning(
+            "seed_recent_pdp_subjects: canonical_products query failed; treating as empty",
+            exc_info=True,
+        )
         canonical_rows = []
 
     for row in canonical_rows or []:
@@ -4484,6 +4533,10 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
             limit_params,
         )
     except Exception:
+        logger.warning(
+            "seed_recent_pdp_subjects: products_cache (ungrouped merchant) query failed; treating as empty",
+            exc_info=True,
+        )
         merchant_rows = []
 
     for row in merchant_rows or []:
@@ -4527,6 +4580,10 @@ async def seed_recent_pdp_subjects(limit: Optional[int] = 50) -> None:
             limit_params,
         )
     except Exception:
+        logger.warning(
+            "seed_recent_pdp_subjects: external_product_seeds query failed; treating as empty",
+            exc_info=True,
+        )
         external_rows = []
 
     for seed in external_rows or []:
