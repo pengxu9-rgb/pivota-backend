@@ -4,12 +4,15 @@ Platform Orders → ACP Integration Routes
 Connects platform orders (Amazon/Temu) with ACP payment and fulfillment.
 """
 
+import hashlib
+import hmac
 import httpx
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, HTTPException, Depends, Header, status, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Header, Request, status, BackgroundTasks
 from utils.auth import get_current_user, require_admin, can_access_merchant
 from db.platform_orders import (
     get_platform_order_by_id,
@@ -215,26 +218,79 @@ async def create_acp_checkout_for_platform_order(
 
 @router.post("/webhooks/acp/order-completed", dependencies=[Depends(ensure_acp_feature_enabled)])
 async def handle_acp_order_completed_webhook(
-    payload: dict,
+    request: Request,
     background_tasks: BackgroundTasks,
     Merchant_Signature: Optional[str] = Header(default=None, alias="Merchant-Signature")
 ) -> Dict[str, Any]:
     """
     Handle ACP order completed webhook.
-    
+
     Updates platform_orders payment status when ACP payment completes.
     Logs payment transaction for audit trail.
+
+    The body is parsed manually (not via FastAPI's `payload: dict` auto-binding)
+    so we have the raw bytes for HMAC-SHA256 signature verification against
+    the `Merchant-Signature` header.
     """
-    import logging
     logger = logging.getLogger(__name__)
-    
+
+    body = await request.body()
+
+    # Verify HMAC-SHA256 signature against PLATFORM_ORDERS_ACP_WEBHOOK_SECRET.
+    # In production we require both the secret and a header; in dev we
+    # accept unsigned payloads with a warning.
+    secret = settings.platform_orders_acp_webhook_secret
+    is_prod = (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+    )
+    if secret:
+        if not Merchant_Signature:
+            logger.warning("ACP webhook rejected: Merchant-Signature header missing")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing Merchant-Signature header",
+            )
+        expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(Merchant_Signature, expected):
+            logger.warning("ACP webhook rejected: signature mismatch")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid signature",
+            )
+    elif is_prod:
+        logger.error(
+            "PLATFORM_ORDERS_ACP_WEBHOOK_SECRET not configured in production "
+            "— refusing to accept unsigned ACP webhook"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="webhook_secret_not_configured",
+        )
+    else:
+        logger.warning(
+            "ACP webhook signature verification skipped "
+            "(PLATFORM_ORDERS_ACP_WEBHOOK_SECRET unset; permitted only in non-production)"
+        )
+
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        logger.warning(f"ACP webhook rejected: invalid JSON ({exc})")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON payload",
+        )
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Webhook payload must be a JSON object",
+        )
+
     # Log webhook received
     logger.info(f"ACP webhook received: {payload.get('id', 'unknown')}")
-    
-    # TODO: Verify HMAC signature
-    # if Merchant_Signature:
-    #     verify_webhook_signature(payload, Merchant_Signature)
-    
+
     # Extract information
     metadata = payload.get('metadata', {})
     platform_order_id = metadata.get('platform_order_id')

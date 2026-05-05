@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     # pivota-acp service. Required in production; missing in dev falls back
     # to the placeholder "test" token so local end-to-end flows keep working.
     platform_orders_acp_token: Optional[str] = os.getenv("PLATFORM_ORDERS_ACP_TOKEN")
+    # Shared HMAC-SHA256 secret signing inbound ACP order-completed webhooks.
+    # Required in production; missing in dev allows the webhook through with
+    # a warning so local end-to-end flows still work.
+    platform_orders_acp_webhook_secret: Optional[str] = os.getenv(
+        "PLATFORM_ORDERS_ACP_WEBHOOK_SECRET"
+    )
 
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"
