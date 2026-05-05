@@ -86,10 +86,14 @@ async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
     if target is None:
         raise LookupError(f"scan_target not found: {scan_target_id}")
 
-    if target["status"] not in {"queued", "stub_complete"}:
+    # `running` is accepted because the route handler may have already
+    # acquired the run-lock (atomic flip to running) before scheduling this
+    # background task. Re-runs from succeeded/failed/stub_complete are also
+    # accepted — matches the set RUNNABLE_PRIOR_STATUSES + 'running'.
+    if target["status"] not in {"queued", "stub_complete", "succeeded", "failed", "running"}:
         raise ValueError(
             f"scan_target {scan_target_id} is in status={target['status']}, "
-            "expected `queued` or `stub_complete` for a (re)run"
+            "expected one of queued/stub_complete/succeeded/failed/running"
         )
 
     scan_mode = target["scan_mode"]

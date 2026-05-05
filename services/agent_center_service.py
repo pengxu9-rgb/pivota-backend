@@ -275,6 +275,40 @@ async def list_scan_targets(
     }
 
 
+RUNNABLE_PRIOR_STATUSES: tuple = ("queued", "stub_complete", "succeeded", "failed")
+
+
+async def try_acquire_run_lock(*, scan_target_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically flip a scan target from any RUNNABLE_PRIOR_STATUSES → 'running'.
+
+    Returns the updated row if the caller won the race (status was eligible
+    and we flipped it), or None if the row is already 'running', soft-deleted,
+    or doesn't exist. Callers should treat None as "another /run already
+    started this job" (HTTP 409).
+
+    The conditional UPDATE relies on Postgres row locking — two concurrent
+    callers cannot both succeed. The route handler should call this BEFORE
+    scheduling the background task; the runner can then assume status='running'.
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE agent_center_scan_targets
+           SET status = 'running',
+               started_at = COALESCE(started_at, NOW()),
+               updated_at = NOW()
+         WHERE id = :scan_target_id
+           AND deleted_at IS NULL
+           AND status = ANY(:prior_statuses)
+        RETURNING *
+        """,
+        {
+            "scan_target_id": scan_target_id,
+            "prior_statuses": list(RUNNABLE_PRIOR_STATUSES),
+        },
+    )
+    return _row_to_dict_with_payload(row) if row else None
+
+
 async def transition_scan_target(
     *,
     scan_target_id: str,

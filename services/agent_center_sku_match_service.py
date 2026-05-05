@@ -189,10 +189,14 @@ async def run_sku_match(scan_target_id: str) -> Dict[str, Any]:
     if target is None:
         raise LookupError(f"scan_target not found: {scan_target_id}")
 
-    if target["status"] not in {"queued", "stub_complete", "succeeded", "failed"}:
+    # `running` is accepted because the route handler may have already
+    # acquired the run-lock (atomic flip to running) before scheduling this
+    # background task. Direct callers (tests, manual debugging) typically
+    # pass `queued` / `stub_complete` / `succeeded` / `failed`.
+    if target["status"] not in {"queued", "stub_complete", "succeeded", "failed", "running"}:
         raise ValueError(
             f"scan_target {scan_target_id} is in status={target['status']}, "
-            "expected `queued` / `stub_complete` / `succeeded` / `failed` to (re)run"
+            "expected one of queued/stub_complete/succeeded/failed/running"
         )
 
     if target["scan_mode"] != SKU_MATCH_SCAN_MODE:

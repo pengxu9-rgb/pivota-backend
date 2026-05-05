@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -173,6 +174,28 @@ class FakeDB:
     async def fetch_one(self, query: str, values: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         q = " ".join(str(query).split())
         v = dict(values or {})
+        # Conditional `UPDATE agent_center_scan_targets ... WHERE status =
+        # ANY(...) RETURNING *` (used by try_acquire_run_lock). Returns the
+        # row only if status was in `prior_statuses`, simulating Postgres'
+        # atomic conditional update.
+        if (
+            q.startswith("UPDATE agent_center_scan_targets")
+            and "RETURNING" in q
+            and "status = ANY" in q
+        ):
+            self.executed.append((q, v))
+            allowed = set(v.get("prior_statuses") or [])
+            for row in self._tables["agent_center_scan_targets"]:
+                if (
+                    row["id"] == v.get("scan_target_id")
+                    and row["deleted_at"] is None
+                    and row["status"] in allowed
+                ):
+                    row["status"] = "running"
+                    if row.get("started_at") is None:
+                        row["started_at"] = datetime.now(timezone.utc)
+                    return dict(row)
+            return None
         if "FROM agent_center_merchant_stores" in q:
             for row in self._tables["agent_center_merchant_stores"]:
                 if (
@@ -525,10 +548,14 @@ async def test_demand_test_runner_replays_idempotently(
 
 
 @pytest.mark.asyncio
-async def test_demand_test_runner_refuses_running_status(
+async def test_demand_test_runner_accepts_running_status_from_lock(
     fake_db: FakeDB,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Runner must accept `running` as a valid prior status — the route
+    handler now acquires the run-lock atomically (try_acquire_run_lock flips
+    to running) before scheduling the background runner. Refusing `running`
+    here would break the production flow."""
     from services import agent_center_service as ac
     from services import agent_center_demand_test_service as dts
     from services import agent_center_llm_client as llm_client
@@ -538,10 +565,13 @@ async def test_demand_test_runner_refuses_running_status(
         merchant_id="m1", store_id="s1",
         scan_mode="open_product_visibility_test",
     )
-    # Force the row into a non-replayable state.
-    await ac.transition_scan_target(scan_target_id=target["id"], status="running")
-    with pytest.raises(ValueError, match="status=running"):
-        await dts.run_demand_test(target["id"])
+    # Simulate the route having already acquired the lock.
+    await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert fake_db._tables["agent_center_scan_targets"][0]["status"] == "running"
+    # Runner must complete without raising.
+    await dts.run_demand_test(target["id"])
+    final = fake_db._tables["agent_center_scan_targets"][0]
+    assert final["status"] in {"stub_complete", "succeeded"}
 
 
 @pytest.mark.asyncio
@@ -578,3 +608,99 @@ async def test_demand_test_runner_marks_failed_on_upstream_error(
     assert len(rows) == 1
     assert rows[0]["status"] == "failed"
     assert rows[0]["payload"]["error"]["kind"] == "llm_probe"
+
+
+# ---------------------------------------------------------------------------
+# try_acquire_run_lock — concurrency lock for the /run endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_run_lock_succeeds_from_queued(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    locked = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert locked is not None
+    assert locked["status"] == "running"
+    assert locked["started_at"] is not None
+    # And the persisted row reflects it.
+    rows = fake_db._tables["agent_center_scan_targets"]
+    assert rows[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prior_status",
+    ["queued", "stub_complete", "succeeded", "failed"],
+)
+async def test_try_acquire_run_lock_succeeds_from_each_runnable_status(
+    fake_db: FakeDB, prior_status: str,
+) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    fake_db._tables["agent_center_scan_targets"][0]["status"] = prior_status
+    locked = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert locked is not None
+    assert locked["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_run_lock_returns_none_when_already_running(fake_db: FakeDB) -> None:
+    """Second concurrent /run must not be able to acquire — this is the
+    actual race-condition guarantee the lock provides."""
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    first = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert first is not None
+
+    second = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_run_lock_returns_none_for_soft_deleted(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    fake_db._tables["agent_center_scan_targets"][0]["deleted_at"] = datetime.now(timezone.utc)
+    locked = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert locked is None
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_run_lock_returns_none_for_unknown_id(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    locked = await ac.try_acquire_run_lock(scan_target_id="acst_does_not_exist")
+    assert locked is None
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_run_lock_preserves_started_at_on_relock(fake_db: FakeDB) -> None:
+    """If the target had a prior started_at (from a previous run), acquiring
+    the lock again (e.g. retry after stub_complete) must not reset it — we
+    want the original started_at preserved via COALESCE."""
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    original_started = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    row = fake_db._tables["agent_center_scan_targets"][0]
+    row["status"] = "stub_complete"
+    row["started_at"] = original_started
+
+    locked = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert locked is not None
+    assert locked["status"] == "running"
+    assert locked["started_at"] == original_started
