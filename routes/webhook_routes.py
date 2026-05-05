@@ -690,7 +690,26 @@ async def handle_stripe_webhook(
                 )
                 raise HTTPException(status_code=400, detail="Invalid signature")
         else:
-            # 开发环境：不验证签名
+            # No Stripe webhook secret configured for this psp_id. In
+            # production this is a hard failure — refuse to fail-open.
+            # In dev/staging, log a warning and accept the unsigned payload
+            # (existing behaviour) so local testing keeps working.
+            is_prod = (
+                os.getenv("ENVIRONMENT", "").lower() == "production"
+                or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+            )
+            if is_prod:
+                logger.error(
+                    "Stripe webhook secret not configured for psp_id=%s in production "
+                    "— rejecting unsigned event",
+                    psp_id,
+                )
+                raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
+            logger.warning(
+                "Stripe webhook signature verification skipped for psp_id=%s "
+                "(no secret candidates; permitted only in non-production)",
+                psp_id,
+            )
             event = json.loads(payload)
         event = _stripe_object_to_dict(event)
         if not isinstance(event, dict):

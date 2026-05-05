@@ -334,7 +334,36 @@ async def checkout_webhook(
                 status="failed"
             )
             raise HTTPException(status_code=401, detail="Missing signature")
-        
+        else:
+            # No webhook secret configured. In production this is a hard
+            # failure — we refuse to silently accept unsigned webhooks. In
+            # dev/staging, log a warning and fall through (existing behaviour).
+            is_prod = (
+                os.getenv("ENVIRONMENT", "").lower() == "production"
+                or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+            )
+            if is_prod:
+                logger.error(
+                    f"CHECKOUT_WEBHOOK_SECRET not configured in production — "
+                    f"rejecting unsigned event {event_id}"
+                )
+                await WebhookService.record_webhook_event(
+                    event_id=event_id,
+                    event_type=event_type,
+                    psp_type="checkout",
+                    order_id=order_id,
+                    payload=payload,
+                    headers=dict(request.headers),
+                    signature_verified=False,
+                    signature_header=signature_header,
+                    status="failed"
+                )
+                raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
+            logger.warning(
+                f"Checkout webhook signature verification skipped for event {event_id} "
+                "(CHECKOUT_WEBHOOK_SECRET not set; permitted only in non-production)"
+            )
+
         # Accept success-like events
         normalized_type = (event_type or "").lower()
         is_success = any(t in normalized_type for t in [
