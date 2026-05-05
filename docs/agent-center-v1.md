@@ -125,14 +125,30 @@ V1 (this PR) implements only the schema + the Demand Test stub runner. Agents
 2–5 add their own logic (and, when payloads grow large, their own
 `agent_center_<n>_diagnoses` tables) in follow-up PRs.
 
-## LLM contract (placeholder for the next PR)
+## LLM contract
 
-The Demand Test stub runner currently records mock usage events instead of
-calling Gemini. The actual contract — how `pivota-backend` asks PIVOTA-Agent to
-run a Gemini probe, the prompt template, the structured-output parser, the
-preflight URL verification rules — is decided in a separate PR (`decision-point #2`
-from the architecture menu). Until then, `PIVOTA_AGENT_CENTER_MOCK_GEMINI=true`
-is the V1 default.
+The Demand Test runner now calls
+`POST /internal/agent-center/llm-probe` on PIVOTA-Agent. Two providers
+behind that endpoint:
+
+- **`mock`** — deterministic stub responses keyed by `scan_mode`. V1 default
+  via `PIVOTA_AGENT_CENTER_MOCK_GEMINI=true`. CI never depends on a live LLM.
+- **`gemini`** — real Gemini calls via `@google/genai`, routed through
+  PIVOTA-Agent's existing `geminiGlobalGate` (rate limit + circuit breaker
+  already deployed). Falls back to mock when `GEMINI_API_KEY` is absent.
+
+Auth is shared-secret `X-Pivota-Internal-Key` matched against
+`PIVOTA_INTERNAL_API_KEY` (PIVOTA-Agent side) /
+`PIVOTA_AGENT_INTERNAL_API_KEY` (this service side). Distinct from
+human-ops `X-ADMIN-KEY` so service auth and admin auth rotate independently.
+
+If the internal API key isn't configured on this side, the LLM client falls
+back to a deterministic local mock (logged at ERROR) rather than failing the
+run. Production must always set the key; the fallback is for local dev / CI.
+
+Full request/response schema lives in the PIVOTA-Agent side at
+`src/internal/agentCenterLlmProbe.js`. The Python client wrapper lives in
+`services/agent_center_llm_client.py`.
 
 ## Auth model
 

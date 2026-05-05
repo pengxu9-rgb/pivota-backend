@@ -407,9 +407,19 @@ async def test_upsert_resolution_plan_replaces_payload_on_conflict(fake_db: Fake
 
 
 @pytest.mark.asyncio
-async def test_demand_test_stub_runner_full_walk(fake_db: FakeDB) -> None:
+async def test_demand_test_runner_full_walk_with_local_mock_fallback(
+    fake_db: FakeDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without `PIVOTA_AGENT_INTERNAL_API_KEY` set, the LLM client falls
+    back to its local mock. The runner should still walk the full state
+    machine, record one usage event, and create the synthetic finding."""
     from services import agent_center_service as ac
     from services import agent_center_demand_test_service as dts
+    from services import agent_center_llm_client as llm_client
+
+    # Make sure we exercise the local mock path explicitly.
+    monkeypatch.setattr(llm_client.settings, "pivota_agent_internal_api_key", None)
 
     target = await ac.create_scan_target(
         merchant_id="merch_x", store_id="store_x",
@@ -417,22 +427,27 @@ async def test_demand_test_stub_runner_full_walk(fake_db: FakeDB) -> None:
         payload={"queries": ["lookup test"]},
     )
 
-    final = await dts.run_demand_test_stub(target["id"])
+    final = await dts.run_demand_test(target["id"])
 
+    # Local-mock fallback → status is `stub_complete` (not `succeeded`); the
+    # runner reserves `succeeded` for actual Gemini-provider responses.
     assert final["status"] == "stub_complete"
     assert final["started_at"] is not None
     assert final["finished_at"] is not None
-    assert final["payload"]["stub_run"]["stub"] is True
+    assert final["payload"]["run"]["provider"] == "local_mock_no_internal_key"
+    assert final["payload"]["run"]["issue_ids"]
 
-    # Exactly one usage event recorded.
+    # Exactly one usage event recorded; quantity reflects runs_count.
     assert len(fake_db._tables["agent_center_usage_events"]) == 1
     usage = fake_db._tables["agent_center_usage_events"][0]
     assert usage["agent_type"] == "demand_test"
     assert usage["workflow_type"] == "pivota_pdp_attribution"
     assert usage["billing_mode"] == "preview_only"
     assert usage["billing_status"] == "not_invoiced"
+    assert usage["provider"] == "local_mock_no_internal_key"
 
-    # Synthetic issue created for this scan_mode.
+    # Synthetic issue created for this scan_mode (pivota_pdp_attribution_gap
+    # per ISSUE_TYPE_BY_SCAN_MODE).
     assert len(fake_db._tables["agent_center_issues"]) == 1
     issue = fake_db._tables["agent_center_issues"][0]
     assert issue["issue_type"] == "pivota_pdp_attribution_gap"
@@ -440,26 +455,84 @@ async def test_demand_test_stub_runner_full_walk(fake_db: FakeDB) -> None:
 
 
 @pytest.mark.asyncio
-async def test_demand_test_stub_runner_replays_idempotently(fake_db: FakeDB) -> None:
-    """The usage event has a stable idempotency key per scan target — re-running
-    the stub against a `stub_complete` row must not double-count usage."""
+async def test_demand_test_runner_marks_succeeded_when_provider_is_gemini(
+    fake_db: FakeDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub the LLM client to return a Gemini-shaped response and verify the
+    runner promotes the scan target to `succeeded`."""
     from services import agent_center_service as ac
     from services import agent_center_demand_test_service as dts
+    from services import agent_center_llm_client as llm_client
 
+    async def _fake_probe(**_kwargs):
+        return {
+            "scan_mode": _kwargs["scan_mode"],
+            "provider": "gemini",
+            "runs_count": 3,
+            "scores": {"visibility_score": 33, "attribution_echo_rate": 0},
+            "findings": [
+                {
+                    "issue_type": "pivota_pdp_attribution_gap",
+                    "severity": "high",
+                    "evidence": {"runs": []},
+                },
+                {
+                    "issue_type": "ai_visibility_loss",
+                    "severity": "medium",
+                    "evidence": {"runs": []},
+                },
+            ],
+            "usage": {"input_tokens": 120, "output_tokens": 240},
+            "raw_runs": [],
+        }
+    monkeypatch.setattr(llm_client, "probe", _fake_probe)
+
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="pivota_pdp_attribution_test",
+    )
+    final = await dts.run_demand_test(target["id"])
+
+    assert final["status"] == "succeeded"
+    assert final["payload"]["run"]["provider"] == "gemini"
+    # Two findings → two issues.
+    assert len(fake_db._tables["agent_center_issues"]) == 2
+    issue_types = {row["issue_type"] for row in fake_db._tables["agent_center_issues"]}
+    assert issue_types == {"pivota_pdp_attribution_gap", "ai_visibility_loss"}
+
+
+@pytest.mark.asyncio
+async def test_demand_test_runner_replays_idempotently(
+    fake_db: FakeDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The usage event has a stable idempotency key per scan target — re-running
+    the runner against a `stub_complete` row must not double-count usage."""
+    from services import agent_center_service as ac
+    from services import agent_center_demand_test_service as dts
+    from services import agent_center_llm_client as llm_client
+
+    monkeypatch.setattr(llm_client.settings, "pivota_agent_internal_api_key", None)
     target = await ac.create_scan_target(
         merchant_id="m1", store_id="s1",
         scan_mode="open_product_visibility_test",
     )
-    await dts.run_demand_test_stub(target["id"])
-    await dts.run_demand_test_stub(target["id"])  # idempotent replay
+    await dts.run_demand_test(target["id"])
+    await dts.run_demand_test(target["id"])  # idempotent replay
 
     assert len(fake_db._tables["agent_center_usage_events"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_demand_test_stub_runner_refuses_running_status(fake_db: FakeDB) -> None:
+async def test_demand_test_runner_refuses_running_status(
+    fake_db: FakeDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from services import agent_center_service as ac
     from services import agent_center_demand_test_service as dts
+    from services import agent_center_llm_client as llm_client
+    monkeypatch.setattr(llm_client.settings, "pivota_agent_internal_api_key", None)
 
     target = await ac.create_scan_target(
         merchant_id="m1", store_id="s1",
@@ -468,11 +541,40 @@ async def test_demand_test_stub_runner_refuses_running_status(fake_db: FakeDB) -
     # Force the row into a non-replayable state.
     await ac.transition_scan_target(scan_target_id=target["id"], status="running")
     with pytest.raises(ValueError, match="status=running"):
-        await dts.run_demand_test_stub(target["id"])
+        await dts.run_demand_test(target["id"])
 
 
 @pytest.mark.asyncio
-async def test_demand_test_stub_runner_unknown_target_raises(fake_db: FakeDB) -> None:
+async def test_demand_test_runner_unknown_target_raises(fake_db: FakeDB) -> None:
     from services import agent_center_demand_test_service as dts
     with pytest.raises(LookupError):
-        await dts.run_demand_test_stub("acst_nonexistent")
+        await dts.run_demand_test("acst_nonexistent")
+
+
+@pytest.mark.asyncio
+async def test_demand_test_runner_marks_failed_on_upstream_error(
+    fake_db: FakeDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the LLM probe raises AgentCenterLlmClientError the runner should
+    flip the scan target to `failed`, persist the error in payload, and
+    re-raise so BackgroundTasks logs it."""
+    from services import agent_center_service as ac
+    from services import agent_center_demand_test_service as dts
+    from services import agent_center_llm_client as llm_client
+
+    async def _failing_probe(**_kwargs):
+        raise llm_client.AgentCenterLlmClientError("upstream 502 boom")
+    monkeypatch.setattr(llm_client, "probe", _failing_probe)
+
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    with pytest.raises(llm_client.AgentCenterLlmClientError):
+        await dts.run_demand_test(target["id"])
+
+    rows = fake_db._tables["agent_center_scan_targets"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["payload"]["error"]["kind"] == "llm_probe"
