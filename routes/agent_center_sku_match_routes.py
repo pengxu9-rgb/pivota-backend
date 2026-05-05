@@ -146,6 +146,12 @@ async def run_sku_match_route(
     background_tasks: BackgroundTasks,
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    """Kick off a SKU-match run.
+
+    Acquires an atomic run-lock (conditional UPDATE flips status to running
+    only if the row is currently in a runnable status). Two parallel /run
+    calls cannot both schedule a background task; the second receives 409.
+    """
     try:
         target = await ac.get_scan_target(scan_target_id=scan_target_id)
         if target is None:
@@ -154,12 +160,16 @@ async def run_sku_match_route(
             raise LookupError(
                 f"scan_target {scan_target_id} is not a sku-match run"
             )
-        # Match the runner's accepted statuses; ValueError otherwise (mapped 400).
-        if target["status"] not in {"queued", "stub_complete", "succeeded", "failed"}:
-            raise ValueError(
-                f"scan_target is in status={target['status']}, "
-                "expected `queued` / `stub_complete` / `succeeded` / `failed` to (re)run"
+        locked = await ac.try_acquire_run_lock(scan_target_id=scan_target_id)
+        if locked is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"scan_target is in status={target['status']}, "
+                    f"expected one of {list(ac.RUNNABLE_PRIOR_STATUSES)} to (re)run"
+                ),
             )
+        target = locked
     except Exception as exc:
         raise _map_error(exc) from exc
 

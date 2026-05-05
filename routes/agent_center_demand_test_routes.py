@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from services import agent_center_service as ac
 from services.agent_center_demand_test_service import (
     is_demand_test_scan_mode,
-    run_demand_test,
+    run_demand_test as _service_run_demand_test,
 )
 from utils.auth import get_current_employee
 
@@ -186,16 +186,16 @@ async def list_demand_test_issues(
 
 
 @router.post("/{scan_target_id}/run")
-async def run_demand_test(
+async def run_demand_test_route(
     scan_target_id: str,
     background_tasks: BackgroundTasks,
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
-    """Kick off the (V1 stub) Demand Test run for a scan target.
+    """Kick off a Demand Test run for a scan target.
 
-    Real Gemini integration lives in a follow-up PR; until then this route
-    schedules `run_demand_test_stub` which transitions the target through
-    queued → running → stub_complete and creates a synthetic issue.
+    Acquires an atomic run-lock (conditional UPDATE flips status to running
+    only if the row is currently in a runnable status). Two parallel /run
+    calls cannot both schedule a background task; the second receives 409.
     """
     try:
         target = await ac.get_scan_target(scan_target_id=scan_target_id)
@@ -205,15 +205,20 @@ async def run_demand_test(
             raise LookupError(
                 f"scan_target {scan_target_id} is not a demand-test run"
             )
-        if target["status"] not in {"queued", "stub_complete"}:
-            raise ValueError(
-                f"scan_target is in status={target['status']}, "
-                "expected `queued` or `stub_complete` to start a (re)run"
+        locked = await ac.try_acquire_run_lock(scan_target_id=scan_target_id)
+        if locked is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"scan_target is in status={target['status']}, "
+                    f"expected one of {list(ac.RUNNABLE_PRIOR_STATUSES)} to (re)run"
+                ),
             )
+        target = locked
     except Exception as exc:
         raise _map_error(exc) from exc
 
-    background_tasks.add_task(run_demand_test, scan_target_id)
+    background_tasks.add_task(_service_run_demand_test, scan_target_id)
     return {
         "status": "running",
         "scan_target_id": scan_target_id,

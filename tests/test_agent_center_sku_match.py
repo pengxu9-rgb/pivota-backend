@@ -258,19 +258,31 @@ async def test_run_sku_match_refuses_wrong_scan_mode(
 
 
 @pytest.mark.asyncio
-async def test_run_sku_match_refuses_non_replayable_status(
+async def test_run_sku_match_accepts_running_status_from_lock(
     fake_db: FakeDB,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Runner must accept `running` as a valid prior status — the route
+    handler now acquires the run-lock atomically (try_acquire_run_lock flips
+    to running) before scheduling the background runner. Refusing `running`
+    here would break the production flow."""
     from services import agent_center_service as ac
     from services import agent_center_sku_match_service as sms
+
+    async def _empty_fetch(**_kwargs):
+        return []
+    monkeypatch.setattr(sms, "_fetch_products_for_merchant", _empty_fetch)
 
     target = await ac.create_scan_target(
         merchant_id="m1", store_id="s1", scan_mode="sku_match",
     )
-    await ac.transition_scan_target(scan_target_id=target["id"], status="running")
-    with pytest.raises(ValueError, match="status=running"):
-        await sms.run_sku_match(target["id"])
+    # Simulate the route having already acquired the lock.
+    await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert fake_db._tables["agent_center_scan_targets"][0]["status"] == "running"
+    # Runner must complete without raising.
+    await sms.run_sku_match(target["id"])
+    final = fake_db._tables["agent_center_scan_targets"][0]
+    assert final["status"] == "succeeded"
 
 
 @pytest.mark.asyncio
