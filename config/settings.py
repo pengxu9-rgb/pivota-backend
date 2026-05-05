@@ -111,6 +111,14 @@ class Settings(BaseSettings):
     
     # Platform Orders ACP Integration
     enable_platform_orders_acp: bool = os.getenv("FEATURE_PLATFORM_ORDERS_ACP", "false").lower() == "true"
+    platform_orders_acp_url: str = os.getenv(
+        "PLATFORM_ORDERS_ACP_URL",
+        "https://pivota-acp-production.up.railway.app",
+    )
+    # Bearer token for service-to-service auth between pivota-backend and the
+    # pivota-acp service. Required in production; missing in dev falls back
+    # to the placeholder "test" token so local end-to-end flows keep working.
+    platform_orders_acp_token: Optional[str] = os.getenv("PLATFORM_ORDERS_ACP_TOKEN")
 
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"

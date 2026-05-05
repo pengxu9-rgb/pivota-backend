@@ -6,6 +6,7 @@ Connects platform orders (Amazon/Temu) with ACP payment and fulfillment.
 
 import httpx
 import json
+import os
 from datetime import datetime
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, Depends, Header, status, BackgroundTasks
@@ -31,7 +32,31 @@ def ensure_acp_feature_enabled():
             detail="Platform Orders ACP integration not enabled"
         )
 
-ACP_URL = "https://pivota-acp-production.up.railway.app"
+ACP_URL = settings.platform_orders_acp_url
+
+
+def _resolve_acp_bearer_token() -> str:
+    """Resolve the bearer token for service-to-service ACP calls.
+
+    In production we require PLATFORM_ORDERS_ACP_TOKEN to be set; the
+    previous default of "Bearer test" would either be rejected by the
+    ACP service or, worse, accepted by a misconfigured peer. In
+    dev/staging we fall back to "test" so local end-to-end flows keep
+    working.
+    """
+    token = settings.platform_orders_acp_token
+    if token:
+        return token
+    is_prod = (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+    )
+    if is_prod:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="platform_orders_acp_token_not_configured",
+        )
+    return "test"
 
 
 @router.post("/{order_id}/create-acp-checkout", dependencies=[Depends(ensure_acp_feature_enabled)])
@@ -110,12 +135,13 @@ async def create_acp_checkout_for_platform_order(
     acp_platform = "shopify" if order['platform'] in ['amazon', 'temu'] else order['platform']
     
     # Call ACP API
+    acp_bearer = _resolve_acp_bearer_token()
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{ACP_URL}/checkout_sessions",
                 headers={
-                    "Authorization": "Bearer test",  # TODO: Use real merchant token
+                    "Authorization": f"Bearer {acp_bearer}",
                     "API-Version": "2025-09-29",
                     "X-Merchant-Id": order['merchant_id'],
                     "X-Platform": acp_platform,  # Use shopify as proxy for amazon/temu
