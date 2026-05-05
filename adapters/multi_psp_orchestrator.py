@@ -268,6 +268,7 @@ class MultiPSPOrchestrator:
         # Try each PSP in priority order
         attempt_number = 0
         blocked_errors: List[str] = []
+        attempt_errors: List[str] = []
         for config in self.psp_configs:
             if enforce_live_readiness and not config.live_charge_ready:
                 blocked_errors.append(
@@ -346,17 +347,28 @@ class MultiPSPOrchestrator:
                         currency=currency,
                         error=error
                     )
-                    
+
+                    attempt_errors.append(
+                        f"{config.psp_type}: {error or 'unknown failure'}"
+                    )
                     # Continue to next PSP
                     continue
 
             except Exception as e:
                 logger.error(f"Exception with {config.psp_type}: {e}")
+                attempt_errors.append(f"{config.psp_type}: {e}")
                 continue
-        
-        # All PSPs failed
-        if blocked_errors and attempt_number == 0:
-            return False, None, "; ".join(blocked_errors), "none"
+
+        # All PSPs failed — surface every error so the caller (and the
+        # merchant's dashboard) can see why each PSP rejected the charge,
+        # rather than the previous generic "All PSPs failed" string.
+        all_errors = blocked_errors + attempt_errors
+        if attempt_number == 0:
+            if blocked_errors:
+                return False, None, "All PSPs blocked: " + "; ".join(blocked_errors), "none"
+            return False, None, "No PSPs configured for merchant", "none"
+        if all_errors:
+            return False, None, "All PSPs failed: " + "; ".join(all_errors), "none"
         return False, None, "All PSPs failed", "none"
     
     async def _log_psp_attempt(
