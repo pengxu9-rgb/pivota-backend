@@ -130,6 +130,12 @@ from routes.agent_sdk_fixed import router as agent_sdk_fixed_router
 from routes.employee_store_psp_fixes import router as emp_store_psp_router
 from routes.fix_agents_table import router as fix_agents_router
 from routes.admin_migrations import router as admin_migrations_router
+from routes.admin_apply_agent_center_migration import (
+    router as admin_apply_agent_center_migration_router,
+)
+from routes.agent_center_demand_test_routes import (
+    router as agent_center_demand_test_router,
+)
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
@@ -697,6 +703,8 @@ app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
 app.include_router(admin_migrations_router)  # Admin migrations
+app.include_router(admin_apply_agent_center_migration_router)  # Agent Center V1 migration apply/verify
+app.include_router(agent_center_demand_test_router)  # Agent Center: Demand Test Agent V1 (internal pilot)
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints

@@ -109,6 +109,25 @@ class Settings(BaseSettings):
     # Platform Onboarding v2 (EPIC-1/2/3)
     platform_onboarding_v2_enabled: bool = os.getenv("FEATURE_PLATFORM_ONBOARDING_V2", "false").lower() == "true"
     
+    # Agent Center V1 (shared runtime for Demand Test / SKU Match / Offer
+    # Execution / Checkout Verification / GMV Attribution agents).
+    # state_backend is reserved for a future swap from "db" to a separate
+    # store; "db" is the only supported value today.
+    agent_center_state_backend: str = os.getenv("AGENT_CENTER_STATE_BACKEND", "db")
+    enable_internal_demo_fixtures: bool = (
+        os.getenv("ENABLE_INTERNAL_DEMO_FIXTURES", "false").lower() == "true"
+    )
+    enable_internal_production_validation: bool = (
+        os.getenv("ENABLE_INTERNAL_PRODUCTION_VALIDATION", "false").lower() == "true"
+    )
+    # When true, demand-test runs that would normally call Gemini via
+    # PIVOTA-Agent fall back to deterministic stub responses. V1 ships with
+    # this on by default; a follow-up PR flips it once the LLM API contract
+    # between pivota-backend and PIVOTA-Agent is locked.
+    pivota_agent_center_mock_gemini: bool = (
+        os.getenv("PIVOTA_AGENT_CENTER_MOCK_GEMINI", "true").lower() == "true"
+    )
+
     # Platform Orders ACP Integration
     enable_platform_orders_acp: bool = os.getenv("FEATURE_PLATFORM_ORDERS_ACP", "false").lower() == "true"
     platform_orders_acp_url: str = os.getenv(
