@@ -1,0 +1,335 @@
+"""
+HTTP-level tests for the Agent Center routes (demand-test + sku-match).
+
+These tests sit on top of `tests/test_agent_center_service.py`'s FakeDB —
+they exercise the route surface (auth wiring, request validation, route →
+service plumbing, the /run lock returning 409) without depending on a real
+Postgres or a real LLM upstream.
+
+Two layers below cover the runner internals:
+  - tests/test_agent_center_service.py — service primitives + lock semantics
+  - tests/test_agent_center_sku_match.py — sku-match runner + pure checks
+
+Background runners are monkey-patched to no-op so the lock can be observed
+in isolation (the runner would otherwise transition the row to
+succeeded/stub_complete during the response cycle of TestClient).
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, Tuple
+
+import pytest
+
+os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from utils.auth import get_current_employee
+from tests.test_agent_center_service import FakeDB
+
+
+# ---------------------------------------------------------------------------
+# Fixture: build a small FastAPI app with just the agent-center routers and
+# a fake DB + no-op runners.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def env(monkeypatch: pytest.MonkeyPatch) -> Tuple[TestClient, FakeDB]:
+    db = FakeDB()
+    from services import agent_center_service as ac
+    monkeypatch.setattr(ac, "database", db)
+
+    # No-op the runners. Without this, BackgroundTasks would call into
+    # the real LLM client / products_cache query during the response cycle
+    # and break tests that don't have those dependencies stubbed.
+    async def _noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    from routes import agent_center_demand_test_routes as dtr
+    from routes import agent_center_sku_match_routes as smr
+    monkeypatch.setattr(dtr, "_service_run_demand_test", _noop)
+    monkeypatch.setattr(smr, "run_sku_match", _noop)
+
+    async def _override_employee() -> Dict[str, Any]:
+        return {"employee_id": "emp_test", "email": "test@example.com", "role": "admin"}
+
+    app = FastAPI()
+    app.include_router(dtr.router)
+    app.include_router(smr.router)
+    app.dependency_overrides[get_current_employee] = _override_employee
+    return TestClient(app), db
+
+
+# ---------------------------------------------------------------------------
+# Demand-test routes
+# ---------------------------------------------------------------------------
+
+
+def test_create_demand_test_returns_queued_row(env: Tuple[TestClient, FakeDB]) -> None:
+    client, db = env
+    res = client.post(
+        "/api/agent-center/demand-tests",
+        json={
+            "merchant_id": "m1",
+            "store_id": "s1",
+            "scan_mode": "open_product_visibility_test",
+            "payload": {"context": {"products": ["p1"]}},
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "queued"
+    assert body["scan_target"]["scan_mode"] == "open_product_visibility_test"
+    assert len(db._tables["agent_center_scan_targets"]) == 1
+
+
+def test_create_demand_test_rejects_unsupported_scan_mode(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    res = client.post(
+        "/api/agent-center/demand-tests",
+        json={
+            "merchant_id": "m1", "store_id": "s1",
+            "scan_mode": "sku_match",  # belongs to the sku-match agent
+        },
+    )
+    assert res.status_code == 400
+    assert "unsupported" in res.json()["detail"].lower()
+
+
+def test_create_demand_test_validates_required_fields(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    res = client.post(
+        "/api/agent-center/demand-tests",
+        json={"merchant_id": "m1"},  # missing store_id, scan_mode
+    )
+    assert res.status_code == 422
+
+
+def test_get_demand_test_returns_row_and_issues(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    created = client.post(
+        "/api/agent-center/demand-tests",
+        json={
+            "merchant_id": "m1", "store_id": "s1",
+            "scan_mode": "open_product_visibility_test",
+        },
+    ).json()
+    scan_target_id = created["scan_target"]["id"]
+
+    res = client.get(f"/api/agent-center/demand-tests/{scan_target_id}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["scan_target"]["id"] == scan_target_id
+    assert body["issues"] == []
+
+
+def test_get_demand_test_404_for_wrong_scan_mode(env: Tuple[TestClient, FakeDB]) -> None:
+    """A sku-match scan_target accessed via /demand-tests must 404 — keeps
+    each agent's surface focused and prevents cross-agent state confusion."""
+    client, _ = env
+    created = client.post(
+        "/api/agent-center/sku-match",
+        json={"merchant_id": "m1", "store_id": "s1"},
+    ).json()
+    scan_target_id = created["scan_target"]["id"]
+
+    res = client.get(f"/api/agent-center/demand-tests/{scan_target_id}")
+    assert res.status_code == 404
+
+
+def test_list_demand_tests_filters_by_status(env: Tuple[TestClient, FakeDB]) -> None:
+    client, db = env
+    for _ in range(2):
+        client.post(
+            "/api/agent-center/demand-tests",
+            json={
+                "merchant_id": "m1", "store_id": "s1",
+                "scan_mode": "open_product_visibility_test",
+            },
+        )
+    # Force one of them into stub_complete so the filter has something to
+    # discriminate on.
+    db._tables["agent_center_scan_targets"][0]["status"] = "stub_complete"
+
+    res = client.get("/api/agent-center/demand-tests?merchant_id=m1&status=queued")
+    assert res.status_code == 200
+    items = res.json()["items"]
+    assert len(items) == 1
+    assert items[0]["status"] == "queued"
+
+
+def test_run_demand_test_acquires_lock_and_returns_running(env: Tuple[TestClient, FakeDB]) -> None:
+    client, db = env
+    created = client.post(
+        "/api/agent-center/demand-tests",
+        json={
+            "merchant_id": "m1", "store_id": "s1",
+            "scan_mode": "open_product_visibility_test",
+        },
+    ).json()
+    scan_target_id = created["scan_target"]["id"]
+
+    res = client.post(f"/api/agent-center/demand-tests/{scan_target_id}/run")
+    assert res.status_code == 200
+    assert res.json()["status"] == "running"
+    # Lock was acquired — row is `running`.
+    assert db._tables["agent_center_scan_targets"][0]["status"] == "running"
+
+
+def test_run_demand_test_returns_409_when_already_running(env: Tuple[TestClient, FakeDB]) -> None:
+    """The actual concurrency guarantee: two parallel /run calls cannot
+    both schedule the runner. The second is rejected with 409."""
+    client, _ = env
+    created = client.post(
+        "/api/agent-center/demand-tests",
+        json={
+            "merchant_id": "m1", "store_id": "s1",
+            "scan_mode": "open_product_visibility_test",
+        },
+    ).json()
+    scan_target_id = created["scan_target"]["id"]
+
+    first = client.post(f"/api/agent-center/demand-tests/{scan_target_id}/run")
+    assert first.status_code == 200
+
+    second = client.post(f"/api/agent-center/demand-tests/{scan_target_id}/run")
+    assert second.status_code == 409
+    assert "running" in second.json()["detail"].lower()
+
+
+def test_run_demand_test_404_for_nonexistent(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    res = client.post("/api/agent-center/demand-tests/acst_does_not_exist/run")
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# SKU-match routes
+# ---------------------------------------------------------------------------
+
+
+def test_create_sku_match_returns_queued_row(env: Tuple[TestClient, FakeDB]) -> None:
+    client, db = env
+    res = client.post(
+        "/api/agent-center/sku-match",
+        json={
+            "merchant_id": "m1", "store_id": "s1",
+            "payload": {"options": {"limit": 10, "max_age_days": 7}},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "queued"
+    assert body["scan_target"]["scan_mode"] == "sku_match"
+    assert len(db._tables["agent_center_scan_targets"]) == 1
+
+
+def test_create_sku_match_validates_required_fields(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    res = client.post("/api/agent-center/sku-match", json={"merchant_id": "m1"})
+    assert res.status_code == 422
+
+
+def test_get_sku_match_404_for_wrong_scan_mode(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    created = client.post(
+        "/api/agent-center/demand-tests",
+        json={
+            "merchant_id": "m1", "store_id": "s1",
+            "scan_mode": "open_product_visibility_test",
+        },
+    ).json()
+    scan_target_id = created["scan_target"]["id"]
+
+    res = client.get(f"/api/agent-center/sku-match/{scan_target_id}")
+    assert res.status_code == 404
+
+
+def test_run_sku_match_acquires_lock_and_returns_running(env: Tuple[TestClient, FakeDB]) -> None:
+    client, db = env
+    created = client.post(
+        "/api/agent-center/sku-match",
+        json={"merchant_id": "m1", "store_id": "s1"},
+    ).json()
+    scan_target_id = created["scan_target"]["id"]
+
+    res = client.post(f"/api/agent-center/sku-match/{scan_target_id}/run")
+    assert res.status_code == 200
+    assert res.json()["status"] == "running"
+    assert db._tables["agent_center_scan_targets"][0]["status"] == "running"
+
+
+def test_run_sku_match_returns_409_when_already_running(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    created = client.post(
+        "/api/agent-center/sku-match",
+        json={"merchant_id": "m1", "store_id": "s1"},
+    ).json()
+    scan_target_id = created["scan_target"]["id"]
+
+    first = client.post(f"/api/agent-center/sku-match/{scan_target_id}/run")
+    assert first.status_code == 200
+
+    second = client.post(f"/api/agent-center/sku-match/{scan_target_id}/run")
+    assert second.status_code == 409
+
+
+def test_run_sku_match_404_for_nonexistent(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    res = client.post("/api/agent-center/sku-match/acst_does_not_exist/run")
+    assert res.status_code == 404
+
+
+def test_list_sku_match_runs_filters_by_merchant(env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = env
+    for merchant in ("m1", "m2"):
+        client.post(
+            "/api/agent-center/sku-match",
+            json={"merchant_id": merchant, "store_id": "s1"},
+        )
+
+    res = client.get("/api/agent-center/sku-match?merchant_id=m1")
+    assert res.status_code == 200
+    items = res.json()["items"]
+    assert len(items) == 1
+    assert items[0]["merchant_id"] == "m1"
+
+
+# ---------------------------------------------------------------------------
+# Auth — when the override is missing, the route must reject anonymous
+# requests. This catches future regressions where someone forgets the
+# `Depends(get_current_employee)` on a new endpoint.
+# ---------------------------------------------------------------------------
+
+
+def test_demand_test_route_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No `dependency_overrides` for `get_current_employee` — the framework
+    falls through to the real auth check, which rejects unauthenticated
+    requests with 401/403."""
+    db = FakeDB()
+    from services import agent_center_service as ac
+    monkeypatch.setattr(ac, "database", db)
+
+    from routes import agent_center_demand_test_routes as dtr
+    app = FastAPI()
+    app.include_router(dtr.router)
+    client = TestClient(app)
+    res = client.get("/api/agent-center/demand-tests?merchant_id=m1")
+    assert res.status_code in {401, 403}
+
+
+def test_sku_match_route_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDB()
+    from services import agent_center_service as ac
+    monkeypatch.setattr(ac, "database", db)
+
+    from routes import agent_center_sku_match_routes as smr
+    app = FastAPI()
+    app.include_router(smr.router)
+    client = TestClient(app)
+    res = client.get("/api/agent-center/sku-match?merchant_id=m1")
+    assert res.status_code in {401, 403}
