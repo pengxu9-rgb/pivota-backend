@@ -1,24 +1,23 @@
 """
-Agent Center — Demand Test Agent (V1 stub).
+Agent Center — Demand Test Agent V1 runner.
 
-This module is the first consumer of `services/agent_center_service.py`. The
-intent is to exercise the shared schema end-to-end without yet calling Gemini —
-the actual LLM probe lands in a follow-up PR after the
-`pivota-backend → PIVOTA-Agent` LLM API contract is locked.
+This is the first concrete agent built on top of `agent_center_service.py`.
+A run:
 
-`run_demand_test_stub` does the bookkeeping a real run will do:
+  1. Marks the scan target `running`.
+  2. Calls `agent_center_llm_client.probe(...)` (which hits the
+     `/internal/agent-center/llm-probe` endpoint on PIVOTA-Agent, or a
+     local mock when `PIVOTA_AGENT_INTERNAL_API_KEY` is unset).
+  3. Records a usage event on the shared meter (idempotent on
+     `idempotency_key`).
+  4. Persists each finding as a row in `agent_center_issues`.
+  5. Marks the scan target `succeeded` (or `failed` on error / `stub_complete`
+     when the upstream returned mock data so it's clear nothing real ran).
 
-  1. Marks the scan target `running` (with `started_at` stamped).
-  2. Records a usage event with provider=`mock` and `billing_mode=preview_only`.
-  3. For Pivota-attribution scan modes, synthesises a placeholder
-     `pivota_pdp_attribution_gap` issue so issue-listing endpoints return
-     non-empty data and the resolution-plan workflow can be exercised.
-  4. Marks the scan target `stub_complete` (with `finished_at` stamped).
-
-When the real Gemini integration lands, only this function changes.
-Routes, schema, and the shared service stay still.
-
-See `docs/agent-center-v1.md` for the per-agent contract.
+This replaces the V1 stub that shipped in #268. Routes import
+`run_demand_test`; `run_demand_test_stub` stays as a thin alias so the
+existing route imports keep working until the route layer is updated in
+the same PR.
 """
 
 from __future__ import annotations
@@ -26,13 +25,17 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
+from config.settings import settings
+from services import agent_center_llm_client as llm_client
 from services import agent_center_service as ac
 
 logger = logging.getLogger(__name__)
 
 
-# Demand-test issue types, lifted from the V1 spec
-# (see merchants-portal#7's `dev/agent-center-demand-test-v1-validation.md`).
+# Demand-test issue types (lifted from the V1 spec). Aligned with the
+# server-side fallback in `services/agent_center_llm_client.py` and with
+# `PRIMARY_ISSUE_TYPE_BY_SCAN_MODE` in
+# `PIVOTA-Agent/src/internal/agentCenterLlmProbe.js`.
 ISSUE_TYPE_BY_SCAN_MODE: Dict[str, str] = {
     "open_product_visibility_test": "ai_visibility_loss",
     "merchant_store_attribution_test": "merchant_store_attribution_gap",
@@ -45,33 +48,61 @@ def is_demand_test_scan_mode(scan_mode: str) -> bool:
     return scan_mode in ac.DEMAND_TEST_SCAN_MODES
 
 
-async def run_demand_test_stub(scan_target_id: str) -> Dict[str, Any]:
-    """V1 stub for a Demand Test Agent run.
+def _resolve_provider_for_settings() -> str:
+    """Pick the LLM provider to ask the upstream for, based on settings.
 
-    Idempotent on the usage event (replay-safe). Returns the final
-    scan-target row.
+    `pivota_agent_center_mock_gemini=true` (V1 default) → ask the upstream
+    for `mock` provider. Once Gemini prompts are calibrated, flip the
+    setting to ship `gemini`.
+    """
+    return "mock" if settings.pivota_agent_center_mock_gemini else "gemini"
 
-    Behaviour gap vs the eventual real implementation:
-        - real Gemini calls go through PIVOTA-Agent's geminiGlobalGate
-        - real implementation will produce real visibility / attribution
-          scores in `payload.findings` and create issues only when scores
-          fall below thresholds
+
+def _final_status_from_probe_result(result: Dict[str, Any]) -> str:
+    """Decide whether the scan target ends in `succeeded` or `stub_complete`.
+
+    `succeeded` = a real LLM (gemini) actually answered.
+    `stub_complete` = the upstream returned a mock or local-mock result, so
+    no real LLM call landed; visible distinction matters when we audit
+    coverage of the V1 pilot.
+    """
+    provider = str(result.get("provider") or "").lower()
+    if provider in {"gemini"}:
+        return "succeeded"
+    return "stub_complete"
+
+
+async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
+    """Drive a Demand Test run end-to-end.
+
+    Idempotent on the usage event (`demand_test:{scan_target_id}:v1`); a
+    replay against a `succeeded` / `stub_complete` row reuses the same
+    idempotency key and the existing usage row wins. Issue rows however are
+    NOT deduplicated server-side in V1 — replays will produce additional
+    issue rows. That's an acceptable V1 trade-off given the agent normally
+    runs once per `scan_target_id`.
     """
     target = await ac.get_scan_target(scan_target_id=scan_target_id)
     if target is None:
         raise LookupError(f"scan_target not found: {scan_target_id}")
 
     if target["status"] not in {"queued", "stub_complete"}:
-        # Refuse to re-stub a non-queued run; let callers explicitly transition
-        # back to `queued` if they want to retry.
         raise ValueError(
             f"scan_target {scan_target_id} is in status={target['status']}, "
-            "expected `queued` or `stub_complete` for stub run"
+            "expected `queued` or `stub_complete` for a (re)run"
         )
 
     scan_mode = target["scan_mode"]
+    if not is_demand_test_scan_mode(scan_mode):
+        raise ValueError(
+            f"scan_target {scan_target_id} has scan_mode={scan_mode!r}; "
+            "this runner only handles demand-test scan modes"
+        )
+
     merchant_id = target["merchant_id"]
     store_id = target["store_id"]
+    context = (target.get("payload") or {}).get("context") or {}
+    requested_provider = _resolve_provider_for_settings()
 
     # 1. Mark running.
     await ac.transition_scan_target(
@@ -80,63 +111,113 @@ async def run_demand_test_stub(scan_target_id: str) -> Dict[str, Any]:
         started_at=ac.utcnow(),
     )
 
-    # 2. Record a usage event. Idempotency key encodes the scan target + a stub
-    #    discriminator so re-running the stub against the same target replays
-    #    cleanly.
+    # 2. Call the LLM probe.
+    try:
+        result = await llm_client.probe(
+            scan_mode=scan_mode,
+            scan_target_id=scan_target_id,
+            merchant_id=merchant_id,
+            store_id=store_id,
+            context=context,
+            provider=requested_provider,
+            max_runs=int((target.get("payload") or {}).get("max_runs") or 3),
+        )
+    except llm_client.AgentCenterLlmClientError as exc:
+        # Upstream failure — record terminal state + bubble up.
+        logger.error(
+            "demand_test run failed for scan_target=%s: %s",
+            scan_target_id, exc,
+        )
+        await ac.transition_scan_target(
+            scan_target_id=scan_target_id,
+            status="failed",
+            finished_at=ac.utcnow(),
+            payload_patch={"error": {"message": str(exc), "kind": "llm_probe"}},
+        )
+        raise
+
+    # 3. Record usage event (first-write-wins idempotent).
     usage_event = await ac.record_usage_event(
-        idempotency_key=f"demand_test_stub:{scan_target_id}:v1",
+        idempotency_key=f"demand_test:{scan_target_id}:v1",
         merchant_id=merchant_id,
         store_id=store_id,
         scan_target_id=scan_target_id,
         agent_type="demand_test",
         workflow_type=_workflow_type_for_scan_mode(scan_mode),
-        event_type="demand_test_stub_credit",
-        provider="mock",
+        event_type="demand_test_credit",
+        provider=str(result.get("provider") or "unknown"),
         scan_mode=scan_mode,
         billing_mode="preview_only",
         billing_status="not_invoiced",
-        quantity=1,
-        payload={"stub": True},
+        quantity=int(result.get("runs_count") or 1),
+        payload={
+            "scores": result.get("scores") or {},
+            "usage": result.get("usage") or {},
+        },
     )
 
-    # 3. Synthetic issue for scan modes that have a clearly-defined "gap" type.
-    issue_payload: Dict[str, Any] = {
-        "stub": True,
-        "scan_mode": scan_mode,
-        "note": "Synthetic issue created by V1 stub runner — see agent-center-v1.md",
-    }
-    issue_type = ISSUE_TYPE_BY_SCAN_MODE.get(scan_mode)
-    issue: Optional[Dict[str, Any]] = None
-    if issue_type is not None:
-        issue = await ac.create_issue(
-            merchant_id=merchant_id,
-            store_id=store_id,
-            scan_target_id=scan_target_id,
-            issue_type=issue_type,
-            severity="medium",
-            payload=issue_payload,
-        )
+    # 4. Persist findings as issues.
+    created_issue_ids = []
+    for finding in (result.get("findings") or []):
+        if not isinstance(finding, dict):
+            continue
+        issue_type = str(finding.get("issue_type") or "").strip()
+        if not issue_type:
+            continue
+        severity = str(finding.get("severity") or "medium").lower()
+        if severity not in ac.ISSUE_SEVERITIES:
+            severity = "medium"
+        evidence = finding.get("evidence")
+        issue_payload: Dict[str, Any] = {
+            "scan_mode": scan_mode,
+            "provider": result.get("provider"),
+            "evidence": evidence if isinstance(evidence, dict) else {"raw": evidence},
+        }
+        try:
+            issue = await ac.create_issue(
+                merchant_id=merchant_id,
+                store_id=store_id,
+                scan_target_id=scan_target_id,
+                issue_type=issue_type,
+                severity=severity,
+                payload=issue_payload,
+            )
+            created_issue_ids.append(issue["id"])
+        except ValueError as exc:
+            # Bad finding shape — log and continue rather than aborting the
+            # whole run. Other findings can still be useful.
+            logger.warning(
+                "demand_test: skipping malformed finding for scan_target=%s: %s",
+                scan_target_id, exc,
+            )
 
-    # 4. Mark stub_complete with a payload patch noting what we did.
+    # 5. Mark final status with a payload patch summarising the run.
+    final_status = _final_status_from_probe_result(result)
     final = await ac.transition_scan_target(
         scan_target_id=scan_target_id,
-        status="stub_complete",
+        status=final_status,
         finished_at=ac.utcnow(),
         payload_patch={
-            "stub_run": {
-                "stub": True,
+            "run": {
+                "provider": result.get("provider"),
+                "runs_count": result.get("runs_count"),
+                "scores": result.get("scores"),
                 "usage_event_id": usage_event.get("id"),
-                "synthetic_issue_id": (issue or {}).get("id"),
+                "issue_ids": created_issue_ids,
             }
         },
     )
     logger.info(
-        "demand_test stub complete: scan_target=%s scan_mode=%s issue=%s",
-        scan_target_id,
-        scan_mode,
-        (issue or {}).get("id"),
+        "demand_test run complete: scan_target=%s scan_mode=%s status=%s issues=%d",
+        scan_target_id, scan_mode, final_status, len(created_issue_ids),
     )
     return final
+
+
+# Backward-compat alias. The route layer can keep importing
+# `run_demand_test_stub` until it switches to the new name; either way the
+# behaviour is the real runner.
+run_demand_test_stub = run_demand_test
 
 
 def _workflow_type_for_scan_mode(scan_mode: str) -> str:

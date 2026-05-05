@@ -122,10 +122,24 @@ class Settings(BaseSettings):
     )
     # When true, demand-test runs that would normally call Gemini via
     # PIVOTA-Agent fall back to deterministic stub responses. V1 ships with
-    # this on by default; a follow-up PR flips it once the LLM API contract
-    # between pivota-backend and PIVOTA-Agent is locked.
+    # this on by default; flip to "false" once GEMINI_API_KEY is wired in
+    # PIVOTA-Agent and prompts have been calibrated.
     pivota_agent_center_mock_gemini: bool = (
         os.getenv("PIVOTA_AGENT_CENTER_MOCK_GEMINI", "true").lower() == "true"
+    )
+    # PIVOTA-Agent /internal/agent-center/llm-probe endpoint URL +
+    # shared-secret. Required in production; in dev with the secret unset
+    # the demand-test runner falls back to local mock findings without
+    # making any HTTP call.
+    pivota_agent_internal_url: str = os.getenv(
+        "PIVOTA_AGENT_INTERNAL_URL",
+        "https://pivota-agent-production.up.railway.app",
+    )
+    pivota_agent_internal_api_key: Optional[str] = os.getenv(
+        "PIVOTA_AGENT_INTERNAL_API_KEY"
+    )
+    agent_center_llm_probe_timeout_s: float = float(
+        os.getenv("AGENT_CENTER_LLM_PROBE_TIMEOUT_S", "30")
     )
 
     # Platform Orders ACP Integration

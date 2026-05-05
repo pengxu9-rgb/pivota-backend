@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from services import agent_center_service as ac
 from services.agent_center_demand_test_service import (
     is_demand_test_scan_mode,
-    run_demand_test_stub,
+    run_demand_test,
 )
 from utils.auth import get_current_employee
 
@@ -213,10 +213,9 @@ async def run_demand_test(
     except Exception as exc:
         raise _map_error(exc) from exc
 
-    background_tasks.add_task(run_demand_test_stub, scan_target_id)
+    background_tasks.add_task(run_demand_test, scan_target_id)
     return {
         "status": "running",
         "scan_target_id": scan_target_id,
         "scan_mode": target["scan_mode"],
-        "stub": True,
     }
