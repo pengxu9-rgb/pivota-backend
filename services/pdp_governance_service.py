@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -11,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from config.settings import resolve_public_api_base_url
 from db.database import IS_POSTGRES, database
+
+logger = logging.getLogger(__name__)
 from db.pdp_governance import (
     merchant_pdp_contributions,
     pdp_gallery_assets,
@@ -686,6 +689,14 @@ async def _fetch_latest_cache_row(merchant_id: str, platform: str, platform_prod
             .limit(1)
         )
     except Exception:
+        # DB error here used to silently surface as "no PDP found", which is
+        # what made PDP Production Smoke fail with red-herring messages.
+        # Preserve the None return for callers but log so the real cause is visible.
+        logger.warning(
+            "_fetch_latest_cache_row failed for merchant=%s platform=%s product=%s",
+            merchant_id, platform, platform_product_id,
+            exc_info=True,
+        )
         return None
     return _row_dict(row) if row else None
 
@@ -708,6 +719,11 @@ async def _resolve_product_group(merchant_id: str, platform: str, platform_produ
             },
         )
     except Exception:
+        logger.warning(
+            "_resolve_product_group group lookup failed for merchant=%s platform=%s product=%s",
+            merchant_id, platform, platform_product_id,
+            exc_info=True,
+        )
         return None
     if not row or not row["product_group_id"]:
         return None
@@ -725,6 +741,11 @@ async def _resolve_product_group(merchant_id: str, platform: str, platform_produ
         count_data = _row_dict(count_row)
         seller_count = int(count_data.get("seller_count") or 0)
     except Exception:
+        logger.warning(
+            "_resolve_product_group seller_count query failed for product_group_id=%s",
+            product_group_id,
+            exc_info=True,
+        )
         seller_count = 0
 
     try:
@@ -739,6 +760,11 @@ async def _resolve_product_group(merchant_id: str, platform: str, platform_produ
             {"product_group_id": product_group_id},
         )
     except Exception:
+        logger.warning(
+            "_resolve_product_group primary-member query failed for product_group_id=%s",
+            product_group_id,
+            exc_info=True,
+        )
         primary = None
 
     return {
@@ -767,6 +793,11 @@ async def _fetch_external_seed_by_product_id(external_product_id: str, market: s
             {"external_product_id": external_product_id, "market": market},
         )
     except Exception:
+        logger.warning(
+            "_fetch_external_seed_by_product_id failed for external_product_id=%s market=%s",
+            external_product_id, market,
+            exc_info=True,
+        )
         return None
     return _row_dict(row) if row else None
 
@@ -778,6 +809,11 @@ async def _fetch_external_seed_by_id(seed_id: str) -> Optional[Dict[str, Any]]:
             {"id": seed_id},
         )
     except Exception:
+        logger.warning(
+            "_fetch_external_seed_by_id failed for seed_id=%s",
+            seed_id,
+            exc_info=True,
+        )
         return None
     return _row_dict(row) if row else None
 
