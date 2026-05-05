@@ -111,6 +111,12 @@ class Settings(BaseSettings):
     
     # Platform Orders ACP Integration
     enable_platform_orders_acp: bool = os.getenv("FEATURE_PLATFORM_ORDERS_ACP", "false").lower() == "true"
+    # Shared HMAC-SHA256 secret signing inbound ACP order-completed webhooks.
+    # Required in production; missing in dev allows the webhook through with
+    # a warning so local end-to-end flows still work.
+    platform_orders_acp_webhook_secret: Optional[str] = os.getenv(
+        "PLATFORM_ORDERS_ACP_WEBHOOK_SECRET"
+    )
 
     # Readiness audit / thin-slice flags
     feature_readiness_audit: bool = os.getenv("FEATURE_READINESS_AUDIT", "false").lower() == "true"
