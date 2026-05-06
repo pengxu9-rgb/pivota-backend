@@ -121,15 +121,30 @@ async def external_merchant_report(
         attribution_result=probes["attribution"],
         provider=body.provider,
     )
-    # Audit trail: log the verdict + scores at INFO so we can correlate
-    # with backend resource graphs if a BD run takes a service down.
+    upstream_status = report.get("upstream_status") or {}
+    if not upstream_status.get("is_real"):
+        # Loud log when we shipped mock data despite a real-provider
+        # request — most likely root cause is missing env var on either
+        # backend (PIVOTA_AGENT_INTERNAL_API_KEY) or upstream
+        # (GEMINI_API_KEY). BD runs are useless without real data; ops
+        # should fix before any rep ships a report to a merchant.
+        logger.warning(
+            "BD report fell back to MOCK — requested=%s visibility=%s attribution=%s reason=%s",
+            upstream_status.get("requested_provider"),
+            upstream_status.get("visibility_provider"),
+            upstream_status.get("attribution_provider"),
+            upstream_status.get("reason"),
+        )
     logger.info(
-        "BD report generated: merchant=%s product=%s verdict=%s vis=%d attr=%d provider=%s",
+        "BD report generated: merchant=%s product=%s verdict=%s vis=%d attr=%d "
+        "requested_provider=%s upstream_visibility=%s is_real=%s",
         body.merchant_name,
         body.product_title,
         report["verdict"]["label"],
         report["verdict"]["visibility_score"],
         report["verdict"]["attribution_score"],
         body.provider,
+        upstream_status.get("visibility_provider"),
+        upstream_status.get("is_real"),
     )
     return {"status": "ok", "report": report}
