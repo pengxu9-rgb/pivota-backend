@@ -1248,23 +1248,32 @@ AGENT_EXTERNAL_SEED_BUILD_TIMEOUT_SECONDS = _env_float(
     min_value=0.05,
     max_value=5.0,
 )
+# PR: bump SQL stage seed-query timeout defaults. Recall probe v7
+# (pivota-agent-ui main reports/recall_v1/recall_v7_*) showed C:timeout
+# stuck at 12 (~22pp pass-rate) even after PR-1306/1307/1309 raised the
+# JS-side caps to 8s. The actual fire site is fetch_external_seed_rows
+# inside agent_api's seed-direct path, with the timeouts capped here at
+# stage_a=0.9s, stage_b=1.4s, parent=1.6s. Multi-term ILIKE on
+# external_product_seeds is the dominant cost; raising defaults gives
+# SQL room to finish on non-trivial queries (electronics/home/fragrance)
+# while still bounded by max_value=10.0 for safety.
 AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS",
-    1.6,
+    4.0,
     min_value=0.05,
-    max_value=5.0,
+    max_value=10.0,
 )
 AGENT_EXTERNAL_SEED_STAGE_A_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_STAGE_A_QUERY_TIMEOUT_SECONDS",
-    0.9,
+    2.0,
     min_value=0.05,
-    max_value=5.0,
+    max_value=10.0,
 )
 AGENT_EXTERNAL_SEED_STAGE_B_QUERY_TIMEOUT_SECONDS = _env_float(
     "AGENT_EXTERNAL_SEED_STAGE_B_QUERY_TIMEOUT_SECONDS",
-    1.4,
+    3.0,
     min_value=0.05,
-    max_value=5.0,
+    max_value=10.0,
 )
 AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS = int(
     _env_float(
