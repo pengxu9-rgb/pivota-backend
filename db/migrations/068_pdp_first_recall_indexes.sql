@@ -22,24 +22,28 @@
 --   4. GIN trigram on LOWER(external_product_seeds.seed_data::text) — closes
 --      the legacy CAST-LIKE seq scan path while attached_product_key migration
 --      (Phase 3) is in flight.
+--
+-- Runbook note:
+-- - Execute this script in a session with autocommit enabled.
+-- - CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- 1. PDP category lookup
-CREATE INDEX IF NOT EXISTS idx_catalog_products_category_active
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_catalog_products_category_active
   ON catalog_products (category)
   WHERE catalog_track = 'internal_merchant' AND truth_tier = 'primary';
 
 -- 2. PDP category + brand compound lookup
-CREATE INDEX IF NOT EXISTS idx_catalog_products_category_brand_active
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_catalog_products_category_brand_active
   ON catalog_products (category, brand)
   WHERE catalog_track = 'internal_merchant' AND truth_tier = 'primary';
 
 -- 3. Beauty profile taxonomy JSONB
-CREATE INDEX IF NOT EXISTS idx_beauty_product_profiles_taxonomy_json_gin
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_beauty_product_profiles_taxonomy_json_gin
   ON beauty_product_profiles USING GIN (taxonomy_json jsonb_path_ops);
 
 -- 4. external_product_seeds seed_data text trigram
-CREATE INDEX IF NOT EXISTS idx_external_product_seeds_active_seed_data_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_external_product_seeds_active_seed_data_trgm
   ON external_product_seeds USING GIN (LOWER(seed_data::text) gin_trgm_ops)
   WHERE status = 'active' AND attached_product_key IS NULL;
