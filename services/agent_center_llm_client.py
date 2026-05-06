@@ -20,6 +20,7 @@ Either way the caller gets a `Dict[str, Any]` with the V1 keys
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -28,6 +29,25 @@ import httpx
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+# Retry once on transport-layer errors (connection reset, read error,
+# remote-protocol error). These are typical during deploy overlap on
+# Railway — when the upstream container is rolling, in-flight TCP
+# connections get reset and httpx surfaces an empty-message
+# RemoteProtocolError. One retry buys us through a single rolling
+# restart without making the user re-run a 30-second BD report.
+#
+# Timeouts are NOT retried — a slow Gemini call shouldn't double the
+# wall-clock cost. Only retry the cheap network-layer failures.
+_TRANSPORT_RETRY_EXCS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.ConnectError,
+    httpx.NetworkError,
+)
+_RETRY_BACKOFF_S = 0.5
 
 
 # Mirror of `PRIMARY_ISSUE_TYPE_BY_SCAN_MODE` in
@@ -134,11 +154,38 @@ async def probe(
         "Content-Type": "application/json",
         "X-Pivota-Internal-Key": api_key,
     }
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, json=body, headers=headers)
-    except httpx.HTTPError as exc:
-        raise AgentCenterLlmClientError(f"llm probe transport failed: {exc}") from exc
+    response = None
+    last_exc: Optional[BaseException] = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json=body, headers=headers)
+            break
+        except _TRANSPORT_RETRY_EXCS as exc:
+            last_exc = exc
+            logger.warning(
+                "llm probe transport retry: scan_mode=%s attempt=%s/%s exc=%s(%r)",
+                scan_mode,
+                attempt,
+                2,
+                type(exc).__name__,
+                str(exc),
+            )
+            if attempt == 2:
+                break
+            await asyncio.sleep(_RETRY_BACKOFF_S)
+        except httpx.HTTPError as exc:
+            # Non-retryable httpx error (e.g. timeout, decoding) — surface
+            # immediately with the exception class named so logs aren't blank.
+            raise AgentCenterLlmClientError(
+                f"llm probe transport failed ({type(exc).__name__}): {exc!r}"
+            ) from exc
+    if response is None:
+        # All retries exhausted on retryable transport errors.
+        raise AgentCenterLlmClientError(
+            f"llm probe transport failed after retry "
+            f"({type(last_exc).__name__ if last_exc else 'unknown'}): {last_exc!r}"
+        ) from last_exc
 
     if response.status_code >= 500:
         raise AgentCenterLlmClientError(
