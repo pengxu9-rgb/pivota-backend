@@ -201,8 +201,10 @@ def test_structured_report_flags_local_mock_no_internal_key() -> None:
         provider="gemini",  # requested gemini but got local mock
     )
     assert report["upstream_status"]["is_real"] is False
-    assert "PIVOTA_AGENT_INTERNAL_API_KEY" in report["upstream_status"]["reason"]
-    assert "Railway" in report["upstream_status"]["reason"]
+    # Reason must mention the canonical (production-preferred) env var
+    # name AND the Railway service name so ops sees actionable info.
+    assert "PROMOTIONS_ADMIN_KEY" in report["upstream_status"]["reason"]
+    assert "web-production-fedb" in report["upstream_status"]["reason"]
 
 
 def test_structured_report_flags_mock_fallback_no_gemini_key() -> None:
@@ -256,7 +258,7 @@ def test_render_markdown_includes_mock_warning_when_not_real() -> None:
     md = render_markdown_from_structured(report)
     assert "MOCK DATA" in md
     assert "DO NOT SHARE" in md
-    assert "PIVOTA_AGENT_INTERNAL_API_KEY" in md
+    assert "PROMOTIONS_ADMIN_KEY" in md
 
 
 def test_render_markdown_omits_warning_when_real() -> None:
