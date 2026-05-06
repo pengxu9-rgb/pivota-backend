@@ -591,7 +591,10 @@ def test_structured_report_includes_action_items_and_industry_context() -> None:
 def test_structured_report_with_category_visibility() -> None:
     """Phase 2a: when category_visibility_result is supplied, the
     structured report exposes a `category_visibility` block + an
-    optional `verdict.category_visibility_score` field."""
+    optional `verdict.category_visibility_score` field. Phase 2d:
+    score is re-derived from raw_runs (brand text-match, not just
+    URL match) — upstream's score is preserved at `upstream_score`
+    for audit but doesn't drive the verdict."""
     from services.agent_center_bd_report_service import build_structured_report
     report = build_structured_report(
         merchant_name="Beauty of Joseon",
@@ -620,9 +623,12 @@ def test_structured_report_with_category_visibility() -> None:
         provider="gemini",
     )
     assert report["category_visibility"] is not None
-    assert report["category_visibility"]["score"] == 25
+    # Re-scored: 0 matches across 1 run (no URL/title/excerpt match
+    # for the brand) → 0/100, NOT the upstream's 25.
+    assert report["category_visibility"]["score"] == 0
+    assert report["category_visibility"]["upstream_score"] == 25
     assert len(report["category_visibility"]["queries"]) == 1
-    assert report["verdict"]["category_visibility_score"] == 25
+    assert report["verdict"]["category_visibility_score"] == 0
 
 
 def test_structured_report_omits_category_block_when_not_run() -> None:
@@ -975,3 +981,304 @@ def test_render_markdown_includes_industry_context_and_actions() -> None:
     # Recommended actions section + at least one severity-tagged item
     assert "## Recommended actions" in md
     assert "_(severity:" in md
+
+
+# ---------------------------------------------------------------------------
+# Phase 2d: brand text-match scoring + VISIBLE_VIA_RETAILERS verdict.
+#
+# Regression case: the first real BoJ BD run scored category_visibility=0
+# even though Gemini quoted "Beauty of Joseon" verbatim in 2/3 category
+# query excerpts and cited Sephora / Olive Young / Lookfantastic as
+# grounded sources. Upstream's URL-only matcher missed all of it.
+# ---------------------------------------------------------------------------
+
+
+def _category_run(
+    query: str,
+    *,
+    excerpt: str = "",
+    grounding_sources: List[Dict[str, str]] = None,
+    competitors_appearing: List[str] = None,
+    brand_appears: bool = False,
+    in_grounding: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "query": query,
+        "parsed": {
+            "brand_appears": brand_appears,
+            "competitors_appearing": competitors_appearing or [],
+            "evidence_excerpt": excerpt,
+        },
+        "grounding_chunks": [
+            s["uri"] for s in (grounding_sources or [])
+        ],
+        "grounding_sources": grounding_sources or [],
+        "url_match": {
+            "in_grounding": in_grounding,
+            "in_text": False,
+            "llm_self_report": brand_appears,
+        },
+    }
+
+
+def test_score_category_visibility_credits_brand_text_match() -> None:
+    """The BoJ-class case: 2/3 runs quote the brand by name in the
+    evidence_excerpt. Re-scored: 67/100, not the upstream's 0."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        _category_run(
+            "best eye patches 2026",
+            excerpt="A wing-shaped hydrogel eye patch...",  # no brand name
+            grounding_sources=[{"uri": "https://r/", "title": "sephora.com"}],
+        ),
+        _category_run(
+            "top eye patches this year",
+            excerpt="Beauty of Joseon Revive Under Eye Patch is described as...",
+            grounding_sources=[{"uri": "https://r/", "title": "sephora.com"}],
+        ),
+        _category_run(
+            "best eye patches under $50",
+            excerpt="Beauty of Joseon Revive Under Eye Patches for Wrinkles...",
+            grounding_sources=[{"uri": "https://r/", "title": "youtube.com"}],
+        ),
+    ]
+    score, details = score_category_visibility(
+        runs,
+        merchant_host="beautyofjoseon.com",
+        merchant_brand="Beauty of Joseon",
+    )
+    assert score == 67  # 2/3 matched via excerpt
+    assert details[0]["matched"] is False
+    assert details[1]["matched"] is True
+    assert details[1]["excerpt_match"] is True
+    assert details[2]["matched"] is True
+
+
+def test_score_category_visibility_credits_title_match() -> None:
+    """A grounding source titled with the merchant brand counts as a
+    full match even without text echo in the excerpt."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        _category_run(
+            "best eye patches 2026",
+            excerpt="hydrogel patches...",
+            grounding_sources=[
+                {"uri": "https://r/", "title": "Beauty of Joseon Official Store"},
+            ],
+        ),
+    ]
+    score, details = score_category_visibility(
+        runs,
+        merchant_host="beautyofjoseon.com",
+        merchant_brand="Beauty of Joseon",
+    )
+    assert score == 100
+    assert details[0]["title_match"] is True
+
+
+def test_score_category_visibility_ignores_self_report_only() -> None:
+    """Gemini's `brand_appears: true` self-report alone is NOT enough.
+    Without textual confirmation in grounding we score 0 — the model
+    frequently hallucinates self-attribution."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        _category_run(
+            "best eye patches 2026",
+            excerpt="some other content",
+            grounding_sources=[{"uri": "https://r/", "title": "sephora.com"}],
+            brand_appears=True,  # LLM self-report — should be ignored
+        ),
+    ]
+    score, _ = score_category_visibility(
+        runs,
+        merchant_host="beautyofjoseon.com",
+        merchant_brand="Beauty of Joseon",
+    )
+    assert score == 0
+
+
+def test_score_category_visibility_empty() -> None:
+    from services.agent_center_bd_report_service import score_category_visibility
+    score, details = score_category_visibility(
+        [], merchant_host="x.com", merchant_brand="X"
+    )
+    assert score == 0
+    assert details == []
+
+
+def test_extract_category_competitors_aggregates_brands_and_retailers() -> None:
+    from services.agent_center_bd_report_service import extract_category_competitors
+    runs = [
+        _category_run(
+            "q1",
+            grounding_sources=[
+                {"uri": "https://r1/", "title": "sephora.com"},
+                {"uri": "https://r2/", "title": "youtube.com"},
+            ],
+            competitors_appearing=["Patchology", "Wander Beauty", "Beauty of Joseon"],
+        ),
+        _category_run(
+            "q2",
+            grounding_sources=[
+                {"uri": "https://r3/", "title": "sephora.com"},  # repeat
+                {"uri": "https://r4/", "title": "oliveyoung.com"},
+            ],
+            competitors_appearing=["Patchology", "Peace Out"],  # Patchology repeats
+        ),
+    ]
+    brands, retailers = extract_category_competitors(
+        runs,
+        merchant_host="beautyofjoseon.com",
+        merchant_brand="Beauty of Joseon",
+    )
+    brand_map = {b["name"]: b["times_cited"] for b in brands}
+    retailer_map = {r["host"]: r["times_cited"] for r in retailers}
+    # Patchology in both runs → 2; Wander Beauty + Peace Out → 1 each.
+    # Beauty of Joseon (the merchant) is filtered out.
+    assert brand_map["Patchology"] == 2
+    assert brand_map["Wander Beauty"] == 1
+    assert brand_map["Peace Out"] == 1
+    assert "Beauty of Joseon" not in brand_map
+    # Sephora cited in both → 2; oliveyoung + youtube → 1 each.
+    assert retailer_map["sephora.com"] == 2
+    assert retailer_map["oliveyoung.com"] == 1
+
+
+def test_verdict_visible_via_retailers_triggers_when_category_high_attr_zero() -> None:
+    """The BoJ-class verdict: named-product visibility 0, attribution 0,
+    BUT category_visibility 67 → VISIBLE VIA RETAILERS, not INVISIBLE."""
+    from services.agent_center_bd_report_service import verdict_for, VERDICT_VIA_RETAILERS
+    label, explanation = verdict_for(
+        visibility_score=0,
+        attribution_score=0,
+        category_visibility_score=67,
+    )
+    assert label == VERDICT_VIA_RETAILERS
+    assert "retailers" in explanation.lower() or "retailer" in explanation.lower()
+
+
+def test_verdict_invisible_when_category_also_zero() -> None:
+    """Genuine INVISIBLE: nothing surfaces anywhere, including category."""
+    from services.agent_center_bd_report_service import verdict_for, VERDICT_INVISIBLE
+    label, _ = verdict_for(
+        visibility_score=0,
+        attribution_score=0,
+        category_visibility_score=0,
+    )
+    assert label == VERDICT_INVISIBLE
+
+
+def test_verdict_via_retailers_does_not_trigger_when_attr_present() -> None:
+    """When attribution >= misattributed_attr_max the verdict should NOT
+    be VIA_RETAILERS — that label is reserved for attribution-broken cases."""
+    from services.agent_center_bd_report_service import verdict_for, VERDICT_VIA_RETAILERS
+    label, _ = verdict_for(
+        visibility_score=20,
+        attribution_score=50,
+        category_visibility_score=70,
+    )
+    assert label != VERDICT_VIA_RETAILERS
+
+
+def test_structured_report_boj_full_scenario_via_retailers() -> None:
+    """End-to-end BoJ-class scenario: real-shape probe payloads
+    → re-scored category visibility → VIA_RETAILERS verdict →
+    competitor brands + retailer hosts surfaced in category block."""
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        VERDICT_VIA_RETAILERS,
+    )
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://beautyofjoseon.com/products/revive-under-eye-patch",
+        product_title="Revive Under Eye Patch: Ginseng + Retinal",
+        product_vendor="Beauty of Joseon",
+        product_type="eye patch",
+        visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [_vis_run("where can I buy X", visible=True, grounding=[])],
+        },
+        attribution_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [_attr_run("where can I buy X", found=False)],
+        },
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},  # upstream missed it
+            "raw_runs": [
+                _category_run(
+                    "best eye patches 2026",
+                    excerpt="hydrogel eye patch",
+                    grounding_sources=[{"uri": "https://r1/", "title": "sephora.com"}],
+                    competitors_appearing=["Patchology", "Wander Beauty"],
+                ),
+                _category_run(
+                    "top eye patches this year",
+                    excerpt="Beauty of Joseon Revive Under Eye Patch is described as...",
+                    grounding_sources=[
+                        {"uri": "https://r2/", "title": "sephora.com"},
+                        {"uri": "https://r3/", "title": "oliveyoung.com"},
+                    ],
+                    competitors_appearing=["Patchology", "Summer Fridays"],
+                ),
+                _category_run(
+                    "best eye patches under $50",
+                    excerpt="Beauty of Joseon Revive eye patches...",
+                    grounding_sources=[
+                        {"uri": "https://r4/", "title": "sephora.com"},
+                        {"uri": "https://r5/", "title": "youtube.com"},
+                    ],
+                    competitors_appearing=["Talika", "Peace Out"],
+                ),
+            ],
+        },
+        provider="gemini",
+    )
+    cat = report["category_visibility"]
+    assert cat["score"] == 67  # 2/3 excerpt-matched
+    assert cat["upstream_score"] == 0
+    # Retailers + competitors surfaced.
+    assert any(r["host"] == "sephora.com" for r in cat["retailer_hosts"])
+    assert any(r["host"] == "oliveyoung.com" for r in cat["retailer_hosts"])
+    brand_map = {b["name"]: b["times_cited"] for b in cat["competitor_brands"]}
+    assert brand_map["Patchology"] == 2
+    # VIA_RETAILERS verdict + retailer-aware action item present.
+    assert report["verdict"]["label"] == VERDICT_VIA_RETAILERS
+    titles = [a["title"] for a in report["action_items"]]
+    assert any("retailer" in t.lower() or "ai-channel funnel" in t.lower() for t in titles)
+
+
+def test_render_markdown_includes_retailer_and_brand_tables_for_category() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://beautyofjoseon.com/products/x",
+        product_title="X",
+        product_vendor="Beauty of Joseon",
+        product_type="eye patch",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [
+                _category_run(
+                    "best eye patches 2026",
+                    excerpt="Beauty of Joseon Revive...",
+                    grounding_sources=[{"uri": "https://r/", "title": "sephora.com"}],
+                    competitors_appearing=["Patchology"],
+                ),
+            ],
+        },
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    assert "Where category traffic is being routed" in md
+    assert "sephora.com" in md
+    assert "Top direct competitors named by Gemini" in md
+    assert "Patchology" in md
