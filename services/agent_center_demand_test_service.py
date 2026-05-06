@@ -251,7 +251,9 @@ async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
             store_id=store_id,
             context=context,
             provider=requested_provider,
-            max_runs=int((target.get("payload") or {}).get("max_runs") or 3),
+            # V1.5 default 10 (was 3). Operator can still override via
+            # payload.max_runs; the upstream caps at HARD_MAX_RUNS=20.
+            max_runs=int((target.get("payload") or {}).get("max_runs") or 10),
         )
     except llm_client.AgentCenterLlmClientError as exc:
         # Upstream failure — record terminal state + bubble up.
