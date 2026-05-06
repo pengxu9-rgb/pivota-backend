@@ -271,44 +271,159 @@ VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
 VERDICT_STRONG = "STRONG"
 VERDICT_PARTIAL = "PARTIAL"
 
+# Default thresholds — used when no peer_thresholds is supplied. These
+# are intuitive defaults from V1.5 (30 = "barely visible", 60 = "strong
+# enough to skip foundational fixes"). They're calibrated to feel right,
+# not to peer-distribution data; once Phase 1c (Pivota PDP self-baseline)
+# accumulates enough runs, ops can pass `peer_thresholds=` to verdict_for
+# with empirical percentile-of-peers values.
+DEFAULT_VERDICT_THRESHOLDS: Dict[str, int] = {
+    "invisible_max": 30,    # both scores below this → INVISIBLE
+    "strong_min": 60,       # both scores at/above this → STRONG
+    "misattributed_attr_max": 30,  # MISATTRIBUTED triggers when attribution < this
+}
 
-def verdict_for(visibility_score: int, attribution_score: int) -> Tuple[str, str]:
+
+def verdict_for(
+    visibility_score: int,
+    attribution_score: int,
+    peer_thresholds: Optional[Dict[str, int]] = None,
+) -> Tuple[str, str]:
     """Categorize the (visibility, attribution) pair into one of four
-    BD-friendly verdicts. Returns (label, explanation paragraph)."""
-    if visibility_score < 30 and attribution_score < 30:
+    BD-friendly verdicts. Returns (label, explanation paragraph).
+
+    `peer_thresholds` (Phase 2c, optional) overrides the V1.5 default
+    cutoffs with empirical percentile-of-peers values. Schema:
+      {
+        invisible_max: int,         # both scores < this → INVISIBLE
+        strong_min: int,            # both scores ≥ this → STRONG
+        misattributed_attr_max: int,  # attribution < this AND visibility ≥ invisible_max → MISATTRIBUTED
+      }
+
+    When peer_thresholds is supplied, the explanation paragraph is
+    augmented with the percentile context so BD reps can read e.g.
+    "your visibility is bottom-quartile vs category peers (median 71%)"
+    instead of an abstract score. Missing keys fall back to defaults
+    individually — partial overrides are supported.
+
+    Source-of-truth for empirical thresholds: aggregate the BD reports
+    + Pivota PDP self-baseline runs into a peer cohort, compute P25/P50/
+    P75. Phase 2c ships the call site only — calibration data flows
+    through this kwarg from a future scheduled job."""
+    t = dict(DEFAULT_VERDICT_THRESHOLDS)
+    if peer_thresholds:
+        for k, v in peer_thresholds.items():
+            if k in t and isinstance(v, (int, float)) and v >= 0:
+                t[k] = int(v)
+
+    invisible_max = t["invisible_max"]
+    strong_min = t["strong_min"]
+    misattr_attr_max = t["misattributed_attr_max"]
+
+    # When using calibrated thresholds, prefix the explanation with the
+    # peer-distribution context so the BD rep has comparative framing.
+    peer_prefix = ""
+    if peer_thresholds:
+        peer_prefix = (
+            f"_(Calibrated thresholds: peer-cohort INVISIBLE < {invisible_max}/100, "
+            f"STRONG ≥ {strong_min}/100. "
+            f"Your visibility {visibility_score}/100, attribution {attribution_score}/100.)_  \n\n"
+        )
+
+    if visibility_score < invisible_max and attribution_score < invisible_max:
         return (
             VERDICT_INVISIBLE,
-            "AI shopping agents don't surface this product at all when consumers ask "
-            "natural buyer queries. The merchant has effectively zero presence in this "
-            "channel today. As consumer search continues to migrate from Google to "
-            "ChatGPT / Gemini / Perplexity, the merchant is losing access to a fast-"
-            "growing acquisition surface they have no way to influence directly.",
+            peer_prefix + (
+                "AI shopping agents don't surface this product at all when consumers ask "
+                "natural buyer queries. The merchant has effectively zero presence in this "
+                "channel today. As consumer search continues to migrate from Google to "
+                "ChatGPT / Gemini / Perplexity, the merchant is losing access to a fast-"
+                "growing acquisition surface they have no way to influence directly."
+            ),
         )
-    if attribution_score < 30 and visibility_score >= 30:
+    if attribution_score < misattr_attr_max and visibility_score >= invisible_max:
         return (
             VERDICT_MISATTRIBUTED,
-            "AI agents recognize this product but consistently direct consumers to "
-            "third-party retailers (marketplaces, beauty blogs, competitor stores) "
-            "instead of the merchant's own site. Every cited URL that's not the "
-            "merchant's is lost organic traffic — and a margin hit if the cited path "
-            "is a third-party reseller. This is the highest-impact failure mode: the "
-            "demand exists, it's just being captured by competitors.",
+            peer_prefix + (
+                "AI agents recognize this product but consistently direct consumers to "
+                "third-party retailers (marketplaces, beauty blogs, competitor stores) "
+                "instead of the merchant's own site. Every cited URL that's not the "
+                "merchant's is lost organic traffic — and a margin hit if the cited path "
+                "is a third-party reseller. This is the highest-impact failure mode: the "
+                "demand exists, it's just being captured by competitors."
+            ),
         )
-    if visibility_score >= 60 and attribution_score >= 60:
+    if visibility_score >= strong_min and attribution_score >= strong_min:
         return (
             VERDICT_STRONG,
-            "AI agents reliably surface this product AND cite the merchant's own "
-            "canonical URL as the buying path. This is the goal state — the merchant "
-            "owns their AI-channel attribution. Pivota's role here is monitoring + "
-            "drift detection, not foundational repair.",
+            peer_prefix + (
+                "AI agents reliably surface this product AND cite the merchant's own "
+                "canonical URL as the buying path. This is the goal state — the merchant "
+                "owns their AI-channel attribution. Pivota's role here is monitoring + "
+                "drift detection, not foundational repair."
+            ),
         )
     return (
         VERDICT_PARTIAL,
-        "Mixed result — the product gets surfaced sometimes, and gets attributed "
-        "to the merchant's own URL sometimes, but neither is consistent. Worth "
-        "investigating which queries fail (see the table below) to identify the "
-        "specific gaps before pitching a full Pivota onboarding.",
+        peer_prefix + (
+            "Mixed result — the product gets surfaced sometimes, and gets attributed "
+            "to the merchant's own URL sometimes, but neither is consistent. Worth "
+            "investigating which queries fail (see the table below) to identify the "
+            "specific gaps before pitching a full Pivota onboarding."
+        ),
     )
+
+
+def calibrate_thresholds_from_baseline(
+    visibility_scores: List[int],
+    attribution_scores: List[int],
+    *,
+    bottom_percentile: int = 25,
+    top_percentile: int = 75,
+) -> Dict[str, int]:
+    """Compute peer-percentile thresholds from a list of historical
+    visibility + attribution scores (e.g. from running the Pivota PDP
+    self-baseline across all canonical PDPs, or aggregating BD reports
+    over time).
+
+    Returns a dict suitable for passing as `peer_thresholds=` to
+    verdict_for. Empty inputs return the default thresholds.
+
+    The bottom-quartile (P25) becomes `invisible_max` — anything below
+    a quarter of peer scores is genuinely invisible. The top-quartile
+    (P75) becomes `strong_min` — STRONG is reserved for the top
+    quarter of peers. `misattributed_attr_max` is set to the same P25
+    on attribution scores: MISATTRIBUTED fires when attribution is in
+    the worst quartile while visibility has cleared the bottom.
+
+    Calibrating per-cohort (e.g. only beauty PDPs, only fashion PDPs)
+    is the future direction; V1 just averages globally."""
+    if not visibility_scores and not attribution_scores:
+        return dict(DEFAULT_VERDICT_THRESHOLDS)
+
+    def _percentile(values: List[int], pct: int) -> Optional[float]:
+        if not values:
+            return None
+        sorted_values = sorted(values)
+        # Use the nearest-rank method (simple, no interpolation):
+        # rank = ceil(pct/100 * N), clamped to [1, N].
+        from math import ceil
+        n = len(sorted_values)
+        rank = max(1, min(n, ceil((pct / 100) * n)))
+        return float(sorted_values[rank - 1])
+
+    vis_p_low = _percentile(visibility_scores, bottom_percentile)
+    vis_p_high = _percentile(visibility_scores, top_percentile)
+    attr_p_low = _percentile(attribution_scores, bottom_percentile)
+
+    out = dict(DEFAULT_VERDICT_THRESHOLDS)
+    if vis_p_low is not None:
+        out["invisible_max"] = int(round(vis_p_low))
+    if vis_p_high is not None:
+        out["strong_min"] = int(round(vis_p_high))
+    if attr_p_low is not None:
+        out["misattributed_attr_max"] = int(round(attr_p_low))
+    return out
 
 
 # ---------------------------------------------------------------------------

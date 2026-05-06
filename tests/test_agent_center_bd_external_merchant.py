@@ -676,6 +676,96 @@ def test_render_markdown_includes_category_section_when_present() -> None:
     assert "harshest BD signal" in md
 
 
+def test_verdict_for_uses_default_thresholds_when_no_peer_thresholds() -> None:
+    """Phase 2c: backward compat — verdict_for() with no peer_thresholds
+    arg behaves exactly like the V1.5 version."""
+    from services.agent_center_bd_report_service import verdict_for
+    label, _ = verdict_for(visibility_score=20, attribution_score=10)
+    assert label == "INVISIBLE"
+    label, _ = verdict_for(visibility_score=70, attribution_score=20)
+    assert label == "VISIBLE BUT MISATTRIBUTED"
+    label, _ = verdict_for(visibility_score=70, attribution_score=70)
+    assert label == "STRONG"
+    label, _ = verdict_for(visibility_score=40, attribution_score=40)
+    assert label == "PARTIAL"
+
+
+def test_verdict_for_honors_peer_thresholds() -> None:
+    """Phase 2c: verdict thresholds shift when calibrated to peer data.
+    Same scores can yield different verdicts under different cohorts."""
+    from services.agent_center_bd_report_service import verdict_for
+    # Strict cohort: 50/100 thresholds. visibility=40 / attr=40 used to be
+    # PARTIAL with default 30/60; under 50/100 it stays PARTIAL too
+    # because attribution=40 ≥ 50 is false (misattr trigger), and both <
+    # 100 (strong trigger). But visibility=40 < 50 AND attribution=40 < 50
+    # → INVISIBLE under stricter thresholds.
+    label, _ = verdict_for(
+        visibility_score=40, attribution_score=40,
+        peer_thresholds={"invisible_max": 50, "strong_min": 100, "misattributed_attr_max": 50},
+    )
+    assert label == "INVISIBLE"
+
+    # Loose cohort: 10/30 thresholds. visibility=40 ≥ 30 AND attribution=40
+    # ≥ 30 → STRONG.
+    label, _ = verdict_for(
+        visibility_score=40, attribution_score=40,
+        peer_thresholds={"invisible_max": 10, "strong_min": 30, "misattributed_attr_max": 10},
+    )
+    assert label == "STRONG"
+
+
+def test_verdict_for_partial_peer_thresholds_falls_back_per_key() -> None:
+    """Calibrated thresholds support partial overrides — only specify
+    the keys you have data for; the rest stay at defaults."""
+    from services.agent_center_bd_report_service import verdict_for
+    label, _ = verdict_for(
+        visibility_score=70, attribution_score=70,
+        # Only override strong_min upward — visibility/attr=70 should no
+        # longer be STRONG. Defaults for invisible_max=30 still apply.
+        peer_thresholds={"strong_min": 80},
+    )
+    # Both ≥ 30 (not invisible), attr ≥ 30 (not misattr), but neither ≥ 80 → PARTIAL
+    assert label == "PARTIAL"
+
+
+def test_verdict_explanation_includes_peer_calibration_prefix() -> None:
+    """When peer thresholds are used, the BD rep needs to know the
+    score is being interpreted against an empirical cohort, not raw
+    intuition. Explanation text says so."""
+    from services.agent_center_bd_report_service import verdict_for
+    _, explanation = verdict_for(
+        visibility_score=40, attribution_score=40,
+        peer_thresholds={"invisible_max": 50, "strong_min": 100, "misattributed_attr_max": 50},
+    )
+    assert "Calibrated thresholds" in explanation
+    assert "INVISIBLE < 50" in explanation
+    assert "STRONG ≥ 100" in explanation
+    assert "Your visibility 40/100" in explanation
+
+
+def test_calibrate_thresholds_from_baseline_uses_p25_p75() -> None:
+    """Phase 2c: empirical calibration. P25/P75 of visibility scores
+    drive invisible_max / strong_min."""
+    from services.agent_center_bd_report_service import calibrate_thresholds_from_baseline
+    visibility_scores = [10, 20, 30, 40, 50, 60, 70, 80]
+    attribution_scores = [0, 10, 20, 30, 40, 50, 60, 70]
+    thresholds = calibrate_thresholds_from_baseline(visibility_scores, attribution_scores)
+    # Nearest-rank P25 of [10,20,30,40,50,60,70,80] → ceil(0.25*8)=2nd → 20
+    assert thresholds["invisible_max"] == 20
+    # P75 → ceil(0.75*8)=6th → 60
+    assert thresholds["strong_min"] == 60
+    # P25 of attribution_scores → 2nd → 10
+    assert thresholds["misattributed_attr_max"] == 10
+
+
+def test_calibrate_thresholds_from_baseline_returns_defaults_on_empty() -> None:
+    from services.agent_center_bd_report_service import (
+        calibrate_thresholds_from_baseline,
+        DEFAULT_VERDICT_THRESHOLDS,
+    )
+    assert calibrate_thresholds_from_baseline([], []) == DEFAULT_VERDICT_THRESHOLDS
+
+
 def test_aggregate_brand_scores_averages_across_succeeded_products() -> None:
     """Phase 2b: brand-level aggregate is the simple-mean of per-product
     scores. No median / weighted-average — keep V1 honest."""
