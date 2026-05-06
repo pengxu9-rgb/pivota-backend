@@ -53,16 +53,26 @@ async def run_bd_probes(
     product_type: Optional[str] = None,
     provider: str = "gemini",
     max_runs: int = 3,
+    include_category_visibility: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
-    """Run the two BD-relevant scan modes against the merchant's product.
+    """Run the BD-relevant scan modes against the merchant's product.
 
-    Returns a `{visibility, attribution}` dict; each value is the raw
-    probe result with `scores`, `findings`, `raw_runs`, `usage`, etc.
+    Returns a `{visibility, attribution, category_visibility?}` dict;
+    each value is the raw probe result with `scores`, `findings`,
+    `raw_runs`, `usage`, etc.
 
-    Conservative defaults: max_runs=3 keeps total cost ~150k Gemini
-    tokens per BD report. Bump only after worker-pool isolation
-    lands upstream (see `feedback_llm_call_multipliers.md` /
-    incident #280)."""
+    `category_visibility` is included by default (Phase 2a) — it asks
+    Gemini open category queries that DO NOT name the product, and
+    checks if the merchant brand/URL appears in grounded sources. This
+    is the honest BD-pitch baseline; the product-named visibility test
+    is a tautology when the prompt mentions the product. Setting
+    `include_category_visibility=False` skips the third probe (saves
+    ~50% Gemini cost; useful for iteration).
+
+    Conservative defaults: max_runs=3 per scan_mode. With three modes
+    on, that's ~9 grounded Gemini calls = ~225k tokens / report. Bump
+    max_runs only after worker-pool isolation lands upstream (see
+    feedback_llm_call_multipliers.md / incident #280)."""
     if not merchant_name or not merchant_name.strip():
         raise ValueError("merchant_name is required")
     if not merchant_pdp_url or not merchant_pdp_url.strip():
@@ -97,7 +107,17 @@ async def run_bd_probes(
 
     visibility = await _one("open_product_visibility_test")
     attribution = await _one("merchant_store_attribution_test")
-    return {"visibility": visibility, "attribution": attribution}
+    out: Dict[str, Dict[str, Any]] = {
+        "visibility": visibility,
+        "attribution": attribution,
+    }
+    # Skip category if product_type is missing — buildCategoryQueries
+    # upstream returns [] in that case and the probe falls back to
+    # product_entity_id which makes the category test meaningless.
+    can_run_category = bool(base_context["product"].get("product_type"))
+    if include_category_visibility and can_run_category:
+        out["category_visibility"] = await _one("category_visibility_test")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -685,13 +705,25 @@ def build_structured_report(
     attribution_result: Dict[str, Any],
     provider: str,
     timestamp: Optional[str] = None,
+    category_visibility_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return a single JSON-serializable dict with everything the UI
-    needs to render the BD report. Pure function."""
+    needs to render the BD report. Pure function.
+
+    `category_visibility_result` is optional (Phase 2a) — when provided,
+    the report exposes a `category_visibility` block with score + queries,
+    and `verdict.category_visibility_score` for downstream consumers."""
     visibility_score = (visibility_result.get("scores") or {}).get("visibility_score", 0)
     attribution_score = (attribution_result.get("scores") or {}).get("visibility_score", 0)
     visibility_runs = visibility_result.get("raw_runs") or []
     attribution_runs = attribution_result.get("raw_runs") or []
+
+    # Category visibility (optional, Phase 2a)
+    category_score = None
+    category_runs: List[Dict[str, Any]] = []
+    if category_visibility_result:
+        category_score = (category_visibility_result.get("scores") or {}).get("visibility_score", 0)
+        category_runs = category_visibility_result.get("raw_runs") or []
 
     merchant_host = normalize_host(merchant_pdp_url)
     # Prefer the explicit vendor; fall back to merchant_name. Brand-name
@@ -771,6 +803,7 @@ def build_structured_report(
             "explanation": verdict_explanation,
             "visibility_score": visibility_score,
             "attribution_score": attribution_score,
+            "category_visibility_score": category_score,  # null when category test wasn't run
         },
         "industry_context": industry_context,
         "action_items": action_items,
@@ -787,11 +820,21 @@ def build_structured_report(
             "queries": _per_query_rows(attribution_runs, "merchant_url_found"),
             "competitor_hosts": competitor_hosts_list,
         },
+        "category_visibility": (
+            {
+                "score": category_score,
+                "runs": len(category_runs),
+                "queries": _per_query_rows(category_runs, "brand_appears"),
+            }
+            if category_visibility_result is not None
+            else None
+        ),
         # Raw probe results for audit / debugging. UI can hide behind a
         # disclosure; CLI embeds in `<details>`.
         "raw": {
             "visibility": visibility_result,
             "attribution": attribution_result,
+            "category_visibility": category_visibility_result,
         },
     }
 
@@ -877,6 +920,31 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
         f"we asked: did Gemini surface the product as one of the answers?\n"
     )
     sections.append(_md_query_table(report["visibility"]["queries"]) + "\n")
+
+    # Optional category visibility section (Phase 2a) — appears between
+    # the open-product visibility table and the direct-attribution table
+    # so the BD rep reads the report in escalating-credibility order:
+    # product-named visibility → category-open visibility → direct
+    # attribution.
+    cat = report.get("category_visibility")
+    if cat is not None:
+        sections.append("## 1.5. Category-level discoverability\n")
+        sections.append(
+            f"We fed Gemini {cat['runs']} **category-open** queries (e.g. "
+            f"\"best {{category}} 2026\") that DON'T name the product. "
+            f"This is the honest discoverability test: does the merchant "
+            f"brand surface in grounded sources for queries a typical "
+            f"consumer asks without already knowing the brand?\n"
+        )
+        sections.append(_md_query_table(cat["queries"]) + "\n")
+        cat_score = cat.get("score") or 0
+        if cat_score == 0:
+            sections.append(
+                "_Score 0/100 — the merchant brand was absent from grounded "
+                "sources on every category query. This is the harshest "
+                "BD signal: consumers asking for products in this category "
+                "without naming the brand never see the merchant._\n"
+            )
 
     sections.append("## 2. Direct attribution\n")
     sections.append(
