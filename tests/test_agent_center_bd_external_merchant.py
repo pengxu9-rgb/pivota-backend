@@ -1168,14 +1168,48 @@ def test_verdict_invisible_when_category_also_zero() -> None:
     assert label == VERDICT_INVISIBLE
 
 
-def test_verdict_via_retailers_does_not_trigger_when_attr_present() -> None:
-    """When attribution >= misattributed_attr_max the verdict should NOT
-    be VIA_RETAILERS — that label is reserved for attribution-broken cases."""
+def test_verdict_via_retailers_cosrx_class_partial_attribution() -> None:
+    """COSRX-class case: category visibility 100, attribution 33 (1/3
+    buyer-intent queries cite cosrx.com). The 67-point gap means
+    retailers (Vogue Scandinavia, skinsort) capture 2/3 of the AI
+    funnel — VIA_RETAILERS is the right pitch framing, not PARTIAL.
+
+    Regression for the gap-based threshold: under the old "attr <
+    misattr_max(30)" rule this fell into PARTIAL because attr=33 >= 30."""
+    from services.agent_center_bd_report_service import verdict_for, VERDICT_VIA_RETAILERS
+    label, explanation = verdict_for(
+        visibility_score=0,
+        attribution_score=33,
+        category_visibility_score=100,
+    )
+    assert label == VERDICT_VIA_RETAILERS
+    assert "retailer" in explanation.lower()
+
+
+def test_verdict_via_retailers_does_not_trigger_when_gap_small() -> None:
+    """STRONG-adjacent: cat=80, attr=70 -> 10-point gap. Brand IS
+    captured first-party most of the time; should NOT be flagged
+    VIA_RETAILERS. Falls through to STRONG (both >= 60)."""
+    from services.agent_center_bd_report_service import verdict_for, VERDICT_VIA_RETAILERS, VERDICT_STRONG
+    label, _ = verdict_for(
+        visibility_score=80,
+        attribution_score=70,
+        category_visibility_score=80,
+    )
+    assert label != VERDICT_VIA_RETAILERS
+    assert label == VERDICT_STRONG
+
+
+def test_verdict_via_retailers_does_not_trigger_at_attribution_60() -> None:
+    """Boundary: when attribution clears the strong_min(60) floor we
+    consider attribution healthy enough that VIA_RETAILERS shouldn't
+    fire even if the gap to category is large (cat=100, attr=60 ->
+    gap 40, but attr already >= strong_min)."""
     from services.agent_center_bd_report_service import verdict_for, VERDICT_VIA_RETAILERS
     label, _ = verdict_for(
         visibility_score=20,
-        attribution_score=50,
-        category_visibility_score=70,
+        attribution_score=60,
+        category_visibility_score=100,
     )
     assert label != VERDICT_VIA_RETAILERS
 

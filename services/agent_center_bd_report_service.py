@@ -467,29 +467,43 @@ def verdict_for(
         )
 
     # VISIBLE VIA RETAILERS — sharpest BD framing. Triggers when the
-    # category test surfaced the brand (≥ invisible_max) but attribution
-    # is rock-bottom: the brand IS findable in the AI channel, just
-    # always through Sephora / Olive Young / retailer reviews, never
-    # the merchant's own URL. Checked BEFORE INVISIBLE so a merchant
-    # with named-product visibility=0 + category-visibility=67 + attr=0
-    # gets the right read.
+    # category test surfaced the brand strongly but the merchant's
+    # own first-party attribution lags far behind: the brand IS
+    # findable in the AI channel, just mostly through retailer pages
+    # (Sephora, Vogue Scandinavia, skinsort, etc.) rather than the
+    # merchant's own URL.
+    #
+    # The check is gap-based, not absolute: it fires when (category -
+    # attribution) >= invisible_max AND attribution < strong_min. This
+    # catches both the BoJ-class case (cat=67, attr=0 → gap 67) and
+    # the COSRX-class case (cat=100, attr=33 → gap 67) — both have
+    # "retailers eating most of the AI funnel" as the right pitch
+    # framing. A merchant with cat=80, attr=70 (gap=10) stays in
+    # STRONG/PARTIAL because their own attribution is already
+    # consistently captured.
+    #
+    # Checked BEFORE INVISIBLE / MISATTRIBUTED so cat-strong + attr-
+    # weak cases land here even when raw attribution clears the
+    # misattributed_attr_max floor.
     if (
         category_visibility_score is not None
         and category_visibility_score >= invisible_max
-        and attribution_score < misattr_attr_max
+        and attribution_score < strong_min
+        and (category_visibility_score - attribution_score) >= invisible_max
     ):
         return (
             VERDICT_VIA_RETAILERS,
             peer_prefix + (
                 "AI shopping agents recognize this brand in category-level "
-                "queries — but every grounded citation routes consumers through "
-                "third-party retailers (Sephora, Olive Young, beauty marketplaces) "
-                "rather than the merchant's own URL. The brand is findable in the "
-                "AI channel; the merchant just isn't capturing the funnel. Every "
-                "retailer-cited query is a margin hit (reseller markup) and a "
-                "lost first-party customer relationship. This is the highest-"
+                "queries — but the funnel mostly routes consumers through "
+                "third-party retailers (Sephora, Vogue Scandinavia, beauty "
+                "marketplaces, skin-database sites) rather than the merchant's "
+                "own URL. The brand is findable in the AI channel; the merchant "
+                "just isn't capturing the funnel consistently. Every retailer-"
+                "cited query is a margin hit (reseller markup) and a lost "
+                "first-party customer relationship. This is the highest-"
                 "leverage onboarding case: the demand exists and is already "
-                "AI-discoverable; only the attribution path is broken."
+                "AI-discoverable; the attribution path needs reinforcing."
             ),
         )
     if visibility_score < invisible_max and attribution_score < invisible_max:
