@@ -190,7 +190,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    :catalog_track, :truth_tier, :readiness_tier, :source_system,
                    :title, :description, :brand, :product_type, :category,
                    :category_path, :category_confidence, :category_label_source,
-                   :canonical_url, :image_url, :product_payload::jsonb)
+                   :canonical_url, :image_url, CAST(:product_payload AS jsonb))
                 ON CONFLICT (product_key) DO UPDATE SET
                   category_path = EXCLUDED.category_path,
                   category_confidence = EXCLUDED.category_confidence,
@@ -219,7 +219,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                   (:id, :external_product_id, :market, :tool, :title, :image_url,
                    :price_amount, :price_currency, :destination_url,
                    :canonical_url, :domain, :attached_product_key, :status,
-                   :seed_data::jsonb)
+                   CAST(:seed_data AS jsonb))
                 ON CONFLICT (id) DO UPDATE SET
                   attached_product_key = EXCLUDED.attached_product_key,
                   destination_url = EXCLUDED.destination_url,
