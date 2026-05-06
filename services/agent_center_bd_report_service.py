@@ -224,16 +224,21 @@ def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
     if p in _REAL_PROVIDERS:
         return {"is_real": True, "reason": None}
     if p == "local_mock_no_internal_key":
-        # Emitted by services/agent_center_llm_client.py when
-        # PIVOTA_AGENT_INTERNAL_API_KEY is unset — the call never even
-        # left the backend.
+        # Emitted by services/agent_center_llm_client.py when none of
+        # PROMOTIONS_ADMIN_KEY / AGENT_API_KEY / PIVOTA_AGENT_INTERNAL_API_KEY
+        # are set on the backend — the call never left the backend at all.
         return {
             "is_real": False,
             "reason": (
-                "Backend `PIVOTA_AGENT_INTERNAL_API_KEY` is unset on Railway. "
-                "The probe never reached PIVOTA-Agent — pivota-backend "
-                "synthesized a local mock instead. Configure the key in "
-                "Railway env (web-production-fedb)."
+                "Backend probe-auth env var is unset on Railway "
+                "(web-production-fedb). The probe accepts any of "
+                "`PROMOTIONS_ADMIN_KEY` (preferred — production already "
+                "shares this admin secret with PIVOTA-Agent), "
+                "`AGENT_API_KEY`, or `PIVOTA_AGENT_INTERNAL_API_KEY`. "
+                "The value must match what's set on PIVOTA-Agent "
+                "(pivota-agent-production). Without it the probe never "
+                "reaches the upstream and pivota-backend synthesizes a "
+                "local mock instead."
             ),
         }
     if p == "mock_fallback_no_gemini_key":
@@ -242,10 +247,10 @@ def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
         return {
             "is_real": False,
             "reason": (
-                "PIVOTA-Agent's `GEMINI_API_KEY` is unset on Railway. The "
-                "probe reached the upstream service but couldn't initialize "
-                "the Gemini client. Configure `GEMINI_API_KEY` in "
-                "PIVOTA-Agent's Railway env (pivota-agent-production)."
+                "PIVOTA-Agent's `GEMINI_API_KEY` is unset on Railway "
+                "(pivota-agent-production). The probe reached the upstream "
+                "service but couldn't initialize the Gemini client. "
+                "Configure `GEMINI_API_KEY` in PIVOTA-Agent's Railway env."
             ),
         }
     if p == "mock":

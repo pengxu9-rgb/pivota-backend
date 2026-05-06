@@ -135,8 +135,24 @@ class Settings(BaseSettings):
         "PIVOTA_AGENT_INTERNAL_URL",
         "https://pivota-agent-production.up.railway.app",
     )
-    pivota_agent_internal_api_key: Optional[str] = os.getenv(
-        "PIVOTA_AGENT_INTERNAL_API_KEY"
+    # Shared secret with PIVOTA-Agent's /internal/agent-center/llm-probe.
+    # Three candidate env vars in priority order:
+    #
+    #   1. PROMOTIONS_ADMIN_KEY — already set on both pivota-backend and
+    #      PIVOTA-Agent for admin/ops routes (utils/auth.py +
+    #      migrate_promotions_to_backend.js). Reusing it eliminates any
+    #      operational burden — the V1 BD-report path just works as
+    #      soon as the new code ships.
+    #   2. AGENT_API_KEY        — gateway-proxy + agent-commerce convention.
+    #   3. PIVOTA_AGENT_INTERNAL_API_KEY — V1 dedicated name; backward compat.
+    #
+    # Mirrors the priority chain in PIVOTA-Agent's requireInternalKey
+    # middleware so a key set on either name on the upstream + the same
+    # name on the backend results in matching auth.
+    pivota_agent_internal_api_key: Optional[str] = (
+        os.getenv("PROMOTIONS_ADMIN_KEY")
+        or os.getenv("AGENT_API_KEY")
+        or os.getenv("PIVOTA_AGENT_INTERNAL_API_KEY")
     )
     agent_center_llm_probe_timeout_s: float = float(
         os.getenv("AGENT_CENTER_LLM_PROBE_TIMEOUT_S", "30")
