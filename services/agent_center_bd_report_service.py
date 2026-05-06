@@ -519,23 +519,37 @@ def verdict_for(
         return (
             VERDICT_INVISIBLE,
             peer_prefix + (
-                "AI shopping agents don't surface this product at all when consumers ask "
-                "natural buyer queries. The merchant has effectively zero presence in this "
-                "channel today. As consumer search continues to migrate from Google to "
-                "ChatGPT / Gemini / Perplexity, the merchant is losing access to a fast-"
-                "growing acquisition surface they have no way to influence directly."
+                "AI shopping agents don't surface this product at all when "
+                "consumers ask natural buyer queries. The merchant has effectively "
+                "zero presence in this channel today. As consumer search continues "
+                "to migrate from Google to ChatGPT / Gemini / Perplexity (~12% of "
+                "D2C beauty traffic today, projected 25-30% by 2028), the merchant "
+                "is losing access to a fast-growing acquisition surface they have "
+                "no way to influence directly. Pivota's foundation step here is the "
+                "canonical AI-channel PDP that gets the brand cited at all; once "
+                "visibility clears the floor, in-chat checkout via Pivota's "
+                "agentic-commerce protocol becomes the second leverage point — "
+                "consumers complete the transaction inside Gemini / ChatGPT instead "
+                "of being routed through retailer.com."
             ),
         )
     if attribution_score < misattr_attr_max and visibility_score >= invisible_max:
         return (
             VERDICT_MISATTRIBUTED,
             peer_prefix + (
-                "AI agents recognize this product but consistently direct consumers to "
-                "third-party retailers (marketplaces, beauty blogs, competitor stores) "
-                "instead of the merchant's own site. Every cited URL that's not the "
-                "merchant's is lost organic traffic — and a margin hit if the cited path "
-                "is a third-party reseller. This is the highest-impact failure mode: the "
-                "demand exists, it's just being captured by competitors."
+                "AI agents recognize this product but consistently direct consumers "
+                "to third-party retailers (marketplaces, beauty blogs, competitor "
+                "stores) instead of the merchant's own site. Every cited URL that's "
+                "not the merchant's is lost organic traffic — and a margin hit if "
+                "the cited path is a third-party reseller. The demand exists; it's "
+                "just being captured by competitors. Pivota's value here is two-part "
+                "and complementary to existing retail distribution: (1) the canonical "
+                "AI-channel PDP captures direct first-party attribution as AI shopping "
+                "grows from ~12% to a projected 25-30% of D2C beauty discovery over "
+                "the next 24 months; (2) in-chat checkout via Pivota's agentic-"
+                "commerce protocol — consumers ask Gemini and complete purchase "
+                "inside the assistant, no redirect, no retailer markup. This is "
+                "AI-channel-native commerce, not an SEO fix."
             ),
         )
     if visibility_score >= strong_min and attribution_score >= strong_min:
@@ -543,18 +557,31 @@ def verdict_for(
             VERDICT_STRONG,
             peer_prefix + (
                 "AI agents reliably surface this product AND cite the merchant's own "
-                "canonical URL as the buying path. This is the goal state — the merchant "
-                "owns their AI-channel attribution. Pivota's role here is monitoring + "
-                "drift detection, not foundational repair."
+                "canonical URL as the buying path. The discovery-and-attribution "
+                "problem is solved at the audit level. The next AI-channel UX "
+                "boundary is in-chat checkout: when a consumer asks Gemini / ChatGPT "
+                "and decides to buy, completing the purchase inside the assistant "
+                "(via Pivota's agentic-commerce protocol) rather than redirecting to "
+                "the merchant's site is what AI-native commerce looks like at this "
+                "stage. Today every consumer who clicks through is one cart-"
+                "abandonment risk + one redirect away from the conversion they "
+                "already committed to. Pivota's leverage at STRONG is highest here, "
+                "not at the SEO/attribution layer the merchant has already won."
             ),
         )
     return (
         VERDICT_PARTIAL,
         peer_prefix + (
-            "Mixed result — the product gets surfaced sometimes, and gets attributed "
-            "to the merchant's own URL sometimes, but neither is consistent. Worth "
-            "investigating which queries fail (see the table below) to identify the "
-            "specific gaps before pitching a full Pivota onboarding."
+            "Mixed result — the product gets surfaced sometimes, and gets "
+            "attributed to the merchant's own URL sometimes, but neither is "
+            "consistent. The foundation is partly there. Pivota's two-part value "
+            "prop applies cleanly: (1) tighten first-party attribution on the "
+            "queries that currently route to retailers via the canonical "
+            "AI-channel PDP; (2) for the queries that DO already reach the merchant, "
+            "add in-chat checkout via Pivota's agentic-commerce protocol so "
+            "consumers complete purchase inside Gemini / ChatGPT instead of being "
+            "redirected out. The failing-query table below shows which gap is "
+            "larger — that determines which lever to pull first in onboarding."
         ),
     )
 
@@ -890,6 +917,7 @@ _INDUSTRY_CONTEXT_DEFAULT: Dict[str, Any] = {
     "category": "default",
     "ai_search_share_pct": None,
     "ai_search_growth_yoy_pct": None,
+    "forward_projection": None,
     "blurb": (
         "AI shopping (ChatGPT / Gemini / Perplexity) is a fast-growing "
         "discovery channel for D2C brands. Merchants without AI-channel "
@@ -897,11 +925,24 @@ _INDUSTRY_CONTEXT_DEFAULT: Dict[str, Any] = {
     ),
 }
 
+# `forward_projection` is the per-category 24-month projection for AI-
+# channel-native commerce share. Currently populated for beauty only —
+# the V1 BD pitch focuses on K-beauty merchants and beauty has the most
+# defensible secondary-source numbers. Other categories get None and the
+# renderer skips the projection line; populate them as BD validates the
+# framing on additional verticals.
 _INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
     "beauty": {
         "category": "beauty",
         "ai_search_share_pct": 12,
         "ai_search_growth_yoy_pct": 40,
+        "forward_projection": (
+            "By 2028, AI-channel-native commerce is projected to reach "
+            "25-30% of D2C beauty discovery. Brands without an AI-native "
+            "transaction surface (canonical PDP + in-chat checkout) will "
+            "be retailer-dependent for that share — paying reseller margin "
+            "on traffic that originated in the AI channel."
+        ),
         "blurb": (
             "AI shopping is ~12% of new D2C beauty traffic and growing ~40% "
             "YoY (2025-2026). Beauty is one of the highest-AI-affinity "
@@ -914,6 +955,7 @@ _INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
         "category": "fashion",
         "ai_search_share_pct": 8,
         "ai_search_growth_yoy_pct": 35,
+        "forward_projection": None,
         "blurb": (
             "AI shopping is ~8% of D2C fashion traffic and growing ~35% YoY. "
             "Visual + style queries (\"summer dress under $80\") shift "
@@ -925,6 +967,7 @@ _INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
         "category": "fitness",
         "ai_search_share_pct": 9,
         "ai_search_growth_yoy_pct": 32,
+        "forward_projection": None,
         "blurb": (
             "AI shopping is ~9% of D2C fitness/wellness traffic and growing "
             "~32% YoY. Consumers research equipment + supplements through "
@@ -936,6 +979,7 @@ _INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
         "category": "food_bev",
         "ai_search_share_pct": 6,
         "ai_search_growth_yoy_pct": 28,
+        "forward_projection": None,
         "blurb": (
             "AI shopping is ~6% of D2C food/beverage traffic, growing ~28% "
             "YoY. Specialty / direct-from-maker brands gain disproportionately "
@@ -946,6 +990,7 @@ _INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
         "category": "home",
         "ai_search_share_pct": 7,
         "ai_search_growth_yoy_pct": 30,
+        "forward_projection": None,
         "blurb": (
             "AI shopping is ~7% of D2C home/decor traffic and growing ~30% "
             "YoY. Higher-consideration purchases ($100+) skew toward AI-"
@@ -957,6 +1002,7 @@ _INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
         "category": "electronics",
         "ai_search_share_pct": 14,
         "ai_search_growth_yoy_pct": 38,
+        "forward_projection": None,
         "blurb": (
             "AI shopping is ~14% of D2C electronics traffic and growing "
             "~38% YoY — the highest among consumer verticals. Spec-heavy "
@@ -1258,6 +1304,119 @@ def _generate_action_items(
     return items[:5]
 
 
+# Pivota PDP self-baseline reference figures, used as the "after onboarding"
+# benchmark in the "What Pivota changes" section. Source: aggregate of
+# `scripts/agent_center_pivota_pdp_baseline.py` median_visibility +
+# median_attribution across the 6 sig_* canonical seed PDPs. Refresh by hand
+# (~1×/month or after material PDP/SEO changes); the alternative of running
+# the baseline live at report-render time costs ~9 grounded Gemini calls per
+# report and adds latency without a corresponding pitch benefit.
+#
+# TODO: when the baseline scheduler ships (deferred — Phase 3), wire these
+# figures from the latest scheduled run instead of hardcoding.
+PIVOTA_PDP_BASELINE_REFERENCE: Dict[str, Any] = {
+    "median_visibility": 67,
+    "median_attribution": 50,
+    "sample_size_pdps": 6,
+    "as_of_date": "2026-05-06",
+}
+
+
+def _build_what_pivota_changes(
+    *,
+    merchant_name: str,
+    merchant_pdp_url: str,
+    attribution_score: int,
+    attribution_runs: int,
+    merchant_cited_runs: int,
+    category_retailer_hosts: List[Dict[str, Any]],
+    category_visibility_score: Optional[int],
+) -> Dict[str, Any]:
+    """Return the "What Pivota changes after onboarding" structured block.
+
+    Three levers, all derived from existing report data — no new probe
+    calls. The merchant reads this section to see the post-onboarding
+    delta, not just the pre-onboarding diagnosis.
+
+      1. First-party AI attribution — converts retailer-routed category
+         visibility into the merchant's own URL via the canonical
+         AI-channel PDP.
+      2. In-chat checkout — the agentic-commerce protocol lets consumers
+         complete purchase inside Gemini / ChatGPT instead of clicking
+         out to merchant.com or being redirected through retailer.com.
+      3. Pivota PDP baseline reference — current median visibility +
+         attribution figures across Pivota's 6 canonical seed PDPs, so
+         the merchant has a concrete "this is what your AI-channel
+         surface looks like after onboarding" anchor."""
+    gap_pct = max(0, 100 - int(attribution_score))
+    top_retailers = [
+        r["host"] for r in (category_retailer_hosts or [])[:3] if r.get("host")
+    ]
+    retailer_phrase = (
+        ", ".join(top_retailers) if top_retailers else "third-party retailers"
+    )
+    cat_phrase = (
+        f"category visibility {category_visibility_score}/100"
+        if category_visibility_score is not None
+        else "category visibility (not measured)"
+    )
+    today_summary = (
+        f"{cat_phrase}; {merchant_cited_runs}/{attribution_runs} "
+        f"buyer-intent queries reach the merchant URL today; the "
+        f"remaining ~{gap_pct}% of the AI-channel funnel is captured by "
+        f"{retailer_phrase}."
+    )
+    return {
+        "today_summary": today_summary,
+        "after_onboarding": [
+            {
+                "title": "First-party AI attribution",
+                "today": (
+                    f"~{gap_pct}% of the AI-channel funnel routes through "
+                    f"{retailer_phrase} — every retailer-cited query is a "
+                    f"margin hit (reseller markup) and a customer "
+                    f"relationship the merchant doesn't own."
+                ),
+                "after": (
+                    "Pivota canonical PDP captured in grounded Gemini answers "
+                    "→ first-party attribution + direct customer relationship, "
+                    "complementary to existing retail distribution."
+                ),
+            },
+            {
+                "title": "In-chat checkout (the AI-native lever)",
+                "today": (
+                    f"Consumers ask Gemini / ChatGPT → click out to "
+                    f"{merchant_pdp_url} or get routed through retailer.com → "
+                    f"cart-abandonment risk + redirect friction + retailer "
+                    f"markup if the path is a reseller."
+                ),
+                "after": (
+                    "Consumers complete checkout inside Gemini / ChatGPT via "
+                    "Pivota's agentic-commerce protocol — no redirect, no "
+                    "retailer margin loss, first-party transaction data. This "
+                    "is the AI-channel UX boundary the merchant doesn't have "
+                    "any path to today."
+                ),
+            },
+            {
+                "title": "Pivota PDP baseline reference",
+                "value": (
+                    f"Pivota's {PIVOTA_PDP_BASELINE_REFERENCE['sample_size_pdps']} "
+                    f"canonical PDPs currently surface in Gemini grounding "
+                    f"with median visibility "
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100 "
+                    f"and median attribution "
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100 "
+                    f"(internal baseline run, "
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']}). Onboarded "
+                    f"merchants inherit this AI-channel surface for their SKUs."
+                ),
+            },
+        ],
+    }
+
+
 def build_structured_report(
     *,
     merchant_name: str,
@@ -1385,6 +1544,15 @@ def build_structured_report(
         product_vendor=product_vendor,
         product_title=product_title,
     )
+    what_pivota_changes = _build_what_pivota_changes(
+        merchant_name=merchant_name,
+        merchant_pdp_url=merchant_pdp_url,
+        attribution_score=attribution_score,
+        attribution_runs=len(attribution_runs),
+        merchant_cited_runs=merchant_cited_runs,
+        category_retailer_hosts=category_retailer_hosts,
+        category_visibility_score=category_score,
+    )
 
     return {
         "merchant_name": merchant_name,
@@ -1407,6 +1575,7 @@ def build_structured_report(
         },
         "industry_context": industry_context,
         "action_items": action_items,
+        "what_pivota_changes": what_pivota_changes,
         "visibility": {
             "score": visibility_score,
             "runs": len(visibility_runs),
@@ -1448,9 +1617,18 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
     the CLI produces. Kept here so the script and any future markdown
     consumers (export-to-PDF, email, etc.) share the same shape."""
     sections: List[str] = []
-    sections.append(f"# AI Visibility Report — {report['merchant_name']}\n")
+    sections.append(f"# AI Commerce Readiness Report — {report['merchant_name']}\n")
     sections.append(
         f"_Generated {report['timestamp']} · Probe: pivota Demand Test Agent V1.5_\n"
+    )
+    sections.append(
+        "This report measures two things: (1) is this brand findable when "
+        "consumers ask AI shopping agents about products in this category "
+        "today? (2) when AI shopping captures the projected 25-30% of D2C "
+        "category traffic over the next 24 months, is the brand positioned "
+        "to capture that funnel directly — or pay retailer markups for it? "
+        "The second question is what Pivota addresses; the first establishes "
+        "the starting point.\n"
     )
 
     upstream = report.get("upstream_status") or {}
@@ -1505,6 +1683,10 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                 f"{industry.get('category', 'category')} traffic, growing "
                 f"~**{industry.get('ai_search_growth_yoy_pct', '?')}%** YoY.\n"
             )
+        if industry.get("forward_projection"):
+            sections.append(
+                f"_24-month projection:_ {industry['forward_projection']}\n"
+            )
 
     # Recommended actions — derived from the merchant's actual failed
     # queries / cited competitors, not generic prose.
@@ -1516,6 +1698,32 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             title = action.get("title") or "(untitled)"
             body = action.get("body") or ""
             sections.append(f"**{idx}. {title}** _(severity: {sev})_  \n{body}\n")
+
+    # What Pivota changes — the post-onboarding delta. Renders between the
+    # diagnostic sections (verdict / industry / actions) and the per-query
+    # tables, so the merchant sees the value-prop framing before scrolling
+    # into the raw data.
+    wpc = report.get("what_pivota_changes") or {}
+    if wpc.get("after_onboarding"):
+        sections.append("## What Pivota changes after onboarding\n")
+        if wpc.get("today_summary"):
+            sections.append(f"**Today:** {wpc['today_summary']}\n")
+        sections.append("**After Pivota onboarding (two-part value prop):**\n")
+        levers = wpc.get("after_onboarding", [])
+        comparison_levers = [lev for lev in levers if "today" in lev and "after" in lev]
+        if comparison_levers:
+            table_rows = ["| Lever | Today | After Pivota |", "|---|---|---|"]
+            for lev in comparison_levers:
+                t = (lev.get("title") or "").replace("|", "\\|")
+                td = (lev.get("today") or "").replace("|", "\\|").replace("\n", " ")
+                af = (lev.get("after") or "").replace("|", "\\|").replace("\n", " ")
+                table_rows.append(f"| **{t}** | {td} | {af} |")
+            sections.append("\n".join(table_rows) + "\n")
+        for lev in levers:
+            if "value" in lev:
+                sections.append(
+                    f"_Pivota PDP reference: {lev['value']}_\n"
+                )
 
     sections.append("## 1. Open product visibility\n")
     sections.append(
@@ -1619,6 +1827,16 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
         "- **Sample size:** 3 runs per scan_mode (conservative default; can be "
         "increased per probe call once worker-pool isolation lands upstream — see "
         "incident #280 for context).\n"
+    )
+    sections.append(
+        "**Scope.** This report measures AI-channel discoverability and "
+        "first-party attribution within Gemini grounded search. It does NOT "
+        "measure D2C web traffic, retail sell-through, organic SEO health, or "
+        "paid search performance — those channels are intentionally orthogonal "
+        "to AI-native commerce and are well-served by existing tools (Search "
+        "Console, GA4, retailer dashboards). Pivota addresses the gap none of "
+        "those tools cover: the AI-channel transaction surface (canonical "
+        "AI-channel PDP + in-chat checkout via the agentic-commerce protocol).\n"
     )
 
     sections.append("## Raw probe data\n")
