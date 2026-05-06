@@ -36,10 +36,64 @@ def test_normalize_host_handles_garbage() -> None:
 
 
 def _run(grounding_chunks: List[str]) -> Dict[str, Any]:
+    """Legacy probe payload shape (URI strings only, pre-PR-30)."""
     return {"grounding_chunks": grounding_chunks}
 
 
-def test_extract_cited_hosts_separates_merchant_from_competitors() -> None:
+def _run_with_sources(sources: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Modern probe payload shape (PR 30+) — `grounding_sources` carries
+    both URI and title. This is what production now emits."""
+    return {
+        "grounding_sources": sources,
+        "grounding_chunks": [s["uri"] for s in sources],  # legacy mirror
+    }
+
+
+def test_extract_cited_hosts_uses_title_when_uri_is_redirector() -> None:
+    """The actual production case from the Beauty of Joseon BD run:
+    Vertex AI grounding wraps every cited URL in a redirector. Without
+    title-based extraction the competitor list ended up as
+    [{vertexaisearch.cloud.google.com: 2}] — useless. The fix reads
+    title ("Sephora", "Olive Young Global", etc.) instead."""
+    from agent_center_bd_external_merchant import _extract_cited_hosts
+    raw_runs = [
+        _run_with_sources([
+            {"uri": "https://vertexaisearch.cloud.google.com/abc",
+             "title": "Beauty of Joseon Official Store"},  # merchant
+            {"uri": "https://vertexaisearch.cloud.google.com/def",
+             "title": "Sephora"},
+            {"uri": "https://vertexaisearch.cloud.google.com/ghi",
+             "title": "Olive Young Global"},
+        ]),
+        _run_with_sources([
+            {"uri": "https://vertexaisearch.cloud.google.com/jkl",
+             "title": "YesStyle"},
+            {"uri": "https://vertexaisearch.cloud.google.com/mno",
+             "title": "Sephora"},
+        ]),
+    ]
+    competitors, merchant_runs, runs_with_citations = _extract_cited_hosts(
+        raw_runs,
+        merchant_host="beautyofjoseon.com",
+        merchant_brand="Beauty of Joseon",
+    )
+    # Brand name match catches the merchant title even though the URI is
+    # a redirector and the host doesn't equal beautyofjoseon.com.
+    assert merchant_runs == 1
+    assert runs_with_citations == 2
+    # Competitors: Sephora(2 runs) + Olive Young Global(1) + YesStyle(1).
+    # No vertexaisearch entries — those are filtered as redirectors.
+    assert competitors == Counter({
+        "Sephora": 2,
+        "Olive Young Global": 1,
+        "YesStyle": 1,
+    })
+
+
+def test_extract_cited_hosts_legacy_uri_only_payload() -> None:
+    """Backward compat: pre-PR-30 payloads only have grounding_chunks
+    (URI strings). Real-host URIs (not redirectors) still work — labels
+    fall back to the host."""
     from agent_center_bd_external_merchant import _extract_cited_hosts
     raw_runs = [
         _run([
@@ -50,19 +104,34 @@ def test_extract_cited_hosts_separates_merchant_from_competitors() -> None:
             "https://ulta.com/p/glossier-cloud-paint",
             "https://sephora.com/product/cloud-paint",
         ]),
-        _run([]),  # no grounding sources
+        _run([]),
     ]
     competitors, merchant_runs, runs_with_citations = _extract_cited_hosts(
         raw_runs, merchant_host="glossier.com",
     )
     assert competitors == Counter({"sephora.com": 2, "ulta.com": 1})
     assert merchant_runs == 1
-    assert runs_with_citations == 2  # third run had no chunks, doesn't count
+    assert runs_with_citations == 2
+
+
+def test_extract_cited_hosts_skips_redirector_only_runs() -> None:
+    """A run whose ONLY chunks are redirectors with no titles is not a
+    real citation — don't count it toward runs_with_any_citation."""
+    from agent_center_bd_external_merchant import _extract_cited_hosts
+    raw_runs = [
+        _run_with_sources([
+            {"uri": "https://vertexaisearch.cloud.google.com/abc", "title": ""},
+            {"uri": "https://vertexaisearch.cloud.google.com/def", "title": ""},
+        ]),
+    ]
+    competitors, merchant_runs, runs_with_citations = _extract_cited_hosts(
+        raw_runs, merchant_host=None,
+    )
+    assert competitors == Counter()
+    assert runs_with_citations == 0
 
 
 def test_extract_cited_hosts_merchant_host_none_treats_all_as_competitors() -> None:
-    """When the merchant URL is missing/unparseable, every cited host is
-    a competitor — caller can still see WHO Gemini is sending traffic to."""
     from agent_center_bd_external_merchant import _extract_cited_hosts
     raw_runs = [_run(["https://sephora.com/x", "https://ulta.com/y"])]
     competitors, merchant_runs, runs_with_citations = _extract_cited_hosts(
@@ -74,9 +143,6 @@ def test_extract_cited_hosts_merchant_host_none_treats_all_as_competitors() -> N
 
 
 def test_extract_cited_hosts_dedupes_within_run() -> None:
-    """If Gemini cites sephora.com twice in one answer, that counts as
-    1 run-occurrence for sephora.com, not 2 — we want host frequency
-    across runs, not raw chunk counts."""
     from agent_center_bd_external_merchant import _extract_cited_hosts
     raw_runs = [
         _run([

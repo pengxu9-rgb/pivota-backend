@@ -120,41 +120,129 @@ def normalize_host(url: str) -> Optional[str]:
     return host or None
 
 
+# Vertex AI grounding wraps every cited URL in a redirector — the URI we
+# get back is `vertexaisearch.cloud.google.com/grounding-api-redirect/...`
+# which hides the actual destination domain. The structured chunk's
+# `title` field contains the human-readable source name ("Sephora",
+# "Olive Young Global", "Beauty of Joseon Official Store") — much more
+# useful for BD competitor analysis than the redirector hostname.
+_VERTEX_REDIRECTOR_HOSTS = {
+    "vertexaisearch.cloud.google.com",
+    "vertex-ai-search.cloud.google.com",
+}
+
+
+def _identify_run_sources(run: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Return a list of `{key, label}` source identifiers for one run.
+
+    Reads the new `grounding_sources` field (list of `{uri, title}`)
+    when present (PIVOTA-Agent #1302+), falls back to the legacy
+    `grounding_chunks` (URI strings only) for older payloads.
+
+    `key` is what we use for de-dup + merchant matching.
+    `label` is what we show in the competitor table — title preferred,
+    URI host as fallback when title is missing.
+    """
+    sources_raw = run.get("grounding_sources")
+    out: List[Dict[str, str]] = []
+    seen_keys = set()
+    if isinstance(sources_raw, list) and sources_raw:
+        for s in sources_raw:
+            if not isinstance(s, dict):
+                continue
+            uri = s.get("uri") or ""
+            title = (s.get("title") or "").strip()
+            host = normalize_host(uri) or ""
+            # Prefer title for the label/key when the URI is a redirector
+            # (which it almost always is with Vertex AI grounding).
+            if host in _VERTEX_REDIRECTOR_HOSTS:
+                if not title:
+                    continue  # nothing meaningful to surface
+                label = title
+                key = title.lower()
+            else:
+                # Real (non-redirected) host — use the host for key and
+                # title for label when we have it.
+                label = title or host
+                key = host or title.lower()
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            out.append({"key": key, "label": label})
+        return out
+    # Legacy fallback: only URI strings available.
+    chunks = run.get("grounding_chunks") or []
+    for url in chunks:
+        host = normalize_host(url) if isinstance(url, str) else None
+        if not host or host in _VERTEX_REDIRECTOR_HOSTS:
+            continue
+        if host in seen_keys:
+            continue
+        seen_keys.add(host)
+        out.append({"key": host, "label": host})
+    return out
+
+
+def _source_matches_merchant(
+    source: Dict[str, str],
+    *,
+    merchant_host: Optional[str],
+    merchant_brand: Optional[str],
+) -> bool:
+    """A grounding source counts as merchant-attribution when:
+      - host matches the verified merchant host (rare with redirectors), OR
+      - title contains the merchant host (e.g. "beautyofjoseon.com" in
+        "Beauty of Joseon Official Store" — only true for some titles), OR
+      - title contains the merchant brand name.
+    """
+    label_lower = source.get("label", "").lower()
+    if merchant_host and merchant_host in label_lower:
+        return True
+    if merchant_brand:
+        brand_lower = merchant_brand.strip().lower()
+        if brand_lower and brand_lower in label_lower:
+            return True
+    return False
+
+
 def extract_cited_hosts(
     raw_runs: List[Dict[str, Any]],
     *,
     merchant_host: Optional[str],
+    merchant_brand: Optional[str] = None,
 ) -> Tuple[Counter, int, int]:
-    """Walk every run's grounding_chunks (the URLs Gemini ACTUALLY cited)
-    and return:
-      - Counter of {competitor_host: occurrences}
-      - count of runs that cited the merchant_host
-      - count of runs that cited at least one URL
+    """Walk every run's grounding sources and return:
+      - Counter of {competitor_label: occurrences} — labels are
+        Gemini's titles ("Sephora", "Olive Young Global") not the
+        redirector host
+      - count of runs that cited the merchant
+      - count of runs that cited at least one source
 
-    Within-run dedup: if Gemini cites sephora.com 3x in one answer, that
-    counts as 1 for sephora.com — we want host frequency across runs,
-    not raw chunk counts."""
+    Within-run dedup: if Gemini cites Sephora 3x in one answer, that
+    counts as 1 for Sephora — host frequency across runs, not raw
+    chunk counts.
+    """
     competitors: Counter = Counter()
     merchant_cited_runs = 0
     runs_with_any_citation = 0
     for run in raw_runs or []:
-        chunks = run.get("grounding_chunks") or []
-        if not chunks:
+        sources = _identify_run_sources(run)
+        if not sources:
             continue
         runs_with_any_citation += 1
-        run_hosts = set()
         merchant_in_run = False
-        for url in chunks:
-            host = normalize_host(url) if isinstance(url, str) else None
-            if host:
-                run_hosts.add(host)
-        if merchant_host and merchant_host in run_hosts:
-            merchant_in_run = True
-            run_hosts.discard(merchant_host)
+        run_competitor_labels = set()
+        for src in sources:
+            if _source_matches_merchant(
+                src, merchant_host=merchant_host, merchant_brand=merchant_brand,
+            ):
+                merchant_in_run = True
+            else:
+                run_competitor_labels.add(src["label"])
         if merchant_in_run:
             merchant_cited_runs += 1
-        for host in run_hosts:
-            competitors[host] += 1
+        for label in run_competitor_labels:
+            competitors[label] += 1
     return competitors, merchant_cited_runs, runs_with_any_citation
 
 
@@ -290,8 +378,15 @@ def build_structured_report(
     attribution_runs = attribution_result.get("raw_runs") or []
 
     merchant_host = normalize_host(merchant_pdp_url)
+    # Prefer the explicit vendor; fall back to merchant_name. Brand-name
+    # matching against grounding chunk titles ("Beauty of Joseon Official
+    # Store" → matches brand "Beauty of Joseon") is what catches
+    # attribution through Vertex AI's redirector wrapper.
+    merchant_brand = (product_vendor or merchant_name or "").strip() or None
     competitors, merchant_cited_runs, runs_with_any_citation = extract_cited_hosts(
-        attribution_runs, merchant_host=merchant_host,
+        attribution_runs,
+        merchant_host=merchant_host,
+        merchant_brand=merchant_brand,
     )
     verdict_label, verdict_explanation = verdict_for(visibility_score, attribution_score)
 
