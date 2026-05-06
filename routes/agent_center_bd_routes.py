@@ -119,6 +119,7 @@ async def external_merchant_report(
         product_type=body.product_type,
         visibility_result=probes["visibility"],
         attribution_result=probes["attribution"],
+        category_visibility_result=probes.get("category_visibility"),
         provider=body.provider,
     )
     upstream_status = report.get("upstream_status") or {}

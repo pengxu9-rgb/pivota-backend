@@ -127,6 +127,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         product_type=args.product_type,
         visibility_result=probes["visibility"],
         attribution_result=probes["attribution"],
+        category_visibility_result=probes.get("category_visibility"),
         provider=args.provider,
     )
 

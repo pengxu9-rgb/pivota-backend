@@ -586,6 +586,94 @@ def test_structured_report_includes_action_items_and_industry_context() -> None:
     assert report["action_items"][0]["severity"] == "critical"
 
 
+def test_structured_report_with_category_visibility() -> None:
+    """Phase 2a: when category_visibility_result is supplied, the
+    structured report exposes a `category_visibility` block + an
+    optional `verdict.category_visibility_score` field."""
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://beautyofjoseon.com/p/x",
+        product_title="Under Eye Patch",
+        product_vendor="Beauty of Joseon",
+        product_type="eye patch",
+        visibility_result={
+            "provider": "gemini", "scores": {"visibility_score": 33},
+            "raw_runs": [_vis_run("q1", visible=True, grounding=["https://x.com"])],
+        },
+        attribution_result={
+            "provider": "gemini", "scores": {"visibility_score": 0},
+            "raw_runs": [_attr_run("q1", found=False)],
+        },
+        category_visibility_result={
+            "provider": "gemini", "scores": {"visibility_score": 25},
+            "raw_runs": [
+                {
+                    "query": "best Korean eye patches 2026",
+                    "parsed": {"brand_appears": False},
+                    "grounding_chunks": ["https://allure.com/x"],
+                },
+            ],
+        },
+        provider="gemini",
+    )
+    assert report["category_visibility"] is not None
+    assert report["category_visibility"]["score"] == 25
+    assert len(report["category_visibility"]["queries"]) == 1
+    assert report["verdict"]["category_visibility_score"] == 25
+
+
+def test_structured_report_omits_category_block_when_not_run() -> None:
+    """Backward compat: when category_visibility_result is None, the
+    block is null (not undefined / missing) so consumers can rely on
+    its presence."""
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="X",
+        merchant_pdp_url="https://x.com/p/1",
+        product_title="Y",
+        product_vendor=None,
+        product_type=None,
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",
+    )
+    assert report["category_visibility"] is None
+    assert report["verdict"]["category_visibility_score"] is None
+
+
+def test_render_markdown_includes_category_section_when_present() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://beautyofjoseon.com/p/x",
+        product_title="Under Eye Patch",
+        product_vendor="Beauty of Joseon",
+        product_type="eye patch",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 33}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        category_visibility_result={
+            "provider": "gemini", "scores": {"visibility_score": 0},
+            "raw_runs": [
+                {
+                    "query": "best Korean eye patches 2026",
+                    "parsed": {"brand_appears": False},
+                    "grounding_chunks": [],
+                },
+            ],
+        },
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    assert "## 1.5. Category-level discoverability" in md
+    assert "best Korean eye patches 2026" in md
+    # Score-0 callout fires for the BD-pitch sweet-spot phrasing
+    assert "harshest BD signal" in md
+
+
 def test_render_markdown_includes_industry_context_and_actions() -> None:
     from services.agent_center_bd_report_service import (
         build_structured_report,

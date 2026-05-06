@@ -316,6 +316,7 @@ async def _run_one_seed(
             product_type=seed.get("product_type"),
             visibility_result=probes["visibility"],
             attribution_result=probes["attribution"],
+            category_visibility_result=probes.get("category_visibility"),
             provider=provider,
         )
         return {"status": "ok", "seed": seed, "report": report}
