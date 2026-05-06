@@ -174,9 +174,11 @@ def _build_seed_inserts(
         if not destination_url or destination_url in seen_urls:
             continue
         seen_urls.add(destination_url)
+        seed_id = derive_seed_id(product_key, destination_url)
+        merchant_slug = _normalize_token(offer.get("merchant_inferred") or "merchant").replace(" ", "-") or "merchant"
         rows.append({
-            "id": derive_seed_id(product_key, destination_url),
-            "external_product_id": offer.get("merchant_inferred") or None,
+            "id": seed_id,
+            "external_product_id": f"{merchant_slug}:{seed_id.split(':')[-1]}",
             "market": market,
             "tool": AGENT_VERSION,
             "title": pdp_payload["product_name"],
