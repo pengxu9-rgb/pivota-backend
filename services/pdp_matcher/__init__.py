@@ -19,9 +19,11 @@ from services.pdp_matcher.deterministic import (
     source_product_id_match,
     title_brand_match,
 )
+from services.pdp_matcher.llm_match import llm_match_seed
 
 __all__ = [
     "canonical_url_match",
+    "llm_match_seed",
     "matches_for_seed",
     "normalize_canonical_url",
     "source_product_id_match",

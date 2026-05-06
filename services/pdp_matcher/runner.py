@@ -27,6 +27,7 @@ from services.pdp_matcher.deterministic import (  # noqa: E402
     matches_for_seed,
     normalize_canonical_url,
 )
+from services.pdp_matcher.llm_match import llm_match_seed  # noqa: E402
 
 logger = logging.getLogger("pdp_matcher_runner")
 
@@ -82,15 +83,20 @@ async def _candidates_by_canonical_url(value: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows or []]
 
 
-async def _candidates_by_title_trigram(*, title: str, brand: Optional[str]) -> List[Dict[str, Any]]:
-    """Use pg_trgm similarity for the catalog_products.title side. The
-    threshold here (0.7) is a wider net than the matcher's 0.85 — the
-    final cut happens in pure Python using the same Jaccard formulation,
-    keeping behavior consistent across the SQL prefilter and the matcher
-    threshold knob."""
+async def _candidates_by_title_trigram(
+    *,
+    title: str,
+    brand: Optional[str],
+    threshold: float = 0.7,
+    limit: int = 25,
+) -> List[Dict[str, Any]]:
+    """Use pg_trgm similarity for the catalog_products.title side. Default
+    threshold 0.7 is a wider net than the deterministic matcher's 0.85 —
+    the final cut happens in pure Python (Jaccard parity with the GIN
+    index). Phase 3B (LLM tail) uses 0.5 to surface near-misses."""
     if not title:
         return []
-    params: Dict[str, Any] = {"title": title}
+    params: Dict[str, Any] = {"title": title, "threshold": float(threshold), "limit": int(limit)}
     brand_clause = ""
     if brand:
         brand_clause = "AND LOWER(brand) = :brand"
@@ -102,14 +108,33 @@ async def _candidates_by_title_trigram(*, title: str, brand: Optional[str]) -> L
         FROM catalog_products
         WHERE truth_tier = 'primary'
           AND title IS NOT NULL
-          AND similarity(LOWER(title), LOWER(:title)) >= 0.7
+          AND similarity(LOWER(title), LOWER(:title)) >= :threshold
           {brand_clause}
         ORDER BY similarity(LOWER(title), LOWER(:title)) DESC
-        LIMIT 25
+        LIMIT :limit
         """,
         params,
     )
     return [dict(row) for row in rows or []]
+
+
+async def _wide_candidates_for_llm(seed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Phase 3B candidate set — wider trigram net (similarity ≥ 0.5)
+    surfaces near-miss titles the deterministic 0.85-cutoff matcher
+    skipped. The LLM picks the right one (or 'none')."""
+    title = seed.get("title")
+    if not title:
+        return []
+    seed_data = seed.get("seed_data") or {}
+    brand_hint = None
+    if isinstance(seed_data, dict):
+        brand_hint = seed_data.get("brand") or seed_data.get("brand_name")
+    return await _candidates_by_title_trigram(
+        title=str(title),
+        brand=str(brand_hint) if brand_hint else None,
+        threshold=0.5,
+        limit=12,
+    )
 
 
 async def _candidates_for_seed(seed: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -210,6 +235,12 @@ async def _run(args: argparse.Namespace) -> int:
                 continue
             candidates = await _candidates_for_seed(seed)
             result = matches_for_seed(seed=seed, candidates=candidates)
+            if result is None and args.llm_tail:
+                # Phase 3B — widen the candidate net to similarity ≥0.5
+                # and let gemini-2.5-flash pick the best (or 'none').
+                wider = await _wide_candidates_for_llm(seed)
+                if wider:
+                    result = await llm_match_seed(seed=seed, candidates=wider)
             if result is None:
                 deferred += 1
                 continue
@@ -254,6 +285,12 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=500, help="rows per batch")
     parser.add_argument("--limit", type=int, default=0, help="cap total rows; 0 = no cap")
     parser.add_argument("--dry-run", action="store_true", help="don't UPDATE; just report")
+    parser.add_argument(
+        "--llm-tail",
+        action="store_true",
+        help="when deterministic matchers defer, fall through to gemini-2.5-flash "
+             "via services.pdp_matcher.llm_match (Phase 3B). Requires GEMINI_API_KEY.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     return asyncio.run(_run(args))
