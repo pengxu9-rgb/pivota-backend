@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import os
 import time
 import unicodedata
 from decimal import Decimal
@@ -1012,6 +1013,16 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
 async def _fetch_external_fallback_items(request: PivotQueryRequest) -> List[PivotResultItem]:
     query_terms = seed_search_terms(request.query)
     external_limit = min(max(request.limit * 2, 30), 200)
+    # PR: stage_a / stage_b seed query budgets were 0.9s / 1.6s. Recall probe
+    # v6 (pivota-agent-ui main reports/recall_v1/recall_v6_*) showed 12
+    # shopping_agent queries (~22pp pass-rate) hitting query_timeout at the
+    # ~5–6s mark — past the seed query alone, but the cumulative
+    # stage_a + stage_b budget plus the build pass eats most of the
+    # outer find_products_multi budget. Bumping to env-overridable defaults
+    # gives the SQL more headroom for non-trivial WHERE clauses (multi-term
+    # ILIKE on external_product_seeds is the dominant cost).
+    stage_a_timeout_s = float(os.environ.get("PIVOT_STAGE_A_SEED_QUERY_TIMEOUT_S") or 1.5)
+    stage_b_timeout_s = float(os.environ.get("PIVOT_STAGE_B_SEED_QUERY_TIMEOUT_S") or 2.5)
     stage_a_result = await fetch_external_seed_rows(
         database=database,
         market=request.market,
@@ -1019,7 +1030,7 @@ async def _fetch_external_fallback_items(request: PivotQueryRequest) -> List[Piv
         limit=external_limit,
         include_seed_data_text_match=False,
         only_unattached=False,
-        query_timeout_seconds=0.9,
+        query_timeout_seconds=stage_a_timeout_s,
         required_terms=None,
         prefer_terms=query_terms or None,
         scope="default",
@@ -1035,7 +1046,7 @@ async def _fetch_external_fallback_items(request: PivotQueryRequest) -> List[Piv
             limit=external_limit,
             include_seed_data_text_match=True,
             only_unattached=False,
-            query_timeout_seconds=1.6,
+            query_timeout_seconds=stage_b_timeout_s,
             required_terms=None,
             prefer_terms=query_terms or None,
             scope="default",
