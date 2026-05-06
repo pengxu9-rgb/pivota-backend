@@ -268,8 +268,142 @@ def extract_cited_hosts(
 
 VERDICT_INVISIBLE = "INVISIBLE"
 VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
+VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
 VERDICT_STRONG = "STRONG"
 VERDICT_PARTIAL = "PARTIAL"
+
+
+def score_category_visibility(
+    runs: List[Dict[str, Any]],
+    *,
+    merchant_host: Optional[str],
+    merchant_brand: Optional[str],
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Re-score category-visibility runs from raw probe data.
+
+    Upstream (`agentCenterLlmProbe.js`) only credits a run when the
+    merchant's verified URL appears in grounding chunks — so a brand
+    that's surfaced via Sephora / Olive Young / retailer reviews
+    scores 0/100 even when Gemini quotes the brand name verbatim. For
+    BD pitch this is the wrong reading: the brand IS discoverable in
+    the AI channel, just attributed to retailers. We re-score here so
+    the category score reflects "did the brand surface at all (via
+    any path) for this category query?"
+
+    A run counts as `matched=True` (full credit) when ANY of:
+      - merchant URL appears in grounding chunks (`url_match.in_grounding`)
+      - merchant brand or host appears in any grounding source title
+        ("Beauty of Joseon Official Store" → matches brand "Beauty of Joseon")
+      - merchant brand appears in `evidence_excerpt` text (Gemini quoted
+        the brand name in its grounded answer)
+
+    The LLM's `brand_appears: true` self-report alone is NOT enough —
+    Gemini frequently hallucinates self-attribution. We require textual
+    confirmation in the grounded output.
+
+    Returns (score 0–100, per-run match details for audit/UI)."""
+    if not runs:
+        return (0, [])
+    brand_lower = (merchant_brand or "").strip().lower()
+    host_lower = (merchant_host or "").strip().lower()
+    details: List[Dict[str, Any]] = []
+    matched = 0
+    for run in runs:
+        url_match = run.get("url_match") or {}
+        in_grounding = bool(url_match.get("in_grounding"))
+        sources = _identify_run_sources(run)
+        title_match = False
+        for src in sources:
+            label = (src.get("label") or "").lower()
+            if brand_lower and brand_lower in label:
+                title_match = True
+                break
+            if host_lower and host_lower in label:
+                title_match = True
+                break
+        parsed = run.get("parsed") or {}
+        excerpt = (parsed.get("evidence_excerpt") or "").lower()
+        excerpt_match = bool(brand_lower and brand_lower in excerpt)
+        is_match = in_grounding or title_match or excerpt_match
+        if is_match:
+            matched += 1
+        details.append({
+            "query": run.get("query") or "",
+            "in_grounding": in_grounding,
+            "title_match": title_match,
+            "excerpt_match": excerpt_match,
+            "matched": is_match,
+        })
+    score = round((matched / len(runs)) * 100)
+    return (score, details)
+
+
+def extract_category_competitors(
+    runs: List[Dict[str, Any]],
+    *,
+    merchant_host: Optional[str],
+    merchant_brand: Optional[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Aggregate the rich competitor data Gemini returns on category
+    queries — currently dropped on the floor by the BD report. Two
+    distinct lists are returned:
+
+      - `competitor_brands`: Counter of brand names from Gemini's
+        `competitors_appearing` field (e.g. "Patchology", "Wander
+        Beauty"). Direct competitors the merchant should know about.
+      - `retailer_hosts`: Counter of grounding source titles that
+        aren't the merchant's own brand/host (e.g. "sephora.com",
+        "oliveyoung.com"). Where AI traffic gets routed instead of
+        the merchant's site — the strongest pitch evidence for the
+        "retailers are eating your AI search funnel" framing.
+
+    Within-run dedup: cite Sephora 3× in one answer = 1 for Sephora.
+    """
+    brand_counter: Counter = Counter()
+    retailer_counter: Counter = Counter()
+    brand_lower = (merchant_brand or "").strip().lower()
+    host_lower = (merchant_host or "").strip().lower()
+    for run in runs or []:
+        parsed = run.get("parsed") or {}
+        run_brands = set()
+        for raw_brand in parsed.get("competitors_appearing") or []:
+            if not isinstance(raw_brand, str):
+                continue
+            name = raw_brand.strip()
+            if not name:
+                continue
+            name_lower = name.lower()
+            if brand_lower and (
+                brand_lower in name_lower or name_lower in brand_lower
+            ):
+                continue  # skip the merchant's own brand
+            run_brands.add(name)
+        for n in run_brands:
+            brand_counter[n] += 1
+
+        run_hosts = set()
+        for src in _identify_run_sources(run):
+            label = src.get("label") or ""
+            label_lower = label.lower()
+            if not label:
+                continue
+            if brand_lower and brand_lower in label_lower:
+                continue
+            if host_lower and host_lower in label_lower:
+                continue
+            run_hosts.add(label)
+        for h in run_hosts:
+            retailer_counter[h] += 1
+
+    competitor_brands = [
+        {"name": n, "times_cited": c}
+        for n, c in brand_counter.most_common(15)
+    ]
+    retailer_hosts = [
+        {"host": h, "times_cited": c}
+        for h, c in retailer_counter.most_common(15)
+    ]
+    return (competitor_brands, retailer_hosts)
 
 # Default thresholds — used when no peer_thresholds is supplied. These
 # are intuitive defaults from V1.5 (30 = "barely visible", 60 = "strong
@@ -288,6 +422,8 @@ def verdict_for(
     visibility_score: int,
     attribution_score: int,
     peer_thresholds: Optional[Dict[str, int]] = None,
+    *,
+    category_visibility_score: Optional[int] = None,
 ) -> Tuple[str, str]:
     """Categorize the (visibility, attribution) pair into one of four
     BD-friendly verdicts. Returns (label, explanation paragraph).
@@ -330,6 +466,32 @@ def verdict_for(
             f"Your visibility {visibility_score}/100, attribution {attribution_score}/100.)_  \n\n"
         )
 
+    # VISIBLE VIA RETAILERS — sharpest BD framing. Triggers when the
+    # category test surfaced the brand (≥ invisible_max) but attribution
+    # is rock-bottom: the brand IS findable in the AI channel, just
+    # always through Sephora / Olive Young / retailer reviews, never
+    # the merchant's own URL. Checked BEFORE INVISIBLE so a merchant
+    # with named-product visibility=0 + category-visibility=67 + attr=0
+    # gets the right read.
+    if (
+        category_visibility_score is not None
+        and category_visibility_score >= invisible_max
+        and attribution_score < misattr_attr_max
+    ):
+        return (
+            VERDICT_VIA_RETAILERS,
+            peer_prefix + (
+                "AI shopping agents recognize this brand in category-level "
+                "queries — but every grounded citation routes consumers through "
+                "third-party retailers (Sephora, Olive Young, beauty marketplaces) "
+                "rather than the merchant's own URL. The brand is findable in the "
+                "AI channel; the merchant just isn't capturing the funnel. Every "
+                "retailer-cited query is a margin hit (reseller markup) and a "
+                "lost first-party customer relationship. This is the highest-"
+                "leverage onboarding case: the demand exists and is already "
+                "AI-discoverable; only the attribution path is broken."
+            ),
+        )
     if visibility_score < invisible_max and attribution_score < invisible_max:
         return (
             VERDICT_INVISIBLE,
@@ -863,6 +1025,8 @@ def _generate_action_items(
     competitor_hosts: List[Dict[str, Any]],
     merchant_cited_runs: int,
     runs_with_any_citation: int,
+    category_retailer_hosts: Optional[List[Dict[str, Any]]] = None,
+    category_competitor_brands: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Return a list of 3-5 specific action items. Each item has
     `severity` (critical|high|medium|low), `title`, `body` (BD-rep
@@ -911,6 +1075,36 @@ def _generate_action_items(
                 "margin hit if the cited path is a reseller. This is the "
                 "highest-impact failure mode — the demand exists; it's "
                 "just being captured by competitors."
+            ),
+        })
+    elif verdict_label == "VISIBLE VIA RETAILERS":
+        # Build a top-retailer mention into the body when we have data.
+        retailer_phrase = ""
+        if category_retailer_hosts:
+            top_retailers = [
+                r["host"] for r in category_retailer_hosts[:3] if r.get("host")
+            ]
+            if top_retailers:
+                retailer_phrase = (
+                    f" Top retailers capturing your AI-channel funnel: "
+                    f"{', '.join(top_retailers)}."
+                )
+        items.append({
+            "severity": "critical",
+            "title": "Capture the AI-channel funnel that retailers are taking today",
+            "body": (
+                "Your brand IS findable in AI-channel category queries — but "
+                "every grounded citation routes consumers through third-party "
+                "retailers instead of your own URL." + retailer_phrase + " "
+                "The demand already exists in this channel; the only thing "
+                "missing is the attribution path. Pivota's canonical PDP + "
+                "Schema.org + sitemap submission converts retailer-cited "
+                "category visibility into first-party AI-channel attribution."
+            ),
+            "evidence": (
+                {"top_retailer_hosts": [r["host"] for r in category_retailer_hosts[:5] if r.get("host")]}
+                if category_retailer_hosts
+                else None
             ),
         })
     elif verdict_label == "STRONG":
@@ -1033,10 +1227,16 @@ def build_structured_report(
     attribution_runs = attribution_result.get("raw_runs") or []
 
     # Category visibility (optional, Phase 2a)
-    category_score = None
+    category_score: Optional[int] = None
     category_runs: List[Dict[str, Any]] = []
+    category_match_details: List[Dict[str, Any]] = []
+    category_competitor_brands: List[Dict[str, Any]] = []
+    category_retailer_hosts: List[Dict[str, Any]] = []
+    upstream_category_score = None
     if category_visibility_result:
-        category_score = (category_visibility_result.get("scores") or {}).get("visibility_score", 0)
+        upstream_category_score = (
+            category_visibility_result.get("scores") or {}
+        ).get("visibility_score", 0)
         category_runs = category_visibility_result.get("raw_runs") or []
 
     merchant_host = normalize_host(merchant_pdp_url)
@@ -1050,7 +1250,34 @@ def build_structured_report(
         merchant_host=merchant_host,
         merchant_brand=merchant_brand,
     )
-    verdict_label, verdict_explanation = verdict_for(visibility_score, attribution_score)
+
+    # Re-score category from raw_runs so brand text-matches in
+    # evidence excerpts and grounding source titles count as positive
+    # signal. Also pull the rich competitor data Gemini returns on
+    # category queries (was being dropped). Done here, post-probe, so
+    # we don't need an upstream re-deploy.
+    if category_runs:
+        category_score, category_match_details = score_category_visibility(
+            category_runs,
+            merchant_host=merchant_host,
+            merchant_brand=merchant_brand,
+        )
+        category_competitor_brands, category_retailer_hosts = (
+            extract_category_competitors(
+                category_runs,
+                merchant_host=merchant_host,
+                merchant_brand=merchant_brand,
+            )
+        )
+    elif category_visibility_result is not None:
+        # Probe ran but returned no runs — keep score=0 for consistency.
+        category_score = 0
+
+    verdict_label, verdict_explanation = verdict_for(
+        visibility_score,
+        attribution_score,
+        category_visibility_score=category_score,
+    )
 
     # Critical for credibility: surface what the upstream ACTUALLY used,
     # not just what was requested. A silent fallback to mock looks
@@ -1093,6 +1320,8 @@ def build_structured_report(
         competitor_hosts=competitor_hosts_list,
         merchant_cited_runs=merchant_cited_runs,
         runs_with_any_citation=runs_with_any_citation,
+        category_retailer_hosts=category_retailer_hosts,
+        category_competitor_brands=category_competitor_brands,
     )
     industry_context = _industry_context_for(
         product_type=product_type,
@@ -1137,8 +1366,12 @@ def build_structured_report(
         "category_visibility": (
             {
                 "score": category_score,
+                "upstream_score": upstream_category_score,
                 "runs": len(category_runs),
                 "queries": _per_query_rows(category_runs, "brand_appears"),
+                "match_details": category_match_details,
+                "competitor_brands": category_competitor_brands,
+                "retailer_hosts": category_retailer_hosts,
             }
             if category_visibility_result is not None
             else None
@@ -1259,6 +1492,19 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                 "BD signal: consumers asking for products in this category "
                 "without naming the brand never see the merchant._\n"
             )
+        retailers = cat.get("retailer_hosts") or []
+        if retailers:
+            sections.append(
+                "**Where category traffic is being routed (retailers cited "
+                "instead of merchant):**\n"
+            )
+            sections.append(_md_retailer_table(retailers) + "\n")
+        comp_brands = cat.get("competitor_brands") or []
+        if comp_brands:
+            sections.append(
+                "**Top direct competitors named by Gemini in category queries:**\n"
+            )
+            sections.append(_md_competitor_brand_table(comp_brands) + "\n")
 
     sections.append("## 2. Direct attribution\n")
     sections.append(
@@ -1348,4 +1594,22 @@ def _md_competitor_table(competitors: List[Dict[str, Any]], top_n: int = 8) -> s
     out = ["| Competitor host | Times cited |", "|---|---|"]
     for entry in competitors[:top_n]:
         out.append(f"| `{entry['host']}` | {entry['times_cited']} |")
+    return "\n".join(out)
+
+
+def _md_retailer_table(retailers: List[Dict[str, Any]], top_n: int = 8) -> str:
+    if not retailers:
+        return "_(none cited)_"
+    out = ["| Retailer / host | Category queries citing |", "|---|---|"]
+    for entry in retailers[:top_n]:
+        out.append(f"| `{entry['host']}` | {entry['times_cited']} |")
+    return "\n".join(out)
+
+
+def _md_competitor_brand_table(brands: List[Dict[str, Any]], top_n: int = 10) -> str:
+    if not brands:
+        return "_(none named)_"
+    out = ["| Competitor brand | Category queries naming |", "|---|---|"]
+    for entry in brands[:top_n]:
+        out.append(f"| {entry['name']} | {entry['times_cited']} |")
     return "\n".join(out)
