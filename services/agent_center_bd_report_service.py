@@ -208,6 +208,63 @@ def verdict_for(visibility_score: int, attribution_score: int) -> Tuple[str, str
 # ---------------------------------------------------------------------------
 
 
+_REAL_PROVIDERS = {"gemini"}
+
+
+def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
+    """Categorize what the upstream actually used.
+
+    Returns:
+      - is_real: True if upstream ran a real LLM (gemini), False on any
+        mock variant.
+      - reason: a human-readable explanation surfaced in UI when a
+        fallback happened. None when is_real.
+    """
+    p = (upstream_provider or "").strip()
+    if p in _REAL_PROVIDERS:
+        return {"is_real": True, "reason": None}
+    if p == "local_mock_no_internal_key":
+        # Emitted by services/agent_center_llm_client.py when
+        # PIVOTA_AGENT_INTERNAL_API_KEY is unset — the call never even
+        # left the backend.
+        return {
+            "is_real": False,
+            "reason": (
+                "Backend `PIVOTA_AGENT_INTERNAL_API_KEY` is unset on Railway. "
+                "The probe never reached PIVOTA-Agent — pivota-backend "
+                "synthesized a local mock instead. Configure the key in "
+                "Railway env (web-production-fedb)."
+            ),
+        }
+    if p == "mock_fallback_no_gemini_key":
+        # Emitted by PIVOTA-Agent's buildGeminiProbe when GoogleGenAI
+        # client init fails (no GEMINI_API_KEY).
+        return {
+            "is_real": False,
+            "reason": (
+                "PIVOTA-Agent's `GEMINI_API_KEY` is unset on Railway. The "
+                "probe reached the upstream service but couldn't initialize "
+                "the Gemini client. Configure `GEMINI_API_KEY` in "
+                "PIVOTA-Agent's Railway env (pivota-agent-production)."
+            ),
+        }
+    if p == "mock":
+        # Operator explicitly requested provider=mock, OR upstream
+        # returned the deterministic stub for some other reason.
+        return {
+            "is_real": False,
+            "reason": (
+                "Upstream returned `mock` — usually because the request "
+                "explicitly set provider=mock. If you requested gemini and "
+                "got this, check both backend and PIVOTA-Agent env vars."
+            ),
+        }
+    return {
+        "is_real": False,
+        "reason": f"Unrecognized upstream provider value: {p!r}",
+    }
+
+
 def build_structured_report(
     *,
     merchant_name: str,
@@ -233,6 +290,23 @@ def build_structured_report(
     )
     verdict_label, verdict_explanation = verdict_for(visibility_score, attribution_score)
 
+    # Critical for credibility: surface what the upstream ACTUALLY used,
+    # not just what was requested. A silent fallback to mock looks
+    # identical to a real run in the UI without this.
+    visibility_actual = (visibility_result.get("provider") or "").strip()
+    attribution_actual = (attribution_result.get("provider") or "").strip()
+    # Take the most-degraded of the two — if either fell back to mock, the
+    # whole report is suspect.
+    actual_provider_for_status = (
+        visibility_actual
+        if visibility_actual not in _REAL_PROVIDERS
+        else attribution_actual
+    )
+    upstream_status = _classify_provider(actual_provider_for_status)
+    upstream_status["requested_provider"] = provider
+    upstream_status["visibility_provider"] = visibility_actual
+    upstream_status["attribution_provider"] = attribution_actual
+
     def _per_query_rows(runs: List[Dict[str, Any]], judge_key: str) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for run in runs:
@@ -256,6 +330,7 @@ def build_structured_report(
             "product_type": product_type or None,
         },
         "provider": provider,
+        "upstream_status": upstream_status,
         "timestamp": timestamp or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "verdict": {
             "label": verdict_label,
@@ -295,9 +370,25 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
     sections: List[str] = []
     sections.append(f"# AI Visibility Report — {report['merchant_name']}\n")
     sections.append(
-        f"_Generated {report['timestamp']} · Provider: {report['provider']} · "
-        f"Probe: pivota Demand Test Agent V1.5_\n"
+        f"_Generated {report['timestamp']} · Probe: pivota Demand Test Agent V1.5_\n"
     )
+
+    upstream = report.get("upstream_status") or {}
+    if upstream and not upstream.get("is_real"):
+        sections.append(
+            f"> ⚠️ **MOCK DATA — DO NOT SHARE WITH BD / MERCHANT**\n"
+            f"> \n"
+            f"> Requested provider: `{upstream.get('requested_provider', '?')}` · "
+            f"Actual upstream: `{upstream.get('visibility_provider', '?')}` "
+            f"(visibility), `{upstream.get('attribution_provider', '?')}` (attribution).\n"
+            f"> \n"
+            f"> {upstream.get('reason', 'Unknown mock fallback.')}\n"
+        )
+    else:
+        sections.append(
+            f"_Upstream: `{upstream.get('visibility_provider', report.get('provider'))}` "
+            f"(real Gemini grounded search)._\n"
+        )
 
     sections.append("## Subject\n")
     bullets = [

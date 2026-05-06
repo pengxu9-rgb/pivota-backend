@@ -174,6 +174,110 @@ def test_render_markdown_smoke() -> None:
     assert "Raw probe data" in report
 
 
+def test_structured_report_marks_real_when_upstream_is_gemini() -> None:
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="X", merchant_pdp_url="https://example.com/p/1",
+        product_title="Y", product_vendor=None, product_type=None,
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",
+    )
+    assert report["upstream_status"]["is_real"] is True
+    assert report["upstream_status"]["reason"] is None
+    assert report["upstream_status"]["visibility_provider"] == "gemini"
+
+
+def test_structured_report_flags_local_mock_no_internal_key() -> None:
+    """Backend's local mock path — call never reached PIVOTA-Agent.
+    Most likely root cause: PIVOTA_AGENT_INTERNAL_API_KEY unset on
+    Railway."""
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="X", merchant_pdp_url="https://example.com/p/1",
+        product_title="Y", product_vendor=None, product_type=None,
+        visibility_result={"provider": "local_mock_no_internal_key", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "local_mock_no_internal_key", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",  # requested gemini but got local mock
+    )
+    assert report["upstream_status"]["is_real"] is False
+    assert "PIVOTA_AGENT_INTERNAL_API_KEY" in report["upstream_status"]["reason"]
+    assert "Railway" in report["upstream_status"]["reason"]
+
+
+def test_structured_report_flags_mock_fallback_no_gemini_key() -> None:
+    """PIVOTA-Agent's GEMINI_API_KEY unset path."""
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="X", merchant_pdp_url="https://example.com/p/1",
+        product_title="Y", product_vendor=None, product_type=None,
+        visibility_result={"provider": "mock_fallback_no_gemini_key", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "mock_fallback_no_gemini_key", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",
+    )
+    assert report["upstream_status"]["is_real"] is False
+    assert "GEMINI_API_KEY" in report["upstream_status"]["reason"]
+
+
+def test_structured_report_flags_when_only_one_probe_fell_back() -> None:
+    """Asymmetric: visibility ran on Gemini, attribution returned mock.
+    Reporting must treat the whole report as mock — any mock probe
+    contaminates the verdict."""
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="X", merchant_pdp_url="https://example.com/p/1",
+        product_title="Y", product_vendor=None, product_type=None,
+        visibility_result={"provider": "mock_fallback_no_gemini_key", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",
+    )
+    # The most-degraded provider drives the status.
+    assert report["upstream_status"]["is_real"] is False
+    # Both providers visible in the structure for diagnostic.
+    assert report["upstream_status"]["visibility_provider"] == "mock_fallback_no_gemini_key"
+    assert report["upstream_status"]["attribution_provider"] == "gemini"
+
+
+def test_render_markdown_includes_mock_warning_when_not_real() -> None:
+    """The markdown report must surface a "DO NOT SHARE" warning when
+    upstream fell back to mock — silent fallback was the failure mode
+    that motivated this PR."""
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="X", merchant_pdp_url="https://example.com/p/1",
+        product_title="Y", product_vendor=None, product_type=None,
+        visibility_result={"provider": "local_mock_no_internal_key", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "local_mock_no_internal_key", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    assert "MOCK DATA" in md
+    assert "DO NOT SHARE" in md
+    assert "PIVOTA_AGENT_INTERNAL_API_KEY" in md
+
+
+def test_render_markdown_omits_warning_when_real() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="X", merchant_pdp_url="https://example.com/p/1",
+        product_title="Y", product_vendor=None, product_type=None,
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    assert "MOCK DATA" not in md
+    assert "DO NOT SHARE" not in md
+    # Real upstream is mentioned in the header for transparency.
+    assert "real Gemini" in md
+
+
 def test_render_markdown_handles_empty_attribution_runs() -> None:
     """Edge case: if Gemini returned zero grounded sources for any
     attribution query, the report should explicitly say so rather than
