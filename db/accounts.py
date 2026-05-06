@@ -107,6 +107,9 @@ shop_browse_history_events = Table(
     Column("currency", String(16), nullable=True),
     Column("image_url", Text, nullable=True),
     Column("description", Text, nullable=True),
+    Column("brand", Text, nullable=True),
+    Column("category", Text, nullable=True),
+    Column("product_type", Text, nullable=True),
     Column("viewed_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )

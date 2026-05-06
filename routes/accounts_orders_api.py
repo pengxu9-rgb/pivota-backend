@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import uuid
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -620,6 +621,8 @@ class BrowseHistoryItem(BaseModel):
     brand: Optional[str] = None
     category: Optional[str] = None
     product_type: Optional[str] = None
+    price_source: Optional[str] = None
+    price_resolution_status: str = "stored"
     timestamp: int
     viewed_at: str
 
@@ -627,6 +630,8 @@ class BrowseHistoryItem(BaseModel):
 class BrowseHistoryListResponse(BaseModel):
     items: List[BrowseHistoryItem]
     total: int
+    unresolved_total: int = 0
+    price_source_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1465,6 +1470,13 @@ def _history_item_key(product_id: str, merchant_id: Optional[str]) -> str:
     return f"{product_id}::{merchant_id or ''}"
 
 
+@dataclass(frozen=True)
+class HistoryPriceResolution:
+    price: float
+    currency: Optional[str] = None
+    source: str = "unknown"
+
+
 def _history_row_to_item(row: Dict[str, Any]) -> BrowseHistoryItem:
     raw_viewed_at = row.get("viewed_at") or row.get("created_at") or datetime.now(timezone.utc)
     parsed = None
@@ -1492,6 +1504,8 @@ def _history_row_to_item(row: Dict[str, Any]) -> BrowseHistoryItem:
         brand=(str(row.get("brand") or "").strip() or None),
         category=(str(row.get("category") or "").strip() or None),
         product_type=(str(row.get("product_type") or "").strip() or None),
+        price_source=(str(row.get("price_source") or "").strip() or None),
+        price_resolution_status=str(row.get("price_resolution_status") or "stored").strip() or "stored",
         timestamp=int(parsed.timestamp() * 1000),
         viewed_at=parsed.isoformat(),
     )
@@ -1506,16 +1520,25 @@ def _coerce_positive_history_price(value: Any) -> Optional[float]:
             value.get("value"),
             value.get("price_amount"),
             value.get("price"),
+            value.get("current_price"),
+            value.get("sale_price"),
+            value.get("min_price"),
             _coerce_json_object(value.get("current")).get("amount"),
             _coerce_json_object(value.get("current")).get("value"),
             _coerce_json_object(value.get("sale")).get("amount"),
+            _coerce_json_object(value.get("sale")).get("value"),
             _coerce_json_object(value.get("min")).get("amount"),
+            _coerce_json_object(value.get("min")).get("value"),
         ]
         for candidate in candidates:
             price = _coerce_positive_history_price(candidate)
             if price is not None:
                 return price
         return None
+    if isinstance(value, str):
+        value = value.strip().replace(",", "")
+        if not value:
+            return None
     try:
         price = float(value)
     except Exception:
@@ -1525,44 +1548,137 @@ def _coerce_positive_history_price(value: Any) -> Optional[float]:
     return None
 
 
-def _extract_history_price_from_product_payload(payload: Any) -> Optional[float]:
-    product = _coerce_json_object(payload)
+def _history_aliases_from_object(value: Any, keys: Tuple[str, ...]) -> List[str]:
+    data = _coerce_json_object(value)
+    aliases: List[str] = []
+
+    def add(raw: Any) -> None:
+        if isinstance(raw, dict):
+            for nested_key in ("id", "product_id", "variant_id", "sku", "sku_id"):
+                add(raw.get(nested_key))
+            return
+        text = str(raw or "").strip()
+        if text and text not in aliases:
+            aliases.append(text)
+
+    for key in keys:
+        add(data.get(key))
+    return aliases
+
+
+def _history_payload_parts(payload: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    root = _coerce_json_object(payload)
+    product = _coerce_json_object(root.get("product")) or root
+    variants: List[Dict[str, Any]] = []
+    offers: List[Dict[str, Any]] = []
+
+    for source in (product.get("variants"), root.get("variants")):
+        if isinstance(source, list):
+            variants.extend(_coerce_json_object(item) for item in source if _coerce_json_object(item))
+
+    for source in (product.get("offers"), root.get("offers")):
+        if isinstance(source, list):
+            offers.extend(_coerce_json_object(item) for item in source if _coerce_json_object(item))
+
+    modules = root.get("modules")
+    if isinstance(modules, list):
+        for module in modules:
+            module_data = _coerce_json_object(module)
+            data = _coerce_json_object(module_data.get("data"))
+            pdp_payload = _coerce_json_object(data.get("pdp_payload"))
+            if not pdp_payload:
+                continue
+            nested_product, nested_variants, nested_offers = _history_payload_parts(pdp_payload)
+            if nested_product and product is root:
+                product = nested_product
+            variants.extend(nested_variants)
+            offers.extend(nested_offers)
+
+    return product, variants, offers
+
+
+def _extract_history_price_from_product_payload(payload: Any, match_id: Optional[str] = None) -> Optional[float]:
+    product, variants, offers = _history_payload_parts(payload)
     if not product:
         return None
 
-    for key in ("price", "pricing", "price_amount"):
-        price = _coerce_positive_history_price(product.get(key))
-        if price is not None:
-            return price
-
-    variants = product.get("variants")
-    if isinstance(variants, list):
-        for variant in variants:
-            variant_data = _coerce_json_object(variant)
-            for key in ("price", "pricing", "price_amount"):
+    match = str(match_id or "").strip()
+    if match:
+        for variant_data in variants:
+            variant_aliases = _history_aliases_from_object(
+                variant_data,
+                (
+                    "variant_id",
+                    "id",
+                    "sku",
+                    "sku_id",
+                    "platform_variant_id",
+                    "external_variant_id",
+                    "product_id",
+                    "platform_product_id",
+                    "external_product_id",
+                ),
+            )
+            if match not in variant_aliases:
+                continue
+            for key in ("price", "pricing", "price_amount", "current_price", "sale_price", "min_price"):
                 price = _coerce_positive_history_price(variant_data.get(key))
                 if price is not None:
                     return price
 
-    offers = product.get("offers")
+        for offer_data in offers:
+            offer_aliases = _history_aliases_from_object(
+                offer_data,
+                (
+                    "offer_id",
+                    "id",
+                    "product_id",
+                    "platform_product_id",
+                    "external_product_id",
+                    "variant_id",
+                    "platform_variant_id",
+                    "sku",
+                    "sku_id",
+                ),
+            )
+            if match not in offer_aliases:
+                continue
+            for key in ("price", "pricing", "price_amount", "current_price", "sale_price", "min_price"):
+                price = _coerce_positive_history_price(offer_data.get(key))
+                if price is not None:
+                    return price
+
+    for key in ("price", "pricing", "price_amount", "current_price", "sale_price", "min_price"):
+        price = _coerce_positive_history_price(product.get(key))
+        if price is not None:
+            return price
+
+    if isinstance(variants, list):
+        for variant in variants:
+            for key in ("price", "pricing", "price_amount"):
+                price = _coerce_positive_history_price(variant.get(key))
+                if price is not None:
+                    return price
+
     if isinstance(offers, list):
         for offer in offers:
-            offer_data = _coerce_json_object(offer)
-            price = _coerce_positive_history_price(offer_data.get("price"))
-            if price is not None:
-                return price
+            for key in ("price", "pricing", "price_amount"):
+                price = _coerce_positive_history_price(offer.get(key))
+                if price is not None:
+                    return price
 
     return None
 
 
 def _extract_history_currency_from_product_payload(payload: Any) -> Optional[str]:
-    product = _coerce_json_object(payload)
+    product, variants, offers = _history_payload_parts(payload)
     if not product:
         return None
 
     for value in (
         product.get("currency"),
         product.get("price_currency"),
+        product.get("currency_code"),
         _coerce_json_object(product.get("price")).get("currency"),
         _coerce_json_object(product.get("price")).get("currency_code"),
         _coerce_json_object(_coerce_json_object(product.get("price")).get("current")).get("currency"),
@@ -1571,56 +1687,147 @@ def _extract_history_currency_from_product_payload(payload: Any) -> Optional[str
         text = str(value or "").strip().upper()
         if text:
             return text
+    for collection in (variants, offers):
+        for item in collection:
+            for value in (
+                item.get("currency"),
+                item.get("price_currency"),
+                item.get("currency_code"),
+                _coerce_json_object(item.get("price")).get("currency"),
+                _coerce_json_object(item.get("price")).get("currency_code"),
+                _coerce_json_object(_coerce_json_object(item.get("price")).get("current")).get("currency"),
+                _coerce_json_object(_coerce_json_object(item.get("price")).get("current")).get("currency_code"),
+            ):
+                text = str(value or "").strip().upper()
+                if text:
+                    return text
     return None
 
 
 def _product_payload_ids(payload: Any) -> List[str]:
-    product = _coerce_json_object(payload)
+    product, variants, offers = _history_payload_parts(payload)
     ids: List[str] = []
 
     def add(value: Any) -> None:
+        if isinstance(value, dict):
+            for nested_key in ("id", "product_id", "variant_id", "sku", "sku_id"):
+                add(value.get(nested_key))
+            return
         text = str(value or "").strip()
         if text and text not in ids:
             ids.append(text)
 
-    for key in ("id", "product_id", "platform_product_id", "external_product_id"):
+    for key in (
+        "id",
+        "product_id",
+        "platform_product_id",
+        "external_product_id",
+        "canonical_product_id",
+        "product_group_id",
+        "sellable_item_group_id",
+        "product_line_id",
+        "sku",
+        "sku_id",
+    ):
         add(product.get(key))
+    add(product.get("canonical_product_ref"))
+    add(product.get("canonical_payload_product_ref"))
 
-    variants = product.get("variants")
-    if isinstance(variants, list):
-        for variant in variants:
-            variant_data = _coerce_json_object(variant)
-            for key in ("variant_id", "id", "sku", "sku_id"):
-                add(variant_data.get(key))
+    for variant_data in variants:
+        for key in (
+            "variant_id",
+            "id",
+            "sku",
+            "sku_id",
+            "platform_variant_id",
+            "external_variant_id",
+            "product_id",
+            "platform_product_id",
+            "external_product_id",
+        ):
+            add(variant_data.get(key))
+
+    for offer_data in offers:
+        for key in (
+            "offer_id",
+            "id",
+            "product_id",
+            "platform_product_id",
+            "external_product_id",
+            "variant_id",
+            "platform_variant_id",
+            "sku",
+            "sku_id",
+        ):
+            add(offer_data.get(key))
 
     return ids
 
 
-async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str, Tuple[float, Optional[str]]]:
-    product_ids = sorted({
-        str(row.get("product_id") or "").strip()
-        for row in rows
-        if str(row.get("product_id") or "").strip()
-    })
+def _is_external_history_merchant(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"external_seed", "external_product_seeds", "external"}
+
+
+async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str, HistoryPriceResolution]:
+    requests: List[Dict[str, Optional[str]]] = []
+    seen_request_keys: set = set()
+    for row in rows:
+        product_id = str(row.get("product_id") or "").strip()
+        if not product_id:
+            continue
+        merchant_id = _normalize_history_merchant_id(row.get("merchant_id"))
+        key = _history_item_key(product_id, merchant_id)
+        if key in seen_request_keys:
+            continue
+        seen_request_keys.add(key)
+        requests.append({"product_id": product_id, "merchant_id": merchant_id, "key": key})
+
+    product_ids = sorted({str(req.get("product_id") or "").strip() for req in requests})
     if not product_ids:
         return {}
 
-    lookup: Dict[str, Tuple[float, Optional[str]]] = {}
+    lookup: Dict[str, HistoryPriceResolution] = {}
 
-    def put(product_id: Any, price: Optional[float], currency: Optional[str]) -> None:
-        pid = str(product_id or "").strip()
-        if not pid or price is None or price <= 0 or pid in lookup:
+    def put(product_id: Any, price: Optional[float], currency: Optional[str], source: str, merchant_id: Optional[str] = None) -> None:
+        alias = str(product_id or "").strip()
+        candidate_merchant = _normalize_history_merchant_id(merchant_id)
+        if not alias or price is None or price <= 0:
             return
-        lookup[pid] = (float(price), str(currency or "").strip().upper() or None)
+        for req in requests:
+            if req["product_id"] != alias:
+                continue
+            req_key = str(req["key"] or "")
+            if req_key in lookup:
+                continue
+            requested_merchant = _normalize_history_merchant_id(req.get("merchant_id"))
+            merchant_matches = (
+                not requested_merchant
+                or not candidate_merchant
+                or requested_merchant == candidate_merchant
+                or _is_external_history_merchant(requested_merchant)
+            )
+            if not merchant_matches:
+                continue
+            lookup[req_key] = HistoryPriceResolution(
+                price=float(price),
+                currency=str(currency or "").strip().upper() or None,
+                source=source,
+            )
 
     try:
         seed_rows = await asyncio.wait_for(
             database.fetch_all(
                 """
-                SELECT id, external_product_id, price_amount, price_currency, seed_data
+                SELECT id, external_product_id, attached_product_key, attached_variant_id,
+                       price_amount, price_currency, seed_data
                 FROM external_product_seeds
                 WHERE status = 'active'
-                  AND (id = ANY(:product_ids) OR external_product_id = ANY(:product_ids))
+                  AND (
+                    id = ANY(:product_ids)
+                    OR external_product_id = ANY(:product_ids)
+                    OR attached_product_key = ANY(:product_ids)
+                    OR attached_variant_id = ANY(:product_ids)
+                  )
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :limit
                 """,
@@ -1642,12 +1849,23 @@ async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str,
                 or str(seed_data.get("price_currency") or seed_data.get("currency") or "").strip().upper()
                 or _extract_history_currency_from_product_payload(seed_data)
             )
-            put(data.get("id"), price, currency)
-            put(data.get("external_product_id"), price, currency)
+            for alias in (
+                data.get("id"),
+                data.get("external_product_id"),
+                data.get("attached_product_key"),
+                data.get("attached_variant_id"),
+                *_product_payload_ids(seed_data),
+            ):
+                alias_price = _extract_history_price_from_product_payload(seed_data, str(alias or "").strip()) or price
+                put(alias, alias_price, currency, "external_product_seeds")
     except Exception as exc:
-        logger.debug(f"Browse history external seed price lookup skipped: {exc}")
+        logger.warning("Browse history external seed price lookup skipped: %s", exc)
 
-    unresolved_ids = [pid for pid in product_ids if pid not in lookup]
+    unresolved_ids = sorted({
+        str(req["product_id"] or "").strip()
+        for req in requests
+        if str(req["key"] or "") not in lookup
+    })
     if unresolved_ids:
         try:
             cache_rows = await asyncio.wait_for(
@@ -1660,6 +1878,13 @@ async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str,
                         platform_product_id = ANY(:product_ids)
                         OR product_data::jsonb->>'id' = ANY(:product_ids)
                         OR product_data::jsonb->>'product_id' = ANY(:product_ids)
+                        OR product_data::jsonb->>'platform_product_id' = ANY(:product_ids)
+                        OR product_data::jsonb->>'external_product_id' = ANY(:product_ids)
+                        OR product_data::jsonb->>'product_group_id' = ANY(:product_ids)
+                        OR product_data::jsonb->>'sellable_item_group_id' = ANY(:product_ids)
+                        OR product_data::jsonb->>'product_line_id' = ANY(:product_ids)
+                        OR product_data::jsonb#>>'{canonical_product_ref,product_id}' = ANY(:product_ids)
+                        OR product_data::jsonb#>>'{canonical_payload_product_ref,product_id}' = ANY(:product_ids)
                         OR EXISTS (
                           SELECT 1
                           FROM jsonb_array_elements(
@@ -1669,12 +1894,34 @@ async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str,
                               ELSE '[]'::jsonb
                             END
                           ) AS variant
-                          WHERE COALESCE(
-                            variant->>'variant_id',
-                            variant->>'id',
-                            variant->>'sku',
-                            variant->>'sku_id'
-                          ) = ANY(:product_ids)
+                          WHERE variant->>'variant_id' = ANY(:product_ids)
+                             OR variant->>'id' = ANY(:product_ids)
+                             OR variant->>'sku' = ANY(:product_ids)
+                             OR variant->>'sku_id' = ANY(:product_ids)
+                             OR variant->>'platform_variant_id' = ANY(:product_ids)
+                             OR variant->>'external_variant_id' = ANY(:product_ids)
+                             OR variant->>'product_id' = ANY(:product_ids)
+                             OR variant->>'platform_product_id' = ANY(:product_ids)
+                             OR variant->>'external_product_id' = ANY(:product_ids)
+                        )
+                        OR EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(
+                            CASE
+                              WHEN jsonb_typeof(product_data::jsonb->'offers') = 'array'
+                              THEN product_data::jsonb->'offers'
+                              ELSE '[]'::jsonb
+                            END
+                          ) AS offer
+                          WHERE offer->>'offer_id' = ANY(:product_ids)
+                             OR offer->>'id' = ANY(:product_ids)
+                             OR offer->>'product_id' = ANY(:product_ids)
+                             OR offer->>'platform_product_id' = ANY(:product_ids)
+                             OR offer->>'external_product_id' = ANY(:product_ids)
+                             OR offer->>'variant_id' = ANY(:product_ids)
+                             OR offer->>'platform_variant_id' = ANY(:product_ids)
+                             OR offer->>'sku' = ANY(:product_ids)
+                             OR offer->>'sku_id' = ANY(:product_ids)
                         )
                       )
                     ORDER BY cached_at DESC, id DESC
@@ -1687,13 +1934,13 @@ async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str,
             for row in cache_rows or []:
                 data = dict(row)
                 product_data = _coerce_json_object(data.get("product_data"))
-                price = _extract_history_price_from_product_payload(product_data)
                 currency = _extract_history_currency_from_product_payload(product_data)
-                put(data.get("platform_product_id"), price, currency)
-                for pid in _product_payload_ids(product_data):
-                    put(pid, price, currency)
+                for alias in (data.get("platform_product_id"), *_product_payload_ids(product_data)):
+                    alias_text = str(alias or "").strip()
+                    price = _extract_history_price_from_product_payload(product_data, alias_text)
+                    put(alias_text, price, currency, "products_cache", data.get("merchant_id"))
         except Exception as exc:
-            logger.debug(f"Browse history products_cache price lookup skipped: {exc}")
+            logger.warning("Browse history products_cache price lookup skipped: %s", exc)
 
     return lookup
 
@@ -1712,6 +1959,14 @@ async def _persist_history_price_best_effort(row_id: Any, price: float, currency
         )
     except Exception:
         return
+
+
+def _history_price_source_counts(items: List[BrowseHistoryItem]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items:
+        source = str(item.price_source or item.price_resolution_status or "unknown").strip() or "unknown"
+        counts[source] = counts.get(source, 0) + 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -2452,14 +2707,46 @@ async def create_browse_history_event(
         )
         .limit(1)
     )
+    existing_price = _coerce_positive_history_price(dict(existing).get("price") if existing else None)
+    incoming_price = _coerce_positive_history_price(body.price)
+    resolved_price: Optional[HistoryPriceResolution] = None
+
+    if incoming_price is None:
+        if body.price is not None:
+            logger.warning(
+                "Browse history ignored non-positive price write user_id=%s product_id=%s merchant_id=%s price=%s",
+                principal.user_id,
+                product_id,
+                merchant_id,
+                body.price,
+            )
+        if existing_price is None:
+            price_lookup = await _resolve_history_price_lookup(
+                [
+                    {
+                        "product_id": product_id,
+                        "merchant_id": merchant_id,
+                        "price": body.price,
+                    }
+                ]
+            )
+            resolved_price = price_lookup.get(_history_item_key(product_id, merchant_id))
+
+    final_price = incoming_price or existing_price or (resolved_price.price if resolved_price else None)
+    final_currency = (
+        body.currency
+        or (dict(existing).get("currency") if existing else None)
+        or (resolved_price.currency if resolved_price else None)
+        or "USD"
+    )
 
     write_values: Dict[str, Any] = {
         "user_id": principal.user_id,
         "product_id": product_id,
         "merchant_id": merchant_id,
         "title": body.title,
-        "price": float(body.price) if body.price is not None else None,
-        "currency": body.currency or "USD",
+        "price": float(final_price) if final_price is not None else None,
+        "currency": final_currency,
         "image_url": body.image_url or "/placeholder.svg",
         "description": body.description,
         "brand": body.brand,
@@ -2551,30 +2838,66 @@ async def list_browse_history(
         if len(selected_rows) >= limit:
             break
 
-    price_lookup = await _resolve_history_price_lookup([
+    rows_missing_price = [
         row
         for row in selected_rows
         if _coerce_positive_history_price(row.get("price")) is None
-    ])
+    ]
+    price_lookup = await _resolve_history_price_lookup(rows_missing_price)
 
     items: List[BrowseHistoryItem] = []
     persist_tasks = []
+    unresolved_rows: List[Dict[str, Any]] = []
     for data in selected_rows:
         product_id = str(data.get("product_id") or "").strip()
-        if _coerce_positive_history_price(data.get("price")) is None and product_id in price_lookup:
-            price, currency = price_lookup[product_id]
-            data["price"] = price
-            if currency:
-                data["currency"] = currency
+        merchant_id = _normalize_history_merchant_id(data.get("merchant_id"))
+        stored_price = _coerce_positive_history_price(data.get("price"))
+        if stored_price is not None:
+            data["price"] = stored_price
+            data["price_source"] = "history_event"
+            data["price_resolution_status"] = "stored"
+            items.append(_history_row_to_item(data))
+            continue
+
+        resolved = price_lookup.get(_history_item_key(product_id, merchant_id))
+        if resolved:
+            data["price"] = resolved.price
+            if resolved.currency:
+                data["currency"] = resolved.currency
+            data["price_source"] = resolved.source
+            data["price_resolution_status"] = "resolved"
             persist_tasks.append(
-                _persist_history_price_best_effort(data.get("id"), price, currency)
+                _persist_history_price_best_effort(data.get("id"), resolved.price, resolved.currency)
             )
-        items.append(_history_row_to_item(data))
+            items.append(_history_row_to_item(data))
+            continue
+
+        data["price_resolution_status"] = "unresolved"
+        unresolved_rows.append(data)
 
     if persist_tasks:
         await asyncio.gather(*persist_tasks, return_exceptions=True)
 
-    return BrowseHistoryListResponse(items=items, total=len(items))
+    if unresolved_rows:
+        logger.warning(
+            "Browse history unresolved prices user_id=%s count=%s sample=%s",
+            principal.user_id,
+            len(unresolved_rows),
+            [
+                {
+                    "product_id": str(row.get("product_id") or "").strip(),
+                    "merchant_id": _normalize_history_merchant_id(row.get("merchant_id")),
+                }
+                for row in unresolved_rows[:10]
+            ],
+        )
+
+    return BrowseHistoryListResponse(
+        items=items,
+        total=len(items),
+        unresolved_total=len(unresolved_rows),
+        price_source_counts=_history_price_source_counts(items),
+    )
 
 
 @router.delete("/browse-history")
