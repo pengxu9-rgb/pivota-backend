@@ -1315,13 +1315,27 @@ def _generate_action_items(
 # TODO: when the baseline scheduler ships (deferred — Phase 3), wire these
 # figures from the latest scheduled run instead of hardcoding.
 PIVOTA_PDP_BASELINE_REFERENCE: Dict[str, Any] = {
-    "median_visibility": 67,
-    "median_attribution": 50,
-    "sample_size_pdps": 6,
+    # Live numbers from `scripts/agent_center_pivota_pdp_baseline.py`
+    # run on as_of_date. Refresh by re-running the script + updating
+    # this dict; the BD report exposes these figures as the
+    # "after-onboarding reference" anchor.
+    #
+    # Today (2026-05-06): Pivota canonical PDPs are in the indexing-up
+    # phase — 0/5 surface in Gemini grounding for named-product
+    # buyer-intent queries. Mechanics are shipped (canonical PDP +
+    # Schema.org + sitemap); Google indexing latency is the rate-
+    # limiting step. Expected to lift over the next 30-90 days as
+    # Search Console URL Inspection submissions mature.
+    "median_visibility": 0,
+    "median_attribution": 0,
+    "sample_size_pdps": 5,    # 1 PDP returned upstream 502 on this run
+    "cited_count": 0,         # PDPs cited in grounding at least once
+    "succeeded_count": 5,
     "as_of_date": "2026-05-06",
+    "indexing_phase": "indexing-up",  # vs "steady-state"
     # Single source of truth for which probe modes the baseline runs.
-    # Pulled from agent_center_pivota_pdp_baseline.py — keep in sync if
-    # the script's mode list ever changes.
+    # Pulled from agent_center_pivota_pdp_baseline.py — keep in sync
+    # if the script's mode list ever changes.
     "probe_modes_in_baseline": [
         "open_product_visibility_test",
         "merchant_store_attribution_test",
@@ -1330,13 +1344,18 @@ PIVOTA_PDP_BASELINE_REFERENCE: Dict[str, Any] = {
 
 
 # Reference to the internal Shopify test merchant used as the live
-# validation playground for the onboarding sequence. Each step in the
-# sequence cites a concrete artifact tied to this merchant — the report
-# is auditable, not abstract.
+# validation playground for the onboarding sequence's order-side steps
+# (Outcome B: order-home). The discovery-side reference (Outcome A:
+# discovery-lift) lives in `pivota-pdp-baseline.md`, produced by
+# scripts/agent_center_pivota_pdp_baseline.py — that's the canonical
+# AI-channel surface, NOT the test merchant's Shopify dev URL.
 TEST_MERCHANT_REFERENCE: Dict[str, str] = {
     "merchant_id": "merch_38fa56d5118b9974",
     "shop_domain": "shop.myshopify.com",
-    "audit_artifact_path": "reports/test-merchant-bd-audit.md",
+    # Discovery-side artifact: probes Pivota canonical sig_* PDPs,
+    # NOT the test merchant's Shopify URL (which is unindexed by
+    # design — Shopify dev domain has no public retrieval surface).
+    "discovery_baseline_path": "reports/pivota-pdp-baseline.md",
 }
 
 
@@ -1397,20 +1416,30 @@ def _build_what_pivota_changes(
             f"({retailer_phrase}) capture the rest of the grounded surface."
         ),
         "pivota_reference": (
-            f"For named-product buyer-intent queries (the same probe "
-            f"modes that score this merchant's attribution), Pivota's "
+            f"Honest disclosure: for named-product buyer-intent queries "
+            f"(the same probe modes that score this merchant's "
+            f"attribution), Pivota's "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['sample_size_pdps']} "
-            f"canonical seed PDPs surface in Gemini grounding with "
-            f"median visibility "
+            f"canonical seed PDPs currently sit at median visibility "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100 + "
             f"median attribution "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100 "
-            f"(internal baseline, "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']}). This is the "
-            f"named-product surface the merchant inherits on onboarding. "
-            f"See `{TEST_MERCHANT_REFERENCE['audit_artifact_path']}` for "
-            f"a paired audit on Pivota's internal test merchant — the "
-            f"live operational reference."
+            f"(internal baseline run "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']} — "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['cited_count']}/"
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['succeeded_count']} PDPs "
+            f"cited in Gemini grounding). The AI-channel mechanics "
+            f"(canonical PDP + Schema.org + sitemap + agentic-commerce) "
+            f"are shipped per the table below — but Pivota's PDPs are "
+            f"in the indexing-up phase: Google's grounded-retrieval "
+            f"index is a 30-90 day arc post-publication, and our "
+            f"canonical pages are working through Search Console URL "
+            f"Inspection. Today's Pivota baseline ≈ today's prospect "
+            f"baseline (both near-zero on named-product attribution); "
+            f"Pivota's value compounds over the indexing window plus "
+            f"the in-chat checkout surface that ships day-1. See "
+            f"`reports/pivota-pdp-baseline.md` for the live operational "
+            f"health check."
         ),
         "mechanics": [
             {
@@ -1435,21 +1464,34 @@ def _build_what_pivota_changes(
             },
         ],
         "prediction": (
-            "On onboarding, the merchant's SKUs inherit the four mechanics "
-            "above. Comparable lift is expected based on the 6-PDP baseline; "
-            "individual SKU performance varies with category competition + "
-            "Google indexing latency."
+            "Indexing is the rate-limiting step. On onboarding, the "
+            "merchant's SKUs inherit the four mechanics above + are "
+            "submitted to Search Console URL Inspection on a rolling "
+            "cadence; first grounded citations typically appear 30-90 "
+            "days post-submission. Pivota's PDPs are themselves on the "
+            "same indexing curve today (see `pivota_reference` above) — "
+            "we are co-investing with onboarded merchants on that arc, "
+            "not selling a finished AI-channel surface. Day-1 value "
+            "lives in the in-chat checkout surface (the Checkout Loop "
+            "section below), which is shipped + verified end-to-end on "
+            "the test merchant."
         ),
         "methodology_note": (
-            "Comparative reference, not paired A/B. The 67/50 figures "
-            "come from the named-product probes — `"
+            "Comparative reference, not paired A/B. The "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/"
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']} "
+            "figures come from the named-product probes — `"
             + "` + `".join(PIVOTA_PDP_BASELINE_REFERENCE["probe_modes_in_baseline"])
             + "`. They are directly comparable to the merchant's "
             "attribution_score in this report, NOT to "
             "category_visibility_score (category-level Pivota PDP "
             "coverage is a separate ops track and not in the baseline "
-            "yet). Refresh via "
-            "scripts/agent_center_pivota_pdp_baseline.py."
+            "yet). Pivota PDPs are currently in the "
+            f"`{PIVOTA_PDP_BASELINE_REFERENCE['indexing_phase']}` "
+            "phase — Google indexing of canonical pages takes 30-90 "
+            "days post-publication; the baseline is expected to lift "
+            "as Search Console URL Inspection submissions mature. "
+            "Refresh via scripts/agent_center_pivota_pdp_baseline.py."
         ),
     }
 
@@ -1524,7 +1566,15 @@ def _build_what_pivota_changes(
             "don't yet have a one-click agent runner; operations runs "
             "them on the merchant's behalf during onboarding."
         ),
-        "test_merchant": dict(TEST_MERCHANT_REFERENCE),
+        "test_merchant": {
+            "merchant_id": TEST_MERCHANT_REFERENCE["merchant_id"],
+            "shop_domain": TEST_MERCHANT_REFERENCE["shop_domain"],
+            # Discovery side (Outcome A) anchored to canonical Pivota
+            # PDPs; order side (Outcome B) anchored to test merchant
+            # e2e tests. The test merchant proves order-home, not
+            # discovery-lift.
+            "discovery_baseline_path": TEST_MERCHANT_REFERENCE["discovery_baseline_path"],
+        },
         "steps": [
             {
                 "step": 1,
@@ -1539,11 +1589,13 @@ def _build_what_pivota_changes(
                 ),
                 "addresses": "Establishes the pre-onboarding baseline.",
                 "test_merchant_validation": (
-                    "Same engine is run against the test merchant's "
-                    "catalog monthly; latest output at `"
-                    f"{TEST_MERCHANT_REFERENCE['audit_artifact_path']}` "
+                    "Same engine runs the Pivota PDP self-baseline "
+                    "(canonical sig_* URLs) monthly; latest output at "
+                    f"`{TEST_MERCHANT_REFERENCE['discovery_baseline_path']}` "
                     "(produced by "
-                    "`scripts/agent_center_bd_test_merchant_audit.py`)."
+                    "`scripts/agent_center_pivota_pdp_baseline.py`). "
+                    "Discovery side: the AI-channel surface Pivota "
+                    "publishes for merchant SKUs."
                 ),
             },
             {

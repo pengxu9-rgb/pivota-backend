@@ -1651,9 +1651,15 @@ def test_render_markdown_includes_discovery_lift_and_checkout_loop() -> None:
     assert "Mechanics that produce that surface" in md
     assert "Schema.org" in md
     assert "sitemap" in md.lower()
-    # Pivota baseline reference inline.
-    assert "67/100" in md  # median_visibility
-    assert "50/100" in md  # median_attribution
+    # Pivota baseline reference inline — assert against the LIVE
+    # constants, not hardcoded values. The 0/0 today reflects the
+    # indexing-up phase; will lift as the baseline is refreshed.
+    from services.agent_center_bd_report_service import PIVOTA_PDP_BASELINE_REFERENCE
+    assert f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100" in md
+    assert f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100" in md
+    # Indexing-up framing must be present so BD doesn't over-promise.
+    assert "indexing-up" in md.lower() or "indexing-up" in md
+    assert "30-90 day" in md
     # Checkout-loop sub-section with 6-step chain table.
     assert "How in-chat checkout closes the loop" in md
     assert "Shopify admin" in md
@@ -1795,11 +1801,34 @@ def test_discovery_lift_pivota_reference_specifies_named_product_probe_modes() -
     assert "buyer-intent" in pr.lower()
 
 
-def test_discovery_lift_pivota_reference_points_to_test_merchant_artifact() -> None:
-    """The pivota_reference cites the test-merchant audit artifact path
-    so BD can hand the merchant a paired-audit example."""
+def test_discovery_lift_pivota_reference_points_to_pdp_baseline_artifact() -> None:
+    """The pivota_reference cites the canonical pivota-pdp-baseline.md
+    artifact (NOT the misframed test-merchant audit) — that's the
+    discovery-side reference. The test merchant proves order-home
+    (Outcome B), not discovery-lift (Outcome A)."""
     pr = _wpc(_basic_report())["discovery_lift"]["pivota_reference"]
-    assert "test-merchant-bd-audit.md" in pr
+    assert "pivota-pdp-baseline.md" in pr
+
+
+def test_discovery_lift_pivota_reference_discloses_indexing_up_phase() -> None:
+    """The pivota_reference must honestly disclose the indexing-up
+    phase + the 30-90 day arc so BD doesn't over-promise a finished
+    AI-channel surface."""
+    pr = _wpc(_basic_report())["discovery_lift"]["pivota_reference"]
+    assert "indexing-up" in pr.lower()
+    assert "30-90 day" in pr
+    # Honest opening: don't bury the baseline state.
+    assert pr.lower().startswith("honest disclosure")
+
+
+def test_pivota_pdp_baseline_reference_uses_live_zero_baseline_today() -> None:
+    """As of 2026-05-06, the live baseline has 0/0 medians (indexing-up
+    phase). Constants must reflect reality, not a hopeful 67/50."""
+    from services.agent_center_bd_report_service import PIVOTA_PDP_BASELINE_REFERENCE
+    assert PIVOTA_PDP_BASELINE_REFERENCE["median_visibility"] == 0
+    assert PIVOTA_PDP_BASELINE_REFERENCE["median_attribution"] == 0
+    assert PIVOTA_PDP_BASELINE_REFERENCE["cited_count"] == 0
+    assert PIVOTA_PDP_BASELINE_REFERENCE["indexing_phase"] == "indexing-up"
 
 
 def test_methodology_note_names_specific_probe_modes_used_in_baseline() -> None:
