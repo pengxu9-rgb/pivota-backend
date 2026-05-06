@@ -35,7 +35,7 @@ from services import agent_center_service as ac
 logger = logging.getLogger(__name__)
 
 
-SUPPORTED_LIVE_PLATFORMS: tuple = ("shopify",)
+SUPPORTED_LIVE_PLATFORMS: tuple = ("shopify", "wix", "woocommerce", "bigcommerce")
 
 # Anything below this is considered "same price" — guards against float
 # noise in upstream platforms that store prices as strings then parse them.
@@ -52,18 +52,70 @@ class LiveAdapterUnsupportedError(Exception):
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_live_credentials(*, merchant_id: str, platform: str) -> Dict[str, str]:
+async def _resolve_live_credentials(*, merchant_id: str, platform: str) -> Dict[str, Any]:
     """Resolve the merchant's connected-store credentials for a given
-    platform. Currently delegates to the platform-specific helpers.
-    Adding a new platform = adding a branch here."""
+    platform. Shopify reuses the existing OAuth-aware helper (handles
+    token refresh); other platforms read from `merchant_stores` and
+    parse the JSON credentials blob stored in `api_key`.
+
+    Adding a new platform = adding a branch here. The returned dict is
+    passed through to `adapters.product_adapters.fetch_merchant_products`
+    which knows the per-platform field names."""
     if platform == "shopify":
-        # Reuse the existing helper; it raises ShopifyProductsSyncConfigError
-        # on disconnected stores.
         from services.shopify_products_sync import _get_shopify_store_credentials
         return await _get_shopify_store_credentials(merchant_id)
+    if platform in {"wix", "woocommerce", "bigcommerce"}:
+        return await _resolve_generic_store_credentials(
+            merchant_id=merchant_id, platform=platform,
+        )
     raise LiveAdapterUnsupportedError(
-        f"live SKU match is V1.5 Shopify-only; {platform!r} support lands in a follow-up"
+        f"live SKU match does not yet support platform {platform!r}; "
+        f"supported: {list(SUPPORTED_LIVE_PLATFORMS)}"
     )
+
+
+async def _resolve_generic_store_credentials(
+    *, merchant_id: str, platform: str,
+) -> Dict[str, Any]:
+    """Read a connected merchant_stores row and unpack its api_key JSON
+    blob. Returns the credentials dict the adapter dispatcher expects.
+
+    Different platforms store different fields inside the blob:
+      wix          → {"site_id": "...", "api_key": "..."}
+      woocommerce  → {"store_url": "...", "consumer_key": "...", "consumer_secret": "..."}
+      bigcommerce  → {"store_hash": "...", "access_token": "...", "client_id": "..."}
+
+    We pass everything through; missing fields surface as 4xx upstream
+    when the platform's API rejects the request."""
+    from services.merchant_store_service import parse_api_credentials
+
+    row = await database.fetch_one(
+        """
+        SELECT store_id, domain, api_key, status
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND platform = :platform
+          AND status IN ('active', 'connected')
+        ORDER BY connected_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        {"merchant_id": merchant_id, "platform": platform},
+    )
+    if not row:
+        raise ValueError(
+            f"no connected {platform!r} store for merchant {merchant_id!r}"
+        )
+    data = dict(row)
+    blob = parse_api_credentials(data.get("api_key") or "")
+    creds: Dict[str, Any] = dict(blob) if blob else {}
+    # Backfill domain → store_url for woocommerce convenience (the merchants-
+    # portal sometimes records it on the merchant_stores.domain column instead
+    # of the JSON blob).
+    if platform == "woocommerce" and not creds.get("store_url") and data.get("domain"):
+        creds["store_url"] = data["domain"]
+    if platform == "wix" and not creds.get("site_id") and data.get("store_id"):
+        creds["site_id"] = data["store_id"]
+    return creds
 
 
 async def _fetch_live_products(

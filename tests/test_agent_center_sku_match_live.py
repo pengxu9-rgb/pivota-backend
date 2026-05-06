@@ -336,3 +336,106 @@ async def test_run_sku_match_internal_path_unaffected_when_no_mode_set(
     assert final["status"] == "succeeded"
     # Live-mode marker should not appear.
     assert final["payload"].get("run", {}).get("mode") != "live"
+
+
+# ---------------------------------------------------------------------------
+# Multi-platform credential resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["wix", "woocommerce", "bigcommerce"])
+async def test_supported_platforms_include_non_shopify(platform: str) -> None:
+    """Sanity: SUPPORTED_LIVE_PLATFORMS expanded beyond Shopify in PR 9."""
+    from services.agent_center_sku_match_live_service import SUPPORTED_LIVE_PLATFORMS
+    assert platform in SUPPORTED_LIVE_PLATFORMS
+
+
+@pytest.mark.asyncio
+async def test_resolve_generic_credentials_parses_wix_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wix store records are stored with site_id+api_key inside the api_key
+    JSON blob — the resolver must unpack them so the adapter dispatcher
+    sees `credentials.site_id` and `credentials.api_key`."""
+    from services import agent_center_sku_match_live_service as live
+
+    async def _fake_fetch_one(query: str, params: Dict[str, Any]):
+        assert params["platform"] == "wix"
+        return {
+            "store_id": "site_zzz",
+            "domain": "example.wixsite.com",
+            "api_key": '{"site_id":"site_xxx","api_key":"wix_token_yyy"}',
+            "status": "active",
+        }
+    monkeypatch.setattr(live.database, "fetch_one", _fake_fetch_one)
+
+    creds = await live._resolve_generic_store_credentials(
+        merchant_id="m1", platform="wix",
+    )
+    assert creds["site_id"] == "site_xxx"
+    assert creds["api_key"] == "wix_token_yyy"
+
+
+@pytest.mark.asyncio
+async def test_resolve_generic_credentials_woocommerce_backfills_store_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WooCommerce records sometimes leave store_url out of the JSON blob
+    (it lives on the merchant_stores.domain column instead). Resolver
+    backfills from `domain` so the adapter has everything it needs."""
+    from services import agent_center_sku_match_live_service as live
+
+    async def _fake_fetch_one(query: str, params: Dict[str, Any]):
+        return {
+            "store_id": "woo_1",
+            "domain": "https://example-shop.com",
+            "api_key": '{"consumer_key":"ck_xxx","consumer_secret":"cs_yyy"}',
+            "status": "active",
+        }
+    monkeypatch.setattr(live.database, "fetch_one", _fake_fetch_one)
+
+    creds = await live._resolve_generic_store_credentials(
+        merchant_id="m1", platform="woocommerce",
+    )
+    assert creds["consumer_key"] == "ck_xxx"
+    assert creds["consumer_secret"] == "cs_yyy"
+    assert creds["store_url"] == "https://example-shop.com"
+
+
+@pytest.mark.asyncio
+async def test_resolve_generic_credentials_raises_when_no_store_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import agent_center_sku_match_live_service as live
+
+    async def _fake_fetch_one(query: str, params: Dict[str, Any]):
+        return None
+    monkeypatch.setattr(live.database, "fetch_one", _fake_fetch_one)
+
+    with pytest.raises(ValueError, match="no connected"):
+        await live._resolve_generic_store_credentials(
+            merchant_id="m1", platform="wix",
+        )
+
+
+@pytest.mark.asyncio
+async def test_unsupported_platform_amazon_still_fails_cleanly(
+    fake_db: FakeDB,
+) -> None:
+    """Amazon and Temu are still out of scope until adapters land. Make
+    sure the contract from PR 7 (clean failed scan_target with descriptive
+    payload.error) still holds after expanding SUPPORTED_LIVE_PLATFORMS."""
+    from services import agent_center_service as ac
+    from services import agent_center_sku_match_live_service as live
+
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1", scan_mode="sku_match",
+        payload={"options": {"mode": "live", "platform": "amazon"}},
+    )
+    with pytest.raises(live.LiveAdapterUnsupportedError):
+        await live.run_sku_match_live(target["id"])
+    err = fake_db._tables["agent_center_scan_targets"][0]["payload"]["error"]
+    assert err["kind"] == "unsupported_platform"
+    assert "shopify" in err["supported"]
+    assert "wix" in err["supported"]
