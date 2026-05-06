@@ -1,0 +1,263 @@
+"""Batch driver — walks active unattached external_product_seeds and
+populates `attached_product_key` via the deterministic matchers.
+
+The runner narrows the candidate PDP set per seed (don't load the entire
+catalog into memory) by querying:
+  1. catalog_products WHERE source_product_id = seed.external_product_id
+  2. catalog_products WHERE canonical_url = seed.canonical_url (normalized)
+  3. catalog_products WHERE pg_trgm similarity(title) >= 0.7
+     (post-filtered to >= TITLE_SIMILARITY_THRESHOLD inside the matcher)
+
+Idempotent — only touches rows where attached_product_key IS NULL.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from db.database import database  # noqa: E402
+from services.pdp_matcher.deterministic import (  # noqa: E402
+    matches_for_seed,
+    normalize_canonical_url,
+)
+
+logger = logging.getLogger("pdp_matcher_runner")
+
+
+async def _fetch_unattached_seed_batch(*, batch_size: int) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT id, external_product_id, title, canonical_url, destination_url,
+               domain, seed_data, market, tool
+        FROM external_product_seeds
+        WHERE status = 'active'
+          AND attached_product_key IS NULL
+        ORDER BY updated_at DESC, id ASC
+        LIMIT :limit
+        """,
+        {"limit": batch_size},
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def _candidates_by_source_product_id(value: str) -> List[Dict[str, Any]]:
+    if not value:
+        return []
+    rows = await database.fetch_all(
+        """
+        SELECT product_key, source_product_id, canonical_url, title, brand,
+               merchant_id
+        FROM catalog_products
+        WHERE source_product_id = :value
+          AND truth_tier = 'primary'
+        LIMIT 25
+        """,
+        {"value": value},
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def _candidates_by_canonical_url(value: str) -> List[Dict[str, Any]]:
+    if not value:
+        return []
+    rows = await database.fetch_all(
+        """
+        SELECT product_key, source_product_id, canonical_url, title, brand,
+               merchant_id
+        FROM catalog_products
+        WHERE canonical_url IS NOT NULL
+          AND LOWER(canonical_url) LIKE :url_lower
+          AND truth_tier = 'primary'
+        LIMIT 25
+        """,
+        {"url_lower": f"%{value.lower()}%"},
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def _candidates_by_title_trigram(*, title: str, brand: Optional[str]) -> List[Dict[str, Any]]:
+    """Use pg_trgm similarity for the catalog_products.title side. The
+    threshold here (0.7) is a wider net than the matcher's 0.85 — the
+    final cut happens in pure Python using the same Jaccard formulation,
+    keeping behavior consistent across the SQL prefilter and the matcher
+    threshold knob."""
+    if not title:
+        return []
+    params: Dict[str, Any] = {"title": title}
+    brand_clause = ""
+    if brand:
+        brand_clause = "AND LOWER(brand) = :brand"
+        params["brand"] = brand.lower()
+    rows = await database.fetch_all(
+        f"""
+        SELECT product_key, source_product_id, canonical_url, title, brand,
+               merchant_id
+        FROM catalog_products
+        WHERE truth_tier = 'primary'
+          AND title IS NOT NULL
+          AND similarity(LOWER(title), LOWER(:title)) >= 0.7
+          {brand_clause}
+        ORDER BY similarity(LOWER(title), LOWER(:title)) DESC
+        LIMIT 25
+        """,
+        params,
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def _candidates_for_seed(seed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Union the three candidate sets (deduped by product_key) to give
+    the matcher a tractable input list."""
+    by_key: Dict[str, Dict[str, Any]] = {}
+
+    spid = seed.get("external_product_id")
+    if spid:
+        for row in await _candidates_by_source_product_id(str(spid)):
+            by_key.setdefault(row["product_key"], row)
+
+    canonical = (
+        normalize_canonical_url(seed.get("canonical_url"))
+        or normalize_canonical_url(seed.get("destination_url"))
+    )
+    if canonical:
+        # Use the path-only suffix for the LIKE prefilter to catch URL drift
+        # (different scheme / www subdomain). The matcher itself does the
+        # exact equality check.
+        try:
+            from urllib.parse import urlparse
+
+            path_only = urlparse(canonical).path or canonical
+        except Exception:
+            path_only = canonical
+        if path_only:
+            for row in await _candidates_by_canonical_url(path_only):
+                by_key.setdefault(row["product_key"], row)
+
+    title = seed.get("title")
+    if title:
+        # Try trigram with brand hint first, then without (looser).
+        seed_data = seed.get("seed_data") or {}
+        brand_hint = None
+        if isinstance(seed_data, dict):
+            brand_hint = seed_data.get("brand") or seed_data.get("brand_name")
+        for row in await _candidates_by_title_trigram(
+            title=str(title), brand=str(brand_hint) if brand_hint else None
+        ):
+            by_key.setdefault(row["product_key"], row)
+    return list(by_key.values())
+
+
+async def _apply_attachment(
+    *,
+    seed_id: str,
+    product_key: str,
+    matcher: str,
+    confidence: float,
+    evidence: str,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        return
+    await database.execute(
+        """
+        UPDATE external_product_seeds
+        SET attached_product_key = :pk,
+            updated_at = NOW(),
+            seed_data = COALESCE(seed_data, '{}'::jsonb) || jsonb_build_object(
+                'pdp_matcher', jsonb_build_object(
+                    'matcher', :matcher,
+                    'confidence', :confidence,
+                    'evidence', :evidence,
+                    'attached_at', NOW()::text
+                )
+            )
+        WHERE id = :seed_id AND attached_product_key IS NULL
+        """,
+        {
+            "pk": product_key,
+            "matcher": matcher,
+            "confidence": confidence,
+            "evidence": evidence,
+            "seed_id": seed_id,
+        },
+    )
+
+
+async def _run(args: argparse.Namespace) -> int:
+    if not getattr(database, "is_connected", False):
+        await database.connect()
+
+    total = 0
+    matched = 0
+    matcher_counts: Dict[str, int] = {}
+    deferred = 0
+
+    while True:
+        seeds = await _fetch_unattached_seed_batch(batch_size=args.batch_size)
+        if not seeds:
+            break
+        for seed in seeds:
+            total += 1
+            if args.limit and total > args.limit:
+                deferred += 1
+                continue
+            candidates = await _candidates_for_seed(seed)
+            result = matches_for_seed(seed=seed, candidates=candidates)
+            if result is None:
+                deferred += 1
+                continue
+            await _apply_attachment(
+                seed_id=seed["id"],
+                product_key=result["product_key"],
+                matcher=result["matcher"],
+                confidence=float(result["confidence"]),
+                evidence=str(result.get("evidence") or ""),
+                dry_run=args.dry_run,
+            )
+            matched += 1
+            matcher_counts[result["matcher"]] = matcher_counts.get(result["matcher"], 0) + 1
+            if matched % 100 == 0:
+                logger.info(
+                    "matched=%d deferred=%d total=%d (per_matcher=%s)",
+                    matched,
+                    deferred,
+                    total,
+                    matcher_counts,
+                )
+        if args.dry_run:
+            # Dry run can't make progress past the first batch — same rows
+            # would be re-fetched. Stop after one batch.
+            break
+        if args.limit and total >= args.limit:
+            break
+
+    logger.info(
+        "Phase-3A backfill complete: matched=%d deferred=%d total=%d per_matcher=%s dry_run=%s",
+        matched,
+        deferred,
+        total,
+        matcher_counts,
+        args.dry_run,
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--batch-size", type=int, default=500, help="rows per batch")
+    parser.add_argument("--limit", type=int, default=0, help="cap total rows; 0 = no cap")
+    parser.add_argument("--dry-run", action="store_true", help="don't UPDATE; just report")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
