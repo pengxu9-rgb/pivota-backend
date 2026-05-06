@@ -1553,25 +1553,40 @@ def test_discovery_lift_includes_mechanics_and_pivota_baseline_reference() -> No
         provider="gemini",
     )
     dl = report["what_pivota_changes"]["discovery_lift"]
-    # Pivota PDP baseline figures cited verbatim.
-    pr = dl["pivota_reference"]
-    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_visibility"]) in pr
-    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_attribution"]) in pr
-    assert str(PIVOTA_PDP_BASELINE_REFERENCE["sample_size_pdps"]) in pr
-    # Four mechanics, all shipped — these are the technical reasons
-    # the merchant should believe the predicted lift.
-    mechanics = dl["mechanics"]
-    assert len(mechanics) == 4
-    labels = [m.get("label", "").lower() for m in mechanics]
-    assert any("canonical" in l and "pdp" in l for l in labels)
-    assert any("schema.org" in l for l in labels)
-    assert any("sitemap" in l for l in labels)
-    assert any("categori" in l for l in labels)
-    assert all(m.get("shipped") is True for m in mechanics)
-    assert all(m.get("evidence") for m in mechanics)
-    # Methodology disclosed honestly — not paired A/B.
+    # Phase 2i: discovery_lift now expresses three layers (grounded LLM /
+    # agent-direct API / editorial co-citation). Layer 1 carries the
+    # SEO-flavored mechanics; Layer 2 carries the agent-direct API
+    # mechanics; Layer 3 has none (outside Pivota's lever).
+    layers = dl["layers"]
+    assert len(layers) == 3
+    layer_names = [l["name"].lower() for l in layers]
+    assert any("layer 1" in n and "grounded" in n for n in layer_names)
+    assert any("layer 2" in n and "agent-direct" in n for n in layer_names)
+    assert any("layer 3" in n and ("editorial" in n or "co-citation" in n) for n in layer_names)
+    # Pivota PDP baseline figures cited inside Layer 1's pivota_status.
+    layer1 = next(l for l in layers if "layer 1" in l["name"].lower())
+    status1 = layer1["pivota_status"]
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["cited_count"]) in status1
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["succeeded_count"]) in status1
+    # Layer 1 carries the four canonical-PDP / SEO-style mechanics.
+    layer1_mechs = layer1["mechanics"]
+    assert len(layer1_mechs) == 4
+    labels1 = [m.get("label", "").lower() for m in layer1_mechs]
+    assert any("canonical" in l and "pdp" in l for l in labels1)
+    assert any("schema.org" in l for l in labels1)
+    assert any("sitemap" in l for l in labels1)
+    # Layer 2 carries agent-direct API mechanics.
+    layer2 = next(l for l in layers if "layer 2" in l["name"].lower())
+    layer2_mechs = layer2["mechanics"]
+    assert len(layer2_mechs) >= 3
+    labels2 = [m.get("label", "").lower() for m in layer2_mechs]
+    assert any("acp" in l and "/orders/create" in l for l in labels2)
+    assert any("ucp" in l for l in labels2)
+    assert any("agent_shop_gateway" in l or "agent/shop/v1" in l for l in labels2)
+    assert all(m.get("shipped") is True for m in layer2_mechs)
+    # Methodology disclosed.
     assert dl.get("methodology_note")
-    assert "comparative" in dl["methodology_note"].lower()
+    assert "layer 1" in dl["methodology_note"].lower()
 
 
 def test_checkout_loop_chain_has_six_steps_each_with_evidence() -> None:
@@ -1646,19 +1661,20 @@ def test_render_markdown_includes_discovery_lift_and_checkout_loop() -> None:
     # Top-level section + today.
     assert "## What Pivota changes after onboarding" in md
     assert "**Today:**" in md
-    # Discovery-lift sub-section with mechanics table.
-    assert "Why your AI-channel visibility will improve" in md
-    assert "Mechanics that produce that surface" in md
+    # Multi-layer discovery framing (Phase 2i).
+    assert "Why your AI-channel discoverability will improve" in md
+    assert "Layer 1" in md and "Grounded LLM citation" in md
+    assert "Layer 2" in md and "Agent-direct API queries" in md
+    assert "Layer 3" in md
+    # Layer 1 mechanics (SEO).
     assert "Schema.org" in md
     assert "sitemap" in md.lower()
-    # Pivota baseline reference inline — assert against the LIVE
-    # constants, not hardcoded values. The 0/0 today reflects the
-    # indexing-up phase; will lift as the baseline is refreshed.
-    from services.agent_center_bd_report_service import PIVOTA_PDP_BASELINE_REFERENCE
-    assert f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100" in md
-    assert f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100" in md
-    # Indexing-up framing must be present so BD doesn't over-promise.
-    assert "indexing-up" in md.lower() or "indexing-up" in md
+    # Layer 2 mechanics (agent-direct API surfaces).
+    assert "/orders/create" in md
+    assert "ucp" in md.lower()
+    assert "agent_shop_gateway" in md or "agent/shop/v1" in md
+    # Indexing-up framing for Layer 1 — must be honest, not buried.
+    assert "indexing-up" in md.lower()
     assert "30-90 day" in md
     # Checkout-loop sub-section with 6-step chain table.
     assert "How in-chat checkout closes the loop" in md
@@ -1792,33 +1808,61 @@ def _basic_report() -> Dict[str, Any]:
     )
 
 
-def test_discovery_lift_pivota_reference_specifies_named_product_probe_modes() -> None:
-    """The pivota_reference paragraph must lead with 'named-product
-    buyer-intent queries' so the merchant cannot misread the 67/50
-    figures as a category-level promise."""
-    pr = _wpc(_basic_report())["discovery_lift"]["pivota_reference"]
-    assert "named-product" in pr.lower()
-    assert "buyer-intent" in pr.lower()
+def test_discovery_lift_layer1_pivota_status_points_to_pdp_baseline_artifact() -> None:
+    """Layer 1's pivota_status cites the canonical pivota-pdp-baseline.md
+    artifact (the live operational health check)."""
+    layers = _wpc(_basic_report())["discovery_lift"]["layers"]
+    layer1 = next(l for l in layers if "layer 1" in l["name"].lower())
+    # The methodology_note carries the artifact reference for Layer 1.
+    note = _wpc(_basic_report())["discovery_lift"]["methodology_note"]
+    status1 = layer1["pivota_status"]
+    assert "pivota-pdp-baseline.md" in status1 or "pivota-pdp-baseline.md" in note
 
 
-def test_discovery_lift_pivota_reference_points_to_pdp_baseline_artifact() -> None:
-    """The pivota_reference cites the canonical pivota-pdp-baseline.md
-    artifact (NOT the misframed test-merchant audit) — that's the
-    discovery-side reference. The test merchant proves order-home
-    (Outcome B), not discovery-lift (Outcome A)."""
-    pr = _wpc(_basic_report())["discovery_lift"]["pivota_reference"]
-    assert "pivota-pdp-baseline.md" in pr
+def test_discovery_lift_layer1_discloses_indexing_up_phase() -> None:
+    """Layer 1's pivota_status honestly discloses the indexing-up phase
+    + the 30-90 day arc."""
+    layers = _wpc(_basic_report())["discovery_lift"]["layers"]
+    layer1 = next(l for l in layers if "layer 1" in l["name"].lower())
+    status1 = layer1["pivota_status"]
+    assert "indexing-up" in status1.lower()
+    assert "30-90 day" in status1
 
 
-def test_discovery_lift_pivota_reference_discloses_indexing_up_phase() -> None:
-    """The pivota_reference must honestly disclose the indexing-up
-    phase + the 30-90 day arc so BD doesn't over-promise a finished
-    AI-channel surface."""
-    pr = _wpc(_basic_report())["discovery_lift"]["pivota_reference"]
-    assert "indexing-up" in pr.lower()
-    assert "30-90 day" in pr
-    # Honest opening: don't bury the baseline state.
-    assert pr.lower().startswith("honest disclosure")
+def test_discovery_lift_layer2_is_shipped_today_independent_of_indexing() -> None:
+    """Layer 2 (agent-direct API) is the day-1 value: shipped today,
+    independent of Google indexing arc. This is the core BD pitch
+    differentiator — apps + personal agents can recommend onboarded
+    merchants from day-1, not day-90."""
+    layers = _wpc(_basic_report())["discovery_lift"]["layers"]
+    layer2 = next(l for l in layers if "layer 2" in l["name"].lower())
+    status2 = layer2["pivota_status"]
+    # Must explicitly say shipped + independent of Google indexing.
+    assert "shipped" in status2.lower()
+    assert (
+        "day-1" in status2.lower()
+        or "independent of" in status2.lower()
+    )
+
+
+def test_discovery_lift_layer2_describes_apps_as_agents_and_personal_agents() -> None:
+    """Layer 2's narrative names the agent ecosystem categories explicitly
+    — apps-as-agents, personal agents — so BD can pitch the compounding
+    play."""
+    layers = _wpc(_basic_report())["discovery_lift"]["layers"]
+    layer2 = next(l for l in layers if "layer 2" in l["name"].lower())
+    blob = (layer2.get("subtitle", "") + " " + layer2.get("what_it_is", "")).lower()
+    assert "apps" in blob and "agent" in blob
+    assert "personal agent" in blob or "chatgpt" in blob or "claude" in blob
+
+
+def test_discovery_lift_prediction_leads_with_layer2_day1_value() -> None:
+    """Prediction must position Layer 2 as the day-1 value; Layer 1's
+    indexing arc is a co-investment, not the headline."""
+    pred = _wpc(_basic_report())["discovery_lift"]["prediction"]
+    assert "layer 2" in pred.lower()
+    assert "day-1" in pred.lower()
+    assert "compound" in pred.lower() or "ecosystem" in pred.lower()
 
 
 def test_pivota_pdp_baseline_reference_uses_live_zero_baseline_today() -> None:
