@@ -309,6 +309,37 @@ async def try_acquire_run_lock(*, scan_target_id: str) -> Optional[Dict[str, Any
     return _row_to_dict_with_payload(row) if row else None
 
 
+async def heartbeat_scan_target(*, scan_target_id: str) -> bool:
+    """Bump `updated_at` on a `running` scan_target — proves the runner is
+    still alive without changing status. Returns True if the heartbeat
+    landed (row was running and not soft-deleted), False otherwise (e.g.,
+    an admin force-reset already moved it to `failed`).
+
+    Why a no-op heartbeat helper instead of just calling
+    `transition_scan_target(status='running', ...)` again: the conditional
+    `WHERE status = 'running'` predicate makes this safe under concurrent
+    state changes — if another process force-reset the row to `failed`,
+    the heartbeat silently no-ops instead of resurrecting it.
+
+    Pair with `list_stuck_running_targets` (admin route #273): once
+    heartbeats are wired into the runners, ops can lower the stale
+    threshold without risk of stealing the lock from a long-running but
+    healthy run.
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE agent_center_scan_targets
+           SET updated_at = NOW()
+         WHERE id = :scan_target_id
+           AND deleted_at IS NULL
+           AND status = 'running'
+        RETURNING id
+        """,
+        {"scan_target_id": scan_target_id},
+    )
+    return row is not None
+
+
 async def transition_scan_target(
     *,
     scan_target_id: str,

@@ -115,7 +115,9 @@ async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
         started_at=ac.utcnow(),
     )
 
-    # 2. Call the LLM probe.
+    # 2. Call the LLM probe. Heartbeat right before so a slow Gemini call
+    #    (real probes can take 30-60s) doesn't make the row look stuck.
+    await ac.heartbeat_scan_target(scan_target_id=scan_target_id)
     try:
         result = await llm_client.probe(
             scan_mode=scan_mode,
