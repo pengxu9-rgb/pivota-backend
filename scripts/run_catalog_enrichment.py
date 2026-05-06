@@ -221,6 +221,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    :canonical_url, :domain, :attached_product_key, :status,
                    CAST(:seed_data AS jsonb))
                 ON CONFLICT (id) DO UPDATE SET
+                  external_product_id = EXCLUDED.external_product_id,
                   attached_product_key = EXCLUDED.attached_product_key,
                   destination_url = EXCLUDED.destination_url,
                   canonical_url = EXCLUDED.canonical_url,
