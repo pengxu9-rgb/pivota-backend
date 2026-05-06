@@ -496,14 +496,23 @@ def verdict_for(
             peer_prefix + (
                 "AI shopping agents recognize this brand in category-level "
                 "queries — but the funnel mostly routes consumers through "
-                "third-party retailers (Sephora, Vogue Scandinavia, beauty "
-                "marketplaces, skin-database sites) rather than the merchant's "
-                "own URL. The brand is findable in the AI channel; the merchant "
-                "just isn't capturing the funnel consistently. Every retailer-"
-                "cited query is a margin hit (reseller markup) and a lost "
-                "first-party customer relationship. This is the highest-"
-                "leverage onboarding case: the demand exists and is already "
-                "AI-discoverable; the attribution path needs reinforcing."
+                "third-party retailers (Sephora, Vogue Scandinavia, Ulta, "
+                "Target, beauty marketplaces) rather than the merchant's own "
+                "URL. The brand is findable in the AI channel; the merchant "
+                "just isn't capturing the funnel consistently. Pivota's value "
+                "here is two-part and complementary to existing retail "
+                "distribution: (1) a canonical AI-channel PDP that captures "
+                "direct first-party attribution as AI shopping grows from "
+                "~12% to a projected 25-30% of D2C beauty traffic over the "
+                "next 24 months — every retailer-cited query today is a "
+                "deferred margin and a customer relationship the merchant "
+                "doesn't own; (2) an in-chat transaction surface (Pivota's "
+                "agentic-commerce protocol) so consumers asking Gemini / "
+                "ChatGPT can complete checkout without leaving the AI "
+                "assistant. This is not an SEO fix — the merchant's existing "
+                "retail channels work fine. It's the AI-native transaction "
+                "surface the merchant doesn't have today, sized for the "
+                "channel that will dominate D2C beauty in 24 months."
             ),
         )
     if visibility_score < invisible_max and attribution_score < invisible_max:
@@ -1039,6 +1048,7 @@ def _generate_action_items(
     competitor_hosts: List[Dict[str, Any]],
     merchant_cited_runs: int,
     runs_with_any_citation: int,
+    attribution_score: int = 0,
     category_retailer_hosts: Optional[List[Dict[str, Any]]] = None,
     category_competitor_brands: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1100,20 +1110,43 @@ def _generate_action_items(
             ]
             if top_retailers:
                 retailer_phrase = (
-                    f" Top retailers capturing your AI-channel funnel: "
+                    f" Top retailers capturing the AI-channel funnel today: "
                     f"{', '.join(top_retailers)}."
                 )
+        # Conditional opener: when the merchant captures SOME first-party
+        # attribution we shouldn't say "every grounded citation" — that
+        # reads false to a brand like COSRX that already has cosrx.com
+        # surfaced 1/3 of buyer-intent queries. Lead with the actual
+        # gap percentage instead.
+        attr_score = int(attribution_score)
+        if attr_score == 0:
+            opener = (
+                "Your brand IS findable in AI-channel category queries — but "
+                "every grounded citation routes consumers through third-party "
+                "retailers instead of your own URL."
+            )
+        else:
+            gap_pct = max(0, 100 - attr_score)
+            opener = (
+                f"Your brand IS findable in AI-channel category queries — and "
+                f"you capture {attr_score}% of buyer-intent queries to your "
+                f"own URL today. The remaining {gap_pct}% routes through "
+                f"third-party retailers."
+            )
         items.append({
             "severity": "critical",
             "title": "Capture the AI-channel funnel that retailers are taking today",
             "body": (
-                "Your brand IS findable in AI-channel category queries — but "
-                "every grounded citation routes consumers through third-party "
-                "retailers instead of your own URL." + retailer_phrase + " "
-                "The demand already exists in this channel; the only thing "
-                "missing is the attribution path. Pivota's canonical PDP + "
-                "Schema.org + sitemap submission converts retailer-cited "
-                "category visibility into first-party AI-channel attribution."
+                opener + retailer_phrase + " "
+                "Pivota's canonical PDP closes that gap two ways, "
+                "complementary to existing retail distribution: (a) consistent "
+                "first-party attribution as AI shopping grows from ~12% to a "
+                "projected 25-30% of D2C beauty traffic over the next 24 months; "
+                "(b) in-chat checkout via Pivota's agentic-commerce protocol — "
+                "consumers ask Gemini / ChatGPT and buy from the brand directly "
+                "without leaving the assistant or being routed through a "
+                "retailer's checkout. This is AI-channel-native commerce, not "
+                "an SEO fix."
             ),
             "evidence": (
                 {"top_retailer_hosts": [r["host"] for r in category_retailer_hosts[:5] if r.get("host")]}
@@ -1197,7 +1230,16 @@ def _generate_action_items(
         })
 
     # Action 5: visibility gap (open-product test failed grounding gate).
-    if failed_visibility_queries and verdict_label != "STRONG":
+    # Suppressed for VIA_RETAILERS — the action's "your PDP isn't indexed"
+    # framing is misleading for retail-strong brands where category
+    # discoverability is high (their PDPs are demonstrably indexed; the
+    # buyer-intent queries are just too long-tail). The right call for
+    # VIA_RETAILERS is action #1's value-prop framing, not SEO hygiene.
+    if (
+        failed_visibility_queries
+        and verdict_label != "STRONG"
+        and verdict_label != "VISIBLE VIA RETAILERS"
+    ):
         items.append({
             "severity": "medium",
             "title": "Strengthen schema + sitemap inclusion for visibility",
@@ -1334,6 +1376,7 @@ def build_structured_report(
         competitor_hosts=competitor_hosts_list,
         merchant_cited_runs=merchant_cited_runs,
         runs_with_any_citation=runs_with_any_citation,
+        attribution_score=attribution_score,
         category_retailer_hosts=category_retailer_hosts,
         category_competitor_brands=category_competitor_brands,
     )

@@ -1316,3 +1316,190 @@ def test_render_markdown_includes_retailer_and_brand_tables_for_category() -> No
     assert "sephora.com" in md
     assert "Top direct competitors named by Gemini" in md
     assert "Patchology" in md
+
+
+# ---------------------------------------------------------------------------
+# Phase 2e: VIA_RETAILERS reframed to AI-native commerce value prop.
+#
+# The COSRX BD run revealed the previous wording mis-pitches retail-strong
+# brands: "every grounded citation routes through retailers" reads false
+# when attribution is 33%, and "Schema.org + sitemap submission" reads as
+# SEO hygiene rather than the actual Pivota value (in-Gemini transactions
+# + AI-channel attribution growth).
+# ---------------------------------------------------------------------------
+
+
+def test_via_retailers_action_body_uses_gap_percentage_when_attribution_positive() -> None:
+    """COSRX-class: attribution=33%, action body should lead with the
+    explicit gap (67% routes through retailers), not "every grounded
+    citation"."""
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        VERDICT_VIA_RETAILERS,
+    )
+    report = build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/products/p",
+        product_title="Charcoal Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={
+            "provider": "gemini", "scores": {"visibility_score": 0},
+            "raw_runs": [_vis_run("q1", visible=True, grounding=[])],
+        },
+        attribution_result={
+            "provider": "gemini", "scores": {"visibility_score": 33},
+            "raw_runs": [
+                _attr_run("for sale", found=True,
+                          grounding=["https://r/", "https://r2/"]),
+                _attr_run("where can I buy", found=False),
+                _attr_run("shop online", found=False),
+            ],
+        },
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [
+                _category_run(
+                    "best face masks 2026",
+                    excerpt="COSRX Glow Mask is best for...",
+                    grounding_sources=[{"uri": "https://r/", "title": "voguescandinavia.com"}],
+                ),
+                _category_run(
+                    "top face masks this year",
+                    excerpt="COSRX Snail Mucin is highlighted...",
+                    grounding_sources=[
+                        {"uri": "https://r/", "title": "voguescandinavia.com"},
+                        {"uri": "https://r2/", "title": "target.com"},
+                    ],
+                ),
+                _category_run(
+                    "best face masks under $50",
+                    excerpt="COSRX offers various masks under $50...",
+                    grounding_sources=[
+                        {"uri": "https://r/", "title": "ulta.com"},
+                    ],
+                ),
+            ],
+        },
+        provider="gemini",
+    )
+    assert report["verdict"]["label"] == VERDICT_VIA_RETAILERS
+    first_action = report["action_items"][0]
+    body = first_action["body"]
+    # Manually compute attribution score the same way the helper does
+    # to make the test resilient if the helper signature changes.
+    # 1 of 3 runs has in_grounding=True via _attr_run helper → 33%.
+    assert "33%" in body or "67%" in body
+    assert "every grounded citation" not in body.lower()
+    # Value-prop framing present.
+    assert "agentic-commerce" in body.lower() or "in-chat checkout" in body.lower()
+    assert "25-30%" in body  # forward-looking growth projection
+
+
+def test_via_retailers_action_body_uses_every_grounded_citation_when_attribution_zero() -> None:
+    """BoJ-class: attribution=0, retain the stronger 'every grounded
+    citation' wording — it's accurate for that case."""
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        VERDICT_VIA_RETAILERS,
+    )
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://beautyofjoseon.com/p/x",
+        product_title="Eye Patch",
+        product_vendor="Beauty of Joseon",
+        product_type="eye patch",
+        visibility_result={
+            "provider": "gemini", "scores": {"visibility_score": 0},
+            "raw_runs": [_vis_run("q1", visible=True, grounding=[])],
+        },
+        attribution_result={
+            "provider": "gemini", "scores": {"visibility_score": 0},
+            "raw_runs": [
+                _attr_run("q1", found=False),
+                _attr_run("q2", found=False),
+                _attr_run("q3", found=False),
+            ],
+        },
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [
+                _category_run(
+                    "best eye patches",
+                    excerpt="Beauty of Joseon Revive...",
+                    grounding_sources=[{"uri": "https://r/", "title": "sephora.com"}],
+                ),
+            ],
+        },
+        provider="gemini",
+    )
+    assert report["verdict"]["label"] == VERDICT_VIA_RETAILERS
+    body = report["action_items"][0]["body"]
+    assert "every grounded citation" in body.lower()
+    # Value-prop framing still present.
+    assert "agentic-commerce" in body.lower() or "in-chat checkout" in body.lower()
+
+
+def test_via_retailers_suppresses_schema_sitemap_action() -> None:
+    """For VIA_RETAILERS verdict, action #5 ('Strengthen schema +
+    sitemap') is suppressed — its 'your PDP isn't indexed' framing
+    mis-pitches retail-strong brands whose PDPs ARE indexed."""
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        VERDICT_VIA_RETAILERS,
+    )
+    report = build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/products/p",
+        product_title="Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={
+            "provider": "gemini", "scores": {"visibility_score": 0},
+            "raw_runs": [_vis_run("q1", visible=True, grounding=[])],
+        },
+        attribution_result={
+            "provider": "gemini", "scores": {"visibility_score": 33},
+            "raw_runs": [
+                _attr_run("q1", found=True, grounding=["https://r/"]),
+                _attr_run("q2", found=False),
+                _attr_run("q3", found=False),
+            ],
+        },
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [
+                _category_run(
+                    "best face masks 2026",
+                    excerpt="COSRX is highlighted...",
+                    grounding_sources=[{"uri": "https://r/", "title": "voguescandinavia.com"}],
+                ),
+            ],
+        },
+        provider="gemini",
+    )
+    assert report["verdict"]["label"] == VERDICT_VIA_RETAILERS
+    titles = [a["title"] for a in report["action_items"]]
+    assert not any("schema + sitemap" in t.lower() for t in titles)
+
+
+def test_via_retailers_explanation_leads_with_value_prop_not_seo() -> None:
+    """Verdict explanation should foreground Pivota's two-part value
+    prop (canonical PDP for AI-channel attribution + agentic-commerce
+    in-chat checkout), not generic SEO/sitemap framing."""
+    from services.agent_center_bd_report_service import verdict_for, VERDICT_VIA_RETAILERS
+    label, explanation = verdict_for(
+        visibility_score=0,
+        attribution_score=33,
+        category_visibility_score=100,
+    )
+    assert label == VERDICT_VIA_RETAILERS
+    e = explanation.lower()
+    # Value-prop signals present.
+    assert "agentic-commerce" in e or "in-chat" in e
+    assert "25-30%" in e or "12%" in e
+    # Explicitly NOT framed as SEO fix.
+    assert "not an seo fix" in e or "complementary to existing retail" in e
