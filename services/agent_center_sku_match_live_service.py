@@ -380,6 +380,11 @@ async def run_sku_match_live(scan_target_id: str) -> Dict[str, Any]:
             scan_target_id=scan_target_id, status="running", started_at=ac.utcnow(),
         )
 
+    # Heartbeat right before the multi-page platform fetch — this is the
+    # slowest section (Shopify pagination over hundreds of products can
+    # take 10-30s) and the one most likely to make a healthy run look
+    # stuck if the stale threshold gets tightened later.
+    await ac.heartbeat_scan_target(scan_target_id=scan_target_id)
     try:
         live_products, cached_products = await _fetch_both(
             merchant_id=merchant_id, platform=platform, limit=limit,
@@ -400,6 +405,9 @@ async def run_sku_match_live(scan_target_id: str) -> Dict[str, Any]:
         )
         raise
 
+    # After the slow fetch — heartbeat again before the in-memory diff so
+    # the runner's progress is visible even on smaller catalogs.
+    await ac.heartbeat_scan_target(scan_target_id=scan_target_id)
     findings = diff_live_vs_cached(
         live=live_products,
         cached=cached_products,

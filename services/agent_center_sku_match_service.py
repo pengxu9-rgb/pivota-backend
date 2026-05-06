@@ -253,7 +253,14 @@ async def run_sku_match(scan_target_id: str) -> Dict[str, Any]:
 
     findings: List[Dict[str, Any]] = []
     products_by_status = {"checked": 0, "with_findings": 0}
-    for row in products:
+    # Heartbeat cadence: every N products through the loop. Pure-function
+    # work per product is microseconds, so a single heartbeat per run is
+    # plenty in normal cases; we bump it every 100 to cover hand-tuned
+    # max-product runs that walk a large catalog.
+    HEARTBEAT_EVERY_N = 100
+    for idx, row in enumerate(products):
+        if idx > 0 and idx % HEARTBEAT_EVERY_N == 0:
+            await ac.heartbeat_scan_target(scan_target_id=scan_target_id)
         product_data = row.get("product_data_decoded") or {}
         product_findings = _check_product(product_data)
 

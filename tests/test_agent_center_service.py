@@ -198,6 +198,24 @@ class FakeDB:
                         row["started_at"] = datetime.now(timezone.utc)
                     return dict(row)
             return None
+        # Heartbeat: UPDATE ... SET updated_at = NOW() WHERE status='running'
+        # RETURNING id — returns the row only if it's currently running.
+        if (
+            q.startswith("UPDATE agent_center_scan_targets")
+            and "RETURNING" in q
+            and "status = 'running'" in q
+            and "status = ANY" not in q
+        ):
+            self.executed.append((q, v))
+            for row in self._tables["agent_center_scan_targets"]:
+                if (
+                    row["id"] == v.get("scan_target_id")
+                    and row["deleted_at"] is None
+                    and row["status"] == "running"
+                ):
+                    row["updated_at"] = datetime.now(timezone.utc)
+                    return {"id": row["id"]}
+            return None
         if "FROM agent_center_merchant_stores" in q:
             for row in self._tables["agent_center_merchant_stores"]:
                 if (
@@ -875,3 +893,81 @@ async def test_force_reset_unblocks_run_lock(fake_db: FakeDB) -> None:
     relocked = await ac.try_acquire_run_lock(scan_target_id=target["id"])
     assert relocked is not None
     assert relocked["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# heartbeat_scan_target — keep-alive for long-running runners
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_succeeds_on_running_row(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    # Set updated_at to old timestamp so we can verify the bump landed.
+    row = fake_db._tables["agent_center_scan_targets"][0]
+    old_ts = datetime.now(timezone.utc) - timedelta(minutes=10)
+    row["updated_at"] = old_ts
+
+    ok = await ac.heartbeat_scan_target(scan_target_id=target["id"])
+    assert ok is True
+    assert row["updated_at"] > old_ts
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_false_for_non_running_row(fake_db: FakeDB) -> None:
+    """If the row was force-reset to failed (or never started), heartbeat
+    silently no-ops. Runner can keep going — its final transition will
+    either fail naturally or be ignored."""
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    # Row is `queued` — heartbeat should not bump it.
+    ok = await ac.heartbeat_scan_target(scan_target_id=target["id"])
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_false_after_force_reset(fake_db: FakeDB) -> None:
+    """The realistic case: ops force-reset a row mid-run. Subsequent
+    heartbeats from the still-living runner must not resurrect it."""
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    await ac.force_reset_scan_target(
+        scan_target_id=target["id"],
+        reason="zombie runner",
+        reset_by="ops@pivota.test",
+    )
+    ok = await ac.heartbeat_scan_target(scan_target_id=target["id"])
+    assert ok is False
+    assert fake_db._tables["agent_center_scan_targets"][0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_false_for_unknown_id(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    ok = await ac.heartbeat_scan_target(scan_target_id="acst_does_not_exist")
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_skips_soft_deleted(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    fake_db._tables["agent_center_scan_targets"][0]["deleted_at"] = datetime.now(timezone.utc)
+    ok = await ac.heartbeat_scan_target(scan_target_id=target["id"])
+    assert ok is False
