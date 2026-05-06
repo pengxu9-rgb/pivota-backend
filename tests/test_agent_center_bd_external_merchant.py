@@ -1515,10 +1515,10 @@ def test_via_retailers_explanation_leads_with_value_prop_not_seo() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_what_pivota_changes_block_present_with_three_levers() -> None:
-    """build_structured_report always emits a what_pivota_changes block
-    with today_summary + 3 after_onboarding levers (first-party
-    attribution, in-chat checkout, Pivota PDP baseline reference)."""
+def test_what_pivota_changes_has_discovery_lift_and_checkout_loop() -> None:
+    """Phase 2g: what_pivota_changes is now a 2-part block —
+    discovery_lift (mechanics + Pivota PDP baseline reference) and
+    checkout_loop (6-step chain → merchant Shopify admin)."""
     from services.agent_center_bd_report_service import build_structured_report
     report = build_structured_report(
         merchant_name="COSRX",
@@ -1533,40 +1533,52 @@ def test_what_pivota_changes_block_present_with_three_levers() -> None:
     wpc = report["what_pivota_changes"]
     assert wpc is not None
     assert "today_summary" in wpc
-    levers = wpc["after_onboarding"]
-    assert len(levers) == 3
-    titles = [lev.get("title", "") for lev in levers]
-    assert any("first-party" in t.lower() for t in titles)
-    assert any("in-chat" in t.lower() for t in titles)
-    assert any("baseline" in t.lower() for t in titles)
+    assert "discovery_lift" in wpc
+    assert "checkout_loop" in wpc
 
 
-def test_what_pivota_changes_in_chat_lever_mentions_agentic_commerce() -> None:
-    from services.agent_center_bd_report_service import build_structured_report
-    report = build_structured_report(
-        merchant_name="X",
-        merchant_pdp_url="https://x.com/p/1",
-        product_title="Y",
-        product_vendor=None,
-        product_type=None,
-        visibility_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
-        attribution_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
-        provider="gemini",
-    )
-    levers = report["what_pivota_changes"]["after_onboarding"]
-    in_chat_lever = next((l for l in levers if "in-chat" in l.get("title", "").lower()), None)
-    assert in_chat_lever is not None
-    assert "agentic-commerce" in in_chat_lever["after"].lower()
-
-
-def test_what_pivota_changes_baseline_reference_has_pivota_pdp_figures() -> None:
-    """The third lever surfaces the Pivota PDP self-baseline median
-    visibility + median attribution figures so the merchant has a
-    concrete after-onboarding anchor."""
+def test_discovery_lift_includes_mechanics_and_pivota_baseline_reference() -> None:
     from services.agent_center_bd_report_service import (
         build_structured_report,
         PIVOTA_PDP_BASELINE_REFERENCE,
     )
+    report = build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/p",
+        product_title="Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 33}, "raw_runs": []},
+        provider="gemini",
+    )
+    dl = report["what_pivota_changes"]["discovery_lift"]
+    # Pivota PDP baseline figures cited verbatim.
+    pr = dl["pivota_reference"]
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_visibility"]) in pr
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_attribution"]) in pr
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["sample_size_pdps"]) in pr
+    # Four mechanics, all shipped — these are the technical reasons
+    # the merchant should believe the predicted lift.
+    mechanics = dl["mechanics"]
+    assert len(mechanics) == 4
+    labels = [m.get("label", "").lower() for m in mechanics]
+    assert any("canonical" in l and "pdp" in l for l in labels)
+    assert any("schema.org" in l for l in labels)
+    assert any("sitemap" in l for l in labels)
+    assert any("categori" in l for l in labels)
+    assert all(m.get("shipped") is True for m in mechanics)
+    assert all(m.get("evidence") for m in mechanics)
+    # Methodology disclosed honestly — not paired A/B.
+    assert dl.get("methodology_note")
+    assert "comparative" in dl["methodology_note"].lower()
+
+
+def test_checkout_loop_chain_has_six_steps_each_with_evidence() -> None:
+    """The 6-step chain from grounded answer → merchant Shopify admin.
+    Each step carries an evidence reference (file path / test) so BD
+    can stand behind the claim."""
+    from services.agent_center_bd_report_service import build_structured_report
     report = build_structured_report(
         merchant_name="X",
         merchant_pdp_url="https://x.com/p/1",
@@ -1577,17 +1589,45 @@ def test_what_pivota_changes_baseline_reference_has_pivota_pdp_figures() -> None
         attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
         provider="gemini",
     )
-    baseline_lever = next(
-        l for l in report["what_pivota_changes"]["after_onboarding"]
-        if "baseline" in l.get("title", "").lower()
+    cl = report["what_pivota_changes"]["checkout_loop"]
+    chain = cl["chain"]
+    assert len(chain) == 6
+    # Steps 1..6 in order, each with shipped=True + evidence.
+    for i, s in enumerate(chain, start=1):
+        assert s["step"] == i
+        assert s.get("label")
+        assert s.get("evidence")
+        assert s.get("shipped") is True
+    # End-to-end test merchant cited in the final-step evidence.
+    last_step = chain[-1]
+    assert "shopify" in last_step["label"].lower()
+    assert "merch_38fa56d5118b9974" in last_step["evidence"]
+
+
+def test_checkout_loop_platform_coverage_honest_about_shopify_only() -> None:
+    """Platform coverage explicitly lists Shopify as shipped + Wix /
+    Woo / PrestaShop on roadmap. Honest disclosure protects BD pitch
+    from over-promising."""
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="X",
+        merchant_pdp_url="https://x.com/p/1",
+        product_title="Y",
+        product_vendor=None,
+        product_type=None,
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        provider="gemini",
     )
-    value = baseline_lever["value"]
-    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_visibility"]) in value
-    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_attribution"]) in value
-    assert str(PIVOTA_PDP_BASELINE_REFERENCE["sample_size_pdps"]) in value
+    pc = report["what_pivota_changes"]["checkout_loop"]["platform_coverage"]
+    assert "Shopify" in pc["shipped"]
+    assert any("woo" in p.lower() for p in pc["roadmap"])
+    assert any("wix" in p.lower() for p in pc["roadmap"])
+    assert "Q3" in pc["note"] or "roadmap" in pc["note"].lower()
 
 
-def test_render_markdown_contains_what_pivota_changes_section() -> None:
+def test_render_markdown_includes_discovery_lift_and_checkout_loop() -> None:
+    """Markdown output renders both sub-sections + tables."""
     from services.agent_center_bd_report_service import (
         build_structured_report,
         render_markdown_from_structured,
@@ -1603,13 +1643,25 @@ def test_render_markdown_contains_what_pivota_changes_section() -> None:
         provider="gemini",
     )
     md = render_markdown_from_structured(report)
+    # Top-level section + today.
     assert "## What Pivota changes after onboarding" in md
     assert "**Today:**" in md
-    # Two-part value prop in the comparison table
-    assert "First-party AI attribution" in md
-    assert "In-chat checkout" in md
-    # Pivota PDP baseline reference line
-    assert "Pivota PDP reference" in md
+    # Discovery-lift sub-section with mechanics table.
+    assert "Why your AI-channel visibility will improve" in md
+    assert "Mechanics that produce that surface" in md
+    assert "Schema.org" in md
+    assert "sitemap" in md.lower()
+    # Pivota baseline reference inline.
+    assert "67/100" in md  # median_visibility
+    assert "50/100" in md  # median_attribution
+    # Checkout-loop sub-section with 6-step chain table.
+    assert "How in-chat checkout closes the loop" in md
+    assert "Shopify admin" in md
+    assert "merch_38fa56d5118b9974" in md
+    # Platform coverage line + outcome.
+    assert "Platform coverage" in md
+    assert "Shopify" in md
+    assert "Roadmap" in md
 
 
 def test_render_markdown_uses_new_title_and_intro() -> None:
