@@ -333,3 +333,111 @@ def test_sku_match_route_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     client = TestClient(app)
     res = client.get("/api/agent-center/sku-match?merchant_id=m1")
     assert res.status_code in {401, 403}
+
+
+# ---------------------------------------------------------------------------
+# Admin routes — stuck-run inspection + force-reset
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def admin_env(monkeypatch: pytest.MonkeyPatch) -> Tuple[TestClient, FakeDB]:
+    from datetime import datetime, timedelta, timezone
+    db = FakeDB()
+    from services import agent_center_service as ac
+    monkeypatch.setattr(ac, "database", db)
+
+    from routes import agent_center_admin_routes as admin_routes
+    from utils.auth import require_admin
+
+    async def _override_admin() -> Dict[str, Any]:
+        return {"employee_id": "emp_admin", "email": "admin@pivota.test", "role": "admin"}
+
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    app.dependency_overrides[require_admin] = _override_admin
+    return TestClient(app), db
+
+
+def test_admin_list_stuck_runs_returns_only_stale(admin_env: Tuple[TestClient, FakeDB]) -> None:
+    from datetime import datetime, timedelta, timezone
+    client, db = admin_env
+
+    # Seed: one fresh running, one stale running, one succeeded.
+    base = {
+        "merchant_id": "m1", "store_id": "s1",
+        "scan_mode": "open_product_visibility_test",
+        "payload": {}, "started_at": None, "finished_at": None, "deleted_at": None,
+    }
+    db._tables["agent_center_scan_targets"].extend([
+        {**base, "id": "fresh", "status": "running",
+         "updated_at": datetime.now(timezone.utc) - timedelta(minutes=2)},
+        {**base, "id": "stale", "status": "running",
+         "updated_at": datetime.now(timezone.utc) - timedelta(minutes=120)},
+        {**base, "id": "ok", "status": "succeeded",
+         "updated_at": datetime.now(timezone.utc) - timedelta(days=1)},
+    ])
+
+    res = client.get("/admin/agent-center/scan-targets/stuck?stale_minutes=30")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["stale_minutes"] == 30
+    ids = [it["id"] for it in body["items"]]
+    assert ids == ["stale"]
+
+
+def test_admin_force_reset_returns_failed_with_audit(admin_env: Tuple[TestClient, FakeDB]) -> None:
+    from datetime import datetime, timedelta, timezone
+    client, db = admin_env
+
+    db._tables["agent_center_scan_targets"].append({
+        "id": "stuck1", "merchant_id": "m1", "store_id": "s1",
+        "scan_mode": "open_product_visibility_test",
+        "status": "running", "payload": {}, "started_at": None,
+        "finished_at": None, "deleted_at": None,
+        "updated_at": datetime.now(timezone.utc) - timedelta(minutes=120),
+    })
+    res = client.post(
+        "/admin/agent-center/scan-targets/stuck1/force-reset",
+        json={"reason": "runner crashed (OOM)"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "reset"
+    err = body["scan_target"]["payload"]["error"]
+    assert err["kind"] == "force_reset"
+    assert err["last_known_status"] == "running"
+    # `reset_by` defaults to the authenticated user's email when present.
+    assert err["reset_by"] == "admin@pivota.test"
+
+
+def test_admin_force_reset_404_for_nonexistent(admin_env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = admin_env
+    res = client.post(
+        "/admin/agent-center/scan-targets/acst_nope/force-reset",
+        json={"reason": "cleanup"},
+    )
+    assert res.status_code == 404
+
+
+def test_admin_force_reset_requires_reason(admin_env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = admin_env
+    res = client.post(
+        "/admin/agent-center/scan-targets/anything/force-reset",
+        json={},
+    )
+    assert res.status_code == 422  # Pydantic catches the missing field
+
+
+def test_admin_routes_require_admin_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDB()
+    from services import agent_center_service as ac
+    monkeypatch.setattr(ac, "database", db)
+
+    from routes import agent_center_admin_routes as admin_routes
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    client = TestClient(app)
+
+    res = client.get("/admin/agent-center/scan-targets/stuck")
+    assert res.status_code in {401, 403}

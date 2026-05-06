@@ -655,3 +655,76 @@ async def create_validation_run(
 def utcnow() -> datetime:
     """Return a timezone-aware UTC `datetime` for callers stamping started/finished_at."""
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Stuck-run inspection + force-reset (admin-only ops lever)
+# ---------------------------------------------------------------------------
+#
+# When a runner crashes mid-execution the row sits in `status='running'`
+# forever, blocking the /run lock for that scan_target. We deliberately do
+# *not* auto-recover (a stale-running TTL without runner heartbeats would
+# steal the lock from a still-working runner and re-introduce the race
+# guard from #271). Instead, ops can list stuck rows and explicitly
+# force-reset one to `failed` after confirming the runner is dead.
+
+
+async def list_stuck_running_targets(
+    *,
+    stale_minutes: int = 30,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return scan_targets in `status='running'` whose `updated_at` is
+    older than `stale_minutes` — candidates for a force-reset."""
+    if stale_minutes < 1:
+        raise ValueError("stale_minutes must be >= 1")
+    rows = await database.fetch_all(
+        """
+        SELECT *
+        FROM agent_center_scan_targets
+        WHERE deleted_at IS NULL
+          AND status = 'running'
+          AND updated_at < NOW() - make_interval(mins => :stale_minutes)
+        ORDER BY updated_at ASC
+        LIMIT :limit
+        """,
+        {
+            "stale_minutes": int(stale_minutes),
+            "limit": max(1, min(int(limit), 500)),
+        },
+    )
+    return [_row_to_dict_with_payload(r) for r in (rows or [])]
+
+
+async def force_reset_scan_target(
+    *,
+    scan_target_id: str,
+    reason: str,
+    reset_by: str,
+) -> Dict[str, Any]:
+    """Force a scan_target into `status='failed'` regardless of current
+    status. Records `last_known_status` and the reset metadata in the
+    error payload so ops can audit later. Raises LookupError if the row
+    doesn't exist or is soft-deleted."""
+    if not (reason and reason.strip()):
+        raise ValueError("reason is required")
+    if not (reset_by and reset_by.strip()):
+        raise ValueError("reset_by is required")
+    target = await get_scan_target(scan_target_id=scan_target_id)
+    if target is None:
+        raise LookupError(f"scan_target not found: {scan_target_id}")
+    last_known = target.get("status")
+    return await transition_scan_target(
+        scan_target_id=scan_target_id,
+        status="failed",
+        finished_at=utcnow(),
+        payload_patch={
+            "error": {
+                "kind": "force_reset",
+                "reason": reason.strip(),
+                "reset_by": reset_by.strip(),
+                "last_known_status": last_known,
+                "reset_at": utcnow().isoformat(),
+            },
+        },
+    )
