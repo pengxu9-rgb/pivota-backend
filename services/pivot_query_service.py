@@ -28,6 +28,7 @@ from models.catalog import (
     SkuNode,
 )
 from services.catalog_sync_service import store_catalog_quote_snapshot
+from services.pdp_category_classifier import category_path_prefix_for_query
 from services.beauty_external_ranking import (
     BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
     RankedExternalBeautyCandidate,
@@ -470,6 +471,13 @@ async def _fetch_canonical_search_rows(
     candidate_limit = min(max(normalized_limit * 4, 25), 200)
     row_limit = min(max(normalized_limit * 6, 50), 500)
     vertical_search = _vertical_intent(query)
+    # Phase 2b: when the query matches a known category alias, bias the
+    # candidate WHERE / score toward catalog_products.category_path matches.
+    # This is the PDP-first recall path enabled by mig 069 + the regex
+    # ported from PIVOTA-Agent BEAUTY_CATEGORY_PATTERNS. When the query
+    # doesn't match a known category, this is a no-op and the existing
+    # text-LIKE path runs unchanged.
+    category_prefix = category_path_prefix_for_query(query)
     params: Dict[str, Any] = {
         "query_exact": lowered,
         "query_like": f"%{lowered}%",
@@ -490,6 +498,20 @@ async def _fetch_canonical_search_rows(
         vertical_score = """
             + CASE WHEN LOWER(COALESCE(CAST(s.visible_option_labels AS TEXT), '')) LIKE :query_like THEN 20 ELSE 0 END
             + CASE WHEN LOWER(COALESCE(CAST(s.ingredient_ids AS TEXT), '')) LIKE :query_like THEN 15 ELSE 0 END
+        """
+    category_where = ""
+    category_score = ""
+    if category_prefix:
+        params["category_path_prefix"] = f"{category_prefix}%"
+        category_where = """
+            OR (p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix)
+        """
+        # Score boost positions a category-path hit just above an exact
+        # brand match (80) but below an exact source_product_id match (105),
+        # mirroring how merchants intend "show me lipsticks" to surface PDPs
+        # whose taxonomy path is the lip family.
+        category_score = """
+            + CASE WHEN p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix THEN 90 ELSE 0 END
         """
 
     rows = await database.fetch_all(
@@ -530,6 +552,7 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN LOWER(COALESCE(p.title, '')) = :query_exact THEN 100 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(m.merchant_name, '')) = :query_exact THEN 90 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(p.brand, '')) = :query_exact THEN 80 ELSE 0 END
+                    {category_score}
                     {vertical_score}
                 ) AS rank_score
             FROM catalog_products p
@@ -543,6 +566,7 @@ async def _fetch_canonical_search_rows(
                 LOWER(COALESCE(s.title, '')) LIKE :query_like OR
                 LOWER(COALESCE(s.source_variant_id, '')) LIKE :query_like OR
                 LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like
+                {category_where}
                 {vertical_where}
             )
             {merchant_clause}
@@ -1011,6 +1035,14 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
 
 
 async def _fetch_external_fallback_items(request: PivotQueryRequest) -> List[PivotResultItem]:
+    # Phase 2b note: the plan calls for a LEFT JOIN catalog_products on
+    # eps.attached_product_key here so external seeds inherit PDP-level
+    # category/brand for ranking. That JOIN is deferred until Phase 3 lands
+    # the seed→PDP matcher — today attached_product_key is NULL on
+    # ~all rows, so the JOIN would be a no-op. Once Phase 3 populates
+    # attached_product_key, wire the decoration in _decorate_external_rows
+    # below (planned helper) and surface pdp.category_path into
+    # rank_external_seed_rows.
     query_terms = seed_search_terms(request.query)
     external_limit = min(max(request.limit * 2, 30), 200)
     # PR: stage_a / stage_b seed query budgets were 0.9s / 1.6s. Recall probe
