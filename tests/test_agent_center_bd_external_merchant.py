@@ -169,7 +169,10 @@ def test_verdict_misattributed_when_visible_but_no_attribution() -> None:
     label, explanation = _verdict_for(visibility_score=70, attribution_score=10)
     assert label == "VISIBLE BUT MISATTRIBUTED"
     assert "third-party" in explanation
-    assert "highest-impact" in explanation  # this is the BD pitch sweet spot
+    # BD pitch sweet spot: post-reframe, this verdict explicitly names
+    # Pivota's two-part value prop (canonical AI-channel PDP + in-chat
+    # checkout via agentic-commerce protocol).
+    assert "agentic-commerce" in explanation.lower() or "in-chat" in explanation.lower()
 
 
 def test_verdict_strong_when_both_high() -> None:
@@ -225,7 +228,7 @@ def test_render_markdown_smoke() -> None:
     })
 
     # Top-level structure
-    assert "# AI Visibility Report — Glossier" in report
+    assert "# AI Commerce Readiness Report — Glossier" in report
     # Verdict picked
     assert "VISIBLE BUT MISATTRIBUTED" in report or "INVISIBLE" in report or "PARTIAL" in report
     # Score values appear
@@ -1503,3 +1506,204 @@ def test_via_retailers_explanation_leads_with_value_prop_not_seo() -> None:
     assert "25-30%" in e or "12%" in e
     # Explicitly NOT framed as SEO fix.
     assert "not an seo fix" in e or "complementary to existing retail" in e
+
+
+# ---------------------------------------------------------------------------
+# Phase 2f: Voice reframe — "AI Commerce Readiness Report" + value-prop
+# verdicts + new "What Pivota changes" section + industry forward projection
+# + methodology scope disclaimer.
+# ---------------------------------------------------------------------------
+
+
+def test_what_pivota_changes_block_present_with_three_levers() -> None:
+    """build_structured_report always emits a what_pivota_changes block
+    with today_summary + 3 after_onboarding levers (first-party
+    attribution, in-chat checkout, Pivota PDP baseline reference)."""
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/products/p",
+        product_title="Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 33}, "raw_runs": []},
+        provider="gemini",
+    )
+    wpc = report["what_pivota_changes"]
+    assert wpc is not None
+    assert "today_summary" in wpc
+    levers = wpc["after_onboarding"]
+    assert len(levers) == 3
+    titles = [lev.get("title", "") for lev in levers]
+    assert any("first-party" in t.lower() for t in titles)
+    assert any("in-chat" in t.lower() for t in titles)
+    assert any("baseline" in t.lower() for t in titles)
+
+
+def test_what_pivota_changes_in_chat_lever_mentions_agentic_commerce() -> None:
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="X",
+        merchant_pdp_url="https://x.com/p/1",
+        product_title="Y",
+        product_vendor=None,
+        product_type=None,
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 50}, "raw_runs": []},
+        provider="gemini",
+    )
+    levers = report["what_pivota_changes"]["after_onboarding"]
+    in_chat_lever = next((l for l in levers if "in-chat" in l.get("title", "").lower()), None)
+    assert in_chat_lever is not None
+    assert "agentic-commerce" in in_chat_lever["after"].lower()
+
+
+def test_what_pivota_changes_baseline_reference_has_pivota_pdp_figures() -> None:
+    """The third lever surfaces the Pivota PDP self-baseline median
+    visibility + median attribution figures so the merchant has a
+    concrete after-onboarding anchor."""
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        PIVOTA_PDP_BASELINE_REFERENCE,
+    )
+    report = build_structured_report(
+        merchant_name="X",
+        merchant_pdp_url="https://x.com/p/1",
+        product_title="Y",
+        product_vendor=None,
+        product_type=None,
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        provider="gemini",
+    )
+    baseline_lever = next(
+        l for l in report["what_pivota_changes"]["after_onboarding"]
+        if "baseline" in l.get("title", "").lower()
+    )
+    value = baseline_lever["value"]
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_visibility"]) in value
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["median_attribution"]) in value
+    assert str(PIVOTA_PDP_BASELINE_REFERENCE["sample_size_pdps"]) in value
+
+
+def test_render_markdown_contains_what_pivota_changes_section() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/p",
+        product_title="Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 33}, "raw_runs": []},
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    assert "## What Pivota changes after onboarding" in md
+    assert "**Today:**" in md
+    # Two-part value prop in the comparison table
+    assert "First-party AI attribution" in md
+    assert "In-chat checkout" in md
+    # Pivota PDP baseline reference line
+    assert "Pivota PDP reference" in md
+
+
+def test_render_markdown_uses_new_title_and_intro() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/p",
+        product_title="Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 33}, "raw_runs": []},
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    assert md.startswith("# AI Commerce Readiness Report — COSRX")
+    # Intro paragraph framing the two questions
+    assert "25-30%" in md
+    assert "the second question is what pivota addresses" in md.lower()
+
+
+def test_render_markdown_methodology_scope_disclaimer() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="X",
+        merchant_pdp_url="https://x.com/p",
+        product_title="Y",
+        product_vendor=None,
+        product_type=None,
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    assert "**Scope.**" in md
+    # Tells the merchant what this report does NOT measure.
+    assert "does NOT measure" in md
+    # Names the categories explicitly so retail-strong brands can
+    # frame this as complementary, not redundant.
+    assert "D2C web traffic" in md
+    assert "retail sell-through" in md
+
+
+def test_industry_context_beauty_has_forward_projection() -> None:
+    from services.agent_center_bd_report_service import _INDUSTRY_CONTEXT_BY_CATEGORY
+    beauty = _INDUSTRY_CONTEXT_BY_CATEGORY["beauty"]
+    assert beauty["forward_projection"] is not None
+    assert "25-30%" in beauty["forward_projection"]
+    assert "2028" in beauty["forward_projection"]
+
+
+def test_render_markdown_includes_forward_projection_for_beauty() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/p",
+        product_title="Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    # Beauty category triggers the "By 2028..." line in industry context.
+    assert "_24-month projection:_" in md
+    assert "2028" in md
+
+
+def test_verdict_explanations_contain_value_prop_signals_for_all_labels() -> None:
+    """Every verdict explanation (across the 4 reframed labels) carries
+    a value-prop signal — agentic-commerce, in-chat, or projected
+    growth — so the BD framing is consistent."""
+    from services.agent_center_bd_report_service import verdict_for
+    cases = [
+        (0, 0, None),       # INVISIBLE
+        (70, 10, None),     # MISATTRIBUTED
+        (70, 80, None),     # STRONG
+        (40, 50, None),     # PARTIAL
+    ]
+    for vis, attr, cat in cases:
+        _, explanation = verdict_for(vis, attr, category_visibility_score=cat)
+        e = explanation.lower()
+        assert (
+            "agentic-commerce" in e
+            or "in-chat" in e
+            or "25-30%" in e
+        ), f"verdict for ({vis},{attr},{cat}) lacks value-prop signal: {explanation[:120]}"
