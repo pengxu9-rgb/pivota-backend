@@ -142,6 +142,9 @@ from routes.agent_center_sku_match_routes import (
 from routes.agent_center_admin_routes import (
     router as agent_center_admin_router,
 )
+from routes.agent_center_bd_routes import (
+    router as agent_center_bd_router,
+)
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
@@ -713,6 +716,7 @@ app.include_router(admin_apply_agent_center_migration_router)  # Agent Center V1
 app.include_router(agent_center_demand_test_router)  # Agent Center: Demand Test Agent V1 (internal pilot)
 app.include_router(agent_center_sku_match_router)  # Agent Center: SKU Match Agent V1 (internal pilot)
 app.include_router(agent_center_admin_router)  # Agent Center: stuck-run inspection / force-reset (admin-only)
+app.include_router(agent_center_bd_router)  # Agent Center: BD external-merchant AI visibility report
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints
