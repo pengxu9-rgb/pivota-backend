@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -72,6 +72,7 @@ class FakeDB:
                 "payload": _decode(v["payload"]),
                 "started_at": None,
                 "finished_at": None,
+                "updated_at": datetime.now(timezone.utc),
                 "deleted_at": None,
             })
         elif "UPDATE agent_center_scan_targets" in q:
@@ -88,6 +89,7 @@ class FakeDB:
                         merged = dict(row.get("payload") or {})
                         merged.update(patch)
                         row["payload"] = merged
+                    row["updated_at"] = datetime.now(timezone.utc)
         elif "INSERT INTO agent_center_issues" in q:
             self._tables["agent_center_issues"].append({
                 "id": v["id"],
@@ -235,6 +237,30 @@ class FakeDB:
     async def fetch_all(self, query: str, values: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         q = " ".join(str(query).split())
         v = dict(values or {})
+        # Stuck-run lookup (list_stuck_running_targets): status='running' AND
+        # updated_at < NOW() - make_interval(mins => :stale_minutes).
+        if (
+            "FROM agent_center_scan_targets" in q
+            and "status = 'running'" in q
+            and "make_interval" in q
+        ):
+            stale_minutes = int(v.get("stale_minutes", 30))
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+            out: List[Dict[str, Any]] = []
+            for row in self._tables["agent_center_scan_targets"]:
+                if row.get("deleted_at") is not None:
+                    continue
+                if row.get("status") != "running":
+                    continue
+                updated_at = row.get("updated_at")
+                if updated_at is None:
+                    continue
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                if updated_at < cutoff:
+                    out.append(dict(row))
+            out.sort(key=lambda r: r.get("updated_at"))
+            return out[: int(v.get("limit", 100))]
         if "FROM agent_center_scan_targets" in q:
             return [
                 row for row in self._tables["agent_center_scan_targets"]
@@ -704,3 +730,148 @@ async def test_try_acquire_run_lock_preserves_started_at_on_relock(fake_db: Fake
     assert locked is not None
     assert locked["status"] == "running"
     assert locked["started_at"] == original_started
+
+
+# ---------------------------------------------------------------------------
+# Stuck-run admin lever — list_stuck_running_targets + force_reset_scan_target
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_stuck_running_returns_empty_when_no_running_targets(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    items = await ac.list_stuck_running_targets(stale_minutes=30)
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_list_stuck_running_returns_only_stale_running_rows(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    # Force the row into running with an old updated_at.
+    row = fake_db._tables["agent_center_scan_targets"][0]
+    row["status"] = "running"
+    row["updated_at"] = datetime.now(timezone.utc) - timedelta(minutes=45)
+
+    items = await ac.list_stuck_running_targets(stale_minutes=30)
+    assert len(items) == 1
+    assert items[0]["id"] == target["id"]
+
+
+@pytest.mark.asyncio
+async def test_list_stuck_running_skips_fresh_running_rows(fake_db: FakeDB) -> None:
+    """A row that was just locked (updated_at recent) is NOT stuck, even
+    though it's `running`. Keeps us from stealing the lock from a
+    legitimately-working runner."""
+    from services import agent_center_service as ac
+    await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    row = fake_db._tables["agent_center_scan_targets"][0]
+    row["status"] = "running"
+    row["updated_at"] = datetime.now(timezone.utc) - timedelta(minutes=2)
+
+    items = await ac.list_stuck_running_targets(stale_minutes=30)
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_list_stuck_running_skips_non_running_states(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    row = fake_db._tables["agent_center_scan_targets"][0]
+    # Old `succeeded` row should not be returned as stuck.
+    row["status"] = "succeeded"
+    row["updated_at"] = datetime.now(timezone.utc) - timedelta(days=1)
+
+    items = await ac.list_stuck_running_targets(stale_minutes=30)
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_force_reset_marks_failed_with_audit_payload(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    fake_db._tables["agent_center_scan_targets"][0]["status"] = "running"
+
+    reset = await ac.force_reset_scan_target(
+        scan_target_id=target["id"],
+        reason="runner crashed (OOM)",
+        reset_by="ops@pivota.test",
+    )
+    assert reset["status"] == "failed"
+    err = reset["payload"]["error"]
+    assert err["kind"] == "force_reset"
+    assert err["reason"] == "runner crashed (OOM)"
+    assert err["reset_by"] == "ops@pivota.test"
+    assert err["last_known_status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_force_reset_unknown_target_raises(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    with pytest.raises(LookupError):
+        await ac.force_reset_scan_target(
+            scan_target_id="acst_does_not_exist",
+            reason="cleanup",
+            reset_by="ops@pivota.test",
+        )
+
+
+@pytest.mark.asyncio
+async def test_force_reset_requires_reason_and_actor(fake_db: FakeDB) -> None:
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    with pytest.raises(ValueError, match="reason"):
+        await ac.force_reset_scan_target(
+            scan_target_id=target["id"], reason="", reset_by="ops@pivota.test",
+        )
+    with pytest.raises(ValueError, match="reset_by"):
+        await ac.force_reset_scan_target(
+            scan_target_id=target["id"], reason="why", reset_by="   ",
+        )
+
+
+@pytest.mark.asyncio
+async def test_force_reset_unblocks_run_lock(fake_db: FakeDB) -> None:
+    """End-to-end: a stuck row blocks /run lock. After force-reset it
+    becomes acquireable again — this is the actual ops workflow."""
+    from services import agent_center_service as ac
+    target = await ac.create_scan_target(
+        merchant_id="m1", store_id="s1",
+        scan_mode="open_product_visibility_test",
+    )
+    fake_db._tables["agent_center_scan_targets"][0]["status"] = "running"
+
+    # Locked — second /run can't acquire.
+    blocked = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert blocked is None
+
+    # Force reset → status='failed'.
+    await ac.force_reset_scan_target(
+        scan_target_id=target["id"],
+        reason="ops cleanup",
+        reset_by="ops@pivota.test",
+    )
+
+    # Now the lock can be re-acquired.
+    relocked = await ac.try_acquire_run_lock(scan_target_id=target["id"])
+    assert relocked is not None
+    assert relocked["status"] == "running"
