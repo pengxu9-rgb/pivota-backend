@@ -1334,20 +1334,24 @@ def _build_what_pivota_changes(
 ) -> Dict[str, Any]:
     """Return the "What Pivota changes after onboarding" structured block.
 
-    Three levers, all derived from existing report data — no new probe
-    calls. The merchant reads this section to see the post-onboarding
-    delta, not just the pre-onboarding diagnosis.
+    Two parts the merchant needs to believe before signing:
 
-      1. First-party AI attribution — converts retailer-routed category
-         visibility into the merchant's own URL via the canonical
-         AI-channel PDP.
-      2. In-chat checkout — the agentic-commerce protocol lets consumers
-         complete purchase inside Gemini / ChatGPT instead of clicking
-         out to merchant.com or being redirected through retailer.com.
-      3. Pivota PDP baseline reference — current median visibility +
-         attribution figures across Pivota's 6 canonical seed PDPs, so
-         the merchant has a concrete "this is what your AI-channel
-         surface looks like after onboarding" anchor."""
+      1. **discovery_lift** — Why your AI-channel visibility will improve.
+         Anchored on Pivota's 6 canonical seed PDPs (median visibility
+         67/100, attribution 50/100) as the empirical "after" reference,
+         plus the four mechanics that produce that surface (canonical
+         AI-channel PDP / Schema.org structured data / sitemap submission
+         / semantic categorization). The claim is comparative, not paired
+         A/B — clearly disclosed in `methodology_note`.
+
+      2. **checkout_loop** — How in-chat checkout closes the loop. The
+         end-to-end 6-step chain from grounded Gemini citation to
+         merchant Shopify admin, each step tagged shipped/roadmap with
+         the verifying file or test reference. Anchors on Shopify-only
+         today (verified e2e with test merchant); other platforms
+         (Wix / Woo / PrestaShop) have adapters but the order-completion
+         dispatch isn't wired yet — disclosed honestly in
+         `platform_coverage`."""
     gap_pct = max(0, 100 - int(attribution_score))
     top_retailers = [
         r["host"] for r in (category_retailer_hosts or [])[:3] if r.get("host")
@@ -1366,54 +1370,125 @@ def _build_what_pivota_changes(
         f"remaining ~{gap_pct}% of the AI-channel funnel is captured by "
         f"{retailer_phrase}."
     )
-    return {
-        "today_summary": today_summary,
-        "after_onboarding": [
+
+    discovery_lift = {
+        "title": "Why your AI-channel visibility will improve",
+        "current_state": (
+            f"{cat_phrase}; {merchant_cited_runs}/{attribution_runs} "
+            f"buyer-intent queries reach your URL today. Retailer pages "
+            f"({retailer_phrase}) capture the rest of the grounded surface."
+        ),
+        "pivota_reference": (
+            f"Pivota's {PIVOTA_PDP_BASELINE_REFERENCE['sample_size_pdps']} "
+            f"canonical seed PDPs currently surface in Gemini grounding "
+            f"with median visibility "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100 and "
+            f"median attribution "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100 "
+            f"(internal baseline, "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']}). These are the "
+            f"infrastructure scores merchants inherit on onboarding."
+        ),
+        "mechanics": [
             {
-                "title": "First-party AI attribution",
-                "today": (
-                    f"~{gap_pct}% of the AI-channel funnel routes through "
-                    f"{retailer_phrase} — every retailer-cited query is a "
-                    f"margin hit (reseller markup) and a customer "
-                    f"relationship the merchant doesn't own."
-                ),
-                "after": (
-                    "Pivota canonical PDP captured in grounded Gemini answers "
-                    "→ first-party attribution + direct customer relationship, "
-                    "complementary to existing retail distribution."
-                ),
+                "label": "Canonical AI-channel PDP per SKU",
+                "evidence": "agent.pivota.cc/products/sig_* (sitemap-seeds.ts)",
+                "shipped": True,
             },
             {
-                "title": "In-chat checkout (the AI-native lever)",
-                "today": (
-                    f"Consumers ask Gemini / ChatGPT → click out to "
-                    f"{merchant_pdp_url} or get routed through retailer.com → "
-                    f"cart-abandonment risk + redirect friction + retailer "
-                    f"markup if the path is a reseller."
-                ),
-                "after": (
-                    "Consumers complete checkout inside Gemini / ChatGPT via "
-                    "Pivota's agentic-commerce protocol — no redirect, no "
-                    "retailer margin loss, first-party transaction data. This "
-                    "is the AI-channel UX boundary the merchant doesn't have "
-                    "any path to today."
-                ),
+                "label": "Schema.org Product + Offer + BreadcrumbList structured data",
+                "evidence": "pivota-agent-ui/src/app/products/[id]/productJsonLd.ts",
+                "shipped": True,
             },
             {
-                "title": "Pivota PDP baseline reference",
-                "value": (
-                    f"Pivota's {PIVOTA_PDP_BASELINE_REFERENCE['sample_size_pdps']} "
-                    f"canonical PDPs currently surface in Gemini grounding "
-                    f"with median visibility "
-                    f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100 "
-                    f"and median attribution "
-                    f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100 "
-                    f"(internal baseline run, "
-                    f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']}). Onboarded "
-                    f"merchants inherit this AI-channel surface for their SKUs."
-                ),
+                "label": "Sitemap submission + URL-Inspection indexing for grounded retrieval",
+                "evidence": "pivota-agent-ui/src/app/sitemap.xml + sitemap-products.xml",
+                "shipped": True,
+            },
+            {
+                "label": "Semantic categorization via canonical title patterns + breadcrumbs",
+                "evidence": "category-aware metadata + JSON-LD breadcrumbs",
+                "shipped": True,
             },
         ],
+        "prediction": (
+            "On onboarding, the merchant's SKUs inherit the four mechanics "
+            "above. Comparable lift is expected based on the 6-PDP baseline; "
+            "individual SKU performance varies with category competition + "
+            "Google indexing latency."
+        ),
+        "methodology_note": (
+            "Comparative reference, not paired A/B. The 67/50 figures come "
+            "from running the same probe set against Pivota's canonical "
+            "seed PDPs covering similar categories. Run "
+            "scripts/agent_center_pivota_pdp_baseline.py to refresh."
+        ),
+    }
+
+    checkout_loop = {
+        "title": "How in-chat checkout closes the loop",
+        "chain": [
+            {
+                "step": 1,
+                "label": "AI agent (Gemini / ChatGPT / shopping agent) cites the Pivota canonical PDP in a grounded answer",
+                "evidence": "AI Commerce Readiness audit (this report) + agent.pivota.cc/products/sig_*",
+                "shipped": True,
+            },
+            {
+                "step": 2,
+                "label": "Consumer (or their AI agent) triggers buy intent on the PDP",
+                "evidence": "pivota-agent-ui/src/app/products/[id]/ProductDetailClient.tsx handleCheckout()",
+                "shipped": True,
+            },
+            {
+                "step": 3,
+                "label": "UCP (Universal Commerce Protocol) checkout session opens in-chat",
+                "evidence": "pivota-agent-ui/src/app/api/ucp/checkout-sessions/route.ts",
+                "shipped": True,
+            },
+            {
+                "step": 4,
+                "label": "ACP (Agent Commerce Protocol) creates the order + processes payment",
+                "evidence": "pivota_infra_main/routes/order_routes.py POST /orders/create",
+                "shipped": True,
+            },
+            {
+                "step": 5,
+                "label": "Order forwarded to merchant Shopify admin async (background task)",
+                "evidence": "pivota_infra_main/routes/order_routes.py create_shopify_order() → Shopify admin /2024-01/orders.json",
+                "shipped": True,
+            },
+            {
+                "step": 6,
+                "label": "Merchant sees the order in their Shopify admin with first-party customer data (email, address, line items, attribution metadata)",
+                "evidence": "Verified e2e with test merchant merch_38fa56d5118b9974 + tests/test_shopify_order_sync_hardening.py",
+                "shipped": True,
+            },
+        ],
+        "platform_coverage": {
+            "shipped": ["Shopify"],
+            "roadmap": ["WooCommerce", "Wix", "PrestaShop"],
+            "note": (
+                "Shopify path is wired end-to-end and verified with a test "
+                "merchant. Adapters for Woo / Wix / PrestaShop exist in the "
+                "codebase but the order-completion dispatch is hardcoded to "
+                "Shopify today; multi-platform wiring is on the Q3 roadmap."
+            ),
+        },
+        "outcome": (
+            "Orders land in the merchant's Shopify admin within seconds of "
+            "in-chat completion. Customer email, shipping address, line "
+            "items, and source-attribution metadata "
+            "(`source = pivota_acp`, `agent = gemini`) are first-party data "
+            "the merchant owns — Pivota does not intermediate the customer "
+            "relationship."
+        ),
+    }
+
+    return {
+        "today_summary": today_summary,
+        "discovery_lift": discovery_lift,
+        "checkout_loop": checkout_loop,
     }
 
 
@@ -1699,31 +1774,77 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             body = action.get("body") or ""
             sections.append(f"**{idx}. {title}** _(severity: {sev})_  \n{body}\n")
 
-    # What Pivota changes — the post-onboarding delta. Renders between the
-    # diagnostic sections (verdict / industry / actions) and the per-query
-    # tables, so the merchant sees the value-prop framing before scrolling
-    # into the raw data.
+    # What Pivota changes — the post-onboarding delta. Two parts the
+    # merchant needs to believe: (1) why their AI-channel visibility
+    # will improve (discovery_lift, with mechanics + Pivota PDP
+    # reference); (2) how in-chat checkout closes the loop (6-step
+    # chain from grounded answer → merchant Shopify admin, each with
+    # verifying file/test reference).
     wpc = report.get("what_pivota_changes") or {}
-    if wpc.get("after_onboarding"):
+    if wpc.get("discovery_lift") or wpc.get("checkout_loop"):
         sections.append("## What Pivota changes after onboarding\n")
         if wpc.get("today_summary"):
             sections.append(f"**Today:** {wpc['today_summary']}\n")
-        sections.append("**After Pivota onboarding (two-part value prop):**\n")
-        levers = wpc.get("after_onboarding", [])
-        comparison_levers = [lev for lev in levers if "today" in lev and "after" in lev]
-        if comparison_levers:
-            table_rows = ["| Lever | Today | After Pivota |", "|---|---|---|"]
-            for lev in comparison_levers:
-                t = (lev.get("title") or "").replace("|", "\\|")
-                td = (lev.get("today") or "").replace("|", "\\|").replace("\n", " ")
-                af = (lev.get("after") or "").replace("|", "\\|").replace("\n", " ")
-                table_rows.append(f"| **{t}** | {td} | {af} |")
-            sections.append("\n".join(table_rows) + "\n")
-        for lev in levers:
-            if "value" in lev:
+
+        dl = wpc.get("discovery_lift") or {}
+        if dl:
+            sections.append(f"### {dl.get('title', 'Discovery lift')}\n")
+            if dl.get("current_state"):
+                sections.append(f"**Current state.** {dl['current_state']}\n")
+            if dl.get("pivota_reference"):
                 sections.append(
-                    f"_Pivota PDP reference: {lev['value']}_\n"
+                    f"**Pivota baseline (after-onboarding reference).** "
+                    f"{dl['pivota_reference']}\n"
                 )
+            mechanics = dl.get("mechanics") or []
+            if mechanics:
+                sections.append(
+                    "**Mechanics that produce that surface (all shipped):**\n"
+                )
+                mech_rows = [
+                    "| Mechanic | Evidence | Status |",
+                    "|---|---|---|",
+                ]
+                for m in mechanics:
+                    label = (m.get("label") or "").replace("|", "\\|")
+                    ev = (m.get("evidence") or "").replace("|", "\\|")
+                    status = "✅ shipped" if m.get("shipped") else "🔄 in progress"
+                    mech_rows.append(f"| {label} | `{ev}` | {status} |")
+                sections.append("\n".join(mech_rows) + "\n")
+            if dl.get("prediction"):
+                sections.append(f"**Prediction.** {dl['prediction']}\n")
+            if dl.get("methodology_note"):
+                sections.append(f"_{dl['methodology_note']}_\n")
+
+        cl = wpc.get("checkout_loop") or {}
+        if cl:
+            sections.append(f"### {cl.get('title', 'Checkout loop')}\n")
+            chain = cl.get("chain") or []
+            if chain:
+                chain_rows = [
+                    "| # | Step | Evidence | Status |",
+                    "|---|---|---|---|",
+                ]
+                for s in chain:
+                    n = s.get("step", "")
+                    label = (s.get("label") or "").replace("|", "\\|")
+                    ev = (s.get("evidence") or "").replace("|", "\\|")
+                    status = "✅ shipped" if s.get("shipped") else "🔄 in progress"
+                    chain_rows.append(f"| {n} | {label} | `{ev}` | {status} |")
+                sections.append("\n".join(chain_rows) + "\n")
+            pc = cl.get("platform_coverage") or {}
+            if pc:
+                shipped_list = ", ".join(pc.get("shipped") or [])
+                roadmap_list = ", ".join(pc.get("roadmap") or [])
+                sections.append(
+                    f"**Platform coverage.** "
+                    f"Today: {shipped_list or '(none)'}. "
+                    f"Roadmap: {roadmap_list or '(none)'}.\n"
+                )
+                if pc.get("note"):
+                    sections.append(f"_{pc['note']}_\n")
+            if cl.get("outcome"):
+                sections.append(f"**Outcome.** {cl['outcome']}\n")
 
     sections.append("## 1. Open product visibility\n")
     sections.append(
