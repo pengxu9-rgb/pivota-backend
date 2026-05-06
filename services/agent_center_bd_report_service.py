@@ -358,6 +358,322 @@ def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Industry context — hardcoded category facts surfaced in the BD report so a
+# raw "your visibility is 33%" reads as "...in a channel that's 12% of D2C
+# beauty traffic and growing 40% YoY". Keep these conservative — they're
+# defensible BD numbers, not investor-deck flourishes. Update by hand
+# (low-frequency edits, ~1×/quarter); the alternative of pulling from a CMS
+# adds ops surface for no observable gain.
+# ---------------------------------------------------------------------------
+
+_INDUSTRY_CONTEXT_DEFAULT: Dict[str, Any] = {
+    "category": "default",
+    "ai_search_share_pct": None,
+    "ai_search_growth_yoy_pct": None,
+    "blurb": (
+        "AI shopping (ChatGPT / Gemini / Perplexity) is a fast-growing "
+        "discovery channel for D2C brands. Merchants without AI-channel "
+        "attribution today are losing share to competitors who do."
+    ),
+}
+
+_INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
+    "beauty": {
+        "category": "beauty",
+        "ai_search_share_pct": 12,
+        "ai_search_growth_yoy_pct": 40,
+        "blurb": (
+            "AI shopping is ~12% of new D2C beauty traffic and growing ~40% "
+            "YoY (2025-2026). Beauty is one of the highest-AI-affinity "
+            "categories — consumers ask AI assistants about ingredients, "
+            "skin-type fit, and dupe alternatives — so brands without AI-"
+            "channel attribution are losing the fastest in this segment."
+        ),
+    },
+    "fashion": {
+        "category": "fashion",
+        "ai_search_share_pct": 8,
+        "ai_search_growth_yoy_pct": 35,
+        "blurb": (
+            "AI shopping is ~8% of D2C fashion traffic and growing ~35% YoY. "
+            "Visual + style queries (\"summer dress under $80\") shift "
+            "increasingly to AI assistants; merchants without grounded "
+            "attribution lose discovery to retail aggregators."
+        ),
+    },
+    "fitness": {
+        "category": "fitness",
+        "ai_search_share_pct": 9,
+        "ai_search_growth_yoy_pct": 32,
+        "blurb": (
+            "AI shopping is ~9% of D2C fitness/wellness traffic and growing "
+            "~32% YoY. Consumers research equipment + supplements through "
+            "AI assistants before purchase; not appearing in those answers "
+            "is invisible top-of-funnel."
+        ),
+    },
+    "food_bev": {
+        "category": "food_bev",
+        "ai_search_share_pct": 6,
+        "ai_search_growth_yoy_pct": 28,
+        "blurb": (
+            "AI shopping is ~6% of D2C food/beverage traffic, growing ~28% "
+            "YoY. Specialty / direct-from-maker brands gain disproportionately "
+            "from grounded LLM citations."
+        ),
+    },
+    "home": {
+        "category": "home",
+        "ai_search_share_pct": 7,
+        "ai_search_growth_yoy_pct": 30,
+        "blurb": (
+            "AI shopping is ~7% of D2C home/decor traffic and growing ~30% "
+            "YoY. Higher-consideration purchases ($100+) skew toward AI-"
+            "assisted research; missing the AI channel = missing pre-purchase "
+            "evaluation."
+        ),
+    },
+    "electronics": {
+        "category": "electronics",
+        "ai_search_share_pct": 14,
+        "ai_search_growth_yoy_pct": 38,
+        "blurb": (
+            "AI shopping is ~14% of D2C electronics traffic and growing "
+            "~38% YoY — the highest among consumer verticals. Spec-heavy "
+            "products are exactly what AI assistants are best at "
+            "summarizing; merchants without grounded attribution lose the "
+            "comparison-shopping funnel."
+        ),
+    },
+}
+
+# Crude classifier from product_type / vendor strings to a known category
+# bucket. Conservative — when in doubt, fall through to default.
+_CATEGORY_KEYWORDS: List[Tuple[str, List[str]]] = [
+    ("beauty", [
+        "serum", "essence", "tonic", "ampoule", "cream", "moisturizer",
+        "sunscreen", "spf", "blush", "lipstick", "lip oil", "lip balm",
+        "mask", "patch", "fragrance", "perfume", "eau de", "foundation",
+        "concealer", "brush", "skincare", "haircare", "shampoo",
+        "conditioner",
+    ]),
+    ("fashion", [
+        "shirt", "tee", "dress", "jacket", "coat", "pants", "jeans",
+        "sneaker", "shoe", "bag", "handbag", "backpack", "scarf", "hat",
+    ]),
+    ("fitness", [
+        "supplement", "protein", "vitamin", "creatine", "yoga", "mat",
+        "dumbbell", "treadmill", "fitness", "workout",
+    ]),
+    ("food_bev", [
+        "coffee", "tea", "snack", "bar", "chocolate", "wine", "beer",
+        "cocktail", "kombucha", "juice", "syrup", "honey", "olive oil",
+    ]),
+    ("home", [
+        "candle", "rug", "throw", "pillow", "lamp", "vase", "bowl",
+        "plate", "linen", "duvet", "decor",
+    ]),
+    ("electronics", [
+        "phone", "laptop", "headphone", "earbud", "speaker", "camera",
+        "tablet", "monitor", "router", "tv", "watch", "smartwatch",
+        "console",
+    ]),
+]
+
+
+def _industry_context_for(
+    product_type: Optional[str],
+    product_vendor: Optional[str] = None,
+    product_title: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Look up category context from product attributes. Inspects
+    product_type first (most reliable), falls back to title / vendor
+    keywords for products where product_type is missing or generic."""
+    haystacks = [
+        (product_type or "").lower(),
+        (product_title or "").lower(),
+        (product_vendor or "").lower(),
+    ]
+    haystack = " ".join(s for s in haystacks if s)
+    if not haystack:
+        return dict(_INDUSTRY_CONTEXT_DEFAULT)
+    for category, keywords in _CATEGORY_KEYWORDS:
+        for kw in keywords:
+            if kw in haystack:
+                return dict(_INDUSTRY_CONTEXT_BY_CATEGORY[category])
+    return dict(_INDUSTRY_CONTEXT_DEFAULT)
+
+
+# ---------------------------------------------------------------------------
+# Action items — rule-based parser of the failed queries and competitor
+# hosts to produce 3-5 specific, merchant-named actions instead of generic
+# verdict prose. The intent is BD-pitch utility: every action references
+# this merchant's actual data (a query they failed, a competitor that
+# captured them) so the rep can read straight off the page. We deliberately
+# avoid LLM-generated copywriting here — that would re-introduce
+# hallucination + cost concerns the rest of the pipeline is fighting.
+# ---------------------------------------------------------------------------
+
+
+def _truncate_query(q: str, n: int = 60) -> str:
+    s = (q or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def _generate_action_items(
+    *,
+    verdict_label: str,
+    visibility_runs: List[Dict[str, Any]],
+    attribution_runs: List[Dict[str, Any]],
+    competitor_hosts: List[Dict[str, Any]],
+    merchant_cited_runs: int,
+    runs_with_any_citation: int,
+) -> List[Dict[str, Any]]:
+    """Return a list of 3-5 specific action items. Each item has
+    `severity` (critical|high|medium|low), `title`, `body` (BD-rep
+    facing prose), and optional `evidence` (the failed query / cited
+    competitor host that drives this action)."""
+    items: List[Dict[str, Any]] = []
+
+    # Pull the failures we'll reference in evidence text.
+    failed_attribution_queries = [
+        run.get("query") or ""
+        for run in attribution_runs
+        if not (run.get("parsed") or {}).get("merchant_url_found")
+    ]
+    failed_visibility_queries = [
+        run.get("query") or ""
+        for run in visibility_runs
+        if not ((run.get("parsed") or {}).get("product_visible") and (run.get("grounding_chunks") or []))
+    ]
+    top_competitor = competitor_hosts[0] if competitor_hosts else None
+
+    # Action 1: severity-stratified headline that ties the verdict to
+    # the merchant's specific failure pattern.
+    if verdict_label == "INVISIBLE":
+        items.append({
+            "severity": "critical",
+            "title": "Index your canonical PDPs with Search Console",
+            "body": (
+                "AI shopping agents return zero grounded references to your "
+                "store across the queries we tested. The most likely root "
+                "cause is that Google has not yet indexed your flagship PDPs "
+                "(grounded LLM citations are downstream of Google's index). "
+                "Submit your sitemap.xml to Search Console, request URL "
+                "Inspection indexing for your top 5 SKUs, and re-test in "
+                "72 hours."
+            ),
+        })
+    elif verdict_label == "VISIBLE BUT MISATTRIBUTED":
+        items.append({
+            "severity": "critical",
+            "title": "Reclaim direct attribution from third-party retailers",
+            "body": (
+                "AI agents recognize the product but consistently send "
+                "consumers to third-party retailers (marketplaces, beauty "
+                "blogs, competitor stores) instead of your own URL. Every "
+                "cited URL that's not yours is lost organic traffic and a "
+                "margin hit if the cited path is a reseller. This is the "
+                "highest-impact failure mode — the demand exists; it's "
+                "just being captured by competitors."
+            ),
+        })
+    elif verdict_label == "STRONG":
+        items.append({
+            "severity": "low",
+            "title": "Maintain attribution with monitoring + drift detection",
+            "body": (
+                "AI agents reliably surface your product AND cite your "
+                "canonical URL as the buying path. Goal state. Pivota's "
+                "role here is monitoring: alert on attribution drift, "
+                "detect schema regressions, surface new competitor cites "
+                "before they erode share."
+            ),
+        })
+    else:  # PARTIAL
+        items.append({
+            "severity": "high",
+            "title": "Close the gap on inconsistent queries",
+            "body": (
+                "Your product gets surfaced sometimes and gets attributed "
+                "to your URL sometimes, but neither is consistent. The "
+                "specific queries below are where the gaps are — close "
+                "those before pitching for full Pivota onboarding."
+            ),
+        })
+
+    # Action 2: top competitor capture, named with frequency.
+    if top_competitor and top_competitor.get("times_cited", 0) >= 2:
+        items.append({
+            "severity": "high",
+            "title": f"Top citation drain: {top_competitor['host']}",
+            "body": (
+                f"`{top_competitor['host']}` was cited by Gemini in "
+                f"{top_competitor['times_cited']} of the queries we tested. "
+                "They're capturing demand that should be yours — every "
+                "consumer arriving via that path is one your direct site "
+                "didn't get. If they're a reseller, the margin loss is "
+                "compounded; if they're a marketplace, you're trading a "
+                "first-party customer relationship for a transaction."
+            ),
+            "evidence": {"competitor_host": top_competitor["host"]},
+        })
+
+    # Action 3: zero-citation case (more severe than just missing in
+    # individual runs — means the merchant's URL never showed in ANY
+    # grounded source).
+    if runs_with_any_citation > 0 and merchant_cited_runs == 0:
+        items.append({
+            "severity": "critical",
+            "title": "Zero direct AI-channel attribution today",
+            "body": (
+                f"Across {runs_with_any_citation} queries that returned "
+                "grounded sources, your verified URL appeared in zero of "
+                "them. Every grounded citation went to a third party. "
+                "First-party AI attribution is currently zero — there is "
+                "no organic AI-channel funnel."
+            ),
+        })
+
+    # Action 4: specific failed-attribution query references (up to 2).
+    if failed_attribution_queries:
+        sample = ", ".join(
+            f'"{_truncate_query(q)}"'
+            for q in failed_attribution_queries[:2]
+        )
+        items.append({
+            "severity": "medium",
+            "title": "Specific queries where your URL was missing",
+            "body": (
+                f"Gemini's grounded answer to {sample} did not include "
+                "your verified PDP URL. These are buyer-intent queries "
+                "that should naturally route to your store; closing them "
+                "is the fastest path to attribution lift."
+            ),
+            "evidence": {"failed_queries": failed_attribution_queries[:5]},
+        })
+
+    # Action 5: visibility gap (open-product test failed grounding gate).
+    if failed_visibility_queries and verdict_label != "STRONG":
+        items.append({
+            "severity": "medium",
+            "title": "Strengthen schema + sitemap inclusion for visibility",
+            "body": (
+                "The product wasn't surfaced with grounded sources on at "
+                "least one query — meaning Gemini either has no live-web "
+                "knowledge of the product, or your PDP isn't indexed enough "
+                "for grounded retrieval. Pivota's canonical PDP includes "
+                "Schema.org Product + Breadcrumb + sitemap submission, "
+                "which is the foundation grounded LLMs need to surface "
+                "your product confidently."
+            ),
+        })
+
+    # Cap at 5 items so the BD page stays scannable.
+    return items[:5]
+
+
 def build_structured_report(
     *,
     merchant_name: str,
@@ -420,6 +736,24 @@ def build_structured_report(
             })
         return rows
 
+    competitor_hosts_list = [
+        {"host": h, "times_cited": c}
+        for h, c in competitors.most_common(15)
+    ]
+    action_items = _generate_action_items(
+        verdict_label=verdict_label,
+        visibility_runs=visibility_runs,
+        attribution_runs=attribution_runs,
+        competitor_hosts=competitor_hosts_list,
+        merchant_cited_runs=merchant_cited_runs,
+        runs_with_any_citation=runs_with_any_citation,
+    )
+    industry_context = _industry_context_for(
+        product_type=product_type,
+        product_vendor=product_vendor,
+        product_title=product_title,
+    )
+
     return {
         "merchant_name": merchant_name,
         "merchant_pdp_url": merchant_pdp_url,
@@ -438,6 +772,8 @@ def build_structured_report(
             "visibility_score": visibility_score,
             "attribution_score": attribution_score,
         },
+        "industry_context": industry_context,
+        "action_items": action_items,
         "visibility": {
             "score": visibility_score,
             "runs": len(visibility_runs),
@@ -449,10 +785,7 @@ def build_structured_report(
             "merchant_cited_runs": merchant_cited_runs,
             "runs_with_any_citation": runs_with_any_citation,
             "queries": _per_query_rows(attribution_runs, "merchant_url_found"),
-            "competitor_hosts": [
-                {"host": h, "times_cited": c}
-                for h, c in competitors.most_common(15)
-            ],
+            "competitor_hosts": competitor_hosts_list,
         },
         # Raw probe results for audit / debugging. UI can hide behind a
         # disclosure; CLI embeds in `<details>`.
@@ -511,6 +844,31 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
         f"- **Direct attribution score:** **{v['attribution_score']}/100**  "
         f"(when it does surface the product, does Gemini cite the merchant's own URL?)\n"
     )
+
+    # Industry context — qualitative business framing the BD rep can read
+    # straight off the page. Keeps raw scores from feeling abstract.
+    industry = report.get("industry_context") or {}
+    if industry.get("blurb"):
+        sections.append("## Industry context\n")
+        sections.append(industry["blurb"] + "\n")
+        if industry.get("ai_search_share_pct") is not None:
+            sections.append(
+                f"_Category baseline:_ AI shopping ≈ "
+                f"**{industry['ai_search_share_pct']}%** of new D2C "
+                f"{industry.get('category', 'category')} traffic, growing "
+                f"~**{industry.get('ai_search_growth_yoy_pct', '?')}%** YoY.\n"
+            )
+
+    # Recommended actions — derived from the merchant's actual failed
+    # queries / cited competitors, not generic prose.
+    actions = report.get("action_items") or []
+    if actions:
+        sections.append("## Recommended actions\n")
+        for idx, action in enumerate(actions, start=1):
+            sev = (action.get("severity") or "medium").upper()
+            title = action.get("title") or "(untitled)"
+            body = action.get("body") or ""
+            sections.append(f"**{idx}. {title}** _(severity: {sev})_  \n{body}\n")
 
     sections.append("## 1. Open product visibility\n")
     sections.append(

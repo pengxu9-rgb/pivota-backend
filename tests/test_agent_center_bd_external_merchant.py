@@ -368,3 +368,249 @@ def test_render_markdown_handles_empty_attribution_runs() -> None:
         },
     })
     assert "didn't return any cited URLs" in report
+
+
+# ---------------------------------------------------------------------------
+# Phase 1b: industry_context — category lookup
+# ---------------------------------------------------------------------------
+
+
+def test_industry_context_routes_beauty_keywords() -> None:
+    from services.agent_center_bd_report_service import _industry_context_for
+    ctx = _industry_context_for("eye patch", "Beauty of Joseon", "Revive Under Eye Patch")
+    assert ctx["category"] == "beauty"
+    assert ctx["ai_search_share_pct"] == 12
+    assert "beauty" in ctx["blurb"].lower()
+
+
+def test_industry_context_routes_fashion_keywords() -> None:
+    from services.agent_center_bd_report_service import _industry_context_for
+    ctx = _industry_context_for("sneaker", "Allbirds", "Tree Runners")
+    assert ctx["category"] == "fashion"
+
+
+def test_industry_context_routes_electronics_keywords() -> None:
+    from services.agent_center_bd_report_service import _industry_context_for
+    ctx = _industry_context_for("headphone", "Sony", "WH-1000XM5")
+    assert ctx["category"] == "electronics"
+    assert ctx["ai_search_share_pct"] == 14  # highest among consumer verticals
+
+
+def test_industry_context_default_when_unknown() -> None:
+    from services.agent_center_bd_report_service import _industry_context_for
+    ctx = _industry_context_for(None, None, None)
+    assert ctx["category"] == "default"
+    assert ctx["ai_search_share_pct"] is None  # don't fabricate numbers
+    assert "fast-growing discovery channel" in ctx["blurb"]
+
+
+def test_industry_context_inspects_title_when_product_type_missing() -> None:
+    """Real BD scenario: operator forgets product_type. Fall back to
+    title-keyword match so we still classify correctly."""
+    from services.agent_center_bd_report_service import _industry_context_for
+    ctx = _industry_context_for(None, "Glossier", "Cloud Paint blush")
+    assert ctx["category"] == "beauty"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1b: action_items — rule-based merchant-specific actions
+# ---------------------------------------------------------------------------
+
+
+def _attr_run(query: str, *, found: bool, grounding: List[str] | None = None) -> Dict[str, Any]:
+    return {
+        "query": query,
+        "parsed": {"merchant_url_found": found},
+        "grounding_chunks": grounding or [],
+    }
+
+
+def _vis_run(query: str, *, visible: bool, grounding: List[str] | None = None) -> Dict[str, Any]:
+    return {
+        "query": query,
+        "parsed": {"product_visible": visible},
+        "grounding_chunks": grounding or [],
+    }
+
+
+def test_action_items_invisible_leads_with_search_console() -> None:
+    """INVISIBLE = nothing surfaces; root cause is most likely indexing,
+    so the first action must point at Search Console submission."""
+    from services.agent_center_bd_report_service import _generate_action_items
+    items = _generate_action_items(
+        verdict_label="INVISIBLE",
+        visibility_runs=[_vis_run("q1", visible=False), _vis_run("q2", visible=False)],
+        attribution_runs=[_attr_run("q1", found=False), _attr_run("q2", found=False)],
+        competitor_hosts=[],
+        merchant_cited_runs=0,
+        runs_with_any_citation=0,
+    )
+    assert items[0]["severity"] == "critical"
+    assert "Search Console" in items[0]["body"]
+
+
+def test_action_items_misattributed_calls_out_zero_attribution_and_top_competitor() -> None:
+    """The BD sweet spot: VISIBLE BUT MISATTRIBUTED with a clear top
+    competitor. Rep should see (a) the verdict-level callout,
+    (b) the named competitor, (c) zero-attribution flag, (d) failed
+    query references."""
+    from services.agent_center_bd_report_service import _generate_action_items
+    items = _generate_action_items(
+        verdict_label="VISIBLE BUT MISATTRIBUTED",
+        visibility_runs=[
+            _vis_run("where can I buy X", visible=True, grounding=["https://sephora.com/x"]),
+            _vis_run("X reviews", visible=True, grounding=["https://allure.com/r"]),
+        ],
+        attribution_runs=[
+            _attr_run("where can I buy X", found=False, grounding=["https://sephora.com/x"]),
+            _attr_run("shop X online", found=False, grounding=["https://ulta.com/y"]),
+        ],
+        competitor_hosts=[
+            {"host": "Sephora", "times_cited": 3},
+            {"host": "Ulta", "times_cited": 1},
+        ],
+        merchant_cited_runs=0,
+        runs_with_any_citation=2,
+    )
+    assert items[0]["severity"] == "critical"
+    titles = [i["title"] for i in items]
+    bodies = " ".join(i["body"] for i in items)
+    # Top-competitor named with frequency
+    assert any("Sephora" in t for t in titles)
+    assert "3 of the queries" in bodies
+    # Zero-attribution callout
+    assert any("Zero direct AI-channel attribution" in t for t in titles)
+
+
+def test_action_items_strong_yields_low_severity_maintain_action() -> None:
+    from services.agent_center_bd_report_service import _generate_action_items
+    items = _generate_action_items(
+        verdict_label="STRONG",
+        visibility_runs=[_vis_run("q", visible=True, grounding=["https://x.com"])],
+        attribution_runs=[_attr_run("q", found=True, grounding=["https://x.com/p"])],
+        competitor_hosts=[],
+        merchant_cited_runs=1,
+        runs_with_any_citation=1,
+    )
+    assert items[0]["severity"] == "low"
+    assert "monitoring" in items[0]["body"].lower()
+
+
+def test_action_items_capped_at_5() -> None:
+    """Even when every action condition fires, list stays scannable."""
+    from services.agent_center_bd_report_service import _generate_action_items
+    items = _generate_action_items(
+        verdict_label="VISIBLE BUT MISATTRIBUTED",
+        visibility_runs=[
+            _vis_run("q1", visible=False),
+            _vis_run("q2", visible=False),
+            _vis_run("q3", visible=False),
+        ],
+        attribution_runs=[
+            _attr_run("q1", found=False),
+            _attr_run("q2", found=False),
+            _attr_run("q3", found=False),
+        ],
+        competitor_hosts=[
+            {"host": "Sephora", "times_cited": 5},
+            {"host": "Ulta", "times_cited": 3},
+        ],
+        merchant_cited_runs=0,
+        runs_with_any_citation=3,
+    )
+    assert len(items) <= 5
+
+
+def test_action_items_referenced_failed_queries_truncated() -> None:
+    """Failed queries are surfaced inline; long ones must be truncated
+    so the markdown stays scannable."""
+    from services.agent_center_bd_report_service import _generate_action_items
+    long_query = "where can I buy this very long product name with many additional descriptors blah blah"
+    items = _generate_action_items(
+        verdict_label="PARTIAL",
+        visibility_runs=[_vis_run(long_query, visible=False)],
+        attribution_runs=[_attr_run(long_query, found=False)],
+        competitor_hosts=[],
+        merchant_cited_runs=0,
+        runs_with_any_citation=0,
+    )
+    failed_queries_action = next(
+        (i for i in items if "queries where your URL was missing" in i["title"]),
+        None,
+    )
+    assert failed_queries_action is not None
+    assert "…" in failed_queries_action["body"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1b: structured report wires action_items + industry_context
+# ---------------------------------------------------------------------------
+
+
+def test_structured_report_includes_action_items_and_industry_context() -> None:
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://beautyofjoseon.com/products/under-eye-patch",
+        product_title="Revive Under Eye Patch",
+        product_vendor="Beauty of Joseon",
+        product_type="eye patch",
+        visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 33},
+            "raw_runs": [
+                _vis_run("q1", visible=True, grounding=["https://x.com"]),
+                _vis_run("q2", visible=False),
+                _vis_run("q3", visible=False),
+            ],
+        },
+        attribution_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [
+                _attr_run("q1", found=False, grounding=["https://sephora.com/x"]),
+                _attr_run("q2", found=False, grounding=["https://sephora.com/y"]),
+                _attr_run("q3", found=False),
+            ],
+        },
+        provider="gemini",
+    )
+    # Industry context picked from "eye patch" → beauty
+    assert report["industry_context"]["category"] == "beauty"
+    assert report["industry_context"]["ai_search_share_pct"] == 12
+    # Action items generated
+    assert isinstance(report["action_items"], list)
+    assert 1 <= len(report["action_items"]) <= 5
+    # Verdict is MISATTRIBUTED, so first action is the critical
+    # reclaim-attribution callout
+    assert report["action_items"][0]["severity"] == "critical"
+
+
+def test_render_markdown_includes_industry_context_and_actions() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://beautyofjoseon.com/products/under-eye-patch",
+        product_title="Revive Under Eye Patch",
+        product_vendor="Beauty of Joseon",
+        product_type="eye patch",
+        visibility_result={
+            "provider": "gemini", "scores": {"visibility_score": 33},
+            "raw_runs": [_vis_run("q1", visible=True, grounding=["https://x.com"])],
+        },
+        attribution_result={
+            "provider": "gemini", "scores": {"visibility_score": 0},
+            "raw_runs": [_attr_run("q1", found=False, grounding=["https://sephora.com/x"])],
+        },
+        provider="gemini",
+    )
+    md = render_markdown_from_structured(report)
+    # Industry context section + concrete category figure
+    assert "## Industry context" in md
+    assert "12%" in md
+    # Recommended actions section + at least one severity-tagged item
+    assert "## Recommended actions" in md
+    assert "_(severity:" in md
