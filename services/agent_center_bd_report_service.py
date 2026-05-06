@@ -1409,89 +1409,168 @@ def _build_what_pivota_changes(
     )
 
     discovery_lift = {
-        "title": "Why your AI-channel visibility will improve",
+        "title": "Why your AI-channel discoverability will improve (multi-layer)",
         "current_state": (
             f"{cat_phrase}; {merchant_cited_runs}/{attribution_runs} "
-            f"buyer-intent queries reach your URL today. Retailer pages "
-            f"({retailer_phrase}) capture the rest of the grounded surface."
+            f"buyer-intent queries reach your URL today (this audit "
+            f"measures Layer 1: grounded LLM citation). Retailer pages "
+            f"({retailer_phrase}) capture the rest of the grounded "
+            f"surface — Layer 3 below."
         ),
-        "pivota_reference": (
-            f"Honest disclosure: for named-product buyer-intent queries "
-            f"(the same probe modes that score this merchant's "
-            f"attribution), Pivota's "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['sample_size_pdps']} "
-            f"canonical seed PDPs currently sit at median visibility "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100 + "
-            f"median attribution "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100 "
-            f"(internal baseline run "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']} — "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['cited_count']}/"
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['succeeded_count']} PDPs "
-            f"cited in Gemini grounding). The AI-channel mechanics "
-            f"(canonical PDP + Schema.org + sitemap + agentic-commerce) "
-            f"are shipped per the table below — but Pivota's PDPs are "
-            f"in the indexing-up phase: Google's grounded-retrieval "
-            f"index is a 30-90 day arc post-publication, and our "
-            f"canonical pages are working through Search Console URL "
-            f"Inspection. Today's Pivota baseline ≈ today's prospect "
-            f"baseline (both near-zero on named-product attribution); "
-            f"Pivota's value compounds over the indexing window plus "
-            f"the in-chat checkout surface that ships day-1. See "
-            f"`reports/pivota-pdp-baseline.md` for the live operational "
-            f"health check."
-        ),
-        "mechanics": [
+        # The 3-layer agentic discovery surface. The merchant is buying
+        # access to all three layers; today's audit only measures Layer 1.
+        # Layer 2 is what's distinct about Pivota — direct API queries
+        # from the proliferating agent ecosystem, independent of Google
+        # indexing.
+        "layers": [
             {
-                "label": "Canonical AI-channel PDP per SKU",
-                "evidence": "agent.pivota.cc/products/sig_* (sitemap-seeds.ts)",
-                "shipped": True,
+                "name": "Layer 1 — Grounded LLM citation",
+                "subtitle": "Gemini today; ChatGPT search / Perplexity / Claude as those engines mature",
+                "what_it_is": (
+                    "AI assistants that ground answers in live web search "
+                    "(Google for Gemini, Bing for ChatGPT, etc.) cite "
+                    "indexed canonical pages. Indexed PDPs surface as "
+                    "buying paths. This is what `attribution_score` in "
+                    "this report measures."
+                ),
+                "pivota_status": (
+                    f"**Indexing-up phase.** "
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['cited_count']}/"
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['succeeded_count']} "
+                    f"Pivota canonical PDPs cited in Gemini grounding "
+                    f"as of "
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']} — "
+                    f"30-90 day arc post-publication, working through "
+                    f"Search Console URL Inspection. See "
+                    f"`reports/pivota-pdp-baseline.md` for live "
+                    f"operational health."
+                ),
+                "merchant_metric": "attribution_score",
+                "mechanics": [
+                    {
+                        "label": "Canonical AI-channel PDP per SKU",
+                        "evidence": "agent.pivota.cc/products/sig_* (sitemap-seeds.ts)",
+                        "shipped": True,
+                    },
+                    {
+                        "label": "Schema.org Product + Offer + BreadcrumbList structured data",
+                        "evidence": "pivota-agent-ui/src/app/products/[id]/productJsonLd.ts",
+                        "shipped": True,
+                    },
+                    {
+                        "label": "Sitemap submission + URL-Inspection indexing for grounded retrieval",
+                        "evidence": "pivota-agent-ui/src/app/sitemap.xml + sitemap-products.xml",
+                        "shipped": True,
+                    },
+                    {
+                        "label": "Semantic categorization via canonical title patterns + breadcrumbs",
+                        "evidence": "category-aware metadata + JSON-LD breadcrumbs",
+                        "shipped": True,
+                    },
+                ],
             },
             {
-                "label": "Schema.org Product + Offer + BreadcrumbList structured data",
-                "evidence": "pivota-agent-ui/src/app/products/[id]/productJsonLd.ts",
-                "shipped": True,
+                "name": "Layer 2 — Agent-direct API queries",
+                "subtitle": "Apps-as-agents + personal agents: ChatGPT GPTs, Claude Projects, Perplexity Agents, vertical commerce agents",
+                "what_it_is": (
+                    "Apps that transform into agents and personal agents "
+                    "(Klarna's shopping agent, ChatGPT GPTs, Claude "
+                    "Projects, custom corporate procurement agents) "
+                    "connect to Pivota via ACP + UCP API. When a user "
+                    "prompts these agents (\"find me a snail mucin "
+                    "mask under $20\", \"replenish my eye-patch order\"), "
+                    "the agent queries Pivota's catalog and recommends "
+                    "matching merchant products + completes checkout. "
+                    "**Independent of Google indexing** — agents resolve "
+                    "canonical PDPs by their stable Pivota URL and "
+                    "complete commerce via the agentic-commerce protocol. "
+                    "This is the layer where Pivota wins the long game: "
+                    "every new app that becomes an agent is a new "
+                    "channel, and onboarded merchants are immediately "
+                    "queryable across all of them without bilateral "
+                    "integration work."
+                ),
+                "pivota_status": (
+                    "**Shipped + queryable today.** ACP + UCP + "
+                    "agent_shop_gateway are all live; canonical PDPs are "
+                    "addressable URLs any agent can reference. Onboarded "
+                    "merchants are agent-queryable on day-1 of "
+                    "onboarding, independent of Layer 1's indexing arc."
+                ),
+                "merchant_metric": None,  # binary by integration; no per-merchant probe
+                "mechanics": [
+                    {
+                        "label": "ACP /orders/create — agents create + complete orders",
+                        "evidence": "pivota-acp/pivota_infra_main/routes/order_routes.py + tests/test_acp_shopify_order_forwarding.py",
+                        "shipped": True,
+                    },
+                    {
+                        "label": "UCP /ucp/v1/checkout-sessions — agent-callable checkout",
+                        "evidence": "pivota-agent-ui/src/app/api/ucp/checkout-sessions/route.ts",
+                        "shipped": True,
+                    },
+                    {
+                        "label": "agent_shop_gateway /agent/shop/v1/invoke — unified agent operation surface",
+                        "evidence": "PIVOTA-Agent/routes/agent_shop_gateway.py",
+                        "shipped": True,
+                    },
+                    {
+                        "label": "Canonical PDP URLs as stable agent-resolvable identifiers",
+                        "evidence": "agent.pivota.cc/products/sig_* — passed to checkout intents by agents",
+                        "shipped": True,
+                    },
+                ],
             },
             {
-                "label": "Sitemap submission + URL-Inspection indexing for grounded retrieval",
-                "evidence": "pivota-agent-ui/src/app/sitemap.xml + sitemap-products.xml",
-                "shipped": True,
-            },
-            {
-                "label": "Semantic categorization via canonical title patterns + breadcrumbs",
-                "evidence": "category-aware metadata + JSON-LD breadcrumbs",
-                "shipped": True,
+                "name": "Layer 3 — Editorial / retail co-citation",
+                "subtitle": "Vogue, Sephora, Ulta, beauty marketplaces — outside Pivota's direct lever",
+                "what_it_is": (
+                    "Editorial content + retailer pages that AI agents "
+                    "cite for category-level queries (\"best face masks "
+                    "2026\"). This is what `category_visibility_score` "
+                    "in the audit above measures. Pivota does not "
+                    "displace this layer — we co-exist with retail "
+                    "distribution."
+                ),
+                "pivota_status": (
+                    "Not in Pivota's lever — driven by the merchant's "
+                    "editorial PR + retail distribution relationships. "
+                    "Pivota's value here is making sure when AI agents "
+                    "follow these citations, the buying path lands on "
+                    "the merchant's first-party surface (Layer 1 + 2), "
+                    "not a reseller's checkout."
+                ),
+                "merchant_metric": "category_visibility_score",
+                "mechanics": [],
             },
         ],
         "prediction": (
-            "Indexing is the rate-limiting step. On onboarding, the "
-            "merchant's SKUs inherit the four mechanics above + are "
-            "submitted to Search Console URL Inspection on a rolling "
-            "cadence; first grounded citations typically appear 30-90 "
-            "days post-submission. Pivota's PDPs are themselves on the "
-            "same indexing curve today (see `pivota_reference` above) — "
-            "we are co-investing with onboarded merchants on that arc, "
-            "not selling a finished AI-channel surface. Day-1 value "
-            "lives in the in-chat checkout surface (the Checkout Loop "
-            "section below), which is shipped + verified end-to-end on "
-            "the test merchant."
+            "Layer 1 (grounded LLM) follows the 30-90 day Google "
+            "indexing arc; Pivota co-invests with onboarded merchants "
+            "via Search Console URL Inspection submissions. Layer 2 "
+            "(agent-direct API) is the day-1 value: any app or personal "
+            "agent integrating with Pivota's ACP/UCP can recommend the "
+            "merchant's products from the moment onboarding completes, "
+            "independent of Google indexing. The compounding play sits "
+            "in Layer 2 — as the agent ecosystem grows (every app "
+            "becoming an agent, personal agents proliferating), Pivota-"
+            "onboarded merchants are the agent-queryable catalog every "
+            "new agent plugs into without bilateral integration work."
         ),
         "methodology_note": (
-            "Comparative reference, not paired A/B. The "
+            "This audit's `attribution_score` measures Layer 1 only "
+            "(grounded LLM citation via Gemini). The "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/"
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']} "
-            "figures come from the named-product probes — `"
+            "Pivota baseline (probe modes: `"
             + "` + `".join(PIVOTA_PDP_BASELINE_REFERENCE["probe_modes_in_baseline"])
-            + "`. They are directly comparable to the merchant's "
-            "attribution_score in this report, NOT to "
-            "category_visibility_score (category-level Pivota PDP "
-            "coverage is a separate ops track and not in the baseline "
-            "yet). Pivota PDPs are currently in the "
+            + "`) is comparable only to attribution_score, NOT to "
+            "category_visibility_score (Layer 3) or to Layer 2's "
+            "agent-direct surface (no per-merchant probe — it's binary "
+            "by ACP/UCP integration). Pivota PDPs are currently in the "
             f"`{PIVOTA_PDP_BASELINE_REFERENCE['indexing_phase']}` "
-            "phase — Google indexing of canonical pages takes 30-90 "
-            "days post-publication; the baseline is expected to lift "
-            "as Search Console URL Inspection submissions mature. "
-            "Refresh via scripts/agent_center_pivota_pdp_baseline.py."
+            "phase for Layer 1; Layer 2 is shipped today. Refresh via "
+            "scripts/agent_center_pivota_pdp_baseline.py."
         ),
     }
 
@@ -2023,26 +2102,46 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             sections.append(f"### {dl.get('title', 'Discovery lift')}\n")
             if dl.get("current_state"):
                 sections.append(f"**Current state.** {dl['current_state']}\n")
-            if dl.get("pivota_reference"):
-                sections.append(
-                    f"**Pivota baseline (after-onboarding reference).** "
-                    f"{dl['pivota_reference']}\n"
-                )
-            mechanics = dl.get("mechanics") or []
-            if mechanics:
-                sections.append(
-                    "**Mechanics that produce that surface (all shipped):**\n"
-                )
-                mech_rows = [
-                    "| Mechanic | Evidence | Status |",
-                    "|---|---|---|",
-                ]
-                for m in mechanics:
-                    label = (m.get("label") or "").replace("|", "\\|")
-                    ev = (m.get("evidence") or "").replace("|", "\\|")
-                    status = "✅ shipped" if m.get("shipped") else "🔄 in progress"
-                    mech_rows.append(f"| {label} | `{ev}` | {status} |")
-                sections.append("\n".join(mech_rows) + "\n")
+            layers = dl.get("layers") or []
+            for layer in layers:
+                name = layer.get("name", "")
+                subtitle = layer.get("subtitle") or ""
+                heading = f"#### {name}"
+                if subtitle:
+                    heading += f"\n_{subtitle}_"
+                sections.append(heading + "\n")
+                if layer.get("what_it_is"):
+                    sections.append(f"{layer['what_it_is']}\n")
+                if layer.get("pivota_status"):
+                    sections.append(
+                        f"**Pivota status.** {layer['pivota_status']}\n"
+                    )
+                metric = layer.get("merchant_metric")
+                if metric:
+                    sections.append(
+                        f"**This layer's per-merchant signal in this audit:** "
+                        f"`{metric}`\n"
+                    )
+                else:
+                    sections.append(
+                        "**This layer's per-merchant signal in this audit:** "
+                        "_(not measured by this report; layer is binary by "
+                        "Pivota integration)_\n"
+                    )
+                mechs = layer.get("mechanics") or []
+                if mechs:
+                    rows = [
+                        "| Mechanic | Evidence | Status |",
+                        "|---|---|---|",
+                    ]
+                    for m in mechs:
+                        lab = (m.get("label") or "").replace("|", "\\|")
+                        ev = (m.get("evidence") or "").replace("|", "\\|")
+                        status = (
+                            "✅ shipped" if m.get("shipped") else "🔄 in progress"
+                        )
+                        rows.append(f"| {lab} | `{ev}` | {status} |")
+                    sections.append("\n".join(rows) + "\n")
             if dl.get("prediction"):
                 sections.append(f"**Prediction.** {dl['prediction']}\n")
             if dl.get("methodology_note"):
