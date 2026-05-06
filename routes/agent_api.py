@@ -2829,6 +2829,45 @@ async def _load_external_seed_products_with_cache(
             )
         else:
             metrics["brand_relevant_rows"] = len(cached_products)
+        # PR-02: refresh-on-thin. Recall probe v2 (pivota-agent-ui#139)
+        # showed shopping queries pinned at thin cache values (e.g. linen
+        # summer dress=4) because cache_hit short-circuits without ever
+        # re-fetching. When the cached row count is below the recall floor,
+        # schedule an async refresh so the NEXT request gets fresh data.
+        # Returns cache for this turn (no user-visible latency hit).
+        # Threshold env-overridable, defaults to 6 (matching SUMMARY.md PASS
+        # threshold). Disable by setting floor to 0.
+        thin_cache_refresh_floor = int(
+            _env_float(
+                "EXTERNAL_SEED_THIN_CACHE_REFRESH_FLOOR",
+                6.0,
+                min_value=0.0,
+                max_value=200.0,
+            )
+        )
+        if (
+            thin_cache_refresh_floor > 0
+            and len(cached_products) < thin_cache_refresh_floor
+        ):
+            metrics["thin_cache_refresh_scheduled"] = bool(
+                _schedule_external_seed_cache_refresh(
+                    cache_key=cache_key,
+                    req=req,
+                    query=query,
+                    query_semantic_class=query_semantic_class,
+                    limit=limit,
+                    page_offset=page_offset,
+                    build_budget_ms=build_budget_ms,
+                    build_concurrency=build_concurrency,
+                    include_seed_data_text_match=include_seed_data_text_match,
+                    enable_broad_fallback=enable_broad_fallback,
+                    expansion_terms=expansion_terms,
+                    brand_terms=brand_terms,
+                    brand_required_terms=normalized_brand_required_terms,
+                    brand_prefer_terms=normalized_brand_prefer_terms,
+                    brand_query_detected=brand_query_detected,
+                )
+            )
         return cached_products[:limit]
 
     metrics["cache_hit"] = False
