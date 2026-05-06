@@ -16,9 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.catalog_enrichment_agent.ingestion import (  # noqa: E402
     AGENT_VERSION,
+    MERCHANT_ID_PREFIX,
+    SKU_SUFFIX,
     canonical_product_name,
+    derive_merchant_id,
+    derive_offer_id,
     derive_product_key,
     derive_seed_id,
+    derive_sku_key,
     ingest_validated_jsonl,
     ingest_validated_record,
 )
@@ -223,26 +228,168 @@ def test_ingest_jsonl_dedupes_pdps_across_records():
         "destination_url": "https://sephora.com/p/mac-ruby-woo",
         "image_url": "", "price": 22.0, "in_stock": True,
     }])
-    pdps, seeds, skipped = ingest_validated_jsonl([rec1, rec2])
-    assert len(pdps) == 1
-    assert len(seeds) == 2
-    assert skipped == 0
-    assert seeds[0]["attached_product_key"] == pdps[0]["product_key"]
-    assert seeds[1]["attached_product_key"] == pdps[0]["product_key"]
+    out = ingest_validated_jsonl([rec1, rec2])
+    assert len(out["pdps"]) == 1
+    assert len(out["skus"]) == 1
+    assert len(out["seeds"]) == 2
+    assert len(out["offers"]) == 2
+    assert len(out["merchants"]) == 2
+    assert out["skipped"] == 0
+    assert out["seeds"][0]["attached_product_key"] == out["pdps"][0]["product_key"]
+    assert out["offers"][0]["product_key"] == out["pdps"][0]["product_key"]
+    assert out["offers"][0]["sku_key"] == out["skus"][0]["sku_key"]
 
 
 def test_ingest_jsonl_counts_skipped():
-    pdps, seeds, skipped = ingest_validated_jsonl([
+    out = ingest_validated_jsonl([
         _record(),
         {"pdp": {}, "offers": []},
         _record(brand="Charlotte Tilbury", product_name="Pillow Talk"),
     ])
-    assert len(pdps) == 2
-    assert skipped == 1
+    assert len(out["pdps"]) == 2
+    assert out["skipped"] == 1
 
 
 def test_ingest_jsonl_empty_input():
-    pdps, seeds, skipped = ingest_validated_jsonl([])
-    assert pdps == []
-    assert seeds == []
-    assert skipped == 0
+    out = ingest_validated_jsonl([])
+    assert out["pdps"] == []
+    assert out["skus"] == []
+    assert out["seeds"] == []
+    assert out["offers"] == []
+    assert out["merchants"] == []
+    assert out["skipped"] == 0
+
+
+# --- Phase 7a builders: SKU + offer + merchant ---
+
+
+def test_derive_sku_key_appends_canonical_suffix():
+    pk = derive_product_key("MAC", "Ruby Woo")
+    sku = derive_sku_key(pk)
+    assert sku == f"{pk}{SKU_SUFFIX}"
+    assert sku.endswith("::canonical")
+
+
+def test_derive_offer_id_is_deterministic_per_destination():
+    pk = derive_product_key("MAC", "Ruby Woo")
+    sku = derive_sku_key(pk)
+    a = derive_offer_id(pk, sku, "https://maccosmetics.com/p/ruby-woo")
+    b = derive_offer_id(pk, sku, "https://maccosmetics.com/p/ruby-woo")
+    c = derive_offer_id(pk, sku, "https://sephora.com/p/mac-ruby-woo")
+    assert a == b
+    assert a != c
+    assert a.startswith(f"offer:{AGENT_VERSION}:")
+
+
+def test_derive_merchant_id_slugifies():
+    assert derive_merchant_id("Sephora", None) == f"{MERCHANT_ID_PREFIX}sephora"
+    assert derive_merchant_id("MAC Cosmetics", None) == f"{MERCHANT_ID_PREFIX}mac-cosmetics"
+    assert derive_merchant_id(None, "ulta.com") == f"{MERCHANT_ID_PREFIX}ulta-com"
+    assert derive_merchant_id(None, None) == f"{MERCHANT_ID_PREFIX}unknown"
+
+
+def test_derive_merchant_id_collapses_same_retailer_to_one_id():
+    """Two offers from the same retailer must share one merchant_id —
+    that's what makes Phase 6 seller_count meaningful."""
+    a = derive_merchant_id("Sephora", "sephora.com")
+    b = derive_merchant_id("Sephora", "sephora.com")
+    assert a == b
+
+
+def test_ingest_record_emits_complete_canonical_chain():
+    """Phase 7a contract: one record yields PDP + SKU + N merchants +
+    N offers + N seeds, with FK-consistent keys throughout."""
+    result = ingest_validated_record(_record())
+    assert result is not None
+    pdp = result["pdp"]
+    sku = result["sku"]
+    merchants = result["merchants"]
+    offers = result["offers"]
+    seeds = result["seeds"]
+
+    assert sku["product_key"] == pdp["product_key"]
+    assert sku["sku_key"] == f"{pdp['product_key']}::canonical"
+    assert sku["title"] == pdp["title"]
+
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer["product_key"] == pdp["product_key"]
+    assert offer["sku_key"] == sku["sku_key"]
+    assert offer["merchant_id"].startswith(MERCHANT_ID_PREFIX)
+    assert offer["catalog_track"] == "external_referral"
+    assert offer["availability"] == "in_stock"
+    assert offer["currency"] == "USD"
+    assert offer["list_price"] == 21.0
+
+    assert any(m["merchant_id"] == offer["merchant_id"] for m in merchants)
+
+    assert len(seeds) == 1
+    assert seeds[0]["attached_product_key"] == pdp["product_key"]
+
+
+def test_ingest_record_collapses_two_mac_offers_into_one_merchant():
+    """Two offers from the same retailer → one merchant upsert, two
+    offer rows. Phase 6 seller_count stays accurate."""
+    record = _record(offers=[
+        {
+            "merchant_inferred": "MAC",
+            "canonical_url": "https://maccosmetics.com/p/ruby-woo",
+            "destination_url": "https://maccosmetics.com/p/ruby-woo",
+            "image_url": "", "price": 21.0, "in_stock": True,
+        },
+        {
+            "merchant_inferred": "MAC",
+            "canonical_url": "https://maccosmetics.com/p/ruby-woo-mini",
+            "destination_url": "https://maccosmetics.com/p/ruby-woo-mini",
+            "image_url": "", "price": 12.0, "in_stock": True,
+        },
+    ])
+    result = ingest_validated_record(record)
+    assert result is not None
+    assert len(result["offers"]) == 2
+    assert len(result["merchants"]) == 1
+    assert result["merchants"][0]["merchant_name"] == "MAC"
+
+
+def test_ingest_record_routes_offers_to_distinct_merchants():
+    """MAC + Sephora → two merchant upserts, two offer rows."""
+    record = _record(offers=[
+        {
+            "merchant_inferred": "MAC",
+            "canonical_url": "https://maccosmetics.com/p/ruby-woo",
+            "destination_url": "https://maccosmetics.com/p/ruby-woo",
+            "image_url": "", "price": 21.0, "in_stock": True,
+        },
+        {
+            "merchant_inferred": "Sephora",
+            "canonical_url": "https://sephora.com/p/mac-ruby-woo",
+            "destination_url": "https://sephora.com/p/mac-ruby-woo",
+            "image_url": "", "price": 22.0, "in_stock": True,
+        },
+    ])
+    result = ingest_validated_record(record)
+    assert result is not None
+    merchant_ids = {m["merchant_id"] for m in result["merchants"]}
+    offer_merchant_ids = {o["merchant_id"] for o in result["offers"]}
+    assert len(merchant_ids) == 2
+    assert merchant_ids == offer_merchant_ids
+
+
+def test_offer_handles_out_of_stock_and_missing_price():
+    record = _record(offers=[
+        {
+            "merchant_inferred": "MAC",
+            "canonical_url": "https://maccosmetics.com/p/ruby-woo",
+            "destination_url": "https://maccosmetics.com/p/ruby-woo",
+            "image_url": "",
+            "price": None,
+            "in_stock": False,
+        },
+    ])
+    result = ingest_validated_record(record)
+    assert result is not None
+    offer = result["offers"][0]
+    assert offer["availability"] == "unknown"
+    assert offer["list_price"] is None
+    assert offer["inventory_quantity"] == 0
+    assert offer["price_confidence"] is None

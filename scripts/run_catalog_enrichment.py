@@ -152,29 +152,65 @@ async def _do_ingest(args: argparse.Namespace) -> int:
     if not rows:
         logger.error("no validated rows in %s", in_path)
         return 1
-    pdps, seeds, skipped = ingest_validated_jsonl(rows, source_jsonl=str(in_path))
+    plan = ingest_validated_jsonl(rows, source_jsonl=str(in_path))
+    pdps = plan["pdps"]
+    skus = plan["skus"]
+    merchants = plan["merchants"]
+    offers = plan["offers"]
+    seeds = plan["seeds"]
+    skipped = plan["skipped"]
     logger.info(
-        "ingest plan: pdps=%s seeds=%s skipped=%s",
-        len(pdps),
-        len(seeds),
-        skipped,
+        "ingest plan: pdps=%s skus=%s merchants=%s offers=%s seeds=%s skipped=%s",
+        len(pdps), len(skus), len(merchants), len(offers), len(seeds), skipped,
     )
     if not args.apply:
-        # Dry run — print one example row of each kind for inspection.
         if pdps:
             logger.info("sample pdp row: %s", json.dumps({k: v for k, v in pdps[0].items() if k != "product_payload"}, ensure_ascii=False))
+        if skus:
+            logger.info("sample sku row: %s", json.dumps({k: v for k, v in skus[0].items() if k != "sku_payload"}, ensure_ascii=False))
+        if merchants:
+            logger.info("sample merchant row: %s", json.dumps({k: v for k, v in merchants[0].items() if k != "metadata_json"}, ensure_ascii=False))
+        if offers:
+            logger.info("sample offer row: %s", json.dumps({k: v for k, v in offers[0].items() if k != "offer_payload"}, ensure_ascii=False))
         if seeds:
             logger.info("sample seed row: %s", json.dumps({k: v for k, v in seeds[0].items() if k != "seed_data"}, ensure_ascii=False))
         return 0
 
-    # Apply mode — actually INSERT.
+    # Apply mode — INSERT in FK order:
+    #   merchants → products → skus → offers → seeds
     from db.database import database  # noqa: E402
 
     if not getattr(database, "is_connected", False):
         await database.connect()
 
-    inserted_pdps = 0
-    inserted_seeds = 0
+    counts = {"merchants": 0, "pdps": 0, "skus": 0, "offers": 0, "seeds": 0}
+
+    # 1. catalog_merchants — UPSERT by merchant_id (FK target for offers).
+    for merchant in merchants:
+        try:
+            await database.execute(
+                """
+                INSERT INTO catalog_merchants
+                  (merchant_id, merchant_name, primary_platform, status,
+                   source_system, source_ref, metadata_json)
+                VALUES
+                  (:merchant_id, :merchant_name, :primary_platform, :status,
+                   :source_system, :source_ref, CAST(:metadata_json AS jsonb))
+                ON CONFLICT (merchant_id) DO UPDATE SET
+                  merchant_name = COALESCE(EXCLUDED.merchant_name, catalog_merchants.merchant_name),
+                  primary_platform = COALESCE(EXCLUDED.primary_platform, catalog_merchants.primary_platform),
+                  status = EXCLUDED.status,
+                  source_ref = COALESCE(EXCLUDED.source_ref, catalog_merchants.source_ref),
+                  metadata_json = EXCLUDED.metadata_json,
+                  updated_at = NOW()
+                """,
+                merchant,
+            )
+            counts["merchants"] += 1
+        except Exception as exc:
+            logger.exception("insert merchant failed for merchant_id=%s — %s", merchant.get("merchant_id"), exc)
+
+    # 2. catalog_products — UPSERT by product_key (already wired in Phase 4/6).
     for pdp in pdps:
         try:
             await database.execute(
@@ -207,10 +243,77 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                 """,
                 pdp,
             )
-            inserted_pdps += 1
+            counts["pdps"] += 1
         except Exception as exc:
             logger.exception("insert pdp failed for product_key=%s — %s", pdp.get("product_key"), exc)
 
+    # 3. catalog_skus — INSERT one synthetic 'canonical' SKU per PDP.
+    for sku in skus:
+        try:
+            await database.execute(
+                """
+                INSERT INTO catalog_skus
+                  (sku_key, product_key, merchant_id, platform,
+                   source_product_id, source_variant_id, sku, barcode,
+                   title, currency, image_url,
+                   visible_attributes, visible_option_labels, ingredient_ids,
+                   sku_payload, readiness_tier)
+                VALUES
+                  (:sku_key, :product_key, :merchant_id, :platform,
+                   :source_product_id, :source_variant_id, :sku, :barcode,
+                   :title, :currency, :image_url,
+                   CAST(:visible_attributes AS jsonb),
+                   CAST(:visible_option_labels AS jsonb),
+                   CAST(:ingredient_ids AS jsonb),
+                   CAST(:sku_payload AS jsonb), :readiness_tier)
+                ON CONFLICT (sku_key) DO UPDATE SET
+                  title = EXCLUDED.title,
+                  image_url = EXCLUDED.image_url,
+                  sku_payload = EXCLUDED.sku_payload,
+                  readiness_tier = EXCLUDED.readiness_tier,
+                  updated_at = NOW()
+                """,
+                sku,
+            )
+            counts["skus"] += 1
+        except Exception as exc:
+            logger.exception("insert sku failed for sku_key=%s — %s", sku.get("sku_key"), exc)
+
+    # 4. catalog_offers — INSERT one row per validated retailer offer.
+    for offer in offers:
+        try:
+            await database.execute(
+                """
+                INSERT INTO catalog_offers
+                  (offer_id, sku_key, product_key, merchant_id,
+                   catalog_track, truth_tier, readiness_tier, offer_mode,
+                   channel, availability, inventory_quantity, currency,
+                   list_price, merchant_effective_price, estimated_best_price,
+                   price_confidence, source_system, source_ref, offer_payload)
+                VALUES
+                  (:offer_id, :sku_key, :product_key, :merchant_id,
+                   :catalog_track, :truth_tier, :readiness_tier, :offer_mode,
+                   :channel, :availability, :inventory_quantity, :currency,
+                   :list_price, :merchant_effective_price, :estimated_best_price,
+                   :price_confidence, :source_system, :source_ref,
+                   CAST(:offer_payload AS jsonb))
+                ON CONFLICT (offer_id) DO UPDATE SET
+                  availability = EXCLUDED.availability,
+                  inventory_quantity = EXCLUDED.inventory_quantity,
+                  list_price = EXCLUDED.list_price,
+                  merchant_effective_price = EXCLUDED.merchant_effective_price,
+                  estimated_best_price = EXCLUDED.estimated_best_price,
+                  price_confidence = EXCLUDED.price_confidence,
+                  offer_payload = EXCLUDED.offer_payload,
+                  updated_at = NOW()
+                """,
+                offer,
+            )
+            counts["offers"] += 1
+        except Exception as exc:
+            logger.exception("insert offer failed for offer_id=%s — %s", offer.get("offer_id"), exc)
+
+    # 5. external_product_seeds — audit + legacy compatibility.
     for seed in seeds:
         try:
             await database.execute(
@@ -238,15 +341,11 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                 """,
                 seed,
             )
-            inserted_seeds += 1
+            counts["seeds"] += 1
         except Exception as exc:
             logger.exception("insert seed failed for id=%s — %s", seed.get("id"), exc)
 
-    logger.info(
-        "applied: inserted_pdps=%s inserted_seeds=%s",
-        inserted_pdps,
-        inserted_seeds,
-    )
+    logger.info("applied: %s", counts)
     return 0
 
 
