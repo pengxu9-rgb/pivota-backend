@@ -58,6 +58,7 @@ async def _candidates_by_source_product_id(value: str) -> List[Dict[str, Any]]:
         FROM catalog_products
         WHERE source_product_id = :value
           AND truth_tier = 'primary'
+          AND pdp_scope = 'multi_merchant_canonical'
         LIMIT 25
         """,
         {"value": value},
@@ -76,6 +77,7 @@ async def _candidates_by_canonical_url(value: str) -> List[Dict[str, Any]]:
         WHERE canonical_url IS NOT NULL
           AND LOWER(canonical_url) LIKE :url_lower
           AND truth_tier = 'primary'
+          AND pdp_scope = 'multi_merchant_canonical'
         LIMIT 25
         """,
         {"url_lower": f"%{value.lower()}%"},
@@ -93,7 +95,12 @@ async def _candidates_by_title_trigram(
     """Use pg_trgm similarity for the catalog_products.title side. Default
     threshold 0.7 is a wider net than the deterministic matcher's 0.85 —
     the final cut happens in pure Python (Jaccard parity with the GIN
-    index). Phase 3B (LLM tail) uses 0.5 to surface near-misses."""
+    index). Phase 3B (LLM tail) uses 0.5 to surface near-misses.
+
+    Restricts to pdp_scope='multi_merchant_canonical' so a cross-merchant
+    seed (e.g. a Sigma seed) can never be silently attached to a
+    single-merchant private PDP (e.g. one of the 1216 MOYU rows) just
+    because trigrams of "brush" titles overlap. See mig 070 / Phase 6."""
     if not title:
         return []
     params: Dict[str, Any] = {"title": title, "threshold": float(threshold), "limit": int(limit)}
@@ -107,6 +114,7 @@ async def _candidates_by_title_trigram(
                merchant_id
         FROM catalog_products
         WHERE truth_tier = 'primary'
+          AND pdp_scope = 'multi_merchant_canonical'
           AND title IS NOT NULL
           AND similarity(LOWER(title), LOWER(:title)) >= :threshold
           {brand_clause}

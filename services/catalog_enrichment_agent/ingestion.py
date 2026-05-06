@@ -37,6 +37,8 @@ DEFAULT_CATEGORY_LABEL_SOURCE = "enrichment_agent_v1"
 DEFAULT_TRUTH_TIER = "primary"
 DEFAULT_READINESS_TIER = "referral_only"
 DEFAULT_CATALOG_TRACK = "external_referral"
+DEFAULT_PDP_SCOPE = "multi_merchant_canonical"
+DEFAULT_PDP_SCOPE_SOURCE = "enrichment_agent_v1"
 
 _NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
@@ -155,6 +157,8 @@ def _build_pdp_insert(
         "canonical_url": canonical_url or None,
         "image_url": image_url or None,
         "product_payload": json.dumps({"enrichment_meta": enrichment_meta}),
+        "pdp_scope": DEFAULT_PDP_SCOPE,
+        "pdp_scope_source": DEFAULT_PDP_SCOPE_SOURCE,
     }
 
 

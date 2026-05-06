@@ -580,6 +580,9 @@ async def ingest_standard_products(
                     "canonical_url": canonical_url,
                     "image_url": product.image_url,
                     "product_payload": raw_product,
+                    "pdp_scope": "merchant_owned",
+                    "pdp_scope_source": "merchant_sync",
+                    "pdp_scope_set_at": _utcnow(),
                     "freshness_json": {
                         "updated_at": product.updated_at.isoformat() if product.updated_at else None,
                         "observed_at": _utcnow().isoformat(),
