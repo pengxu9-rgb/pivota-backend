@@ -41,57 +41,41 @@ logger = logging.getLogger("backfill_pdp_scope")
 async def _fetch_batch(batch_size: int) -> List[Dict[str, Any]]:
     """Fetch unverified rows along with their merchant fan-out count.
 
-    seller_count counts the row's own merchant_id once, plus distinct
-    merchants from catalog_offers and external_product_seeds. The
-    GREATEST() guard handles rows where neither offers nor seeds exist
-    (the catalog_products row itself still represents one merchant)."""
+    seller_count = 1 (the PDP's own merchant) + distinct OTHER merchants
+    visible through catalog_offers (by merchant_id) + distinct
+    external_product_seeds (by domain — external_product_seeds doesn't
+    carry merchant_id, the merchant identity is the destination domain).
+    A small over-count is acceptable since the classifier only checks
+    >= 2; cross-checking against pdp_subject_index.seller_count would
+    tighten this but isn't required for the canonical/merchant_owned
+    cut."""
     rows = await database.fetch_all(
         """
-        WITH unverified AS (
-          SELECT product_key, merchant_id, category_label_source
-          FROM catalog_products
-          WHERE pdp_scope = 'unverified'
-          LIMIT :limit
-        ),
-        offer_merchants AS (
-          SELECT cp.product_key,
-                 COALESCE(co.merchant_id, eps_m.merchant_id) AS m
-          FROM unverified cp
-          LEFT JOIN catalog_offers co ON co.product_key = cp.product_key
-          LEFT JOIN (
-            SELECT attached_product_key AS pk,
-                   merchant_id
-            FROM external_product_seeds
-            WHERE status = 'active' AND attached_product_key IS NOT NULL
-          ) eps_m ON eps_m.pk = cp.product_key
-        ),
-        agg AS (
-          SELECT u.product_key,
-                 u.merchant_id        AS pdp_merchant_id,
-                 u.category_label_source,
-                 COUNT(DISTINCT om.m) FILTER (WHERE om.m IS NOT NULL) AS off_merchants
-          FROM unverified u
-          LEFT JOIN offer_merchants om ON om.product_key = u.product_key
-          GROUP BY u.product_key, u.merchant_id, u.category_label_source
-        )
-        SELECT product_key,
-               category_label_source,
-               -- the PDP's own merchant counts once; offers/seeds add more.
-               GREATEST(
-                 1,
-                 (
-                   SELECT COUNT(DISTINCT m)
-                   FROM (
-                     SELECT pdp_merchant_id AS m
-                     UNION
-                     SELECT om.m
-                     FROM offer_merchants om
-                     WHERE om.product_key = agg.product_key
-                       AND om.m IS NOT NULL
-                   ) merged
-                 )
+        SELECT u.product_key,
+               u.category_label_source,
+               (
+                 1
+                 + COALESCE((
+                     SELECT COUNT(DISTINCT co.merchant_id)
+                     FROM catalog_offers co
+                     WHERE co.product_key = u.product_key
+                       AND co.merchant_id IS NOT NULL
+                       AND co.merchant_id <> u.merchant_id
+                   ), 0)
+                 + COALESCE((
+                     SELECT COUNT(DISTINCT eps.domain)
+                     FROM external_product_seeds eps
+                     WHERE eps.attached_product_key = u.product_key
+                       AND eps.status = 'active'
+                       AND eps.domain IS NOT NULL
+                   ), 0)
                ) AS seller_count
-        FROM agg
+        FROM (
+            SELECT product_key, merchant_id, category_label_source
+            FROM catalog_products
+            WHERE pdp_scope = 'unverified'
+            LIMIT :limit
+        ) u
         """,
         {"limit": batch_size},
     )
