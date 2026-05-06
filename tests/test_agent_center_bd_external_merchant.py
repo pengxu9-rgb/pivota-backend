@@ -1759,3 +1759,132 @@ def test_verdict_explanations_contain_value_prop_signals_for_all_labels() -> Non
             or "in-chat" in e
             or "25-30%" in e
         ), f"verdict for ({vis},{attr},{cat}) lacks value-prop signal: {explanation[:120]}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2h: Probe-mode honesty + onboarding_sequence with test-merchant
+# validation. Each step in the onboarding sequence must cite a concrete
+# test-merchant artifact so BD can show evidence, not just describe steps.
+# ---------------------------------------------------------------------------
+
+
+def _wpc(report: Dict[str, Any]) -> Dict[str, Any]:
+    return report["what_pivota_changes"]
+
+
+def _basic_report() -> Dict[str, Any]:
+    from services.agent_center_bd_report_service import build_structured_report
+    return build_structured_report(
+        merchant_name="COSRX",
+        merchant_pdp_url="https://www.cosrx.com/products/p",
+        product_title="Mask",
+        product_vendor="COSRX",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 33}, "raw_runs": []},
+        provider="gemini",
+    )
+
+
+def test_discovery_lift_pivota_reference_specifies_named_product_probe_modes() -> None:
+    """The pivota_reference paragraph must lead with 'named-product
+    buyer-intent queries' so the merchant cannot misread the 67/50
+    figures as a category-level promise."""
+    pr = _wpc(_basic_report())["discovery_lift"]["pivota_reference"]
+    assert "named-product" in pr.lower()
+    assert "buyer-intent" in pr.lower()
+
+
+def test_discovery_lift_pivota_reference_points_to_test_merchant_artifact() -> None:
+    """The pivota_reference cites the test-merchant audit artifact path
+    so BD can hand the merchant a paired-audit example."""
+    pr = _wpc(_basic_report())["discovery_lift"]["pivota_reference"]
+    assert "test-merchant-bd-audit.md" in pr
+
+
+def test_methodology_note_names_specific_probe_modes_used_in_baseline() -> None:
+    """methodology_note must name `open_product_visibility_test` AND
+    `merchant_store_attribution_test` — exactly the two scan modes
+    `agent_center_pivota_pdp_baseline.py` runs."""
+    note = _wpc(_basic_report())["discovery_lift"]["methodology_note"]
+    assert "open_product_visibility_test" in note
+    assert "merchant_store_attribution_test" in note
+
+
+def test_methodology_note_disclaims_category_level_comparison() -> None:
+    """methodology_note must explicitly say the baseline is NOT
+    comparable to category_visibility_score."""
+    note = _wpc(_basic_report())["discovery_lift"]["methodology_note"]
+    assert "category_visibility_score" in note
+    assert "NOT" in note or "not" in note
+
+
+def test_onboarding_sequence_present_with_five_steps() -> None:
+    seq = _wpc(_basic_report())["onboarding_sequence"]
+    assert seq
+    assert seq.get("title")
+    assert seq.get("intro")
+    assert len(seq["steps"]) == 5
+    # Steps numbered 1..5 in order.
+    for i, s in enumerate(seq["steps"], start=1):
+        assert s["step"] == i
+
+
+def test_onboarding_sequence_each_step_has_test_merchant_validation() -> None:
+    """Every step must carry a non-empty test_merchant_validation
+    field — that's the whole point of the section."""
+    seq = _wpc(_basic_report())["onboarding_sequence"]
+    for s in seq["steps"]:
+        assert s.get("test_merchant_validation"), (
+            f"step {s.get('step')} ({s.get('name')}) missing "
+            f"test_merchant_validation"
+        )
+
+
+def test_onboarding_sequence_test_merchant_block_present() -> None:
+    """The merchant_id + shop_domain are surfaced as a structured
+    field so the UI can render the playground identifier separately."""
+    from services.agent_center_bd_report_service import TEST_MERCHANT_REFERENCE
+    seq = _wpc(_basic_report())["onboarding_sequence"]
+    tm = seq["test_merchant"]
+    assert tm["merchant_id"] == TEST_MERCHANT_REFERENCE["merchant_id"]
+    assert tm["shop_domain"] == TEST_MERCHANT_REFERENCE["shop_domain"]
+
+
+def test_onboarding_sequence_does_not_promise_reserved_agents_as_shipped_agents() -> None:
+    """The 3 RESERVED agents (Offer Execution / Checkout Verification
+    / GMV Attribution) must NOT appear as shipped-agent step names.
+    Steps 4 + 5 cover their function manually + are tagged
+    `manual_today=True`."""
+    seq = _wpc(_basic_report())["onboarding_sequence"]
+    reserved = {"offer execution", "checkout verification", "gmv attribution"}
+    for s in seq["steps"]:
+        name_lower = s.get("name", "").lower()
+        # If the name contains a reserved agent label, the step must be
+        # `manual_today=True` (not promised as one-click).
+        if any(r in name_lower for r in reserved):
+            assert s.get("manual_today") is True, (
+                f"step {s.get('step')} names a RESERVED agent but is "
+                f"not flagged manual_today: {s}"
+            )
+    # roadmap_note must explicitly disclose the RESERVED status.
+    assert "RESERVED" in seq["roadmap_note"]
+
+
+def test_render_markdown_contains_onboarding_sequence_section() -> None:
+    from services.agent_center_bd_report_service import (
+        render_markdown_from_structured,
+    )
+    md = render_markdown_from_structured(_basic_report())
+    # Section heading + the 2 actually-shipped agents named explicitly.
+    assert "Onboarding sequence" in md
+    assert "Demand Test" in md
+    assert "SKU Match" in md
+    assert "Shopify OAuth" in md
+    # Test merchant playground line.
+    assert "merch_38fa56d5118b9974" in md
+    assert "shop.myshopify.com" in md
+    # Manual-today steps render with the wrench badge.
+    assert "🔧 manual today" in md
+    # Roadmap_note explains RESERVED placeholders.
+    assert "RESERVED" in md

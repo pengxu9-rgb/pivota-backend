@@ -1319,6 +1319,24 @@ PIVOTA_PDP_BASELINE_REFERENCE: Dict[str, Any] = {
     "median_attribution": 50,
     "sample_size_pdps": 6,
     "as_of_date": "2026-05-06",
+    # Single source of truth for which probe modes the baseline runs.
+    # Pulled from agent_center_pivota_pdp_baseline.py — keep in sync if
+    # the script's mode list ever changes.
+    "probe_modes_in_baseline": [
+        "open_product_visibility_test",
+        "merchant_store_attribution_test",
+    ],
+}
+
+
+# Reference to the internal Shopify test merchant used as the live
+# validation playground for the onboarding sequence. Each step in the
+# sequence cites a concrete artifact tied to this merchant — the report
+# is auditable, not abstract.
+TEST_MERCHANT_REFERENCE: Dict[str, str] = {
+    "merchant_id": "merch_38fa56d5118b9974",
+    "shop_domain": "shop.myshopify.com",
+    "audit_artifact_path": "reports/test-merchant-bd-audit.md",
 }
 
 
@@ -1379,15 +1397,20 @@ def _build_what_pivota_changes(
             f"({retailer_phrase}) capture the rest of the grounded surface."
         ),
         "pivota_reference": (
-            f"Pivota's {PIVOTA_PDP_BASELINE_REFERENCE['sample_size_pdps']} "
-            f"canonical seed PDPs currently surface in Gemini grounding "
-            f"with median visibility "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100 and "
+            f"For named-product buyer-intent queries (the same probe "
+            f"modes that score this merchant's attribution), Pivota's "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['sample_size_pdps']} "
+            f"canonical seed PDPs surface in Gemini grounding with "
+            f"median visibility "
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/100 + "
             f"median attribution "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']}/100 "
             f"(internal baseline, "
-            f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']}). These are the "
-            f"infrastructure scores merchants inherit on onboarding."
+            f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']}). This is the "
+            f"named-product surface the merchant inherits on onboarding. "
+            f"See `{TEST_MERCHANT_REFERENCE['audit_artifact_path']}` for "
+            f"a paired audit on Pivota's internal test merchant — the "
+            f"live operational reference."
         ),
         "mechanics": [
             {
@@ -1418,10 +1441,15 @@ def _build_what_pivota_changes(
             "Google indexing latency."
         ),
         "methodology_note": (
-            "Comparative reference, not paired A/B. The 67/50 figures come "
-            "from running the same probe set against Pivota's canonical "
-            "seed PDPs covering similar categories. Run "
-            "scripts/agent_center_pivota_pdp_baseline.py to refresh."
+            "Comparative reference, not paired A/B. The 67/50 figures "
+            "come from the named-product probes — `"
+            + "` + `".join(PIVOTA_PDP_BASELINE_REFERENCE["probe_modes_in_baseline"])
+            + "`. They are directly comparable to the merchant's "
+            "attribution_score in this report, NOT to "
+            "category_visibility_score (category-level Pivota PDP "
+            "coverage is a separate ops track and not in the baseline "
+            "yet). Refresh via "
+            "scripts/agent_center_pivota_pdp_baseline.py."
         ),
     }
 
@@ -1485,10 +1513,162 @@ def _build_what_pivota_changes(
         ),
     }
 
+    onboarding_sequence = {
+        "title": "Onboarding sequence — validated end-to-end on the Pivota test merchant",
+        "intro": (
+            "Each step below is operated either as a Pivota agent or as a "
+            "shipped pipeline (Shopify OAuth + ACP). Every step cites a "
+            "concrete artifact from running the same sequence on Pivota's "
+            "internal Shopify test merchant — verifiable evidence, not "
+            "concepts. Steps marked `manual_today` work end-to-end but "
+            "don't yet have a one-click agent runner; operations runs "
+            "them on the merchant's behalf during onboarding."
+        ),
+        "test_merchant": dict(TEST_MERCHANT_REFERENCE),
+        "steps": [
+            {
+                "step": 1,
+                "name": "Demand Test (this report)",
+                "status": "shipped",
+                "manual_today": False,
+                "operates": "Pivota agent",
+                "what": (
+                    "Audits AI-channel discoverability + first-party "
+                    "attribution against Gemini grounded search. This "
+                    "document is its output."
+                ),
+                "addresses": "Establishes the pre-onboarding baseline.",
+                "test_merchant_validation": (
+                    "Same engine is run against the test merchant's "
+                    "catalog monthly; latest output at `"
+                    f"{TEST_MERCHANT_REFERENCE['audit_artifact_path']}` "
+                    "(produced by "
+                    "`scripts/agent_center_bd_test_merchant_audit.py`)."
+                ),
+            },
+            {
+                "step": 2,
+                "name": "SKU Match",
+                "status": "shipped",
+                "manual_today": False,
+                "operates": "Pivota agent",
+                "what": (
+                    "Data-quality preflight on the merchant's product "
+                    "catalog: flags missing SKU IDs, missing/stale "
+                    "prices, missing images, stale cache. These are the "
+                    "gating issues that block canonical PDP indexing."
+                ),
+                "addresses": (
+                    "Resolves catalog defects before they reach the "
+                    "AI-channel surface."
+                ),
+                "test_merchant_validation": (
+                    "Test merchant catalog runs through SKU Match on "
+                    "each ops cycle; flag categories (missing/stale "
+                    "price, image, cache) validated against a "
+                    "known-good catalog."
+                ),
+            },
+            {
+                "step": 3,
+                "name": "Merchant onboarding (KYB + Shopify OAuth)",
+                "status": "shipped",
+                "manual_today": False,
+                "operates": "Pivota merchant portal pipeline",
+                "what": (
+                    "Standard onboarding: KYB verification + PSP setup "
+                    "+ Shopify OAuth installs the access token Pivota "
+                    "needs to forward orders. Stored in `merchant_stores"
+                    "` table; retrieved at order-completion time via "
+                    "`services/merchant_store_service.py:"
+                    "get_primary_store`."
+                ),
+                "addresses": (
+                    "Wires the order-forwarding path described in the "
+                    "Checkout Loop section above (step 5 of the chain)."
+                ),
+                "test_merchant_validation": (
+                    f"Test merchant `{TEST_MERCHANT_REFERENCE['merchant_id']}` "
+                    "is fully onboarded via this pipeline — Shopify "
+                    "OAuth completed, access_token stored, primary_store "
+                    "row exists. The same row is what "
+                    "`create_shopify_order()` reads at order time."
+                ),
+            },
+            {
+                "step": 4,
+                "name": "End-to-end checkout verification",
+                "status": "shipped",
+                "manual_today": True,
+                "operates": "Pivota ACP + manual ops walkthrough",
+                "what": (
+                    "Place a test order against one canonical PDP for a "
+                    "representative SKU; confirm the 6-step chain "
+                    "completes and the order lands in the merchant's "
+                    "Shopify admin with first-party customer data."
+                ),
+                "addresses": (
+                    "Confirms the Checkout Loop is functional for this "
+                    "merchant's specific catalog/Shopify setup before "
+                    "going live."
+                ),
+                "test_merchant_validation": (
+                    "Verified by the e2e shell test "
+                    "`pivota-acp/test_epic5_shopify_order_poc.sh` "
+                    "against test merchant on each release. Hardening "
+                    "tests "
+                    "`pivota-backend/tests/"
+                    "test_shopify_order_sync_hardening.py` lock the "
+                    "401-fallback + retry behavior. Same script will "
+                    "run on the prospective merchant during onboarding "
+                    "QA."
+                ),
+            },
+            {
+                "step": 5,
+                "name": "Audit re-run + attribution monitoring",
+                "status": "shipped (audit) / roadmap (automated GMV agent)",
+                "manual_today": True,
+                "operates": "Demand Test (rerun) + manual GMV review of order metadata",
+                "what": (
+                    "Re-run this audit 30 days post-onboarding for "
+                    "paired before/after lift on the same SKUs. Order "
+                    "metadata (`source = pivota_acp`, `agent = gemini`) "
+                    "supports manual GMV attribution today; an "
+                    "automated GMV Attribution agent is on the Q3 "
+                    "roadmap (currently a RESERVED scan_mode "
+                    "placeholder, not a shipped runner)."
+                ),
+                "addresses": (
+                    "Replaces today's comparative reference (vs Pivota "
+                    "baseline) with merchant-specific paired data; "
+                    "quantifies the lift."
+                ),
+                "test_merchant_validation": (
+                    "Test merchant has a rolling history of monthly "
+                    "Demand Test audits archived alongside its order "
+                    "metadata; the diff between successive months is "
+                    "what an automated GMV Attribution agent would "
+                    "compute. Pattern is shipped — the wrapper agent is "
+                    "the Q3 roadmap item."
+                ),
+            },
+        ],
+        "roadmap_note": (
+            "Three Pivota agents (Offer Execution, Checkout "
+            "Verification, GMV Attribution) exist as RESERVED scan_mode "
+            "placeholders today and appear in our roadmap, not as "
+            "shipped agents. Steps 4 and 5 above deliver their function "
+            "manually until the agents ship — and the test merchant "
+            "artifacts above show the underlying pipelines work today."
+        ),
+    }
+
     return {
         "today_summary": today_summary,
         "discovery_lift": discovery_lift,
         "checkout_loop": checkout_loop,
+        "onboarding_sequence": onboarding_sequence,
     }
 
 
@@ -1845,6 +2025,44 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                     sections.append(f"_{pc['note']}_\n")
             if cl.get("outcome"):
                 sections.append(f"**Outcome.** {cl['outcome']}\n")
+
+        os = wpc.get("onboarding_sequence") or {}
+        if os:
+            sections.append(f"### {os.get('title', 'Onboarding sequence')}\n")
+            if os.get("intro"):
+                sections.append(os["intro"] + "\n")
+            tm = os.get("test_merchant") or {}
+            if tm.get("merchant_id"):
+                sections.append(
+                    f"_Test merchant playground: "
+                    f"`{tm['merchant_id']}` @ `{tm.get('shop_domain', '?')}` "
+                    f"(audit artifact: "
+                    f"`{tm.get('audit_artifact_path', '?')}`)._\n"
+                )
+            steps = os.get("steps") or []
+            if steps:
+                rows = [
+                    "| # | Step | Status | What | Test merchant validation |",
+                    "|---|---|---|---|---|",
+                ]
+                for s in steps:
+                    n = s.get("step", "")
+                    name = (s.get("name") or "").replace("|", "\\|")
+                    status = (s.get("status") or "").replace("|", "\\|")
+                    if s.get("manual_today"):
+                        status = f"🔧 manual today ({status})"
+                    elif "shipped" in status.lower():
+                        status = f"✅ {status}"
+                    what = (s.get("what") or "").replace("|", "\\|").replace("\n", " ")
+                    val = (
+                        s.get("test_merchant_validation") or ""
+                    ).replace("|", "\\|").replace("\n", " ")
+                    rows.append(
+                        f"| {n} | **{name}** | {status} | {what} | {val} |"
+                    )
+                sections.append("\n".join(rows) + "\n")
+            if os.get("roadmap_note"):
+                sections.append(f"_{os['roadmap_note']}_\n")
 
     sections.append("## 1. Open product visibility\n")
     sections.append(
