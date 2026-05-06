@@ -533,6 +533,7 @@ async def _fetch_canonical_search_rows(
                 p.catalog_track,
                 p.truth_tier,
                 p.readiness_tier,
+                p.pdp_scope,
                 p.source_system,
                 p.freshness_json,
                 p.updated_at AS product_updated_at,
@@ -551,7 +552,17 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN LOWER(COALESCE(p.source_product_id, '')) = :query_exact THEN 105 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(p.title, '')) = :query_exact THEN 100 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(m.merchant_name, '')) = :query_exact THEN 90 ELSE 0 END +
-                    CASE WHEN LOWER(COALESCE(p.brand, '')) = :query_exact THEN 80 ELSE 0 END
+                    CASE WHEN LOWER(COALESCE(p.brand, '')) = :query_exact THEN 80 ELSE 0 END +
+                    -- Phase 6 (mig 070): rank multi_merchant_canonical PDPs
+                    -- strictly above merchant_owned for any matched query.
+                    -- The bonus is large enough to dominate every other
+                    -- term so a canonical match always wins over a single-
+                    -- merchant private listing that happens to overlap
+                    -- titles (the MOYU 1216-row pollution case).
+                    -- Merchant-scoped queries are unaffected because the
+                    -- candidate set is already filtered to one merchant
+                    -- whose rows share the same scope.
+                    CASE WHEN p.pdp_scope = 'multi_merchant_canonical' THEN 200 ELSE 0 END
                     {category_score}
                     {vertical_score}
                 ) AS rank_score
@@ -589,6 +600,7 @@ async def _fetch_canonical_search_rows(
             c.catalog_track,
             c.truth_tier,
             c.readiness_tier,
+            c.pdp_scope,
             c.source_system,
             c.freshness_json,
             c.product_updated_at,
