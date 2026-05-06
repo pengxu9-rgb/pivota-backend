@@ -205,6 +205,17 @@ async def run_sku_match(scan_target_id: str) -> Dict[str, Any]:
             f"this runner only handles {SKU_MATCH_SCAN_MODE!r}"
         )
 
+    # V1.5 dispatch: if the merchant requested a live drift comparison,
+    # delegate to the live runner. The internal-data-quality runner stays
+    # the default for backward compat (existing scan_targets without an
+    # explicit `mode` field continue to work unchanged).
+    payload = target.get("payload") or {}
+    options = (payload.get("options") if isinstance(payload.get("options"), dict) else {}) or {}
+    requested_mode = options.get("mode")
+    if isinstance(requested_mode, str) and requested_mode.strip().lower() == "live":
+        from services.agent_center_sku_match_live_service import run_sku_match_live
+        return await run_sku_match_live(scan_target_id)
+
     merchant_id = target["merchant_id"]
     store_id = target["store_id"]
     payload = target.get("payload") or {}
