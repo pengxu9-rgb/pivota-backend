@@ -379,6 +379,205 @@ def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Brand-level multi-product BD report (Phase 2b)
+#
+# Merchants pitch their brand, not a single SKU. The brand report runs
+# the standard BD probe pipeline against up to 5 flagship products of
+# one merchant, then aggregates: per-product structured reports, brand
+# verdict from averaged scores, cross-product competitor host frequency.
+#
+# Hard cap of 5 products is the post-#280 cost guard equivalent at the
+# brand level: 5 products × 3 scan modes × 3 runs = 45 grounded Gemini
+# calls = ~1.1M tokens per brand report. Runs sequentially (each per-
+# product call is already a 9-call probe burst); a future async fan-out
+# is possible once worker-pool isolation lands.
+# ---------------------------------------------------------------------------
+
+
+_BRAND_REPORT_MAX_PRODUCTS = 5
+
+
+async def run_brand_report(
+    *,
+    merchant_name: str,
+    merchant_domain: Optional[str],
+    products: List[Dict[str, Any]],
+    provider: str = "gemini",
+    max_runs: int = 3,
+    include_category_visibility: bool = True,
+) -> Dict[str, Any]:
+    """Run BD probes against up to 5 products of one merchant and
+    aggregate into a brand-level report.
+
+    `products` items: { title, vendor?, product_type?, pdp_url }
+
+    Returns:
+      {
+        merchant_name, merchant_domain, timestamp, provider,
+        per_product: [<structured BD report>, ...],
+        aggregate: {
+          avg_visibility, avg_attribution, avg_category_visibility,
+          brand_verdict_label, brand_verdict_explanation,
+          products_count, products_succeeded, products_failed,
+        },
+        cross_product_competitors: [{host, times_cited}, ...],
+        failed: [{pdp_url, error}, ...],
+      }
+    """
+    if not merchant_name or not merchant_name.strip():
+        raise ValueError("merchant_name is required")
+    if not products:
+        raise ValueError("products is required (at least 1)")
+    if len(products) > _BRAND_REPORT_MAX_PRODUCTS:
+        raise ValueError(
+            f"products capped at {_BRAND_REPORT_MAX_PRODUCTS} per brand "
+            f"report (received {len(products)}). Cost guard — see #280."
+        )
+
+    per_product: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for idx, p in enumerate(products):
+        pdp_url = (p.get("pdp_url") or "").strip()
+        title = (p.get("title") or "").strip()
+        if not pdp_url or not title:
+            failed.append({
+                "pdp_url": pdp_url,
+                "title": title,
+                "error": "pdp_url and title are required for each product",
+            })
+            continue
+        try:
+            probes = await run_bd_probes(
+                merchant_name=merchant_name,
+                merchant_pdp_url=pdp_url,
+                product_title=title,
+                product_vendor=p.get("vendor"),
+                product_type=p.get("product_type"),
+                provider=provider,
+                max_runs=max_runs,
+                include_category_visibility=include_category_visibility,
+            )
+            structured = build_structured_report(
+                merchant_name=merchant_name,
+                merchant_pdp_url=pdp_url,
+                product_title=title,
+                product_vendor=p.get("vendor"),
+                product_type=p.get("product_type"),
+                visibility_result=probes["visibility"],
+                attribution_result=probes["attribution"],
+                category_visibility_result=probes.get("category_visibility"),
+                provider=provider,
+            )
+            per_product.append(structured)
+        except Exception as exc:  # noqa: BLE001 — per-product isolation
+            failed.append({
+                "pdp_url": pdp_url,
+                "title": title,
+                "error": str(exc),
+            })
+
+    aggregate = _aggregate_brand_scores(per_product)
+    aggregate["products_count"] = len(products)
+    aggregate["products_succeeded"] = len(per_product)
+    aggregate["products_failed"] = len(failed)
+
+    cross_competitors = _aggregate_brand_competitors(per_product)
+
+    return {
+        "merchant_name": merchant_name,
+        "merchant_domain": (merchant_domain or "").strip() or None,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "provider": provider,
+        "per_product": per_product,
+        "aggregate": aggregate,
+        "cross_product_competitors": cross_competitors,
+        "failed": failed,
+    }
+
+
+def _aggregate_brand_scores(per_product: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Average each score across successful per-product reports +
+    derive a brand-level verdict. Returns empty-shape dict (with
+    None values) when per_product is empty so the caller can render
+    a clean "all failed" state."""
+    if not per_product:
+        return {
+            "avg_visibility": None,
+            "avg_attribution": None,
+            "avg_category_visibility": None,
+            "brand_verdict_label": None,
+            "brand_verdict_explanation": (
+                "No products were successfully probed; can't aggregate."
+            ),
+        }
+    visibility_vals = [
+        r["verdict"]["visibility_score"]
+        for r in per_product
+        if r.get("verdict", {}).get("visibility_score") is not None
+    ]
+    attribution_vals = [
+        r["verdict"]["attribution_score"]
+        for r in per_product
+        if r.get("verdict", {}).get("attribution_score") is not None
+    ]
+    category_vals = [
+        r["verdict"]["category_visibility_score"]
+        for r in per_product
+        if r.get("verdict", {}).get("category_visibility_score") is not None
+    ]
+
+    avg_visibility = (
+        sum(visibility_vals) / len(visibility_vals) if visibility_vals else None
+    )
+    avg_attribution = (
+        sum(attribution_vals) / len(attribution_vals) if attribution_vals else None
+    )
+    avg_category_visibility = (
+        sum(category_vals) / len(category_vals) if category_vals else None
+    )
+
+    # Brand-level verdict uses the same thresholds as the per-product
+    # verdict_for, but on AVERAGED scores so a brand with one strong
+    # SKU + four weak ones gets correctly flagged as PARTIAL/MISATTRIBUTED.
+    if avg_visibility is None or avg_attribution is None:
+        brand_label = None
+        brand_explanation = "Insufficient data to render a brand verdict."
+    else:
+        brand_label, brand_explanation = verdict_for(
+            int(avg_visibility), int(avg_attribution),
+        )
+
+    return {
+        "avg_visibility": round(avg_visibility, 1) if avg_visibility is not None else None,
+        "avg_attribution": round(avg_attribution, 1) if avg_attribution is not None else None,
+        "avg_category_visibility": (
+            round(avg_category_visibility, 1) if avg_category_visibility is not None else None
+        ),
+        "brand_verdict_label": brand_label,
+        "brand_verdict_explanation": brand_explanation,
+    }
+
+
+def _aggregate_brand_competitors(per_product: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Walk per-product attribution.competitor_hosts, sum across
+    products, return ranked top 15. The aggregate "who's stealing
+    your AI traffic across the whole brand" view — typically more
+    pitch-relevant than per-product because BD wants to call out
+    "Sephora captures 12 / 15 of your queries across these 5 SKUs"."""
+    counter: Counter = Counter()
+    for product in per_product:
+        for entry in (product.get("attribution") or {}).get("competitor_hosts") or []:
+            host = entry.get("host")
+            count = entry.get("times_cited") or 0
+            if host and count:
+                counter[host] += int(count)
+    return [
+        {"host": h, "times_cited": c}
+        for h, c in counter.most_common(15)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Industry context — hardcoded category facts surfaced in the BD report so a
 # raw "your visibility is 33%" reads as "...in a channel that's 12% of D2C
 # beauty traffic and growing 40% YoY". Keep these conservative — they're

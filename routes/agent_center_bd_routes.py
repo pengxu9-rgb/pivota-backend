@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field, validator
 from services.agent_center_bd_report_service import (
     build_structured_report,
     run_bd_probes,
+    run_brand_report,
 )
 from utils.auth import get_current_employee
 
@@ -149,3 +150,93 @@ async def external_merchant_report(
         upstream_status.get("is_real"),
     )
     return {"status": "ok", "report": report}
+
+
+# ---------------------------------------------------------------------------
+# Brand-level multi-product BD report (Phase 2b)
+# ---------------------------------------------------------------------------
+
+
+_BRAND_REPORT_HARD_MAX_PRODUCTS = 5
+
+
+class BdBrandReportProduct(BaseModel):
+    title: str = Field(..., min_length=1, max_length=400)
+    pdp_url: str = Field(..., min_length=8, max_length=2000)
+    vendor: Optional[str] = Field(None, max_length=200)
+    product_type: Optional[str] = Field(None, max_length=120)
+
+    @validator("pdp_url")
+    def _url_looks_like_url(cls, v: str) -> str:
+        s = v.strip()
+        if not (s.startswith("http://") or s.startswith("https://")):
+            raise ValueError("pdp_url must start with http:// or https://")
+        return s
+
+
+class BdBrandReportRequest(BaseModel):
+    merchant_name: str = Field(..., min_length=1, max_length=200)
+    merchant_domain: Optional[str] = Field(None, max_length=200)
+    products: list[BdBrandReportProduct] = Field(
+        ..., min_length=1, max_length=_BRAND_REPORT_HARD_MAX_PRODUCTS,
+    )
+    provider: str = Field("gemini")
+    max_runs: int = Field(3, ge=1, le=_HARD_MAX_RUNS)
+    include_category_visibility: bool = Field(True)
+
+    @validator("provider")
+    def _provider_allowed(cls, v: str) -> str:
+        if v not in {"gemini", "mock"}:
+            raise ValueError("provider must be 'gemini' or 'mock'")
+        return v
+
+
+@router.post("/brand-report")
+async def brand_report(
+    body: BdBrandReportRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Run BD probes against up to 5 products of one merchant. Returns
+    per-product structured reports + brand-level aggregate verdict +
+    cross-product competitor host frequency.
+
+    Synchronous. Real Gemini calls take 6-12s per product × N products =
+    can hit ~60s for 5 products. UI must show a clear progress state.
+    Per-product failures are isolated — one failed product doesn't kill
+    the whole brand run; failures are returned in `failed[]`.
+
+    Cost: capped at 5 products × 3 scan modes × `max_runs` runs.
+    Default 5 × 3 × 3 = 45 grounded Gemini calls per brand report
+    (~1.1M tokens). Pydantic enforces both the product count and
+    max_runs caps so cost is bounded by the request schema."""
+    try:
+        out = await run_brand_report(
+            merchant_name=body.merchant_name,
+            merchant_domain=body.merchant_domain,
+            products=[p.dict() for p in body.products],
+            provider=body.provider,
+            max_runs=body.max_runs,
+            include_category_visibility=body.include_category_visibility,
+        )
+    except Exception as exc:
+        raise _map_error(exc) from exc
+
+    # Operational signals — log brand-level verdict + how many products
+    # succeeded. Helps diagnose when a brand pitch came back weak
+    # because of probe failures vs because the merchant is genuinely
+    # weak in AI search.
+    agg = out.get("aggregate") or {}
+    logger.info(
+        "BD brand report: merchant=%s products_count=%s succeeded=%s "
+        "failed=%s avg_visibility=%s avg_attribution=%s avg_category=%s "
+        "verdict=%s",
+        body.merchant_name,
+        agg.get("products_count"),
+        agg.get("products_succeeded"),
+        agg.get("products_failed"),
+        agg.get("avg_visibility"),
+        agg.get("avg_attribution"),
+        agg.get("avg_category_visibility"),
+        agg.get("brand_verdict_label"),
+    )
+    return {"status": "ok", "brand_report": out}

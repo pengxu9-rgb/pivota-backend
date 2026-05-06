@@ -13,6 +13,8 @@ import sys
 from collections import Counter
 from typing import Any, Dict, List
 
+import pytest
+
 
 _HERE = os.path.dirname(__file__)
 _SCRIPTS = os.path.abspath(os.path.join(_HERE, "..", "scripts"))
@@ -672,6 +674,187 @@ def test_render_markdown_includes_category_section_when_present() -> None:
     assert "best Korean eye patches 2026" in md
     # Score-0 callout fires for the BD-pitch sweet-spot phrasing
     assert "harshest BD signal" in md
+
+
+def test_aggregate_brand_scores_averages_across_succeeded_products() -> None:
+    """Phase 2b: brand-level aggregate is the simple-mean of per-product
+    scores. No median / weighted-average — keep V1 honest."""
+    from services.agent_center_bd_report_service import _aggregate_brand_scores
+    per_product = [
+        {"verdict": {"visibility_score": 60, "attribution_score": 30, "category_visibility_score": 0}},
+        {"verdict": {"visibility_score": 100, "attribution_score": 60, "category_visibility_score": 25}},
+        {"verdict": {"visibility_score": 40, "attribution_score": 0, "category_visibility_score": 0}},
+    ]
+    agg = _aggregate_brand_scores(per_product)
+    # (60+100+40)/3 = 66.67, rounded to 1 decimal = 66.7
+    assert agg["avg_visibility"] == 66.7
+    # (30+60+0)/3 = 30.0
+    assert agg["avg_attribution"] == 30.0
+    # (0+25+0)/3 = 8.33 → 8.3
+    assert agg["avg_category_visibility"] == 8.3
+    # avg_visibility=66 (≥60) + avg_attribution=30 (<60) → not STRONG.
+    # avg_visibility=66 ≥30 + avg_attribution=30 < 30 is false (== 30
+    # is at the boundary — 30 < 30 is False). Falls into PARTIAL.
+    assert agg["brand_verdict_label"] == "PARTIAL"
+
+
+def test_aggregate_brand_scores_handles_empty() -> None:
+    from services.agent_center_bd_report_service import _aggregate_brand_scores
+    agg = _aggregate_brand_scores([])
+    assert agg["avg_visibility"] is None
+    assert agg["avg_attribution"] is None
+    assert agg["brand_verdict_label"] is None
+    assert "can't aggregate" in agg["brand_verdict_explanation"]
+
+
+def test_aggregate_brand_scores_skips_missing_category_when_only_some_have_it() -> None:
+    """Phase 2a interaction: some products have category_visibility,
+    some don't (e.g. one product missing product_type). Average should
+    use only the ones that ran."""
+    from services.agent_center_bd_report_service import _aggregate_brand_scores
+    per_product = [
+        {"verdict": {"visibility_score": 50, "attribution_score": 50, "category_visibility_score": 25}},
+        {"verdict": {"visibility_score": 50, "attribution_score": 50, "category_visibility_score": None}},
+    ]
+    agg = _aggregate_brand_scores(per_product)
+    assert agg["avg_visibility"] == 50.0
+    # Only the one with category=25 contributes to the average.
+    assert agg["avg_category_visibility"] == 25.0
+
+
+def test_aggregate_brand_competitors_sums_across_products() -> None:
+    """Cross-product competitor frequency: Sephora cited 3× on product
+    A + 2× on product B = 5 total. Better signal than per-product
+    competitor table because BD wants brand-wide narrative."""
+    from services.agent_center_bd_report_service import _aggregate_brand_competitors
+    per_product = [
+        {"attribution": {"competitor_hosts": [
+            {"host": "Sephora", "times_cited": 3},
+            {"host": "Ulta", "times_cited": 1},
+        ]}},
+        {"attribution": {"competitor_hosts": [
+            {"host": "Sephora", "times_cited": 2},
+            {"host": "YesStyle", "times_cited": 1},
+        ]}},
+    ]
+    out = _aggregate_brand_competitors(per_product)
+    assert out[0] == {"host": "Sephora", "times_cited": 5}
+    # Top-15 ordering: Sephora (5), Ulta (1), YesStyle (1)
+    assert len(out) == 3
+
+
+@pytest.mark.asyncio
+async def test_run_brand_report_caps_at_5_products(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """Cost guard: hard cap on per-call product count."""
+    from services.agent_center_bd_report_service import run_brand_report
+    products = [
+        {"title": f"P{i}", "pdp_url": f"https://x.com/p/{i}", "product_type": "thing"}
+        for i in range(6)
+    ]
+    with pytest.raises(ValueError, match="capped at 5"):
+        await run_brand_report(
+            merchant_name="X",
+            merchant_domain=None,
+            products=products,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_brand_report_isolates_per_product_failures(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """One product crashing doesn't kill the brand run — per-product
+    isolation is the core reliability property."""
+    from services import agent_center_bd_report_service as bd
+
+    call_count = {"n": 0}
+    async def _fake_probe(**kwargs):
+        call_count["n"] += 1
+        # First product succeeds, second product raises, third succeeds.
+        # run_bd_probes calls probe() twice (visibility + attribution)
+        # OR 3 times (with category). For this test we'll have it
+        # succeed on calls 1-3, fail on call 4 (visibility of product 2),
+        # succeed on the rest.
+        if call_count["n"] == 4:
+            raise RuntimeError("upstream timeout for product 2")
+        return {
+            "scan_mode": kwargs.get("scan_mode"),
+            "provider": "gemini",
+            "scores": {"visibility_score": 50},
+            "raw_runs": [],
+            "findings": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    out = await bd.run_brand_report(
+        merchant_name="Brand X",
+        merchant_domain="brandx.com",
+        products=[
+            {"title": "P1", "pdp_url": "https://x.com/p/1", "product_type": "thing"},
+            {"title": "P2", "pdp_url": "https://x.com/p/2", "product_type": "thing"},
+            {"title": "P3", "pdp_url": "https://x.com/p/3", "product_type": "thing"},
+        ],
+        include_category_visibility=False,  # 2 calls per product instead of 3
+    )
+    # Product 2 should be in failed[], products 1+3 in per_product
+    assert out["aggregate"]["products_count"] == 3
+    assert out["aggregate"]["products_succeeded"] == 2
+    assert out["aggregate"]["products_failed"] == 1
+    assert len(out["per_product"]) == 2
+    assert out["failed"][0]["title"] == "P2"
+    assert "upstream timeout" in out["failed"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_brand_report_aggregate_competitor_view(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """End-to-end: brand-level competitor frequency rolls up correctly."""
+    from services import agent_center_bd_report_service as bd
+
+    async def _fake_probe(**kwargs):
+        # Both products' attribution probes return Sephora cite.
+        # Visibility/category probes return no grounding.
+        scan_mode = kwargs.get("scan_mode")
+        if scan_mode == "merchant_store_attribution_test":
+            return {
+                "scan_mode": scan_mode,
+                "provider": "gemini",
+                "scores": {"visibility_score": 0},
+                "raw_runs": [
+                    {
+                        "query": "buy",
+                        "parsed": {"merchant_url_found": False},
+                        "grounding_chunks": ["https://vertexaisearch.cloud.google.com/x"],
+                        "grounding_sources": [
+                            {"uri": "https://vertexaisearch.cloud.google.com/x",
+                             "title": "Sephora"},
+                        ],
+                    },
+                ],
+                "findings": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        return {
+            "scan_mode": scan_mode, "provider": "gemini",
+            "scores": {"visibility_score": 50}, "raw_runs": [], "findings": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    out = await bd.run_brand_report(
+        merchant_name="Brand X",
+        merchant_domain=None,
+        products=[
+            {"title": "P1", "pdp_url": "https://x.com/p/1", "product_type": "thing"},
+            {"title": "P2", "pdp_url": "https://x.com/p/2", "product_type": "thing"},
+        ],
+        include_category_visibility=False,
+    )
+    # Sephora is cited 1× on each of 2 products = 2 total brand-wide.
+    competitors = out["cross_product_competitors"]
+    assert competitors[0] == {"host": "Sephora", "times_cited": 2}
 
 
 def test_render_markdown_includes_industry_context_and_actions() -> None:
