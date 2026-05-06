@@ -1497,6 +1497,223 @@ def _history_row_to_item(row: Dict[str, Any]) -> BrowseHistoryItem:
     )
 
 
+def _coerce_positive_history_price(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        candidates = [
+            value.get("amount"),
+            value.get("value"),
+            value.get("price_amount"),
+            value.get("price"),
+            _coerce_json_object(value.get("current")).get("amount"),
+            _coerce_json_object(value.get("current")).get("value"),
+            _coerce_json_object(value.get("sale")).get("amount"),
+            _coerce_json_object(value.get("min")).get("amount"),
+        ]
+        for candidate in candidates:
+            price = _coerce_positive_history_price(candidate)
+            if price is not None:
+                return price
+        return None
+    try:
+        price = float(value)
+    except Exception:
+        return None
+    if price > 0:
+        return price
+    return None
+
+
+def _extract_history_price_from_product_payload(payload: Any) -> Optional[float]:
+    product = _coerce_json_object(payload)
+    if not product:
+        return None
+
+    for key in ("price", "pricing", "price_amount"):
+        price = _coerce_positive_history_price(product.get(key))
+        if price is not None:
+            return price
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        for variant in variants:
+            variant_data = _coerce_json_object(variant)
+            for key in ("price", "pricing", "price_amount"):
+                price = _coerce_positive_history_price(variant_data.get(key))
+                if price is not None:
+                    return price
+
+    offers = product.get("offers")
+    if isinstance(offers, list):
+        for offer in offers:
+            offer_data = _coerce_json_object(offer)
+            price = _coerce_positive_history_price(offer_data.get("price"))
+            if price is not None:
+                return price
+
+    return None
+
+
+def _extract_history_currency_from_product_payload(payload: Any) -> Optional[str]:
+    product = _coerce_json_object(payload)
+    if not product:
+        return None
+
+    for value in (
+        product.get("currency"),
+        product.get("price_currency"),
+        _coerce_json_object(product.get("price")).get("currency"),
+        _coerce_json_object(product.get("price")).get("currency_code"),
+        _coerce_json_object(_coerce_json_object(product.get("price")).get("current")).get("currency"),
+        _coerce_json_object(_coerce_json_object(product.get("price")).get("current")).get("currency_code"),
+    ):
+        text = str(value or "").strip().upper()
+        if text:
+            return text
+    return None
+
+
+def _product_payload_ids(payload: Any) -> List[str]:
+    product = _coerce_json_object(payload)
+    ids: List[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in ids:
+            ids.append(text)
+
+    for key in ("id", "product_id", "platform_product_id", "external_product_id"):
+        add(product.get(key))
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        for variant in variants:
+            variant_data = _coerce_json_object(variant)
+            for key in ("variant_id", "id", "sku", "sku_id"):
+                add(variant_data.get(key))
+
+    return ids
+
+
+async def _resolve_history_price_lookup(rows: List[Dict[str, Any]]) -> Dict[str, Tuple[float, Optional[str]]]:
+    product_ids = sorted({
+        str(row.get("product_id") or "").strip()
+        for row in rows
+        if str(row.get("product_id") or "").strip()
+    })
+    if not product_ids:
+        return {}
+
+    lookup: Dict[str, Tuple[float, Optional[str]]] = {}
+
+    def put(product_id: Any, price: Optional[float], currency: Optional[str]) -> None:
+        pid = str(product_id or "").strip()
+        if not pid or price is None or price <= 0 or pid in lookup:
+            return
+        lookup[pid] = (float(price), str(currency or "").strip().upper() or None)
+
+    try:
+        seed_rows = await asyncio.wait_for(
+            database.fetch_all(
+                """
+                SELECT id, external_product_id, price_amount, price_currency, seed_data
+                FROM external_product_seeds
+                WHERE status = 'active'
+                  AND (id = ANY(:product_ids) OR external_product_id = ANY(:product_ids))
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT :limit
+                """,
+                {"product_ids": product_ids, "limit": min(max(len(product_ids) * 2, 1), 250)},
+            ),
+            timeout=1.0,
+        )
+        for row in seed_rows or []:
+            data = dict(row)
+            seed_data = _coerce_json_object(data.get("seed_data"))
+            price = (
+                _coerce_positive_history_price(data.get("price_amount"))
+                or _coerce_positive_history_price(seed_data.get("price_amount"))
+                or _coerce_positive_history_price(seed_data.get("price"))
+                or _extract_history_price_from_product_payload(seed_data)
+            )
+            currency = (
+                str(data.get("price_currency") or "").strip().upper()
+                or str(seed_data.get("price_currency") or seed_data.get("currency") or "").strip().upper()
+                or _extract_history_currency_from_product_payload(seed_data)
+            )
+            put(data.get("id"), price, currency)
+            put(data.get("external_product_id"), price, currency)
+    except Exception as exc:
+        logger.debug(f"Browse history external seed price lookup skipped: {exc}")
+
+    unresolved_ids = [pid for pid in product_ids if pid not in lookup]
+    if unresolved_ids:
+        try:
+            cache_rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT merchant_id, platform_product_id, product_data
+                    FROM products_cache
+                    WHERE (expires_at IS NULL OR expires_at > NOW())
+                      AND (
+                        platform_product_id = ANY(:product_ids)
+                        OR product_data::jsonb->>'id' = ANY(:product_ids)
+                        OR product_data::jsonb->>'product_id' = ANY(:product_ids)
+                        OR EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(
+                            CASE
+                              WHEN jsonb_typeof(product_data::jsonb->'variants') = 'array'
+                              THEN product_data::jsonb->'variants'
+                              ELSE '[]'::jsonb
+                            END
+                          ) AS variant
+                          WHERE COALESCE(
+                            variant->>'variant_id',
+                            variant->>'id',
+                            variant->>'sku',
+                            variant->>'sku_id'
+                          ) = ANY(:product_ids)
+                        )
+                      )
+                    ORDER BY cached_at DESC, id DESC
+                    LIMIT :limit
+                    """,
+                    {"product_ids": unresolved_ids, "limit": min(max(len(unresolved_ids) * 2, 1), 250)},
+                ),
+                timeout=1.0,
+            )
+            for row in cache_rows or []:
+                data = dict(row)
+                product_data = _coerce_json_object(data.get("product_data"))
+                price = _extract_history_price_from_product_payload(product_data)
+                currency = _extract_history_currency_from_product_payload(product_data)
+                put(data.get("platform_product_id"), price, currency)
+                for pid in _product_payload_ids(product_data):
+                    put(pid, price, currency)
+        except Exception as exc:
+            logger.debug(f"Browse history products_cache price lookup skipped: {exc}")
+
+    return lookup
+
+
+async def _persist_history_price_best_effort(row_id: Any, price: float, currency: Optional[str]) -> None:
+    if row_id is None or price <= 0:
+        return
+    try:
+        await database.execute(
+            shop_browse_history_events.update()
+            .where(shop_browse_history_events.c.id == row_id)
+            .values(
+                price=float(price),
+                **({"currency": currency} if currency else {}),
+            )
+        )
+    except Exception:
+        return
+
+
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -2319,7 +2536,7 @@ async def list_browse_history(
         .limit(scan_limit)
     )
 
-    items: List[BrowseHistoryItem] = []
+    selected_rows: List[Dict[str, Any]] = []
     seen: set = set()
     for row in rows:
         data = dict(row)
@@ -2330,9 +2547,32 @@ async def list_browse_history(
         if not key or key in seen:
             continue
         seen.add(key)
-        items.append(_history_row_to_item(data))
-        if len(items) >= limit:
+        selected_rows.append(data)
+        if len(selected_rows) >= limit:
             break
+
+    price_lookup = await _resolve_history_price_lookup([
+        row
+        for row in selected_rows
+        if _coerce_positive_history_price(row.get("price")) is None
+    ])
+
+    items: List[BrowseHistoryItem] = []
+    persist_tasks = []
+    for data in selected_rows:
+        product_id = str(data.get("product_id") or "").strip()
+        if _coerce_positive_history_price(data.get("price")) is None and product_id in price_lookup:
+            price, currency = price_lookup[product_id]
+            data["price"] = price
+            if currency:
+                data["currency"] = currency
+            persist_tasks.append(
+                _persist_history_price_best_effort(data.get("id"), price, currency)
+            )
+        items.append(_history_row_to_item(data))
+
+    if persist_tasks:
+        await asyncio.gather(*persist_tasks, return_exceptions=True)
 
     return BrowseHistoryListResponse(items=items, total=len(items))
 
