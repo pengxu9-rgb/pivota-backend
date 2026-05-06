@@ -441,3 +441,179 @@ def test_admin_routes_require_admin_auth(monkeypatch: pytest.MonkeyPatch) -> Non
 
     res = client.get("/admin/agent-center/scan-targets/stuck")
     assert res.status_code in {401, 403}
+
+
+# ---------------------------------------------------------------------------
+# BD report route — POST /api/agent-center/bd/external-merchant-report
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bd_env(monkeypatch: pytest.MonkeyPatch) -> Tuple[TestClient, FakeDB]:
+    """BD route doesn't touch the DB, but mocking llm_client.probe is
+    essential — otherwise tests would hit real Gemini."""
+    db = FakeDB()
+    from services import agent_center_service as ac
+    monkeypatch.setattr(ac, "database", db)
+
+    # Mock the upstream probe to return deterministic canned shapes.
+    # Different responses per scan_mode so the structured report has
+    # interesting numbers (visibility=33, attribution=0).
+    from services import agent_center_bd_report_service as bd_service
+
+    async def _fake_probe(**kwargs):
+        scan_mode = kwargs.get("scan_mode")
+        if scan_mode == "open_product_visibility_test":
+            return {
+                "scan_mode": scan_mode,
+                "provider": "mock",
+                "scores": {"visibility_score": 33, "attribution_echo_rate": 0},
+                "runs_count": 3,
+                "raw_runs": [
+                    {
+                        "query": "where can I buy Cloud Paint",
+                        "parsed": {"product_visible": True},
+                        "grounding_chunks": ["https://sephora.com/p/cloud-paint"],
+                    },
+                    {
+                        "query": "Cloud Paint reviews",
+                        "parsed": {"product_visible": False},
+                        "grounding_chunks": [],
+                    },
+                    {
+                        "query": "best blush for sensitive skin",
+                        "parsed": {"product_visible": False},
+                        "grounding_chunks": ["https://allure.com/best-blushes"],
+                    },
+                ],
+                "findings": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        # attribution
+        return {
+            "scan_mode": scan_mode,
+            "provider": "mock",
+            "scores": {"visibility_score": 0, "attribution_echo_rate": 0},
+            "runs_count": 3,
+            "raw_runs": [
+                {
+                    "query": "shop Cloud Paint online",
+                    "parsed": {"merchant_url_found": False},
+                    "grounding_chunks": [
+                        "https://sephora.com/p/cloud-paint",
+                        "https://ulta.com/p/cloud-paint",
+                    ],
+                },
+                {
+                    "query": "Cloud Paint discount",
+                    "parsed": {"merchant_url_found": False},
+                    "grounding_chunks": ["https://sephora.com/p/cloud-paint"],
+                },
+                {
+                    "query": "where can I buy Glossier blush",
+                    "parsed": {"merchant_url_found": False},
+                    "grounding_chunks": [],
+                },
+            ],
+            "findings": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+
+    # Patch the import inside the service module.
+    monkeypatch.setattr(bd_service.llm_client, "probe", _fake_probe)
+
+    from routes import agent_center_bd_routes as bd_routes
+    from utils.auth import get_current_employee
+
+    async def _override_employee() -> Dict[str, Any]:
+        return {"employee_id": "emp_bd", "email": "bd@pivota.test", "role": "bd"}
+
+    app = FastAPI()
+    app.include_router(bd_routes.router)
+    app.dependency_overrides[get_current_employee] = _override_employee
+    return TestClient(app), db
+
+
+def test_bd_external_merchant_report_returns_structured_report(
+    bd_env: Tuple[TestClient, FakeDB],
+) -> None:
+    client, _ = bd_env
+    res = client.post(
+        "/api/agent-center/bd/external-merchant-report",
+        json={
+            "merchant_name": "Glossier",
+            "merchant_pdp_url": "https://glossier.com/products/cloud-paint",
+            "product_title": "Cloud Paint",
+            "product_vendor": "Glossier",
+            "product_type": "blush",
+            "provider": "mock",
+            "max_runs": 3,
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "ok"
+    report = body["report"]
+
+    # Verdict reflects the canned scores: vis=33, attr=0 → MISATTRIBUTED.
+    assert report["verdict"]["label"] == "VISIBLE BUT MISATTRIBUTED"
+    assert report["verdict"]["visibility_score"] == 33
+    assert report["verdict"]["attribution_score"] == 0
+
+    # Per-query rows from both probes.
+    assert len(report["visibility"]["queries"]) == 3
+    assert len(report["attribution"]["queries"]) == 3
+
+    # Competitor list extracted from grounding_chunks; merchant host
+    # (glossier.com) excluded; sephora cited 2x, ulta 1x.
+    hosts = {entry["host"]: entry["times_cited"] for entry in report["attribution"]["competitor_hosts"]}
+    assert hosts.get("sephora.com") == 2
+    assert hosts.get("ulta.com") == 1
+    assert "glossier.com" not in hosts
+
+
+def test_bd_route_rejects_invalid_url(bd_env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = bd_env
+    res = client.post(
+        "/api/agent-center/bd/external-merchant-report",
+        json={
+            "merchant_name": "X",
+            "merchant_pdp_url": "not-a-url",
+            "product_title": "Y",
+        },
+    )
+    assert res.status_code == 422
+
+
+def test_bd_route_caps_max_runs_at_8(bd_env: Tuple[TestClient, FakeDB]) -> None:
+    client, _ = bd_env
+    res = client.post(
+        "/api/agent-center/bd/external-merchant-report",
+        json={
+            "merchant_name": "X",
+            "merchant_pdp_url": "https://example.com/p/1",
+            "product_title": "Y",
+            "max_runs": 99,  # should fail Pydantic ge=1, le=8
+        },
+    )
+    assert res.status_code == 422
+
+
+def test_bd_route_requires_employee_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDB()
+    from services import agent_center_service as ac
+    monkeypatch.setattr(ac, "database", db)
+
+    from routes import agent_center_bd_routes as bd_routes
+    app = FastAPI()
+    app.include_router(bd_routes.router)
+    client = TestClient(app)
+    res = client.post(
+        "/api/agent-center/bd/external-merchant-report",
+        json={
+            "merchant_name": "X",
+            "merchant_pdp_url": "https://example.com/p/1",
+            "product_title": "Y",
+        },
+    )
+    assert res.status_code in {401, 403}
