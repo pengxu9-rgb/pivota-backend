@@ -26,10 +26,130 @@ import logging
 from typing import Any, Dict, Optional
 
 from config.settings import settings
+from db.database import database
 from services import agent_center_llm_client as llm_client
 from services import agent_center_service as ac
 
 logger = logging.getLogger(__name__)
+
+
+# Maximum number of times we'll fall back to a products_cache lookup
+# during a single run. Currently 1 (one lookup per run); future work may
+# enrich `context.product` with extra fields without changing the call
+# site, so the constant exists for clarity.
+_PRODUCT_LOOKUP_BUDGET = 1
+
+
+def _parse_product_entity_id(entity_id: str) -> Optional[Dict[str, str]]:
+    """Decode the canonical entity_id format.
+
+    Format: `<merchant_id>|<platform>|<platform_product_id>`. Returns the
+    three fields as a dict, or None when the format doesn't match (e.g.
+    a free-form entity_id that pre-dates the canonical format)."""
+    if not isinstance(entity_id, str):
+        return None
+    parts = entity_id.split("|")
+    if len(parts) != 3 or not all(p.strip() for p in parts):
+        return None
+    return {
+        "merchant_id": parts[0].strip(),
+        "platform": parts[1].strip(),
+        "platform_product_id": parts[2].strip(),
+    }
+
+
+async def _lookup_product_for_query_generation(
+    *, merchant_id: str, platform: str, platform_product_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Look up products_cache for the (merchant, platform, product_id) and
+    return a `{title, vendor, product_type}` dict the PIVOTA-Agent probe
+    can use to auto-generate buyer-style queries. Returns None when the
+    row is missing or the cached payload doesn't have a usable title.
+
+    Best-effort — failures are logged but don't fail the run. The probe
+    will fall back to its V1 behavior (using product_entity_id as the
+    sole query) if we return None."""
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT product_data
+            FROM products_cache
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND platform_product_id = :platform_product_id
+            ORDER BY cached_at DESC
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "platform_product_id": platform_product_id,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "demand_test product lookup failed (%s|%s|%s): %s",
+            merchant_id, platform, platform_product_id, exc,
+        )
+        return None
+    if not row:
+        return None
+    # Reuse the same payload decoder as the sku-match runner — handles
+    # bytes/str/dict shapes uniformly.
+    from services.agent_center_sku_match_service import _decode_product_data
+    data = _decode_product_data(dict(row).get("product_data"))
+    title = data.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+    out: Dict[str, Any] = {"title": title.strip()}
+    vendor = data.get("vendor")
+    if isinstance(vendor, str) and vendor.strip():
+        out["vendor"] = vendor.strip()
+    product_type = data.get("product_type")
+    if isinstance(product_type, str) and product_type.strip():
+        out["product_type"] = product_type.strip()
+    return out
+
+
+async def _enrich_context_with_product_info(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort: when the operator didn't write any queries and an
+    entity_id is present, fill `context.product` from products_cache so
+    the PIVOTA-Agent probe can derive buyer-style queries from real
+    product attributes (PR 15) instead of using the meaningless
+    pipe-delimited entity_id (V1 fallback).
+
+    Returns the (possibly mutated) context dict. Never raises — lookup
+    failures degrade gracefully to the V1 path."""
+    if not isinstance(context, dict):
+        return context
+    queries = context.get("queries")
+    if isinstance(queries, list) and len(queries) > 0:
+        # Operator wrote queries — auto-generation is bypassed in the probe
+        # anyway. Skip the lookup to save a SQL roundtrip.
+        return context
+    if isinstance(context.get("product"), dict) and context["product"].get("title"):
+        # Already populated (form sent it directly).
+        return context
+    entity_id = context.get("product_entity_id")
+    parsed = _parse_product_entity_id(entity_id) if entity_id else None
+    if not parsed:
+        return context
+    product = await _lookup_product_for_query_generation(
+        merchant_id=parsed["merchant_id"],
+        platform=parsed["platform"],
+        platform_product_id=parsed["platform_product_id"],
+    )
+    if product:
+        # Mutate a shallow copy so the scan_target's stored context isn't
+        # accidentally extended in-memory beyond what we explicitly persist.
+        out = dict(context)
+        out["product"] = product
+        logger.info(
+            "demand_test: enriched context.product from products_cache for entity=%s (title=%r)",
+            entity_id, product["title"],
+        )
+        return out
+    return context
 
 
 # Demand-test issue types (lifted from the V1 spec). Aligned with the
@@ -115,7 +235,12 @@ async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
         started_at=ac.utcnow(),
     )
 
-    # 2. Call the LLM probe. Heartbeat right before so a slow Gemini call
+    # 2. Best-effort: enrich context.product from products_cache so the
+    #    upstream probe can derive buyer-style queries from real attributes
+    #    instead of falling back to the meaningless product_entity_id.
+    context = await _enrich_context_with_product_info(context)
+
+    # 3. Call the LLM probe. Heartbeat right before so a slow Gemini call
     #    (real probes can take 30-60s) doesn't make the row look stuck.
     await ac.heartbeat_scan_target(scan_target_id=scan_target_id)
     try:

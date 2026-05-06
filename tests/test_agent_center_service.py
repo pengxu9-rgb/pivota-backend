@@ -971,3 +971,154 @@ async def test_heartbeat_skips_soft_deleted(fake_db: FakeDB) -> None:
     fake_db._tables["agent_center_scan_targets"][0]["deleted_at"] = datetime.now(timezone.utc)
     ok = await ac.heartbeat_scan_target(scan_target_id=target["id"])
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Demand-test product lookup — context.product enrichment from products_cache
+# (PR 16; pairs with PIVOTA-Agent #1298 query generator)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_product_entity_id_canonical_format() -> None:
+    from services.agent_center_demand_test_service import _parse_product_entity_id
+    parsed = _parse_product_entity_id("m1|shopify|P123")
+    assert parsed == {
+        "merchant_id": "m1",
+        "platform": "shopify",
+        "platform_product_id": "P123",
+    }
+
+
+def test_parse_product_entity_id_rejects_malformed() -> None:
+    from services.agent_center_demand_test_service import _parse_product_entity_id
+    assert _parse_product_entity_id("not-canonical") is None
+    assert _parse_product_entity_id("only|two") is None
+    assert _parse_product_entity_id("a||c") is None  # empty middle segment
+    assert _parse_product_entity_id("") is None
+    assert _parse_product_entity_id(None) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_enrich_skips_lookup_when_operator_wrote_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator-supplied queries always win in the upstream probe; no need
+    to burn a SQL roundtrip on lookup."""
+    from services import agent_center_demand_test_service as dts
+
+    calls = []
+    async def _spy(**kwargs):
+        calls.append(kwargs)
+        return {"title": "should not be called"}
+    monkeypatch.setattr(dts, "_lookup_product_for_query_generation", _spy)
+
+    ctx = {
+        "queries": ["where can I buy this"],
+        "product_entity_id": "m1|shopify|P1",
+    }
+    out = await dts._enrich_context_with_product_info(ctx)
+    assert calls == []
+    assert out is ctx  # unchanged identity
+
+
+@pytest.mark.asyncio
+async def test_enrich_skips_lookup_when_product_already_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import agent_center_demand_test_service as dts
+
+    calls = []
+    async def _spy(**kwargs):
+        calls.append(kwargs)
+        return None
+    monkeypatch.setattr(dts, "_lookup_product_for_query_generation", _spy)
+
+    ctx = {
+        "queries": [],
+        "product_entity_id": "m1|shopify|P1",
+        "product": {"title": "Already Provided"},
+    }
+    out = await dts._enrich_context_with_product_info(ctx)
+    assert calls == []
+    assert out["product"]["title"] == "Already Provided"
+
+
+@pytest.mark.asyncio
+async def test_enrich_populates_product_from_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual happy path — operator left queries empty, entity_id is
+    canonical, products_cache has the row."""
+    from services import agent_center_demand_test_service as dts
+
+    async def _fake_lookup(*, merchant_id, platform, platform_product_id):
+        assert merchant_id == "m1"
+        assert platform == "shopify"
+        assert platform_product_id == "P1"
+        return {"title": "Vitamin C Tonic 50ml", "vendor": "Acme", "product_type": "serum"}
+    monkeypatch.setattr(dts, "_lookup_product_for_query_generation", _fake_lookup)
+
+    ctx = {"queries": [], "product_entity_id": "m1|shopify|P1"}
+    out = await dts._enrich_context_with_product_info(ctx)
+    assert out["product"]["title"] == "Vitamin C Tonic 50ml"
+    assert out["product"]["vendor"] == "Acme"
+    assert out["product"]["product_type"] == "serum"
+    # Original ctx untouched (we returned a shallow copy).
+    assert "product" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_enrich_skips_when_entity_id_not_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import agent_center_demand_test_service as dts
+
+    calls = []
+    async def _spy(**kwargs):
+        calls.append(kwargs)
+        return None
+    monkeypatch.setattr(dts, "_lookup_product_for_query_generation", _spy)
+
+    ctx = {"queries": [], "product_entity_id": "free-form-string"}
+    out = await dts._enrich_context_with_product_info(ctx)
+    assert calls == []
+    assert "product" not in out
+
+
+@pytest.mark.asyncio
+async def test_enrich_returns_context_unchanged_when_lookup_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cache miss is fine — probe falls back to V1 behavior (entity_id
+    as the sole query). Don't add a falsy `product` field that would
+    confuse downstream readers."""
+    from services import agent_center_demand_test_service as dts
+
+    async def _miss(**kwargs):
+        return None
+    monkeypatch.setattr(dts, "_lookup_product_for_query_generation", _miss)
+
+    ctx = {"queries": [], "product_entity_id": "m1|shopify|UNKNOWN"}
+    out = await dts._enrich_context_with_product_info(ctx)
+    assert "product" not in out
+    assert out["product_entity_id"] == "m1|shopify|UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_enrich_swallows_lookup_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort: a SQL outage shouldn't break the demand-test run.
+    The probe will fall back to V1 query selection."""
+    from services import agent_center_demand_test_service as dts
+
+    # _lookup_product_for_query_generation already swallows exceptions
+    # internally (returns None on DB error). This test verifies that.
+    async def _fake_database_fetch_one(query, params):
+        raise RuntimeError("Postgres unavailable")
+    monkeypatch.setattr(dts.database, "fetch_one", _fake_database_fetch_one)
+
+    out = await dts._lookup_product_for_query_generation(
+        merchant_id="m1", platform="shopify", platform_product_id="P1",
+    )
+    assert out is None
