@@ -138,6 +138,50 @@ def _row(
     }
 
 
+def _install_audit_run_persistence_mocks(monkeypatch: pytest.MonkeyPatch, mar) -> List[Dict[str, Any]]:
+    """Phase C-4 PR-C helper: replace the 4 audit-history DB helpers
+    with stateful in-memory simulations. Used by the main `env`
+    fixture and each inline-fixture-style test below.
+
+    Returns the in-memory history list so callers that need to assert
+    on persisted state can inspect it directly.
+    """
+    history: List[Dict[str, Any]] = []
+
+    async def _count(*, merchant_id: str, window_seconds: int) -> int:
+        return sum(1 for r in history if r["merchant_id"] == merchant_id)
+
+    async def _start(*, merchant_id: str, product_keys: List[str]) -> str:
+        run_id = f"run-{len(history)}"
+        history.append({
+            "run_id": run_id,
+            "merchant_id": merchant_id,
+            "product_keys": list(product_keys),
+            "status": "running",
+        })
+        return run_id
+
+    async def _complete(**kwargs) -> None:
+        run_id = kwargs.get("run_id")
+        for r in history:
+            if r["run_id"] == run_id:
+                r.update({k: v for k, v in kwargs.items() if k != "run_id"})
+
+    async def _recent(*, merchant_id: str, limit: int = 5):
+        rows = [r for r in history if r["merchant_id"] == merchant_id]
+        return rows[-limit:][::-1]
+
+    monkeypatch.setattr(mar, "count_runs_in_window", _count)
+    monkeypatch.setattr(mar, "record_audit_run_started", _start)
+    monkeypatch.setattr(mar, "record_audit_run_completed", _complete)
+    monkeypatch.setattr(mar, "recent_runs_for_merchant", _recent)
+    # Compatibility shim: existing tests call `mar._audit_run_history.clear()`
+    # to reset state. Point that name at the in-memory list so the .clear()
+    # works without rewriting each test.
+    mar._audit_run_history = history  # type: ignore[attr-defined]
+    return history
+
+
 # ---------------------------------------------------------------------------
 # Fixture: a small FastAPI app with just the merchant audit router +
 # overridden auth + fake DB + mocked run_brand_report.
@@ -207,9 +251,7 @@ def env(monkeypatch: pytest.MonkeyPatch):
         }
 
     monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
-
-    # Reset the in-memory rate-limit history between tests.
-    mar._audit_run_history.clear()
+    _install_audit_run_persistence_mocks(monkeypatch, mar)
 
     # Override merchant auth — default to a "merch_self" merchant token.
     async def _override_merchant() -> str:
@@ -416,7 +458,7 @@ def test_existing_pivota_canonical_url_is_used_without_lazy_mint(
             "failed": [],
         }
     monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
-    mar._audit_run_history.clear()
+    _install_audit_run_persistence_mocks(monkeypatch, mar)
 
     async def _override_merchant() -> str:
         return "merch_self"
@@ -483,7 +525,7 @@ def test_canonical_url_derived_from_handle_when_catalog_url_missing(
             "failed": [],
         }
     monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
-    mar._audit_run_history.clear()
+    _install_audit_run_persistence_mocks(monkeypatch, mar)
 
     async def _override_merchant() -> str:
         return "merch_self"

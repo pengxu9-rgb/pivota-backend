@@ -287,10 +287,14 @@ def test_tracking_baseline_reference_from_pivota_pdp_baseline():
     assert bl["as_of"] == PIVOTA_PDP_BASELINE_REFERENCE["as_of_date"]
 
 
-def test_tracking_history_link_null_until_pr_c_lands():
+def test_tracking_history_link_set_to_history_endpoint_after_pr_c():
+    """Phase C-4 PR-C populated history_link with the
+    /api/merchant-center/audit/history endpoint. next_audit_eligible_at
+    is still None — computed at the route layer from rate-limit
+    query, not by the structured-report builder."""
     report = _build_invisible_report()
     t = report["merchant_view"]["tracking"]
-    assert t["history_link"] is None
+    assert t["history_link"] == "/api/merchant-center/audit/history"
     assert t["next_audit_eligible_at"] is None
 
 
