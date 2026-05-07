@@ -1033,6 +1033,11 @@ async def run_brand_report(
                 attribution_result=probes["attribution"],
                 category_visibility_result=probes.get("category_visibility"),
                 provider=provider,
+                # Per-product url_source threads through from the
+                # merchant audit route's 3-tier fallback chain so the
+                # `merchant_view.headline.audited_via_pivota_canonical`
+                # flag is per-product accurate, not just top-level.
+                url_source=p.get("url_source"),
             )
             per_product.append(structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
@@ -2184,6 +2189,141 @@ def _build_what_pivota_changes(
     }
 
 
+def _build_merchant_view(
+    *,
+    verdict_label: str,
+    verdict_explanation: str,
+    visibility_score: int,
+    attribution_score: int,
+    category_visibility_score: Optional[int],
+    industry_context: Dict[str, Any],
+    action_items: List[Dict[str, Any]],
+    competitive_pressure: Dict[str, Any],
+    what_pivota_changes: Dict[str, Any],
+    attribution_runs_count: int,
+    merchant_cited_runs: int,
+    competitor_hosts_list: List[Dict[str, Any]],
+    category_retailer_hosts: List[Dict[str, Any]],
+    category_competitor_brands: List[Dict[str, Any]],
+    visibility_query_rows: List[Dict[str, Any]],
+    attribution_query_rows: List[Dict[str, Any]],
+    url_source: Optional[str],
+) -> Dict[str, Any]:
+    """Project the already-computed structured report into a 6-layer
+    information architecture the merchant portal can render directly:
+    headline → receipts → diagnosis → actions → tracking → pivota_value_prop.
+
+    Pure projection — does not re-extract evidence or recompute scores.
+    Every field references data the engine already produced. This is
+    additive: existing top-level keys (`verdict`, `industry_context`,
+    `action_items`, `competitive_pressure`, `what_pivota_changes`,
+    `visibility`, `attribution`, `category_visibility`) remain
+    untouched so the BD-side renderer keeps working.
+
+    `url_source` flags whether THIS product's audit was probed against
+    the merchant's own URL or the Pivota canonical PDP fallback (see
+    `routes/merchant_audit_routes.py`'s 3-tier fallback chain). Used
+    to render a "audited via Pivota canonical surface" indicator.
+    Indexing-arc state computation lands in PR-D — for now the
+    `diagnosis.indexing_arc_state` field is a static caveat.
+    """
+    headline_one_liner = (verdict_explanation or "").split(".")[0].strip()
+    if headline_one_liner and not headline_one_liner.endswith("."):
+        headline_one_liner += "."
+
+    # Top cited URLs across the attribution runs (collapses per-run dups
+    # into a host frequency view sorted by count). Distinct from
+    # `competitor_hosts` because it includes the merchant's own URL when
+    # cited — so the receipts block honestly answers "who got cited?"
+    # rather than only "who beat me?".
+    top_cited_urls = []
+    for row in attribution_query_rows:
+        url = row.get("top_cited_url")
+        if url:
+            top_cited_urls.append(url)
+    # Dedupe preserving order, cap at 5.
+    seen: set = set()
+    top_cited_urls_unique = []
+    for u in top_cited_urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        top_cited_urls_unique.append(u)
+        if len(top_cited_urls_unique) >= 5:
+            break
+
+    pivota_baseline = dict(PIVOTA_PDP_BASELINE_REFERENCE)
+    your_gap_to_baseline = {
+        "visibility": visibility_score - int(pivota_baseline.get("median_visibility") or 0),
+        "attribution": attribution_score - int(pivota_baseline.get("median_attribution") or 0),
+    }
+
+    audited_via_pivota_canonical = (url_source == "pivota_canonical_pdp")
+
+    return {
+        "headline": {
+            "verdict_label": verdict_label,
+            "one_liner": headline_one_liner or None,
+            "scores": {
+                "visibility": visibility_score,
+                "attribution": attribution_score,
+                "category_visibility": category_visibility_score,
+            },
+            "what_is_at_stake": industry_context.get("blurb"),
+            "audited_via_pivota_canonical": audited_via_pivota_canonical,
+            "url_source": url_source,
+        },
+        "receipts": {
+            "queries_tested": attribution_runs_count,
+            "merchant_cited_in": merchant_cited_runs,
+            "top_cited_urls": top_cited_urls_unique,
+            "top_retailers_eating_funnel": [
+                h.get("host")
+                for h in (category_retailer_hosts or [])[:5]
+                if h.get("host")
+            ],
+            "top_competitor_brands": [
+                b.get("name")
+                for b in (category_competitor_brands or [])[:5]
+                if b.get("name")
+            ],
+        },
+        "diagnosis": {
+            "primary": (competitive_pressure or {}).get("framing"),
+            # Static for now; PR-D computes real phase from
+            # `pivota_signature_minted_at` (fresh / indexing /
+            # expected_steady) when url_source == "pivota_canonical_pdp".
+            "indexing_arc_state": (
+                {
+                    "phase": "indexing-up",
+                    "caveat": (
+                        "Pivota canonical PDPs follow a 30-90 day Google "
+                        "indexing arc post-publication. Grounded LLM "
+                        "citations lift as Search Console URL Inspection "
+                        "submissions mature."
+                    ),
+                }
+                if audited_via_pivota_canonical
+                else None
+            ),
+        },
+        "actions": list(action_items or []),
+        "tracking": {
+            # Populated by PR-C once merchant_audit_runs table ships.
+            "next_audit_eligible_at": None,
+            "history_link": None,
+            "pivota_baseline_reference": {
+                "visibility": pivota_baseline.get("median_visibility"),
+                "attribution": pivota_baseline.get("median_attribution"),
+                "as_of": pivota_baseline.get("as_of_date"),
+                "indexing_phase": pivota_baseline.get("indexing_phase"),
+            },
+            "your_gap_to_baseline": your_gap_to_baseline,
+        },
+        "pivota_value_prop": what_pivota_changes,
+    }
+
+
 def build_structured_report(
     *,
     merchant_name: str,
@@ -2196,6 +2336,7 @@ def build_structured_report(
     provider: str,
     timestamp: Optional[str] = None,
     category_visibility_result: Optional[Dict[str, Any]] = None,
+    url_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a single JSON-serializable dict with everything the UI
     needs to render the BD report. Pure function.
@@ -2357,6 +2498,29 @@ def build_structured_report(
         category_visibility_score=category_score,
     )
 
+    visibility_query_rows = _per_query_rows(visibility_runs, "product_visible")
+    attribution_query_rows = _per_query_rows(attribution_runs, "merchant_url_found")
+
+    merchant_view = _build_merchant_view(
+        verdict_label=verdict_label,
+        verdict_explanation=verdict_explanation,
+        visibility_score=visibility_score,
+        attribution_score=attribution_score,
+        category_visibility_score=category_score,
+        industry_context=industry_context,
+        action_items=action_items,
+        competitive_pressure=competitive_pressure,
+        what_pivota_changes=what_pivota_changes,
+        attribution_runs_count=len(attribution_runs),
+        merchant_cited_runs=merchant_cited_runs,
+        competitor_hosts_list=competitor_hosts_list,
+        category_retailer_hosts=category_retailer_hosts or [],
+        category_competitor_brands=category_competitor_brands or [],
+        visibility_query_rows=visibility_query_rows,
+        attribution_query_rows=attribution_query_rows,
+        url_source=url_source,
+    )
+
     return {
         "merchant_name": merchant_name,
         "merchant_pdp_url": merchant_pdp_url,
@@ -2380,17 +2544,18 @@ def build_structured_report(
         "action_items": action_items,
         "competitive_pressure": competitive_pressure,
         "what_pivota_changes": what_pivota_changes,
+        "merchant_view": merchant_view,
         "visibility": {
             "score": visibility_score,
             "runs": len(visibility_runs),
-            "queries": _per_query_rows(visibility_runs, "product_visible"),
+            "queries": visibility_query_rows,
         },
         "attribution": {
             "score": attribution_score,
             "runs": len(attribution_runs),
             "merchant_cited_runs": merchant_cited_runs,
             "runs_with_any_citation": runs_with_any_citation,
-            "queries": _per_query_rows(attribution_runs, "merchant_url_found"),
+            "queries": attribution_query_rows,
             "competitor_hosts": competitor_hosts_list,
         },
         "category_visibility": (

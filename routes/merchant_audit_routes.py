@@ -284,7 +284,12 @@ async def run_merchant_self_audit(
             "vendor": r["brand"],
             "product_type": r["product_type"],
             "pdp_url": pdp_url,
-            "_url_source": url_source,  # dropped before passing to run_brand_report
+            # Phase C-4 (PR-B): pass url_source through to the engine so
+            # per-product `merchant_view.headline.audited_via_pivota_canonical`
+            # is accurate. Was previously stripped before calling
+            # run_brand_report; now consumed by build_structured_report's
+            # url_source kwarg.
+            "url_source": url_source,
         })
 
     # All products always resolve to a URL now (Pivota canonical fallback
@@ -293,12 +298,6 @@ async def run_merchant_self_audit(
     # canonical PDP rather than the merchant's own URL — useful so the
     # UI can flag "this score reflects Pivota canonical surface, not
     # your storefront."
-    # Strip the internal _url_source field before handing to run_brand_report.
-    audit_products = [
-        {k: v for k, v in p.items() if not k.startswith("_")}
-        for p in products
-    ]
-    products = audit_products  # rebind so the rest of the route is unchanged
 
     logger.info(
         "merchant_self_audit_start merchant_id=%s sku_count=%d max_runs=%d",
