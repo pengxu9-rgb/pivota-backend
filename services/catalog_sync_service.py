@@ -960,6 +960,177 @@ async def ingest_standard_products(
     return stats
 
 
+async def prune_missing_catalog_products_for_source(
+    *,
+    merchant_id: str,
+    platform: str,
+    valid_source_product_ids: List[str],
+    source_system: str,
+) -> Dict[str, int]:
+    """Remove catalog rows that are no longer present in a completed source sync.
+
+    This is intentionally scoped to one merchant/platform/source_system. Shopify
+    refreshes products_cache as the live source of truth, so catalog rows from an
+    older completed sync must not keep surfacing after the upstream product ids
+    disappear.
+    """
+    normalized_ids = [str(item or "").strip() for item in valid_source_product_ids or [] if str(item or "").strip()]
+    prune_all = not normalized_ids
+    stats: Dict[str, int] = {}
+
+    async with database.transaction():
+        await database.execute(
+            """
+            CREATE TEMP TABLE stale_catalog_products ON COMMIT DROP AS
+            SELECT product_key, source_product_id
+            FROM catalog_products
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND source_system = :source_system
+              AND (
+                :prune_all
+                OR source_product_id <> ALL(CAST(:valid_source_product_ids AS text[]))
+              )
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "source_system": source_system,
+                "prune_all": prune_all,
+                "valid_source_product_ids": normalized_ids,
+            },
+        )
+        await database.execute(
+            """
+            CREATE TEMP TABLE stale_catalog_skus ON COMMIT DROP AS
+            SELECT sku_key
+            FROM catalog_skus
+            WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
+            """
+        )
+        await database.execute(
+            """
+            CREATE TEMP TABLE stale_catalog_offers ON COMMIT DROP AS
+            SELECT offer_id
+            FROM catalog_offers
+            WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
+               OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+            """
+        )
+
+        delete_statements: List[Tuple[str, str]] = [
+            (
+                "catalog_field_facts",
+                """
+                WITH deleted AS (
+                  DELETE FROM catalog_field_facts
+                  WHERE entity_id IN (SELECT product_key FROM stale_catalog_products)
+                     OR entity_id IN (SELECT sku_key FROM stale_catalog_skus)
+                     OR entity_id IN (SELECT offer_id FROM stale_catalog_offers)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+            (
+                "catalog_inventory_snapshots",
+                """
+                WITH deleted AS (
+                  DELETE FROM catalog_inventory_snapshots
+                  WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)
+                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+            (
+                "catalog_price_snapshots",
+                """
+                WITH deleted AS (
+                  DELETE FROM catalog_price_snapshots
+                  WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)
+                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+            (
+                "beauty_sku_ingredients",
+                """
+                WITH deleted AS (
+                  DELETE FROM beauty_sku_ingredients
+                  WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
+                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+            (
+                "beauty_product_profiles",
+                """
+                WITH deleted AS (
+                  DELETE FROM beauty_product_profiles
+                  WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+            (
+                "catalog_offers",
+                """
+                WITH deleted AS (
+                  DELETE FROM catalog_offers
+                  WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)
+                     OR product_key IN (SELECT product_key FROM stale_catalog_products)
+                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+            (
+                "catalog_skus",
+                """
+                WITH deleted AS (
+                  DELETE FROM catalog_skus
+                  WHERE sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+                     OR product_key IN (SELECT product_key FROM stale_catalog_products)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+            (
+                "catalog_products",
+                """
+                WITH deleted AS (
+                  DELETE FROM catalog_products
+                  WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
+                  RETURNING 1
+                )
+                SELECT count(*) FROM deleted
+                """,
+            ),
+        ]
+
+        for table_name, sql in delete_statements:
+            deleted = await database.fetch_val(sql)
+            stats[table_name] = int(deleted or 0)
+
+    logger.info(
+        "Catalog source prune completed merchant=%s platform=%s source_system=%s products_deleted=%s",
+        merchant_id,
+        platform,
+        source_system,
+        stats.get("catalog_products", 0),
+    )
+    return stats
+
+
 async def create_catalog_sync_job(
     *,
     merchant_id: str,

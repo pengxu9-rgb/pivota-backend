@@ -35,7 +35,7 @@ async def test_sync_marks_truncated_when_limit_reached_with_next_page(monkeypatc
         return None
 
     async def fake_delete_missing(**_kwargs):
-        return 0
+        raise AssertionError("cache prune should not run for truncated sync")
 
     monkeypatch.setattr(sync_service, "_get_shopify_store_credentials", fake_creds)
     monkeypatch.setattr(sync_service, "fetch_merchant_products", fake_fetch)
@@ -72,7 +72,7 @@ async def test_sync_marks_truncated_when_next_token_is_unparseable(monkeypatch: 
         return None
 
     async def fake_delete_missing(**_kwargs):
-        return 0
+        raise AssertionError("cache prune should not run for truncated sync")
 
     monkeypatch.setattr(sync_service, "_get_shopify_store_credentials", fake_creds)
     monkeypatch.setattr(sync_service, "fetch_merchant_products", fake_fetch)
@@ -148,3 +148,112 @@ async def test_sync_injects_description_text_for_html_descriptions(
     assert product_data["description_text"] == "Clean lines\n- Soft mesh\n- Light feel"
     assert product_data["raw"]["description_text"] == "Clean lines\n- Soft mesh\n- Light feel"
     assert product_data["platform_metadata"]["reviewed_ingredient_ids"] == ["Niacinamide"]
+
+
+@pytest.mark.asyncio
+async def test_complete_shopify_sync_prunes_missing_catalog_products(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.catalog_sync_service as catalog_module
+    import services.shopify_products_sync as module
+
+    observed: dict = {}
+
+    async def fake_creds(_merchant_id: str):
+        return {"shop_domain": "test-shop.myshopify.com", "access_token": "token"}
+
+    async def fake_fetch(**_kwargs):
+        return [_DummyStandardProduct("p1"), _DummyStandardProduct("p2")], None, None
+
+    async def fake_upsert(**_kwargs):
+        return None
+
+    async def fake_hydrate(**kwargs):
+        return kwargs["product_payloads"]
+
+    async def fake_delete_missing(**_kwargs):
+        return 0
+
+    async def fake_ingest(**kwargs):
+        observed["ingest"] = kwargs
+        return {"products_ingested": len(kwargs["product_payloads"])}
+
+    async def fake_prune(**kwargs):
+        observed["prune"] = kwargs
+        return {"catalog_products": 3}
+
+    monkeypatch.setattr(module, "_get_shopify_store_credentials", fake_creds)
+    monkeypatch.setattr(module, "fetch_merchant_products", fake_fetch)
+    monkeypatch.setattr(module, "upsert_product_cache", fake_upsert)
+    monkeypatch.setattr(module, "hydrate_product_payloads_from_attached_seed_runtime_evidence", fake_hydrate)
+    monkeypatch.setattr(module, "delete_missing_products_from_cache", fake_delete_missing)
+    monkeypatch.setattr(catalog_module, "ingest_standard_products", fake_ingest)
+    monkeypatch.setattr(catalog_module, "prune_missing_catalog_products_for_source", fake_prune)
+
+    summary = await module.sync_shopify_products_for_merchant(
+        merchant_id="merch_1",
+        limit=10,
+        ttl_seconds=3600,
+        per_page=5,
+        max_pages=20,
+        ingest_catalog=True,
+    )
+
+    assert summary["catalogDeletedStale"] == {"catalog_products": 3}
+    assert summary["catalogPruneSkippedReason"] is None
+    assert observed["prune"]["merchant_id"] == "merch_1"
+    assert observed["prune"]["platform"] == "shopify"
+    assert observed["prune"]["source_system"] == "shopify_products_sync"
+    assert set(observed["prune"]["valid_source_product_ids"]) == {"p1", "p2"}
+
+
+@pytest.mark.asyncio
+async def test_truncated_shopify_sync_skips_catalog_prune(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import services.catalog_sync_service as catalog_module
+    import services.shopify_products_sync as module
+
+    async def fake_creds(_merchant_id: str):
+        return {"shop_domain": "test-shop.myshopify.com", "access_token": "token"}
+
+    async def fake_fetch(**_kwargs):
+        return [_DummyStandardProduct("p1"), _DummyStandardProduct("p2")], "next_1", None
+
+    async def fake_upsert(**_kwargs):
+        return None
+
+    async def fake_hydrate(**kwargs):
+        return kwargs["product_payloads"]
+
+    async def fake_delete_missing(**_kwargs):
+        raise AssertionError("cache prune should not run for truncated sync")
+
+    async def fake_ingest(**kwargs):
+        return {"products_ingested": len(kwargs["product_payloads"])}
+
+    async def fail_prune(**_kwargs):
+        raise AssertionError("catalog prune should not run for truncated sync")
+
+    monkeypatch.setattr(module, "_get_shopify_store_credentials", fake_creds)
+    monkeypatch.setattr(module, "fetch_merchant_products", fake_fetch)
+    monkeypatch.setattr(module, "upsert_product_cache", fake_upsert)
+    monkeypatch.setattr(module, "hydrate_product_payloads_from_attached_seed_runtime_evidence", fake_hydrate)
+    monkeypatch.setattr(module, "delete_missing_products_from_cache", fake_delete_missing)
+    monkeypatch.setattr(catalog_module, "ingest_standard_products", fake_ingest)
+    monkeypatch.setattr(catalog_module, "prune_missing_catalog_products_for_source", fail_prune)
+
+    summary = await module.sync_shopify_products_for_merchant(
+        merchant_id="merch_1",
+        limit=2,
+        ttl_seconds=3600,
+        per_page=2,
+        max_pages=20,
+        ingest_catalog=True,
+    )
+
+    assert summary["truncated"] is True
+    assert summary["deletedStale"] == 0
+    assert summary["cachePruneSkippedReason"] == "limit_reached_with_next_page"
+    assert summary["catalogDeletedStale"] is None
+    assert summary["catalogPruneSkippedReason"] == "limit_reached_with_next_page"

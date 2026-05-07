@@ -230,16 +230,25 @@ async def sync_shopify_products_for_merchant(
         truncated_reason = "max_pages_reached_with_next_page"
 
     deleted_stale = 0
+    cache_prune_skipped_reason: Optional[str] = None
     if synced_platform_ids:
-        deleted_stale = await delete_missing_products_from_cache(
-            merchant_id=merchant_id,
-            platform="shopify",
-            valid_platform_product_ids=list(synced_platform_ids),
-        )
+        if truncated:
+            cache_prune_skipped_reason = truncated_reason or "sync_truncated"
+        else:
+            deleted_stale = await delete_missing_products_from_cache(
+                merchant_id=merchant_id,
+                platform="shopify",
+                valid_platform_product_ids=list(synced_platform_ids),
+            )
 
     catalog_stats: Optional[Dict[str, Any]] = None
+    catalog_deleted_stale: Optional[Dict[str, int]] = None
+    catalog_prune_skipped_reason: Optional[str] = None
     if ingest_catalog and catalog_payloads:
-        from services.catalog_sync_service import ingest_standard_products
+        from services.catalog_sync_service import (
+            ingest_standard_products,
+            prune_missing_catalog_products_for_source,
+        )
 
         catalog_stats = await ingest_standard_products(
             merchant_id=merchant_id,
@@ -248,6 +257,17 @@ async def sync_shopify_products_for_merchant(
             source_system="shopify_products_sync",
             source_ref=f"shopify_products_sync:{merchant_id}:{datetime.utcnow().isoformat()}",
         )
+        if truncated:
+            catalog_prune_skipped_reason = truncated_reason or "sync_truncated"
+        elif synced_platform_ids:
+            catalog_deleted_stale = await prune_missing_catalog_products_for_source(
+                merchant_id=merchant_id,
+                platform="shopify",
+                valid_source_product_ids=list(synced_platform_ids),
+                source_system="shopify_products_sync",
+            )
+        else:
+            catalog_prune_skipped_reason = "no_synced_product_ids"
 
     return {
         "merchantId": merchant_id,
@@ -264,8 +284,11 @@ async def sync_shopify_products_for_merchant(
         "perPage": per_page,
         "maxPages": max_pages,
         "deletedStale": deleted_stale,
+        "cachePruneSkippedReason": cache_prune_skipped_reason,
         "catalogIngested": bool(catalog_stats),
         "catalogStats": catalog_stats,
+        "catalogDeletedStale": catalog_deleted_stale,
+        "catalogPruneSkippedReason": catalog_prune_skipped_reason,
         "syncedAt": datetime.utcnow().isoformat(),
         "lastError": last_error,
     }
