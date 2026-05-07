@@ -2054,3 +2054,169 @@ def test_render_markdown_includes_visibility_booster_section() -> None:
     # Search Console + structured data evidence row visible.
     assert "Search Console" in md or "URL Inspection" in md
     assert "Schema.org" in md
+
+
+# ---------------------------------------------------------------------------
+# Phase 2k: competitive_pressure section — peers vs merchant first-party
+# visibility comparison. The BD pressure point: "merchant might shrug off
+# 0/3 attribution, but won't shrug off competitor X having their own .com
+# cited."
+# ---------------------------------------------------------------------------
+
+
+def _category_run_with_competitors_and_hosts(
+    query: str,
+    *,
+    competitors: List[str],
+    hosts: List[str],
+    excerpt: str = "",
+) -> Dict[str, Any]:
+    """Fixture builder. NOTE: each grounding source needs a distinct
+    URI host or _identify_run_sources dedup will drop duplicates."""
+    return {
+        "query": query,
+        "parsed": {
+            "brand_appears": True,
+            "competitors_appearing": competitors,
+            "evidence_excerpt": excerpt,
+        },
+        "grounding_chunks": [
+            f"https://r{i}.example/{i}" for i in range(len(hosts))
+        ],
+        "grounding_sources": [
+            {"uri": f"https://r{i}.example/{i}", "title": h}
+            for i, h in enumerate(hosts)
+        ],
+        "url_match": {
+            "target_brand": "Test",
+            "target_url": "https://test.com/p",
+            "in_grounding": False,
+            "in_text": False,
+            "llm_self_report": True,
+        },
+    }
+
+
+def _report_with_competitive_data(category_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    from services.agent_center_bd_report_service import build_structured_report
+    return build_structured_report(
+        merchant_name="TestBrand",
+        merchant_pdp_url="https://testbrand.com/products/p",
+        product_title="Test Product",
+        product_vendor="TestBrand",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": category_runs,
+        },
+        provider="gemini",
+    )
+
+
+def test_competitive_pressure_present_with_peers_named() -> None:
+    """The competitive_pressure block surfaces peer brands AI agents
+    named in category queries — the comparative set."""
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best face masks 2026",
+            competitors=["Origins", "The Ordinary", "Beauty of Joseon"],
+            hosts=["voguescandinavia.com", "skinsort.com"],
+        ),
+    ]
+    cp = _report_with_competitive_data(runs)["competitive_pressure"]
+    assert cp["title"]
+    peer_names = [p["name"] for p in cp["peers_named"]]
+    assert "Origins" in peer_names
+    assert "The Ordinary" in peer_names
+
+
+def test_competitive_pressure_detects_competitor_first_party_visibility() -> None:
+    """Heuristic match: when a competitor's .com appears in retailer_hosts,
+    flag them as first-party-visible. This is the BD pressure point —
+    'X has their own .com cited; you don't.'"""
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best face masks 2026",
+            competitors=["Origins", "The Ordinary"],
+            # origins.com is a competitor's first-party domain
+            hosts=["voguescandinavia.com", "origins.com"],
+        ),
+    ]
+    cp = _report_with_competitive_data(runs)["competitive_pressure"]
+    fp = cp["peers_with_first_party_visibility"]
+    assert len(fp) >= 1
+    assert any(p["brand"] == "Origins" for p in fp)
+    origins_entry = next(p for p in fp if p["brand"] == "Origins")
+    assert origins_entry["first_party_host"] == "origins.com"
+
+
+def test_competitive_pressure_framing_when_peers_first_party_visible() -> None:
+    """When some peers ARE first-party-visible, framing must be urgent —
+    'every retailer-routed query is a customer they won and you didn't see'."""
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best face masks 2026",
+            competitors=["Origins"],
+            hosts=["origins.com"],
+        ),
+    ]
+    cp = _report_with_competitive_data(runs)["competitive_pressure"]
+    framing = cp["framing"].lower()
+    assert "competitive pressure" in framing
+    assert "real and immediate" in framing or "won" in framing
+    assert "origins" in framing
+
+
+def test_competitive_pressure_framing_when_no_peers_first_party_visible() -> None:
+    """When NO peers are first-party-visible (entire category retailer-
+    mediated), framing pivots to 'first-mover opportunity' — wider win."""
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best face masks 2026",
+            competitors=["Origins", "The Ordinary"],
+            hosts=["voguescandinavia.com", "skinsort.com", "target.com"],
+        ),
+    ]
+    cp = _report_with_competitive_data(runs)["competitive_pressure"]
+    assert len(cp["peers_with_first_party_visibility"]) == 0
+    framing = cp["framing"].lower()
+    assert "first-mover" in framing
+    assert "retailer-mediated" in framing
+
+
+def test_competitive_pressure_brand_discriminator_handles_multiword_brands() -> None:
+    """Heuristic must match multi-word brands like 'Beauty of Joseon' →
+    'beautyofjoseon.com' via longest-word discriminator (joseon)."""
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best face masks 2026",
+            competitors=["Beauty of Joseon", "PEACH & LILY"],
+            hosts=["beautyofjoseon.com", "peachandlily.com"],
+        ),
+    ]
+    cp = _report_with_competitive_data(runs)["competitive_pressure"]
+    fp = cp["peers_with_first_party_visibility"]
+    fp_brands = {p["brand"] for p in fp}
+    # Both should be detected
+    assert "Beauty of Joseon" in fp_brands
+    assert "PEACH & LILY" in fp_brands
+
+
+def test_render_markdown_includes_competitive_pressure_section() -> None:
+    from services.agent_center_bd_report_service import render_markdown_from_structured
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best face masks 2026",
+            competitors=["Origins", "The Ordinary"],
+            hosts=["origins.com", "voguescandinavia.com"],
+        ),
+    ]
+    md = render_markdown_from_structured(_report_with_competitive_data(runs))
+    assert "Competitive pressure" in md
+    assert "Direct competitor brands" in md
+    assert "first-party in" in md.lower() or "their own .com" in md.lower()
+    assert "Origins" in md
+    assert "origins.com" in md

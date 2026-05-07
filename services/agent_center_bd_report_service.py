@@ -405,6 +405,139 @@ def extract_category_competitors(
     ]
     return (competitor_brands, retailer_hosts)
 
+
+# ---------------------------------------------------------------------------
+# Competitive pressure — the sharpest BD framing. A merchant might shrug
+# off "your visibility is 0/3" if their products still sell through
+# retailers. But "competitor X has their own .com cited 2/3 times in the
+# same category queries you're invisible in" — that's an immediate
+# competitive emergency the merchant can't ignore.
+# ---------------------------------------------------------------------------
+
+
+def _brand_discriminator(brand_name: str) -> Optional[str]:
+    """Pick the longest >=4-char alphanumeric word from the brand name to
+    use as a discriminator when matching against retailer hostnames.
+    e.g. "Beauty of Joseon" → "joseon"; "The Ordinary" → "ordinary";
+    "PEACH & LILY" → "peach" (passes through 'peachandlily' first segment)."""
+    if not brand_name:
+        return None
+    import re as _re
+    words = _re.findall(r"\w+", brand_name.lower())
+    long_words = [w for w in words if len(w) >= 4]
+    if not long_words:
+        return None
+    return max(long_words, key=len)
+
+
+def _build_competitive_pressure(
+    *,
+    category_competitor_brands: List[Dict[str, Any]],
+    category_retailer_hosts: List[Dict[str, Any]],
+    merchant_brand: Optional[str],
+    merchant_host: Optional[str],
+    merchant_attribution_score: int,
+) -> Dict[str, Any]:
+    """Build the competitive-pressure block surfaced at top-level on the
+    structured report. Two parallel lists:
+
+      - peers_named: every competitor brand AI agents name when consumers
+        ask about this category. Sorted by mention count.
+      - peers_with_first_party_visibility: subset whose .com is cited in
+        Gemini grounding for those same category queries. Heuristic match
+        — see _brand_discriminator. The presence of even ONE such peer
+        is the BD pressure point.
+
+    The framing string below tells the right story for both cases:
+      (a) some peers are first-party visible — urgent: "every retailer-
+          routed query is a customer they won and you didn't see"
+      (b) no peers are first-party visible — first-mover opportunity:
+          "the entire category is retailer-mediated; whoever onboards
+          first owns the AI-channel surface"
+    """
+    peers_named = list(category_competitor_brands or [])
+    retailer_hosts = list(category_retailer_hosts or [])
+
+    peers_with_fp: List[Dict[str, Any]] = []
+    for peer in peers_named:
+        brand = peer.get("name") or ""
+        disc = _brand_discriminator(brand)
+        if not disc:
+            continue
+        for host_entry in retailer_hosts:
+            host = (host_entry.get("host") or "").lower()
+            first_segment = host.split(".")[0] if host else ""
+            if disc in first_segment:
+                peers_with_fp.append({
+                    "brand": brand,
+                    "first_party_host": host_entry.get("host"),
+                    "category_query_mentions": peer.get("times_cited", 0),
+                    "host_citations": host_entry.get("times_cited", 0),
+                })
+                break
+
+    # Did the merchant's own .com appear in any retailer_host? Should
+    # almost never be true — but if attribution_score > 0, check.
+    merchant_first_party_visible = False
+    if merchant_host:
+        for host_entry in retailer_hosts:
+            host = (host_entry.get("host") or "").lower()
+            if merchant_host.lower() in host:
+                merchant_first_party_visible = True
+                break
+
+    if peers_with_fp:
+        framing = (
+            f"**Competitive pressure: real and immediate.** Of the "
+            f"{len(peers_named)} competitor brands AI agents name when "
+            f"consumers ask about this category, "
+            f"{len(peers_with_fp)} have their own .com cited in Gemini "
+            f"grounding for the same queries — "
+            + ", ".join(
+                f"{p['brand']} ({p['first_party_host']})"
+                for p in peers_with_fp[:3]
+            )
+            + (
+                f". Your URL appears in {merchant_attribution_score}% of "
+                f"buyer-intent queries; theirs appears multiple times. "
+                f"Every retailer-routed query you have today is a customer "
+                f"those competitors won and you didn't see."
+                if not merchant_first_party_visible
+                else ". You also appear first-party — but at a lower "
+                "frequency than these peers."
+            )
+        )
+    else:
+        framing = (
+            f"**First-mover opportunity.** Of the {len(peers_named)} "
+            f"competitor brands AI agents name in this category, NONE "
+            f"have their own .com cited in Gemini grounding today — the "
+            f"entire vertical is retailer-mediated (Vogue, Sephora, Ulta, "
+            f"Target, beauty marketplaces). This is the rarer case: "
+            f"there's no incumbent capturing first-party AI-channel "
+            f"attribution yet. Whichever brand onboards Pivota first + "
+            f"completes the 30-90 day indexing arc owns the surface "
+            f"before the rest of the category notices the channel exists."
+        )
+
+    return {
+        "title": "Competitive pressure — your peers in the AI channel",
+        "intro": (
+            "Your products may still sell well through retailers today, "
+            "so a 0/3 attribution score might feel low-urgency. The real "
+            "BD signal is comparative: which of your direct competitors "
+            "have their own .com cited in Gemini grounding for the same "
+            "category queries you're invisible in? That's where the "
+            "pressure changes."
+        ),
+        "peers_named": peers_named[:10],
+        "peers_with_first_party_visibility": peers_with_fp,
+        "merchant_first_party_visible": merchant_first_party_visible,
+        "merchant_attribution_score": int(merchant_attribution_score),
+        "framing": framing,
+    }
+
+
 # Default thresholds — used when no peer_thresholds is supplied. These
 # are intuitive defaults from V1.5 (30 = "barely visible", 60 = "strong
 # enough to skip foundational fixes"). They're calibrated to feel right,
@@ -2044,6 +2177,13 @@ def build_structured_report(
         category_retailer_hosts=category_retailer_hosts,
         category_visibility_score=category_score,
     )
+    competitive_pressure = _build_competitive_pressure(
+        category_competitor_brands=category_competitor_brands,
+        category_retailer_hosts=category_retailer_hosts,
+        merchant_brand=merchant_brand,
+        merchant_host=merchant_host,
+        merchant_attribution_score=attribution_score,
+    )
 
     return {
         "merchant_name": merchant_name,
@@ -2066,6 +2206,7 @@ def build_structured_report(
         },
         "industry_context": industry_context,
         "action_items": action_items,
+        "competitive_pressure": competitive_pressure,
         "what_pivota_changes": what_pivota_changes,
         "visibility": {
             "score": visibility_score,
@@ -2189,6 +2330,53 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             title = action.get("title") or "(untitled)"
             body = action.get("body") or ""
             sections.append(f"**{idx}. {title}** _(severity: {sev})_  \n{body}\n")
+
+    # Competitive pressure — direct peer-vs-merchant first-party
+    # visibility comparison. Sharpest BD framing: a merchant might
+    # shrug off "your visibility is 0" but won't shrug off "your
+    # competitor X has their own .com cited; you don't."
+    cp = report.get("competitive_pressure") or {}
+    if cp.get("peers_named"):
+        sections.append(f"## {cp.get('title', 'Competitive pressure')}\n")
+        if cp.get("intro"):
+            sections.append(cp["intro"] + "\n")
+        peers_named = cp.get("peers_named") or []
+        if peers_named:
+            sections.append(
+                "**Direct competitor brands AI agents name in this category "
+                "(top 10):**\n"
+            )
+            rows = ["| Brand | Times named in category queries |", "|---|---|"]
+            for p in peers_named[:10]:
+                brand = (p.get("brand") or p.get("name") or "").replace("|", "\\|")
+                cnt = p.get("category_query_mentions") or p.get("times_cited") or 0
+                rows.append(f"| {brand} | {cnt} |")
+            sections.append("\n".join(rows) + "\n")
+        peers_fp = cp.get("peers_with_first_party_visibility") or []
+        if peers_fp:
+            sections.append(
+                "**Competitors whose own .com is cited first-party in "
+                "Gemini grounding (this is the BD pressure):**\n"
+            )
+            rows = [
+                "| Brand | First-party host | Citations | Category mentions |",
+                "|---|---|---|---|",
+            ]
+            for p in peers_fp:
+                brand = (p.get("brand") or "").replace("|", "\\|")
+                host = (p.get("first_party_host") or "").replace("|", "\\|")
+                citations = p.get("host_citations", 0)
+                mentions = p.get("category_query_mentions", 0)
+                rows.append(f"| {brand} | `{host}` | {citations} | {mentions} |")
+            sections.append("\n".join(rows) + "\n")
+        else:
+            sections.append(
+                "_None of the named competitor brands have their own .com "
+                "cited in Gemini grounding for the same queries — the "
+                "category is currently retailer-mediated end-to-end._\n"
+            )
+        if cp.get("framing"):
+            sections.append(cp["framing"] + "\n")
 
     # What Pivota changes — the post-onboarding delta. Two parts the
     # merchant needs to believe: (1) why their AI-channel visibility
