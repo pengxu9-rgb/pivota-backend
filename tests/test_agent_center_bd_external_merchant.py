@@ -161,18 +161,18 @@ def test_verdict_invisible_when_both_scores_low() -> None:
     from agent_center_bd_external_merchant import _verdict_for
     label, explanation = _verdict_for(visibility_score=10, attribution_score=5)
     assert label == "INVISIBLE"
-    assert "fast-growing" in explanation
+    # Phase C-4 (PR-A): legacy fallback path (no evidence dict supplied)
+    # emits a pitch-free generic sentence about indexing.
+    assert "indexed" in explanation.lower() or "grounded" in explanation.lower()
 
 
 def test_verdict_misattributed_when_visible_but_no_attribution() -> None:
     from agent_center_bd_external_merchant import _verdict_for
     label, explanation = _verdict_for(visibility_score=70, attribution_score=10)
     assert label == "VISIBLE BUT MISATTRIBUTED"
-    assert "third-party" in explanation
-    # BD pitch sweet spot: post-reframe, this verdict explicitly names
-    # Pivota's two-part value prop (canonical AI-channel PDP + in-chat
-    # checkout via agentic-commerce protocol).
-    assert "agentic-commerce" in explanation.lower() or "in-chat" in explanation.lower()
+    # Phase C-4 (PR-A): pitch-free diagnostic. The BD value prop now
+    # lives only in `what_pivota_changes`, not the verdict text.
+    assert "third-party" in explanation.lower() or "competitors" in explanation.lower()
 
 
 def test_verdict_strong_when_both_high() -> None:
@@ -498,7 +498,12 @@ def test_action_items_strong_yields_low_severity_maintain_action() -> None:
         runs_with_any_citation=1,
     )
     assert items[0]["severity"] == "low"
-    assert "monitoring" in items[0]["body"].lower()
+    # Phase C-4 (PR-A): STRONG action body now leads with cited-ratio
+    # data; "monitoring" stays in the title, drift+schema watch-out
+    # framing in the body.
+    assert "monitoring" in items[0]["title"].lower()
+    body_lower = items[0]["body"].lower()
+    assert "drift" in body_lower or "schema regression" in body_lower
 
 
 def test_action_items_capped_at_5() -> None:
@@ -1395,9 +1400,11 @@ def test_via_retailers_action_body_uses_gap_percentage_when_attribution_positive
     # 1 of 3 runs has in_grounding=True via _attr_run helper → 33%.
     assert "33%" in body or "67%" in body
     assert "every grounded citation" not in body.lower()
-    # Value-prop framing present.
-    assert "agentic-commerce" in body.lower() or "in-chat checkout" in body.lower()
-    assert "25-30%" in body  # forward-looking growth projection
+    # Phase C-4 (PR-A): action body is now pitch-free — no agentic-
+    # commerce / 25-30% / Pivota in diagnostic surfaces. The retailer
+    # name(s) the brand is losing the funnel to should appear instead.
+    assert "agentic-commerce" not in body.lower()
+    assert "25-30%" not in body
 
 
 def test_via_retailers_action_body_uses_every_grounded_citation_when_attribution_zero() -> None:
@@ -1441,8 +1448,10 @@ def test_via_retailers_action_body_uses_every_grounded_citation_when_attribution
     assert report["verdict"]["label"] == VERDICT_VIA_RETAILERS
     body = report["action_items"][0]["body"]
     assert "every grounded citation" in body.lower()
-    # Value-prop framing still present.
-    assert "agentic-commerce" in body.lower() or "in-chat checkout" in body.lower()
+    # Phase C-4 (PR-A): pitch macros stripped from action bodies — they
+    # live only in `what_pivota_changes` going forward.
+    assert "agentic-commerce" not in body.lower()
+    assert "25-30%" not in body
 
 
 def test_via_retailers_suppresses_schema_sitemap_action() -> None:
@@ -1489,10 +1498,13 @@ def test_via_retailers_suppresses_schema_sitemap_action() -> None:
     assert not any("schema + sitemap" in t.lower() for t in titles)
 
 
-def test_via_retailers_explanation_leads_with_value_prop_not_seo() -> None:
-    """Verdict explanation should foreground Pivota's two-part value
-    prop (canonical PDP for AI-channel attribution + agentic-commerce
-    in-chat checkout), not generic SEO/sitemap framing."""
+def test_via_retailers_explanation_is_pitch_free_diagnostic() -> None:
+    """Phase C-4 (PR-A): verdict explanation is pure diagnostic prose.
+    The Pivota value prop (agentic-commerce / in-chat checkout / 12% →
+    25-30% market sizing) lives only in `what_pivota_changes` and
+    `merchant_view.pivota_value_prop`. The verdict text describes the
+    diagnostic state — that the brand is findable in category queries
+    but not capturing first-party attribution."""
     from services.agent_center_bd_report_service import verdict_for, VERDICT_VIA_RETAILERS
     label, explanation = verdict_for(
         visibility_score=0,
@@ -1501,11 +1513,14 @@ def test_via_retailers_explanation_leads_with_value_prop_not_seo() -> None:
     )
     assert label == VERDICT_VIA_RETAILERS
     e = explanation.lower()
-    # Value-prop signals present.
-    assert "agentic-commerce" in e or "in-chat" in e
-    assert "25-30%" in e or "12%" in e
-    # Explicitly NOT framed as SEO fix.
-    assert "not an seo fix" in e or "complementary to existing retail" in e
+    # Pitch tokens explicitly absent from diagnostic.
+    assert "agentic-commerce" not in e
+    assert "25-30%" not in explanation
+    assert "complementary to existing retail" not in e
+    assert "not an seo fix" not in e
+    # The diagnostic state IS described — brand findable, attribution gap.
+    assert "category" in e or "category-level" in e
+    assert "attribution" in e or "captur" in e
 
 
 # ---------------------------------------------------------------------------
@@ -1764,10 +1779,13 @@ def test_render_markdown_includes_forward_projection_for_beauty() -> None:
     assert "2028" in md
 
 
-def test_verdict_explanations_contain_value_prop_signals_for_all_labels() -> None:
-    """Every verdict explanation (across the 4 reframed labels) carries
-    a value-prop signal — agentic-commerce, in-chat, or projected
-    growth — so the BD framing is consistent."""
+def test_verdict_explanations_are_pitch_free_for_all_labels() -> None:
+    """Phase C-4 (PR-A) inverted contract: every verdict explanation
+    is pitch-free across all labels. Pitch tokens (agentic-commerce,
+    in-chat, 25-30%) live exclusively in `what_pivota_changes` and
+    PR-B's `merchant_view.pivota_value_prop`. This is the analogue of
+    `tests/test_diagnostic_no_pitch.py` for the no-evidence fallback
+    path that this script-style helper still exercises."""
     from services.agent_center_bd_report_service import verdict_for
     cases = [
         (0, 0, None),       # INVISIBLE
@@ -1778,11 +1796,11 @@ def test_verdict_explanations_contain_value_prop_signals_for_all_labels() -> Non
     for vis, attr, cat in cases:
         _, explanation = verdict_for(vis, attr, category_visibility_score=cat)
         e = explanation.lower()
-        assert (
-            "agentic-commerce" in e
-            or "in-chat" in e
-            or "25-30%" in e
-        ), f"verdict for ({vis},{attr},{cat}) lacks value-prop signal: {explanation[:120]}"
+        for token in ("agentic-commerce", "in-chat", "25-30%", "pivota"):
+            assert token not in e, (
+                f"pitch token {token!r} leaked into ({vis},{attr},{cat}) "
+                f"verdict explanation: {explanation[:120]}"
+            )
 
 
 # ---------------------------------------------------------------------------
