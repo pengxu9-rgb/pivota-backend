@@ -229,7 +229,7 @@ async def run_merchant_self_audit(
     #      (c) None → bail out with a 422 listing the SKUs that need
     #          attention
     products: List[Dict[str, Any]] = []
-    derivation_failed: List[Dict[str, Any]] = []
+    skipped_no_url: List[Dict[str, Any]] = []
     for r in rows:
         pdp_url = (r["canonical_url"] or "").strip()
         if not pdp_url:
@@ -238,10 +238,18 @@ async def run_merchant_self_audit(
                 product_payload=r["product_payload"],
             ) or ""
         if not pdp_url:
-            derivation_failed.append({
+            skipped_no_url.append({
                 "platform": r["platform"],
                 "source_product_id": r["source_product_id"],
                 "title": r["title"],
+                "reason": (
+                    "no_canonical_url_and_no_handle — catalog row has "
+                    "neither canonical_url nor a derivable {store_domain}"
+                    "/products/{handle} (typically: product was imported "
+                    "outside the Shopify OAuth sync, e.g. manual upload "
+                    "or scraped seed data, so no URL metadata to probe "
+                    "against)"
+                ),
             })
             continue
         products.append({
@@ -250,19 +258,22 @@ async def run_merchant_self_audit(
             "product_type": r["product_type"],
             "pdp_url": pdp_url,
         })
-    if derivation_failed:
+
+    # If EVERY selected product was skipped, there's nothing to audit
+    # — bail with a 422 so the merchant knows to pick auditable SKUs.
+    if not products:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
                 "message": (
-                    "Some selected products have no resolvable buyer-"
-                    "facing URL — neither catalog_products.canonical_url "
-                    "nor a (store_domain + product handle) derivation "
-                    "succeeded. The audit needs a URL to score "
-                    "attribution against. Reach out to support to fix "
-                    "the catalog sync."
+                    "None of the selected products have a usable "
+                    "buyer-facing URL — the audit needs a URL to score "
+                    "AI-channel attribution against. Pick products that "
+                    "came in via the Shopify OAuth sync (they'll have "
+                    "URLs); manually-uploaded or scraped seed products "
+                    "typically don't carry URL metadata."
                 ),
-                "products_missing_url": derivation_failed,
+                "skipped_products": skipped_no_url,
             },
         )
 
@@ -295,4 +306,8 @@ async def run_merchant_self_audit(
     return {
         "brand_report": brand_report,
         "rate_limit_remaining": remaining,
+        # Pre-flight skipped products (URL-less catalog rows). The
+        # audit ran on the remainder; the merchant can see why these
+        # specific SKUs didn't make it in. Only set when non-empty.
+        "skipped_products": skipped_no_url,
     }
