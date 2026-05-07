@@ -20,6 +20,8 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database
+from services.pdp_category_classifier import resolve_path_from_row
 
 
 MERCHANT_ID = "external_seed"
@@ -36,6 +39,8 @@ CATALOG_TRACK = "external_referral"
 TRUTH_TIER = "observed"
 READINESS_TIER = "referral_only"
 SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
+CATEGORY_CONFIDENCE_REGEX_AT_MIRROR = 0.85
+CATEGORY_LABEL_SOURCE_AT_MIRROR = "regex_backfill_at_mirror"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -70,10 +75,41 @@ def _write_if_requested(path_str: Optional[str], content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def _json_default(value: Any) -> str:
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value)
+
+
+def resolve_mirror_category_metadata(
+    *,
+    category: Optional[str],
+    product_type: Optional[str],
+    title: Optional[str],
+) -> Dict[str, Any]:
+    """Classify only newly inserted mirror rows.
+
+    Existing catalog_products rows are intentionally not overwritten by the
+    mirror; this helper is used only on the INSERT path so future mirrors do not
+    recreate NULL category_path rows.
+    """
+    hit = resolve_path_from_row(category=category, product_type=product_type, title=title)
+    if hit is None:
+        return {
+            "category_path": None,
+            "category_confidence": None,
+            "category_label_source": None,
+            "category_label": None,
+        }
+    label, path = hit
+    return {
+        "category_path": path,
+        "category_confidence": CATEGORY_CONFIDENCE_REGEX_AT_MIRROR,
+        "category_label_source": CATEGORY_LABEL_SOURCE_AT_MIRROR,
+        "category_label": label,
+    }
 
 
 async def _table_exists(name: str) -> bool:
@@ -344,84 +380,153 @@ async def _apply(limit: int) -> int:
     rows = await database.fetch_all(
         COMMON_CTES
         + f"""
-        INSERT INTO catalog_products (
-          product_key,
-          merchant_id,
-          platform,
-          source_product_id,
-          catalog_track,
-          truth_tier,
-          readiness_tier,
-          source_system,
-          source_ref,
-          title,
-          description,
-          brand,
-          product_type,
-          category,
-          canonical_url,
-          image_url,
-          product_payload,
-          freshness_json,
-          created_at,
-          updated_at
-        )
         SELECT
           'prod::external_seed::external_seed::' || external_product_id AS product_key,
-          CAST(:merchant_id AS text) AS merchant_id,
-          CAST(:platform AS text) AS platform,
-          external_product_id AS source_product_id,
-          CAST(:catalog_track AS text) AS catalog_track,
-          CAST(:truth_tier AS text) AS truth_tier,
-          CAST(:readiness_tier AS text) AS readiness_tier,
-          CAST(:source_system AS text) AS source_system,
-          id AS source_ref,
+          id,
+          external_product_id,
+          market,
+          tool,
+          domain,
           title,
-          mirrored_description AS description,
-          mirrored_brand AS brand,
-          mirrored_product_type AS product_type,
-          mirrored_category AS category,
-          destination_url AS canonical_url,
+          destination_url,
+          canonical_url,
+          price_amount,
+          price_currency,
+          availability,
           image_url,
-          jsonb_build_object(
-            'external_seed', jsonb_build_object(
-              'id', id,
-              'external_product_id', external_product_id,
-              'market', market,
-              'tool', tool,
-              'domain', domain,
-              'destination_url', destination_url,
-              'canonical_url', canonical_url,
-              'price_amount', price_amount,
-              'price_currency', price_currency,
-              'availability', availability,
-              'updated_at', updated_at
-            ),
-            'seed_data', seed_data,
-            'mirror_meta', jsonb_build_object(
-              'source_system', CAST(:source_system AS text),
-              'mirrored_at', now(),
-              'duplicate_count', duplicate_count,
-              'selection_rank', rn
-            )
-          ) AS product_payload,
-          jsonb_build_object(
-            'mirrored_from', 'external_product_seeds',
-            'source_seed_id', id,
-            'source_updated_at', updated_at,
-            'mirrored_at', now()
-          ) AS freshness_json,
-          now() AS created_at,
-          now() AS updated_at
+          seed_data,
+          updated_at,
+          duplicate_count,
+          rn,
+          mirrored_description,
+          mirrored_brand,
+          mirrored_product_type,
+          mirrored_category
         FROM missing
         ORDER BY updated_at DESC NULLS LAST, id ASC
         {limit_clause}
-        ON CONFLICT (merchant_id, platform, source_product_id) DO NOTHING
-        RETURNING product_key
         """,
         values,
     )
-    return len(rows)
+    inserted = 0
+    for row in rows or []:
+        row_dict = dict(row)
+        mirrored_at = datetime.now(timezone.utc).isoformat()
+        category_meta = resolve_mirror_category_metadata(
+            category=row_dict.get("mirrored_category"),
+            product_type=row_dict.get("mirrored_product_type"),
+            title=row_dict.get("title"),
+        )
+        product_payload = {
+            "external_seed": {
+                "id": row_dict.get("id"),
+                "external_product_id": row_dict.get("external_product_id"),
+                "market": row_dict.get("market"),
+                "tool": row_dict.get("tool"),
+                "domain": row_dict.get("domain"),
+                "destination_url": row_dict.get("destination_url"),
+                "canonical_url": row_dict.get("canonical_url"),
+                "price_amount": row_dict.get("price_amount"),
+                "price_currency": row_dict.get("price_currency"),
+                "availability": row_dict.get("availability"),
+                "updated_at": row_dict.get("updated_at"),
+            },
+            "seed_data": row_dict.get("seed_data"),
+            "mirror_meta": {
+                "source_system": SOURCE_SYSTEM,
+                "mirrored_at": mirrored_at,
+                "duplicate_count": row_dict.get("duplicate_count"),
+                "selection_rank": row_dict.get("rn"),
+            },
+        }
+        freshness_json = {
+            "mirrored_from": "external_product_seeds",
+            "source_seed_id": row_dict.get("id"),
+            "source_updated_at": row_dict.get("updated_at"),
+            "mirrored_at": mirrored_at,
+        }
+        inserted_row = await database.fetch_one(
+            """
+            INSERT INTO catalog_products (
+              product_key,
+              merchant_id,
+              platform,
+              source_product_id,
+              catalog_track,
+              truth_tier,
+              readiness_tier,
+              source_system,
+              source_ref,
+              title,
+              description,
+              brand,
+              product_type,
+              category,
+              category_path,
+              category_confidence,
+              category_label_source,
+              canonical_url,
+              image_url,
+              product_payload,
+              freshness_json,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              :product_key,
+              :merchant_id,
+              :platform,
+              :source_product_id,
+              :catalog_track,
+              :truth_tier,
+              :readiness_tier,
+              :source_system,
+              :source_ref,
+              :title,
+              :description,
+              :brand,
+              :product_type,
+              :category,
+              :category_path,
+              :category_confidence,
+              :category_label_source,
+              :canonical_url,
+              :image_url,
+              CAST(:product_payload AS jsonb),
+              CAST(:freshness_json AS jsonb),
+              now(),
+              now()
+            )
+            ON CONFLICT (merchant_id, platform, source_product_id) DO NOTHING
+            RETURNING product_key
+            """,
+            {
+                "product_key": row_dict.get("product_key"),
+                "merchant_id": MERCHANT_ID,
+                "platform": PLATFORM,
+                "source_product_id": row_dict.get("external_product_id"),
+                "catalog_track": CATALOG_TRACK,
+                "truth_tier": TRUTH_TIER,
+                "readiness_tier": READINESS_TIER,
+                "source_system": SOURCE_SYSTEM,
+                "source_ref": row_dict.get("id"),
+                "title": row_dict.get("title"),
+                "description": row_dict.get("mirrored_description"),
+                "brand": row_dict.get("mirrored_brand"),
+                "product_type": row_dict.get("mirrored_product_type"),
+                "category": row_dict.get("mirrored_category"),
+                "category_path": category_meta.get("category_path"),
+                "category_confidence": category_meta.get("category_confidence"),
+                "category_label_source": category_meta.get("category_label_source"),
+                "canonical_url": row_dict.get("destination_url"),
+                "image_url": row_dict.get("image_url"),
+                "product_payload": json.dumps(product_payload, ensure_ascii=False, default=_json_default),
+                "freshness_json": json.dumps(freshness_json, ensure_ascii=False, default=_json_default),
+            },
+        )
+        if inserted_row:
+            inserted += 1
+    return inserted
 
 
 def _render_markdown(report: Dict[str, Any]) -> str:

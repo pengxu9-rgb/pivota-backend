@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -39,15 +40,23 @@ CONFIDENCE_REGEX_BACKFILL = 0.85
 LABEL_SOURCE = "regex_backfill"
 
 
-async def _fetch_batch(limit: int) -> List[dict]:
+async def _fetch_batch(limit: int, after_key: Optional[str]) -> List[dict]:
     rows = await database.fetch_all(
         """
-        SELECT product_key, category, product_type, title
+        SELECT
+          product_key,
+          pivota_signature_id,
+          brand,
+          category,
+          product_type,
+          title
         FROM catalog_products
         WHERE category_path IS NULL
+          AND (CAST(:after_key AS text) IS NULL OR product_key > CAST(:after_key AS text))
+        ORDER BY product_key ASC
         LIMIT :limit
         """,
-        {"limit": limit},
+        {"limit": limit, "after_key": after_key},
     )
     return [dict(row) for row in rows or []]
 
@@ -70,20 +79,47 @@ async def _apply_update(product_key: str, category_path: str) -> None:
     )
 
 
-async def _run(args: argparse.Namespace) -> int:
+def _increment(counter: Dict[str, int], key: str) -> None:
+    normalized = key.strip() if key else "unknown"
+    counter[normalized] = int(counter.get(normalized) or 0) + 1
+
+
+def _group_key(row: Dict[str, Any]) -> str:
+    brand = str(row.get("brand") or "unknown").strip() or "unknown"
+    product_type = str(row.get("product_type") or "unknown").strip() or "unknown"
+    return f"{brand} :: {product_type}"
+
+
+async def run_category_path_backfill(
+    *,
+    batch_size: int = 1000,
+    limit: int = 0,
+    dry_run: bool = False,
+    sample_limit: int = 20,
+) -> Dict[str, Any]:
     if not getattr(database, "is_connected", False):
         await database.connect()
 
     total = 0
     matched = 0
     unmatched = 0
+    after_key: Optional[str] = None
+    matched_by_label: Dict[str, int] = {}
+    matched_by_path: Dict[str, int] = {}
+    unmatched_by_brand_product_type: Dict[str, int] = {}
+    matched_samples: List[Dict[str, Any]] = []
+    unmatched_samples: List[Dict[str, Any]] = []
 
     while True:
-        rows = await _fetch_batch(args.batch_size)
+        remaining = max(0, int(limit or 0) - total) if limit else 0
+        if limit and remaining <= 0:
+            break
+        rows = await _fetch_batch(min(batch_size, remaining) if limit else batch_size, after_key)
         if not rows:
             break
         for row in rows:
             total += 1
+            after_key = str(row.get("product_key") or "")
             hit = resolve_path_from_row(
                 category=row.get("category"),
                 product_type=row.get("product_type"),
@@ -91,27 +127,80 @@ async def _run(args: argparse.Namespace) -> int:
             )
             if hit is None:
                 unmatched += 1
+                _increment(unmatched_by_brand_product_type, _group_key(row))
+                if len(unmatched_samples) < sample_limit:
+                    unmatched_samples.append(
+                        {
+                            "product_key": row.get("product_key"),
+                            "pivota_signature_id": row.get("pivota_signature_id"),
+                            "brand": row.get("brand"),
+                            "product_type": row.get("product_type"),
+                            "category": row.get("category"),
+                            "title": row.get("title"),
+                        }
+                    )
                 continue
             label, path = hit
-            if not args.dry_run:
+            if not dry_run:
                 await _apply_update(row["product_key"], path)
             matched += 1
+            _increment(matched_by_label, label)
+            _increment(matched_by_path, path)
+            if len(matched_samples) < sample_limit:
+                matched_samples.append(
+                    {
+                        "product_key": row.get("product_key"),
+                        "pivota_signature_id": row.get("pivota_signature_id"),
+                        "brand": row.get("brand"),
+                        "product_type": row.get("product_type"),
+                        "category": row.get("category"),
+                        "title": row.get("title"),
+                        "category_label": label,
+                        "category_path": path,
+                    }
+                )
             if matched % 100 == 0:
                 logger.info("matched=%d unmatched=%d total=%d", matched, unmatched, total)
-        if args.limit and total >= args.limit:
-            break
-        # Page through; the WHERE filter shrinks the eligible set automatically.
-        if args.dry_run:
-            # Dry-run can't progress through the batch since rows still match.
-            break
 
+    unmatched_groups = [
+        {"brand_product_type": key, "rows": rows}
+        for key, rows in sorted(
+            unmatched_by_brand_product_type.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+    return {
+        "matched": matched,
+        "unmatched": unmatched,
+        "total": total,
+        "dry_run": dry_run,
+        "batch_size": batch_size,
+        "limit": limit,
+        "category_confidence": CONFIDENCE_REGEX_BACKFILL,
+        "category_label_source": LABEL_SOURCE,
+        "matched_by_label": dict(sorted(matched_by_label.items())),
+        "matched_by_path": dict(sorted(matched_by_path.items())),
+        "unmatched_by_brand_product_type": unmatched_groups,
+        "matched_samples": matched_samples,
+        "unmatched_samples": unmatched_samples,
+    }
+
+
+async def _run(args: argparse.Namespace) -> int:
+    report = await run_category_path_backfill(
+        batch_size=args.batch_size,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        sample_limit=args.sample_limit,
+    )
     logger.info(
         "Backfill complete: matched=%d unmatched=%d total=%d dry_run=%s",
-        matched,
-        unmatched,
-        total,
-        args.dry_run,
+        report["matched"],
+        report["unmatched"],
+        report["total"],
+        report["dry_run"],
     )
+    print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     return 0
 
 
@@ -119,6 +208,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=1000, help="rows per batch")
     parser.add_argument("--limit", type=int, default=0, help="cap total rows; 0 = no cap")
+    parser.add_argument("--sample-limit", type=int, default=20, help="sample rows in JSON report")
     parser.add_argument("--dry-run", action="store_true", help="don't UPDATE; just count matches")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
