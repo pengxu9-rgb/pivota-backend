@@ -1085,6 +1085,99 @@ async def run_brand_report(
     }
 
 
+def _aggregate_brand_verdict_evidence(
+    per_product: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a brand-level evidence dict for verdict_for() from
+    successfully-probed per-product reports. Sums totals, unions top
+    retailers across products (ranked by total times_cited), picks
+    the highest-scoring product's competitive_pressure framing as
+    representative, and computes a brand-wide failed_attribution_query
+    sample.
+
+    Used by `_aggregate_brand_scores` so the brand-level
+    `verdict_for(...)` call gets evidence — without it the explanation
+    falls back to the generic non-evidence prose, which reads
+    template-y to merchants. This is the brand-level analogue of the
+    per-product evidence built in `build_structured_report`.
+    """
+    if not per_product:
+        return {}
+
+    total_runs = 0
+    total_cited = 0
+    retailer_count: Counter = Counter()
+    failed_query_sample: List[str] = []
+    category_scores: List[int] = []
+    framing: Optional[str] = None
+    framing_score = -1
+    for p in per_product:
+        attr = p.get("attribution") or {}
+        total_runs += int(attr.get("runs") or 0)
+        total_cited += int(attr.get("merchant_cited_runs") or 0)
+
+        # Walk both attribution.competitor_hosts (buyer-intent probe)
+        # and category_visibility.retailer_hosts (category probe). The
+        # union surfaces hosts that win across either probe type.
+        for entry in attr.get("competitor_hosts") or []:
+            host = entry.get("host")
+            count = int(entry.get("times_cited") or 0)
+            if host and count:
+                retailer_count[host] += count
+        cat = p.get("category_visibility") or {}
+        if cat:
+            cs = cat.get("score")
+            if isinstance(cs, (int, float)):
+                category_scores.append(int(cs))
+            for entry in cat.get("retailer_hosts") or []:
+                host = entry.get("host")
+                count = int(entry.get("times_cited") or 0)
+                if host and count:
+                    retailer_count[host] += count
+
+        # Failed-query sample: pull `query` from attribution.queries
+        # entries where merchant URL was missing (self_report_yes False).
+        for q_row in attr.get("queries") or []:
+            if not q_row.get("self_report_yes"):
+                q = (q_row.get("query") or "").strip()
+                if q and q not in failed_query_sample:
+                    failed_query_sample.append(q)
+                if len(failed_query_sample) >= 5:
+                    break
+
+        # Pick the competitive_pressure.framing from the highest-
+        # scoring product (most-grounded data → least noise in framing).
+        cp = p.get("competitive_pressure") or {}
+        cp_framing = cp.get("framing")
+        product_score = int((p.get("verdict") or {}).get("attribution_score") or 0)
+        if cp_framing and product_score > framing_score:
+            framing = cp_framing
+            framing_score = product_score
+
+    avg_category = (
+        sum(category_scores) / len(category_scores)
+        if category_scores else None
+    )
+    # gap_pct is per-tier semantics: how far category visibility leads
+    # attribution. Computed at the brand level when we have both.
+    gap_pct: Optional[int] = None
+    if avg_category is not None and total_runs > 0:
+        avg_attribution_pct = (
+            int(round((total_cited / total_runs) * 100)) if total_runs else 0
+        )
+        gap_pct = max(0, int(avg_category) - avg_attribution_pct)
+
+    return {
+        "attribution_runs_total": total_runs,
+        "merchant_cited_runs": total_cited,
+        "top_retailers": [h for h, _ in retailer_count.most_common(5)],
+        "competitive_pressure_framing": framing,
+        "category_score": int(avg_category) if avg_category is not None else None,
+        "gap_pct": gap_pct,
+        "failed_attribution_query_sample": failed_query_sample[:5],
+    }
+
+
 def _aggregate_brand_scores(per_product: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Average each score across successful per-product reports +
     derive a brand-level verdict. Returns empty-shape dict (with
@@ -1133,8 +1226,20 @@ def _aggregate_brand_scores(per_product: List[Dict[str, Any]]) -> Dict[str, Any]
         brand_label = None
         brand_explanation = "Insufficient data to render a brand verdict."
     else:
+        # PR-A regression fix: aggregate per-product evidence so the
+        # brand-level explanation is data-bound (not the generic
+        # fallback). Sums totals, unions top retailers across products
+        # ranked by frequency, picks the highest-scoring product's
+        # competitive_pressure framing as the representative one.
+        brand_evidence = _aggregate_brand_verdict_evidence(per_product)
         brand_label, brand_explanation = verdict_for(
-            int(avg_visibility), int(avg_attribution),
+            int(avg_visibility),
+            int(avg_attribution),
+            category_visibility_score=(
+                int(avg_category_visibility)
+                if avg_category_visibility is not None else None
+            ),
+            evidence=brand_evidence,
         )
 
     return {
