@@ -67,8 +67,18 @@ router = APIRouter(
 # db/merchant_audit_runs.py — so the cap survives restarts and works
 # across multiple backend pods. The window + cap stay here because
 # they're route-policy values, not DB schema.
-_AUDIT_RATE_WINDOW_S = 24 * 60 * 60   # 24 hours
-_AUDIT_RATE_MAX = 2                   # audits per merchant per window
+#
+# Both are env-configurable so testing / staging / per-tier policy
+# changes can lift the cap without a code deploy. Defaults preserve
+# the original 2-per-24h cost guard. NOTE: this is a quota cap
+# (max audits per merchant per window), NOT a per-audit multiplier
+# (each audit still costs ~9 grounded Gemini calls × N products).
+# Lifting the cap scales total daily LLM cost linearly with merchant
+# count × cap; lifting per-audit multipliers is the dangerous one
+# (see feedback_llm_call_multipliers.md / PR #278 incident).
+import os as _os
+_AUDIT_RATE_WINDOW_S = int(_os.getenv("MERCHANT_AUDIT_RATE_WINDOW_SECONDS", str(24 * 60 * 60)))
+_AUDIT_RATE_MAX = int(_os.getenv("MERCHANT_AUDIT_RATE_MAX", "2"))
 
 
 def _derive_canonical_url(
