@@ -45,6 +45,11 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # both depend on these columns being present.
             "pivota_signature_id",
             "pivota_canonical_url",
+            # Phase C-4 PR-D — see migration 073. Audit reports use
+            # this timestamp to compute the indexing-arc phase
+            # (fresh / indexing / expected_steady) for Pivota
+            # canonical PDPs in merchant_view.diagnosis.
+            "pivota_signature_minted_at",
         },
     ),
 )
@@ -146,7 +151,8 @@ async def ensure_required_schema_light() -> None:
                     """
                     ALTER TABLE IF EXISTS catalog_products
                       ADD COLUMN IF NOT EXISTS pivota_signature_id TEXT,
-                      ADD COLUMN IF NOT EXISTS pivota_canonical_url TEXT;
+                      ADD COLUMN IF NOT EXISTS pivota_canonical_url TEXT,
+                      ADD COLUMN IF NOT EXISTS pivota_signature_minted_at TIMESTAMPTZ;
                     """
                 )
             )

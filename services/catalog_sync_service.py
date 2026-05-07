@@ -156,13 +156,18 @@ def pivota_canonical_pdp_url(signature_id: str) -> str:
 
 def make_pivota_canonical_fields(
     merchant_id: str, platform: str, source_product_id: str,
-) -> Dict[str, str]:
-    """Convenience: return both fields ready to splat into a
-    catalog_products upsert."""
+) -> Dict[str, Any]:
+    """Convenience: return all three Pivota canonical fields ready to
+    splat into a catalog_products upsert. `pivota_signature_minted_at`
+    is set to the call time so audit reports can compute the indexing
+    arc phase from a real minted timestamp (vs static caveat). See
+    services/pivota_indexing_arc.py for arc consumers."""
+    from datetime import datetime as _dt, timezone as _tz
     sig = make_pivota_signature_id(merchant_id, platform, source_product_id)
     return {
         "pivota_signature_id": sig,
         "pivota_canonical_url": pivota_canonical_pdp_url(sig),
+        "pivota_signature_minted_at": _dt.now(_tz.utc),
     }
 
 
@@ -644,6 +649,7 @@ async def ingest_standard_products(
                     "pdp_scope_set_at": _utcnow(),
                     "pivota_signature_id": pivota_fields["pivota_signature_id"],
                     "pivota_canonical_url": pivota_fields["pivota_canonical_url"],
+                    "pivota_signature_minted_at": pivota_fields["pivota_signature_minted_at"],
                     "freshness_json": {
                         "updated_at": product.updated_at.isoformat() if product.updated_at else None,
                         "observed_at": _utcnow().isoformat(),
