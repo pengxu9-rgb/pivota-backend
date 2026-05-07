@@ -1030,8 +1030,13 @@ def _category_run(
 
 
 def test_score_category_visibility_credits_brand_text_match() -> None:
-    """The BoJ-class case: 2/3 runs quote the brand by name in the
-    evidence_excerpt. Re-scored: 67/100, not the upstream's 0."""
+    """The BoJ-class case: 2/3 runs surface the brand in a grounding
+    source title (the editorial site published an article naming it).
+    Re-scored: 67/100. Note: per the brand-match tightening fix, the
+    brand must appear in the source TITLE (or the merchant URL must
+    be in grounding chunks) — excerpt-only no longer credits because
+    Gemini's evidence excerpt can hallucinate brand names that aren't
+    actually in any grounded source."""
     from services.agent_center_bd_report_service import score_category_visibility
     runs = [
         _category_run(
@@ -1042,12 +1047,12 @@ def test_score_category_visibility_credits_brand_text_match() -> None:
         _category_run(
             "top eye patches this year",
             excerpt="Beauty of Joseon Revive Under Eye Patch is described as...",
-            grounding_sources=[{"uri": "https://r/", "title": "sephora.com"}],
+            grounding_sources=[{"uri": "https://r/", "title": "Sephora — Beauty of Joseon Revive Eye Patch"}],
         ),
         _category_run(
             "best eye patches under $50",
             excerpt="Beauty of Joseon Revive Under Eye Patches for Wrinkles...",
-            grounding_sources=[{"uri": "https://r/", "title": "youtube.com"}],
+            grounding_sources=[{"uri": "https://r/", "title": "YouTube: Beauty of Joseon haul"}],
         ),
     ]
     score, details = score_category_visibility(
@@ -1055,11 +1060,12 @@ def test_score_category_visibility_credits_brand_text_match() -> None:
         merchant_host="beautyofjoseon.com",
         merchant_brand="Beauty of Joseon",
     )
-    assert score == 67  # 2/3 matched via excerpt
+    assert score == 67  # 2/3 matched via title
     assert details[0]["matched"] is False
     assert details[1]["matched"] is True
-    assert details[1]["excerpt_match"] is True
+    assert details[1]["title_match"] is True
     assert details[2]["matched"] is True
+    assert details[2]["title_match"] is True
 
 
 def test_score_category_visibility_credits_title_match() -> None:
@@ -1260,7 +1266,11 @@ def test_structured_report_boj_full_scenario_via_retailers() -> None:
                     "top eye patches this year",
                     excerpt="Beauty of Joseon Revive Under Eye Patch is described as...",
                     grounding_sources=[
-                        {"uri": "https://r2/", "title": "sephora.com"},
+                        # Brand-named source credits title_match (post brand-match
+                        # tightening fix); bare retailer host makes it into
+                        # retailer_hosts for the funnel-pressure framing.
+                        {"uri": "https://r2a/", "title": "Sephora — Beauty of Joseon Revive Eye Patch"},
+                        {"uri": "https://r2b/", "title": "sephora.com"},
                         {"uri": "https://r3/", "title": "oliveyoung.com"},
                     ],
                     competitors_appearing=["Patchology", "Summer Fridays"],
@@ -1269,7 +1279,8 @@ def test_structured_report_boj_full_scenario_via_retailers() -> None:
                     "best eye patches under $50",
                     excerpt="Beauty of Joseon Revive eye patches...",
                     grounding_sources=[
-                        {"uri": "https://r4/", "title": "sephora.com"},
+                        {"uri": "https://r4a/", "title": "Sephora: Beauty of Joseon under-$50 picks"},
+                        {"uri": "https://r4b/", "title": "sephora.com"},
                         {"uri": "https://r5/", "title": "youtube.com"},
                     ],
                     competitors_appearing=["Talika", "Peace Out"],
@@ -1371,21 +1382,21 @@ def test_via_retailers_action_body_uses_gap_percentage_when_attribution_positive
                 _category_run(
                     "best face masks 2026",
                     excerpt="COSRX Glow Mask is best for...",
-                    grounding_sources=[{"uri": "https://r/", "title": "voguescandinavia.com"}],
+                    grounding_sources=[{"uri": "https://r/", "title": "Vogue Scandinavia: COSRX Glow Mask"}],
                 ),
                 _category_run(
                     "top face masks this year",
                     excerpt="COSRX Snail Mucin is highlighted...",
                     grounding_sources=[
-                        {"uri": "https://r/", "title": "voguescandinavia.com"},
-                        {"uri": "https://r2/", "title": "target.com"},
+                        {"uri": "https://r/", "title": "Vogue Scandinavia: COSRX Snail Mucin"},
+                        {"uri": "https://r2/", "title": "Target — face masks"},
                     ],
                 ),
                 _category_run(
                     "best face masks under $50",
                     excerpt="COSRX offers various masks under $50...",
                     grounding_sources=[
-                        {"uri": "https://r/", "title": "ulta.com"},
+                        {"uri": "https://r/", "title": "Ulta: COSRX face masks"},
                     ],
                 ),
             ],
@@ -1439,7 +1450,7 @@ def test_via_retailers_action_body_uses_every_grounded_citation_when_attribution
                 _category_run(
                     "best eye patches",
                     excerpt="Beauty of Joseon Revive...",
-                    grounding_sources=[{"uri": "https://r/", "title": "sephora.com"}],
+                    grounding_sources=[{"uri": "https://r/", "title": "Sephora: Beauty of Joseon Revive"}],
                 ),
             ],
         },
@@ -1487,7 +1498,7 @@ def test_via_retailers_suppresses_schema_sitemap_action() -> None:
                 _category_run(
                     "best face masks 2026",
                     excerpt="COSRX is highlighted...",
-                    grounding_sources=[{"uri": "https://r/", "title": "voguescandinavia.com"}],
+                    grounding_sources=[{"uri": "https://r/", "title": "Vogue Scandinavia: COSRX face mask"}],
                 ),
             ],
         },
