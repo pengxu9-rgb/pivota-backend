@@ -519,23 +519,22 @@ def _build_competitive_pressure(
 
     if peers_with_fp:
         framing = (
-            f"**Competitive pressure: real and immediate.** Of the "
-            f"{len(peers_named)} competitor brands AI agents name when "
-            f"consumers ask about this category, "
-            f"{len(peers_with_fp)} have their own .com cited in Gemini "
-            f"grounding for the same queries — "
+            f"Of the {len(peers_named)} competitor brands AI agents named "
+            f"in this category, {len(peers_with_fp)} have a .com that "
+            f"appeared in Gemini grounding sources during the same probe "
+            f"window — "
             + ", ".join(
                 f"{p['brand']} ({p['first_party_host']})"
                 for p in peers_with_fp[:3]
             )
             + (
-                f". Your URL appears in {merchant_attribution_score}% of "
-                f"buyer-intent queries; theirs appears multiple times. "
-                f"Every retailer-routed query you have today is a customer "
-                f"those competitors won and you didn't see."
+                f". The peer-host match is heuristic (longest brand "
+                f"word vs hostname first segment), so a few of these "
+                f"may be coincidental. Your URL appears in "
+                f"{merchant_attribution_score}% of buyer-intent queries."
                 if not merchant_first_party_visible
-                else ". You also appear first-party — but at a lower "
-                "frequency than these peers."
+                else f". Your own URL also appeared in grounding "
+                f"sources during this probe."
             )
         )
     else:
@@ -552,24 +551,21 @@ def _build_competitive_pressure(
                 h.get("host") for h in retailer_hosts[:5] if h.get("host")
             )
             cited_phrase = (
-                f"the cited surface is split across third-party hosts "
-                f"({top_named}) instead of any one brand's own .com"
+                f"category-level grounding sources came from third-party "
+                f"hosts ({top_named})"
                 if top_named
-                else "the cited surface is split across third-party hosts"
+                else "category-level grounding sources came from third-party hosts"
             )
         else:
             cited_phrase = (
-                "the cited surface is split across third-party hosts"
+                "category-level grounding sources came from third-party hosts"
             )
         framing = (
-            f"**First-mover opportunity.** Of the {len(peers_named)} "
-            f"competitor brands AI agents name in this category, NONE "
-            f"appear to have their own .com cited in Gemini grounding "
-            f"today (we may be under-counting — see follow-up note on "
-            f"brand-from-grounding detection) — {cited_phrase}. "
-            f"Whichever brand wins first-party attribution first + "
-            f"completes the 30-90 day indexing arc owns the surface "
-            f"before the rest of the category notices the channel exists."
+            f"Of the {len(peers_named)} competitor brands AI agents named "
+            f"in this category, none had a .com that we matched to a "
+            f"grounding source for these queries (the matcher is "
+            f"heuristic — see follow-up on brand-from-grounding detection). "
+            f"{cited_phrase[0].upper() + cited_phrase[1:]}."
         )
 
     return {
@@ -699,64 +695,65 @@ def _explain_verdict(
         if has_evidence:
             losing = max(0, (runs_total or 0) - (cited or 0))
             if cited and cited > 0:
-                # The "1 of 6 cited; 5 went to..." case — phrase as
-                # success/loss split so the merchant doesn't read
-                # "1 cited" + "cited instead" as contradictory.
                 base = (
                     f"{your_url_label} was cited in {cited} of "
                     f"{runs_total} buyer-intent queries"
                 )
                 if losing > 0 and retailers_phrase:
                     base += (
-                        f". The other {losing} went to: {retailers_phrase}"
+                        f". The other {losing} grounded their answers in "
+                        f"third-party sources including {retailers_phrase}"
                     )
                 elif losing > 0:
-                    base += f". The other {losing} cited no merchant URL"
+                    base += f". The other {losing} had no grounded merchant URL"
             else:
-                # 0/N case — no contradictory phrasing needed.
                 base = (
                     f"None of {runs_total} buyer-intent queries cited "
                     f"{your_url_label.lower()}"
                 )
                 if retailers_phrase:
-                    base += f". They cited: {retailers_phrase} instead"
+                    base += (
+                        f". Gemini grounded its answers in third-party "
+                        f"sources including {retailers_phrase}"
+                    )
             base += (
-                ". Grounded LLM citations are downstream of Google's "
-                "index, so the typical root cause is that Google hasn't "
-                "indexed your canonical PDPs yet — the AI agents have "
-                "nothing to cite."
+                ". We did not verify whether those sources mention your "
+                "brand or products. Possible causes (Google indexing of "
+                "your PDPs, query relevance, URL configuration) are "
+                "covered by the action items below."
             )
             return base
         return (
-            "AI agents return zero grounded references to your store "
-            "across the queries we tested. Typical root cause: Google "
-            "hasn't indexed your canonical PDPs, so grounded LLMs have "
-            "nothing to cite."
+            "Across the queries we tested, your URL did not appear in any "
+            "grounded source. We did not gather enough additional data "
+            "in this run to characterize what was cited; re-run the "
+            "audit or check the action items for next steps."
         )
 
     if label == VERDICT_MISATTRIBUTED:
         if has_evidence:
             losing = max(0, (runs_total or 0) - (cited or 0))
             base = (
-                f"AI agents recognize your product (visibility "
+                f"AI agents surface your product (visibility "
                 f"{visibility_score}/100). {your_url_label} was cited "
                 f"in {cited} of {runs_total} buyer-intent queries"
             )
             if losing > 0 and retailers_phrase:
                 base += (
-                    f"; the other {losing} went to {retailers_phrase}"
+                    f"; the other {losing} grounded their answers in "
+                    f"third-party sources including {retailers_phrase}"
                 )
             base += (
-                ". The demand exists; resellers and marketplaces are "
-                "capturing it instead of you."
+                ". We did not verify whether those sources mention your "
+                "brand or products."
             )
             if cp_framing:
                 base += " " + cp_framing
             return base
         return (
-            "AI agents recognize your product but consistently send "
-            "consumers to third-party URLs instead of yours. The demand "
-            "exists; competitors and resellers are capturing it."
+            "AI agents surface your product, but your URL appeared in "
+            "few buyer-intent queries; other queries grounded their "
+            "answers in third-party sources we did not verify."
         )
 
     if label == VERDICT_VIA_RETAILERS:
@@ -764,25 +761,31 @@ def _explain_verdict(
             cs = cat_score if cat_score is not None else "?"
             gp = gap_pct if gap_pct is not None else "?"
             base = (
-                f"Your brand surfaces in category-level AI queries "
-                f"(category visibility {cs}/100), but your URL captures "
-                f"only {attribution_score}/100 of buyer-intent queries — "
-                f"a {gp}-point gap"
+                f"Your category-visibility score is {cs}/100; your "
+                f"buyer-intent attribution score is {attribution_score}"
+                f"/100 — a {gp}-point gap. Your URL appears in some "
+                f"category-level grounded sources but in few buyer-intent "
+                f"queries"
             )
             if retailers_phrase:
-                base += f", routed through {retailers_phrase}"
+                base += (
+                    f". For buyer-intent queries where your URL did not "
+                    f"appear, Gemini grounded answers in third-party "
+                    f"sources including {retailers_phrase}"
+                )
             base += (
-                ". The brand is findable in the AI channel; you're just "
-                "not capturing the funnel."
+                ". We did not verify whether those sources mention your "
+                "brand or products."
             )
             if cp_framing:
                 base += " " + cp_framing
             return base
         return (
-            "AI agents recognize this brand in category-level queries — "
-            "but the funnel mostly routes consumers through third-party "
-            "retailers rather than the merchant's own URL. The brand is "
-            "findable; the merchant isn't capturing it."
+            "There is a gap between this brand's category-level visibility "
+            "score and its buyer-intent attribution score. Buyer-intent "
+            "queries grounded their answers in third-party sources rather "
+            "than the merchant's own URL; we did not verify whether those "
+            "sources mention the brand."
         )
 
     if label == VERDICT_STRONG:
@@ -2522,60 +2525,126 @@ def _build_failed_queries_detailed(
     return out
 
 
+def _category_recognition_phrase(
+    score: Optional[int],
+    *,
+    has_title_match: bool,
+) -> str:
+    """Score- and signal-conditional phrase for what category visibility
+    actually means. Never overstates: if the score came purely from
+    `in_grounding` (URL was a grounding chunk) without any
+    `title_match` (a grounded source title named the brand), we DO NOT
+    claim "your brand is recognized" — only that the URL was used as
+    a grounding source. Title matches are stronger signal because
+    they confirm Gemini ground-truthed the brand by name.
+    """
+    if score is None:
+        return "we didn't measure category-level presence in this run"
+    if not has_title_match:
+        return (
+            f"your URL was used as a grounding source on some "
+            f"category-level queries (score {score}/100), though no "
+            f"grounded source named your brand"
+        )
+    if score >= 70:
+        return (
+            f"your brand surfaces consistently in category-level "
+            f"queries (score {score}/100)"
+        )
+    if score >= 50:
+        return (
+            f"your brand surfaces in some category-level queries "
+            f"(score {score}/100)"
+        )
+    return (
+        f"your brand surfaces only intermittently in category-level "
+        f"queries (score {score}/100)"
+    )
+
+
 def _build_visibility_plain_summary(
     *,
     verdict_label: str,
     visibility_score: int,
     attribution_score: int,
     category_visibility_score: Optional[int],
+    category_match_details: Optional[List[Dict[str, Any]]] = None,
     attribution_runs_total: int,
     merchant_cited_runs: int,
     top_retailers: List[str],
 ) -> str:
     """Merchant-friendly translation of the score combination.
 
-    Merchants see two scores (`visibility` and `attribution`) plus a
-    technical verdict explanation and ask the obvious question:
-    "Am I visible to AI users or not?". This helper answers that
-    question directly per tier, in one short paragraph, without
-    re-stating the scores in math notation.
-
-    Distinct from `verdict.explanation` (the per-tier diagnostic
-    paragraph) — that lands the technical claim with named retailers
-    + numbers; this one is the merchant-comprehension layer above it.
+    Honesty rules:
+      - Never claim a host is cited "instead of your URL" — only that
+        third-party sources were used to ground answers when your
+        URL didn't appear. We don't verify whether those sources
+        editorially mention your brand or products.
+      - Never claim "your brand is recognized" without title-match
+        evidence. The brand-recognition phrase is gated on whether
+        any category run had a grounded source title containing the
+        brand name (`category_match_details[*].title_match`).
+      - Never speculate about root causes (Google indexing, etc.) —
+        describe what we observed; let the action items propose fixes.
     """
-    retailers_phrase = ", ".join(top_retailers[:3]) if top_retailers else "third-party hosts"
+    has_title_match = bool(
+        category_match_details
+        and any(d.get("title_match") for d in category_match_details)
+    )
+    retailers_phrase = ", ".join(top_retailers[:3]) if top_retailers else ""
+    not_cited = max(0, attribution_runs_total - merchant_cited_runs)
 
     if verdict_label == VERDICT_INVISIBLE:
+        if attribution_runs_total > 0:
+            base = (
+                f"Across {attribution_runs_total} buyer-intent queries we "
+                f"tested, your URL did not appear in any grounded source"
+            )
+            if retailers_phrase:
+                base += (
+                    f". Gemini grounded its answers in third-party sources "
+                    f"including {retailers_phrase} — we did not verify "
+                    f"whether those sources mention your brand or products"
+                )
+            base += "."
+            return base
         return (
-            "No — AI agents don't surface your brand or your products "
-            "today. The likely root cause is that your canonical PDPs "
-            "aren't indexed by Google yet, so grounded LLMs have "
-            "nothing to cite."
+            "Across the queries we tested, your URL did not appear in "
+            "any grounded source. We didn't gather enough additional "
+            "data to characterize what was cited instead."
         )
 
     if verdict_label == VERDICT_VIA_RETAILERS:
-        cs = category_visibility_score or 0
-        gap_pct = max(0, cs - attribution_score)
-        return (
-            f"Yes and no. AI agents DO recognize your brand at the "
-            f"category level — when consumers ask 'best X', your "
-            f"brand is mentioned. But when they ask where to actually "
-            f"buy your products, AI cites editorial / retailer pages "
-            f"({retailers_phrase}) instead of your URL {gap_pct}% of "
-            f"the time. You have brand recognition; you don't yet "
-            f"have first-party traffic."
+        recognition = _category_recognition_phrase(
+            category_visibility_score, has_title_match=has_title_match
         )
+        base = (
+            f"Mixed. {recognition[0].upper() + recognition[1:]}, but for "
+            f"buyer-intent queries your URL appeared in only "
+            f"{merchant_cited_runs} of {attribution_runs_total} runs"
+        )
+        if not_cited > 0 and retailers_phrase:
+            base += (
+                f". The other {not_cited} grounded answers in third-party "
+                f"sources including {retailers_phrase} — we did not verify "
+                f"whether those sources mention your brand"
+            )
+        base += "."
+        return base
 
     if verdict_label == VERDICT_MISATTRIBUTED:
-        return (
-            f"Partly. AI agents recognize your product, but when "
-            f"buyers ask where to find it, your URL appears in "
-            f"{merchant_cited_runs} of {attribution_runs_total} "
-            f"buyer-intent queries — the rest route to "
-            f"{retailers_phrase}. The product is recognized; the "
-            f"buying funnel isn't yours."
+        base = (
+            f"Partly. Your URL appeared in {merchant_cited_runs} of "
+            f"{attribution_runs_total} buyer-intent queries"
         )
+        if not_cited > 0 and retailers_phrase:
+            base += (
+                f". The other {not_cited} grounded answers in third-party "
+                f"sources including {retailers_phrase} — we did not verify "
+                f"whether those sources mention your brand"
+            )
+        base += "."
+        return base
 
     if verdict_label == VERDICT_STRONG:
         return (
@@ -2638,6 +2707,7 @@ def _build_merchant_view(
     visibility_score: int,
     attribution_score: int,
     category_visibility_score: Optional[int],
+    category_match_details: Optional[List[Dict[str, Any]]] = None,
     industry_context: Dict[str, Any],
     action_items: List[Dict[str, Any]],
     competitive_pressure: Dict[str, Any],
@@ -2652,6 +2722,7 @@ def _build_merchant_view(
     url_source: Optional[str],
     merchant_brand: Optional[str],
     merchant_host: Optional[str],
+    merchant_storefront_name: Optional[str] = None,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     pivota_signature_minted_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
@@ -2748,6 +2819,7 @@ def _build_merchant_view(
         visibility_score=visibility_score,
         attribution_score=attribution_score,
         category_visibility_score=category_visibility_score,
+        category_match_details=category_match_details,
         attribution_runs_total=len(attribution_runs or []),
         merchant_cited_runs=merchant_cited_runs,
         top_retailers=[
@@ -2757,6 +2829,21 @@ def _build_merchant_view(
         ],
     )
     competitive_table = _build_competitive_table(competitive_pressure or {})
+
+    # Brand-vs-vendor disambiguation. For drop-shippers / wholesale
+    # merchants whose product `vendor` is a sourcing-platform brand
+    # (e.g. "guiruo" from a 1688-sourced PDP) NOT the storefront's
+    # legal brand identity, "your brand" prose attributes signals to
+    # the wrong entity from the merchant's perspective. Surface both
+    # so the portal can clarify which brand the audit was probed
+    # against.
+    brand_audited_against = (merchant_brand or "").strip() or None
+    storefront_name = (merchant_storefront_name or "").strip() or None
+    brand_vendor_diverges = bool(
+        brand_audited_against
+        and storefront_name
+        and brand_audited_against.lower() != storefront_name.lower()
+    )
 
     return {
         "headline": {
@@ -2776,6 +2863,21 @@ def _build_merchant_view(
             "what_is_at_stake": industry_context.get("blurb"),
             "audited_via_pivota_canonical": audited_via_pivota_canonical,
             "url_source": url_source,
+            "brand_disambiguation": (
+                {
+                    "brand_audited_against": brand_audited_against,
+                    "storefront_name": storefront_name,
+                    "note": (
+                        "The audit probes were issued for the product's "
+                        "vendor field — not the storefront name. If the "
+                        "two represent different brand identities, treat "
+                        "claims about 'your brand' as referring to the "
+                        "vendor."
+                    ),
+                }
+                if brand_vendor_diverges
+                else None
+            ),
         },
         "receipts": {
             "queries_tested": len(attribution_runs or []),
@@ -3043,6 +3145,7 @@ def build_structured_report(
         visibility_score=visibility_score,
         attribution_score=attribution_score,
         category_visibility_score=category_score,
+        category_match_details=category_match_details,
         industry_context=industry_context,
         action_items=action_items,
         competitive_pressure=competitive_pressure,
@@ -3057,6 +3160,7 @@ def build_structured_report(
         url_source=url_source,
         merchant_brand=merchant_brand,
         merchant_host=merchant_host,
+        merchant_storefront_name=merchant_name,
         prior_runs=prior_runs,
         pivota_signature_minted_at=pivota_signature_minted_at,
     )
