@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
+from services.cited_host_classifier import classify_cited_hosts
 
 
 # ---------------------------------------------------------------------------
@@ -2286,15 +2287,23 @@ def _build_merchant_view(
             # sources except the merchant's own". Could be retailers
             # (nordstrom.com, sephora.com), competitor brand .coms
             # (serenaandlily.com), or editorial/review sites
-            # (businessinsider.com, forbes.com). The frontend should
-            # render this as "where the AI cited instead of you", not
-            # "retailers eating funnel". Brand-vs-retailer-vs-media
-            # classification is a follow-up.
+            # (businessinsider.com, forbes.com).
             "top_cited_hosts": [
                 h.get("host")
                 for h in (category_retailer_hosts or [])[:5]
                 if h.get("host")
             ],
+            # Phase C-4 PR-E: each cited host annotated with type +
+            # coverage_note + outreach_hint pulled from the BD-curated
+            # `data/cited_host_registry.json`. Unknown hosts get
+            # `type: "unclassified"`. Frontend renders alongside
+            # `top_cited_hosts` so merchants understand what each host
+            # is and which lever applies. PR-G turns these annotations
+            # into per-host playbook actions.
+            "cited_hosts_detailed": classify_cited_hosts(
+                category_retailer_hosts or [],
+                merchant_category=(industry_context or {}).get("category"),
+            )[:5],
             "top_competitor_brands": [
                 b.get("name")
                 for b in (category_competitor_brands or [])[:5]
