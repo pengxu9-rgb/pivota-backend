@@ -677,6 +677,22 @@ def _explain_verdict(
     cat_score = evidence.get("category_score")
     gap_pct = evidence.get("gap_pct")
     failed_sample: List[str] = evidence.get("failed_attribution_query_sample") or []
+    # category_match_details: per-run flags from score_category_visibility.
+    # Each entry: {in_grounding, title_match, excerpt_match, matched, ...}.
+    # Used to gate the "Your URL appears in some category-level grounded
+    # sources" claim — that's only true when at least one matched run had
+    # in_grounding=True (URL was a grounding chunk). title_match-only
+    # signal means the brand was named in a source title but the URL
+    # itself did NOT appear, so the URL-appearance claim would be wrong.
+    cat_match_details: List[Dict[str, Any]] = (
+        evidence.get("category_match_details") or []
+    )
+    cat_has_url_grounding = any(
+        d.get("in_grounding") for d in cat_match_details
+    )
+    cat_has_title_match = any(
+        d.get("title_match") for d in cat_match_details
+    )
     # When the audit fell back to fallback (c) — the Pivota canonical
     # PDP at agent.pivota.cc/products/sig_* — the merchant doesn't have
     # an external URL; "your URL" alone is ambiguous to them. Disambig.
@@ -760,12 +776,37 @@ def _explain_verdict(
         if has_evidence:
             cs = cat_score if cat_score is not None else "?"
             gp = gap_pct if gap_pct is not None else "?"
+            # Pick the right description based on what actually drove
+            # the category score. Three cases:
+            #   1. URL was a grounding chunk — "Your URL appears..."
+            #   2. Brand was named in source titles but URL didn't
+            #      appear — "Your brand was named in some source titles
+            #      but your URL did not appear..."
+            #   3. Score came from neither (legacy or sparse data) —
+            #      describe the score without claiming where it came
+            #      from.
+            if cat_has_url_grounding:
+                signal_phrase = (
+                    f"{your_url_label} appears in some category-level "
+                    f"grounded sources"
+                )
+            elif cat_has_title_match:
+                signal_phrase = (
+                    "your brand was named in some category-level "
+                    f"grounded source titles, though {your_url_label.lower()} "
+                    f"itself did not appear"
+                )
+            else:
+                signal_phrase = (
+                    f"the category-visibility score is {cs}/100 (we don't "
+                    f"have per-run match details for this run)"
+                )
             base = (
                 f"Your category-visibility score is {cs}/100; your "
                 f"buyer-intent attribution score is {attribution_score}"
-                f"/100 — a {gp}-point gap. Your URL appears in some "
-                f"category-level grounded sources but in few buyer-intent "
-                f"queries"
+                f"/100 — a {gp}-point gap. " +
+                signal_phrase[0].upper() + signal_phrase[1:] +
+                ", but in few buyer-intent queries"
             )
             if retailers_phrase:
                 base += (
@@ -3061,6 +3102,13 @@ def build_structured_report(
         "category_score": category_score,
         "gap_pct": gap_pct,
         "failed_attribution_query_sample": _failed_attribution_queries(attribution_runs)[:3],
+        # Per-run category match flags (in_grounding / title_match /
+        # excerpt_match). VIA_RETAILERS prose uses these to gate the
+        # "Your URL appears..." claim — only true when at least one
+        # matched run had in_grounding=True. title_match-only signal
+        # means brand was named in a source title but the URL itself
+        # did not appear.
+        "category_match_details": category_match_details,
         # Disambiguates "your URL" in the verdict text. When the audit
         # fell back to the Pivota canonical PDP, "your URL" reads as
         # "your store URL" to the merchant — but they don't HAVE one;
