@@ -70,10 +70,25 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | recall_v9_phase8_1778122760 | After fragrance ingestion (Phase 8) | 24 | 9 | 20 | 0 | **45% — peak** |
 | recall_v9_phase9_1778124544 | After eye+face ingestion (Phase 9) | 15 | 10 | 27 | 1 | **28% — regression** |
 | recall_v10_phase7a_backfill_1778130307 | After Phase 7a backfill (lipstick + fragrance SKUs) | 16 | 10 | 26 | 1 | **30%** |
+| recall_v11_aurora_bff_1778170034 | Same data, source=aurora-bff (orchestrator localization probe) | 16 | 3 | 33 | 1 | **30%** |
 
 **Headline insight:** every probe since v9_phase8 has *more* canonical data
 than the previous one, yet pass-rate has not returned to peak. The bottleneck
 is no longer "do the rows exist" but "does the recall query reach them."
+
+**v11 (aurora-bff) localization probe**: ran the same 53-query corpus under a
+different orchestrator (`source=aurora-bff` instead of `shopping_agent`).
+**Lipstick still 0/9 on both paths**, with different failure modes:
+
+- shopping_agent: seed query runs, returns 0 (`cache_miss_sync_filled,
+  external_raw_count=0`)
+- aurora-bff: seed query NEVER RUNS (`external_seed_executed=false,
+  fallback_route=invoke_primary_irrelevant`) — internal catalog returns 0
+  → "primary irrelevant" gate fires → skips external seed entirely
+
+This rules out a per-orchestrator one-line patch. The architectural fix
+(Phase 7b — gateway reads `catalog_offers`/`skus`) is the unambiguous
+next step.
 
 ---
 
