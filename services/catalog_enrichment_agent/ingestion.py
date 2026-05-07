@@ -317,7 +317,12 @@ def _build_sku_insert(
         "source_product_id": canonical_product_name(
             pdp_payload["brand"], pdp_payload["product_name"]
         ),
-        "source_variant_id": "canonical",
+        # Must be unique within (merchant_id, platform) per
+        # idx_catalog_skus_source_identity. All agent SKUs share
+        # merchant_id='external_seed' + platform='external_seed', so
+        # source_variant_id has to vary per PDP. Using product_key
+        # makes it deterministic across re-runs.
+        "source_variant_id": product_key,
         "sku": None,
         "barcode": None,
         "title": pdp_payload["product_name"],
