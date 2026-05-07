@@ -91,12 +91,22 @@ def _check_audit_rate_limit(merchant_id: str) -> int:
     return _AUDIT_RATE_MAX - len(history)
 
 
+class ProductRef(BaseModel):
+    """A reference to one of the merchant's catalog products. The
+    frontend has these from `getProducts()` (returns `platform` +
+    `platform_product_id`); the backend resolves them to catalog rows
+    via `(merchant_id, platform, source_product_id)`."""
+
+    platform: str = Field(..., min_length=1)
+    source_product_id: str = Field(..., min_length=1)
+
+
 class MerchantSelfAuditRequest(BaseModel):
-    """1–5 of the merchant's own product_keys. Vendor / type / pdp_url
-    are not in the request — they come from catalog_products so the
+    """1–5 of the merchant's own products. Vendor / type / pdp_url are
+    not in the request — they come from catalog_products so the
     merchant can never audit URLs that aren't theirs."""
 
-    product_keys: List[str] = Field(..., min_length=1, max_length=5)
+    products: List[ProductRef] = Field(..., min_length=1, max_length=5)
     max_runs: int = Field(3, ge=1, le=5)
 
 
@@ -107,12 +117,17 @@ async def run_merchant_self_audit(
 ) -> Dict[str, Any]:
     remaining = _check_audit_rate_limit(merchant_id)
 
-    # 1. Look up products. WHERE merchant_id=current AND product_key IN
-    #    keys handles the cross-tenant guard implicitly — products owned
-    #    by another merchant simply aren't loaded.
+    # 1. Build the set of (platform, source_product_id) tuples the
+    #    merchant asked for. WHERE merchant_id=current is the cross-
+    #    tenant guard — even if the same source_product_id exists for
+    #    a different merchant, the AND merchant_id=current filter
+    #    excludes it.
+    refs = [(p.platform, p.source_product_id) for p in body.products]
     query = (
         select(
             catalog_products.c.product_key,
+            catalog_products.c.platform,
+            catalog_products.c.source_product_id,
             catalog_products.c.title,
             catalog_products.c.brand,
             catalog_products.c.product_type,
@@ -120,21 +135,33 @@ async def run_merchant_self_audit(
         )
         .where(
             catalog_products.c.merchant_id == merchant_id,
-            catalog_products.c.product_key.in_(body.product_keys),
+            catalog_products.c.platform.in_([p for p, _ in refs]),
+            catalog_products.c.source_product_id.in_([s for _, s in refs]),
         )
     )
     rows = await database.fetch_all(query)
-    found_keys = {r["product_key"] for r in rows}
-    missing = [k for k in body.product_keys if k not in found_keys]
+    # Reconcile what the merchant asked for vs what catalog returned.
+    # IN-list filters can return products matching either column
+    # independently; we re-check the (platform, source_product_id) pair.
+    found_pairs = {(r["platform"], r["source_product_id"]) for r in rows}
+    rows = [
+        r for r in rows
+        if (r["platform"], r["source_product_id"]) in set(refs)
+    ]
+    found_pairs = {(r["platform"], r["source_product_id"]) for r in rows}
+    missing = [
+        {"platform": p, "source_product_id": s}
+        for (p, s) in refs if (p, s) not in found_pairs
+    ]
     if missing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
                 "message": (
-                    f"{len(missing)} product_key(s) not found for this "
+                    f"{len(missing)} product(s) not found for this "
                     f"merchant."
                 ),
-                "missing_product_keys": missing,
+                "missing_products": missing,
             },
         )
     # Reject any product missing the canonical_url field — the audit
