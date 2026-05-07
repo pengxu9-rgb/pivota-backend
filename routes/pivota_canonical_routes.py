@@ -72,7 +72,8 @@ def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     description = (
-        (payload.get("description") or "")
+        (row.get("description") or "").strip()
+        or (payload.get("description") or "")
         or (payload.get("description_text") or "")
         or ""
     )
@@ -119,6 +120,7 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             catalog_products.c.platform,
             catalog_products.c.source_product_id,
             catalog_products.c.title,
+            catalog_products.c.description,
             catalog_products.c.brand,
             catalog_products.c.product_type,
             catalog_products.c.canonical_url,
