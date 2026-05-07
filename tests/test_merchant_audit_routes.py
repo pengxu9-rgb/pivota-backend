@@ -43,49 +43,69 @@ from utils.auth import get_current_user, get_current_merchant
 
 class FakeDatabase:
     """In-memory replacement for `db.database.database` covering only the
-    one query the audit route runs (catalog_products SELECT)."""
+    one query the audit route runs (catalog_products SELECT). The route
+    filters on merchant_id + platform IN (...) + source_product_id IN
+    (...) — we parse those literals from the compiled SQL and apply
+    the same filter."""
 
     def __init__(self, products: List[Dict[str, Any]]) -> None:
-        # products: list of dict rows (merchant_id + product_key + title +
-        # brand + product_type + canonical_url).
         self._products = products
 
     async def fetch_all(self, query) -> List[Dict[str, Any]]:
-        # We don't run the actual SQLAlchemy query — pull merchant_id +
-        # product_keys from the compiled WHERE clause.
         try:
             compiled = query.compile(compile_kwargs={"literal_binds": True})
         except Exception:
             return []
         sql = str(compiled).lower()
-        # Crude but sufficient parse — extract the literals after merchant_id =
-        # and the IN(...) tuple.
         import re
         m = re.search(r"merchant_id\s*=\s*'([^']+)'", sql)
         merchant_id = m.group(1) if m else None
-        keys_match = re.search(r"product_key\s+in\s*\((.*?)\)", sql)
-        keys: List[str] = []
-        if keys_match:
-            keys = [
-                k.strip().strip("'") for k in keys_match.group(1).split(",")
+        platforms_match = re.search(
+            r"platform\s+in\s*\((.*?)\)", sql,
+        )
+        sources_match = re.search(
+            r"source_product_id\s+in\s*\((.*?)\)", sql,
+        )
+        platforms: List[str] = []
+        sources: List[str] = []
+        if platforms_match:
+            platforms = [
+                p.strip().strip("'") for p in platforms_match.group(1).split(",")
+            ]
+        if sources_match:
+            sources = [
+                s.strip().strip("'") for s in sources_match.group(1).split(",")
             ]
         if merchant_id is None:
             return []
         return [
             r for r in self._products
             if r["merchant_id"] == merchant_id
-            and r["product_key"] in keys
+            and r["platform"] in platforms
+            and r["source_product_id"] in sources
         ]
 
 
-def _row(merchant_id: str, key: str, *, with_url: bool = True) -> Dict[str, Any]:
+def _row(
+    merchant_id: str,
+    source_product_id: str,
+    *,
+    platform: str = "shopify",
+    with_url: bool = True,
+) -> Dict[str, Any]:
     return {
         "merchant_id": merchant_id,
-        "product_key": key,
-        "title": f"Product {key}",
+        "product_key": (
+            f"prod::{merchant_id}::{platform}::{source_product_id}"
+        ),
+        "platform": platform,
+        "source_product_id": source_product_id,
+        "title": f"Product {source_product_id}",
         "brand": "Test Brand",
         "product_type": "face mask",
-        "canonical_url": f"https://example.com/p/{key}" if with_url else None,
+        "canonical_url": (
+            f"https://example.com/p/{source_product_id}" if with_url else None
+        ),
     }
 
 
@@ -196,7 +216,7 @@ def test_403_when_token_role_is_not_merchant(monkeypatch: pytest.MonkeyPatch):
     client = TestClient(app)
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p1"]},
+        json={"products": [{"platform": "shopify", "source_product_id": "p1"}]},
     )
     assert res.status_code == 403
     assert "merchant" in res.json()["detail"].lower()
@@ -215,7 +235,7 @@ def test_400_when_token_missing_merchant_id(monkeypatch: pytest.MonkeyPatch):
     client = TestClient(app)
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p1"]},
+        json={"products": [{"platform": "shopify", "source_product_id": "p1"}]},
     )
     assert res.status_code == 400
 
@@ -225,20 +245,24 @@ def test_400_when_token_missing_merchant_id(monkeypatch: pytest.MonkeyPatch):
 # ---------------------------------------------------------------------------
 
 
-def test_422_when_product_keys_empty(env):
+def _ref(source_id: str, platform: str = "shopify") -> Dict[str, str]:
+    return {"platform": platform, "source_product_id": source_id}
+
+
+def test_422_when_products_empty(env):
     client, _, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": []},
+        json={"products": []},
     )
     assert res.status_code == 422
 
 
-def test_422_when_product_keys_over_five(env):
+def test_422_when_products_over_five(env):
     client, _, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p1", "p2", "p3", "p4", "p5", "p6"]},
+        json={"products": [_ref(f"p{i}") for i in range(6)]},
     )
     assert res.status_code == 422
 
@@ -248,14 +272,15 @@ def test_422_when_product_keys_over_five(env):
 # ---------------------------------------------------------------------------
 
 
-def test_404_when_product_key_unknown(env):
+def test_404_when_product_unknown(env):
     client, _, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p1", "does_not_exist"]},
+        json={"products": [_ref("p1"), _ref("does_not_exist")]},
     )
     assert res.status_code == 404
-    assert "does_not_exist" in res.json()["detail"]["missing_product_keys"]
+    missing = res.json()["detail"]["missing_products"]
+    assert any(m["source_product_id"] == "does_not_exist" for m in missing)
 
 
 def test_404_when_product_owned_by_different_merchant(env):
@@ -265,10 +290,11 @@ def test_404_when_product_owned_by_different_merchant(env):
     client, _, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p_other"]},
+        json={"products": [_ref("p_other")]},
     )
     assert res.status_code == 404
-    assert "p_other" in res.json()["detail"]["missing_product_keys"]
+    missing = res.json()["detail"]["missing_products"]
+    assert any(m["source_product_id"] == "p_other" for m in missing)
 
 
 def test_422_when_product_has_no_canonical_url(env):
@@ -278,10 +304,11 @@ def test_422_when_product_has_no_canonical_url(env):
     client, _, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p_no_url"]},
+        json={"products": [_ref("p_no_url")]},
     )
     assert res.status_code == 422
-    assert "p_no_url" in res.json()["detail"]["product_keys_missing_canonical_url"]
+    keys = res.json()["detail"]["product_keys_missing_canonical_url"]
+    assert any("p_no_url" in k for k in keys)
 
 
 # ---------------------------------------------------------------------------
@@ -295,13 +322,13 @@ def test_429_when_audit_quota_exhausted(env):
     for _ in range(2):
         res = client.post(
             "/api/merchant-center/audit/ai-commerce-readiness",
-            json={"product_keys": ["p1"]},
+            json={"products": [_ref("p1")]},
         )
         assert res.status_code == 200, res.text
     # Third hits the cap
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p1"]},
+        json={"products": [_ref("p1")]},
     )
     assert res.status_code == 429
     detail = res.json()["detail"]
@@ -318,9 +345,9 @@ def test_happy_path_returns_brand_report_with_per_product_array(env):
     client, captured_calls, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"product_keys": ["p1", "p2"], "max_runs": 2},
+        json={"products": [_ref("p1"), _ref("p2")], "max_runs": 2},
     )
-    assert res.status_code == 200
+    assert res.status_code == 200, res.text
     body = res.json()
     assert "brand_report" in body
     assert "rate_limit_remaining" in body
