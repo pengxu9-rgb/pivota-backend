@@ -1558,11 +1558,13 @@ def test_discovery_lift_includes_mechanics_and_pivota_baseline_reference() -> No
     # SEO-flavored mechanics; Layer 2 carries the agent-direct API
     # mechanics; Layer 3 has none (outside Pivota's lever).
     layers = dl["layers"]
-    assert len(layers) == 3
+    # Phase 2j: Layer 3 (editorial co-citation) dropped — outside
+    # Pivota's lever, dilutes the pitch. Just Layer 1 + Layer 2.
+    assert len(layers) == 2
     layer_names = [l["name"].lower() for l in layers]
     assert any("layer 1" in n and "grounded" in n for n in layer_names)
     assert any("layer 2" in n and "agent-direct" in n for n in layer_names)
-    assert any("layer 3" in n and ("editorial" in n or "co-citation" in n) for n in layer_names)
+    assert not any("layer 3" in n for n in layer_names)
     # Pivota PDP baseline figures cited inside Layer 1's pivota_status.
     layer1 = next(l for l in layers if "layer 1" in l["name"].lower())
     status1 = layer1["pivota_status"]
@@ -1661,11 +1663,11 @@ def test_render_markdown_includes_discovery_lift_and_checkout_loop() -> None:
     # Top-level section + today.
     assert "## What Pivota changes after onboarding" in md
     assert "**Today:**" in md
-    # Multi-layer discovery framing (Phase 2i).
+    # Multi-layer discovery framing (Phase 2j: Layer 3 dropped — outside Pivota's lever).
     assert "Why your AI-channel discoverability will improve" in md
     assert "Layer 1" in md and "Grounded LLM citation" in md
     assert "Layer 2" in md and "Agent-direct API queries" in md
-    assert "Layer 3" in md
+    assert "Layer 3" not in md
     # Layer 1 mechanics (SEO).
     assert "Schema.org" in md
     assert "sitemap" in md.lower()
@@ -1884,12 +1886,14 @@ def test_methodology_note_names_specific_probe_modes_used_in_baseline() -> None:
     assert "merchant_store_attribution_test" in note
 
 
-def test_methodology_note_disclaims_category_level_comparison() -> None:
-    """methodology_note must explicitly say the baseline is NOT
-    comparable to category_visibility_score."""
+def test_methodology_note_clarifies_layer_specific_comparability() -> None:
+    """methodology_note must clarify the Pivota baseline is comparable
+    only to attribution_score (Layer 1) and that Layer 2 is binary by
+    integration (no per-merchant probe). Phase 2j: Layer 3 dropped."""
     note = _wpc(_basic_report())["discovery_lift"]["methodology_note"]
-    assert "category_visibility_score" in note
-    assert "NOT" in note or "not" in note
+    assert "attribution_score" in note
+    assert "layer 2" in note.lower()
+    assert "binary by" in note.lower() or "integration" in note.lower()
 
 
 def test_onboarding_sequence_present_with_five_steps() -> None:
@@ -1961,3 +1965,92 @@ def test_render_markdown_contains_onboarding_sequence_section() -> None:
     assert "🔧 manual today" in md
     # Roadmap_note explains RESERVED placeholders.
     assert "RESERVED" in md
+
+
+# ---------------------------------------------------------------------------
+# Phase 2j: Layer 2 reframe + visibility_booster + Layer 3 dropped.
+# ---------------------------------------------------------------------------
+
+
+def test_layer2_examples_are_apps_with_traffic_not_existing_shopping_apps() -> None:
+    """Layer 2 narrative names apps with massive non-shopping traffic
+    that are transforming into agents — Uber / Airbnb / Spotify / Reddit
+    / X / Discord / Pinterest type — NOT Klarna (already a shopping app).
+    These are the right examples for 'every app becomes an agent'."""
+    layers = _wpc(_basic_report())["discovery_lift"]["layers"]
+    layer2 = next(l for l in layers if "layer 2" in l["name"].lower())
+    blob = (layer2.get("subtitle", "") + " " + layer2.get("what_it_is", "")).lower()
+    # At least 3 of the named non-shopping apps should appear.
+    candidates = ["uber", "airbnb", "spotify", "reddit", " x ", "discord", "pinterest"]
+    matches = sum(1 for c in candidates if c in blob)
+    assert matches >= 3, (
+        f"Layer 2 should reference apps-with-traffic-but-no-shopping; "
+        f"found only {matches} of {candidates} in blob"
+    )
+    # Klarna (existing shopping vertical) MUST NOT be the headline example.
+    # It can appear in passing but shouldn't be the primary positioning.
+    # (Looser check — just don't lead with Klarna.)
+    assert "klarna" not in blob.split(".")[0].lower(), (
+        "Layer 2 should not lead with Klarna (already a shopping app); "
+        "lead with non-shopping apps becoming agents."
+    )
+
+
+def test_visibility_booster_block_present_with_three_required_pieces() -> None:
+    """visibility_booster must explain the merchant-side workflow with
+    three required parts: mechanisms_that_work, what_doesnt_work,
+    honest_position."""
+    vb = _wpc(_basic_report())["visibility_booster"]
+    assert vb["title"]
+    assert vb["intro"]
+    assert vb["mechanisms_that_work"]
+    assert vb["what_doesnt_work"]
+    assert vb["honest_position"]
+
+
+def test_visibility_booster_corrects_prompt_repetition_misconception() -> None:
+    """Required honesty: explicitly call out that prompt repetition /
+    spam does NOT lift grounded retrieval (folk remedy that BD has
+    heard from merchants)."""
+    vb = _wpc(_basic_report())["visibility_booster"]
+    blob = " ".join(vb["what_doesnt_work"]).lower()
+    assert "prompt repetition" in blob or "prompt history" in blob or "don't learn" in blob
+
+
+def test_visibility_booster_mechanisms_include_index_reinforcement_and_demand_test() -> None:
+    """The mechanisms_that_work list must include index reinforcement
+    (Search Console URL Inspection) + Demand Test continuous diagnosis
+    + structured-data depth + canonical URL authority. These are the
+    actual levers Pivota operates."""
+    vb = _wpc(_basic_report())["visibility_booster"]
+    labels = " ".join(m.get("label", "").lower() for m in vb["mechanisms_that_work"])
+    assert "search console" in labels or "url inspection" in labels or "index reinforcement" in labels
+    assert "demand test" in labels or "continuous diagnosis" in labels
+    assert "schema.org" in labels or "structured-data" in labels or "structured data" in labels
+    assert "canonical url" in labels or "canonical pdp" in labels or "stable canonical" in labels
+
+
+def test_visibility_booster_honest_position_does_not_overpromise_layer1() -> None:
+    """The honest_position MUST explicitly acknowledge Layer 1 is a
+    30-90 day arc and NOT promise immediate visibility lift."""
+    vb = _wpc(_basic_report())["visibility_booster"]
+    pos = vb["honest_position"].lower()
+    assert "30-90 day" in pos
+    assert "do not promise" in pos or "not promise" in pos
+    # Should reposition value to Layer 2 + ongoing diagnosis.
+    assert "layer 2" in pos
+    assert "day-1" in pos
+
+
+def test_render_markdown_includes_visibility_booster_section() -> None:
+    from services.agent_center_bd_report_service import (
+        render_markdown_from_structured,
+    )
+    md = render_markdown_from_structured(_basic_report())
+    assert "Merchant-side agent workflow" in md
+    assert "What does NOT work" in md or "what does not work" in md.lower()
+    assert "Prompt repetition" in md or "prompt repetition" in md
+    assert "Honest position" in md
+    # Search Console + structured data evidence row visible.
+    assert "Search Console" in md or "URL Inspection" in md
+    assert "Schema.org" in md
