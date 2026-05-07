@@ -37,6 +37,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select, func
 
+from db.canonical_pdp_filter import visible_canonical_clause
 from db.catalog import catalog_products
 from db.database import database
 from utils.logger import logger
@@ -128,11 +129,18 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             catalog_products.c.pivota_canonical_url,
             catalog_products.c.updated_at,
         )
-        .where(catalog_products.c.pivota_signature_id == sig)
+        .where(
+            catalog_products.c.pivota_signature_id == sig,
+            visible_canonical_clause(),
+        )
         .limit(1)
     )
     row = await database.fetch_one(query)
     if not row:
+        # Either the sig doesn't exist or it exists but failed the
+        # quality gate (no image / thin description). Either way the
+        # public answer is 404 — we don't differentiate so crawlers
+        # see a clean "gone".
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
@@ -165,7 +173,7 @@ async def list_canonical_pdp_signatures(
     total_q = (
         select(func.count())
         .select_from(catalog_products)
-        .where(catalog_products.c.pivota_signature_id.isnot(None))
+        .where(visible_canonical_clause())
     )
     total = await database.fetch_val(total_q) or 0
 
@@ -175,7 +183,7 @@ async def list_canonical_pdp_signatures(
             catalog_products.c.pivota_canonical_url,
             catalog_products.c.updated_at,
         )
-        .where(catalog_products.c.pivota_signature_id.isnot(None))
+        .where(visible_canonical_clause())
         .order_by(catalog_products.c.updated_at.desc())
         .limit(limit)
         .offset(offset)

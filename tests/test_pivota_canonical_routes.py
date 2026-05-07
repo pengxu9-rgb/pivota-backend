@@ -136,7 +136,12 @@ def test_get_canonical_pdp_400_for_malformed_sig(env):
     assert "sig_" in res.json()["detail"]
 
 
-def test_get_canonical_pdp_handles_missing_image_gracefully(env):
+def test_get_canonical_pdp_serves_image_less_row_when_gate_disabled_in_fake(env):
+    """The real production query joins visible_canonical_clause() which
+    rejects image-less rows — see tests/test_canonical_pdp_filter.py
+    for the gated behaviour. This FakeDb deliberately ignores the gate
+    predicates so we can keep exercising the resolver's shaping code
+    on rows that wouldn't survive in prod."""
     client = env
     res = client.get("/api/canonical/products/sig_xyz")
     assert res.status_code == 200
