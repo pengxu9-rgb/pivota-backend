@@ -2655,6 +2655,12 @@ def _build_merchant_view(
         failed_queries_detailed=failed_queries_detailed,
     )
     merged_actions = list(action_items or []) + list(playbook_actions or [])
+    # Stamp a 1-indexed `priority_order` on every action so the
+    # frontend can render "Step 1, Step 2..." without re-deriving the
+    # ordering. Strategic actions from `_generate_action_items` come
+    # first (lower numbers), per-host playbook actions follow.
+    for i, a in enumerate(merged_actions, start=1):
+        a["priority_order"] = i
 
     plain_summary = _build_visibility_plain_summary(
         verdict_label=verdict_label,

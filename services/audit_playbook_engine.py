@@ -247,10 +247,22 @@ def select_playbooks(
         if not title or not body:
             continue
 
+        # `concrete_next_step` (playbook schema_v2) is the BD-curated
+        # 1-sentence "this week" task — what the merchant should DO
+        # first, with specifics (URLs, who to email, sample sizes,
+        # required documents). Distinct from `body` which describes
+        # the strategic rationale.
+        concrete_next_step_tpl = pb.get("concrete_next_step") or ""
+        concrete_next_step = (
+            _render_template(concrete_next_step_tpl, ctx)
+            if concrete_next_step_tpl else None
+        )
+
         actions.append({
             "severity": pb.get("severity") or "medium",
             "title": title,
             "body": body,
+            "concrete_next_step": concrete_next_step,
             "evidence": {
                 "host": host,
                 "times_cited": entry.get("times_cited") or 0,
