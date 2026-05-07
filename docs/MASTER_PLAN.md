@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-07
+- Last updated: 2026-05-07 (post issue #1 trace — root cause is gateway/backend disconnect, not a backend bug)
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -104,33 +104,67 @@ Per-bucket breakdown (PASS/THIN/EMPTY):
 
 ## Open issues
 
-### #1 — Lipstick recall returns zero candidates despite full canonical chain (BLOCKER)
+### #1 — Lipstick recall returns zero (BLOCKER — diagnosed 2026-05-07, fix scoped)
 
-**Symptom:** all 9 lipstick queries (`lipstick`, `red lipstick long-lasting`,
-`口红`, `推荐口红`, `平价口红`, etc.) layer-attribute to **C-external_seed /
-seed_ran_returned_zero**. The seed query executes (executed=true) but
-returns raw=0.
+**Symptom:** all 9 lipstick queries (EN + ZH) layer-attribute to
+`C-external_seed / seed_ran_returned_zero`. Probe metadata:
+`external_seed_executed=true, external_raw_count=0,
+external_seed_skip_reason=cache_miss_sync_filled, internal_raw_count=0`.
 
-**Why it's surprising:** the data is there.
-- 15 lipstick `catalog_products` (verified)
-- 18 lipstick `external_product_seeds` (verified)
-- 15 lipstick `catalog_skus` (just inserted today via PR #332 backfill)
-- 18 lipstick `catalog_offers` (just inserted)
-- All `pdp_scope='multi_merchant_canonical'` (Phase 6 + 7a)
+**Diagnosis: the gateway never reads the backend canonical chain.**
+Three layered findings, in escalating severity:
 
-**Hypotheses to test (in order):**
-1. Lipstick PDP/seed `category_path` doesn't match the recall SQL's category
-   filter (e.g. SQL looks for `'beauty/lip%'` but rows have `'beauty/makeup/lip/lipstick'`).
-2. ZH→EN alias dict (PR-04 in PIVOTA-Agent) doesn't expand `口红`.
-3. Phase 2b's PDP-first JOIN never engages for lipstick queries — the seed-side
-   text-LIKE scan is short-circuiting before the JOIN runs.
-4. Cache poisoning from the v9_phase9 regression — but probe v10 shows mostly
-   `cache_miss_sync_filled`, not cache_hit, so cache isn't the cause.
+1. **Architectural gap (root cause).** PIVOTA-Agent (`agent.pivota.cc/api/gateway`)
+   has **zero SQL references to `catalog_products` / `catalog_skus` /
+   `catalog_offers`**. Every backend phase that landed under the "canonical
+   migration" banner — Phases 1, 2, 2b, 7a, 7c, 8, 9, C-1/C-2/C-3 — is
+   invisible to live `find_products_multi` recall. The comment at
+   `findProductsExternalSeedDirectRetrieval.js:152` acknowledges this:
+   *"the gateway does not yet JOIN catalog_offers (Phase 7b)"*.
 
-**Next move:** read `services/pivot_query_service.py:_fetch_canonical_search_rows`
-+ `_fetch_external_fallback_items` end-to-end against a sample lipstick query
-  trace. Don't try fixes blind. ~1 hour read; pin a unit test for whichever
-  hypothesis confirms.
+2. **Bridge clause is in the wrong file.** `findProductsExternalSeedDirectRetrieval.js`
+   has `OR tool = 'catalog_enrichment_agent_v1'` to let attached agent seeds
+   pass. But 5+ other seed-query templates in `server.js` and `auroraBff/`
+   hard-code `attached_product_key IS NULL` with no bridge. Whichever path
+   fires for `shopping_agent → find_products_multi` lacks it.
+
+3. **Even unattached lipstick seeds (36 in prod) return 0.** Some additional
+   filter (quality gate, merchant scope, or cache key mismatch on
+   `cache_miss_sync_filled`) is dropping rows beyond the IS-NULL filter.
+   Needs a separate trace.
+
+**Verification done:**
+- ✅ Backend `_fetch_canonical_search_rows` returns all 18 lipstick rows
+  when SQL is run directly with `query='lipstick'` — backend recall is
+  correct, just unused.
+- ✅ Direct seed-table SQL with `attached_product_key IS NULL AND
+  market='US' AND lower(title) LIKE '%lipstick%'` returns 36 rows in prod.
+- ✅ Agent-authored seeds populate `title` correctly but leave
+  `seed_data.derived` NULL; non-agent seeds populate
+  `seed_data.derived.recall.category='Lipstick'`. Either should match the
+  LIKE predicate via `lower(title)` alone — yet the gateway returns 0,
+  pointing to finding #3.
+
+**Next move (recommended): two tracks**
+
+- **A. Cheap (today, ~2 hr).** Find which seed-query path actually fires
+  for `shopping_agent → find_products_multi`. Add per-path query telemetry
+  or use existing `route_health` traces, run a one-shot probe, identify
+  the file. Then add the agent-bridge clause `OR tool = 'catalog_enrichment_agent_v1'`
+  to that path. This unblocks lipstick AS LONG AS the unattached-36-returning-0
+  mystery (#3 above) is also resolved.
+
+- **B. Right (next week, 1–2 days).** Phase 7b — wire gateway recall to
+  JOIN `catalog_offers` / `catalog_skus`. This is the real fix. Until 7b
+  lands, every canonical PDP we ingest stays invisible to live recall, and
+  we're spending probe rounds tuning a path the data never reaches.
+  Needs design alignment with the rest of PIVOTA-Agent because the seed-scan
+  code is load-bearing for the existing ~80% of recall traffic that isn't
+  agent-authored.
+
+**Recommendation:** A first today, then B next. Do **not** extend Phase 4
+to fashion/electronics/home until B is in flight — otherwise we're adding
+to a ghost catalog.
 
 ### #2 — Phase 9 regression (45% → 28%) not root-caused
 
@@ -190,19 +224,31 @@ the recall path doesn't surface lipstick. Fix #1 first, then extend.
 
 ---
 
-## Recommended next steps (priority order)
+## Recommended next steps (priority order, post-diagnosis 2026-05-07)
 
-1. **Diagnose open issue #1** — read recall path, find why lipstick seeds
-   return 0 even with full canonical chain. Don't ingest more data until
-   this is understood.
-2. **After #1**: run probe v11. Target: lipstick lift 0/9 → ≥6/9.
-3. **Then** root-cause #2 (Phase 9 regression). May resolve as a side effect
-   of #1 if both are in `_fetch_canonical_search_rows`.
-4. **Parallel work eligible** while #1 is in progress:
-   - #3 (runner hardening) — independent, mechanical
-   - Stretch: pick the next Phase 4 category for when #1 closes
-5. **Phase 4 fashion/electronics/home** — only after #1 + #2 close, otherwise
-   we're adding to a recall path that doesn't surface what we have.
+The diagnosis flips the priority. Issue #1 is no longer a backend bug —
+it's a gateway/backend integration gap that all backend canonical work
+depends on.
+
+1. **Track A — instrument & patch (today, ~2 hr)**
+   - Identify which seed-query path fires for `shopping_agent →
+     find_products_multi` (probe + log inspection in PIVOTA-Agent)
+   - Add the agent-bridge clause to that path
+   - Re-probe. Expected lift: lipstick 0/9 → 4–6/9 if finding #3
+     (unattached seeds also return 0) is just the bridge issue. If
+     lipstick stays 0/9, escalate to track B sooner.
+2. **Track B — Phase 7b (next, 1–2 days)**
+   - Wire PIVOTA-Agent's `find_products_multi` to JOIN
+     `catalog_offers`/`catalog_skus` so canonical PDPs surface in recall.
+   - This is the real fix and unblocks every category at once. Must align
+     with the existing seed-scan path (load-bearing for ~80% of traffic).
+3. **Parallel work eligible while A/B in flight:**
+   - Open issue #3 (runner swallow-and-log hardening) — independent, mechanical
+   - Open issue #2 (Phase 9 regression) — diff v9_phase8 vs v9_phase9 records
+4. **Phase 4 fashion/electronics/home — DEFER until B lands.** Adding more
+   PDPs to a catalog the gateway doesn't read is wasted ingestion budget.
+5. **304 NULL `category_path` rows** (issue #4) — defer indefinitely until
+   Phase 4 expansion resumes.
 
 ---
 
