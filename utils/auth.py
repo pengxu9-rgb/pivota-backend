@@ -163,13 +163,13 @@ async def get_current_user(
 async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Require admin or super_admin role
-    
+
     Args:
         current_user: Current authenticated user
-    
+
     Returns:
         User information if authorized
-    
+
     Raises:
         HTTPException: If user is not an admin
     """
@@ -179,6 +179,31 @@ async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)
             detail="Admin access required"
         )
     return current_user
+
+
+async def get_current_merchant(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> str:
+    """Return the merchant_id from a merchant-role JWT, 403 otherwise.
+
+    Centralizes the merchant-role check that's repeated inline across
+    every merchant-scoped route. Use as `Depends(get_current_merchant)`
+    where the only thing the route needs is the merchant_id (most cases).
+    For routes that need the full user record (e.g., to read email or
+    role-specific claims), keep using `Depends(get_current_user)` and
+    do the role check inline."""
+    if current_user.get("role") != "merchant":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Merchant access required",
+        )
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Merchant ID missing from token",
+        )
+    return merchant_id
 
 
 async def require_admin_or_key(
