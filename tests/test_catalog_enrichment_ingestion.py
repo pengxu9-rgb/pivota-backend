@@ -393,3 +393,81 @@ def test_offer_handles_out_of_stock_and_missing_price():
     assert offer["list_price"] is None
     assert offer["inventory_quantity"] == 0
     assert offer["price_confidence"] is None
+
+
+# --- Phase 7c: synthetic variant + availability prevent zero_variants blocker ---
+
+
+def test_seed_carries_synthetic_variant_in_seed_data():
+    """Phase 7c: every agent seed must ship with a non-empty variants
+    array inside seed_data and a column-level availability value.
+    Without this, evaluate_external_referral_seed flags zero_variants
+    (severity=blocker) and the recall loader silently drops the seed."""
+    result = ingest_validated_record(_record())
+    assert result is not None
+    seed = result["seeds"][0]
+    assert seed["availability"] in {"in_stock", "out_of_stock"}
+    sd = json.loads(seed["seed_data"])
+    variants = sd.get("variants")
+    assert isinstance(variants, list) and len(variants) == 1, "exactly one synthetic variant per offer"
+    v = variants[0]
+    assert v["currency"] == "USD"
+    assert v["price_amount"] == 21.0
+    assert v["availability"] == "in_stock"
+    assert v["variant_id"].endswith("::canonical")
+    assert v["sku"] == seed["external_product_id"]
+
+
+def test_seed_data_mirrors_title_and_image_urls_for_audit():
+    """The audit's collect_seed_image_urls / title resolution paths
+    look inside seed_data first. We mirror so the audit doesn't fall
+    back to less reliable column reads."""
+    result = ingest_validated_record(_record())
+    seed = result["seeds"][0]
+    sd = json.loads(seed["seed_data"])
+    assert sd["title"] == "Ruby Woo Matte Lipstick"
+    assert sd["image_urls"] == ["https://maccosmetics.com/img/ruby-woo.jpg"]
+
+
+def test_seed_passes_external_referral_audit():
+    """End-to-end pin: a seed produced by the new builder passes
+    services.external_referral_readiness.evaluate_external_referral_seed
+    with status='healthy'. This is the regression test for the actual
+    bug — pre-Phase-7c agent seeds were status='blocked' on
+    zero_variants and dropped silently at recall time."""
+    import asyncio as _asyncio
+    from services.external_referral_readiness import evaluate_external_referral_seed
+
+    result = ingest_validated_record(_record())
+    seed = result["seeds"][0]
+
+    async def _check():
+        status = await evaluate_external_referral_seed(
+            seed, matched_via="test", allowed_domains=["maccosmetics.com"]
+        )
+        return status
+
+    status = _asyncio.run(_check())
+    assert status.status == "healthy", (
+        f"agent seed must pass audit cleanly; got status={status.status} "
+        f"blockers={list(status.blocker_anomaly_types or [])}"
+    )
+
+
+def test_seed_is_out_of_stock_when_offer_marked_oos():
+    record = _record(offers=[
+        {
+            "merchant_inferred": "MAC",
+            "canonical_url": "https://maccosmetics.com/p/ruby-woo",
+            "destination_url": "https://maccosmetics.com/p/ruby-woo",
+            "image_url": "https://maccosmetics.com/img/x.jpg",
+            "price": 21.0,
+            "in_stock": False,
+        },
+    ])
+    result = ingest_validated_record(record)
+    seed = result["seeds"][0]
+    assert seed["availability"] == "out_of_stock"
+    sd = json.loads(seed["seed_data"])
+    assert sd["variants"][0]["availability"] == "out_of_stock"
+    assert sd["variants"][0]["in_stock"] is False

@@ -190,7 +190,18 @@ def _build_seed_inserts(
     offers: List[Dict[str, Any]],
     market: str = "US",
 ) -> List[Dict[str, Any]]:
-    """Produce one external_product_seeds row per validated offer."""
+    """Produce one external_product_seeds row per validated offer.
+
+    Phase 7c: each row carries a single synthetic variant inside
+    seed_data and a column-level `availability` value. Without this,
+    services.external_referral_readiness.evaluate_external_referral_seed
+    audits the row, finds zero variants, returns status='blocked', and
+    routes/agent_api.py:_build_external_seed_product silently drops the
+    seed (no metric reason recorded). This is what made probe v9 return
+    0/9 lipstick queries even though Option A's Node-side patch landed
+    — the wrong code path entirely. The correct hot path is
+    pivota-backend's external_seed loader, and it gates on the audit.
+    """
     rows: List[Dict[str, Any]] = []
     seen_urls: set = set()
     for offer in offers:
@@ -201,28 +212,53 @@ def _build_seed_inserts(
         seen_urls.add(destination_url)
         seed_id = derive_seed_id(product_key, destination_url)
         merchant_slug = _normalize_token(offer.get("merchant_inferred") or "merchant").replace(" ", "-") or "merchant"
+        external_product_id = f"{merchant_slug}:{seed_id.split(':')[-1]}"
+        in_stock = bool(offer.get("in_stock") or False)
+        availability = "in_stock" if in_stock else "out_of_stock"
+        price = offer.get("price")
+        # One synthetic variant — the audit only requires a non-empty
+        # variant list with currency matching the row's price_currency.
+        # We don't have real merchant variant data; this represents the
+        # canonical purchasable identity and matches the same shape used
+        # by Phase 7a's catalog_skus + catalog_offers chain.
+        synthetic_variant = {
+            "variant_id": f"{external_product_id}::canonical",
+            "id": f"{external_product_id}::canonical",
+            "sku": external_product_id,
+            "title": pdp_payload["product_name"],
+            "currency": "USD",
+            "price_amount": price,
+            "price": price,
+            "availability": availability,
+            "in_stock": in_stock,
+        }
         rows.append({
             "id": seed_id,
-            "external_product_id": f"{merchant_slug}:{seed_id.split(':')[-1]}",
+            "external_product_id": external_product_id,
             "market": market,
             "tool": AGENT_VERSION,
             "title": pdp_payload["product_name"],
             "image_url": offer.get("image_url") or None,
-            "price_amount": offer.get("price"),
+            "price_amount": price,
             "price_currency": "USD",
             "destination_url": destination_url,
             "canonical_url": canonical_url or None,
             "domain": _domain_of(canonical_url or destination_url),
             "attached_product_key": product_key,
             "status": "active",
+            "availability": availability,
             "seed_data": json.dumps({
                 "brand": pdp_payload["brand"],
                 "product_name": pdp_payload["product_name"],
+                "title": pdp_payload["product_name"],
                 "category_path": pdp_payload.get("category_path"),
                 "merchant_inferred": offer.get("merchant_inferred"),
-                "in_stock": offer.get("in_stock"),
+                "in_stock": in_stock,
+                "availability": availability,
                 "validated_at": offer.get("validated_at"),
                 "agent_version": AGENT_VERSION,
+                "variants": [synthetic_variant],
+                "image_urls": [offer.get("image_url")] if offer.get("image_url") else [],
             }),
         })
     return rows
