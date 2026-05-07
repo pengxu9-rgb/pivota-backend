@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-07 (post user's ext→sig audit — migration is clean, prior "130 rows lost" claim retracted; current focus shifts to content-quality backfill)
+- Last updated: 2026-05-07 evening (post Phase 2-redo: 4069 → 627 NULL category_path; mirror script now classifies at INSERT time; probe v13 in flight)
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -23,19 +23,24 @@ recall investigation closed at 23% pass-rate; tracks every phase since.
 After the ext→sig migration (Phase C-1/C-2/C-3 + the
 `mirror_external_seeds_to_catalog_products` script), the catalog has
 **4715 rows in `catalog_products`, all with `pivota_signature_id`**, with
-**zero migration drift** (titles/descriptions/images/URLs all match seed
-source-of-truth — see audit summary below). Public sig_* PDPs are live and
-returning 200. Recall pass-rate sits at **30%** as of probe v10/v11 with
-lipstick stuck at 0/9, but that's no longer the immediate priority.
+zero migration drift. Phase 2-redo (PRs #347/#348/#349/#351/#352, applied
+2026-05-07) backfilled `category_path` on **3442 of the 4069 NULL rows**
+and added INSERT-time classification to the mirror script as a
+forward-going guardrail. Remaining 627 NULL rows are accessory / lingerie
+/ pet long-tail that requires a separate non-beauty taxonomy.
 
-**Current priority: content-quality backfill.** Three concrete gaps the
-audit surfaced — 38 demo/signoff rows polluting counts, 129 rows with
-description < 50 chars (K-beauty heavy), 3467 rows missing snapshot
-contract metadata. Plan in the "Content backfill plan" section below.
+**Recall trajectory:** 30% (v10) → 32% (v12, post content backfill) →
+**v13 in flight** (post Phase 2-redo). The category_path backfill should
+help category-anchored buckets *if* the gateway path actually consults
+`category_path` — but the gateway still doesn't read `catalog_products`
+directly, so v13 is the leading indicator for whether
+`external_product_seeds.seed_data->derived->recall->category` was also
+populated by the new pipeline (= free lift) or whether Phase 7b is still
+required to bridge the gap (= architectural fix needed).
 
-**Recall fix (Phase 7b — gateway reads canonical chain) is parked**, not
-cancelled. The architectural diagnosis still stands but content quality
-unblocks more user-visible value first.
+**Public PDPs are healthy.** sig_* URLs return 200, content + JSON-LD
+correct, codex's PDP detail-page sig resolver works (commit `9adbcf1d`
+in PIVOTA-Agent — narrowly scoped to detail page, doesn't help recall).
 
 ---
 
@@ -47,7 +52,8 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 |---|---|---|---|
 | Deliv. A | Recall investigation handoff doc | ✅ | `pivota-agent-ui/reports/recall_v1/RECALL_INVESTIGATION_FINAL.md` |
 | 1 | PDP-first SQL indexes | ✅ | #295, mig 068 |
-| 2 | `category_path` columns + regex backfill | ✅ | #296, mig 069 (1216/1535 covered, 304 NULL — known long-tail) |
+| 2 | `category_path` columns + regex backfill | ✅ | #296, mig 069 (1216/1535 covered initially, then 304 NULL long-tail) |
+| 2-redo | Re-classify 4069 NULL rows after ext→sig mirror; mirror gains INSERT-time classifier | ✅ | #347, #348, #349, #351, #352 — applied 2026-05-07. **4069 → 627 NULL** (3442 backfilled). Remaining 627 are accessory/lingerie/pet long-tail; requires separate taxonomy, not beauty regex. |
 | 2b | Recall side wired to PDP-first | ✅ | #297, `services/pivot_query_service.py` |
 | 3A | Deterministic seed→PDP matcher | ✅ | #299, `services/pdp_matcher/deterministic.py` |
 | 3B | LLM tail matcher (gemini-2.5-flash) | ✅ | #305, `services/pdp_matcher/llm_match.py` |
