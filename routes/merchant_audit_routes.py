@@ -284,7 +284,15 @@ async def run_merchant_self_audit(
         # PR-D: track the canonical sig's mint timestamp per product
         # so the engine can compute the indexing-arc phase. Default to
         # the catalog row's existing value; lazy-mint sets it below.
-        pivota_minted_at = r.get("pivota_signature_minted_at")
+        # Bracket access (not .get) — the `databases` Record type
+        # resolves attribute lookups against column names; calling
+        # `r.get(...)` raised TypeError because there's no `get`
+        # column. `r["pivota_signature_minted_at"]` returns None when
+        # the column is NULL for this row.
+        try:
+            pivota_minted_at = r["pivota_signature_minted_at"]
+        except (KeyError, IndexError):
+            pivota_minted_at = None
         if not pdp_url:
             # Fallback (c): Pivota canonical PDP URL. Lazily mint the
             # sig + URL if the catalog row predates migration 071.
