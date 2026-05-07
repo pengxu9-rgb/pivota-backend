@@ -687,12 +687,29 @@ def _explain_verdict(
 
     if label == VERDICT_INVISIBLE:
         if has_evidence:
-            base = (
-                f"{cited} of {runs_total} buyer-intent queries surfaced "
-                f"your URL"
-            )
-            if retailers_phrase:
-                base += f". Top URLs cited instead: {retailers_phrase}"
+            losing = max(0, (runs_total or 0) - (cited or 0))
+            if cited and cited > 0:
+                # The "1 of 6 cited; 5 went to..." case — phrase as
+                # success/loss split so the merchant doesn't read
+                # "1 cited" + "cited instead" as contradictory.
+                base = (
+                    f"Your URL was cited in {cited} of {runs_total} "
+                    f"buyer-intent queries"
+                )
+                if losing > 0 and retailers_phrase:
+                    base += (
+                        f". The other {losing} went to: {retailers_phrase}"
+                    )
+                elif losing > 0:
+                    base += f". The other {losing} cited no merchant URL"
+            else:
+                # 0/N case — no contradictory phrasing needed.
+                base = (
+                    f"None of {runs_total} buyer-intent queries cited "
+                    f"your URL"
+                )
+                if retailers_phrase:
+                    base += f". They cited: {retailers_phrase} instead"
             base += (
                 ". Grounded LLM citations are downstream of Google's "
                 "index, so the typical root cause is that Google hasn't "
@@ -709,13 +726,16 @@ def _explain_verdict(
 
     if label == VERDICT_MISATTRIBUTED:
         if has_evidence:
+            losing = max(0, (runs_total or 0) - (cited or 0))
             base = (
                 f"AI agents recognize your product (visibility "
-                f"{visibility_score}/100) but your URL appears in {cited} "
+                f"{visibility_score}/100). Your URL was cited in {cited} "
                 f"of {runs_total} buyer-intent queries"
             )
-            if retailers_phrase:
-                base += f". Top citation drains: {retailers_phrase}"
+            if losing > 0 and retailers_phrase:
+                base += (
+                    f"; the other {losing} went to {retailers_phrase}"
+                )
             base += (
                 ". The demand exists; resellers and marketplaces are "
                 "capturing it instead of you."
@@ -2422,9 +2442,27 @@ def _build_failed_queries_detailed(
         if parsed.get("merchant_url_found"):
             continue  # query succeeded, not in the "failed" set
 
+        # Resolve the cited host via _identify_run_sources so Vertex
+        # redirector URIs render as their FINAL DESTINATION (e.g.
+        # "whowhatwear.com — best lingerie roundup") instead of the
+        # opaque vertexaisearch.cloud.google.com redirector. The
+        # redirect-resolution + title-lookup logic is already there;
+        # we just need to use it.
+        sources = _identify_run_sources(run)
         chunks = run.get("grounding_chunks") or []
-        top_url: Optional[str] = chunks[0] if chunks else None
-        top_host: Optional[str] = normalize_host(top_url) if top_url else None
+        if sources:
+            top_label = sources[0].get("label") or ""
+            top_url: Optional[str] = chunks[0] if chunks else None
+            # Prefer the label as the host when it's already a hostname
+            # (no spaces). Otherwise keep the raw URL host.
+            top_host: Optional[str]
+            if top_label and " " not in top_label and "." in top_label:
+                top_host = top_label.lower()
+            else:
+                top_host = normalize_host(top_url) if top_url else None
+        else:
+            top_url = chunks[0] if chunks else None
+            top_host = normalize_host(top_url) if top_url else None
 
         # If the "top cited host" actually IS the merchant (rare —
         # parsed.merchant_url_found should already catch this) skip
