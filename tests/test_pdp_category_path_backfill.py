@@ -75,6 +75,7 @@ FRAGRANCE_FIXTURES = [
     "Byredo Gypsy Water Perfume",
     "Issey Miyake L'Eau d'Issey Eau de Toilette",
     "Tom Ford Ébène Fumé All Over Body Spray",
+    "Guerlain Vanille Planifolia Extrait 21",
 ]
 
 SUNSCREEN_FIXTURES = [
@@ -174,6 +175,7 @@ MASK_FIXTURES = [
     "Pixi LipPatch",
     "Summer Fridays Jet Lag Mask",
     "Anua Ultra-Thin Spot Cover Patch",
+    "Patyka Patchs Lift Regard 360°",
 ]
 
 EXFOLIANT_FIXTURES = [
@@ -215,12 +217,21 @@ EYELINER_FIXTURES = [
     "Lancôme Idôle Ultra-Precise Felt Tip Liquid Liner",
 ]
 
+BODY_CARE_FIXTURES = [
+    "KraveBeauty Great Body Relief",
+    "Fenty Butta Drop Hydrating Body Milk",
+    "Rare Beauty Find Comfort Mini Body Essentials",
+    "Cicalisse Protective Skin & Hand Care Set",
+    "Kylie Loofah",
+]
+
 GIFT_SET_FIXTURES = [
     "Olehenriksen The Glow Cycle Bundle Full-Size Daily Routine",
     "Kylie Cosmic Kylie Jenner & 2.0 30ml Gift Set",
     "Embryolisse Lightweight Hydration Set",
     "Pixi Best of Pixi - Holiday Edition",
-    "Cicalisse Protective Skin & Hand Care Set",
+    "Pixi Daily Glow Duo",
+    "Sigma Soft Blend Eye Duo",
 ]
 
 
@@ -350,6 +361,14 @@ def test_eyeliner_resolves(title: str) -> None:
     assert hit is not None
     assert hit[0] == "Eyeliner"
     assert hit[1] == "beauty/makeup/eye/eyeliner"
+
+
+@pytest.mark.parametrize("title", BODY_CARE_FIXTURES)
+def test_body_care_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Body Care"
+    assert hit[1] == "beauty/body/care"
 
 
 @pytest.mark.parametrize("title", GIFT_SET_FIXTURES)

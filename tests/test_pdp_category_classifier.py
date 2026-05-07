@@ -36,6 +36,7 @@ from services.pdp_category_classifier import (  # noqa: E402
         ("vanilla perfume", "beauty/fragrance/"),
         ("eau de parfum", "beauty/fragrance/"),
         ("body spray", "beauty/fragrance/"),
+        ("vanilla extrait", "beauty/fragrance/"),
         ("sunscreen", "beauty/skincare/sun/"),
         ("spf 50", "beauty/skincare/sun/"),
         ("hyaluronic acid serum", "beauty/skincare/treat/"),
@@ -55,6 +56,8 @@ from services.pdp_category_classifier import (  # noqa: E402
         ("liquid eyeliner", "beauty/makeup/eye/"),
         ("lip tint", "beauty/makeup/lip/"),
         ("lip combo", "beauty/makeup/lip/"),
+        ("lip care", "beauty/makeup/lip/"),
+        ("body milk", "beauty/body/"),
         ("skincare set", "beauty/sets/"),
     ],
 )
