@@ -31,6 +31,7 @@ LIPSTICK_FIXTURES = [
     "Pixi Glow-y Lip Oil",
     "Kylie Precision Pout Lip Liner",
     "Tom Ford Gloss Luxe",
+    "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
 ]
 
 FOUNDATION_FIXTURES = [
@@ -44,6 +45,7 @@ FOUNDATION_FIXTURES = [
     "Bobbi Brown Skin Long-Wear Foundation",
     "Dior Forever Foundation 3CR",
     "Armani Luminous Silk Foundation",
+    "Fenty Eaze Drop Blur + Smooth Tint Stick",
 ]
 
 MASCARA_FIXTURES = [
@@ -109,6 +111,7 @@ CLEANSER_FIXTURES = [
     "Boscia Detoxifying Black Cleansing Foam",
     "First Aid Beauty Pure Skin Face Cleanser",
     "Innisfree Apple Seed Cleansing Oil",
+    "Beekman 1802 Fresh Air Face Wipes",
 ]
 
 SERUM_FIXTURES = [
@@ -122,6 +125,38 @@ SERUM_FIXTURES = [
     "COSRX Advanced Snail 96 Mucin Power Essence",
     "Vichy Mineral 89 Hyaluronic Acid Booster Serum",
     "Kiehl's Midnight Recovery Concentrate",
+]
+
+TONER_FIXTURES = [
+    "Pixi Glow Tonic Original Size",
+    "Pixi Milky Tonic Original Size",
+    "Round Lab DIVE IN Skin Booster",
+    "Laneige Cream Skin Refiner Mist",
+    "I'm From Rice Toner",
+]
+
+TREATMENT_FIXTURES = [
+    "Naturium Azelaic Acid Derivative Complex 10%",
+    "Olehenriksen GFH Glow from Home Vitamin C Duo",
+    "Murad Retinol Youth Renewal Night Treatment",
+    "Pixi Spot Stickers Trio",
+    "Peace Out Acne Stickers",
+]
+
+FACE_OIL_FIXTURES = [
+    "Jurlique Lavender Pure Essential Oil",
+    "Jurlique Face Oils Discovery",
+    "NUXE Huile Prodigieuse Body Oil",
+    "Sunday Riley Juno Antioxidant + Superfood Face Oil",
+    "Kiehl's Midnight Recovery Oil Drops",
+]
+
+TANNING_FIXTURES = [
+    "Pixi GradualGlow Self-Tan Petite Size",
+    "Isle of Paradise Self Tanning Drops",
+    "Tan-Luxe The Face Illuminating Self-Tan Drops",
+    "St. Tropez Self Tan Classic Bronzing Mousse",
+    "Bondi Sands Gradual Tanning Milk",
 ]
 
 MASK_FIXTURES = [
@@ -239,6 +274,38 @@ def test_serum_resolves(title: str) -> None:
     assert hit is not None
     assert hit[0] == "Serum"
     assert hit[1] == "beauty/skincare/treat/serum"
+
+
+@pytest.mark.parametrize("title", TONER_FIXTURES)
+def test_toner_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Toner"
+    assert hit[1] == "beauty/skincare/treat/toner"
+
+
+@pytest.mark.parametrize("title", TREATMENT_FIXTURES)
+def test_treatment_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Treatment"
+    assert hit[1] == "beauty/skincare/treat/treatment"
+
+
+@pytest.mark.parametrize("title", FACE_OIL_FIXTURES)
+def test_face_oil_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Face Oil"
+    assert hit[1] == "beauty/skincare/moisturize/oil"
+
+
+@pytest.mark.parametrize("title", TANNING_FIXTURES)
+def test_tanning_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Tanning"
+    assert hit[1] == "beauty/body/tanning"
 
 
 @pytest.mark.parametrize("title", MASK_FIXTURES)
