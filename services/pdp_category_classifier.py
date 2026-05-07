@@ -50,10 +50,10 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Cleanser", "beauty/skincare/cleanse/cleanser", re.compile(
         r"\b(cleanser|cleansing|face wash|facial wash|"
-        r"cleansing milk|cleansing foam|cleansing gel|wash)\b",
+        r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|wipes?|wash)\b",
         re.IGNORECASE)),
     ("Toner", "beauty/skincare/treat/toner", re.compile(
-        r"\b(toner|mist|pad)\b", re.IGNORECASE)),
+        r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
     ("Mask", "beauty/skincare/treat/mask", re.compile(
         r"\b(face mask|clay mask|charcoal mask|sheet mask|gel mask|sleeping mask|"
         r"sleep mask|wash[-\s]?off mask|under eye patch|eye patch|pimple patch|"
@@ -65,14 +65,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Treatment", "beauty/skincare/treat/treatment", re.compile(
         r"\b(spot[-\s]?target(?:ing|ed)?|spot[-\s]?treatment|blemish|acne|"
-        r"clarifying treatment|targeting gel|treatment gel)\b",
+        r"clarifying treatment|targeting gel|treatment gel|spot stickers?|"
+        r"pimple stickers?|acne stickers?|azelaic acid|vitamin c duo|"
+        r"retinol youth renewal|retinol treatment)\b",
+        re.IGNORECASE)),
+    ("Face Oil", "beauty/skincare/moisturize/oil", re.compile(
+        r"\b(face oils?|facial oils?|body oil|essential oil|oil drops?)\b",
         re.IGNORECASE)),
     ("Serum", "beauty/skincare/treat/serum", re.compile(
         r"\b(serum|essence|ampoule|concentrate)\b", re.IGNORECASE)),
+    ("Tanning", "beauty/body/tanning", re.compile(
+        r"\b(self[-\s]?tan|self[-\s]?tanning|sunless tan|gradual tanning|gradualglow)\b",
+        re.IGNORECASE)),
     ("Primer", "beauty/makeup/face/primer", re.compile(
         r"\b(primer|pore prep|pore[-\s]?filling)\b", re.IGNORECASE)),
     ("Concealer", "beauty/makeup/face/concealer", re.compile(
-        r"\b(concealer)\b", re.IGNORECASE)),
+        r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick)\b",
+        re.IGNORECASE)),
     ("Foundation", "beauty/makeup/face/foundation", re.compile(
         r"\b(foundation|skin tint|tint stick|foundation stick|cushion foundation)\b",
         re.IGNORECASE)),
@@ -102,10 +111,11 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Lipstick", "beauty/makeup/lip/lipstick", re.compile(
         r"\b(lipstick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
         r"lip gloss|lip oil|lip liner|lip stain|lip tint|pout lip|gloss luxe|"
-        r"gloss drip)\b",
+        r"gloss drip|gloss bomb|gloss stick|gloss stix)\b",
         re.IGNORECASE)),
     ("Moisturizer", "beauty/skincare/moisturize/cream", re.compile(
-        r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|barrier cream)\b",
+        r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|"
+        r"water gel|barrier cream)\b",
         re.IGNORECASE)),
 ]
 
