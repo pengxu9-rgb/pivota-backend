@@ -222,11 +222,27 @@ def test_403_when_token_role_is_not_merchant(monkeypatch: pytest.MonkeyPatch):
     assert "merchant" in res.json()["detail"].lower()
 
 
-def test_400_when_token_missing_merchant_id(monkeypatch: pytest.MonkeyPatch):
+def test_400_when_token_missing_merchant_id_and_email_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When the JWT has no merchant_id claim AND the email fallback
+    against merchant_onboarding misses, get_current_merchant 400s."""
     from routes import merchant_audit_routes as mar
+    from utils import auth as auth_module
 
     async def _override_user_no_mid():
-        return {"role": "merchant", "email": "x@example.com"}
+        return {"role": "merchant", "email": "unknown@example.com"}
+
+    # Stub the fallback DB query to return None (email not in
+    # merchant_onboarding).
+    class _FakeDb:
+        async def fetch_one(self, *_args, **_kwargs):
+            return None
+
+    # Patch the lazily-imported `database` module-level — auth.py
+    # does `from db.database import database` inside the function.
+    import db.database as db_module
+    monkeypatch.setattr(db_module, "database", _FakeDb())
 
     app = FastAPI()
     app.include_router(mar.router)
@@ -238,6 +254,72 @@ def test_400_when_token_missing_merchant_id(monkeypatch: pytest.MonkeyPatch):
         json={"products": [{"platform": "shopify", "source_product_id": "p1"}]},
     )
     assert res.status_code == 400
+
+
+def test_email_fallback_resolves_merchant_id_when_token_lacks_claim(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The realistic merchants-portal case: JWT carries email but no
+    explicit merchant_id claim (existing tokens were minted without
+    it). The email fallback against merchant_onboarding resolves the
+    merchant_id and the route proceeds. Mirrors the pattern in
+    merchant_dashboard_routes._resolve_merchant_id."""
+    from routes import merchant_audit_routes as mar
+
+    async def _override_user_email_only():
+        return {"role": "merchant", "email": "test@example.com"}
+
+    class _FakeDb:
+        async def fetch_one(self, *_args, **_kwargs):
+            return {"merchant_id": "merch_self"}
+
+    import db.database as db_module
+    monkeypatch.setattr(db_module, "database", _FakeDb())
+
+    # Set up the merchant audit fixtures (mocks for catalog + run_brand_report)
+    # exactly like the env fixture, but without overriding get_current_merchant.
+    products_for_self = [_row("merch_self", "p1")]
+    monkeypatch.setattr(mar, "database", FakeDatabase(products_for_self))
+
+    async def _fake_get_merchant_onboarding(_mid: str):
+        return {"merchant_id": "merch_self", "business_name": "Test"}
+    monkeypatch.setattr(
+        mar, "get_merchant_onboarding", _fake_get_merchant_onboarding,
+    )
+
+    async def _fake_run_brand_report(**kwargs):
+        return {
+            "merchant_name": kwargs["merchant_name"],
+            "merchant_domain": kwargs.get("merchant_domain"),
+            "timestamp": "2026-05-07T00:00:00+00:00",
+            "provider": kwargs["provider"],
+            "per_product": [],
+            "aggregate": {
+                "avg_visibility": 0, "avg_attribution": 0,
+                "avg_category_visibility": 0,
+                "brand_verdict_label": "INVISIBLE",
+                "brand_verdict_explanation": "test",
+                "products_count": 1, "products_succeeded": 1,
+                "products_failed": 0,
+            },
+            "cross_product_competitors": [],
+            "failed": [],
+        }
+    monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
+    mar._audit_run_history.clear()
+
+    app = FastAPI()
+    app.include_router(mar.router)
+    app.dependency_overrides[get_current_user] = _override_user_email_only
+
+    client = TestClient(app)
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness",
+        json={"products": [{"platform": "shopify", "source_product_id": "p1"}]},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["brand_report"]["merchant_name"] == "Test"
 
 
 # ---------------------------------------------------------------------------

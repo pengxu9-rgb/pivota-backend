@@ -184,26 +184,52 @@ async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)
 async def get_current_merchant(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> str:
-    """Return the merchant_id from a merchant-role JWT, 403 otherwise.
+    """Return the merchant_id for the current merchant-role JWT.
 
-    Centralizes the merchant-role check that's repeated inline across
-    every merchant-scoped route. Use as `Depends(get_current_merchant)`
-    where the only thing the route needs is the merchant_id (most cases).
-    For routes that need the full user record (e.g., to read email or
-    role-specific claims), keep using `Depends(get_current_user)` and
-    do the role check inline."""
+    Resolves merchant_id with the same fallback chain the existing
+    merchant routes use (see routes/merchant_dashboard_routes.py
+    `_resolve_merchant_id`):
+      1. `merchant_id` claim from the JWT (preferred)
+      2. Email lookup against `merchant_onboarding.contact_email`
+         — many merchant tokens were minted without an explicit
+         merchant_id claim and rely on this DB fallback
+
+    403 if the role isn't `merchant`. 400 if neither path resolves
+    a merchant_id (token missing both merchant_id claim AND a
+    matching email)."""
     if current_user.get("role") != "merchant":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Merchant access required",
         )
     merchant_id = current_user.get("merchant_id")
-    if not merchant_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Merchant ID missing from token",
+    if merchant_id:
+        return merchant_id
+
+    # Email fallback — mirrors merchant_dashboard_routes._resolve_merchant_id.
+    # Imported lazily to avoid a circular import (db.database imports
+    # config which can pull utils helpers).
+    email = current_user.get("email")
+    if email:
+        from db.database import database
+        result = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_onboarding
+            WHERE contact_email = :email
+            LIMIT 1
+            """,
+            {"email": email},
         )
-    return merchant_id
+        if result:
+            row = dict(result)
+            if row.get("merchant_id"):
+                return str(row["merchant_id"])
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Merchant ID not found in token",
+    )
 
 
 async def require_admin_or_key(
