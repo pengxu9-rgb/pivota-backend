@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -63,6 +63,47 @@ router = APIRouter(
 _AUDIT_RATE_WINDOW_S = 24 * 60 * 60   # 24 hours
 _AUDIT_RATE_MAX = 2                   # audits per merchant per window
 _audit_run_history: Dict[str, List[float]] = {}
+
+
+def _derive_canonical_url(
+    *, merchant_domain: Optional[str], product_payload: Any,
+) -> Optional[str]:
+    """Build a buyer-facing PDP URL from the merchant's store domain
+    + the product handle stored in the raw catalog payload. Returns
+    None if either input is missing/unusable.
+
+    This is deterministic derivation, not a fallback that hides bugs:
+    the catalog sync stores the full upstream payload (which always
+    has `handle` for Shopify), and the merchant's store_url is set
+    at onboarding. We just compose them — no DB lookups, no I/O.
+    """
+    if not merchant_domain:
+        return None
+    payload: Dict[str, Any]
+    if isinstance(product_payload, dict):
+        payload = product_payload
+    elif isinstance(product_payload, str):
+        try:
+            import json as _json
+            payload = _json.loads(product_payload)
+            if not isinstance(payload, dict):
+                return None
+        except Exception:
+            return None
+    else:
+        return None
+    handle = (
+        (payload.get("handle") or "").strip()
+        if isinstance(payload.get("handle"), str)
+        else ""
+    )
+    if not handle:
+        return None
+    domain = merchant_domain.strip().rstrip("/")
+    # Tolerate either "shop.myshopify.com" or "https://shop.myshopify.com"
+    if "://" not in domain:
+        domain = f"https://{domain}"
+    return f"{domain}/products/{handle}"
 
 
 def _check_audit_rate_limit(merchant_id: str) -> int:
@@ -132,6 +173,7 @@ async def run_merchant_self_audit(
             catalog_products.c.brand,
             catalog_products.c.product_type,
             catalog_products.c.canonical_url,
+            catalog_products.c.product_payload,
         )
         .where(
             catalog_products.c.merchant_id == merchant_id,
@@ -143,7 +185,6 @@ async def run_merchant_self_audit(
     # Reconcile what the merchant asked for vs what catalog returned.
     # IN-list filters can return products matching either column
     # independently; we re-check the (platform, source_product_id) pair.
-    found_pairs = {(r["platform"], r["source_product_id"]) for r in rows}
     rows = [
         r for r in rows
         if (r["platform"], r["source_product_id"]) in set(refs)
@@ -164,25 +205,9 @@ async def run_merchant_self_audit(
                 "missing_products": missing,
             },
         )
-    # Reject any product missing the canonical_url field — the audit
-    # probe requires a buyer-facing URL to score attribution against.
-    no_url = [
-        r["product_key"] for r in rows if not (r["canonical_url"] or "").strip()
-    ]
-    if no_url:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": (
-                    "Some selected products have no canonical_url in "
-                    "the catalog. Run SKU Match first to populate it, "
-                    "or pick different products."
-                ),
-                "product_keys_missing_canonical_url": no_url,
-            },
-        )
 
     # 2. Resolve merchant display name + domain for the report header.
+    #    The store_url also drives canonical_url derivation below.
     merchant = await get_merchant_onboarding(merchant_id) or {}
     merchant_name = (
         merchant.get("business_name")
@@ -190,18 +215,56 @@ async def run_merchant_self_audit(
         or merchant.get("store_url")
         or merchant_id
     )
-    merchant_domain = merchant.get("store_url") or None
+    merchant_domain = (merchant.get("store_url") or "").strip() or None
 
     # 3. Build the products list run_brand_report expects.
-    products = [
-        {
+    #    Derivation order for the buyer-facing pdp_url that the audit
+    #    probes against:
+    #      (a) catalog_products.canonical_url if set (preferred — set
+    #          by catalog sync when the upstream payload includes it)
+    #      (b) "{store_domain}/products/{handle}" derived from
+    #          product_payload.handle (Shopify-style; catalog stores
+    #          the full raw payload so we always have this for synced
+    #          merchants even if canonical_url wasn't extracted)
+    #      (c) None → bail out with a 422 listing the SKUs that need
+    #          attention
+    products: List[Dict[str, Any]] = []
+    derivation_failed: List[Dict[str, Any]] = []
+    for r in rows:
+        pdp_url = (r["canonical_url"] or "").strip()
+        if not pdp_url:
+            pdp_url = _derive_canonical_url(
+                merchant_domain=merchant_domain,
+                product_payload=r["product_payload"],
+            ) or ""
+        if not pdp_url:
+            derivation_failed.append({
+                "platform": r["platform"],
+                "source_product_id": r["source_product_id"],
+                "title": r["title"],
+            })
+            continue
+        products.append({
             "title": r["title"],
             "vendor": r["brand"],
             "product_type": r["product_type"],
-            "pdp_url": r["canonical_url"],
-        }
-        for r in rows
-    ]
+            "pdp_url": pdp_url,
+        })
+    if derivation_failed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    "Some selected products have no resolvable buyer-"
+                    "facing URL — neither catalog_products.canonical_url "
+                    "nor a (store_domain + product handle) derivation "
+                    "succeeded. The audit needs a URL to score "
+                    "attribution against. Reach out to support to fix "
+                    "the catalog sync."
+                ),
+                "products_missing_url": derivation_failed,
+            },
+        )
 
     logger.info(
         "merchant_self_audit_start merchant_id=%s sku_count=%d max_runs=%d",

@@ -92,7 +92,11 @@ def _row(
     *,
     platform: str = "shopify",
     with_url: bool = True,
+    handle: str = "",
 ) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"id": source_product_id}
+    if handle:
+        payload["handle"] = handle
     return {
         "merchant_id": merchant_id,
         "product_key": (
@@ -106,6 +110,7 @@ def _row(
         "canonical_url": (
             f"https://example.com/p/{source_product_id}" if with_url else None
         ),
+        "product_payload": payload,
     }
 
 
@@ -304,18 +309,90 @@ def test_404_when_product_owned_by_different_merchant(env):
     assert any(m["source_product_id"] == "p_other" for m in missing)
 
 
-def test_422_when_product_has_no_canonical_url(env):
-    """An audit needs a buyer-facing URL to score attribution against —
-    if the catalog row has no canonical_url, we 422 with a clear
-    message telling the merchant to run SKU Match first."""
+def test_422_when_product_has_no_canonical_url_and_no_handle(env):
+    """An audit needs a buyer-facing URL to score attribution against.
+    `p_no_url` lacks both canonical_url AND a handle in
+    product_payload — derivation fails, route 422s with the products
+    missing a URL."""
     client, _, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
         json={"products": [_ref("p_no_url")]},
     )
     assert res.status_code == 422
-    keys = res.json()["detail"]["product_keys_missing_canonical_url"]
-    assert any("p_no_url" in k for k in keys)
+    missing = res.json()["detail"]["products_missing_url"]
+    assert any(m["source_product_id"] == "p_no_url" for m in missing)
+
+
+def test_canonical_url_derived_from_handle_when_catalog_url_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The realistic case: catalog_products.canonical_url is NULL
+    (catalog sync didn't capture it) but product_payload carries the
+    Shopify handle. Route derives `{store_url}/products/{handle}` and
+    proceeds — no 422, no fallback flag."""
+    from routes import merchant_audit_routes as mar
+
+    products = [
+        _row("merch_self", "p_with_handle", with_url=False, handle="snail-mucin"),
+    ]
+    monkeypatch.setattr(mar, "database", FakeDatabase(products))
+
+    async def _fake_get_merchant_onboarding(_mid: str):
+        return {
+            "merchant_id": "merch_self",
+            "business_name": "Test",
+            "store_url": "test-merchant.example.com",
+        }
+    monkeypatch.setattr(
+        mar, "get_merchant_onboarding", _fake_get_merchant_onboarding,
+    )
+
+    captured: List[Dict[str, Any]] = []
+
+    async def _fake_run_brand_report(**kwargs):
+        captured.append(kwargs)
+        return {
+            "merchant_name": kwargs["merchant_name"],
+            "merchant_domain": kwargs.get("merchant_domain"),
+            "timestamp": "2026-05-07T00:00:00+00:00",
+            "provider": "gemini",
+            "per_product": [],
+            "aggregate": {
+                "avg_visibility": 0, "avg_attribution": 0,
+                "avg_category_visibility": 0,
+                "brand_verdict_label": "INVISIBLE",
+                "brand_verdict_explanation": "test",
+                "products_count": 1, "products_succeeded": 1,
+                "products_failed": 0,
+            },
+            "cross_product_competitors": [],
+            "failed": [],
+        }
+    monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
+    mar._audit_run_history.clear()
+
+    async def _override_merchant() -> str:
+        return "merch_self"
+
+    app = FastAPI()
+    app.include_router(mar.router)
+    from utils.auth import get_current_merchant
+    app.dependency_overrides[get_current_merchant] = _override_merchant
+
+    client = TestClient(app)
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness",
+        json={"products": [_ref("p_with_handle")]},
+    )
+    assert res.status_code == 200, res.text
+    # The derived URL was passed to run_brand_report.
+    assert len(captured) == 1
+    call_products = captured[0]["products"]
+    assert len(call_products) == 1
+    assert call_products[0]["pdp_url"] == (
+        "https://test-merchant.example.com/products/snail-mucin"
+    )
 
 
 # ---------------------------------------------------------------------------
