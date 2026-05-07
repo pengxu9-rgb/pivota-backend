@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-07 (post issue #1 trace — root cause is gateway/backend disconnect, not a backend bug)
+- Last updated: 2026-05-07 (post user's ext→sig audit — migration is clean, prior "130 rows lost" claim retracted; current focus shifts to content-quality backfill)
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -20,15 +20,22 @@ recall investigation closed at 23% pass-rate; tracks every phase since.
 
 ## Where we are (one-paragraph summary)
 
-The catalog architecture migration (PDP-first labeling + canonical chain
-across `catalog_products` → `catalog_skus` → `catalog_offers` → `catalog_merchants`)
-is mechanically complete for **lipstick (15 PDPs), fragrance (50), eye makeup (50),
-face makeup (50)** as of 2026-05-07. Recall pass-rate peaked at **45%** after
-fragrance ingestion (Phase 8) but regressed to **28%** after Phase 9, then
-recovered to **30%** after the Phase 7a backfill applied today. The remaining
-gap is no longer a data gap — **the recall query path is not using the
-canonical chain for lipstick queries** even though all rows exist. That's the
-next blocker.
+After the ext→sig migration (Phase C-1/C-2/C-3 + the
+`mirror_external_seeds_to_catalog_products` script), the catalog has
+**4715 rows in `catalog_products`, all with `pivota_signature_id`**, with
+**zero migration drift** (titles/descriptions/images/URLs all match seed
+source-of-truth — see audit summary below). Public sig_* PDPs are live and
+returning 200. Recall pass-rate sits at **30%** as of probe v10/v11 with
+lipstick stuck at 0/9, but that's no longer the immediate priority.
+
+**Current priority: content-quality backfill.** Three concrete gaps the
+audit surfaced — 38 demo/signoff rows polluting counts, 129 rows with
+description < 50 chars (K-beauty heavy), 3467 rows missing snapshot
+contract metadata. Plan in the "Content backfill plan" section below.
+
+**Recall fix (Phase 7b — gateway reads canonical chain) is parked**, not
+cancelled. The architectural diagnosis still stands but content quality
+unblocks more user-visible value first.
 
 ---
 
@@ -87,8 +94,11 @@ different orchestrator (`source=aurora-bff` instead of `shopping_agent`).
   → "primary irrelevant" gate fires → skips external seed entirely
 
 This rules out a per-orchestrator one-line patch. The architectural fix
-(Phase 7b — gateway reads `catalog_offers`/`skus`) is the unambiguous
-next step.
+(Phase 7b — gateway reads `catalog_offers`/`skus`) is the right
+long-term answer, but **deprioritized as of 2026-05-07 evening** in
+favor of the content-quality backfill plan below — thicker content may
+move pass-rate without needing the gateway-side spike, and the content
+work is mechanically simpler.
 
 ---
 
@@ -117,9 +127,112 @@ Per-bucket breakdown (PASS/THIN/EMPTY):
 
 ---
 
+## ext→sig migration audit (2026-05-07, user-run)
+
+After codex's ext→sig migration ran on prod, peng performed a read-only audit
+to verify quality. **Migration is clean.** Earlier in the same session I
+incorrectly speculated that the migration had deleted ~130 agent-authored
+rows; that claim is retracted — the catalog had been thinly seeded *before*
+the migration, and what looked like "loss" was just the seed snapshot's
+pre-existing thinness now being faithfully projected.
+
+**Headline counts:**
+- `external_product_seeds`: total 4528, active 4120 (184 attached + 3936 standalone), deduped valid candidates 3936
+- `catalog_products`: total 4715, **all 4715 with `pivota_signature_id`**, mirror rows 3936, missing external mirror **0**, legacy external seed catalog rows **0**, sig duplicate groups **0**, identity duplicate groups **0**
+- Field-drift checks (title / description / image / canonical_url / brand / product_type / category / payload seed_data / source_ref): **all 0**
+- Public live sample: 8/8 sig_* and ext_* PDPs return 200; HTML titles + og:title look correct
+
+**Count pollution to clean (38 rows total):**
+- 36 from `universal_product_sync` (legacy demo: dog harness/leash, AeroFlex Joggers, etc.)
+- 2 from `products_cache_backfill_signoff`
+- Should not appear in canonical sitemap / "real product" totals.
+
+**Content quality gaps:**
+
+| Metric | Count |
+|---|---:|
+| external_seed rows in catalog | 3936 |
+| image+description ready | 3807 |
+| description < 50 chars | **129** |
+| zero image | 0 |
+| snapshot contract missing | **3467** |
+| snapshot quarantine present | 105 |
+
+K-beauty thin-content concentration:
+- roundlab.co.kr: 12/12 (KR rows, description = 0)
+- medicube.us: 9/17
+- anua.com: 4/54
+- wishtrend.com: 4/5
+- tirtir.global: 1/68 (TIRTIR Stickers — accessory)
+- cosrx.com: 1/101 (Perfect Sebum Centella Powder Puff OPP — accessory)
+
+**Shopify stale bug** is fully cleaned: 741 in cache, 741 in catalog, 0 mismatch.
+
+---
+
+## Content backfill plan (current priority, 2026-05-07)
+
+Four sequenced steps, each gated by dry-run → diff → apply → DB postcheck →
+canonical API sample → public PDP sample → sig + identity duplicate-group
+invariant check.
+
+### Step 1 — Count-pollution cleanup (38 rows)
+
+- Targets: 36 `universal_product_sync` + 2 `products_cache_backfill_signoff`.
+- Sample first: dump all 38 rows to a markdown report, eyeball-confirm
+  they're demo/signoff (not real merchant inventory).
+- **Reversibility-first option:** instead of deleting, gate them out of the
+  canonical sitemap / public "real product" list via a `pdp_visibility`
+  flag or equivalent. Keeps rows in the DB if we ever need to reference
+  them; deletion is a follow-up if the gate proves stable.
+- Apply once samples confirm safe.
+
+### Step 2 — `description < 50` content backfill (129 rows)
+
+Priority order (matches the audit's failure concentration):
+
+1. K-beauty: Medicube (9), Round Lab (12), Anua (4), Wishtrend (4), COSRX (1) — **first batch, 30 rows**
+2. Fenty / Sigma and other large-volume thin descriptions
+3. **Hold list (do not backfill content):** Shipping Protection, stickers,
+   samples, puff/accessory items. Mark with a `pdp_content_hold_reason`
+   column (nullable) so future audits skip them automatically. Prevents
+   another agent from re-flagging them as "thin" and trying to write
+   skincare-style PDP copy onto an accessory.
+
+Per-batch flow: dry-run → diff → apply → postcheck (sig + identity
+duplicate-group invariants must stay 0) → sample 5 public PDPs.
+
+### Step 3 — Snapshot contract metadata (3467 rows)
+
+- Backfill `seed_data->derived->recall->*` (or whatever the contract
+  schema is) and quarantine flags **only**. **Do not rewrite** title /
+  description / image / canonical_url — those columns already passed
+  the audit's drift check.
+- Lowest-risk and largest-volume; can run in parallel with Step 2.
+- Same gate: dry-run → diff → apply → invariant check.
+
+### Step 4 — Standing invariant gates (apply to all future backfills)
+
+After every batch:
+- `legacy external seed catalog rows = 0`
+- `sig duplicate groups = 0`
+- `identity duplicate groups = 0`
+- `missing external mirror = 0`
+- 5-PDP public sample returns 200 with non-empty `<title>` and `og:title`
+
+These are the four metrics from the user's audit; treat them as test gates
+on every apply step.
+
+---
+
 ## Open issues
 
-### #1 — Lipstick recall returns zero (BLOCKER — diagnosed 2026-05-07, fix scoped)
+### #1 — Lipstick recall returns zero (PARKED — diagnosed but deprioritized 2026-05-07)
+
+**Status update (2026-05-07 evening):** demoted from BLOCKER. The
+content-quality backfill is the new immediate priority. Architectural
+diagnosis below still holds; revisit once the 4-step content plan above
+has been worked through enough to justify the gateway-side spike.
 
 **Symptom:** all 9 lipstick queries (EN + ZH) layer-attribute to
 `C-external_seed / seed_ran_returned_zero`. Probe metadata:
@@ -261,34 +374,32 @@ the recall path doesn't surface lipstick. Fix #1 first, then extend.
 
 ---
 
-## Recommended next steps (priority order, post-cold-trace 2026-05-07)
+## Recommended next steps (priority order, post-audit 2026-05-07 evening)
 
-The trace ruled out Track A as scoped — cold-reading PIVOTA-Agent without
-runtime access was insufficient to land a confident single-line patch.
+Re-prioritized after the user's ext→sig audit. **Content quality first**,
+recall fix parked.
 
-1. **Track B — Phase 7b (next, 1–2 day spike on PIVOTA-Agent side)**
-   - Wire `find_products_multi` to JOIN `catalog_offers`/`catalog_skus`
-     so canonical PDPs surface in recall.
-   - This is the real fix and unblocks every category at once. Must align
-     with the existing seed-scan path (load-bearing for ~80% of traffic).
-   - Side-quest: while in there, also propagate the agent-bridge clause
-     `OR tool = 'catalog_enrichment_agent_v1'` to the seed-query templates
-     that lack it (5+ sites in `server.js` and `auroraBff/`).
-2. **Track A as a stretch (only with runtime access)**
-   - Deploy log instrumentation OR run gateway locally with debugger.
-   - Identify which filter actually zeros out `external_raw_count` for
-     lipstick. Strong candidate: beauty-diversity gate in
-     `findProductsMulti/policy.js:5390-5410` (fragrance is explicitly
-     exempted; lipstick isn't).
-   - Lower-priority once B lands because the canonical-chain path will
-     bypass these seed-side filters anyway.
-3. **Parallel work eligible while B is in flight:**
-   - Open issue #3 (runner swallow-and-log hardening) — independent, mechanical
-   - Open issue #2 (Phase 9 regression) — diff v9_phase8 vs v9_phase9 records
-4. **Phase 4 fashion/electronics/home — DEFER until B lands.** Adding more
-   PDPs to a catalog the gateway doesn't read is wasted ingestion budget.
-5. **304 NULL `category_path` rows** (issue #4) — defer indefinitely until
-   Phase 4 expansion resumes.
+1. **Step 1 — Count-pollution cleanup (38 rows)** — see "Content backfill
+   plan" above. Dry-run + sample report first; reversibility-first
+   (gate-out before delete).
+2. **Step 2 — `description < 50` backfill (129 rows, K-beauty first)** —
+   30-row K-beauty batch, then expand. Add `pdp_content_hold_reason` column
+   to skip accessories/samples permanently.
+3. **Step 3 — Snapshot contract metadata (3467 rows)** — metadata-only,
+   no content rewrite. Can run in parallel with Step 2.
+4. **Run probe v12 after Steps 1+2 land** — the 129 thin descriptions
+   include some lipstick-adjacent rows; thicker content might quietly
+   move recall pass-rate even before Phase 7b. Cheap signal.
+5. **Phase 7b (parked, not cancelled)** — gateway reads canonical chain.
+   Defer until Step 1+2 done. Architectural diagnosis at issue #1 stands;
+   `docs/PHASE_7B_PLAN.md` retains the implementation outline.
+6. **Phase 4 expansion to fashion/electronics/home — STILL DEFERRED** —
+   no point until Phase 7b unblocks the recall path AND content gates are
+   in place to avoid creating more thin rows.
+
+**Open issues #2 (Phase 9 regression), #3 (runner swallow-and-log), #4
+(304 NULL category_path), #5 (Phase 4 expansion)** — parallel-eligible
+when bandwidth allows; none are immediate blockers.
 
 ---
 
