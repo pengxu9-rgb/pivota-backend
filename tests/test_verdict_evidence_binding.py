@@ -45,13 +45,31 @@ def _evidence(**overrides) -> Dict[str, Any]:
 
 
 def test_invisible_explanation_quotes_zero_cited_of_total():
+    """0/9 phrased as 'None of 9 cited your URL' (post-clarity rewrite
+    that splits the success/loss case into two phrasings — see
+    follow-up PR fixing the '1 of 6 surfaced... cited instead'
+    contradiction)."""
     label, explanation = verdict_for(
         visibility_score=5,
         attribution_score=0,
         evidence=_evidence(merchant_cited_runs=0, attribution_runs_total=9),
     )
     assert label == VERDICT_INVISIBLE
-    assert "0 of 9" in explanation
+    assert "None of 9" in explanation or "0 of 9" in explanation
+
+
+def test_invisible_explanation_split_phrasing_when_some_succeeded():
+    """User-reported case: 1 of 6 cited the merchant; 5 went to
+    others. Phrasing must split the success/loss explicitly so it
+    doesn't read as contradictory."""
+    label, explanation = verdict_for(
+        visibility_score=5,
+        attribution_score=0,
+        evidence=_evidence(merchant_cited_runs=1, attribution_runs_total=6),
+    )
+    assert label == VERDICT_INVISIBLE
+    assert "1 of 6" in explanation
+    assert "other 5" in explanation
 
 
 def test_invisible_explanation_names_top_retailers():
