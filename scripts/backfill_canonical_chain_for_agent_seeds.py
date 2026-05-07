@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""Phase 7a backfill — for catalog_products rows authored by
-catalog_enrichment_agent_v1 that landed BEFORE Phase 7a, materialize
-the missing catalog_skus + catalog_offers + catalog_merchants rows so
-the canonical recall chain is complete.
+"""Phase 7a backfill — for agent-authored catalog_products rows that are
+missing pieces of the canonical chain (catalog_skus, catalog_offers,
+catalog_merchants), reconstruct those rows from their external_product_seeds
+so the canonical recall chain is complete.
 
-The existing 15 lipstick PDPs (ingested 2026-05-06) were written via
-the Phase 4 ingestion path which only created catalog_products +
-external_product_seeds. They have no catalog_skus, so any canonical
-recall path that JOINs through catalog_skus → catalog_offers cannot
-reach them.
+Why this script exists:
+  - Phase 4 ingestion (lipstick) only wrote catalog_products + seeds, so the
+    15 lipstick PDPs had no catalog_skus and were invisible to canonical
+    recall paths that JOIN through catalog_skus → catalog_offers.
+  - Phase 8 (fragrance) ingested 50 PDPs through the post-Phase-7a runner
+    but hit UniqueViolationError on idx_catalog_skus_source_identity
+    (source_variant_id collisions, fixed in PR #326). The runner's
+    swallow-and-log on the SKU INSERT meant offers landed without their
+    matching SKU rows. Re-running this backfill heals those gaps.
 
-This script:
+What it does:
   1. Finds catalog_products rows with category_label_source = 'enrichment_agent_v1'.
-  2. For each PDP, finds its existing external_product_seeds rows
-     (attached_product_key matches).
-  3. Reconstructs the validated_offers payload from each seed and feeds
-     it through the existing builder functions to produce SKU + merchants
-     + offers row dicts.
-  4. UPSERTs them in FK order. Idempotent — safe to re-run.
+     Optional --category-prefix narrows scope (repeatable).
+  2. For each PDP, reads external_product_seeds (attached_product_key match).
+  3. Reconstructs validated_offers dicts from seed rows and feeds them
+     through the same builder functions used by the live ingestion path.
+  4. UPSERTs in FK order: merchants → SKU → offers. Idempotent.
 
 Usage:
   python scripts/backfill_canonical_chain_for_agent_seeds.py [--dry-run]
+  python scripts/backfill_canonical_chain_for_agent_seeds.py \\
+    --category-prefix beauty/makeup/lip --category-prefix beauty/fragrance
 """
 
 from __future__ import annotations
@@ -86,7 +91,21 @@ class _Conn:
 _db: _Conn = None  # type: ignore
 
 
-async def _fetch_agent_pdps() -> List[Dict[str, Any]]:
+async def _fetch_agent_pdps(category_prefixes: List[str] | None = None) -> List[Dict[str, Any]]:
+    if category_prefixes:
+        clauses = " OR ".join(
+            f"category_path LIKE :prefix_{i}" for i in range(len(category_prefixes))
+        )
+        params = {f"prefix_{i}": f"{p}%" for i, p in enumerate(category_prefixes)}
+        return await _db.fetch_all(
+            f"""
+            SELECT product_key, brand, title, category_path, canonical_url, image_url
+            FROM catalog_products
+            WHERE category_label_source = 'enrichment_agent_v1'
+              AND ({clauses})
+            """,
+            params,
+        )
     return await _db.fetch_all(
         """
         SELECT product_key, brand, title, category_path, canonical_url, image_url
@@ -225,7 +244,7 @@ async def _run(args: argparse.Namespace) -> int:
     conn = await asyncpg.connect(dsn)
     _db = _Conn(conn)
     try:
-        pdps = await _fetch_agent_pdps()
+        pdps = await _fetch_agent_pdps(args.category_prefix or None)
         return await _drive(args, pdps)
     finally:
         await conn.close()
@@ -304,6 +323,11 @@ async def _drive(args: argparse.Namespace, pdps: List[Dict[str, Any]]) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="print plan; no DB writes")
+    parser.add_argument(
+        "--category-prefix",
+        action="append",
+        help="restrict to PDPs whose category_path starts with this prefix; repeatable",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     return asyncio.run(_run(args))
