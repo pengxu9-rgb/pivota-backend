@@ -72,10 +72,11 @@ def test_competitive_pressure_first_mover_uses_real_retailers_when_available():
     assert "macys.com" in framing
 
 
-def test_competitive_pressure_first_mover_no_retailers_uses_generic_language():
-    """When the audit surfaced no retailer hosts at all, framing falls
-    back to generic 'retailer-mediated today' language — never beauty-
-    specific names."""
+def test_competitive_pressure_first_mover_no_hosts_uses_generic_language():
+    """When the audit surfaced no cited hosts at all, framing falls
+    back to a generic 'cited surface is split across third-party hosts'
+    line — never beauty-specific names, never asserting 'retailers'
+    when we don't know what those hosts are."""
     framing = _build_competitive_pressure(
         category_competitor_brands=[
             {"name": "Lunya", "times_cited": 1},
@@ -87,9 +88,9 @@ def test_competitive_pressure_first_mover_no_retailers_uses_generic_language():
     )["framing"]
     for token in HARDCODED_BEAUTY_RETAILERS:
         assert token not in framing, (
-            f"beauty retailer {token!r} leaked in zero-retailer fallback: {framing!r}"
+            f"beauty retailer {token!r} leaked in zero-host fallback: {framing!r}"
         )
-    assert "retailer-mediated" in framing
+    assert "third-party hosts" in framing
 
 
 def test_industry_context_recognizes_sleepwear_as_fashion():

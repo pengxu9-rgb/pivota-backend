@@ -203,18 +203,29 @@ def test_receipts_merchant_cited_in_matches_attribution():
     assert r["merchant_cited_in"] == report["attribution"]["merchant_cited_runs"]
 
 
-def test_receipts_top_retailers_eating_funnel_from_category():
-    """Real-data example: sleepwear merchant, retailers should be
-    Nordstrom + Macy's (the seed grounded sources). No hardcoded
-    beauty leak."""
+def test_receipts_top_cited_hosts_from_category():
+    """Real-data example: sleepwear merchant. The hosts list contains
+    everything Gemini cited that wasn't the merchant — could be
+    retailers, competitor brand .coms, or editorial sites; we don't
+    classify, we just surface honestly."""
     report = _build_invisible_report()
     r = report["merchant_view"]["receipts"]
-    retailers = r["top_retailers_eating_funnel"]
-    assert "nordstrom.com" in retailers or "macys.com" in retailers
+    hosts = r["top_cited_hosts"]
+    assert "nordstrom.com" in hosts or "macys.com" in hosts
     # Defensive: hardcoded beauty retailers should not appear unless
     # the audit really cited them (which this fixture doesn't).
-    assert "sephora.com" not in retailers
-    assert "ulta.com" not in retailers
+    assert "sephora.com" not in hosts
+    assert "ulta.com" not in hosts
+
+
+def test_receipts_field_is_top_cited_hosts_not_top_retailers():
+    """Naming is honest: the list mixes brand .coms / retailers /
+    media; calling it 'retailers' would mislead merchants when (e.g.)
+    forbes.com or hillhousehome.com appears."""
+    report = _build_invisible_report()
+    r = report["merchant_view"]["receipts"]
+    assert "top_cited_hosts" in r
+    assert "top_retailers_eating_funnel" not in r
 
 
 # ---------------------------------------------------------------------

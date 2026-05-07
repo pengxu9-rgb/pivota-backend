@@ -508,32 +508,37 @@ def _build_competitive_pressure(
             )
         )
     else:
-        # Name THIS audit's actual retailer hosts when available, so the
-        # framing reflects the real category surface (sleepwear merchants
-        # see Nordstrom / Macy's / etc.; supplements see Amazon / iHerb /
-        # etc.) rather than a hardcoded beauty list. Fall back to generic
-        # "retailers" only when the audit didn't surface any retailer
-        # citations at all (rare).
+        # Name THIS audit's actual cited hosts when available. NOTE
+        # these are "non-merchant hosts cited in grounded sources" —
+        # could be retailers (nordstrom.com), competitor brand .coms
+        # (serenaandlily.com), OR editorial/review sites
+        # (businessinsider.com, forbes.com). Don't claim
+        # "retailer-mediated" because that's only sometimes true; let
+        # the merchant judge the mix from the names. Brand-vs-retailer-
+        # vs-media classification is a follow-up.
         if retailer_hosts:
             top_named = ", ".join(
                 h.get("host") for h in retailer_hosts[:5] if h.get("host")
             )
-            retailer_phrase = (
-                f"the entire vertical is retailer-mediated ({top_named})"
+            cited_phrase = (
+                f"the cited surface is split across third-party hosts "
+                f"({top_named}) instead of any one brand's own .com"
                 if top_named
-                else "the entire vertical is retailer-mediated today"
+                else "the cited surface is split across third-party hosts"
             )
         else:
-            retailer_phrase = "the entire vertical is retailer-mediated today"
+            cited_phrase = (
+                "the cited surface is split across third-party hosts"
+            )
         framing = (
             f"**First-mover opportunity.** Of the {len(peers_named)} "
             f"competitor brands AI agents name in this category, NONE "
-            f"have their own .com cited in Gemini grounding today — "
-            f"{retailer_phrase}. This is the rarer case: there's no "
-            f"incumbent capturing first-party AI-channel attribution "
-            f"yet. Whichever brand onboards first + completes the 30-90 "
-            f"day indexing arc owns the surface before the rest of the "
-            f"category notices the channel exists."
+            f"appear to have their own .com cited in Gemini grounding "
+            f"today (we may be under-counting — see follow-up note on "
+            f"brand-from-grounding detection) — {cited_phrase}. "
+            f"Whichever brand wins first-party attribution first + "
+            f"completes the 30-90 day indexing arc owns the surface "
+            f"before the rest of the category notices the channel exists."
         )
 
     return {
@@ -2277,7 +2282,15 @@ def _build_merchant_view(
             "queries_tested": attribution_runs_count,
             "merchant_cited_in": merchant_cited_runs,
             "top_cited_urls": top_cited_urls_unique,
-            "top_retailers_eating_funnel": [
+            # Honest naming: these are "all hosts cited in grounded
+            # sources except the merchant's own". Could be retailers
+            # (nordstrom.com, sephora.com), competitor brand .coms
+            # (serenaandlily.com), or editorial/review sites
+            # (businessinsider.com, forbes.com). The frontend should
+            # render this as "where the AI cited instead of you", not
+            # "retailers eating funnel". Brand-vs-retailer-vs-media
+            # classification is a follow-up.
+            "top_cited_hosts": [
                 h.get("host")
                 for h in (category_retailer_hosts or [])[:5]
                 if h.get("host")
