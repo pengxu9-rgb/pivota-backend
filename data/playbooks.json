@@ -1,23 +1,26 @@
 {
   "_meta": {
-    "schema_version": 1,
+    "schema_version": 2,
     "purpose": "BD-curated per-cited-host action playbooks. Each playbook matches one host_type (and optionally host_subtype) and produces a templated action item the merchant can execute. PR-G wires playbook selection into the merchant audit's action_items list.",
-    "owner": "BD team for content (titles, body templates, timelines, leverage); engineering reviews schema only.",
+    "owner": "BD team for content; engineering reviews schema only.",
     "schema_per_playbook": {
       "applies_when": "match criteria: host_type required, host_subtype optional",
       "title_template": "string with {host} placeholder",
       "body_template": "string with placeholders: {host} {coverage_note} {outreach_hint} {example_query} {competitors_phrase} {timeline_low} {timeline_high}",
+      "concrete_next_step": "1-sentence 'this week' task — what the merchant should DO first, with specifics (URLs, contact methods, sample sizes). Distinct from body_template (which describes the strategic rationale).",
       "severity": "critical | high | medium | low — applied uniformly across all instances of this playbook",
       "lever": "editorial_outreach | wholesale_onboarding | creator_partnership | marketplace_listing | research",
       "expected_timeline_weeks": "[low, high] integer pair"
     },
-    "matching_priority": "When multiple playbooks could match a host, the more specific match wins (subtype > type). Unknown hosts (type='unclassified') match the catch-all generic_unclassified playbook."
+    "matching_priority": "When multiple playbooks could match a host, the more specific match wins (subtype > type). Unknown hosts (type='unclassified') match the catch-all generic_unclassified playbook.",
+    "schema_v2_changes": "Added concrete_next_step field to every playbook (PR after merchant feedback that actions read as 'sample format' instead of deep-dive specifics)."
   },
   "playbooks": {
     "editorial_pitch_review_site": {
       "applies_when": {"type": "editorial", "subtype": "review_site"},
       "title_template": "Pitch {host} editorial team",
       "body_template": "{coverage_note} {competitors_phrase}{example_phrase}{outreach_hint} Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "This week: send a 100-word pitch email to {host}'s product/tip line referencing their existing category roundup, attach 3 product samples + a 1-page brand differentiation note (what makes you different from the brands they already cover).",
       "severity": "high",
       "lever": "editorial_outreach",
       "expected_timeline_weeks": [4, 8]
@@ -26,6 +29,7 @@
       "applies_when": {"type": "editorial", "subtype": "fashion"},
       "title_template": "Pitch {host} fashion team",
       "body_template": "{coverage_note} {competitors_phrase}{example_phrase}{outreach_hint} Fashion editorial cycles run on seasonal calendar; expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "This week: identify the {host} editor covering your category (LinkedIn / masthead) and send a trend-led pitch (not a product-led pitch — fashion editors want a STORY angle), with 3 sample looks + a 100-word seasonal trend hook.",
       "severity": "high",
       "lever": "editorial_outreach",
       "expected_timeline_weeks": [6, 12]
@@ -34,6 +38,7 @@
       "applies_when": {"type": "editorial", "subtype": "beauty"},
       "title_template": "Pitch {host} beauty editors",
       "body_template": "{coverage_note} {competitors_phrase}{example_phrase}{outreach_hint} Beauty editorial: sample submission required. Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "This week: send PR samples + INCI list + claims/clinical data to {host}'s beauty editor; beauty editorial requires substantiation, not just samples — include the specific testing or formulation differentiator that makes you newsworthy.",
       "severity": "high",
       "lever": "editorial_outreach",
       "expected_timeline_weeks": [4, 10]
@@ -42,6 +47,7 @@
       "applies_when": {"type": "editorial", "subtype": "review_aggregator"},
       "title_template": "Get listed on {host}",
       "body_template": "{coverage_note} {competitors_phrase}{outreach_hint}",
+      "concrete_next_step": "This week: submit your product to {host}'s database via their listing/curation form. Provide ingredient list, claims, and at least 3 high-resolution images.",
       "severity": "medium",
       "lever": "editorial_outreach",
       "expected_timeline_weeks": [2, 6]
@@ -50,6 +56,7 @@
       "applies_when": {"type": "retailer", "subtype": "department_store"},
       "title_template": "Wholesale onboarding: {host}",
       "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Wholesale onboarding is a multi-quarter process; expected timeline: {timeline_low}-{timeline_high} weeks for vendor approval.",
+      "concrete_next_step": "This quarter: submit through {host}'s vendor portal. Department-store wholesale needs a line sheet (10-30 SKUs minimum), wholesale price list at 50% of retail, EDI compliance documentation, and proof of $500k+ annual brand revenue. Start the application even if you're not ready — the review is multi-step.",
       "severity": "medium",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [12, 26]
@@ -58,6 +65,7 @@
       "applies_when": {"type": "retailer", "subtype": "luxury"},
       "title_template": "Wholesale onboarding: {host} (luxury)",
       "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Luxury wholesale requires established brand authority + price point fit; expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "Likely premature for early-stage D2C — luxury wholesale wants $1M+ brand revenue, established editorial coverage in Vogue / Harper's Bazaar / Elle, and a complete look-book. Build editorial visibility first; circle back to {host} after 2-3 luxury-tier press hits.",
       "severity": "low",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [16, 36]
@@ -66,6 +74,7 @@
       "applies_when": {"type": "retailer", "subtype": "beauty_retailer"},
       "title_template": "Wholesale onboarding: {host}",
       "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Beauty specialty retailers run accelerator programs (Sephora Accelerate, Ulta Sparked) for D2C/indie brands as a faster track than direct wholesale.",
+      "concrete_next_step": "This month: apply to {host}'s D2C/indie accelerator (Sephora Accelerate or Ulta Sparked) — these are the front-door for D2C beauty brands and run application cycles 1-2x/year. Have ready: brand deck, $500k+ revenue evidence, hero SKU clinical data.",
       "severity": "high",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [12, 26]
@@ -74,6 +83,7 @@
       "applies_when": {"type": "retailer", "subtype": "fashion_marketplace"},
       "title_template": "Wholesale onboarding: {host}",
       "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Fashion marketplace onboarding is faster than department-store wholesale; expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "This month: apply via {host}'s vendor application page with a complete line sheet, wholesale price list, and 6-month sell-through projections. Fashion marketplaces respond faster than department stores but want strong sell-through evidence.",
       "severity": "medium",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [6, 12]
@@ -82,6 +92,7 @@
       "applies_when": {"type": "retailer", "subtype": "wellness_retailer"},
       "title_template": "Wholesale onboarding: {host}",
       "body_template": "{coverage_note} {outreach_hint} Wellness retailer onboarding: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "This month: apply via {host}'s wholesale form with full ingredient/sourcing documentation + GMP/FDA certifications + COA per batch. Wellness retailers gate on substantiation more than scale.",
       "severity": "medium",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [8, 16]
@@ -90,6 +101,7 @@
       "applies_when": {"type": "retailer", "subtype": "mass_market"},
       "title_template": "Wholesale onboarding: {host} (mass market)",
       "body_template": "{coverage_note} {outreach_hint} Note: mass-market retailers typically prefer brands at scale; if you're early-stage D2C, prioritize specialty retailers + editorial first.",
+      "concrete_next_step": "Likely premature — mass-market wholesale wants $5M+ brand revenue and established distribution. Skip {host} for now; revisit once you have specialty-retailer wholesale + editorial coverage from the higher-priority actions.",
       "severity": "low",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [16, 36]
@@ -98,6 +110,7 @@
       "applies_when": {"type": "retailer", "subtype": "regional"},
       "title_template": "Regional wholesale: {host}",
       "body_template": "{coverage_note} {outreach_hint}",
+      "concrete_next_step": "Confirm market relevance first: does {host}'s region match your shipping / market priorities? If yes, apply via their vendor portal. If no, skip.",
       "severity": "low",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [8, 20]
@@ -106,6 +119,7 @@
       "applies_when": {"type": "marketplace", "subtype": "mass_market"},
       "title_template": "List on {host}",
       "body_template": "{coverage_note} {outreach_hint} Marketplace listings (1P + 3P) get D2C brands AI-channel grounded faster than editorial because product feeds index directly. Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "This week: enroll in {host}'s 3P seller program (faster than 1P vendor onboarding) — list your hero SKU with rich content (A+ content / brand store), then enable Amazon Brand Registry. Listings index in grounded retrieval within 2-4 weeks.",
       "severity": "high",
       "lever": "marketplace_listing",
       "expected_timeline_weeks": [2, 8]
@@ -114,6 +128,7 @@
       "applies_when": {"type": "marketplace", "subtype": "fashion_marketplace"},
       "title_template": "List on {host}",
       "body_template": "{coverage_note} {outreach_hint}",
+      "concrete_next_step": "This week: apply via {host}'s seller / vendor onboarding form with line sheet + wholesale terms. Fashion marketplaces are faster to list than they are to actually merchandise; budget for paid-feature ads to lift visibility.",
       "severity": "medium",
       "lever": "marketplace_listing",
       "expected_timeline_weeks": [2, 6]
@@ -122,6 +137,7 @@
       "applies_when": {"type": "video", "subtype": "creator_platform"},
       "title_template": "Creator partnerships: {host}",
       "body_template": "{coverage_note} {outreach_hint} For sleepwear/fashion/beauty: focus on mid-tier reviewers (10k-100k subs) who already cover your category. Sponsored reviews land in grounded retrieval within {timeline_low}-{timeline_high} weeks of upload.",
+      "concrete_next_step": "This month: identify 3-5 mid-tier creators (10k-100k subs) on {host} who already publish category roundups including competitor brands. Send a sponsorship pitch — typical rate is $50-500/video at this tier — with a custom discount code so you can track conversions.",
       "severity": "medium",
       "lever": "creator_partnership",
       "expected_timeline_weeks": [4, 12]
@@ -130,6 +146,7 @@
       "applies_when": {"type": "video", "subtype": "social"},
       "title_template": "Influencer partnerships: {host}",
       "body_template": "{coverage_note} {outreach_hint} Social-first creators drive social pickup but lower AI-channel grounding weight than YouTube long-form.",
+      "concrete_next_step": "Lower priority for AI-channel attribution. Spend first on YouTube long-form creators (higher grounded-retrieval pickup). Use {host} for category awareness + paid ads, not for editorial-style endorsement.",
       "severity": "low",
       "lever": "creator_partnership",
       "expected_timeline_weeks": [2, 8]
@@ -138,6 +155,7 @@
       "applies_when": {"type": "editorial"},
       "title_template": "Pitch {host}",
       "body_template": "{coverage_note} {outreach_hint} Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "concrete_next_step": "This week: identify the right editor at {host} (LinkedIn / masthead) and send a 100-word product pitch + sample. Editorial pitches need a story angle, not just product specs.",
       "severity": "medium",
       "lever": "editorial_outreach",
       "expected_timeline_weeks": [4, 12]
@@ -146,6 +164,7 @@
       "applies_when": {"type": "retailer"},
       "title_template": "Wholesale: {host}",
       "body_template": "{coverage_note} {outreach_hint}",
+      "concrete_next_step": "This month: apply via {host}'s vendor portal with line sheet + wholesale price list + brand deck.",
       "severity": "medium",
       "lever": "wholesale_onboarding",
       "expected_timeline_weeks": [8, 26]
@@ -154,6 +173,7 @@
       "applies_when": {"type": "marketplace"},
       "title_template": "Listing: {host}",
       "body_template": "{coverage_note} {outreach_hint}",
+      "concrete_next_step": "This week: enroll in {host}'s seller program with hero SKU listing + rich product content.",
       "severity": "medium",
       "lever": "marketplace_listing",
       "expected_timeline_weeks": [2, 8]
@@ -162,6 +182,7 @@
       "applies_when": {"type": "unclassified"},
       "title_template": "Investigate {host}",
       "body_template": "This host appeared in your audit's grounded sources but isn't in our registry yet. Worth a quick research pass — visit the site, identify whether it's editorial / retailer / marketplace / brand competitor, and assess whether it's a relevant outreach target for your category.",
+      "concrete_next_step": "This week: visit {host}, identify what they cover, decide whether they're editorial / retailer / brand competitor / noise. If they're a relevant editorial or retailer, file a follow-up to add them to our registry.",
       "severity": "low",
       "lever": "research",
       "expected_timeline_weeks": [1, 1]
