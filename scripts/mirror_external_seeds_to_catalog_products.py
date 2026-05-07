@@ -244,6 +244,7 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
           (SELECT count(*) FROM catalog_products WHERE pivota_signature_id IS NOT NULL) AS catalog_products_with_sig,
           (SELECT count(*) FROM catalog_products WHERE merchant_id = 'external_seed' AND platform = 'external_seed') AS catalog_products_external_seed,
           (SELECT count(*) FROM catalog_products WHERE merchant_id = 'external_seed' AND platform = 'external_seed' AND pivota_signature_id IS NOT NULL) AS catalog_products_external_seed_with_sig,
+          (SELECT count(*) FROM catalog_products WHERE merchant_id = 'external_seed' AND platform = 'external_seed' AND coalesce(source_system, '') <> 'external_product_seeds_mirror_v1') AS legacy_external_seed_catalog_rows,
           (SELECT count(*) FROM catalog_products WHERE pivota_signature_id IS NOT NULL AND image_url IS NOT NULL AND length(coalesce(image_url, '')) > 0 AND length(coalesce(description, '')) >= 50) AS catalog_products_visible_quality_with_sig
         """
     )
@@ -456,6 +457,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "catalog_products_with_sig",
         "catalog_products_external_seed",
         "catalog_products_external_seed_with_sig",
+        "legacy_external_seed_catalog_rows",
         "catalog_products_visible_quality_with_sig",
         "inserted_catalog_products",
         "post_apply_missing_catalog_products",
@@ -463,6 +465,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "post_apply_catalog_products_with_sig",
         "post_apply_catalog_products_external_seed",
         "post_apply_catalog_products_external_seed_with_sig",
+        "post_apply_legacy_external_seed_catalog_rows",
         "post_apply_catalog_products_visible_quality_with_sig",
     ]:
         if key in totals:
@@ -498,6 +501,14 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
 
         report = before
         if args.apply:
+            legacy_rows = int((before.get("totals") or {}).get("legacy_external_seed_catalog_rows") or 0)
+            if legacy_rows > 0:
+                before["ok"] = False
+                before["error"] = (
+                    "legacy external_seed catalog rows exist; clean or reconcile them before applying "
+                    "the external_product_seeds mirror to avoid duplicate public PDPs"
+                )
+                return before
             inserted = await _apply(args.limit)
             after = await _build_report(
                 sample_limit=args.sample_limit,
@@ -516,6 +527,7 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
                 "post_apply_catalog_products_with_sig": after_totals.get("catalog_products_with_sig"),
                 "post_apply_catalog_products_external_seed": after_totals.get("catalog_products_external_seed"),
                 "post_apply_catalog_products_external_seed_with_sig": after_totals.get("catalog_products_external_seed_with_sig"),
+                "post_apply_legacy_external_seed_catalog_rows": after_totals.get("legacy_external_seed_catalog_rows"),
                 "post_apply_catalog_products_visible_quality_with_sig": after_totals.get("catalog_products_visible_quality_with_sig"),
             }
         return report
