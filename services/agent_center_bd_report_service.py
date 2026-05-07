@@ -307,8 +307,28 @@ def score_category_visibility(
     Returns (score 0–100, per-run match details for audit/UI)."""
     if not runs:
         return (0, [])
+    import re
     brand_lower = (merchant_brand or "").strip().lower()
     host_lower = (merchant_host or "").strip().lower()
+    # Word-boundary regex for brand matching when the brand is long
+    # enough to be specific. Substring matching false-positived no-name
+    # brands whose name happens to be a substring of editorial copy
+    # (e.g. a 1688 wholesale SKU's brand collapsing to a common word).
+    # 3-char brands keep substring match (false-positive class is
+    # already moot at that length).
+    use_word_boundary = bool(brand_lower) and len(brand_lower) >= 4
+    brand_pattern = (
+        re.compile(r"\b" + re.escape(brand_lower) + r"\b")
+        if use_word_boundary else None
+    )
+
+    def _brand_in(text: str) -> bool:
+        if not brand_lower:
+            return False
+        if brand_pattern is not None:
+            return brand_pattern.search(text) is not None
+        return brand_lower in text
+
     details: List[Dict[str, Any]] = []
     matched = 0
     for run in runs:
@@ -318,7 +338,7 @@ def score_category_visibility(
         title_match = False
         for src in sources:
             label = (src.get("label") or "").lower()
-            if brand_lower and brand_lower in label:
+            if _brand_in(label):
                 title_match = True
                 break
             if host_lower and host_lower in label:
@@ -326,8 +346,15 @@ def score_category_visibility(
                 break
         parsed = run.get("parsed") or {}
         excerpt = (parsed.get("evidence_excerpt") or "").lower()
-        excerpt_match = bool(brand_lower and brand_lower in excerpt)
-        is_match = in_grounding or title_match or excerpt_match
+        excerpt_match = _brand_in(excerpt)
+        # excerpt_match alone no longer credits a run. Gemini's
+        # evidence excerpt is LLM-generated text and can mention the
+        # brand even when no grounding source cites it (hallucination
+        # / paraphrase). Require corroboration from url_match (the
+        # merchant URL was in grounding chunks) or title_match (a
+        # grounded source title contains the brand). Excerpt-only is
+        # surfaced in `details` as a signal-quality flag, not a hit.
+        is_match = in_grounding or title_match
         if is_match:
             matched += 1
         details.append({
@@ -336,6 +363,7 @@ def score_category_visibility(
             "title_match": title_match,
             "excerpt_match": excerpt_match,
             "matched": is_match,
+            "excerpt_only_signal": (excerpt_match and not is_match),
         })
     score = round((matched / len(runs)) * 100)
     return (score, details)
