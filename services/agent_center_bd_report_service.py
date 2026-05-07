@@ -508,16 +508,32 @@ def _build_competitive_pressure(
             )
         )
     else:
+        # Name THIS audit's actual retailer hosts when available, so the
+        # framing reflects the real category surface (sleepwear merchants
+        # see Nordstrom / Macy's / etc.; supplements see Amazon / iHerb /
+        # etc.) rather than a hardcoded beauty list. Fall back to generic
+        # "retailers" only when the audit didn't surface any retailer
+        # citations at all (rare).
+        if retailer_hosts:
+            top_named = ", ".join(
+                h.get("host") for h in retailer_hosts[:5] if h.get("host")
+            )
+            retailer_phrase = (
+                f"the entire vertical is retailer-mediated ({top_named})"
+                if top_named
+                else "the entire vertical is retailer-mediated today"
+            )
+        else:
+            retailer_phrase = "the entire vertical is retailer-mediated today"
         framing = (
             f"**First-mover opportunity.** Of the {len(peers_named)} "
             f"competitor brands AI agents name in this category, NONE "
-            f"have their own .com cited in Gemini grounding today — the "
-            f"entire vertical is retailer-mediated (Vogue, Sephora, Ulta, "
-            f"Target, beauty marketplaces). This is the rarer case: "
-            f"there's no incumbent capturing first-party AI-channel "
-            f"attribution yet. Whichever brand onboards Pivota first + "
-            f"completes the 30-90 day indexing arc owns the surface "
-            f"before the rest of the category notices the channel exists."
+            f"have their own .com cited in Gemini grounding today — "
+            f"{retailer_phrase}. This is the rarer case: there's no "
+            f"incumbent capturing first-party AI-channel attribution "
+            f"yet. Whichever brand onboards first + completes the 30-90 "
+            f"day indexing arc owns the surface before the rest of the "
+            f"category notices the channel exists."
         )
 
     return {
@@ -1249,6 +1265,13 @@ _CATEGORY_KEYWORDS: List[Tuple[str, List[str]]] = [
     ("fashion", [
         "shirt", "tee", "dress", "jacket", "coat", "pants", "jeans",
         "sneaker", "shoe", "bag", "handbag", "backpack", "scarf", "hat",
+        # Sleepwear / loungewear / intimates — same vertical for the
+        # purpose of industry context (D2C apparel, retailer-mediated
+        # discovery), so they share the fashion blurb until BD validates
+        # a sleepwear-specific projection.
+        "sleepwear", "pajama", "pyjama", "robe", "loungewear",
+        "nightgown", "lingerie", "intimates", "underwear", "bralette",
+        "swimwear", "swimsuit", "bikini",
     ]),
     ("fitness", [
         "supplement", "protein", "vitamin", "creatine", "yoga", "mat",
