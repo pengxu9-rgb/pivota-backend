@@ -32,6 +32,8 @@ LIPSTICK_FIXTURES = [
     "Kylie Precision Pout Lip Liner",
     "Tom Ford Gloss Luxe",
     "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
+    "Kylie Rosy Radiance Lip Combo",
+    "Pixi Lip Duo - Choose Your Shades",
 ]
 
 FOUNDATION_FIXTURES = [
@@ -72,6 +74,7 @@ FRAGRANCE_FIXTURES = [
     "Diptyque Tam Dao Eau de Parfum",
     "Byredo Gypsy Water Perfume",
     "Issey Miyake L'Eau d'Issey Eau de Toilette",
+    "Tom Ford Ébène Fumé All Over Body Spray",
 ]
 
 SUNSCREEN_FIXTURES = [
@@ -170,6 +173,7 @@ MASK_FIXTURES = [
     "Hero Cosmetics Mighty Pimple Patch",
     "Pixi LipPatch",
     "Summer Fridays Jet Lag Mask",
+    "Anua Ultra-Thin Spot Cover Patch",
 ]
 
 EXFOLIANT_FIXTURES = [
@@ -209,6 +213,14 @@ EYELINER_FIXTURES = [
     "Rare Beauty Perfect Strokes Matte Liquid Liner",
     "Make Up For Ever Aqua Resist Pencil Liner",
     "Lancôme Idôle Ultra-Precise Felt Tip Liquid Liner",
+]
+
+GIFT_SET_FIXTURES = [
+    "Olehenriksen The Glow Cycle Bundle Full-Size Daily Routine",
+    "Kylie Cosmic Kylie Jenner & 2.0 30ml Gift Set",
+    "Embryolisse Lightweight Hydration Set",
+    "Pixi Best of Pixi - Holiday Edition",
+    "Cicalisse Protective Skin & Hand Care Set",
 ]
 
 
@@ -338,6 +350,14 @@ def test_eyeliner_resolves(title: str) -> None:
     assert hit is not None
     assert hit[0] == "Eyeliner"
     assert hit[1] == "beauty/makeup/eye/eyeliner"
+
+
+@pytest.mark.parametrize("title", GIFT_SET_FIXTURES)
+def test_gift_set_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Gift Set"
+    assert hit[1] == "beauty/sets/gift-set"
 
 
 def test_priority_uses_category_first_then_product_type_then_title() -> None:

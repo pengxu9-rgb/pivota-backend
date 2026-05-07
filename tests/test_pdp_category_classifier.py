@@ -35,6 +35,7 @@ from services.pdp_category_classifier import (  # noqa: E402
         ("waterproof volumizing mascara", "beauty/makeup/eye/"),
         ("vanilla perfume", "beauty/fragrance/"),
         ("eau de parfum", "beauty/fragrance/"),
+        ("body spray", "beauty/fragrance/"),
         ("sunscreen", "beauty/skincare/sun/"),
         ("spf 50", "beauty/skincare/sun/"),
         ("hyaluronic acid serum", "beauty/skincare/treat/"),
@@ -53,6 +54,8 @@ from services.pdp_category_classifier import (  # noqa: E402
         ("pore prep primer", "beauty/makeup/face/"),
         ("liquid eyeliner", "beauty/makeup/eye/"),
         ("lip tint", "beauty/makeup/lip/"),
+        ("lip combo", "beauty/makeup/lip/"),
+        ("skincare set", "beauty/sets/"),
     ],
 )
 def test_category_prefix_extracts_2_segments(query: str, expected_prefix: str) -> None:
