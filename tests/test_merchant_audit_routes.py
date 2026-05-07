@@ -309,19 +309,40 @@ def test_404_when_product_owned_by_different_merchant(env):
     assert any(m["source_product_id"] == "p_other" for m in missing)
 
 
-def test_422_when_product_has_no_canonical_url_and_no_handle(env):
+def test_422_when_all_selected_products_lack_url_and_handle(env):
     """An audit needs a buyer-facing URL to score attribution against.
     `p_no_url` lacks both canonical_url AND a handle in
-    product_payload — derivation fails, route 422s with the products
-    missing a URL."""
+    product_payload. When EVERY selected product is URL-less, route
+    422s with the skipped list — there's nothing to audit."""
     client, _, _ = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
         json={"products": [_ref("p_no_url")]},
     )
     assert res.status_code == 422
-    missing = res.json()["detail"]["products_missing_url"]
-    assert any(m["source_product_id"] == "p_no_url" for m in missing)
+    skipped = res.json()["detail"]["skipped_products"]
+    assert any(s["source_product_id"] == "p_no_url" for s in skipped)
+    assert "no_canonical_url_and_no_handle" in skipped[0]["reason"]
+
+
+def test_partial_success_when_some_products_lack_url(env):
+    """Realistic catalog state: some SKUs have URLs, others don't.
+    Route audits the ones that do + returns the URL-less ones as
+    skipped_products. Doesn't 422 the whole batch."""
+    client, captured_calls, _ = env
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness",
+        json={"products": [_ref("p1"), _ref("p_no_url")]},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # Audit ran on p1 only.
+    assert len(captured_calls) == 1
+    assert len(captured_calls[0]["products"]) == 1
+    # p_no_url surfaced as skipped.
+    assert len(body["skipped_products"]) == 1
+    assert body["skipped_products"][0]["source_product_id"] == "p_no_url"
+    assert "no_canonical_url_and_no_handle" in body["skipped_products"][0]["reason"]
 
 
 def test_canonical_url_derived_from_handle_when_catalog_url_missing(
