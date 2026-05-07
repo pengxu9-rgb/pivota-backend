@@ -1,14 +1,26 @@
 # Phase 7b — Gateway reads canonical chain
 
 **Goal:** wire `find_products_multi` (and Aurora equivalents) to read
-`catalog_products` / `catalog_skus` / `catalog_offers` so canonical PDPs
-surface in live recall. Until this lands, every backend phase since 1
-has been building a ghost catalog the gateway can't see.
+`catalog_products` so canonical PDPs surface in live recall. Until this
+lands, every backend phase since 1 has been building a ghost catalog
+the gateway can't see.
 
-- Status: **PROPOSED — not yet started**
+- Status: **Step 1 SHIPPED, Step 2 IN FLIGHT (draft PR)**
 - Created: 2026-05-07
-- Owner: TBD (PIVOTA-Agent side)
-- Estimated cost: 1–2 day spike + 0.5 day staging probe + integration tests
+- Last updated: 2026-05-07 night
+- Step 1 PR (helper + 16 unit tests): [PIVOTA-Agent #1311](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1311) (claude/phase-7b-canonical-recall) — open, ready for merge
+- Step 2 PR (find_products_multi integration): [PIVOTA-Agent #1312](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1312) (codex/phase7b-canonical-chain, commit `91cbcc98`) — **draft, pending staging deploy + probe v14**
+- Owner: peng (review) + codex (Step 2 implementation) + claude (Step 1 + spec)
+- Actual cost so far: ~3 hours Step 1 (helper + tests + spec) + ~2 hours Step 2 (codex implementation, locally green)
+
+---
+
+## Cross-links
+
+- Diagnostic trail leading to this work: see `docs/MASTER_PLAN.md` "Recall pass-rate trajectory" + Open Issue #1
+- Probe v13 result (the localization probe — confirmed gateway-disconnect): `pivota-agent-ui/reports/recall_v1/recall_v13_post_phase2_redo_1778187080/`
+- Reference SQL the helper ports: `pivota-backend/services/pivot_query_service.py:_fetch_canonical_search_rows` (lines 461–637)
+- Codex's PDP-detail page sig resolver that proved the read pattern: PIVOTA-Agent commit `9adbcf1d`, function `resolveCatalogProductRefFromPivotaSignature`
 
 ---
 
@@ -113,31 +125,55 @@ maintenance pain.
 
 ---
 
-## Sequencing (Option A)
+## Sequencing (Option A) — actual landing pattern
 
-Land in this order, all in **one PR** for atomicity:
+Originally scoped as one PR; in practice landed as two ordered PRs to
+minimize blast radius on `server.js` (30k+ LOC, codex-authored).
 
-1. **Add `fetchCanonicalChainRows()` helper** in PIVOTA-Agent
-   (`src/services/canonicalCatalogSearch.js` — new file). SQL ported from
-   `pivot_query_service.py:_fetch_canonical_search_rows`. Same WHERE,
-   same rank scoring, same `pdp_scope='multi_merchant_canonical'` bonus.
-2. **Wire into `findProductsMulti`** flow — call `fetchCanonicalChainRows`
-   in parallel with existing seed scan. Both feed into the candidate pool
-   before quality gates.
-3. **Dedupe + merge** — canonical and seed rows that share `product_key`
-   collapse to one row (canonical wins). Both seed-only and canonical-only
-   rows pass through.
-4. **Telemetry** — add `canonical_raw_count`, `canonical_path_executed`,
-   `canonical_dedupe_count` to route_health and metadata.
-5. **Tests** — three integration tests (see "In scope #5" above).
-6. **Probe v12** run on staging before merging to main.
+### Step 1 — Helper module + unit tests ✅
 
-### Optional concurrent PR (PIVOTA-Agent)
+Branch `claude/phase-7b-canonical-recall`, PR
+[PIVOTA-Agent #1311](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1311).
+
+Files:
+- `src/services/canonicalCatalogSearch.js` (~250 LOC) — `fetchCanonicalChainRows({query, merchantId?, categoryPathPrefix?, verticalSearch?, limit?, deps: {query}})`.
+- `tests/canonical_catalog_search.test.js` (~180 LOC) — 16 unit tests, all passing.
+- `tests/_manual/canonical_catalog_search_live.js` — read-only DB sanity probe (NOT in CI).
+
+No changes to `server.js` or `findProductsMulti`. Helper is unwired —
+ready for Step 2 to consume it.
+
+### Step 2 — Wire helper into find_products_multi 🟡 (in flight)
+
+Branch `codex/phase7b-canonical-chain`, commit `91cbcc98`, PR
+[PIVOTA-Agent #1312](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1312)
+— **draft, pending staging deploy + probe v14**.
+
+Files (12 changed, +1372 / −76):
+- `src/services/canonicalCatalogSearch.js` — extended with `includeSkuOffers` flag (default false → product-level query, no skus/offers JOIN). Strict category-anchored WHERE when `categoryPathPrefix` is set.
+- `src/server.js` — `mergeCanonicalChainProductsWithSeedProducts` helper, telemetry fields, beauty mainline runs canonical chain in parallel with existing seed scan.
+- `src/services/externalSeedProducts.js` — exposes existing BEAUTY_CATEGORY_PATTERNS so `find_products_multi` can compute the prefix without porting Python.
+- `tests/integration/find_products_multi_lipstick_canonical.test.js` — asserts lipstick query returns canonical rows + `canonical_path_executed=true`.
+- `tests/integration/find_products_multi_brand_no_regression.test.js` — Glossier brand-anchored query still surfaces seeds.
+- `tests/integration/find_products_multi_merchant_scope.test.js` — MOYU merchant-scoped query honors `pdp_scope='merchant_owned'`.
+
+Local verification:
+- 175 jest tests pass, 1 skipped, no failures
+- Prod read-only sanity (codex): 200 lipstick rows / 144 mascara / 160 perfume returned by helper
+
+Two design decisions worth noting (both flagged in PR review):
+1. **Product-level default (`includeSkuOffers=false`)** — correct given current data state. The 3936 mirror rows lack catalog_skus rows; a hard JOIN would zero out lipstick. The opt-in flag preserves the offer-aware path for downstream resolve_offers / quote callers.
+2. **Strict category-anchored WHERE** — when `categoryPathPrefix` is set, WHERE is only `(category_path LIKE :prefix)`, no text-LIKE fallback on title/brand. Eliminates the v12 fashion_shoes-style false positives but creates a contract: rows with NULL `category_path` will silently miss category-anchored queries. Currently safe (the 627 NULL rows are accessory/lingerie/pet long-tail, no lipsticks); future operators must keep `category_path` populated for any new beauty rows.
+
+### Optional concurrent PR (still PROPOSED, not in flight)
 
 Propagate the agent-bridge clause `OR tool = 'catalog_enrichment_agent_v1'`
 to the 5+ seed-query templates that lack it (see MASTER_PLAN.md issue #1
 finding #2). Useful even after 7b lands because some attached agent seeds
 still want to surface in seed-side recall paths (brand fastpath, AuroraBff).
+Defer until probe v14 is green; if the canonical-chain path covers all
+agent-attached seeds via `catalog_products`, this side-quest may become
+unnecessary.
 
 ---
 
@@ -161,12 +197,27 @@ still want to surface in seed-side recall paths (brand fastpath, AuroraBff).
 
 ### Post-merge (prod)
 
-1. Run probe v13 on prod within 1 hr of deploy.
+1. Run probe v15 on prod within 1 hr of deploy.
 2. Watch `route_health.canonical_path_executed` rate — should be ~100%
    for shopping_agent traffic. If <50%, investigate.
 3. Watch `pivot_search_slow` warnings (≥3 s elapsed) — no spike.
 4. Watch `external_seed` query volume — should stay roughly flat (we
    ADDED canonical, didn't replace seed).
+
+### Verification status (current)
+
+| Gate | Status | Source |
+|---|---|---|
+| Step 1 unit tests (16) | ✅ PASS | claude/phase-7b-canonical-recall on PIVOTA-Agent #1311 |
+| Step 2 jest suite (10 suites, 175 tests) | ✅ PASS | codex/phase7b-canonical-chain commit `91cbcc98` |
+| Prod read-only sanity (helper SQL returns rows) | ✅ PASS — lipstick=200, mascara=144, perfume=160 | codex's Step 2 verification before opening PR |
+| GitHub checks (Shopping Search, Discovery Unit, Contract Gate) | ✅ PASS | PR #1312 |
+| GitHub runtime smoke | ⏸️ skipped (PR is draft) | PR #1312 |
+| Pre-merge per-brand sanity (Fenty/MAC/CT actually have lipstick rows) | ⏳ pending | Suggested in PR review |
+| Staging preview deploy | ⏳ pending | Triggered when PR flips draft → ready |
+| Probe v14 staging gates | ⏳ pending | Required: lipstick 0/9 → ≥6/9, fragrance ≥4/5, skincare passes hold, overall ≥40%, `canonical_path_executed=true` ≥95% |
+| Latency budget | ⏳ pending | p50 +<50ms, p99 +<200ms |
+| Probe v15 prod (post-merge, within 1hr) | ⏳ pending | Same gates as v14 |
 
 ---
 
@@ -183,45 +234,75 @@ still want to surface in seed-side recall paths (brand fastpath, AuroraBff).
 
 ---
 
-## Open questions (resolve during design, not post-hoc)
+## Open questions (now resolved by Step 2 implementation)
 
-1. **Where in the gateway flow do canonical rows enter?** Before or
-   after the ZH→EN query alias expansion? Before or after the brand
-   fastpath? — Decide based on what produces the cleanest layer trace.
-2. **What ranking applies?** Reuse backend's exact scoring
-   (`pdp_scope='multi_merchant_canonical' = +200 bonus`,
-   `category_path LIKE = +90`, etc.) or define gateway-specific ranking?
-   — Recommend: copy backend's exactly to start; tune later if needed.
-3. **Aurora-bff path:** does it share the same `findProductsMulti` flow
-   or have its own? Probe v11 showed aurora-bff has a "primary irrelevant"
-   gate shopping_agent doesn't have. Trace this in the design phase.
-4. **Caching:** the existing `cache_miss_sync_filled` mechanism on seed
-   queries — does canonical chain need its own cache, or piggyback on
-   the same key? — Probably piggyback for simplicity; flag for review.
-
----
-
-## What ships in this PR
-
-- `pivota-agent/src/services/canonicalCatalogSearch.js` (new) — ~150 LOC
-- `pivota-agent/src/findProductsInvokeSearchSupplements.js` or equivalent
-  (modified) — ~30 LOC integration
-- `pivota-agent/src/findProductsSearchTelemetry.js` (modified) — ~10 LOC
-  for new metadata fields
-- 3 new test files, ~150 LOC total
-- One staging probe + one prod probe report linked in PR description
-
-Total scope: ~350 net LOC + tests. Reviewable in one sitting.
+1. ~~**Where in the gateway flow do canonical rows enter?**~~ — Resolved.
+   Codex placed it in the **beauty mainline**, running in parallel with
+   the existing seed scan. Both feed into the candidate pool before
+   downstream quality gates. See `mergeCanonicalChainProductsWithSeedProducts`
+   in `src/server.js` (added in commit `91cbcc98`).
+2. ~~**What ranking applies?**~~ — Resolved. Helper preserves backend's
+   exact scoring (Phase 6 multi_merchant_canonical +200, category_path +90,
+   etc.). Drift mitigation: shared SQL fixture is a Step 3 follow-up if
+   we observe inconsistency between gateway top-N and backend HTTP API
+   top-N.
+3. ~~**Aurora-bff path:**~~ — **Partially resolved, partially deferred.**
+   Step 2 wires the canonical chain into the beauty mainline that both
+   shopping_agent and aurora-bff route through. If canonical rows enter
+   the candidate pool before aurora-bff's "primary irrelevant" gate, that
+   gate may pass automatically. Probe v14 should run for both
+   `--source shopping_agent` and `--source aurora-bff` to verify.
+4. ~~**Caching:**~~ — Resolved as deferred. Step 2 ships **without**
+   canonical-chain caching. The existing `cache_miss_sync_filled`
+   mechanism is on the seed query path; canonical query latency will be
+   measured in v14, and if p50/p99 budgets blow we add a separate
+   canonical cache as Step 3.
 
 ---
 
-## What does NOT ship in this PR
+## What actually shipped (Step 1 + Step 2 combined)
 
-- Aurora-bff "primary irrelevant" gate fix — separate ticket if needed
-- Fragrance regression analysis (issue #2 in MASTER_PLAN.md) — separate ticket
-- 304 NULL `category_path` rows backfill (issue #4) — defer
-- Phase 4 fashion / electronics / home expansion — defer until 7b lands
-  and probe v12 confirms canonical-chain reads work end-to-end
+- `src/services/canonicalCatalogSearch.js` (new, ~350 LOC after codex
+  extensions in Step 2 — `includeSkuOffers` opt-in, EXISTS-based vertical
+  search, strict category-anchored WHERE)
+- `src/server.js` (modified, +344/−70) — `mergeCanonicalChainProductsWithSeedProducts`
+  helper, beauty mainline parallel canonical fetch, telemetry plumbing
+- `src/services/externalSeedProducts.js` (+55) — exposes BEAUTY_CATEGORY_PATTERNS
+  for prefix derivation
+- `src/findProductsExternalSeedDirectRetrieval.js` (+10/−2) — small adjustment
+  consistent with the new merge logic
+- `scripts/backfill-external-product-seeds-catalog.js` (+4/−2) — minor
+  alignment
+- 3 integration tests in `tests/integration/` (~290 LOC):
+  `find_products_multi_lipstick_canonical.test.js`,
+  `find_products_multi_brand_no_regression.test.js`,
+  `find_products_multi_merchant_scope.test.js`
+- `tests/canonical_catalog_search.test.js` (16 unit tests)
+- `tests/_manual/canonical_catalog_search_live.js` — read-only sanity probe
+- `tests/services/external_seed_products.test.js` (+9) — patterns export test
+
+Total scope: 12 files changed, +1372/−76. Heavier than the originally-
+estimated ~350 LOC because codex correctly invested in the EXISTS-subquery
+vertical-search path, the `includeSkuOffers` opt-in, and the strict
+category-anchored WHERE — all of which are correct calls given the data
+state but add complexity.
+
+---
+
+## What does NOT ship in this work
+
+- Aurora-bff "primary irrelevant" gate fix — separate ticket. Step 2 may
+  resolve it as a side effect; probe v14 will tell.
+- Fragrance regression analysis (issue #2 in MASTER_PLAN.md) — separate
+  ticket; not on the v14 critical path.
+- 627 NULL `category_path` long-tail (accessory/lingerie/pet) backfill —
+  needs separate non-beauty taxonomy; defer.
+- Phase 4 expansion to fashion / electronics / home — defer until probe
+  v15 (post-merge prod) confirms canonical-chain reads work end-to-end.
+- Shared SQL fixture between backend `pivot_query_service.py` and gateway
+  helper — defer to Step 3 if drift is observed.
+- Canonical-chain caching — defer until p50/p99 measurements from v14
+  show a need.
 
 ---
 
