@@ -47,6 +47,13 @@ class ProductGroupUpsertRequest(BaseModel):
     members: List[ProductGroupMemberInput] = Field(default_factory=list)
 
 
+class CategoryPathBackfillRequest(BaseModel):
+    mode: str = Field(default="dry_run", description="'dry_run' or 'apply'")
+    batch_size: int = Field(default=5000, ge=1, le=10000)
+    limit: int = Field(default=0, ge=0, le=50000)
+    sample_limit: int = Field(default=20, ge=0, le=100)
+
+
 @router.get("/merchant/{merchant_id}", response_model=Dict[str, Any])
 async def debug_merchant_catalog(
     merchant_id: str = Path(..., description="Internal merchant ID"),
@@ -178,6 +185,121 @@ async def reconcile_store_product_counts(
             updated.append({"store_id": store_id, "platform": platform, "from": current, "to": target})
 
     return {"ok": True, "merchant_id": merchant_id, "counts_by_platform": counts_by_platform, "updated": updated}
+
+
+@router.post("/category-path-backfill", response_model=Dict[str, Any])
+async def run_category_path_backfill(
+    payload: CategoryPathBackfillRequest,
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """Run the Phase 2 category_path classifier inside the production network.
+
+    This endpoint exists for ops backfills where the database is only reachable
+    from Railway private networking. It calls the same script function used by
+    scripts/backfill_pdp_category_path.py.
+    """
+    mode = str(payload.mode or "").strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="mode must be 'dry_run' or 'apply'",
+        )
+
+    from scripts.backfill_pdp_category_path import run_category_path_backfill as _run_backfill
+
+    report = await _run_backfill(
+        batch_size=int(payload.batch_size),
+        limit=int(payload.limit or 0),
+        dry_run=(mode == "dry_run"),
+        sample_limit=int(payload.sample_limit),
+    )
+    return {"ok": True, "mode": mode, "report": report}
+
+
+@router.get("/catalog-products/invariants", response_model=Dict[str, Any])
+async def catalog_products_invariants(
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """Audit invariants for external seed -> catalog_products migration."""
+    from scripts.mirror_external_seeds_to_catalog_products import COMMON_CTES
+
+    legacy_external_seed_catalog_rows = await database.fetch_val(
+        """
+        SELECT count(*)
+        FROM catalog_products
+        WHERE merchant_id = 'external_seed'
+          AND platform = 'external_seed'
+          AND coalesce(source_system, '') <> 'external_product_seeds_mirror_v1'
+        """
+    )
+    sig_duplicate_groups = await database.fetch_val(
+        """
+        SELECT count(*)
+        FROM (
+          SELECT pivota_signature_id
+          FROM catalog_products
+          WHERE pivota_signature_id IS NOT NULL
+          GROUP BY pivota_signature_id
+          HAVING count(*) > 1
+        ) d
+        """
+    )
+    identity_duplicate_groups = await database.fetch_val(
+        """
+        SELECT count(*)
+        FROM (
+          SELECT merchant_id, platform, source_product_id
+          FROM catalog_products
+          WHERE source_product_id IS NOT NULL
+          GROUP BY merchant_id, platform, source_product_id
+          HAVING count(*) > 1
+        ) d
+        """
+    )
+    missing_external_mirror = await database.fetch_val(
+        COMMON_CTES
+        + """
+        SELECT count(*)
+        FROM missing
+        """
+    )
+    null_category_path = await database.fetch_val(
+        """
+        SELECT count(*)
+        FROM catalog_products
+        WHERE category_path IS NULL
+        """
+    )
+    source_rows = await database.fetch_all(
+        """
+        SELECT coalesce(category_label_source, 'NULL') AS category_label_source,
+               count(*) AS rows
+        FROM catalog_products
+        GROUP BY 1
+        ORDER BY rows DESC, category_label_source ASC
+        LIMIT 20
+        """
+    )
+    path_rows = await database.fetch_all(
+        """
+        SELECT category_path, count(*) AS rows
+        FROM catalog_products
+        WHERE category_label_source IN ('regex_backfill', 'regex_backfill_at_mirror')
+        GROUP BY category_path
+        ORDER BY rows DESC, category_path ASC
+        LIMIT 30
+        """
+    )
+    return {
+        "ok": True,
+        "legacy_external_seed_catalog_rows": int(legacy_external_seed_catalog_rows or 0),
+        "sig_duplicate_groups": int(sig_duplicate_groups or 0),
+        "identity_duplicate_groups": int(identity_duplicate_groups or 0),
+        "missing_external_mirror": int(missing_external_mirror or 0),
+        "catalog_products_null_category_path": int(null_category_path or 0),
+        "category_label_source_counts": [_row_to_dict(row) for row in source_rows or []],
+        "regex_backfill_path_counts": [_row_to_dict(row) for row in path_rows or []],
+    }
 
 
 @router.post("/product-groups/upsert", response_model=Dict[str, Any])
