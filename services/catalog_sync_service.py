@@ -114,6 +114,58 @@ def make_catalog_sku_key(product_key: str, source_variant_id: str) -> str:
     return f"sku::{product_key}::{source_variant_id}"
 
 
+# ---------------------------------------------------------------------------
+# Pivota canonical PDP — every onboarded merchant product gets a stable
+# agent.pivota.cc/products/<sig_id> URL. sig_id is a deterministic
+# 32-hex hash of the product's identity tuple so:
+#   - Same product across re-syncs gets the same sig (idempotent)
+#   - Different merchants' products NEVER collide (merchant_id in input)
+#   - Doesn't leak the product_key format to public URLs (hash, not literal)
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+
+def make_pivota_signature_id(
+    merchant_id: str, platform: str, source_product_id: str,
+) -> str:
+    """sig_<32hex> deterministic from the product's identity tuple.
+    Same inputs → same sig forever; different merchants' products
+    can't collide (merchant_id is in the hash input)."""
+    if not merchant_id or not platform or not source_product_id:
+        raise ValueError(
+            "merchant_id, platform, and source_product_id are all required "
+            f"to mint a Pivota signature; got "
+            f"({merchant_id!r}, {platform!r}, {source_product_id!r})"
+        )
+    raw = f"{merchant_id}::{platform}::{source_product_id}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:32]
+    return f"sig_{digest}"
+
+
+def pivota_canonical_pdp_url(signature_id: str) -> str:
+    """Build the public canonical PDP URL for a given sig. Reads
+    CHECKOUT_UI_BASE_URL (mirrors the convention used by order_routes,
+    buyer_api, agent_payment_sdk, agent_checkout_intents) so dev /
+    staging environments stay self-consistent."""
+    base = (
+        _os.getenv("CHECKOUT_UI_BASE_URL") or "https://agent.pivota.cc"
+    ).rstrip("/")
+    return f"{base}/products/{signature_id}"
+
+
+def make_pivota_canonical_fields(
+    merchant_id: str, platform: str, source_product_id: str,
+) -> Dict[str, str]:
+    """Convenience: return both fields ready to splat into a
+    catalog_products upsert."""
+    sig = make_pivota_signature_id(merchant_id, platform, source_product_id)
+    return {
+        "pivota_signature_id": sig,
+        "pivota_canonical_url": pivota_canonical_pdp_url(sig),
+    }
+
+
 def make_catalog_offer_id(sku_key: str, channel: str, catalog_track: str) -> str:
     return f"offer::{catalog_track}::{channel}::{sku_key}"
 
@@ -553,11 +605,18 @@ async def ingest_standard_products(
             continue
 
         async with database.transaction():
-            product_key = make_catalog_product_key(merchant_id, platform, str(product.product_id or product.id))
+            source_pid = str(product.product_id or product.id)
+            product_key = make_catalog_product_key(merchant_id, platform, source_pid)
             metadata = _json_dict(product.platform_metadata)
             readiness_tier = _readiness_tier_for_product(product)
             canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
             brand = str(product.vendor or metadata.get("brand") or "").strip() or None
+            # Pivota canonical PDP fields (sig_id + agent.pivota.cc URL)
+            # — every onboarded merchant product gets one. Deterministic
+            # so re-syncs are idempotent.
+            pivota_fields = make_pivota_canonical_fields(
+                merchant_id, platform, source_pid,
+            )
 
             await _upsert_by_pk(
                 catalog_products,
@@ -566,7 +625,7 @@ async def ingest_standard_products(
                     "product_key": product_key,
                     "merchant_id": merchant_id,
                     "platform": platform,
-                    "source_product_id": str(product.product_id or product.id),
+                    "source_product_id": source_pid,
                     "catalog_track": "internal_merchant",
                     "truth_tier": "primary",
                     "readiness_tier": readiness_tier,
@@ -583,6 +642,8 @@ async def ingest_standard_products(
                     "pdp_scope": "merchant_owned",
                     "pdp_scope_source": "merchant_sync",
                     "pdp_scope_set_at": _utcnow(),
+                    "pivota_signature_id": pivota_fields["pivota_signature_id"],
+                    "pivota_canonical_url": pivota_fields["pivota_canonical_url"],
                     "freshness_json": {
                         "updated_at": product.updated_at.isoformat() if product.updated_at else None,
                         "observed_at": _utcnow().isoformat(),
