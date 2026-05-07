@@ -367,13 +367,13 @@ async def _apply(limit: int) -> int:
         )
         SELECT
           'prod::external_seed::external_seed::' || external_product_id AS product_key,
-          :merchant_id AS merchant_id,
-          :platform AS platform,
+          CAST(:merchant_id AS text) AS merchant_id,
+          CAST(:platform AS text) AS platform,
           external_product_id AS source_product_id,
-          :catalog_track AS catalog_track,
-          :truth_tier AS truth_tier,
-          :readiness_tier AS readiness_tier,
-          :source_system AS source_system,
+          CAST(:catalog_track AS text) AS catalog_track,
+          CAST(:truth_tier AS text) AS truth_tier,
+          CAST(:readiness_tier AS text) AS readiness_tier,
+          CAST(:source_system AS text) AS source_system,
           id AS source_ref,
           title,
           mirrored_description AS description,
@@ -398,7 +398,7 @@ async def _apply(limit: int) -> int:
             ),
             'seed_data', seed_data,
             'mirror_meta', jsonb_build_object(
-              'source_system', :source_system,
+              'source_system', CAST(:source_system AS text),
               'mirrored_at', now(),
               'duplicate_count', duplicate_count,
               'selection_rank', rn
