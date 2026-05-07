@@ -2202,7 +2202,11 @@ def test_competitive_pressure_framing_when_no_peers_first_party_visible() -> Non
     assert len(cp["peers_with_first_party_visibility"]) == 0
     framing = cp["framing"].lower()
     assert "first-mover" in framing
-    assert "retailer-mediated" in framing
+    # Phase C-4 PR-B follow-up: framing no longer claims "retailer-mediated"
+    # because cited hosts can include media (forbes.com), brand .coms
+    # (serenaandlily.com), etc. — not always retailers. We say
+    # "third-party hosts" instead.
+    assert "third-party hosts" in framing
 
 
 def test_competitive_pressure_brand_discriminator_handles_multiword_brands() -> None:
