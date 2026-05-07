@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
+from services.audit_playbook_engine import select_playbooks
 from services.cited_host_classifier import classify_cited_hosts, classify_host
 
 
@@ -2357,6 +2358,32 @@ def _build_merchant_view(
 
     audited_via_pivota_canonical = (url_source == "pivota_canonical_pdp")
 
+    # Hoist the enriched receipt blocks so we can both (a) put them in
+    # merchant_view.receipts and (b) feed them into the playbook engine
+    # for action generation. Computed once per report.
+    merchant_category = (industry_context or {}).get("category")
+    failed_queries_detailed = _build_failed_queries_detailed(
+        attribution_runs,
+        merchant_brand=merchant_brand,
+        merchant_host=merchant_host,
+        merchant_category=merchant_category,
+    )
+    cited_hosts_detailed_full = classify_cited_hosts(
+        category_retailer_hosts or [],
+        merchant_category=merchant_category,
+    )
+
+    # Phase C-4 PR-G: per-cited-host playbook actions. Strategic
+    # actions from `_generate_action_items` (verdict-tier-based) lead;
+    # per-host playbook actions come after, sorted by severity. Each
+    # playbook action carries `playbook_step_id + target_host + lever
+    # + expected_timeline_weeks` so the frontend can group/filter.
+    playbook_actions = select_playbooks(
+        cited_hosts_detailed=cited_hosts_detailed_full,
+        failed_queries_detailed=failed_queries_detailed,
+    )
+    merged_actions = list(action_items or []) + list(playbook_actions or [])
+
     return {
         "headline": {
             "verdict_label": verdict_label,
@@ -2379,12 +2406,7 @@ def _build_merchant_view(
             # host_classification, competitors_named}. Closes the gap
             # between "your URL was missing on N queries" and "for THIS
             # query, this host won, with these competitor brands".
-            "failed_queries_detailed": _build_failed_queries_detailed(
-                attribution_runs,
-                merchant_brand=merchant_brand,
-                merchant_host=merchant_host,
-                merchant_category=(industry_context or {}).get("category"),
-            ),
+            "failed_queries_detailed": failed_queries_detailed,
             # Honest naming: these are "all hosts cited in grounded
             # sources except the merchant's own". Could be retailers
             # (nordstrom.com, sephora.com), competitor brand .coms
@@ -2401,11 +2423,8 @@ def _build_merchant_view(
             # `type: "unclassified"`. Frontend renders alongside
             # `top_cited_hosts` so merchants understand what each host
             # is and which lever applies. PR-G turns these annotations
-            # into per-host playbook actions.
-            "cited_hosts_detailed": classify_cited_hosts(
-                category_retailer_hosts or [],
-                merchant_category=(industry_context or {}).get("category"),
-            )[:5],
+            # into per-host playbook actions (in `actions` block).
+            "cited_hosts_detailed": cited_hosts_detailed_full[:5],
             "top_competitor_brands": [
                 b.get("name")
                 for b in (category_competitor_brands or [])[:5]
@@ -2431,7 +2450,7 @@ def _build_merchant_view(
                 else None
             ),
         },
-        "actions": list(action_items or []),
+        "actions": merged_actions,
         "tracking": {
             # Populated by PR-C once merchant_audit_runs table ships.
             "next_audit_eligible_at": None,

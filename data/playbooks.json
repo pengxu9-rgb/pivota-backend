@@ -1,0 +1,170 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "purpose": "BD-curated per-cited-host action playbooks. Each playbook matches one host_type (and optionally host_subtype) and produces a templated action item the merchant can execute. PR-G wires playbook selection into the merchant audit's action_items list.",
+    "owner": "BD team for content (titles, body templates, timelines, leverage); engineering reviews schema only.",
+    "schema_per_playbook": {
+      "applies_when": "match criteria: host_type required, host_subtype optional",
+      "title_template": "string with {host} placeholder",
+      "body_template": "string with placeholders: {host} {coverage_note} {outreach_hint} {example_query} {competitors_phrase} {timeline_low} {timeline_high}",
+      "severity": "critical | high | medium | low — applied uniformly across all instances of this playbook",
+      "lever": "editorial_outreach | wholesale_onboarding | creator_partnership | marketplace_listing | research",
+      "expected_timeline_weeks": "[low, high] integer pair"
+    },
+    "matching_priority": "When multiple playbooks could match a host, the more specific match wins (subtype > type). Unknown hosts (type='unclassified') match the catch-all generic_unclassified playbook."
+  },
+  "playbooks": {
+    "editorial_pitch_review_site": {
+      "applies_when": {"type": "editorial", "subtype": "review_site"},
+      "title_template": "Pitch {host} editorial team",
+      "body_template": "{coverage_note} {competitors_phrase}{example_phrase}{outreach_hint} Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "severity": "high",
+      "lever": "editorial_outreach",
+      "expected_timeline_weeks": [4, 8]
+    },
+    "editorial_pitch_fashion": {
+      "applies_when": {"type": "editorial", "subtype": "fashion"},
+      "title_template": "Pitch {host} fashion team",
+      "body_template": "{coverage_note} {competitors_phrase}{example_phrase}{outreach_hint} Fashion editorial cycles run on seasonal calendar; expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "severity": "high",
+      "lever": "editorial_outreach",
+      "expected_timeline_weeks": [6, 12]
+    },
+    "editorial_pitch_beauty": {
+      "applies_when": {"type": "editorial", "subtype": "beauty"},
+      "title_template": "Pitch {host} beauty editors",
+      "body_template": "{coverage_note} {competitors_phrase}{example_phrase}{outreach_hint} Beauty editorial: sample submission required. Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "severity": "high",
+      "lever": "editorial_outreach",
+      "expected_timeline_weeks": [4, 10]
+    },
+    "editorial_pitch_review_aggregator": {
+      "applies_when": {"type": "editorial", "subtype": "review_aggregator"},
+      "title_template": "Get listed on {host}",
+      "body_template": "{coverage_note} {competitors_phrase}{outreach_hint}",
+      "severity": "medium",
+      "lever": "editorial_outreach",
+      "expected_timeline_weeks": [2, 6]
+    },
+    "wholesale_department_store": {
+      "applies_when": {"type": "retailer", "subtype": "department_store"},
+      "title_template": "Wholesale onboarding: {host}",
+      "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Wholesale onboarding is a multi-quarter process; expected timeline: {timeline_low}-{timeline_high} weeks for vendor approval.",
+      "severity": "medium",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [12, 26]
+    },
+    "wholesale_luxury": {
+      "applies_when": {"type": "retailer", "subtype": "luxury"},
+      "title_template": "Wholesale onboarding: {host} (luxury)",
+      "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Luxury wholesale requires established brand authority + price point fit; expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "severity": "low",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [16, 36]
+    },
+    "wholesale_beauty_retailer": {
+      "applies_when": {"type": "retailer", "subtype": "beauty_retailer"},
+      "title_template": "Wholesale onboarding: {host}",
+      "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Beauty specialty retailers run accelerator programs (Sephora Accelerate, Ulta Sparked) for D2C/indie brands as a faster track than direct wholesale.",
+      "severity": "high",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [12, 26]
+    },
+    "wholesale_fashion_marketplace": {
+      "applies_when": {"type": "retailer", "subtype": "fashion_marketplace"},
+      "title_template": "Wholesale onboarding: {host}",
+      "body_template": "{coverage_note} {competitors_phrase}{outreach_hint} Fashion marketplace onboarding is faster than department-store wholesale; expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "severity": "medium",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [6, 12]
+    },
+    "wholesale_wellness_retailer": {
+      "applies_when": {"type": "retailer", "subtype": "wellness_retailer"},
+      "title_template": "Wholesale onboarding: {host}",
+      "body_template": "{coverage_note} {outreach_hint} Wellness retailer onboarding: {timeline_low}-{timeline_high} weeks.",
+      "severity": "medium",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [8, 16]
+    },
+    "wholesale_mass_market_retailer": {
+      "applies_when": {"type": "retailer", "subtype": "mass_market"},
+      "title_template": "Wholesale onboarding: {host} (mass market)",
+      "body_template": "{coverage_note} {outreach_hint} Note: mass-market retailers typically prefer brands at scale; if you're early-stage D2C, prioritize specialty retailers + editorial first.",
+      "severity": "low",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [16, 36]
+    },
+    "wholesale_regional_retailer": {
+      "applies_when": {"type": "retailer", "subtype": "regional"},
+      "title_template": "Regional wholesale: {host}",
+      "body_template": "{coverage_note} {outreach_hint}",
+      "severity": "low",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [8, 20]
+    },
+    "marketplace_listing_mass_market": {
+      "applies_when": {"type": "marketplace", "subtype": "mass_market"},
+      "title_template": "List on {host}",
+      "body_template": "{coverage_note} {outreach_hint} Marketplace listings (1P + 3P) get D2C brands AI-channel grounded faster than editorial because product feeds index directly. Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "severity": "high",
+      "lever": "marketplace_listing",
+      "expected_timeline_weeks": [2, 8]
+    },
+    "marketplace_listing_fashion": {
+      "applies_when": {"type": "marketplace", "subtype": "fashion_marketplace"},
+      "title_template": "List on {host}",
+      "body_template": "{coverage_note} {outreach_hint}",
+      "severity": "medium",
+      "lever": "marketplace_listing",
+      "expected_timeline_weeks": [2, 6]
+    },
+    "creator_partnership_video": {
+      "applies_when": {"type": "video", "subtype": "creator_platform"},
+      "title_template": "Creator partnerships: {host}",
+      "body_template": "{coverage_note} {outreach_hint} For sleepwear/fashion/beauty: focus on mid-tier reviewers (10k-100k subs) who already cover your category. Sponsored reviews land in grounded retrieval within {timeline_low}-{timeline_high} weeks of upload.",
+      "severity": "medium",
+      "lever": "creator_partnership",
+      "expected_timeline_weeks": [4, 12]
+    },
+    "creator_partnership_social": {
+      "applies_when": {"type": "video", "subtype": "social"},
+      "title_template": "Influencer partnerships: {host}",
+      "body_template": "{coverage_note} {outreach_hint} Social-first creators drive social pickup but lower AI-channel grounding weight than YouTube long-form.",
+      "severity": "low",
+      "lever": "creator_partnership",
+      "expected_timeline_weeks": [2, 8]
+    },
+    "generic_editorial": {
+      "applies_when": {"type": "editorial"},
+      "title_template": "Pitch {host}",
+      "body_template": "{coverage_note} {outreach_hint} Expected timeline: {timeline_low}-{timeline_high} weeks.",
+      "severity": "medium",
+      "lever": "editorial_outreach",
+      "expected_timeline_weeks": [4, 12]
+    },
+    "generic_retailer": {
+      "applies_when": {"type": "retailer"},
+      "title_template": "Wholesale: {host}",
+      "body_template": "{coverage_note} {outreach_hint}",
+      "severity": "medium",
+      "lever": "wholesale_onboarding",
+      "expected_timeline_weeks": [8, 26]
+    },
+    "generic_marketplace": {
+      "applies_when": {"type": "marketplace"},
+      "title_template": "Listing: {host}",
+      "body_template": "{coverage_note} {outreach_hint}",
+      "severity": "medium",
+      "lever": "marketplace_listing",
+      "expected_timeline_weeks": [2, 8]
+    },
+    "generic_unclassified": {
+      "applies_when": {"type": "unclassified"},
+      "title_template": "Investigate {host}",
+      "body_template": "This host appeared in your audit's grounded sources but isn't in our registry yet. Worth a quick research pass — visit the site, identify whether it's editorial / retailer / marketplace / brand competitor, and assess whether it's a relevant outreach target for your category.",
+      "severity": "low",
+      "lever": "research",
+      "expected_timeline_weeks": [1, 1]
+    }
+  }
+}

@@ -263,8 +263,18 @@ def test_diagnosis_indexing_arc_state_omitted_for_merchant_url():
 
 
 def test_actions_block_references_existing_action_items():
+    """Phase C-4 PR-G: merchant_view.actions is now strategic actions
+    (from `action_items`) PREFIX + playbook actions (per cited host).
+    Strategic actions still appear unchanged at the start; legacy
+    `action_items` continues to hold only strategic."""
     report = _build_invisible_report()
-    assert report["merchant_view"]["actions"] == report["action_items"]
+    actions = report["merchant_view"]["actions"]
+    legacy = report["action_items"]
+    # Strategic prefix matches legacy action_items exactly.
+    assert actions[: len(legacy)] == legacy
+    # Anything beyond the strategic prefix is a playbook action.
+    for tail_action in actions[len(legacy):]:
+        assert "playbook_step_id" in tail_action
 
 
 def test_tracking_baseline_reference_from_pivota_pdp_baseline():
