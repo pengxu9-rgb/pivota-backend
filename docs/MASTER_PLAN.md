@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-07 evening (post Phase 2-redo: 4069 → 627 NULL category_path; mirror script now classifies at INSERT time; probe v13 in flight)
+- Last updated: 2026-05-07 night (Phase 7b Step 2 PR open as PIVOTA-Agent #1312, draft — pending staging deploy + probe v14)
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -68,6 +68,8 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | C-1 | Pivota canonical PDP foundation — schema + sig generator + audit fallback | ✅ | #327 |
 | C-2 | Public sig_* → product API + sitemap list | ✅ | #329 |
 | C-3 | One-shot script for legacy rows | ✅ | #331, plus #330 schema guard |
+| 7b Step 1 | Gateway-side canonicalCatalogSearch helper + 16 unit tests | ✅ | PIVOTA-Agent #1311 (claude/phase-7b-canonical-recall) |
+| 7b Step 2 | Wire helper into find_products_multi + dedupe + telemetry + 3 integration tests | 🟡 **open as draft** | PIVOTA-Agent #1312 (codex/phase7b-canonical-chain, commit 91cbcc98). Local verification: 175 jest tests pass, prod read-only sanity returns 200 lipstick / 144 mascara / 160 perfume rows. Pending: flip draft → ready, preview deploy, probe v14. |
 
 ---
 
