@@ -978,6 +978,7 @@ async def run_brand_report(
     provider: str = "gemini",
     max_runs: int = 3,
     include_category_visibility: bool = True,
+    prior_runs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run BD probes against up to 5 products of one merchant and
     aggregate into a brand-level report.
@@ -1045,6 +1046,11 @@ async def run_brand_report(
                 # `merchant_view.headline.audited_via_pivota_canonical`
                 # flag is per-product accurate, not just top-level.
                 url_source=p.get("url_source"),
+                # PR-C: prior_runs → trend in merchant_view.tracking.
+                # Same merchant-level history is duplicated to each
+                # per-product report so the frontend doesn't have to
+                # join across products + audit history separately.
+                prior_runs=prior_runs,
             )
             per_product.append(structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
@@ -2196,6 +2202,50 @@ def _build_what_pivota_changes(
     }
 
 
+def _build_history_trend(
+    prior_runs: Optional[List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """PR-C: distill the merchant's last few audit runs into a trend
+    summary the merchant_view.tracking block can render. None when
+    no prior runs (first-ever audit on this merchant).
+
+    Each prior_run entry comes from `db.merchant_audit_runs.recent_runs_for_merchant`.
+    We use the most-recent succeeded run's scores as the comparison
+    baseline — delta from THIS audit shows the merchant whether they're
+    moving up, flat, or down since last time.
+    """
+    succeeded = [
+        r for r in (prior_runs or [])
+        if r.get("status") == "succeeded"
+        and r.get("visibility_score_avg") is not None
+    ]
+    if not succeeded:
+        return None
+    most_recent = succeeded[0]
+    return {
+        "audits_in_history": len(succeeded),
+        "most_recent_audit": {
+            "run_id": most_recent.get("run_id"),
+            "requested_at": most_recent.get("requested_at"),
+            "visibility": most_recent.get("visibility_score_avg"),
+            "attribution": most_recent.get("attribution_score_avg"),
+            "category_visibility": most_recent.get("category_visibility_score_avg"),
+            "verdict_labels": most_recent.get("verdict_labels") or [],
+        },
+        # The series for sparkline rendering (oldest → newest within
+        # the history window). Capped at the # of prior_runs we got.
+        "series": [
+            {
+                "requested_at": r.get("requested_at"),
+                "visibility": r.get("visibility_score_avg"),
+                "attribution": r.get("attribution_score_avg"),
+                "category_visibility": r.get("category_visibility_score_avg"),
+            }
+            for r in reversed(succeeded)
+        ],
+    }
+
+
 def _build_failed_queries_detailed(
     attribution_runs: List[Dict[str, Any]],
     *,
@@ -2306,6 +2356,7 @@ def _build_merchant_view(
     url_source: Optional[str],
     merchant_brand: Optional[str],
     merchant_host: Optional[str],
+    prior_runs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Project the already-computed structured report into a 6-layer
     information architecture the merchant portal can render directly:
@@ -2452,9 +2503,10 @@ def _build_merchant_view(
         },
         "actions": merged_actions,
         "tracking": {
-            # Populated by PR-C once merchant_audit_runs table ships.
+            # PR-C populates these from merchant_audit_runs history.
             "next_audit_eligible_at": None,
-            "history_link": None,
+            "history_link": "/api/merchant-center/audit/history",
+            "history": _build_history_trend(prior_runs),
             "pivota_baseline_reference": {
                 "visibility": pivota_baseline.get("median_visibility"),
                 "attribution": pivota_baseline.get("median_attribution"),
@@ -2480,6 +2532,7 @@ def build_structured_report(
     timestamp: Optional[str] = None,
     category_visibility_result: Optional[Dict[str, Any]] = None,
     url_source: Optional[str] = None,
+    prior_runs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Return a single JSON-serializable dict with everything the UI
     needs to render the BD report. Pure function.
@@ -2664,6 +2717,7 @@ def build_structured_report(
         url_source=url_source,
         merchant_brand=merchant_brand,
         merchant_host=merchant_host,
+        prior_runs=prior_runs,
     )
 
     return {

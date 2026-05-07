@@ -44,6 +44,12 @@ from sqlalchemy import select
 
 from db.catalog import catalog_products
 from db.database import database
+from db.merchant_audit_runs import (
+    count_runs_in_window,
+    record_audit_run_completed,
+    record_audit_run_started,
+    recent_runs_for_merchant,
+)
 from db.merchant_onboarding import get_merchant_onboarding
 from services.agent_center_bd_report_service import run_brand_report
 from services.catalog_sync_service import make_pivota_canonical_fields
@@ -56,14 +62,13 @@ router = APIRouter(
 )
 
 
-# Per-merchant rate-limit storage. In-memory dict keyed by merchant_id;
-# values are deque[float] of timestamps for runs in the trailing window.
-# Mirrors the simple pattern in middleware/rate_limiter.py — swap to
-# Redis when we need cross-instance state. For now the audit endpoint
-# is low-traffic enough that a single-process counter is fine.
+# Per-merchant rate-limit window. Phase C-4 PR-C moved the storage
+# from an in-memory dict to the `merchant_audit_runs` table — see
+# db/merchant_audit_runs.py — so the cap survives restarts and works
+# across multiple backend pods. The window + cap stay here because
+# they're route-policy values, not DB schema.
 _AUDIT_RATE_WINDOW_S = 24 * 60 * 60   # 24 hours
 _AUDIT_RATE_MAX = 2                   # audits per merchant per window
-_audit_run_history: Dict[str, List[float]] = {}
 
 
 def _derive_canonical_url(
@@ -107,16 +112,39 @@ def _derive_canonical_url(
     return f"{domain}/products/{handle}"
 
 
-def _check_audit_rate_limit(merchant_id: str) -> int:
+async def _check_audit_rate_limit(merchant_id: str) -> int:
     """Returns remaining quota (>=0) if allowed, raises 429 if exceeded.
-    Pure side effect of recording the audit timestamp on success."""
-    now = time.time()
-    history = _audit_run_history.setdefault(merchant_id, [])
-    # Drop expired entries
-    cutoff = now - _AUDIT_RATE_WINDOW_S
-    history[:] = [ts for ts in history if ts > cutoff]
-    if len(history) >= _AUDIT_RATE_MAX:
-        next_reset_in = int(_AUDIT_RATE_WINDOW_S - (now - history[0]))
+
+    Phase C-4 PR-C: counts persisted runs in `merchant_audit_runs`
+    instead of an in-memory deque. Window + cap unchanged
+    (`_AUDIT_RATE_WINDOW_S`, `_AUDIT_RATE_MAX`). On DB error
+    `count_runs_in_window` returns 0 — degraded persistence shouldn't
+    lock merchants out of auditing.
+    """
+    used = await count_runs_in_window(
+        merchant_id=merchant_id,
+        window_seconds=_AUDIT_RATE_WINDOW_S,
+    )
+    if used >= _AUDIT_RATE_MAX:
+        # Best-effort fetch of the oldest run-in-window so we can
+        # tell the caller when their quota resets. Falls back to the
+        # full window if we can't determine it.
+        recent = await recent_runs_for_merchant(
+            merchant_id=merchant_id, limit=_AUDIT_RATE_MAX,
+        )
+        next_reset_in = _AUDIT_RATE_WINDOW_S
+        if recent:
+            try:
+                from datetime import datetime as _dt
+                oldest_iso = recent[-1].get("requested_at")
+                if oldest_iso:
+                    oldest = _dt.fromisoformat(oldest_iso.replace("Z", "+00:00"))
+                    next_reset_in = max(
+                        0,
+                        _AUDIT_RATE_WINDOW_S - int(time.time() - oldest.timestamp()),
+                    )
+            except Exception:  # noqa: BLE001 — best effort
+                pass
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
@@ -126,11 +154,10 @@ def _check_audit_rate_limit(merchant_id: str) -> int:
                 ),
                 "limit": _AUDIT_RATE_MAX,
                 "window_seconds": _AUDIT_RATE_WINDOW_S,
-                "next_reset_in_seconds": max(0, next_reset_in),
+                "next_reset_in_seconds": next_reset_in,
             },
         )
-    history.append(now)
-    return _AUDIT_RATE_MAX - len(history)
+    return _AUDIT_RATE_MAX - used - 1
 
 
 class ProductRef(BaseModel):
@@ -157,7 +184,7 @@ async def run_merchant_self_audit(
     body: MerchantSelfAuditRequest,
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
-    remaining = _check_audit_rate_limit(merchant_id)
+    remaining = await _check_audit_rate_limit(merchant_id)
 
     # 1. Build the set of (platform, source_product_id) tuples the
     #    merchant asked for. WHERE merchant_id=current is the cross-
@@ -303,6 +330,24 @@ async def run_merchant_self_audit(
         "merchant_self_audit_start merchant_id=%s sku_count=%d max_runs=%d",
         merchant_id, len(products), body.max_runs,
     )
+    # Phase C-4 PR-C: persist audit run lifecycle to merchant_audit_runs.
+    # Best-effort — DB failures degrade to "no history captured" but
+    # never fail the audit itself.
+    product_keys = [r["product_key"] for r in rows]
+    run_id = await record_audit_run_started(
+        merchant_id=merchant_id,
+        product_keys=product_keys,
+    )
+    # Pull the merchant's recent audit runs BEFORE the new row's
+    # status flips to 'succeeded' — the trend in merchant_view.tracking
+    # is "your last N audits", not including the one running now.
+    prior_runs = await recent_runs_for_merchant(
+        merchant_id=merchant_id, limit=5,
+    )
+    # Filter out the just-inserted running row so trend is purely
+    # historical.
+    if run_id:
+        prior_runs = [r for r in prior_runs if r.get("run_id") != run_id]
     try:
         brand_report = await run_brand_report(
             merchant_name=str(merchant_name),
@@ -310,19 +355,45 @@ async def run_merchant_self_audit(
             products=products,
             provider="gemini",
             max_runs=body.max_runs,
+            prior_runs=prior_runs,
         )
     except ValueError as exc:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message=str(exc),
+        )
         # run_brand_report's input validators (e.g. "products capped at 5")
         # — surface as 422 since these are client-supplied bounds.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         )
+    except Exception as exc:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message=str(exc),
+        )
+        raise
+    aggregate = brand_report.get("aggregate") or {}
+    per_product = brand_report.get("per_product") or []
+    verdict_labels = [
+        ((p.get("verdict") or {}).get("label") or "")
+        for p in per_product
+    ]
+    await record_audit_run_completed(
+        run_id=run_id,
+        status="succeeded",
+        verdict_labels=[v for v in verdict_labels if v],
+        visibility_score_avg=aggregate.get("avg_visibility"),
+        attribution_score_avg=aggregate.get("avg_attribution"),
+        category_visibility_score_avg=aggregate.get("avg_category_visibility"),
+        audited_via_pivota_canonical=pivota_url_used,
+        report_jsonb=brand_report,
+    )
     logger.info(
-        "merchant_self_audit_done merchant_id=%s succeeded=%d failed=%d",
+        "merchant_self_audit_done merchant_id=%s succeeded=%d failed=%d run_id=%s",
         merchant_id,
-        (brand_report.get("aggregate") or {}).get("products_succeeded", 0),
-        (brand_report.get("aggregate") or {}).get("products_failed", 0),
+        aggregate.get("products_succeeded", 0),
+        aggregate.get("products_failed", 0),
+        run_id or "(persistence-skipped)",
     )
 
     return {
@@ -334,4 +405,41 @@ async def run_merchant_self_audit(
         # 30-90 day Google indexing arc post-creation. Empty when the
         # merchant's own URLs covered every selected SKU.
         "audited_via_pivota_canonical": pivota_url_used,
+        # Phase C-4 PR-C: run_id of the persisted audit row, lets
+        # callers fetch this audit's history entry later.
+        "audit_run_id": run_id,
+    }
+
+
+@router.get("/history")
+async def get_merchant_audit_history(
+    limit: int = 5,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Return the most recent audit runs for this merchant, newest
+    first. Drives the merchants-portal trend / history view + the
+    `merchant_view.tracking.history_link` payload.
+
+    Trend-only fields (no full report_jsonb) — fetch a specific run
+    via its `run_id` if the full report is needed.
+    """
+    if limit <= 0 or limit > 50:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="limit must be between 1 and 50",
+        )
+    runs = await recent_runs_for_merchant(
+        merchant_id=merchant_id, limit=limit,
+    )
+    return {
+        "merchant_id": merchant_id,
+        "runs": runs,
+        "rate_limit": {
+            "max": _AUDIT_RATE_MAX,
+            "window_seconds": _AUDIT_RATE_WINDOW_S,
+            "used_in_window": await count_runs_in_window(
+                merchant_id=merchant_id,
+                window_seconds=_AUDIT_RATE_WINDOW_S,
+            ),
+        },
     }
