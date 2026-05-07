@@ -18,28 +18,48 @@
       "subtype": "review_site",
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness"],
       "coverage_note": "The Strategist (NYMag's product review vertical) runs frequent category roundups including sleepwear; high AI-channel pickup.",
-      "outreach_hint": "Pitch The Strategist editorial team — 4-8 week cycle for inclusion in roundups."
+      "outreach_hint": "Pitch The Strategist editorial team — 4-8 week cycle for inclusion in roundups.",
+      "pitch_recipient": {
+        "email": "tips@nymag.com",
+        "submission_url": "https://www.nymag.com/strategist/article/contact-the-strategist.html",
+        "note": "The Strategist accepts pitches via tips@nymag.com or the contact form. Email is faster for time-sensitive trend tie-ins."
+      }
     },
     "nytimes.com": {
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
       "coverage_note": "Wirecutter (NYT's reviews vertical) is the most-cited consumer review site; inclusion is the single highest-impact editorial placement.",
-      "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission."
+      "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.nytimes.com/wirecutter/about/submission-guidelines/",
+        "note": "Wirecutter doesn't accept open pitches by email — submit via their official submission guidelines page. Multi-month review cycle."
+      }
     },
     "forbes.com": {
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
       "coverage_note": "Forbes Vetted runs lifestyle / loungewear / category 'best of' lists; growing AI-channel pickup in 2025-2026.",
-      "outreach_hint": "Forbes Vetted editorial pitch via their submission process."
+      "outreach_hint": "Forbes Vetted editorial pitch via their submission process.",
+      "pitch_recipient": {
+        "email": "vetted@forbes.com",
+        "submission_url": null,
+        "note": "Forbes Vetted accepts product pitches at vetted@forbes.com. Subject line should specify the category vertical (sleepwear, beauty, home, etc.)."
+      }
     },
     "mattressclarity.com": {
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["sleepwear", "loungewear", "bedding", "home"],
       "coverage_note": "Independent review site. Despite the name, publishes 'Best Pajamas / Best Loungewear' annual roundups in addition to mattress content.",
-      "outreach_hint": "Editorial pitch — submit product samples + pitch via their tip form."
+      "outreach_hint": "Editorial pitch — submit product samples + pitch via their tip form.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://mattressclarity.com/contact/",
+        "note": "Submit via Mattress Clarity contact form; lead with the sleepwear / loungewear angle if pitching non-mattress product."
+      }
     },
     "sleepopolis.com": {
       "type": "editorial",
@@ -53,14 +73,24 @@
       "subtype": "review_site",
       "categories": ["fashion", "sleepwear", "beauty", "home", "food_bev"],
       "coverage_note": "Good Housekeeping Institute runs product testing + roundups across most D2C categories.",
-      "outreach_hint": "GH Institute submission — formal product testing process."
+      "outreach_hint": "GH Institute submission — formal product testing process.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.goodhousekeeping.com/institute/about-the-institute/a31905906/contact-us/",
+        "note": "GH Institute requires a formal product-testing submission, not an email pitch. Multi-month testing cycle."
+      }
     },
     "realsimple.com": {
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["fashion", "sleepwear", "home", "food_bev"],
       "coverage_note": "Lifestyle reviews vertical; runs roundups in sleepwear / loungewear / home goods.",
-      "outreach_hint": "Editorial pitch — affiliate-driven roundups."
+      "outreach_hint": "Editorial pitch — affiliate-driven roundups.",
+      "pitch_recipient": {
+        "email": null,
+        "submission_url": "https://www.realsimple.com/work-life/realsimple-magazine/contact-real-simple",
+        "note": "Pitch via Real Simple contact form; specify shopping vertical."
+      }
     },
     "buzzfeed.com": {
       "type": "editorial",

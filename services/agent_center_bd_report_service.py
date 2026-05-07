@@ -2726,9 +2726,14 @@ def _build_merchant_view(
     # per-host playbook actions come after, sorted by severity. Each
     # playbook action carries `playbook_step_id + target_host + lever
     # + expected_timeline_weeks` so the frontend can group/filter.
+    # Phase A: also passes merchant_name + merchant_category so the
+    # playbook engine can render `pitch_draft` (pre-filled email)
+    # per editorial action.
     playbook_actions = select_playbooks(
         cited_hosts_detailed=cited_hosts_detailed_full,
         failed_queries_detailed=failed_queries_detailed,
+        merchant_name=merchant_brand,  # use the friendly brand name
+        merchant_category=merchant_category,
     )
     merged_actions = list(action_items or []) + list(playbook_actions or [])
     # Stamp a 1-indexed `priority_order` on every action so the
