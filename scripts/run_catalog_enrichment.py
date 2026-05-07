@@ -322,12 +322,12 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                   (id, external_product_id, market, tool, title, image_url,
                    price_amount, price_currency, destination_url,
                    canonical_url, domain, attached_product_key, status,
-                   seed_data)
+                   availability, seed_data)
                 VALUES
                   (:id, :external_product_id, :market, :tool, :title, :image_url,
                    :price_amount, :price_currency, :destination_url,
                    :canonical_url, :domain, :attached_product_key, :status,
-                   CAST(:seed_data AS jsonb))
+                   :availability, CAST(:seed_data AS jsonb))
                 ON CONFLICT (id) DO UPDATE SET
                   external_product_id = EXCLUDED.external_product_id,
                   attached_product_key = EXCLUDED.attached_product_key,
@@ -336,6 +336,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                   image_url = EXCLUDED.image_url,
                   price_amount = EXCLUDED.price_amount,
                   status = EXCLUDED.status,
+                  availability = EXCLUDED.availability,
                   seed_data = EXCLUDED.seed_data,
                   updated_at = NOW()
                 """,
