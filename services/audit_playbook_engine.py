@@ -223,20 +223,22 @@ def _build_pitch_draft(
     """Phase A: render the pre-filled email pitch the merchant can
     one-click into their mail client. Returns None when either side
     of the contract is missing (playbook has no template, or host
-    has no recipient).
+    has no email recipient).
 
     Output shape:
       {
         "subject": "...",
         "body": "...",
-        "recipient_email": "tips@nymag.com" | None,
-        "recipient_url":   "https://..." | None,
+        "recipient_email": "tips@nymag.com",
         "recipient_note":  "..." | None,
       }
 
-    Frontend uses recipient_email to construct a `mailto:` link;
-    falls back to recipient_url (open in new tab) when email is
-    null. recipient_note explains the choice to the merchant.
+    Email-only path. Hosts without a published editorial email (e.g.
+    Wirecutter's submission form) are intentionally skipped — we only
+    render the "Draft pitch email" CTA when it actually opens a
+    pre-filled mail client in one click. Half-working fallbacks
+    (open-the-form-yourself) erode trust in the execution layer; we
+    prefer honest coverage gaps.
     """
     pitch_tpl = pb.get("pitch_template") or {}
     subject_tpl = pitch_tpl.get("subject_template") or ""
@@ -246,11 +248,9 @@ def _build_pitch_draft(
 
     recipient = host_entry.get("pitch_recipient") or {}
     recipient_email = recipient.get("email") if isinstance(recipient, dict) else None
-    recipient_url = recipient.get("submission_url") if isinstance(recipient, dict) else None
     recipient_note = recipient.get("note") if isinstance(recipient, dict) else None
 
-    # Without an email or a URL, the draft has no destination — skip.
-    if not recipient_email and not recipient_url:
+    if not recipient_email:
         return None
 
     subject = _render_template(subject_tpl, ctx)
@@ -262,7 +262,6 @@ def _build_pitch_draft(
         "subject": subject,
         "body": body,
         "recipient_email": recipient_email,
-        "recipient_url": recipient_url,
         "recipient_note": recipient_note,
     }
 

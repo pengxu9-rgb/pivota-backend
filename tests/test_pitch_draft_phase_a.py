@@ -74,8 +74,10 @@ def test_nymag_action_carries_pitch_draft_with_email_recipient():
     pd = actions[0]["pitch_draft"]
     assert pd is not None
     assert pd["recipient_email"] == "tips@nymag.com"
-    assert pd["recipient_url"]
     assert pd["recipient_note"]
+    # No recipient_url field — submission-form fallbacks were dropped to
+    # avoid breaking the one-click promise.
+    assert "recipient_url" not in pd
     # Subject contains merchant name
     assert "TestSleepwear" in pd["subject"]
     # Body contains merchant name + competitors
@@ -85,9 +87,13 @@ def test_nymag_action_carries_pitch_draft_with_email_recipient():
     assert "TODO" in pd["body"]
 
 
-def test_wirecutter_action_carries_pitch_draft_with_submission_url():
-    """nytimes.com (Wirecutter) doesn't accept email pitches —
-    submission_url only. pitch_draft must still be emitted."""
+def test_wirecutter_action_has_no_pitch_draft():
+    """nytimes.com (Wirecutter) has only a submission_url — no email.
+    We deliberately don't surface a 'pitch draft' button for these:
+    a button that opens a generic form for the merchant to fill out
+    breaks the one-click execution-layer promise. The action still
+    emits with concrete_next_step ('submit via Wirecutter form'), but
+    no pitch_draft."""
     from services.audit_playbook_engine import select_playbooks
     actions = select_playbooks(
         cited_hosts_detailed=[_registry_entry_for("nytimes.com")],
@@ -96,11 +102,7 @@ def test_wirecutter_action_carries_pitch_draft_with_submission_url():
         merchant_category="fashion",
     )
     assert len(actions) == 1
-    pd = actions[0]["pitch_draft"]
-    assert pd is not None
-    assert pd["recipient_email"] is None
-    assert "wirecutter" in pd["recipient_url"].lower()
-    assert "TestBrand" in pd["body"]
+    assert actions[0]["pitch_draft"] is None
 
 
 def test_unregistered_host_emits_action_without_pitch_draft():
