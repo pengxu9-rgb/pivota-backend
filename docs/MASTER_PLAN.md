@@ -145,26 +145,48 @@ Three layered findings, in escalating severity:
   LIKE predicate via `lower(title)` alone — yet the gateway returns 0,
   pointing to finding #3.
 
-**Next move (recommended): two tracks**
+**Trace summary (2026-05-07 cold-read of PIVOTA-Agent):**
 
-- **A. Cheap (today, ~2 hr).** Find which seed-query path actually fires
-  for `shopping_agent → find_products_multi`. Add per-path query telemetry
-  or use existing `route_health` traces, run a one-shot probe, identify
-  the file. Then add the agent-bridge clause `OR tool = 'catalog_enrichment_agent_v1'`
-  to that path. This unblocks lipstick AS LONG AS the unattached-36-returning-0
-  mystery (#3 above) is also resolved.
+- Probe metadata pinpoints the failing query: `pq_candidates=0,
+  primary_quality_gate_passed=false, sd_query_semantic_class='default'`
+  for lipstick vs `pq_candidates>0, semantic_class='fragrance'` for fragrance
+  (which DOES surface our agent seeds — Aventus, Baccarat).
+- `inferFragranceSemanticClass()` only classifies fragrance. Lipstick
+  / makeup queries fall through to `'default'`.
+- **Strong candidate filter:** `src/findProductsMulti/policy.js:5390-5410`
+  — beauty-diversity gate requires ≥2 non-tool category buckets; fragrance is
+  explicitly exempt (`isFragranceFlow`); lipstick isn't. A pure-lipstick
+  result set (1 bucket = `lip_makeup`) gets `filtered = []`.
+- **But** the probe reports `external_raw_count=0`, `domain_filter_dropped_external=0`
+  — if the diversity filter were the cause, drops would be non-zero. So
+  there's likely an upstream filter ALSO returning 0 (the SQL itself).
+- Phase 8 (fragrance) commit was **data-only** (50 PDP candidates JSONL); no
+  code change went in to enable fragrance retrieval. So fragrance succeeds
+  through whatever existing path also exists for lipstick — meaning the
+  difference is purely in pre-retrieval expansion / classification, not a
+  new fragrance-specific SQL path.
 
-- **B. Right (next week, 1–2 days).** Phase 7b — wire gateway recall to
-  JOIN `catalog_offers` / `catalog_skus`. This is the real fix. Until 7b
-  lands, every canonical PDP we ingest stays invisible to live recall, and
-  we're spending probe rounds tuning a path the data never reaches.
-  Needs design alignment with the rest of PIVOTA-Agent because the seed-scan
-  code is load-bearing for the existing ~80% of recall traffic that isn't
-  agent-authored.
+**Recommendation: skip Track A as originally scoped.**
 
-**Recommendation:** A first today, then B next. Do **not** extend Phase 4
-to fashion/electronics/home until B is in flight — otherwise we're adding
-to a ghost catalog.
+Cold-reading 30k+ LOC across PIVOTA-Agent's `server.js`, `policy.js`, and
+`auroraBff/` was sufficient to identify the architectural gap and a
+filter candidate, but not enough to confidently land a single-line patch.
+A real Track A would need either:
+- runtime log instrumentation deployed to staging, OR
+- running the gateway locally with a debugger against the prod DB
+
+Both are bigger commitments than "today, ~2 hr" anticipated. Pivot to
+Track B, which addresses root cause and avoids guessing:
+
+- **B. Phase 7b — wire gateway recall to JOIN `catalog_offers` /
+  `catalog_skus`.** Estimated 1–2 day spike on PIVOTA-Agent side. Needs
+  design alignment because the seed-scan code is load-bearing for the
+  existing ~80% of recall traffic that isn't agent-authored. The
+  comment at `findProductsExternalSeedDirectRetrieval.js:152` already
+  flags this work as planned.
+
+**Don't extend Phase 4 to fashion/electronics/home until B is in flight**
+— otherwise we're adding to a ghost catalog the gateway doesn't read.
 
 ### #2 — Phase 9 regression (45% → 28%) not root-caused
 
@@ -224,25 +246,28 @@ the recall path doesn't surface lipstick. Fix #1 first, then extend.
 
 ---
 
-## Recommended next steps (priority order, post-diagnosis 2026-05-07)
+## Recommended next steps (priority order, post-cold-trace 2026-05-07)
 
-The diagnosis flips the priority. Issue #1 is no longer a backend bug —
-it's a gateway/backend integration gap that all backend canonical work
-depends on.
+The trace ruled out Track A as scoped — cold-reading PIVOTA-Agent without
+runtime access was insufficient to land a confident single-line patch.
 
-1. **Track A — instrument & patch (today, ~2 hr)**
-   - Identify which seed-query path fires for `shopping_agent →
-     find_products_multi` (probe + log inspection in PIVOTA-Agent)
-   - Add the agent-bridge clause to that path
-   - Re-probe. Expected lift: lipstick 0/9 → 4–6/9 if finding #3
-     (unattached seeds also return 0) is just the bridge issue. If
-     lipstick stays 0/9, escalate to track B sooner.
-2. **Track B — Phase 7b (next, 1–2 days)**
-   - Wire PIVOTA-Agent's `find_products_multi` to JOIN
-     `catalog_offers`/`catalog_skus` so canonical PDPs surface in recall.
+1. **Track B — Phase 7b (next, 1–2 day spike on PIVOTA-Agent side)**
+   - Wire `find_products_multi` to JOIN `catalog_offers`/`catalog_skus`
+     so canonical PDPs surface in recall.
    - This is the real fix and unblocks every category at once. Must align
      with the existing seed-scan path (load-bearing for ~80% of traffic).
-3. **Parallel work eligible while A/B in flight:**
+   - Side-quest: while in there, also propagate the agent-bridge clause
+     `OR tool = 'catalog_enrichment_agent_v1'` to the seed-query templates
+     that lack it (5+ sites in `server.js` and `auroraBff/`).
+2. **Track A as a stretch (only with runtime access)**
+   - Deploy log instrumentation OR run gateway locally with debugger.
+   - Identify which filter actually zeros out `external_raw_count` for
+     lipstick. Strong candidate: beauty-diversity gate in
+     `findProductsMulti/policy.js:5390-5410` (fragrance is explicitly
+     exempted; lipstick isn't).
+   - Lower-priority once B lands because the canonical-chain path will
+     bypass these seed-side filters anyway.
+3. **Parallel work eligible while B is in flight:**
    - Open issue #3 (runner swallow-and-log hardening) — independent, mechanical
    - Open issue #2 (Phase 9 regression) — diff v9_phase8 vs v9_phase9 records
 4. **Phase 4 fashion/electronics/home — DEFER until B lands.** Adding more
