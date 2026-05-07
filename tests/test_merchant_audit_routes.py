@@ -43,13 +43,26 @@ from utils.auth import get_current_user, get_current_merchant
 
 class FakeDatabase:
     """In-memory replacement for `db.database.database` covering only the
-    one query the audit route runs (catalog_products SELECT). The route
-    filters on merchant_id + platform IN (...) + source_product_id IN
-    (...) — we parse those literals from the compiled SQL and apply
-    the same filter."""
+    queries the audit route runs:
+      - SELECT from catalog_products (filtered)
+      - UPDATE catalog_products SET pivota_signature_id, pivota_canonical_url
+        for the lazy mint path
+    Both parsed loosely from compiled SQL — sufficient for the in-route
+    behaviors we need to verify."""
 
     def __init__(self, products: List[Dict[str, Any]]) -> None:
         self._products = products
+        self.update_calls: List[Dict[str, Any]] = []
+
+    async def execute(self, query) -> Any:
+        # Track UPDATEs so tests can assert lazy mint persisted.
+        try:
+            compiled = query.compile(compile_kwargs={"literal_binds": True})
+        except Exception:
+            return None
+        sql = str(compiled)
+        self.update_calls.append({"sql": sql})
+        return None
 
     async def fetch_all(self, query) -> List[Dict[str, Any]]:
         try:
@@ -93,10 +106,19 @@ def _row(
     platform: str = "shopify",
     with_url: bool = True,
     handle: str = "",
+    with_pivota_canonical: bool = False,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"id": source_product_id}
     if handle:
         payload["handle"] = handle
+    pivota_sig = (
+        f"sig_test_{source_product_id}" if with_pivota_canonical else None
+    )
+    pivota_url = (
+        f"https://agent.pivota.cc/products/{pivota_sig}"
+        if with_pivota_canonical
+        else None
+    )
     return {
         "merchant_id": merchant_id,
         "product_key": (
@@ -111,6 +133,8 @@ def _row(
             f"https://example.com/p/{source_product_id}" if with_url else None
         ),
         "product_payload": payload,
+        "pivota_canonical_url": pivota_url,
+        "pivota_signature_id": pivota_sig,
     }
 
 
@@ -309,40 +333,108 @@ def test_404_when_product_owned_by_different_merchant(env):
     assert any(m["source_product_id"] == "p_other" for m in missing)
 
 
-def test_422_when_all_selected_products_lack_url_and_handle(env):
-    """An audit needs a buyer-facing URL to score attribution against.
-    `p_no_url` lacks both canonical_url AND a handle in
-    product_payload. When EVERY selected product is URL-less, route
-    422s with the skipped list — there's nothing to audit."""
-    client, _, _ = env
+def test_url_less_product_falls_back_to_pivota_canonical_url(env):
+    """A catalog row with no canonical_url AND no handle in
+    product_payload now falls back to its Pivota canonical PDP URL
+    (auto-minted if missing) — the audit ALWAYS finds a URL to probe.
+    The product is audited; product_key surfaces in
+    `audited_via_pivota_canonical` so the UI can flag the score
+    reflects Pivota's hosted surface."""
+    client, captured_calls, mar_module = env
     res = client.post(
         "/api/merchant-center/audit/ai-commerce-readiness",
         json={"products": [_ref("p_no_url")]},
     )
-    assert res.status_code == 422
-    skipped = res.json()["detail"]["skipped_products"]
-    assert any(s["source_product_id"] == "p_no_url" for s in skipped)
-    assert "no_canonical_url_and_no_handle" in skipped[0]["reason"]
-
-
-def test_partial_success_when_some_products_lack_url(env):
-    """Realistic catalog state: some SKUs have URLs, others don't.
-    Route audits the ones that do + returns the URL-less ones as
-    skipped_products. Doesn't 422 the whole batch."""
-    client, captured_calls, _ = env
-    res = client.post(
-        "/api/merchant-center/audit/ai-commerce-readiness",
-        json={"products": [_ref("p1"), _ref("p_no_url")]},
-    )
     assert res.status_code == 200, res.text
     body = res.json()
-    # Audit ran on p1 only.
+    # Audit ran (no skip).
     assert len(captured_calls) == 1
     assert len(captured_calls[0]["products"]) == 1
-    # p_no_url surfaced as skipped.
-    assert len(body["skipped_products"]) == 1
-    assert body["skipped_products"][0]["source_product_id"] == "p_no_url"
-    assert "no_canonical_url_and_no_handle" in body["skipped_products"][0]["reason"]
+    pdp_url = captured_calls[0]["products"][0]["pdp_url"]
+    # URL points at Pivota canonical surface, not example.com / merchant store.
+    assert pdp_url.startswith("https://agent.pivota.cc/products/sig_")
+    # audited_via_pivota_canonical lists this product_key.
+    assert len(body["audited_via_pivota_canonical"]) == 1
+    assert "p_no_url" in body["audited_via_pivota_canonical"][0]
+
+
+def test_url_less_product_persists_minted_pivota_sig_to_catalog(env):
+    """Lazy-mint path: when the catalog row has no pivota_signature_id
+    yet, the route generates one + writes it back via UPDATE so
+    subsequent audits + the sitemap renderer see the same sig."""
+    client, _, mar_module = env
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness",
+        json={"products": [_ref("p_no_url")]},
+    )
+    assert res.status_code == 200
+    # Verify the UPDATE happened — FakeDatabase records execute() calls.
+    db = mar_module.database
+    assert len(db.update_calls) == 1
+    sql = db.update_calls[0]["sql"]
+    assert "pivota_signature_id" in sql.lower()
+    assert "pivota_canonical_url" in sql.lower()
+
+
+def test_existing_pivota_canonical_url_is_used_without_lazy_mint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When catalog row already has pivota_canonical_url set (from
+    catalog sync), the audit uses it directly — no UPDATE roundtrip."""
+    from routes import merchant_audit_routes as mar
+    products_for_self = [
+        _row("merch_self", "p_with_pivota", with_url=False, with_pivota_canonical=True),
+    ]
+    db = FakeDatabase(products_for_self)
+    monkeypatch.setattr(mar, "database", db)
+
+    async def _fake_get_merchant_onboarding(_mid: str):
+        return {"merchant_id": "merch_self", "business_name": "Test"}
+    monkeypatch.setattr(
+        mar, "get_merchant_onboarding", _fake_get_merchant_onboarding,
+    )
+
+    captured: List[Dict[str, Any]] = []
+
+    async def _fake_run_brand_report(**kwargs):
+        captured.append(kwargs)
+        return {
+            "merchant_name": kwargs["merchant_name"],
+            "merchant_domain": None,
+            "timestamp": "2026-05-07T00:00:00+00:00",
+            "provider": "gemini",
+            "per_product": [],
+            "aggregate": {
+                "avg_visibility": 0, "avg_attribution": 0,
+                "avg_category_visibility": 0,
+                "brand_verdict_label": "INVISIBLE",
+                "brand_verdict_explanation": "test",
+                "products_count": 1, "products_succeeded": 1,
+                "products_failed": 0,
+            },
+            "cross_product_competitors": [],
+            "failed": [],
+        }
+    monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
+    mar._audit_run_history.clear()
+
+    async def _override_merchant() -> str:
+        return "merch_self"
+
+    app = FastAPI()
+    app.include_router(mar.router)
+    app.dependency_overrides[get_current_merchant] = _override_merchant
+    client = TestClient(app)
+
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness",
+        json={"products": [_ref("p_with_pivota")]},
+    )
+    assert res.status_code == 200, res.text
+    pdp_url = captured[0]["products"][0]["pdp_url"]
+    assert pdp_url == "https://agent.pivota.cc/products/sig_test_p_with_pivota"
+    # No UPDATE — sig already existed.
+    assert len(db.update_calls) == 0
 
 
 def test_canonical_url_derived_from_handle_when_catalog_url_missing(

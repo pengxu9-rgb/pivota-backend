@@ -52,6 +52,13 @@ catalog_products = Table(
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
     Column("freshness_json", JSONB_TYPE, nullable=True),
+    # Pivota canonical PDP — sig_<32hex> identifying the product's
+    # agent.pivota.cc/products/<sig> URL (the AI-channel surface).
+    # See migration 071 + services/catalog_sync_service.py:
+    # make_pivota_signature_id. Nullable for now (rows predating the
+    # migration get populated lazily at next sync or first audit).
+    Column("pivota_signature_id", Text, nullable=True),
+    Column("pivota_canonical_url", Text, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index(
@@ -60,6 +67,12 @@ catalog_products = Table(
         "platform",
         "source_product_id",
         unique=True,
+    ),
+    Index(
+        "idx_catalog_products_pivota_signature",
+        "pivota_signature_id",
+        unique=True,
+        postgresql_where=Column("pivota_signature_id").isnot(None),
     ),
 )
 

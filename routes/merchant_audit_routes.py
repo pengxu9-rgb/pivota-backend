@@ -46,6 +46,7 @@ from db.catalog import catalog_products
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from services.agent_center_bd_report_service import run_brand_report
+from services.catalog_sync_service import make_pivota_canonical_fields
 from utils.auth import get_current_merchant
 from utils.logger import logger
 
@@ -174,6 +175,8 @@ async def run_merchant_self_audit(
             catalog_products.c.product_type,
             catalog_products.c.canonical_url,
             catalog_products.c.product_payload,
+            catalog_products.c.pivota_canonical_url,
+            catalog_products.c.pivota_signature_id,
         )
         .where(
             catalog_products.c.merchant_id == merchant_id,
@@ -228,54 +231,74 @@ async def run_merchant_self_audit(
     #          merchants even if canonical_url wasn't extracted)
     #      (c) None → bail out with a 422 listing the SKUs that need
     #          attention
+    # URL resolution per selected product, in priority order:
+    #   (a) catalog_products.canonical_url       — merchant's own URL
+    #   (b) {store_domain}/products/{handle}     — derived from Shopify payload
+    #   (c) catalog_products.pivota_canonical_url — Pivota canonical PDP URL
+    #       (lazily minted + persisted if missing — every onboarded
+    #       merchant product gets one; see migration 071 / make_pivota_
+    #       canonical_fields). This is the AI-channel surface Pivota
+    #       hosts on agent.pivota.cc — works even for URL-less catalog
+    #       rows (manual imports / seed data) because we OWN the URL.
     products: List[Dict[str, Any]] = []
-    skipped_no_url: List[Dict[str, Any]] = []
+    pivota_url_used: List[str] = []  # surfaced to caller as informational
     for r in rows:
         pdp_url = (r["canonical_url"] or "").strip()
+        url_source = "merchant_canonical_url"
         if not pdp_url:
-            pdp_url = _derive_canonical_url(
+            derived = _derive_canonical_url(
                 merchant_domain=merchant_domain,
                 product_payload=r["product_payload"],
             ) or ""
+            if derived:
+                pdp_url = derived
+                url_source = "derived_from_handle"
         if not pdp_url:
-            skipped_no_url.append({
-                "platform": r["platform"],
-                "source_product_id": r["source_product_id"],
-                "title": r["title"],
-                "reason": (
-                    "no_canonical_url_and_no_handle — catalog row has "
-                    "neither canonical_url nor a derivable {store_domain}"
-                    "/products/{handle} (typically: product was imported "
-                    "outside the Shopify OAuth sync, e.g. manual upload "
-                    "or scraped seed data, so no URL metadata to probe "
-                    "against)"
-                ),
-            })
-            continue
+            # Fallback (c): Pivota canonical PDP URL. Lazily mint the
+            # sig + URL if the catalog row predates migration 071.
+            pivota_url = (r["pivota_canonical_url"] or "").strip()
+            if not pivota_url:
+                fields = make_pivota_canonical_fields(
+                    merchant_id, r["platform"], r["source_product_id"],
+                )
+                pivota_url = fields["pivota_canonical_url"]
+                # Persist back so subsequent audits + sitemap renderer
+                # see the same sig. Single-row UPDATE; cheap.
+                await database.execute(
+                    catalog_products.update()
+                    .where(
+                        catalog_products.c.merchant_id == merchant_id,
+                        catalog_products.c.platform == r["platform"],
+                        catalog_products.c.source_product_id == r["source_product_id"],
+                    )
+                    .values(
+                        pivota_signature_id=fields["pivota_signature_id"],
+                        pivota_canonical_url=pivota_url,
+                    )
+                )
+            pdp_url = pivota_url
+            url_source = "pivota_canonical_pdp"
+            pivota_url_used.append(r["product_key"])
         products.append({
             "title": r["title"],
             "vendor": r["brand"],
             "product_type": r["product_type"],
             "pdp_url": pdp_url,
+            "_url_source": url_source,  # dropped before passing to run_brand_report
         })
 
-    # If EVERY selected product was skipped, there's nothing to audit
-    # — bail with a 422 so the merchant knows to pick auditable SKUs.
-    if not products:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": (
-                    "None of the selected products have a usable "
-                    "buyer-facing URL — the audit needs a URL to score "
-                    "AI-channel attribution against. Pick products that "
-                    "came in via the Shopify OAuth sync (they'll have "
-                    "URLs); manually-uploaded or scraped seed products "
-                    "typically don't carry URL metadata."
-                ),
-                "skipped_products": skipped_no_url,
-            },
-        )
+    # All products always resolve to a URL now (Pivota canonical fallback
+    # always succeeds), so no skipped_products list. The `pivota_url_used`
+    # list informs the caller which SKUs were audited against the Pivota
+    # canonical PDP rather than the merchant's own URL — useful so the
+    # UI can flag "this score reflects Pivota canonical surface, not
+    # your storefront."
+    # Strip the internal _url_source field before handing to run_brand_report.
+    audit_products = [
+        {k: v for k, v in p.items() if not k.startswith("_")}
+        for p in products
+    ]
+    products = audit_products  # rebind so the rest of the route is unchanged
 
     logger.info(
         "merchant_self_audit_start merchant_id=%s sku_count=%d max_runs=%d",
@@ -306,8 +329,10 @@ async def run_merchant_self_audit(
     return {
         "brand_report": brand_report,
         "rate_limit_remaining": remaining,
-        # Pre-flight skipped products (URL-less catalog rows). The
-        # audit ran on the remainder; the merchant can see why these
-        # specific SKUs didn't make it in. Only set when non-empty.
-        "skipped_products": skipped_no_url,
+        # product_keys whose audit URL was the Pivota canonical PDP
+        # (not the merchant's own URL) — UI surfaces a note that the
+        # score reflects Pivota's hosted surface, which is in the
+        # 30-90 day Google indexing arc post-creation. Empty when the
+        # merchant's own URLs covered every selected SKU.
+        "audited_via_pivota_canonical": pivota_url_used,
     }
