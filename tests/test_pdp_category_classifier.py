@@ -43,6 +43,11 @@ from services.pdp_category_classifier import (  # noqa: E402
         ("face wash", "beauty/skincare/cleanse/"),
         ("barrier moisturizer", "beauty/skincare/moisturize/"),
         ("night cream", "beauty/skincare/moisturize/"),
+        ("gel mask", "beauty/skincare/treat/"),
+        ("peeling gel", "beauty/skincare/treat/"),
+        ("pore prep primer", "beauty/makeup/face/"),
+        ("liquid eyeliner", "beauty/makeup/eye/"),
+        ("lip tint", "beauty/makeup/lip/"),
     ],
 )
 def test_category_prefix_extracts_2_segments(query: str, expected_prefix: str) -> None:
