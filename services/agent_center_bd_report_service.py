@@ -681,6 +681,16 @@ def _explain_verdict(
     cat_score = evidence.get("category_score")
     gap_pct = evidence.get("gap_pct")
     failed_sample: List[str] = evidence.get("failed_attribution_query_sample") or []
+    # When the audit fell back to fallback (c) — the Pivota canonical
+    # PDP at agent.pivota.cc/products/sig_* — the merchant doesn't have
+    # an external URL; "your URL" alone is ambiguous to them. Disambig.
+    url_source: Optional[str] = evidence.get("url_source")
+    is_pivota_canonical = url_source == "pivota_canonical_pdp"
+    your_url_label = (
+        "Your Pivota canonical URL"
+        if is_pivota_canonical
+        else "Your URL"
+    )
 
     has_evidence = runs_total is not None and cited is not None
     retailers_phrase = ", ".join(top_retailers[:3])
@@ -693,8 +703,8 @@ def _explain_verdict(
                 # success/loss split so the merchant doesn't read
                 # "1 cited" + "cited instead" as contradictory.
                 base = (
-                    f"Your URL was cited in {cited} of {runs_total} "
-                    f"buyer-intent queries"
+                    f"{your_url_label} was cited in {cited} of "
+                    f"{runs_total} buyer-intent queries"
                 )
                 if losing > 0 and retailers_phrase:
                     base += (
@@ -706,7 +716,7 @@ def _explain_verdict(
                 # 0/N case — no contradictory phrasing needed.
                 base = (
                     f"None of {runs_total} buyer-intent queries cited "
-                    f"your URL"
+                    f"{your_url_label.lower()}"
                 )
                 if retailers_phrase:
                     base += f". They cited: {retailers_phrase} instead"
@@ -729,8 +739,8 @@ def _explain_verdict(
             losing = max(0, (runs_total or 0) - (cited or 0))
             base = (
                 f"AI agents recognize your product (visibility "
-                f"{visibility_score}/100). Your URL was cited in {cited} "
-                f"of {runs_total} buyer-intent queries"
+                f"{visibility_score}/100). {your_url_label} was cited "
+                f"in {cited} of {runs_total} buyer-intent queries"
             )
             if losing > 0 and retailers_phrase:
                 base += (
@@ -2944,6 +2954,12 @@ def build_structured_report(
         "category_score": category_score,
         "gap_pct": gap_pct,
         "failed_attribution_query_sample": _failed_attribution_queries(attribution_runs)[:3],
+        # Disambiguates "your URL" in the verdict text. When the audit
+        # fell back to the Pivota canonical PDP, "your URL" reads as
+        # "your store URL" to the merchant — but they don't HAVE one;
+        # we tested the Pivota canonical sig_*. Verdict text now says
+        # "Your Pivota canonical URL was cited..." for that case.
+        "url_source": url_source,
     }
     verdict_label, verdict_explanation = verdict_for(
         visibility_score,
