@@ -241,12 +241,17 @@ def test_diagnosis_primary_uses_competitive_pressure_framing():
 
 
 def test_diagnosis_indexing_arc_state_present_when_pivota_audit():
+    """Phase C-4 PR-D landed: the diagnosis now carries the real
+    arc state. Without `pivota_signature_minted_at` (this fixture
+    doesn't pass one), phase is `unknown` + the static-style 30-90d
+    caveat. With minted_at, phase is `fresh|indexing|expected_steady`
+    — covered by tests/test_pivota_indexing_arc.py."""
     report = _build_invisible_report(url_source="pivota_canonical_pdp")
     d = report["merchant_view"]["diagnosis"]
     arc = d["indexing_arc_state"]
     assert arc is not None
-    assert arc["phase"] == "indexing-up"  # PR-D will compute real phase
-    assert "30-90 day" in arc["caveat"]
+    assert arc["phase"] in {"unknown", "fresh", "indexing", "expected_steady"}
+    assert "30-90" in arc["caveat"] or "indexing" in arc["caveat"].lower()
 
 
 def test_diagnosis_indexing_arc_state_omitted_for_merchant_url():

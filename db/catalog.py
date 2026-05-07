@@ -59,6 +59,12 @@ catalog_products = Table(
     # migration get populated lazily at next sync or first audit).
     Column("pivota_signature_id", Text, nullable=True),
     Column("pivota_canonical_url", Text, nullable=True),
+    # Phase C-4 PR-D — when the sig + canonical_url were minted, used
+    # to compute the indexing-arc phase (fresh / indexing /
+    # expected_steady) in merchant_view.diagnosis. See migration 073
+    # + services/pivota_indexing_arc.py. Nullable for now because the
+    # backfill sets pre-existing rows to their created_at.
+    Column("pivota_signature_minted_at", DateTime, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index(

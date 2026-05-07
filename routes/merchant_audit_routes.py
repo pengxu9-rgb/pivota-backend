@@ -204,6 +204,7 @@ async def run_merchant_self_audit(
             catalog_products.c.product_payload,
             catalog_products.c.pivota_canonical_url,
             catalog_products.c.pivota_signature_id,
+            catalog_products.c.pivota_signature_minted_at,
         )
         .where(
             catalog_products.c.merchant_id == merchant_id,
@@ -280,6 +281,10 @@ async def run_merchant_self_audit(
             if derived:
                 pdp_url = derived
                 url_source = "derived_from_handle"
+        # PR-D: track the canonical sig's mint timestamp per product
+        # so the engine can compute the indexing-arc phase. Default to
+        # the catalog row's existing value; lazy-mint sets it below.
+        pivota_minted_at = r.get("pivota_signature_minted_at")
         if not pdp_url:
             # Fallback (c): Pivota canonical PDP URL. Lazily mint the
             # sig + URL if the catalog row predates migration 071.
@@ -289,8 +294,12 @@ async def run_merchant_self_audit(
                     merchant_id, r["platform"], r["source_product_id"],
                 )
                 pivota_url = fields["pivota_canonical_url"]
+                pivota_minted_at = fields["pivota_signature_minted_at"]
                 # Persist back so subsequent audits + sitemap renderer
-                # see the same sig. Single-row UPDATE; cheap.
+                # see the same sig. Single-row UPDATE; cheap. Phase
+                # C-4 PR-D: also writes pivota_signature_minted_at so
+                # the next audit's indexing-arc state is computed
+                # from a real timestamp.
                 await database.execute(
                     catalog_products.update()
                     .where(
@@ -301,6 +310,7 @@ async def run_merchant_self_audit(
                     .values(
                         pivota_signature_id=fields["pivota_signature_id"],
                         pivota_canonical_url=pivota_url,
+                        pivota_signature_minted_at=pivota_minted_at,
                     )
                 )
             pdp_url = pivota_url
@@ -311,6 +321,10 @@ async def run_merchant_self_audit(
             "vendor": r["brand"],
             "product_type": r["product_type"],
             "pdp_url": pdp_url,
+            # PR-D: pivota_signature_minted_at threads through to
+            # build_structured_report so merchant_view.diagnosis.
+            # indexing_arc_state can compute the real phase.
+            "pivota_signature_minted_at": pivota_minted_at,
             # Phase C-4 (PR-B): pass url_source through to the engine so
             # per-product `merchant_view.headline.audited_via_pivota_canonical`
             # is accurate. Was previously stripped before calling

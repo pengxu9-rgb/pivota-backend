@@ -31,6 +31,7 @@ from urllib.parse import urlparse
 from services import agent_center_llm_client as llm_client
 from services.audit_playbook_engine import select_playbooks
 from services.cited_host_classifier import classify_cited_hosts, classify_host
+from services.pivota_indexing_arc import compute_indexing_arc_state
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1052,11 @@ async def run_brand_report(
                 # per-product report so the frontend doesn't have to
                 # join across products + audit history separately.
                 prior_runs=prior_runs,
+                # PR-D: per-product mint timestamp — when this row's
+                # Pivota canonical sig was first created. Drives
+                # merchant_view.diagnosis.indexing_arc_state's real
+                # phase computation (replaces the static caveat).
+                pivota_signature_minted_at=p.get("pivota_signature_minted_at"),
             )
             per_product.append(structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
@@ -2357,6 +2363,7 @@ def _build_merchant_view(
     merchant_brand: Optional[str],
     merchant_host: Optional[str],
     prior_runs: Optional[List[Dict[str, Any]]] = None,
+    pivota_signature_minted_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Project the already-computed structured report into a 6-layer
     information architecture the merchant portal can render directly:
@@ -2484,19 +2491,18 @@ def _build_merchant_view(
         },
         "diagnosis": {
             "primary": (competitive_pressure or {}).get("framing"),
-            # Static for now; PR-D computes real phase from
-            # `pivota_signature_minted_at` (fresh / indexing /
-            # expected_steady) when url_source == "pivota_canonical_pdp".
+            # PR-D: real arc phase computed from this product's
+            # `pivota_signature_minted_at` (set by go-forward sync or
+            # lazy-mint at first audit). Phases:
+            #   fresh           — < 7 days since mint
+            #   indexing        — 7-90 days (Google crawl + first-pass)
+            #   expected_steady — > 90 days (if not cited by now, the
+            #                     diagnostic shifts from "wait" to
+            #                     "your URL doesn't win the queries")
+            # Falls back to a generic caveat when minted_at is missing
+            # (legacy rows the migration backfill couldn't reach).
             "indexing_arc_state": (
-                {
-                    "phase": "indexing-up",
-                    "caveat": (
-                        "Pivota canonical PDPs follow a 30-90 day Google "
-                        "indexing arc post-publication. Grounded LLM "
-                        "citations lift as Search Console URL Inspection "
-                        "submissions mature."
-                    ),
-                }
+                compute_indexing_arc_state(pivota_signature_minted_at)
                 if audited_via_pivota_canonical
                 else None
             ),
@@ -2533,6 +2539,7 @@ def build_structured_report(
     category_visibility_result: Optional[Dict[str, Any]] = None,
     url_source: Optional[str] = None,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
+    pivota_signature_minted_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Return a single JSON-serializable dict with everything the UI
     needs to render the BD report. Pure function.
@@ -2718,6 +2725,7 @@ def build_structured_report(
         merchant_brand=merchant_brand,
         merchant_host=merchant_host,
         prior_runs=prior_runs,
+        pivota_signature_minted_at=pivota_signature_minted_at,
     )
 
     return {
