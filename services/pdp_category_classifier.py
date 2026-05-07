@@ -54,16 +54,27 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Toner", "beauty/skincare/treat/toner", re.compile(
         r"\b(toner|mist|pad)\b", re.IGNORECASE)),
+    ("Mask", "beauty/skincare/treat/mask", re.compile(
+        r"\b(face mask|clay mask|charcoal mask|sheet mask|gel mask|sleeping mask|"
+        r"sleep mask|wash[-\s]?off mask|under eye patch|eye patch|pimple patch|"
+        r"lip\s?patch|mask)\b",
+        re.IGNORECASE)),
+    ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
+        r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
+        r"scrub|polish)\b",
+        re.IGNORECASE)),
     ("Treatment", "beauty/skincare/treat/treatment", re.compile(
         r"\b(spot[-\s]?target(?:ing|ed)?|spot[-\s]?treatment|blemish|acne|"
         r"clarifying treatment|targeting gel|treatment gel)\b",
         re.IGNORECASE)),
     ("Serum", "beauty/skincare/treat/serum", re.compile(
         r"\b(serum|essence|ampoule|concentrate)\b", re.IGNORECASE)),
+    ("Primer", "beauty/makeup/face/primer", re.compile(
+        r"\b(primer|pore prep|pore[-\s]?filling)\b", re.IGNORECASE)),
     ("Concealer", "beauty/makeup/face/concealer", re.compile(
         r"\b(concealer)\b", re.IGNORECASE)),
     ("Foundation", "beauty/makeup/face/foundation", re.compile(
-        r"\b(foundation|skin tint|foundation stick|cushion foundation)\b",
+        r"\b(foundation|skin tint|tint stick|foundation stick|cushion foundation)\b",
         re.IGNORECASE)),
     ("Powder", "beauty/makeup/face/powder", re.compile(
         r"\b(powder|setting powder|pressed powder|loose powder|"
@@ -78,15 +89,20 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(bronzer|contour)\b", re.IGNORECASE)),
     ("Eyeshadow", "beauty/makeup/eye/eyeshadow", re.compile(
         r"\b(eye\s?shadow|eyeshadow|eye color|eye colour)\b", re.IGNORECASE)),
+    ("Eyeliner", "beauty/makeup/eye/eyeliner", re.compile(
+        r"\b(eyeliner|eye liner|liquid liner|pencil liner|flypencil)\b",
+        re.IGNORECASE)),
     ("Mascara", "beauty/makeup/eye/mascara", re.compile(
         r"\b(mascara)\b", re.IGNORECASE)),
     ("Brow Pencil", "beauty/makeup/eye/brow", re.compile(
         r"\b(brow pencil|eyebrow pencil|brow definer|brow sculptor|brow styler)\b",
         re.IGNORECASE)),
     ("Lip Balm", "beauty/makeup/lip/balm", re.compile(
-        r"\b(lip balm|lip treatment)\b", re.IGNORECASE)),
+        r"\b(lip balm|lip treatment|lip scrub|scrubstick)\b", re.IGNORECASE)),
     ("Lipstick", "beauty/makeup/lip/lipstick", re.compile(
-        r"\b(lipstick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|lip gloss)\b",
+        r"\b(lipstick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
+        r"lip gloss|lip oil|lip liner|lip stain|lip tint|pout lip|gloss luxe|"
+        r"gloss drip)\b",
         re.IGNORECASE)),
     ("Moisturizer", "beauty/skincare/moisturize/cream", re.compile(
         r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|barrier cream)\b",

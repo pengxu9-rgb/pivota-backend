@@ -28,6 +28,9 @@ LIPSTICK_FIXTURES = [
     "Glossier Generation G Sheer Lipstick",
     "Pat McGrath MatteTrance Lipstick",
     "Rare Beauty Stay Vulnerable Lip Color",
+    "Pixi Glow-y Lip Oil",
+    "Kylie Precision Pout Lip Liner",
+    "Tom Ford Gloss Luxe",
 ]
 
 FOUNDATION_FIXTURES = [
@@ -121,6 +124,58 @@ SERUM_FIXTURES = [
     "Kiehl's Midnight Recovery Concentrate",
 ]
 
+MASK_FIXTURES = [
+    "Round Lab Birch Juice Moisturizing Gel Mask",
+    "COSRX Poreless Clarifying Charcoal Mask Pink",
+    "Fenty Cookies N Clean Whipped Clay Pore Detox Face Mask",
+    "Beauty of Joseon Revive Under Eye Patch",
+    "Mediheal Tea Tree Essential Sheet Mask",
+    "Laneige Water Sleeping Mask",
+    "Innisfree Super Volcanic Pore Clay Mask",
+    "Hero Cosmetics Mighty Pimple Patch",
+    "Pixi LipPatch",
+    "Summer Fridays Jet Lag Mask",
+]
+
+EXFOLIANT_FIXTURES = [
+    "Pixi Clarity Acid Peel",
+    "Beauty of Joseon Apricot Blossom Peeling Gel",
+    "The Ordinary AHA 30% + BHA 2% Peeling Solution",
+    "Dermalogica Daily Microfoliant Exfoliant",
+    "Olehenriksen Lemonade Smoothing Scrub",
+    "Tatcha The Rice Polish",
+    "Drunk Elephant Babyfacial AHA BHA Peel",
+    "Paula's Choice Skin Perfecting 2% BHA Liquid Exfoliant",
+    "Dr. Dennis Gross Alpha Beta Daily Peel",
+    "Kate Somerville ExfoliKate Intensive Exfoliating Treatment",
+]
+
+PRIMER_FIXTURES = [
+    "TIRTIR Flawless Pore Prep Primer",
+    "Benefit POREfessional Face Primer",
+    "Fenty Pro Filt'r Instant Retouch Primer",
+    "Rare Beauty Always an Optimist Illuminating Primer",
+    "Milk Makeup Hydro Grip Primer",
+    "Smashbox Photo Finish Primer",
+    "e.l.f. Pore-Filling Primer",
+    "Hourglass Veil Mineral Primer",
+    "Laura Mercier Pure Canvas Primer",
+    "Tatcha The Silk Canvas Primer",
+]
+
+EYELINER_FIXTURES = [
+    "Fenty Flypencil Longwear Pencil Eyeliner",
+    "Glitty Lid Shimmer Liquid Eyeliner",
+    "Stila Stay All Day Waterproof Liquid Eye Liner",
+    "Urban Decay 24/7 Glide-On Pencil Liner",
+    "KVD Tattoo Liquid Liner",
+    "NYX Epic Ink Eyeliner",
+    "Charlotte Tilbury Rock 'N' Kohl Eyeliner",
+    "Rare Beauty Perfect Strokes Matte Liquid Liner",
+    "Make Up For Ever Aqua Resist Pencil Liner",
+    "Lancôme Idôle Ultra-Precise Felt Tip Liquid Liner",
+]
+
 
 @pytest.mark.parametrize("title", LIPSTICK_FIXTURES)
 def test_lipstick_resolves(title: str) -> None:
@@ -184,6 +239,38 @@ def test_serum_resolves(title: str) -> None:
     assert hit is not None
     assert hit[0] == "Serum"
     assert hit[1] == "beauty/skincare/treat/serum"
+
+
+@pytest.mark.parametrize("title", MASK_FIXTURES)
+def test_mask_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Mask"
+    assert hit[1] == "beauty/skincare/treat/mask"
+
+
+@pytest.mark.parametrize("title", EXFOLIANT_FIXTURES)
+def test_exfoliant_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Exfoliant"
+    assert hit[1] == "beauty/skincare/treat/exfoliant"
+
+
+@pytest.mark.parametrize("title", PRIMER_FIXTURES)
+def test_primer_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Primer"
+    assert hit[1] == "beauty/makeup/face/primer"
+
+
+@pytest.mark.parametrize("title", EYELINER_FIXTURES)
+def test_eyeliner_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None
+    assert hit[0] == "Eyeliner"
+    assert hit[1] == "beauty/makeup/eye/eyeliner"
 
 
 def test_priority_uses_category_first_then_product_type_then_title() -> None:
