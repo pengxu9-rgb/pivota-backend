@@ -37,7 +37,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Hair Styling", "beauty/haircare/styling", re.compile(
         r"\b(edge control|styling gel|hair-thickening|hair thickening|"
-        r"detangling spray|hair clip|hair clips|edge styling)\b",
+        r"detangling spray|hair clip|hair clips|edge styling|slick[-\s]?back|"
+        r"styling essentials)\b",
         re.IGNORECASE)),
     ("Hair Care", "beauty/haircare/general", re.compile(
         r"\b(hair care|hair repair|repair bundle|maintenance crew|"
@@ -45,7 +46,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Sunscreen", "beauty/skincare/sun/sunscreen", _SUNSCREEN_RE),
     ("Fragrance", "beauty/fragrance/perfume", re.compile(
-        r"\b(perfume|parfum|eau de parfum|eau de toilette|cologne|body spray|scent)\b|"
+        r"\b(perfume|parfum|extrait|extract|eau de parfum|eau de toilette|cologne|body spray|scent)\b|"
         r"\bfragrance\b(?![-\s]?free)\b",
         re.IGNORECASE)),
     ("Cleanser", "beauty/skincare/cleanse/cleanser", re.compile(
@@ -57,7 +58,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Mask", "beauty/skincare/treat/mask", re.compile(
         r"\b(face mask|clay mask|charcoal mask|sheet mask|gel mask|sleeping mask|"
         r"sleep mask|wash[-\s]?off mask|under eye patch|eye patch|pimple patch|"
-        r"spot cover patch|spot patch|lip\s?patch|mask)\b",
+        r"spot cover patch|spot patch|patchs|patches|lip\s?patch|mask)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
@@ -80,7 +81,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Primer", "beauty/makeup/face/primer", re.compile(
         r"\b(primer|pore prep|pore[-\s]?filling)\b", re.IGNORECASE)),
     ("Concealer", "beauty/makeup/face/concealer", re.compile(
-        r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick)\b",
+        r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick|"
+        r"eye brightener|bright fix)\b",
         re.IGNORECASE)),
     ("Foundation", "beauty/makeup/face/foundation", re.compile(
         r"\b(foundation|skin tint|tint stick|foundation stick|cushion foundation)\b",
@@ -90,7 +92,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"blurring powder|finishing powder)\b",
         re.IGNORECASE)),
     ("Highlighter", "beauty/makeup/face/highlighter", re.compile(
-        r"\b(highlighter|illuminator|luminizer|luminiser|killawatt|diamond bomb)\b",
+        r"\b(highlighter|illuminator|luminizer|luminiser|killawatt|diamond bomb|"
+        r"glow drops)\b",
         re.IGNORECASE)),
     ("Blush", "beauty/makeup/face/blush", re.compile(
         r"\b(blush|cheeks out|cheek tint|flush)\b", re.IGNORECASE)),
@@ -107,7 +110,9 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(brow pencil|eyebrow pencil|brow definer|brow sculptor|brow styler)\b",
         re.IGNORECASE)),
     ("Lip Balm", "beauty/makeup/lip/balm", re.compile(
-        r"\b(lip balm|lip butter|lip treatment|lip scrub|scrubstick)\b", re.IGNORECASE)),
+        r"\b(lip balm|lip butter|lip treatment|lip care|lip serum|lipserum|"
+        r"nightbalm|lip scrub|scrubstick)\b",
+        re.IGNORECASE)),
     ("Lipstick", "beauty/makeup/lip/lipstick", re.compile(
         r"\b(lipstick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
         r"lip gloss|lip oil|lip liner|lip stain|lip tint|pout lip|gloss luxe|"
@@ -117,9 +122,12 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|"
         r"water gel|barrier cream)\b",
         re.IGNORECASE)),
+    ("Body Care", "beauty/body/care", re.compile(
+        r"\b(body milk|body relief|body essentials|body care|hand care|loofah)\b",
+        re.IGNORECASE)),
     ("Gift Set", "beauty/sets/gift-set", re.compile(
         r"\b(skincare set|skin care set|gift set|holiday edition|routine|bundle|"
-        r"essentials set|body essentials|care set|set)\b",
+        r"essentials set|essentials|care set|duo|kit|collection|set)\b",
         re.IGNORECASE)),
 ]
 
