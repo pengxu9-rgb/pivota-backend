@@ -288,6 +288,79 @@ def test_verdict_explanation_no_competition_lies(vis, attr, cat, expected_label)
         )
 
 
+def test_verdict_via_retailers_url_appearance_gated_on_in_grounding():
+    """VIA_RETAILERS prose claims 'Your URL appears in some
+    category-level grounded sources' only when category_match_details
+    has at least one in_grounding=True. URL-only signal: claim allowed.
+    Title-match-only signal: claim must be reworded to 'your brand was
+    named in source titles, though your URL itself did not appear'."""
+    base_evidence = {
+        "attribution_runs_total": 9,
+        "merchant_cited_runs": 1,
+        "top_retailers": ["cosmopolitan.com"],
+        "competitive_pressure_framing": None,
+        "category_score": 33,
+        "gap_pct": 33,
+        "failed_attribution_query_sample": ["q1"],
+    }
+
+    # Case 1: in_grounding=True somewhere → URL-appearance claim OK
+    _, expl_url = verdict_for(
+        visibility_score=10,
+        attribution_score=0,
+        category_visibility_score=33,
+        evidence={
+            **base_evidence,
+            "category_match_details": [
+                {"in_grounding": True, "title_match": False, "matched": True},
+                {"in_grounding": False, "title_match": False, "matched": False},
+                {"in_grounding": False, "title_match": False, "matched": False},
+            ],
+        },
+    )
+    assert "your url appears" in expl_url.lower() or "your pivota canonical url appears" in expl_url.lower()
+    assert "did not appear" not in expl_url.lower() or "your url did not" in expl_url.lower()
+    # Specifically the FALSE claim from the bug — never:
+    bug_phrase = "your url appears in some category-level grounded sources"
+    if bug_phrase in expl_url.lower():
+        # Allowed only because in_grounding evidence exists.
+        pass
+
+    # Case 2: title_match only (no in_grounding) → URL-appearance claim NOT allowed
+    _, expl_title = verdict_for(
+        visibility_score=10,
+        attribution_score=0,
+        category_visibility_score=33,
+        evidence={
+            **base_evidence,
+            "category_match_details": [
+                {"in_grounding": False, "title_match": True, "matched": True},
+                {"in_grounding": False, "title_match": False, "matched": False},
+                {"in_grounding": False, "title_match": False, "matched": False},
+            ],
+        },
+    )
+    # The strong claim is forbidden:
+    assert "your url appears in some category-level grounded sources" not in expl_title.lower()
+    assert "your pivota canonical url appears in some category-level grounded sources" not in expl_title.lower()
+    # The honest replacement is present:
+    assert "did not appear" in expl_title.lower()
+    assert "named in some category-level" in expl_title.lower()
+
+    # Case 3: no match details (legacy / sparse) — neither false claim
+    _, expl_none = verdict_for(
+        visibility_score=10,
+        attribution_score=0,
+        category_visibility_score=33,
+        evidence={
+            **base_evidence,
+            "category_match_details": [],
+        },
+    )
+    assert "your url appears in some category-level grounded sources" not in expl_none.lower()
+    assert "named in some category-level grounded source titles" not in expl_none.lower()
+
+
 def test_verdict_invisible_no_evidence_drops_root_cause():
     """When evidence is empty (legacy callers), INVISIBLE prose must
     not assert 'Google indexing' as the cause — we have nothing to
