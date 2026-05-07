@@ -1,0 +1,97 @@
+name: External Seeds Catalog Products Mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Insert missing catalog_products rows and run sig backfill"
+        required: true
+        default: false
+        type: boolean
+      limit:
+        description: "Optional migration limit (0 = all)"
+        required: true
+        default: "0"
+        type: string
+      sample_limit:
+        description: "Sample rows in reports"
+        required: true
+        default: "25"
+        type: string
+
+jobs:
+  external-seeds-catalog-products-mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CHECKOUT_UI_BASE_URL: ${{ vars.CHECKOUT_UI_BASE_URL || 'https://agent.pivota.cc' }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run external seed mirror dry-run
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DATABASE_URL:-}" ]]; then
+            echo "DATABASE_URL secret is required" >&2
+            exit 1
+          fi
+          out_dir="reports/workflow_ops/external-seeds-catalog-products-mirror/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          python scripts/mirror_external_seeds_to_catalog_products.py \
+            --limit "${{ inputs.limit }}" \
+            --sample-limit "${{ inputs.sample_limit }}" \
+            --output-json "${out_dir}/dry_run.json" \
+            --output-md "${out_dir}/dry_run.md" \
+            | tee "${out_dir}/dry_run.stdout.json"
+
+      - name: Apply mirror and canonical sig backfill
+        if: ${{ inputs.apply }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="reports/workflow_ops/external-seeds-catalog-products-mirror/${{ github.run_id }}"
+          mkdir -p "${out_dir}"
+          python scripts/mirror_external_seeds_to_catalog_products.py \
+            --apply \
+            --limit "${{ inputs.limit }}" \
+            --sample-limit "${{ inputs.sample_limit }}" \
+            --output-json "${out_dir}/apply.json" \
+            --output-md "${out_dir}/apply.md" \
+            | tee "${out_dir}/apply.stdout.json"
+
+          python scripts/backfill_pivota_canonical_pdp.py \
+            --apply \
+            --merchant-id external_seed \
+            --platform external_seed \
+            --chunk-size 1000 \
+            | tee "${out_dir}/canonical_sig_backfill.log"
+
+          python scripts/mirror_external_seeds_to_catalog_products.py \
+            --limit "${{ inputs.limit }}" \
+            --sample-limit "${{ inputs.sample_limit }}" \
+            --output-json "${out_dir}/postcheck.json" \
+            --output-md "${out_dir}/postcheck.md" \
+            | tee "${out_dir}/postcheck.stdout.json"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-seeds-catalog-products-mirror-${{ github.run_id }}
+          path: reports/workflow_ops/external-seeds-catalog-products-mirror/${{ github.run_id }}
+          retention-days: 14
