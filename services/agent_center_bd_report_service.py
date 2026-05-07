@@ -508,16 +508,32 @@ def _build_competitive_pressure(
             )
         )
     else:
+        # Name THIS audit's actual retailer hosts when available, so the
+        # framing reflects the real category surface (sleepwear merchants
+        # see Nordstrom / Macy's / etc.; supplements see Amazon / iHerb /
+        # etc.) rather than a hardcoded beauty list. Fall back to generic
+        # "retailers" only when the audit didn't surface any retailer
+        # citations at all (rare).
+        if retailer_hosts:
+            top_named = ", ".join(
+                h.get("host") for h in retailer_hosts[:5] if h.get("host")
+            )
+            retailer_phrase = (
+                f"the entire vertical is retailer-mediated ({top_named})"
+                if top_named
+                else "the entire vertical is retailer-mediated today"
+            )
+        else:
+            retailer_phrase = "the entire vertical is retailer-mediated today"
         framing = (
             f"**First-mover opportunity.** Of the {len(peers_named)} "
             f"competitor brands AI agents name in this category, NONE "
-            f"have their own .com cited in Gemini grounding today — the "
-            f"entire vertical is retailer-mediated (Vogue, Sephora, Ulta, "
-            f"Target, beauty marketplaces). This is the rarer case: "
-            f"there's no incumbent capturing first-party AI-channel "
-            f"attribution yet. Whichever brand onboards Pivota first + "
-            f"completes the 30-90 day indexing arc owns the surface "
-            f"before the rest of the category notices the channel exists."
+            f"have their own .com cited in Gemini grounding today — "
+            f"{retailer_phrase}. This is the rarer case: there's no "
+            f"incumbent capturing first-party AI-channel attribution "
+            f"yet. Whichever brand onboards first + completes the 30-90 "
+            f"day indexing arc owns the surface before the rest of the "
+            f"category notices the channel exists."
         )
 
     return {
@@ -551,34 +567,232 @@ DEFAULT_VERDICT_THRESHOLDS: Dict[str, int] = {
 }
 
 
+def _failed_attribution_queries(attribution_runs: List[Dict[str, Any]]) -> List[str]:
+    """Queries where the merchant's URL was NOT in the grounded sources.
+    Shared by verdict_for + _generate_action_items so they read off the
+    same evidence vocabulary (no double extraction)."""
+    return [
+        run.get("query") or ""
+        for run in attribution_runs
+        if not (run.get("parsed") or {}).get("merchant_url_found")
+    ]
+
+
+def _failed_visibility_queries(visibility_runs: List[Dict[str, Any]]) -> List[str]:
+    """Queries where the product wasn't surfaced with grounded sources."""
+    return [
+        run.get("query") or ""
+        for run in visibility_runs
+        if not (
+            (run.get("parsed") or {}).get("product_visible")
+            and (run.get("grounding_chunks") or [])
+        )
+    ]
+
+
+def _classify_verdict(
+    visibility_score: int,
+    attribution_score: int,
+    category_visibility_score: Optional[int],
+    invisible_max: int,
+    strong_min: int,
+    misattr_attr_max: int,
+) -> str:
+    """Pure tier classification — no copy. The gap-based VIA_RETAILERS
+    check runs first so cat-strong + attr-weak cases (BoJ cat=67/attr=0,
+    COSRX cat=100/attr=33) land in the right tier even when attribution
+    clears the misattributed_attr_max floor."""
+    if (
+        category_visibility_score is not None
+        and category_visibility_score >= invisible_max
+        and attribution_score < strong_min
+        and (category_visibility_score - attribution_score) >= invisible_max
+    ):
+        return VERDICT_VIA_RETAILERS
+    if visibility_score < invisible_max and attribution_score < invisible_max:
+        return VERDICT_INVISIBLE
+    if attribution_score < misattr_attr_max and visibility_score >= invisible_max:
+        return VERDICT_MISATTRIBUTED
+    if visibility_score >= strong_min and attribution_score >= strong_min:
+        return VERDICT_STRONG
+    return VERDICT_PARTIAL
+
+
+def _explain_verdict(
+    label: str,
+    visibility_score: int,
+    attribution_score: int,
+    evidence: Dict[str, Any],
+) -> str:
+    """Compose the merchant-facing diagnostic paragraph for a verdict.
+
+    All output references THIS audit's actual evidence — failed query
+    counts, top retailers cited instead of the merchant, gap percentages.
+    No BD-pitch macros: no "12% → 25-30%", no "Pivota's agentic-commerce
+    protocol", no "complementary to existing retail distribution". Those
+    live in `_build_what_pivota_changes` exclusively (and a Phase 6 test
+    enforces the boundary).
+
+    When `evidence` is empty (legacy callers that haven't been wired up
+    yet — e.g. the calibration-prefix unit tests), falls back to a
+    minimal generic sentence that's still data-bound on score values
+    and still pitch-free.
+    """
+    runs_total = evidence.get("attribution_runs_total")
+    cited = evidence.get("merchant_cited_runs")
+    top_retailers: List[str] = evidence.get("top_retailers") or []
+    cp_framing: Optional[str] = evidence.get("competitive_pressure_framing")
+    cat_score = evidence.get("category_score")
+    gap_pct = evidence.get("gap_pct")
+    failed_sample: List[str] = evidence.get("failed_attribution_query_sample") or []
+
+    has_evidence = runs_total is not None and cited is not None
+    retailers_phrase = ", ".join(top_retailers[:3])
+
+    if label == VERDICT_INVISIBLE:
+        if has_evidence:
+            base = (
+                f"{cited} of {runs_total} buyer-intent queries surfaced "
+                f"your URL"
+            )
+            if retailers_phrase:
+                base += f". Top URLs cited instead: {retailers_phrase}"
+            base += (
+                ". Grounded LLM citations are downstream of Google's "
+                "index, so the typical root cause is that Google hasn't "
+                "indexed your canonical PDPs yet — the AI agents have "
+                "nothing to cite."
+            )
+            return base
+        return (
+            "AI agents return zero grounded references to your store "
+            "across the queries we tested. Typical root cause: Google "
+            "hasn't indexed your canonical PDPs, so grounded LLMs have "
+            "nothing to cite."
+        )
+
+    if label == VERDICT_MISATTRIBUTED:
+        if has_evidence:
+            base = (
+                f"AI agents recognize your product (visibility "
+                f"{visibility_score}/100) but your URL appears in {cited} "
+                f"of {runs_total} buyer-intent queries"
+            )
+            if retailers_phrase:
+                base += f". Top citation drains: {retailers_phrase}"
+            base += (
+                ". The demand exists; resellers and marketplaces are "
+                "capturing it instead of you."
+            )
+            if cp_framing:
+                base += " " + cp_framing
+            return base
+        return (
+            "AI agents recognize your product but consistently send "
+            "consumers to third-party URLs instead of yours. The demand "
+            "exists; competitors and resellers are capturing it."
+        )
+
+    if label == VERDICT_VIA_RETAILERS:
+        if has_evidence:
+            cs = cat_score if cat_score is not None else "?"
+            gp = gap_pct if gap_pct is not None else "?"
+            base = (
+                f"Your brand surfaces in category-level AI queries "
+                f"(category visibility {cs}/100), but your URL captures "
+                f"only {attribution_score}/100 of buyer-intent queries — "
+                f"a {gp}-point gap"
+            )
+            if retailers_phrase:
+                base += f", routed through {retailers_phrase}"
+            base += (
+                ". The brand is findable in the AI channel; you're just "
+                "not capturing the funnel."
+            )
+            if cp_framing:
+                base += " " + cp_framing
+            return base
+        return (
+            "AI agents recognize this brand in category-level queries — "
+            "but the funnel mostly routes consumers through third-party "
+            "retailers rather than the merchant's own URL. The brand is "
+            "findable; the merchant isn't capturing it."
+        )
+
+    if label == VERDICT_STRONG:
+        if has_evidence:
+            return (
+                f"AI agents cite your URL in {cited} of {runs_total} "
+                f"buyer-intent queries (visibility {visibility_score}/100, "
+                f"attribution {attribution_score}/100). Both discovery "
+                "and attribution are at goal state. Remaining leverage "
+                "points are post-discovery — conversion friction, schema "
+                "drift detection, new-competitor early warning."
+            )
+        return (
+            "AI agents reliably surface this product AND cite the "
+            "merchant's own URL as the buying path. Discovery and "
+            "attribution are solved at the audit level."
+        )
+
+    # PARTIAL
+    if has_evidence:
+        base = (
+            f"Mixed result — visibility {visibility_score}/100, "
+            f"attribution {attribution_score}/100. Of {runs_total} "
+            f"buyer-intent queries, {cited} cited your URL; the rest "
+            f"routed elsewhere"
+        )
+        if failed_sample:
+            sample = ", ".join(f'"{q[:50]}"' for q in failed_sample[:2])
+            base += f". Failing queries include: {sample}"
+        base += (
+            ". The actions below show which gap is bigger; close that "
+            "one first."
+        )
+        return base
+    return (
+        "Mixed result — the product gets surfaced sometimes, and gets "
+        "attributed to the merchant's own URL sometimes, but neither is "
+        "consistent. The action items below show which gap is bigger."
+    )
+
+
 def verdict_for(
     visibility_score: int,
     attribution_score: int,
     peer_thresholds: Optional[Dict[str, int]] = None,
     *,
     category_visibility_score: Optional[int] = None,
+    evidence: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
-    """Categorize the (visibility, attribution) pair into one of four
-    BD-friendly verdicts. Returns (label, explanation paragraph).
+    """Categorize the (visibility, attribution) pair into one of five
+    verdicts and emit an evidence-bound diagnostic paragraph. Returns
+    (label, explanation).
+
+    `evidence` is a dict assembled by `build_structured_report` from
+    already-extracted probe data:
+      - attribution_runs_total: int
+      - merchant_cited_runs: int
+      - top_retailers: List[str]               (top hosts, len ≤ 3 used)
+      - competitive_pressure_framing: str|None (from `_build_competitive_pressure`)
+      - category_score: int|None
+      - gap_pct: int|None                       (category - attribution)
+      - failed_attribution_query_sample: List[str]
+    When evidence is None or empty (legacy callers, calibration-prefix
+    tests), explanations fall back to score-only generic prose.
 
     `peer_thresholds` (Phase 2c, optional) overrides the V1.5 default
     cutoffs with empirical percentile-of-peers values. Schema:
       {
-        invisible_max: int,         # both scores < this → INVISIBLE
-        strong_min: int,            # both scores ≥ this → STRONG
-        misattributed_attr_max: int,  # attribution < this AND visibility ≥ invisible_max → MISATTRIBUTED
+        invisible_max: int,
+        strong_min: int,
+        misattributed_attr_max: int,
       }
-
-    When peer_thresholds is supplied, the explanation paragraph is
-    augmented with the percentile context so BD reps can read e.g.
-    "your visibility is bottom-quartile vs category peers (median 71%)"
-    instead of an abstract score. Missing keys fall back to defaults
-    individually — partial overrides are supported.
-
-    Source-of-truth for empirical thresholds: aggregate the BD reports
-    + Pivota PDP self-baseline runs into a peer cohort, compute P25/P50/
-    P75. Phase 2c ships the call site only — calibration data flows
-    through this kwarg from a future scheduled job."""
+    Missing keys fall back to defaults individually. When supplied, a
+    one-line peer-context prefix is prepended so callers can see "your
+    visibility {N}/100" against the calibrated cohort.
+    """
     t = dict(DEFAULT_VERDICT_THRESHOLDS)
     if peer_thresholds:
         for k, v in peer_thresholds.items():
@@ -589,8 +803,6 @@ def verdict_for(
     strong_min = t["strong_min"]
     misattr_attr_max = t["misattributed_attr_max"]
 
-    # When using calibrated thresholds, prefix the explanation with the
-    # peer-distribution context so the BD rep has comparative framing.
     peer_prefix = ""
     if peer_thresholds:
         peer_prefix = (
@@ -599,124 +811,18 @@ def verdict_for(
             f"Your visibility {visibility_score}/100, attribution {attribution_score}/100.)_  \n\n"
         )
 
-    # VISIBLE VIA RETAILERS — sharpest BD framing. Triggers when the
-    # category test surfaced the brand strongly but the merchant's
-    # own first-party attribution lags far behind: the brand IS
-    # findable in the AI channel, just mostly through retailer pages
-    # (Sephora, Vogue Scandinavia, skinsort, etc.) rather than the
-    # merchant's own URL.
-    #
-    # The check is gap-based, not absolute: it fires when (category -
-    # attribution) >= invisible_max AND attribution < strong_min. This
-    # catches both the BoJ-class case (cat=67, attr=0 → gap 67) and
-    # the COSRX-class case (cat=100, attr=33 → gap 67) — both have
-    # "retailers eating most of the AI funnel" as the right pitch
-    # framing. A merchant with cat=80, attr=70 (gap=10) stays in
-    # STRONG/PARTIAL because their own attribution is already
-    # consistently captured.
-    #
-    # Checked BEFORE INVISIBLE / MISATTRIBUTED so cat-strong + attr-
-    # weak cases land here even when raw attribution clears the
-    # misattributed_attr_max floor.
-    if (
-        category_visibility_score is not None
-        and category_visibility_score >= invisible_max
-        and attribution_score < strong_min
-        and (category_visibility_score - attribution_score) >= invisible_max
-    ):
-        return (
-            VERDICT_VIA_RETAILERS,
-            peer_prefix + (
-                "AI shopping agents recognize this brand in category-level "
-                "queries — but the funnel mostly routes consumers through "
-                "third-party retailers (Sephora, Vogue Scandinavia, Ulta, "
-                "Target, beauty marketplaces) rather than the merchant's own "
-                "URL. The brand is findable in the AI channel; the merchant "
-                "just isn't capturing the funnel consistently. Pivota's value "
-                "here is two-part and complementary to existing retail "
-                "distribution: (1) a canonical AI-channel PDP that captures "
-                "direct first-party attribution as AI shopping grows from "
-                "~12% to a projected 25-30% of D2C beauty traffic over the "
-                "next 24 months — every retailer-cited query today is a "
-                "deferred margin and a customer relationship the merchant "
-                "doesn't own; (2) an in-chat transaction surface (Pivota's "
-                "agentic-commerce protocol) so consumers asking Gemini / "
-                "ChatGPT can complete checkout without leaving the AI "
-                "assistant. This is not an SEO fix — the merchant's existing "
-                "retail channels work fine. It's the AI-native transaction "
-                "surface the merchant doesn't have today, sized for the "
-                "channel that will dominate D2C beauty in 24 months."
-            ),
-        )
-    if visibility_score < invisible_max and attribution_score < invisible_max:
-        return (
-            VERDICT_INVISIBLE,
-            peer_prefix + (
-                "AI shopping agents don't surface this product at all when "
-                "consumers ask natural buyer queries. The merchant has effectively "
-                "zero presence in this channel today. As consumer search continues "
-                "to migrate from Google to ChatGPT / Gemini / Perplexity (~12% of "
-                "D2C beauty traffic today, projected 25-30% by 2028), the merchant "
-                "is losing access to a fast-growing acquisition surface they have "
-                "no way to influence directly. Pivota's foundation step here is the "
-                "canonical AI-channel PDP that gets the brand cited at all; once "
-                "visibility clears the floor, in-chat checkout via Pivota's "
-                "agentic-commerce protocol becomes the second leverage point — "
-                "consumers complete the transaction inside Gemini / ChatGPT instead "
-                "of being routed through retailer.com."
-            ),
-        )
-    if attribution_score < misattr_attr_max and visibility_score >= invisible_max:
-        return (
-            VERDICT_MISATTRIBUTED,
-            peer_prefix + (
-                "AI agents recognize this product but consistently direct consumers "
-                "to third-party retailers (marketplaces, beauty blogs, competitor "
-                "stores) instead of the merchant's own site. Every cited URL that's "
-                "not the merchant's is lost organic traffic — and a margin hit if "
-                "the cited path is a third-party reseller. The demand exists; it's "
-                "just being captured by competitors. Pivota's value here is two-part "
-                "and complementary to existing retail distribution: (1) the canonical "
-                "AI-channel PDP captures direct first-party attribution as AI shopping "
-                "grows from ~12% to a projected 25-30% of D2C beauty discovery over "
-                "the next 24 months; (2) in-chat checkout via Pivota's agentic-"
-                "commerce protocol — consumers ask Gemini and complete purchase "
-                "inside the assistant, no redirect, no retailer markup. This is "
-                "AI-channel-native commerce, not an SEO fix."
-            ),
-        )
-    if visibility_score >= strong_min and attribution_score >= strong_min:
-        return (
-            VERDICT_STRONG,
-            peer_prefix + (
-                "AI agents reliably surface this product AND cite the merchant's own "
-                "canonical URL as the buying path. The discovery-and-attribution "
-                "problem is solved at the audit level. The next AI-channel UX "
-                "boundary is in-chat checkout: when a consumer asks Gemini / ChatGPT "
-                "and decides to buy, completing the purchase inside the assistant "
-                "(via Pivota's agentic-commerce protocol) rather than redirecting to "
-                "the merchant's site is what AI-native commerce looks like at this "
-                "stage. Today every consumer who clicks through is one cart-"
-                "abandonment risk + one redirect away from the conversion they "
-                "already committed to. Pivota's leverage at STRONG is highest here, "
-                "not at the SEO/attribution layer the merchant has already won."
-            ),
-        )
-    return (
-        VERDICT_PARTIAL,
-        peer_prefix + (
-            "Mixed result — the product gets surfaced sometimes, and gets "
-            "attributed to the merchant's own URL sometimes, but neither is "
-            "consistent. The foundation is partly there. Pivota's two-part value "
-            "prop applies cleanly: (1) tighten first-party attribution on the "
-            "queries that currently route to retailers via the canonical "
-            "AI-channel PDP; (2) for the queries that DO already reach the merchant, "
-            "add in-chat checkout via Pivota's agentic-commerce protocol so "
-            "consumers complete purchase inside Gemini / ChatGPT instead of being "
-            "redirected out. The failing-query table below shows which gap is "
-            "larger — that determines which lever to pull first in onboarding."
-        ),
+    label = _classify_verdict(
+        visibility_score,
+        attribution_score,
+        category_visibility_score,
+        invisible_max,
+        strong_min,
+        misattr_attr_max,
     )
+    explanation = _explain_verdict(
+        label, visibility_score, attribution_score, evidence or {}
+    )
+    return label, peer_prefix + explanation
 
 
 def calibrate_thresholds_from_baseline(
@@ -1159,6 +1265,13 @@ _CATEGORY_KEYWORDS: List[Tuple[str, List[str]]] = [
     ("fashion", [
         "shirt", "tee", "dress", "jacket", "coat", "pants", "jeans",
         "sneaker", "shoe", "bag", "handbag", "backpack", "scarf", "hat",
+        # Sleepwear / loungewear / intimates — same vertical for the
+        # purpose of industry context (D2C apparel, retailer-mediated
+        # discovery), so they share the fashion blurb until BD validates
+        # a sleepwear-specific projection.
+        "sleepwear", "pajama", "pyjama", "robe", "loungewear",
+        "nightgown", "lingerie", "intimates", "underwear", "bralette",
+        "swimwear", "swimsuit", "bikini",
     ]),
     ("fitness", [
         "supplement", "protein", "vitamin", "creatine", "yoga", "mat",
@@ -1227,134 +1340,163 @@ def _generate_action_items(
     competitor_hosts: List[Dict[str, Any]],
     merchant_cited_runs: int,
     runs_with_any_citation: int,
+    visibility_score: int = 0,
     attribution_score: int = 0,
     category_retailer_hosts: Optional[List[Dict[str, Any]]] = None,
     category_competitor_brands: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Return a list of 3-5 specific action items. Each item has
-    `severity` (critical|high|medium|low), `title`, `body` (BD-rep
-    facing prose), and optional `evidence` (the failed query / cited
-    competitor host that drives this action)."""
+    `severity` (critical|high|medium|low), `title`, `body` (merchant-
+    facing diagnostic prose, evidence-bound), and optional `evidence`
+    (the failed query / cited competitor host that drives this action).
+
+    Pitch-free: no "Pivota's agentic-commerce protocol", no "12% →
+    25-30%" macros, no "complementary to existing retail distribution".
+    Those live in `_build_what_pivota_changes` exclusively.
+    """
     items: List[Dict[str, Any]] = []
 
-    # Pull the failures we'll reference in evidence text.
-    failed_attribution_queries = [
-        run.get("query") or ""
-        for run in attribution_runs
-        if not (run.get("parsed") or {}).get("merchant_url_found")
-    ]
-    failed_visibility_queries = [
-        run.get("query") or ""
-        for run in visibility_runs
-        if not ((run.get("parsed") or {}).get("product_visible") and (run.get("grounding_chunks") or []))
-    ]
+    # Failures named in evidence text — shared with verdict_for via
+    # module-level helpers so vocabulary stays consistent.
+    failed_attribution_queries = _failed_attribution_queries(attribution_runs)
+    failed_visibility_queries = _failed_visibility_queries(visibility_runs)
     top_competitor = competitor_hosts[0] if competitor_hosts else None
+    top_retailer_names = [
+        r["host"] for r in (category_retailer_hosts or [])[:3] if r.get("host")
+    ]
+    retailers_phrase = ", ".join(top_retailer_names)
+    attribution_runs_total = len(attribution_runs)
 
-    # Action 1: severity-stratified headline that ties the verdict to
-    # the merchant's specific failure pattern.
-    if verdict_label == "INVISIBLE":
+    # Action 1: severity-stratified headline tied to this merchant's
+    # specific failure pattern. All five tiers data-bind off the same
+    # extracted variables so the language stays consistent.
+    if verdict_label == VERDICT_INVISIBLE:
+        body = (
+            f"Across {attribution_runs_total} buyer-intent queries we "
+            f"tested, AI agents returned zero grounded references to "
+            f"your store"
+        )
+        if retailers_phrase:
+            body += f". {retailers_phrase} captured the citation slots that should have been yours"
+        body += (
+            ". Grounded LLM citations are downstream of Google's index, "
+            "so the typical root cause is that Google hasn't indexed "
+            "your canonical PDPs yet. Submit your sitemap.xml to "
+            "Search Console, request URL Inspection indexing for your "
+            "top SKUs, and re-test in 72 hours."
+        )
         items.append({
             "severity": "critical",
-            "title": "Index your canonical PDPs with Search Console",
-            "body": (
-                "AI shopping agents return zero grounded references to your "
-                "store across the queries we tested. The most likely root "
-                "cause is that Google has not yet indexed your flagship PDPs "
-                "(grounded LLM citations are downstream of Google's index). "
-                "Submit your sitemap.xml to Search Console, request URL "
-                "Inspection indexing for your top 5 SKUs, and re-test in "
-                "72 hours."
-            ),
+            "title": "Index your canonical PDPs with Google Search Console",
+            "body": body,
+            "evidence": {
+                "queries_tested": attribution_runs_total,
+                "top_retailers": top_retailer_names[:5],
+            } if top_retailer_names else {"queries_tested": attribution_runs_total},
         })
-    elif verdict_label == "VISIBLE BUT MISATTRIBUTED":
+    elif verdict_label == VERDICT_MISATTRIBUTED:
+        if top_retailer_names:
+            title = f"Reclaim attribution from {top_retailer_names[0]} and other resellers"
+        else:
+            title = "Reclaim direct attribution from third-party retailers"
+        body = (
+            f"AI agents recognize your product (visibility "
+            f"{visibility_score}/100) but your URL appears in "
+            f"{merchant_cited_runs} of {attribution_runs_total} buyer-"
+            f"intent queries"
+        )
+        if retailers_phrase:
+            body += f". The remaining {attribution_runs_total - merchant_cited_runs} route through {retailers_phrase}"
+        body += (
+            ". Every cited URL that's not yours is lost organic "
+            "traffic — and a margin hit if the cited path is a "
+            "reseller. The demand exists; it's just being captured by "
+            "competitors."
+        )
         items.append({
             "severity": "critical",
-            "title": "Reclaim direct attribution from third-party retailers",
-            "body": (
-                "AI agents recognize the product but consistently send "
-                "consumers to third-party retailers (marketplaces, beauty "
-                "blogs, competitor stores) instead of your own URL. Every "
-                "cited URL that's not yours is lost organic traffic and a "
-                "margin hit if the cited path is a reseller. This is the "
-                "highest-impact failure mode — the demand exists; it's "
-                "just being captured by competitors."
-            ),
+            "title": title,
+            "body": body,
+            "evidence": {
+                "merchant_cited_runs": merchant_cited_runs,
+                "queries_tested": attribution_runs_total,
+                "top_retailers": top_retailer_names[:5],
+            },
         })
-    elif verdict_label == "VISIBLE VIA RETAILERS":
-        # Build a top-retailer mention into the body when we have data.
-        retailer_phrase = ""
-        if category_retailer_hosts:
-            top_retailers = [
-                r["host"] for r in category_retailer_hosts[:3] if r.get("host")
-            ]
-            if top_retailers:
-                retailer_phrase = (
-                    f" Top retailers capturing the AI-channel funnel today: "
-                    f"{', '.join(top_retailers)}."
-                )
-        # Conditional opener: when the merchant captures SOME first-party
-        # attribution we shouldn't say "every grounded citation" — that
-        # reads false to a brand like COSRX that already has cosrx.com
-        # surfaced 1/3 of buyer-intent queries. Lead with the actual
-        # gap percentage instead.
-        attr_score = int(attribution_score)
-        if attr_score == 0:
+    elif verdict_label == VERDICT_VIA_RETAILERS:
+        # Conditional opener: brands like COSRX with cat=100/attr=33
+        # already capture some first-party attribution; lead with the
+        # gap, not "every grounded citation".
+        if attribution_score == 0:
             opener = (
-                "Your brand IS findable in AI-channel category queries — but "
-                "every grounded citation routes consumers through third-party "
-                "retailers instead of your own URL."
+                "Your brand IS findable in AI-channel category queries "
+                "— but every grounded citation routes consumers through "
+                "third-party retailers instead of your own URL."
             )
         else:
-            gap_pct = max(0, 100 - attr_score)
+            gap_pct = max(0, 100 - attribution_score)
             opener = (
-                f"Your brand IS findable in AI-channel category queries — and "
-                f"you capture {attr_score}% of buyer-intent queries to your "
-                f"own URL today. The remaining {gap_pct}% routes through "
-                f"third-party retailers."
+                f"Your brand IS findable in AI-channel category queries "
+                f"— and you capture {attribution_score}% of buyer-intent "
+                f"queries to your own URL today. The remaining "
+                f"{gap_pct}% routes through third-party retailers."
+            )
+        if retailers_phrase:
+            opener += (
+                f" Top retailers capturing the AI-channel funnel today: "
+                f"{retailers_phrase}."
             )
         items.append({
             "severity": "critical",
             "title": "Capture the AI-channel funnel that retailers are taking today",
-            "body": (
-                opener + retailer_phrase + " "
-                "Pivota's canonical PDP closes that gap two ways, "
-                "complementary to existing retail distribution: (a) consistent "
-                "first-party attribution as AI shopping grows from ~12% to a "
-                "projected 25-30% of D2C beauty traffic over the next 24 months; "
-                "(b) in-chat checkout via Pivota's agentic-commerce protocol — "
-                "consumers ask Gemini / ChatGPT and buy from the brand directly "
-                "without leaving the assistant or being routed through a "
-                "retailer's checkout. This is AI-channel-native commerce, not "
-                "an SEO fix."
-            ),
+            "body": opener,
             "evidence": (
                 {"top_retailer_hosts": [r["host"] for r in category_retailer_hosts[:5] if r.get("host")]}
                 if category_retailer_hosts
                 else None
             ),
         })
-    elif verdict_label == "STRONG":
+    elif verdict_label == VERDICT_STRONG:
         items.append({
             "severity": "low",
             "title": "Maintain attribution with monitoring + drift detection",
             "body": (
-                "AI agents reliably surface your product AND cite your "
-                "canonical URL as the buying path. Goal state. Pivota's "
-                "role here is monitoring: alert on attribution drift, "
-                "detect schema regressions, surface new competitor cites "
-                "before they erode share."
+                f"AI agents cite your URL in {merchant_cited_runs} of "
+                f"{attribution_runs_total} buyer-intent queries "
+                f"(visibility {visibility_score}/100, attribution "
+                f"{attribution_score}/100). Both discovery and "
+                f"attribution are at goal state. Watch for drift: "
+                f"alert on attribution dropping below "
+                f"{max(0, attribution_score - 15)}, schema regressions, "
+                f"and new competitor cites that erode share."
             ),
+            "evidence": {
+                "merchant_cited_runs": merchant_cited_runs,
+                "queries_tested": attribution_runs_total,
+            },
         })
     else:  # PARTIAL
+        body = (
+            f"Visibility {visibility_score}/100, attribution "
+            f"{attribution_score}/100. Of {attribution_runs_total} "
+            f"buyer-intent queries, {merchant_cited_runs} cited your "
+            f"URL; the rest routed elsewhere"
+        )
+        if retailers_phrase:
+            body += f" (top: {retailers_phrase})"
+        body += (
+            ". The specific failing queries below are where the gaps "
+            "are — close those first."
+        )
         items.append({
             "severity": "high",
             "title": "Close the gap on inconsistent queries",
-            "body": (
-                "Your product gets surfaced sometimes and gets attributed "
-                "to your URL sometimes, but neither is consistent. The "
-                "specific queries below are where the gaps are — close "
-                "those before pitching for full Pivota onboarding."
-            ),
+            "body": body,
+            "evidence": {
+                "merchant_cited_runs": merchant_cited_runs,
+                "queries_tested": attribution_runs_total,
+                "top_retailers": top_retailer_names[:5],
+            },
         })
 
     # Action 2: top competitor capture, named with frequency.
@@ -1364,29 +1506,30 @@ def _generate_action_items(
             "title": f"Top citation drain: {top_competitor['host']}",
             "body": (
                 f"`{top_competitor['host']}` was cited by Gemini in "
-                f"{top_competitor['times_cited']} of the queries we tested. "
-                "They're capturing demand that should be yours — every "
-                "consumer arriving via that path is one your direct site "
-                "didn't get. If they're a reseller, the margin loss is "
-                "compounded; if they're a marketplace, you're trading a "
-                "first-party customer relationship for a transaction."
+                f"{top_competitor['times_cited']} of the queries we "
+                f"tested. They're capturing demand that should be "
+                f"yours — every consumer arriving via that path is one "
+                f"your direct site didn't get. If they're a reseller, "
+                f"the margin loss is compounded; if they're a "
+                f"marketplace, you're trading a first-party customer "
+                f"relationship for a transaction."
             ),
             "evidence": {"competitor_host": top_competitor["host"]},
         })
 
-    # Action 3: zero-citation case (more severe than just missing in
-    # individual runs — means the merchant's URL never showed in ANY
-    # grounded source).
+    # Action 3: zero-citation case — more severe than just missing in
+    # individual runs (the merchant's URL never showed in ANY grounded
+    # source).
     if runs_with_any_citation > 0 and merchant_cited_runs == 0:
         items.append({
             "severity": "critical",
             "title": "Zero direct AI-channel attribution today",
             "body": (
                 f"Across {runs_with_any_citation} queries that returned "
-                "grounded sources, your verified URL appeared in zero of "
-                "them. Every grounded citation went to a third party. "
-                "First-party AI attribution is currently zero — there is "
-                "no organic AI-channel funnel."
+                f"grounded sources, your verified URL appeared in zero "
+                f"of them. Every grounded citation went to a third "
+                f"party. First-party AI attribution is currently zero — "
+                f"there is no organic AI-channel funnel."
             ),
         })
 
@@ -1401,39 +1544,39 @@ def _generate_action_items(
             "title": "Specific queries where your URL was missing",
             "body": (
                 f"Gemini's grounded answer to {sample} did not include "
-                "your verified PDP URL. These are buyer-intent queries "
-                "that should naturally route to your store; closing them "
-                "is the fastest path to attribution lift."
+                f"your verified PDP URL. These are buyer-intent queries "
+                f"that should naturally route to your store; closing "
+                f"them is the fastest path to attribution lift."
             ),
             "evidence": {"failed_queries": failed_attribution_queries[:5]},
         })
 
     # Action 5: visibility gap (open-product test failed grounding gate).
-    # Suppressed for VIA_RETAILERS — the action's "your PDP isn't indexed"
-    # framing is misleading for retail-strong brands where category
-    # discoverability is high (their PDPs are demonstrably indexed; the
-    # buyer-intent queries are just too long-tail). The right call for
-    # VIA_RETAILERS is action #1's value-prop framing, not SEO hygiene.
+    # Suppressed for VIA_RETAILERS — "your PDP isn't indexed" reads
+    # false for retail-strong brands whose PDPs ARE indexed; their
+    # buyer-intent queries are just too long-tail. Suppressed for
+    # STRONG too — discovery is solved.
     if (
         failed_visibility_queries
-        and verdict_label != "STRONG"
-        and verdict_label != "VISIBLE VIA RETAILERS"
+        and verdict_label != VERDICT_STRONG
+        and verdict_label != VERDICT_VIA_RETAILERS
     ):
         items.append({
             "severity": "medium",
             "title": "Strengthen schema + sitemap inclusion for visibility",
             "body": (
-                "The product wasn't surfaced with grounded sources on at "
-                "least one query — meaning Gemini either has no live-web "
-                "knowledge of the product, or your PDP isn't indexed enough "
-                "for grounded retrieval. Pivota's canonical PDP includes "
-                "Schema.org Product + Breadcrumb + sitemap submission, "
-                "which is the foundation grounded LLMs need to surface "
-                "your product confidently."
+                f"The product wasn't surfaced with grounded sources on "
+                f"{len(failed_visibility_queries)} of "
+                f"{len(visibility_runs)} visibility queries. Either "
+                f"Gemini has no live-web knowledge of the product, or "
+                f"your PDP isn't indexed deeply enough for grounded "
+                f"retrieval. Schema.org Product + Breadcrumb markup "
+                f"plus a Search-Console-submitted sitemap is the "
+                f"foundation grounded LLMs need."
             ),
         })
 
-    # Cap at 5 items so the BD page stays scannable.
+    # Cap at 5 items so the report stays scannable.
     return items[:5]
 
 
@@ -2112,10 +2255,45 @@ def build_structured_report(
         # Probe ran but returned no runs — keep score=0 for consistency.
         category_score = 0
 
+    # Build competitive_pressure first — its `framing` string is folded
+    # into the verdict explanation as the second sentence (when
+    # available) so we don't repeat the analysis in two places.
+    competitive_pressure = _build_competitive_pressure(
+        category_competitor_brands=category_competitor_brands,
+        category_retailer_hosts=category_retailer_hosts,
+        merchant_brand=merchant_brand,
+        merchant_host=merchant_host,
+        merchant_attribution_score=attribution_score,
+    )
+
+    # Evidence dict for verdict_for — references THIS audit's actual
+    # numbers (top retailers, failed query sample, gap pct, peer
+    # framing) so the explanation paragraph names real things instead
+    # of falling back to generic prose.
+    top_retailer_hosts = [
+        r["host"]
+        for r in (category_retailer_hosts or [])[:5]
+        if r.get("host")
+    ]
+    gap_pct = (
+        max(0, category_score - attribution_score)
+        if category_score is not None
+        else None
+    )
+    verdict_evidence: Dict[str, Any] = {
+        "attribution_runs_total": len(attribution_runs),
+        "merchant_cited_runs": merchant_cited_runs,
+        "top_retailers": top_retailer_hosts,
+        "competitive_pressure_framing": (competitive_pressure or {}).get("framing"),
+        "category_score": category_score,
+        "gap_pct": gap_pct,
+        "failed_attribution_query_sample": _failed_attribution_queries(attribution_runs)[:3],
+    }
     verdict_label, verdict_explanation = verdict_for(
         visibility_score,
         attribution_score,
         category_visibility_score=category_score,
+        evidence=verdict_evidence,
     )
 
     # Critical for credibility: surface what the upstream ACTUALLY used,
@@ -2159,6 +2337,7 @@ def build_structured_report(
         competitor_hosts=competitor_hosts_list,
         merchant_cited_runs=merchant_cited_runs,
         runs_with_any_citation=runs_with_any_citation,
+        visibility_score=visibility_score,
         attribution_score=attribution_score,
         category_retailer_hosts=category_retailer_hosts,
         category_competitor_brands=category_competitor_brands,
@@ -2176,13 +2355,6 @@ def build_structured_report(
         merchant_cited_runs=merchant_cited_runs,
         category_retailer_hosts=category_retailer_hosts,
         category_visibility_score=category_score,
-    )
-    competitive_pressure = _build_competitive_pressure(
-        category_competitor_brands=category_competitor_brands,
-        category_retailer_hosts=category_retailer_hosts,
-        merchant_brand=merchant_brand,
-        merchant_host=merchant_host,
-        merchant_attribution_score=attribution_score,
     )
 
     return {
