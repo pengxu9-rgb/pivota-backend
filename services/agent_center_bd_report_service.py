@@ -2446,6 +2446,115 @@ def _build_failed_queries_detailed(
     return out
 
 
+def _build_visibility_plain_summary(
+    *,
+    verdict_label: str,
+    visibility_score: int,
+    attribution_score: int,
+    category_visibility_score: Optional[int],
+    attribution_runs_total: int,
+    merchant_cited_runs: int,
+    top_retailers: List[str],
+) -> str:
+    """Merchant-friendly translation of the score combination.
+
+    Merchants see two scores (`visibility` and `attribution`) plus a
+    technical verdict explanation and ask the obvious question:
+    "Am I visible to AI users or not?". This helper answers that
+    question directly per tier, in one short paragraph, without
+    re-stating the scores in math notation.
+
+    Distinct from `verdict.explanation` (the per-tier diagnostic
+    paragraph) — that lands the technical claim with named retailers
+    + numbers; this one is the merchant-comprehension layer above it.
+    """
+    retailers_phrase = ", ".join(top_retailers[:3]) if top_retailers else "third-party hosts"
+
+    if verdict_label == VERDICT_INVISIBLE:
+        return (
+            "No — AI agents don't surface your brand or your products "
+            "today. The likely root cause is that your canonical PDPs "
+            "aren't indexed by Google yet, so grounded LLMs have "
+            "nothing to cite."
+        )
+
+    if verdict_label == VERDICT_VIA_RETAILERS:
+        cs = category_visibility_score or 0
+        gap_pct = max(0, cs - attribution_score)
+        return (
+            f"Yes and no. AI agents DO recognize your brand at the "
+            f"category level — when consumers ask 'best X', your "
+            f"brand is mentioned. But when they ask where to actually "
+            f"buy your products, AI cites editorial / retailer pages "
+            f"({retailers_phrase}) instead of your URL {gap_pct}% of "
+            f"the time. You have brand recognition; you don't yet "
+            f"have first-party traffic."
+        )
+
+    if verdict_label == VERDICT_MISATTRIBUTED:
+        return (
+            f"Partly. AI agents recognize your product, but when "
+            f"buyers ask where to find it, your URL appears in "
+            f"{merchant_cited_runs} of {attribution_runs_total} "
+            f"buyer-intent queries — the rest route to "
+            f"{retailers_phrase}. The product is recognized; the "
+            f"buying funnel isn't yours."
+        )
+
+    if verdict_label == VERDICT_STRONG:
+        return (
+            f"Yes. AI agents reliably surface your product AND cite "
+            f"your URL as the buying path "
+            f"({merchant_cited_runs} of {attribution_runs_total} "
+            f"buyer-intent queries). Discovery and direct attribution "
+            f"are at goal state."
+        )
+
+    # PARTIAL
+    return (
+        f"Mixed. AI agents sometimes find your product and sometimes "
+        f"cite your URL, but neither is consistent — visibility "
+        f"{visibility_score}/100, attribution {attribution_score}/100. "
+        f"The action items below show the bigger gap to close first."
+    )
+
+
+def _build_competitive_table(
+    competitive_pressure: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Flat per-brand rows merging `peers_named` (every competitor
+    brand AI agents named) with `peers_with_first_party_visibility`
+    (subset whose .com is cited). Frontend renders as a table directly.
+
+    Schema per row:
+      brand                    : str
+      times_mentioned          : int  — how often the brand was named
+      first_party_visible      : bool — does their .com appear in grounded sources?
+      first_party_host         : Optional[str]
+      host_citations           : int  — how many times their host was cited
+    """
+    peers_named = (competitive_pressure or {}).get("peers_named") or []
+    peers_with_fp = (competitive_pressure or {}).get("peers_with_first_party_visibility") or []
+    fp_by_brand: Dict[str, Dict[str, Any]] = {
+        (p.get("brand") or "").lower(): p for p in peers_with_fp
+    }
+
+    rows: List[Dict[str, Any]] = []
+    for entry in peers_named:
+        brand = entry.get("name") or ""
+        if not brand:
+            continue
+        fp = fp_by_brand.get(brand.lower())
+        rows.append({
+            "brand": brand,
+            "times_mentioned": int(entry.get("times_cited") or 0),
+            "first_party_visible": bool(fp),
+            "first_party_host": (fp or {}).get("first_party_host"),
+            "host_citations": int((fp or {}).get("host_citations") or 0),
+        })
+    return rows
+
+
 def _build_merchant_view(
     *,
     verdict_label: str,
@@ -2547,10 +2656,31 @@ def _build_merchant_view(
     )
     merged_actions = list(action_items or []) + list(playbook_actions or [])
 
+    plain_summary = _build_visibility_plain_summary(
+        verdict_label=verdict_label,
+        visibility_score=visibility_score,
+        attribution_score=attribution_score,
+        category_visibility_score=category_visibility_score,
+        attribution_runs_total=len(attribution_runs or []),
+        merchant_cited_runs=merchant_cited_runs,
+        top_retailers=[
+            h.get("host")
+            for h in (category_retailer_hosts or [])[:3]
+            if h.get("host")
+        ],
+    )
+    competitive_table = _build_competitive_table(competitive_pressure or {})
+
     return {
         "headline": {
             "verdict_label": verdict_label,
             "one_liner": headline_one_liner or None,
+            # Plain-language answer to "Am I visible to AI users or
+            # not?" — translates the score combination into one short
+            # paragraph the merchant can read without parsing the
+            # vis/attr/category math. Distinct from `verdict.explanation`
+            # (technical diagnostic) — see _build_visibility_plain_summary.
+            "plain_summary": plain_summary,
             "scores": {
                 "visibility": visibility_score,
                 "attribution": attribution_score,
@@ -2593,6 +2723,11 @@ def _build_merchant_view(
                 for b in (category_competitor_brands or [])[:5]
                 if b.get("name")
             ],
+            # Flat per-brand rows merging peers_named + peers_with_
+            # first_party_visibility — frontend renders as a table.
+            # Each row: {brand, times_mentioned, first_party_visible,
+            # first_party_host, host_citations}.
+            "competitive_table": competitive_table,
         },
         "diagnosis": {
             "primary": (competitive_pressure or {}).get("framing"),
