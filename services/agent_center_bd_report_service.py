@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
-from services.cited_host_classifier import classify_cited_hosts
+from services.cited_host_classifier import classify_cited_hosts, classify_host
 
 
 # ---------------------------------------------------------------------------
@@ -2195,6 +2195,95 @@ def _build_what_pivota_changes(
     }
 
 
+def _build_failed_queries_detailed(
+    attribution_runs: List[Dict[str, Any]],
+    *,
+    merchant_brand: Optional[str],
+    merchant_host: Optional[str],
+    merchant_category: Optional[str],
+    cap: int = 10,
+) -> List[Dict[str, Any]]:
+    """For each attribution-test query where the merchant's URL was
+    NOT cited, surface what *did* win + which competitors Gemini
+    named. Closes the gap between "your URL was missing on N queries"
+    and "for THIS query, strategist.com cited Lunya / Eberjey / Hill
+    House Home — your brand absent."
+
+    Each entry:
+      query              : verbatim query Gemini was asked
+      top_cited_url      : winning URL (None when no grounded sources)
+      top_cited_host     : hostname extracted from top_cited_url
+      host_classification: classify_host output (type / coverage /
+                           outreach hint), without the redundant `host`
+                           field (it's already in `top_cited_host`)
+      competitors_named  : up to 5 competitor brand names from
+                           parsed.competitors_appearing, with the
+                           merchant's own brand filtered out
+
+    Capped at `cap` entries (default 10) to keep response size bounded
+    even on large probe runs.
+    """
+    out: List[Dict[str, Any]] = []
+    brand_lower = (merchant_brand or "").strip().lower()
+    host_lower = (merchant_host or "").strip().lower()
+
+    for run in attribution_runs or []:
+        parsed = run.get("parsed") or {}
+        if parsed.get("merchant_url_found"):
+            continue  # query succeeded, not in the "failed" set
+
+        chunks = run.get("grounding_chunks") or []
+        top_url: Optional[str] = chunks[0] if chunks else None
+        top_host: Optional[str] = normalize_host(top_url) if top_url else None
+
+        # If the "top cited host" actually IS the merchant (rare —
+        # parsed.merchant_url_found should already catch this) skip
+        # to avoid a confusing "you won this query but it's listed as
+        # failed" output.
+        if top_host and host_lower and host_lower in top_host.lower():
+            continue
+
+        competitors: List[str] = []
+        for raw in parsed.get("competitors_appearing") or []:
+            if not isinstance(raw, str):
+                continue
+            name = raw.strip()
+            if not name:
+                continue
+            name_lower = name.lower()
+            if brand_lower and (brand_lower in name_lower or name_lower in brand_lower):
+                continue
+            competitors.append(name)
+            if len(competitors) >= 5:
+                break
+
+        host_classification: Dict[str, Any]
+        if top_host:
+            full = classify_host(top_host, merchant_category=merchant_category)
+            host_classification = {k: v for k, v in full.items() if k != "host"}
+        else:
+            host_classification = {
+                "type": "unclassified",
+                "subtype": None,
+                "categories": [],
+                "coverage_note": None,
+                "outreach_hint": None,
+                "applies_to_merchant_category": None,
+            }
+
+        out.append({
+            "query": (run.get("query") or "").strip(),
+            "top_cited_url": top_url,
+            "top_cited_host": top_host,
+            "host_classification": host_classification,
+            "competitors_named": competitors,
+        })
+        if len(out) >= cap:
+            break
+
+    return out
+
+
 def _build_merchant_view(
     *,
     verdict_label: str,
@@ -2206,7 +2295,7 @@ def _build_merchant_view(
     action_items: List[Dict[str, Any]],
     competitive_pressure: Dict[str, Any],
     what_pivota_changes: Dict[str, Any],
-    attribution_runs_count: int,
+    attribution_runs: List[Dict[str, Any]],
     merchant_cited_runs: int,
     competitor_hosts_list: List[Dict[str, Any]],
     category_retailer_hosts: List[Dict[str, Any]],
@@ -2214,6 +2303,8 @@ def _build_merchant_view(
     visibility_query_rows: List[Dict[str, Any]],
     attribution_query_rows: List[Dict[str, Any]],
     url_source: Optional[str],
+    merchant_brand: Optional[str],
+    merchant_host: Optional[str],
 ) -> Dict[str, Any]:
     """Project the already-computed structured report into a 6-layer
     information architecture the merchant portal can render directly:
@@ -2280,9 +2371,20 @@ def _build_merchant_view(
             "url_source": url_source,
         },
         "receipts": {
-            "queries_tested": attribution_runs_count,
+            "queries_tested": len(attribution_runs or []),
             "merchant_cited_in": merchant_cited_runs,
             "top_cited_urls": top_cited_urls_unique,
+            # Phase C-4 PR-F: per-failed-query winner attribution.
+            # Each entry: {query, top_cited_url, top_cited_host,
+            # host_classification, competitors_named}. Closes the gap
+            # between "your URL was missing on N queries" and "for THIS
+            # query, this host won, with these competitor brands".
+            "failed_queries_detailed": _build_failed_queries_detailed(
+                attribution_runs,
+                merchant_brand=merchant_brand,
+                merchant_host=merchant_host,
+                merchant_category=(industry_context or {}).get("category"),
+            ),
             # Honest naming: these are "all hosts cited in grounded
             # sources except the merchant's own". Could be retailers
             # (nordstrom.com, sephora.com), competitor brand .coms
@@ -2533,7 +2635,7 @@ def build_structured_report(
         action_items=action_items,
         competitive_pressure=competitive_pressure,
         what_pivota_changes=what_pivota_changes,
-        attribution_runs_count=len(attribution_runs),
+        attribution_runs=attribution_runs,
         merchant_cited_runs=merchant_cited_runs,
         competitor_hosts_list=competitor_hosts_list,
         category_retailer_hosts=category_retailer_hosts or [],
@@ -2541,6 +2643,8 @@ def build_structured_report(
         visibility_query_rows=visibility_query_rows,
         attribution_query_rows=attribution_query_rows,
         url_source=url_source,
+        merchant_brand=merchant_brand,
+        merchant_host=merchant_host,
     )
 
     return {
