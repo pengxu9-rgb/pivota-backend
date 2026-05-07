@@ -36,6 +36,17 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "last_validated_at",
         },
     ),
+    RequiredTableColumns(
+        table="catalog_products",
+        columns={
+            # Pivota canonical PDP — see migration 071. The canonical
+            # resolver (routes/pivota_canonical_routes.py) and the
+            # audit URL fallback (routes/merchant_audit_routes.py)
+            # both depend on these columns being present.
+            "pivota_signature_id",
+            "pivota_canonical_url",
+        },
+    ),
 )
 
 
@@ -122,6 +133,29 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown',
                       ADD COLUMN IF NOT EXISTS validation_error TEXT,
                       ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE;
+                    """
+                )
+            )
+            # Pivota canonical PDP columns (migration 071). Fast-mode
+            # startup skips db/migrations/, so the schema guard owns
+            # these in production. Mirrors what's already in db.catalog
+            # (the SQLAlchemy model) — schema_guard is the runtime
+            # safety net.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS pivota_signature_id TEXT,
+                      ADD COLUMN IF NOT EXISTS pivota_canonical_url TEXT;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_products_pivota_signature
+                      ON catalog_products (pivota_signature_id)
+                      WHERE pivota_signature_id IS NOT NULL;
                     """
                 )
             )
