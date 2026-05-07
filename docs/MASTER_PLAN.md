@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-07 night — **Phase 7b SHIPPED to prod**. Probe v15 = **69.8%** (was 32%, +37.8pp). Lipstick **9/9** (was 0/9). All beauty buckets 100% PASS. Remaining 14 EMPTY are non-beauty categories with no canonical PDPs — Phase 4 expansion territory.
+- Last updated: 2026-05-07 night — **Phase 7b SHIPPED to prod** (probe v15 = 69.8%, lipstick 9/9, all beauty 100%). Follow-up PR #1315 open to close the only beauty gap (skincare_serum 0/2 PASS) by extending the same pattern to the ingredient_recall_direct path. Awaiting merge + deploy + probe v17.
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -70,6 +70,7 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | 7b Step 1 | Gateway-side canonicalCatalogSearch helper + 16 unit tests | ✅ | PIVOTA-Agent #1311 (claude/phase-7b-canonical-recall) |
 | 7b Step 2 | Wire helper into find_products_multi + dedupe + telemetry + 3 integration tests | ✅ | PIVOTA-Agent #1312, merged → prod commit `91cbcc98` |
 | 7b non-beauty deadline | Gateway-level 6000ms hard deadline on non-beauty primary upstream; authoritative strict-empty on hit; `fpm_primary_deadline_*` telemetry | ✅ | PIVOTA-Agent #1314, merged → prod commit `d98a8704` |
+| 7b ingredient_recall_direct | Extend canonical chain to ingredient_recall_direct path (closes the 2 serum THIN gaps from probe v15) | 🟡 PR open | PIVOTA-Agent #1315 (claude/phase-7b-ingredient-recall, commit `a30a9654`). Same pattern as #1312, applied at `server.js:~28950`. 24 jest tests pass across 5 Phase 7b suites. Pending: merge → auto-deploy → probe v17. Expected: skincare_serum 0/2 → 2/2, overall 37/53 → 39/53 = 73.6% (+3.8pp), all beauty 100%. |
 
 ---
 
@@ -90,6 +91,7 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | recall_v13_post_phase2_redo_1778187080 | Post Phase 2-redo (3442 NULL → category_path) | 17 | 10 | 26 | 0 | **32%** (0pp) |
 | recall_v14_phase7b_staging_deadline_1778195751 | Phase 7b + non-beauty deadline, staging | 37 | 2 | 14 | 0 | **69.8%** (+37.8pp) |
 | recall_v15_phase7b_prod_deadline_1778196048 | Phase 7b + non-beauty deadline, **prod** | 37 | 2 | 14 | 0 | **69.8%** (production parity) |
+| recall_v17_pre_pr1315_baseline_1778197677 | Pre-merge baseline (PR #1315 not yet deployed) | 37 | 3 | 13 | 0 | **70%** (≡ v15; serum still 0/2 PASS, 2 THIN) |
 
 **Headline insight:** every probe since v9_phase8 has *more* canonical data
 than the previous one, yet pass-rate has not returned to peak. The bottleneck
