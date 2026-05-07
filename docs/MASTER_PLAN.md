@@ -84,10 +84,17 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | recall_v9_phase9_1778124544 | After eye+face ingestion (Phase 9) | 15 | 10 | 27 | 1 | **28% — regression** |
 | recall_v10_phase7a_backfill_1778130307 | After Phase 7a backfill (lipstick + fragrance SKUs) | 16 | 10 | 26 | 1 | **30%** |
 | recall_v11_aurora_bff_1778170034 | Same data, source=aurora-bff (orchestrator localization probe) | 16 | 3 | 33 | 1 | **30%** |
+| recall_v12_post_backfill_1778176777 | Post 84+177 thin-desc content backfill | 17 | 10 | 26 | 0 | **32%** (+2pp) |
+| recall_v13_post_phase2_redo_1778187080 | Post Phase 2-redo (3442 NULL → category_path) | 17 | 10 | 26 | 0 | **32%** (0pp) |
 
 **Headline insight:** every probe since v9_phase8 has *more* canonical data
 than the previous one, yet pass-rate has not returned to peak. The bottleneck
 is no longer "do the rows exist" but "does the recall query reach them."
+
+**v13 cleanly confirms the gateway-disconnect diagnosis:** Phase 2-redo
+populated `catalog_products.category_path` on 3442 rows but probe pass-rate
+moved 0pp. The data is there; the gateway just doesn't read it. Phase 7b
+(gateway reads canonical chain) is now the only remaining lever.
 
 **v11 (aurora-bff) localization probe**: ran the same 53-query corpus under a
 different orchestrator (`source=aurora-bff` instead of `shopping_agent`).
@@ -380,32 +387,47 @@ the recall path doesn't surface lipstick. Fix #1 first, then extend.
 
 ---
 
-## Recommended next steps (priority order, post-audit 2026-05-07 evening)
+## Recommended next steps (post probe v13, 2026-05-07 evening)
 
-Re-prioritized after the user's ext→sig audit. **Content quality first**,
-recall fix parked.
+Three cycles of work landed in 12 hours: thin-desc backfill (84+177 rows),
+ext→sig migration audit, Phase 2-redo (3442 NULL → category_path).
+Probe v13 cleanly localized the bottleneck: **gateway recall doesn't read
+`catalog_products`**. All data layers are now in good shape — only the
+read-path code is missing.
 
-1. **Step 1 — Count-pollution cleanup (38 rows)** — see "Content backfill
-   plan" above. Dry-run + sample report first; reversibility-first
-   (gate-out before delete).
-2. **Step 2 — `description < 50` backfill (129 rows, K-beauty first)** —
-   30-row K-beauty batch, then expand. Add `pdp_content_hold_reason` column
-   to skip accessories/samples permanently.
-3. **Step 3 — Snapshot contract metadata (3467 rows)** — metadata-only,
-   no content rewrite. Can run in parallel with Step 2.
-4. **Run probe v12 after Steps 1+2 land** — the 129 thin descriptions
-   include some lipstick-adjacent rows; thicker content might quietly
-   move recall pass-rate even before Phase 7b. Cheap signal.
-5. **Phase 7b (parked, not cancelled)** — gateway reads canonical chain.
-   Defer until Step 1+2 done. Architectural diagnosis at issue #1 stands;
-   `docs/PHASE_7B_PLAN.md` retains the implementation outline.
-6. **Phase 4 expansion to fashion/electronics/home — STILL DEFERRED** —
-   no point until Phase 7b unblocks the recall path AND content gates are
-   in place to avoid creating more thin rows.
+1. **Phase 7b — gateway reads canonical chain** (the only remaining lever)
+   - Codex's `9adbcf1d` already shipped `resolveCatalogProductRefFromPivotaSignature`
+     in PIVOTA-Agent for PDP-detail page. The DB infrastructure (query
+     function, SQL pattern) is in place.
+   - Extend that pattern to `find_products_multi`: add a parallel
+     canonical-chain query alongside the existing seed scan, dedupe by
+     product_key.
+   - Implementation outline in `docs/PHASE_7B_PLAN.md`. Step 1 helper
+     `~/dev/PIVOTA-Agent-claude-phase-7b/src/services/canonicalCatalogSearch.js`
+     already written + 16 unit tests passing; needs to be rewritten using
+     the codex-deployed `query` injection pattern.
+   - Estimated cost: half-day to 1 day given the infrastructure now exists.
 
-**Open issues #2 (Phase 9 regression), #3 (runner swallow-and-log), #4
-(304 NULL category_path), #5 (Phase 4 expansion)** — parallel-eligible
-when bandwidth allows; none are immediate blockers.
+2. **Probe v14 after Phase 7b lands** — target lipstick 0/9 → ≥6/9,
+   overall pass-rate ≥40%.
+
+3. **Tighten probe verdict logic (parallel)** — the v12 fashion_shoes
+   "PASS" was a false positive (returned 12 cosmetic items matching
+   "black"/"leather" tokens). Verdict should require bucket alignment
+   between query intent and returned product taxonomy. Otherwise we're
+   making decisions on inflated numbers.
+
+4. **627 long-tail NULL category_path rows** — needs a separate
+   non-beauty taxonomy (accessory / lingerie / pet). Defer until Phase 7b
+   lands and we know whether category-anchored queries even reach those
+   buckets.
+
+5. **Phase 4 expansion to fashion/electronics/home** — only after Phase 7b
+   confirms recall path actually surfaces canonical PDPs. Otherwise more
+   ingestion would land in a still-unread layer.
+
+**Open issues #2 (Phase 9 regression), #3 (runner swallow-and-log)** —
+parallel-eligible when bandwidth allows; not blockers.
 
 ---
 
