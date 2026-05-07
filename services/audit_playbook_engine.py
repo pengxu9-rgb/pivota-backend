@@ -187,10 +187,91 @@ def _example_phrase(example_query: Optional[Dict[str, Any]]) -> str:
     return f'For "{q}", they were the cited URL. '
 
 
+def _competitors_phrase_short(competitors: List[str]) -> str:
+    """Email-friendly variant — names competitors without the "your
+    brand absent" closer (which makes sense in body prose but reads
+    harshly in a pitch email)."""
+    names = [c for c in (competitors or []) if isinstance(c, str) and c.strip()]
+    if not names:
+        return "other brands in this category"
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{', '.join(names[:2])}, and {names[2]}"
+
+
+def _example_phrase_short(example_query: Optional[Dict[str, Any]]) -> str:
+    """Email-friendly variant — references the query as a parenthetical
+    rather than a full sentence."""
+    if not example_query:
+        return ""
+    q = (example_query.get("query") or "").strip()
+    if not q:
+        return ""
+    if len(q) > 70:
+        q = q[:67].rstrip() + "..."
+    return f' (e.g. for "{q}")'
+
+
+def _build_pitch_draft(
+    *,
+    pb: Dict[str, Any],
+    host_entry: Dict[str, Any],
+    ctx: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Phase A: render the pre-filled email pitch the merchant can
+    one-click into their mail client. Returns None when either side
+    of the contract is missing (playbook has no template, or host
+    has no email recipient).
+
+    Output shape:
+      {
+        "subject": "...",
+        "body": "...",
+        "recipient_email": "tips@nymag.com",
+        "recipient_note":  "..." | None,
+      }
+
+    Email-only path. Hosts without a published editorial email (e.g.
+    Wirecutter's submission form) are intentionally skipped — we only
+    render the "Draft pitch email" CTA when it actually opens a
+    pre-filled mail client in one click. Half-working fallbacks
+    (open-the-form-yourself) erode trust in the execution layer; we
+    prefer honest coverage gaps.
+    """
+    pitch_tpl = pb.get("pitch_template") or {}
+    subject_tpl = pitch_tpl.get("subject_template") or ""
+    body_tpl = pitch_tpl.get("body_template") or ""
+    if not subject_tpl or not body_tpl:
+        return None
+
+    recipient = host_entry.get("pitch_recipient") or {}
+    recipient_email = recipient.get("email") if isinstance(recipient, dict) else None
+    recipient_note = recipient.get("note") if isinstance(recipient, dict) else None
+
+    if not recipient_email:
+        return None
+
+    subject = _render_template(subject_tpl, ctx)
+    body = _render_template(body_tpl, ctx)
+    if not subject or not body:
+        return None
+
+    return {
+        "subject": subject,
+        "body": body,
+        "recipient_email": recipient_email,
+        "recipient_note": recipient_note,
+    }
+
+
 def select_playbooks(
     *,
     cited_hosts_detailed: List[Dict[str, Any]],
     failed_queries_detailed: List[Dict[str, Any]],
+    merchant_name: Optional[str] = None,
+    merchant_category: Optional[str] = None,
     cap: int = 5,
 ) -> List[Dict[str, Any]]:
     """Produce per-host playbook actions for the merchant audit's
@@ -204,6 +285,11 @@ def select_playbooks(
       target_host               : the cited host this action targets
       lever                     : editorial_outreach / wholesale_onboarding / ...
       expected_timeline_weeks   : [low, high]
+      pitch_draft (optional)    : pre-filled pitch email — see Phase A
+                                  spec. Present when both the playbook
+                                  has `pitch_template` and the host
+                                  has at least an outreach destination
+                                  (`email` or `submission_url`).
     """
     actions: List[Dict[str, Any]] = []
 
@@ -232,6 +318,17 @@ def select_playbooks(
         example = _example_query_for_host(host, failed_queries_detailed)
         competitors_named = (example or {}).get("competitors_named") or []
 
+        # Phase A: render the pitch_draft when playbook + host both
+        # have the right metadata. Use a richer ctx so subject/body
+        # templates can reference merchant_name + category in addition
+        # to the existing host / competitors / example fields. Uses
+        # _short variants of the phrases so they fit naturally inside
+        # email-shape sentences.
+        competitors_short = _competitors_phrase_short(competitors_named)
+        example_short = _example_phrase_short(example)
+        category_label = (merchant_category or "category").strip() or "category"
+        merchant_label = (merchant_name or "[brand]").strip() or "[brand]"
+
         ctx = {
             "host": host,
             "coverage_note": entry.get("coverage_note") or "",
@@ -240,6 +337,13 @@ def select_playbooks(
             "example_phrase": _example_phrase(example),
             "timeline_low": tl_low,
             "timeline_high": tl_high,
+            # Pitch-template-only fields (used only by pitch_template
+            # render below, but harmless to include in the broader
+            # ctx — _render_template ignores extras).
+            "merchant_name": merchant_label,
+            "category": category_label,
+            "competitors_phrase_short": competitors_short,
+            "example_phrase_short": example_short,
         }
 
         title = _render_template(pb.get("title_template") or "", ctx)
@@ -258,6 +362,16 @@ def select_playbooks(
             if concrete_next_step_tpl else None
         )
 
+        # Phase A pitch_draft. Emit when the playbook has a
+        # pitch_template AND the host has a pitch_recipient (email
+        # OR submission_url). Without either side, no pitch is
+        # rendered (no draft button).
+        pitch_draft = _build_pitch_draft(
+            pb=pb,
+            host_entry=entry,
+            ctx=ctx,
+        )
+
         actions.append({
             "severity": pb.get("severity") or "medium",
             "title": title,
@@ -273,6 +387,7 @@ def select_playbooks(
             "target_host": host,
             "lever": pb.get("lever"),
             "expected_timeline_weeks": [tl_low, tl_high],
+            "pitch_draft": pitch_draft,
         })
 
     # Sort: severity ascending (critical first) then times_cited descending.
