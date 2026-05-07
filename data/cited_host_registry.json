@@ -1,0 +1,308 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "purpose": "BD-curated registry of hosts that frequently appear in Gemini grounded sources for D2C category queries. Each entry annotates the merchant audit's `cited_hosts_detailed` block so the report can tell merchants what they're looking at and what to do about it.",
+    "owner": "BD team for content; engineering reviews schema only",
+    "schema_per_host": {
+      "type": "editorial | retailer | marketplace | video | brand | unclassified",
+      "subtype": "review_site | department_store | luxury | mass_market | fashion_marketplace | beauty_retailer | wellness_retailer | regional | review_aggregator | creator_platform | social",
+      "categories": "list of merchant categories where this host has notable AI-channel presence",
+      "coverage_note": "1-2 sentences: what this host actually publishes for these categories, why it matters",
+      "outreach_hint": "1 sentence: which lever applies (editorial pitch / wholesale onboarding / creator partnership / etc.)"
+    },
+    "added_for_test_merchant_audits": "2026-05-07 — initial seed covering hosts that appeared in merch_efbc46b4619cfbdf sleepwear audit + the broader fashion/beauty/lifestyle review surface."
+  },
+  "hosts": {
+    "nymag.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "fitness"],
+      "coverage_note": "The Strategist (NYMag's product review vertical) runs frequent category roundups including sleepwear; high AI-channel pickup.",
+      "outreach_hint": "Pitch The Strategist editorial team — 4-8 week cycle for inclusion in roundups."
+    },
+    "nytimes.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
+      "coverage_note": "Wirecutter (NYT's reviews vertical) is the most-cited consumer review site; inclusion is the single highest-impact editorial placement.",
+      "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission."
+    },
+    "forbes.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
+      "coverage_note": "Forbes Vetted runs lifestyle / loungewear / category 'best of' lists; growing AI-channel pickup in 2025-2026.",
+      "outreach_hint": "Forbes Vetted editorial pitch via their submission process."
+    },
+    "mattressclarity.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["sleepwear", "loungewear", "bedding", "home"],
+      "coverage_note": "Independent review site. Despite the name, publishes 'Best Pajamas / Best Loungewear' annual roundups in addition to mattress content.",
+      "outreach_hint": "Editorial pitch — submit product samples + pitch via their tip form."
+    },
+    "sleepopolis.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["sleepwear", "bedding", "home"],
+      "coverage_note": "Sleep-product review site; covers sleepwear / loungewear / pillows / mattresses. Reviews AI-cited for sleep-adjacent queries.",
+      "outreach_hint": "Editorial pitch — sample-based reviews."
+    },
+    "goodhousekeeping.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "food_bev"],
+      "coverage_note": "Good Housekeeping Institute runs product testing + roundups across most D2C categories.",
+      "outreach_hint": "GH Institute submission — formal product testing process."
+    },
+    "realsimple.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "home", "food_bev"],
+      "coverage_note": "Lifestyle reviews vertical; runs roundups in sleepwear / loungewear / home goods.",
+      "outreach_hint": "Editorial pitch — affiliate-driven roundups."
+    },
+    "buzzfeed.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "beauty", "home"],
+      "coverage_note": "BuzzFeed Reviews / Shopping verticals run affiliate-driven roundups; high social pickup but variable AI-channel grounding weight.",
+      "outreach_hint": "Editorial / affiliate pitch — fast turnaround."
+    },
+    "thecut.com": {
+      "type": "editorial",
+      "subtype": "fashion",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "NYMag's fashion vertical; runs trend pieces + product features. Editorial bar higher than The Strategist.",
+      "outreach_hint": "Pitch The Cut fashion editors with a trend angle, not just product."
+    },
+    "vogue.com": {
+      "type": "editorial",
+      "subtype": "fashion",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "High-fashion editorial; product mentions skew luxury/premium D2C. AI-channel grounded for trend + lifestyle queries.",
+      "outreach_hint": "Pitch Vogue editorial team via PR / agency relationships."
+    },
+    "voguescandinavia.com": {
+      "type": "editorial",
+      "subtype": "fashion",
+      "categories": ["fashion", "beauty"],
+      "coverage_note": "Vogue Scandinavia regional edition; frequently cited in K-beauty + Scandi-fashion grounded queries.",
+      "outreach_hint": "Regional pitch — Scandinavia/Europe market relevance."
+    },
+    "harpersbazaar.com": {
+      "type": "editorial",
+      "subtype": "fashion",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "Fashion + lifestyle editorial; mid-luxury angle. Runs sleepwear / loungewear features.",
+      "outreach_hint": "Editorial pitch via PR; sample submission."
+    },
+    "elle.com": {
+      "type": "editorial",
+      "subtype": "fashion",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "Fashion editorial with shopping vertical; covers loungewear / sleepwear roundups seasonally.",
+      "outreach_hint": "Editorial pitch — shopping vertical receives PR submissions."
+    },
+    "glamour.com": {
+      "type": "editorial",
+      "subtype": "beauty",
+      "categories": ["beauty", "fashion", "fitness"],
+      "coverage_note": "Beauty + lifestyle reviews; affiliate-driven product roundups.",
+      "outreach_hint": "Editorial pitch via beauty/lifestyle editors."
+    },
+    "allure.com": {
+      "type": "editorial",
+      "subtype": "beauty",
+      "categories": ["beauty"],
+      "coverage_note": "Beauty-only editorial; Best of Beauty awards are highly weighted in grounded retrieval.",
+      "outreach_hint": "Best of Beauty submission process — annual cycle."
+    },
+    "byrdie.com": {
+      "type": "editorial",
+      "subtype": "beauty",
+      "categories": ["beauty"],
+      "coverage_note": "Beauty + wellness editorial; affiliate roundups + ingredient explainers.",
+      "outreach_hint": "Editorial pitch — beauty editors, sample-based."
+    },
+    "whowhatwear.com": {
+      "type": "editorial",
+      "subtype": "fashion",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "Fashion-trend-driven editorial; affiliate roundups. AI-cited on trend queries.",
+      "outreach_hint": "Editorial pitch — trend-led angle."
+    },
+    "popsugar.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "beauty", "home"],
+      "coverage_note": "Affiliate-heavy lifestyle reviews; high volume of category roundups.",
+      "outreach_hint": "Editorial pitch — affiliate-driven roundups."
+    },
+
+    "amazon.com": {
+      "type": "marketplace",
+      "subtype": "mass_market",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics", "food_bev"],
+      "coverage_note": "Largest US marketplace; AI-channel grounded for almost every D2C category. Listings + reviews surface heavily.",
+      "outreach_hint": "Wholesale onboarding via Amazon Vendor Central or 3P seller via Seller Central."
+    },
+    "nordstrom.com": {
+      "type": "retailer",
+      "subtype": "department_store",
+      "categories": ["fashion", "sleepwear", "beauty", "home"],
+      "coverage_note": "Major US department store with strong AI-channel grounded presence in fashion/lifestyle queries.",
+      "outreach_hint": "Wholesale onboarding via Nordstrom Vendor Portal."
+    },
+    "macys.com": {
+      "type": "retailer",
+      "subtype": "department_store",
+      "categories": ["fashion", "sleepwear", "beauty", "home"],
+      "coverage_note": "Mid-market US department store; sleepwear + loungewear category strong AI-channel grounding.",
+      "outreach_hint": "Wholesale onboarding via Macy's vendor portal."
+    },
+    "bloomingdales.com": {
+      "type": "retailer",
+      "subtype": "department_store",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "Mid-luxury department store; covers contemporary D2C brands.",
+      "outreach_hint": "Wholesale onboarding via Bloomingdale's vendor relations."
+    },
+    "saksfifthavenue.com": {
+      "type": "retailer",
+      "subtype": "luxury",
+      "categories": ["fashion", "beauty"],
+      "coverage_note": "Luxury department store; fashion + beauty premium tier.",
+      "outreach_hint": "Luxury wholesale — Saks vendor outreach."
+    },
+    "neimanmarcus.com": {
+      "type": "retailer",
+      "subtype": "luxury",
+      "categories": ["fashion", "beauty"],
+      "coverage_note": "Luxury department store.",
+      "outreach_hint": "Luxury wholesale — Neiman Marcus vendor outreach."
+    },
+    "target.com": {
+      "type": "retailer",
+      "subtype": "mass_market",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "food_bev"],
+      "coverage_note": "Mass-market US retailer; A-Beauty / D2C-collab heavy in beauty + lifestyle.",
+      "outreach_hint": "Target vendor onboarding (note: prefers established brands at scale)."
+    },
+    "walmart.com": {
+      "type": "retailer",
+      "subtype": "mass_market",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "food_bev"],
+      "coverage_note": "Largest US mass-market retailer; growing D2C presence via Walmart+ + marketplace.",
+      "outreach_hint": "Walmart Marketplace onboarding (3P) or Walmart vendor (1P)."
+    },
+    "shopbop.com": {
+      "type": "retailer",
+      "subtype": "fashion_marketplace",
+      "categories": ["fashion", "sleepwear"],
+      "coverage_note": "Contemporary fashion marketplace; D2C-friendly buying.",
+      "outreach_hint": "Wholesale onboarding — Shopbop vendor outreach."
+    },
+    "net-a-porter.com": {
+      "type": "retailer",
+      "subtype": "luxury",
+      "categories": ["fashion", "beauty"],
+      "coverage_note": "Luxury fashion marketplace; sleepwear + loungewear premium tier.",
+      "outreach_hint": "Luxury wholesale — Net-a-Porter vendor relations."
+    },
+    "revolve.com": {
+      "type": "retailer",
+      "subtype": "fashion_marketplace",
+      "categories": ["fashion", "sleepwear"],
+      "coverage_note": "Influencer-driven fashion marketplace; high social pickup.",
+      "outreach_hint": "Wholesale onboarding — Revolve vendor outreach."
+    },
+    "sephora.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty"],
+      "coverage_note": "Largest beauty specialty retailer; AI-channel grounded for nearly every beauty query.",
+      "outreach_hint": "Sephora Accelerate program (D2C/indie brands) or wholesale via vendor relations."
+    },
+    "ulta.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty"],
+      "coverage_note": "Mass + premium beauty retailer; strong AI-channel grounding for beauty.",
+      "outreach_hint": "Ulta Sparked program (D2C/indie) or wholesale."
+    },
+    "iherb.com": {
+      "type": "retailer",
+      "subtype": "wellness_retailer",
+      "categories": ["fitness", "beauty"],
+      "coverage_note": "Wellness + supplements + K-beauty; strong international AI-channel grounding.",
+      "outreach_hint": "iHerb wholesale onboarding."
+    },
+    "boscovs.com": {
+      "type": "retailer",
+      "subtype": "department_store",
+      "categories": ["fashion", "sleepwear", "home"],
+      "coverage_note": "Regional US (East Coast) department store; sleepwear + home categories.",
+      "outreach_hint": "Wholesale onboarding — Boscov's vendor relations."
+    },
+
+    "youtube.com": {
+      "type": "video",
+      "subtype": "creator_platform",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics", "food_bev"],
+      "coverage_note": "Product hauls + reviews from mid-tier creators (10k-100k subs) frequently surface in grounded answers.",
+      "outreach_hint": "Creator partnerships — sponsor 2-3 mid-tier reviewers in your category."
+    },
+    "tiktok.com": {
+      "type": "video",
+      "subtype": "social",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "Short-form viral product content; less stable AI-channel grounding than YouTube but growing.",
+      "outreach_hint": "Creator partnerships + TikTok Shop integration."
+    },
+    "instagram.com": {
+      "type": "video",
+      "subtype": "social",
+      "categories": ["fashion", "sleepwear", "beauty"],
+      "coverage_note": "Visual product discovery; AI-channel grounding weight low compared to editorial.",
+      "outreach_hint": "Influencer partnerships — Instagram-first creators."
+    },
+
+    "etsy.com": {
+      "type": "marketplace",
+      "subtype": "fashion_marketplace",
+      "categories": ["fashion", "home"],
+      "coverage_note": "Handmade / small-batch marketplace; AI-channel grounded for niche / artisanal queries.",
+      "outreach_hint": "Etsy seller onboarding (D2C marketplace listing)."
+    },
+    "ebay.com": {
+      "type": "marketplace",
+      "subtype": "mass_market",
+      "categories": ["fashion", "electronics", "home"],
+      "coverage_note": "General-purpose resale + retail marketplace.",
+      "outreach_hint": "Generally lower-priority for D2C brand authority — confirm market fit."
+    },
+
+    "thewinners.ae": {
+      "type": "retailer",
+      "subtype": "regional",
+      "categories": ["fashion", "sleepwear"],
+      "coverage_note": "UAE-based fashion retailer.",
+      "outreach_hint": "Regional / international wholesale — confirm market relevance before pursuing."
+    },
+    "oliveyoungglobal.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty"],
+      "coverage_note": "K-beauty specialty retailer (international); high AI-channel grounding for K-beauty queries.",
+      "outreach_hint": "K-beauty wholesale — Olive Young vendor relations."
+    },
+    "skinsort.com": {
+      "type": "editorial",
+      "subtype": "review_aggregator",
+      "categories": ["beauty"],
+      "coverage_note": "Skincare ingredient + product database; aggregates reviews + ingredient analysis.",
+      "outreach_hint": "Skinsort listing — submission via their database curation process."
+    }
+  }
+}
