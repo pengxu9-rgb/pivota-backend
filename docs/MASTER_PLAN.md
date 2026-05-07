@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-07 night (Phase 7b Step 2 PR open as PIVOTA-Agent #1312, draft — pending staging deploy + probe v14)
+- Last updated: 2026-05-07 night — **Phase 7b SHIPPED to prod**. Probe v15 = **69.8%** (was 32%, +37.8pp). Lipstick **9/9** (was 0/9). All beauty buckets 100% PASS. Remaining 14 EMPTY are non-beauty categories with no canonical PDPs — Phase 4 expansion territory.
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -20,27 +20,26 @@ recall investigation closed at 23% pass-rate; tracks every phase since.
 
 ## Where we are (one-paragraph summary)
 
-After the ext→sig migration (Phase C-1/C-2/C-3 + the
-`mirror_external_seeds_to_catalog_products` script), the catalog has
-**4715 rows in `catalog_products`, all with `pivota_signature_id`**, with
-zero migration drift. Phase 2-redo (PRs #347/#348/#349/#351/#352, applied
-2026-05-07) backfilled `category_path` on **3442 of the 4069 NULL rows**
-and added INSERT-time classification to the mirror script as a
-forward-going guardrail. Remaining 627 NULL rows are accessory / lingerie
-/ pet long-tail that requires a separate non-beauty taxonomy.
+**Phase 7b shipped to prod 2026-05-07 night.** Probe v15 (prod, post-deploy):
+**37/53 PASS = 69.8%, lipstick 9/9, all beauty buckets at 100%**.
+`canonical_path_executed=true` rate **96.2%** (51/53), confirming the gateway
+now reads `catalog_products` at scale. Codex also added a non-beauty primary
+deadline (PR #1314) to keep slow non-beauty queries from padding fallbacks
+indefinitely; production p99 dropped from 17.4s to **12.0s** (still slow but
+under v13 baseline).
 
-**Recall trajectory:** 30% (v10) → 32% (v12, post content backfill) →
-**v13 in flight** (post Phase 2-redo). The category_path backfill should
-help category-anchored buckets *if* the gateway path actually consults
-`category_path` — but the gateway still doesn't read `catalog_products`
-directly, so v13 is the leading indicator for whether
-`external_product_seeds.seed_data->derived->recall->category` was also
-populated by the new pipeline (= free lift) or whether Phase 7b is still
-required to bridge the gap (= architectural fix needed).
+The 16 remaining non-PASS queries are entirely **non-beauty categories** —
+electronics, home, fashion_*. Recall path is healthy; we just have no
+canonical PDPs for those buckets. That's Phase 4 expansion territory.
 
-**Public PDPs are healthy.** sig_* URLs return 200, content + JSON-LD
-correct, codex's PDP detail-page sig resolver works (commit `9adbcf1d`
-in PIVOTA-Agent — narrowly scoped to detail page, doesn't help recall).
+**Catalog state (durable):** 4715 rows in `catalog_products` all with
+`pivota_signature_id`, zero migration drift. Phase 2-redo (PRs #347/#348/
+#349/#351/#352) brought NULL `category_path` from 4069 to 627 (long-tail
+accessory/lingerie/pet, not beauty). Mirror script now classifies at
+INSERT time so this hole won't reopen.
+
+**Public PDPs are healthy.** sig_* URLs return 200 across the prod sample,
+content + JSON-LD intact.
 
 ---
 
@@ -69,7 +68,8 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | C-2 | Public sig_* → product API + sitemap list | ✅ | #329 |
 | C-3 | One-shot script for legacy rows | ✅ | #331, plus #330 schema guard |
 | 7b Step 1 | Gateway-side canonicalCatalogSearch helper + 16 unit tests | ✅ | PIVOTA-Agent #1311 (claude/phase-7b-canonical-recall) |
-| 7b Step 2 | Wire helper into find_products_multi + dedupe + telemetry + 3 integration tests | 🟡 **open as draft** | PIVOTA-Agent #1312 (codex/phase7b-canonical-chain, commit 91cbcc98). Local verification: 175 jest tests pass, prod read-only sanity returns 200 lipstick / 144 mascara / 160 perfume rows. Pending: flip draft → ready, preview deploy, probe v14. |
+| 7b Step 2 | Wire helper into find_products_multi + dedupe + telemetry + 3 integration tests | ✅ | PIVOTA-Agent #1312, merged → prod commit `91cbcc98` |
+| 7b non-beauty deadline | Gateway-level 6000ms hard deadline on non-beauty primary upstream; authoritative strict-empty on hit; `fpm_primary_deadline_*` telemetry | ✅ | PIVOTA-Agent #1314, merged → prod commit `d98a8704` |
 
 ---
 
@@ -88,6 +88,8 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | recall_v11_aurora_bff_1778170034 | Same data, source=aurora-bff (orchestrator localization probe) | 16 | 3 | 33 | 1 | **30%** |
 | recall_v12_post_backfill_1778176777 | Post 84+177 thin-desc content backfill | 17 | 10 | 26 | 0 | **32%** (+2pp) |
 | recall_v13_post_phase2_redo_1778187080 | Post Phase 2-redo (3442 NULL → category_path) | 17 | 10 | 26 | 0 | **32%** (0pp) |
+| recall_v14_phase7b_staging_deadline_1778195751 | Phase 7b + non-beauty deadline, staging | 37 | 2 | 14 | 0 | **69.8%** (+37.8pp) |
+| recall_v15_phase7b_prod_deadline_1778196048 | Phase 7b + non-beauty deadline, **prod** | 37 | 2 | 14 | 0 | **69.8%** (production parity) |
 
 **Headline insight:** every probe since v9_phase8 has *more* canonical data
 than the previous one, yet pass-rate has not returned to peak. The bottleneck
@@ -97,6 +99,14 @@ is no longer "do the rows exist" but "does the recall query reach them."
 populated `catalog_products.category_path` on 3442 rows but probe pass-rate
 moved 0pp. The data is there; the gateway just doesn't read it. Phase 7b
 (gateway reads canonical chain) is now the only remaining lever.
+
+**v14/v15 confirm the fix worked:** 32% → 69.8% (+37.8pp) is the
+single-largest jump in the trajectory. **Lipstick 0/9 → 9/9** validates
+that the architectural diagnosis was correct. `canonical_path_executed`
+fires on 51/53 queries (96.2%) — the two that don't are short-circuited
+by the new non-beauty deadline. p50 prod 3.8s, p99 prod 12.0s (down from
+17.4s pre-deadline; still over budget but the deadline is now upper-bounded
+on non-beauty paths).
 
 **v11 (aurora-bff) localization probe**: ran the same 53-query corpus under a
 different orchestrator (`source=aurora-bff` instead of `shopping_agent`).
@@ -242,12 +252,19 @@ on every apply step.
 
 ## Open issues
 
-### #1 — Lipstick recall returns zero (PARKED — diagnosed but deprioritized 2026-05-07)
+### #1 — Lipstick recall returns zero (✅ RESOLVED 2026-05-07 night)
 
-**Status update (2026-05-07 evening):** demoted from BLOCKER. The
-content-quality backfill is the new immediate priority. Architectural
-diagnosis below still holds; revisit once the 4-step content plan above
-has been worked through enough to justify the gateway-side spike.
+**Resolution:** Phase 7b Step 2 (PIVOTA-Agent #1312, prod commit `91cbcc98`)
++ non-beauty deadline (PIVOTA-Agent #1314, prod commit `d98a8704`) shipped
+to production. Probe v15 (prod) shows **lipstick 9/9 PASS, all beauty
+buckets 100%, overall 69.8%** (was 32%). `canonical_path_executed=true`
+fires on 96.2% of queries.
+
+The architectural diagnosis below was confirmed correct — gateway needed
+to read `catalog_products` directly, which it now does via
+`fetchCanonicalChainRows` running in parallel with the existing seed scan.
+
+**Diagnosis (kept for reference):**
 
 **Symptom:** all 9 lipstick queries (EN + ZH) layer-attribute to
 `C-external_seed / seed_ran_returned_zero`. Probe metadata:
@@ -389,47 +406,51 @@ the recall path doesn't surface lipstick. Fix #1 first, then extend.
 
 ---
 
-## Recommended next steps (post probe v13, 2026-05-07 evening)
+## Recommended next steps (post probe v15, Phase 7b shipped 2026-05-07 night)
 
-Three cycles of work landed in 12 hours: thin-desc backfill (84+177 rows),
-ext→sig migration audit, Phase 2-redo (3442 NULL → category_path).
-Probe v13 cleanly localized the bottleneck: **gateway recall doesn't read
-`catalog_products`**. All data layers are now in good shape — only the
-read-path code is missing.
+Phase 7b is in production. Beauty recall is solved (100% PASS across
+lipstick/fragrance/eye/face/skincare). The remaining 14 EMPTY queries
+are entirely non-beauty (electronics 4/5, home 4/4, fashion_*) — pure
+data gap, not recall code.
 
-1. **Phase 7b — gateway reads canonical chain** (the only remaining lever)
-   - Codex's `9adbcf1d` already shipped `resolveCatalogProductRefFromPivotaSignature`
-     in PIVOTA-Agent for PDP-detail page. The DB infrastructure (query
-     function, SQL pattern) is in place.
-   - Extend that pattern to `find_products_multi`: add a parallel
-     canonical-chain query alongside the existing seed scan, dedupe by
-     product_key.
-   - Implementation outline in `docs/PHASE_7B_PLAN.md`. Step 1 helper
-     `~/dev/PIVOTA-Agent-claude-phase-7b/src/services/canonicalCatalogSearch.js`
-     already written + 16 unit tests passing; needs to be rewritten using
-     the codex-deployed `query` injection pattern.
-   - Estimated cost: half-day to 1 day given the infrastructure now exists.
+The architectural era of this work is over. The next era is **catalog
+breadth**.
 
-2. **Probe v14 after Phase 7b lands** — target lipstick 0/9 → ≥6/9,
-   overall pass-rate ≥40%.
+1. **Phase 4 expansion to fashion / electronics / home** (top priority).
+   The exact lipstick/fragrance Phase 4 pattern that landed beauty
+   coverage now applies. For each new vertical:
+   - Prepare 30–50 hand-curated PDP candidates JSONL (mirrors
+     `data/catalog_enrichment/lipstick_validated.jsonl` shape)
+   - Run `scripts/run_catalog_enrichment.py run --category <vertical> --apply`
+   - Mirror script will pick up the resulting agent seeds at INSERT time
+     and classify them (Phase 2-redo guardrail)
+   - Probe v16 should show non-beauty buckets lift from 0/N to ≥half/N
+   Estimated cost: 2-4 hours per vertical if hand-curated, plus probe.
+   Recommend electronics first (5 queries, biggest weight on overall
+   pass-rate) followed by home (4) and fashion_* (7 across 3 buckets).
 
-3. **Tighten probe verdict logic (parallel)** — the v12 fashion_shoes
-   "PASS" was a false positive (returned 12 cosmetic items matching
-   "black"/"leather" tokens). Verdict should require bucket alignment
-   between query intent and returned product taxonomy. Otherwise we're
-   making decisions on inflated numbers.
+2. **Latency follow-up** — p99 prod 12.0s is still over the original
+   3s `pivot_search_slow` warning threshold. The 6000ms non-beauty
+   deadline is upper-bounded but stacked timeouts (clampLocalBeauty +
+   external_seed_direct + canonical_chain) may compose to 12s on the
+   slowest queries. Investigate the 2 cache_miss_sync_filled outliers
+   (noise cancelling headphones, black leather sneakers) — different
+   bug than canonical recall.
 
-4. **627 long-tail NULL category_path rows** — needs a separate
-   non-beauty taxonomy (accessory / lingerie / pet). Defer until Phase 7b
-   lands and we know whether category-anchored queries even reach those
-   buckets.
+3. **627 long-tail NULL category_path rows** — needs non-beauty
+   taxonomy. Lower priority; only matters if a category-anchored
+   recall query ever targets accessories/lingerie/pet, which today's
+   corpus doesn't.
 
-5. **Phase 4 expansion to fashion/electronics/home** — only after Phase 7b
-   confirms recall path actually surfaces canonical PDPs. Otherwise more
-   ingestion would land in a still-unread layer.
+4. **Tighten probe verdict logic** — v12 fashion_shoes false positive
+   (PASS on cosmetic results matching "black"/"leather") should fail
+   with a stricter verdict. Worth doing before declaring future
+   pass-rate gates met. ~1 hr in
+   `pivota-agent-ui/scripts/eval_corpus_recall_summarize.mjs`.
 
-**Open issues #2 (Phase 9 regression), #3 (runner swallow-and-log)** —
-parallel-eligible when bandwidth allows; not blockers.
+5. **Open issues #2 (Phase 9 regression), #3 (runner swallow-and-log)** —
+   parallel-eligible; not blockers. Issue #2 may have been masked by
+   the Phase 7b lift; revisit if it resurfaces.
 
 ---
 
