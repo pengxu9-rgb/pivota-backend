@@ -56,3 +56,11 @@ async def test_ensure_required_schema_light_adds_merchant_psp_columns_in_fast_mo
     assert "ADD COLUMN IF NOT EXISTS use_case_tags" in catalog_stmt
     assert "ADD COLUMN IF NOT EXISTS lifestyle_tags" in catalog_stmt
     assert "ADD COLUMN IF NOT EXISTS demographic" in catalog_stmt
+    # Phase O-4 (mig 077). pdp_lifecycle_stage column + partial index
+    # on (validated, published) — without the column, all 3 ingestion
+    # paths would error on insert; without the index, recall live-stage
+    # filtering would seq-scan in O-5.
+    assert "ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage" in catalog_stmt
+    assert any(
+        "idx_catalog_products_lifecycle_live" in stmt for stmt in executed
+    ), "partial index for pdp_lifecycle_stage live stages not created"

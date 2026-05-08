@@ -443,3 +443,108 @@ async def test_ingest_standard_products_writes_o2_taxonomy(
     assert write["use_case_tags"] == []
     assert write["lifestyle_tags"] == []
     assert write["demographic"] is None  # NULL is correct here
+
+
+@pytest.mark.asyncio
+async def test_ingest_standard_products_writes_o4_lifecycle_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase O-4: ingest_standard_products must compute and persist
+    pdp_lifecycle_stage on every Path A write. Without this, the recall
+    live-stage filter (O-5) treats Shopify ingest rows as draft and
+    drops them from the candidate set."""
+
+    catalog_products_writes: list[dict] = []
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_upsert_catalog_merchant(**_kwargs):
+        return None
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_products":
+            catalog_products_writes.append(dict(values))
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module, "upsert_catalog_merchant", fake_upsert_catalog_merchant)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+
+    # Candidate-grade row: title + image + long description + taxonomy
+    # signals via derive_taxonomy_v1. Path A intentionally hardcodes
+    # category_path=None at this write (classifier promotes downstream),
+    # so this row stops at "candidate" — the validated gate requires
+    # category_path which Path A doesn't supply on initial sync.
+    await module.ingest_standard_products(
+        merchant_id="merch_o4",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_o4_valid",
+                "product_id": "prod_o4_valid",
+                "merchant_id": "merch_o4",
+                "platform": "shopify",
+                "title": "Vegan Daily Moisturizer for Women",
+                "description": "Cruelty-free fragrance-free moisturizer for everyday hydration without irritation.",
+                "image_url": "https://example.com/img.jpg",
+                "price": 28.0,
+                "currency": "USD",
+                "tags": [],
+                "variants": [],
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    assert "pdp_lifecycle_stage" in write, (
+        "Path A write must include pdp_lifecycle_stage column (Phase O-4)"
+    )
+    # category_path is None on initial Path A write → caps at candidate.
+    # A follow-up classifier run + lifecycle recompute promotes validated.
+    assert write["pdp_lifecycle_stage"] == "candidate"
+
+    # Draft-grade row: missing image + short description → can't even
+    # promote to candidate. Must still write the column (so writes don't
+    # NULL it on conflict update).
+    catalog_products_writes.clear()
+    await module.ingest_standard_products(
+        merchant_id="merch_o4_thin",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_o4_thin",
+                "product_id": "prod_o4_thin",
+                "merchant_id": "merch_o4_thin",
+                "platform": "shopify",
+                "title": "Bare Bones Item",
+                "price": 5.0,
+                "currency": "USD",
+                "variants": [],
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    assert write.get("pdp_lifecycle_stage") == "draft"

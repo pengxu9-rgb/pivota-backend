@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
 
 from db.database import database
 from services.pdp_category_classifier import resolve_path_from_row
+from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
 
@@ -163,6 +164,30 @@ def _extract_tags_from_seed_data(seed_data: Any) -> List[str]:
         if out:
             return out
     return []
+
+
+def _compute_mirror_lifecycle_stage(
+    row_dict: Dict[str, Any],
+    category_meta: Dict[str, Any],
+    seed_tags: List[str],
+    taxonomy: Dict[str, Any],
+) -> str:
+    """Build the stage_input dict matching Path B's row shape and
+    delegate to compute_lifecycle_stage. Mirror rows never set
+    pdp_scope here, so this path tops out at validated."""
+    stage_input = {
+        "title": row_dict.get("title"),
+        "description": row_dict.get("mirrored_description"),
+        "image_url": row_dict.get("image_url"),
+        "category_path": category_meta.get("category_path"),
+        "tags": seed_tags,
+        "demographic": taxonomy.get("demographic"),
+        "use_case_tags": taxonomy.get("use_case_tags"),
+        "lifestyle_tags": taxonomy.get("lifestyle_tags"),
+        "pdp_scope": None,
+        "source_system": SOURCE_SYSTEM,
+    }
+    return compute_lifecycle_stage(stage_input)
 
 
 async def _table_exists(name: str) -> bool:
@@ -490,6 +515,16 @@ async def _apply(limit: int) -> int:
             description=row_dict.get("mirrored_description"),
             tags=seed_tags,
         )
+        # Phase O-4: compute lifecycle stage. Mirror rows default to
+        # pdp_scope=NULL (no scope assignment in this script — the
+        # catalog_products row has unverified by Phase 6 default), so
+        # the row promotes to candidate / validated only when content
+        # + taxonomy + category_path are present, never to published
+        # via this path (would need governance-side multi-merchant
+        # promotion). mig 077.
+        mirror_lifecycle_stage = _compute_mirror_lifecycle_stage(
+            row_dict, category_meta, seed_tags, taxonomy
+        )
         product_payload = {
             "external_seed": {
                 "id": row_dict.get("id"),
@@ -547,6 +582,7 @@ async def _apply(limit: int) -> int:
               use_case_tags,
               lifestyle_tags,
               demographic,
+              pdp_lifecycle_stage,
               created_at,
               updated_at
             )
@@ -577,6 +613,7 @@ async def _apply(limit: int) -> int:
               CAST(:use_case_tags AS jsonb),
               CAST(:lifestyle_tags AS jsonb),
               :demographic,
+              :pdp_lifecycle_stage,
               now(),
               now()
             )
@@ -610,6 +647,7 @@ async def _apply(limit: int) -> int:
                 "use_case_tags": json.dumps(taxonomy["use_case_tags"], ensure_ascii=False),
                 "lifestyle_tags": json.dumps(taxonomy["lifestyle_tags"], ensure_ascii=False),
                 "demographic": taxonomy["demographic"],
+                "pdp_lifecycle_stage": mirror_lifecycle_stage,
             },
         )
         if inserted_row:

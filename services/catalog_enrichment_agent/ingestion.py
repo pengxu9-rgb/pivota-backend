@@ -39,6 +39,7 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
 logger = logging.getLogger("catalog_enrichment_agent.ingestion")
@@ -205,9 +206,56 @@ def _build_pdp_insert(
         # extractors. Stringified for CAST(:... AS jsonb) in the
         # runner. mig 076.
         **_taxonomy_v1_payload(pdp_payload, offers),
+        # Phase O-4: lifecycle stage. Path C ingests under
+        # source_system='catalog_enrichment_agent_v1' which is one of
+        # the published-readiness triggers, so a curated row with
+        # category_path + at-least-one taxonomy signal lands as
+        # 'published' directly. mig 077.
+        "pdp_lifecycle_stage": _lifecycle_stage_for_agent_pdp(pdp_payload, offers, canonical_url, image_url),
         "pdp_scope": DEFAULT_PDP_SCOPE,
         "pdp_scope_source": DEFAULT_PDP_SCOPE_SOURCE,
     }
+
+
+def _lifecycle_stage_for_agent_pdp(
+    pdp_payload: Dict[str, Any],
+    offers: List[Dict[str, Any]],
+    canonical_url: str,
+    image_url: str,
+) -> str:
+    """Compute the lifecycle stage for a Path C agent-ingested row.
+    Reuses the same compute_lifecycle_stage gates as Path A/B —
+    inputs reshape to the row dict the gate expects."""
+    # The taxonomy v1 derivation runs again here to get list values
+    # (the main return path serializes to JSON strings for the runner;
+    # the gate needs Python lists).
+    price = None
+    if offers:
+        raw_price = offers[0].get("price")
+        try:
+            price = float(raw_price) if raw_price is not None else None
+        except (TypeError, ValueError):
+            price = None
+    taxonomy = derive_taxonomy_v1(
+        price=price,
+        title=pdp_payload.get("product_name"),
+        description=pdp_payload.get("attribute_summary"),
+        tags=list(pdp_payload.get("tags") or []),
+    )
+    return compute_lifecycle_stage(
+        {
+            "title": pdp_payload.get("product_name"),
+            "description": pdp_payload.get("attribute_summary"),
+            "image_url": image_url or None,
+            "category_path": pdp_payload.get("category_path") or None,
+            "tags": list(pdp_payload.get("tags") or []),
+            "demographic": taxonomy.get("demographic"),
+            "use_case_tags": taxonomy.get("use_case_tags"),
+            "lifestyle_tags": taxonomy.get("lifestyle_tags"),
+            "pdp_scope": DEFAULT_PDP_SCOPE,
+            "source_system": AGENT_VERSION,
+        }
+    )
 
 
 def _taxonomy_v1_payload(pdp_payload: Dict[str, Any], offers: List[Dict[str, Any]]) -> Dict[str, Any]:

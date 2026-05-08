@@ -38,6 +38,7 @@ from db.merchant_onboarding import merchant_onboarding
 from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
+from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
 
@@ -624,6 +625,33 @@ async def ingest_standard_products(
                 merchant_id, platform, source_pid,
             )
 
+            _description_for_ingest = product.description_text or product.description
+            _tags_for_ingest = list(product.tags or [])
+            _taxonomy_v1 = derive_taxonomy_v1(
+                price=product.price,
+                title=product.title,
+                description=_description_for_ingest,
+                tags=_tags_for_ingest,
+            )
+            # Phase O-4: compute lifecycle stage from the same shape
+            # the row will be UPSERTed with. Path A always sets
+            # pdp_scope='merchant_owned' so the row promotes through
+            # candidate → validated as content + taxonomy fill in.
+            # multi_merchant_canonical promotion happens in a separate
+            # governance path and won't affect this initial write.
+            _stage_input = {
+                "title": product.title,
+                "description": _description_for_ingest,
+                "image_url": product.image_url,
+                "category_path": None,  # Phase A doesn't set this; classifier may, downstream
+                "tags": _tags_for_ingest,
+                "demographic": _taxonomy_v1.get("demographic"),
+                "use_case_tags": _taxonomy_v1.get("use_case_tags"),
+                "lifestyle_tags": _taxonomy_v1.get("lifestyle_tags"),
+                "pdp_scope": "merchant_owned",
+                "source_system": source_system,
+            }
+
             await _upsert_by_pk(
                 catalog_products,
                 "product_key",
@@ -638,7 +666,7 @@ async def ingest_standard_products(
                     "source_system": source_system,
                     "source_ref": source_ref,
                     "title": product.title,
-                    "description": product.description_text or product.description,
+                    "description": _description_for_ingest,
                     "brand": brand,
                     "product_type": product.product_type,
                     "category": product.product_type,
@@ -647,18 +675,15 @@ async def ingest_standard_products(
                     # can tell "ingest saw the feed and it was empty" from
                     # NULL ("row predates the column"). See
                     # docs/PDP_ONBOARDING_PLAYBOOK.md gap #2 + mig 075.
-                    "tags": list(product.tags or []),
+                    "tags": _tags_for_ingest,
                     # Phase O-2: derived taxonomy v1 — price_tier (deterministic
                     # from product.price), use_case_tags / lifestyle_tags
                     # (conservative keyword extraction), demographic (NULL if
                     # ambiguous). Pure function in services/pdp_taxonomy.py.
                     # See docs/PDP_ONBOARDING_PLAYBOOK.md + mig 076.
-                    **derive_taxonomy_v1(
-                        price=product.price,
-                        title=product.title,
-                        description=product.description_text or product.description,
-                        tags=list(product.tags or []),
-                    ),
+                    **_taxonomy_v1,
+                    # Phase O-4: compute lifecycle stage. mig 077.
+                    "pdp_lifecycle_stage": compute_lifecycle_stage(_stage_input),
                     "canonical_url": canonical_url,
                     "image_url": product.image_url,
                     "product_payload": raw_product,
