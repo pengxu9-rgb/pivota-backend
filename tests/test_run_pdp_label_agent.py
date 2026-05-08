@@ -28,22 +28,26 @@ def _row(
     category_path: Any = None,
     use_case_tags: Any = None,
     lifestyle_tags: Any = None,
+    pdp_lifecycle_stage: Any = None,
     **extras: Any,
 ) -> Dict[str, Any]:
     return {
         "product_key": product_key,
         "merchant_id": extras.get("merchant_id", "external_seed"),
         "platform": extras.get("platform", "external_seed"),
+        "source_system": extras.get("source_system", "shopify"),
         "title": extras.get("title", "Sample Product"),
         "description": extras.get("description", "desc"),
         "brand": extras.get("brand", "Brand"),
         "product_type": extras.get("product_type", "Cream"),
         "category_path": category_path,
+        "image_url": extras.get("image_url", None),
         "tags": extras.get("tags", []),
         "demographic": demographic,
         "use_case_tags": use_case_tags,
         "lifestyle_tags": lifestyle_tags,
         "pdp_scope": extras.get("pdp_scope", "merchant_owned"),
+        "pdp_lifecycle_stage": pdp_lifecycle_stage,
     }
 
 
@@ -264,3 +268,169 @@ async def test_process_one_no_gemini_flag_skips_classification(monkeypatch):
     assert result["drop_reason"] == "no_gemini_flag"
     assert "needed_fields" in result
     assert "demographic" in result["needed_fields"]
+
+
+# ---------------------------------------------------------------------------
+# Phase O-4b — lifecycle stage recompute on UPDATE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_one_recomputes_and_writes_new_lifecycle_stage(monkeypatch):
+    """Phase O-4b: when LabelAgent fills the missing taxonomy fields
+    on a row that's at 'candidate', the merged row qualifies for
+    'validated' — the UPDATE must include the new stage. Without
+    this, O-5's recall live-stage filter would never surface the
+    promoted row."""
+
+    async def fake_classify(row, **_kwargs):
+        return {
+            "demographic": "women",
+            "use_case_tags": ["daily"],
+            "lifestyle_tags": ["vegan"],
+            "category_path": "beauty/skincare/treat/serum",
+            "confidence": 0.9,
+            "drop_reason": None,
+            "model": "gemini-2.5-flash",
+        }
+
+    db_calls: List[Dict[str, Any]] = []
+
+    async def fake_execute(sql, params):
+        db_calls.append({"sql": str(sql), "params": dict(params)})
+
+    monkeypatch.setattr(runner, "classify_pdp", fake_classify)
+    monkeypatch.setattr(runner.database, "execute", fake_execute)
+
+    # Row was written by Path A as 'candidate' (title + image + long
+    # description, no category_path / taxonomy yet).
+    row = _row(
+        product_key="prod::promote_me",
+        title="Vitamin C Serum",
+        description="A long enough product description to clear the candidate gate by a comfortable margin.",
+        image_url="https://example.com/serum.jpg",
+        pdp_lifecycle_stage="candidate",
+    )
+
+    result = await runner._process_one(
+        row, apply=True, no_gemini=False, min_confidence=0.5, api_key="fake",
+    )
+
+    assert result["applied"] is True
+    assert result["lifecycle_stage_before"] == "candidate"
+    # After the agent fills demographic + tags + category_path, the
+    # merged row qualifies for validated (merchant_owned scope, so
+    # never published from this path).
+    assert result["lifecycle_stage_after"] == "validated"
+    assert result["lifecycle_promoted"] is True
+    # The UPDATE must carry the new stage so the column tracks reality.
+    assert len(db_calls) == 1
+    assert db_calls[0]["params"]["new_stage"] == "validated"
+
+
+@pytest.mark.asyncio
+async def test_process_one_no_promotion_when_stage_unchanged(monkeypatch):
+    """If the agent fills only ONE of the missing fields and the row
+    still doesn't qualify for the next stage, the UPDATE still writes
+    the (unchanged) stage but lifecycle_promoted=False so the report
+    summary is honest."""
+
+    async def fake_classify(row, **_kwargs):
+        # Agent only fills demographic; category_path stays NULL,
+        # so the validated gate (which requires category_path) doesn't
+        # fire.
+        return {
+            "demographic": "women",
+            "use_case_tags": [],
+            "lifestyle_tags": [],
+            "category_path": None,
+            "confidence": 0.9,
+            "drop_reason": None,
+            "model": "gemini-2.5-flash",
+        }
+
+    db_calls: List[Dict[str, Any]] = []
+
+    async def fake_execute(sql, params):
+        db_calls.append({"sql": str(sql), "params": dict(params)})
+
+    monkeypatch.setattr(runner, "classify_pdp", fake_classify)
+    monkeypatch.setattr(runner.database, "execute", fake_execute)
+
+    row = _row(
+        product_key="prod::stays_candidate",
+        title="Mystery Product",
+        description="A long enough description that the candidate gate is satisfied for this row.",
+        image_url="https://example.com/x.jpg",
+        pdp_lifecycle_stage="candidate",
+    )
+
+    result = await runner._process_one(
+        row, apply=True, no_gemini=False, min_confidence=0.5, api_key="fake",
+    )
+
+    assert result["applied"] is True
+    assert result["lifecycle_stage_before"] == "candidate"
+    assert result["lifecycle_stage_after"] == "candidate"
+    assert result["lifecycle_promoted"] is False
+    assert db_calls[0]["params"]["new_stage"] == "candidate"
+
+
+@pytest.mark.asyncio
+async def test_process_one_promotes_null_stage_row(monkeypatch):
+    """Pre-O-6b-backfill rows have pdp_lifecycle_stage=NULL. When the
+    LabelAgent UPDATE fires on one, it sets the stage from scratch.
+    Reporting shows 'null->validated' so the operator can see the
+    backfill side-effect of running LabelAgent on legacy rows."""
+
+    async def fake_classify(row, **_kwargs):
+        return {
+            "demographic": "women",
+            "use_case_tags": ["daily"],
+            "lifestyle_tags": [],
+            "category_path": "beauty/skincare/treat/serum",
+            "confidence": 0.9,
+            "drop_reason": None,
+            "model": "gemini-2.5-flash",
+        }
+
+    db_calls: List[Dict[str, Any]] = []
+
+    async def fake_execute(sql, params):
+        db_calls.append({"sql": str(sql), "params": dict(params)})
+
+    monkeypatch.setattr(runner, "classify_pdp", fake_classify)
+    monkeypatch.setattr(runner.database, "execute", fake_execute)
+
+    row = _row(
+        product_key="prod::legacy_null",
+        title="Legacy Serum",
+        description="A long enough product description to satisfy the candidate length gate for this row.",
+        image_url="https://example.com/legacy.jpg",
+        pdp_lifecycle_stage=None,  # legacy row
+    )
+
+    result = await runner._process_one(
+        row, apply=True, no_gemini=False, min_confidence=0.5, api_key="fake",
+    )
+
+    assert result["lifecycle_stage_before"] is None
+    assert result["lifecycle_stage_after"] == "validated"
+    assert result["lifecycle_promoted"] is True
+    assert db_calls[0]["params"]["new_stage"] == "validated"
+
+
+def test_update_sql_writes_lifecycle_stage():
+    """Pin the UPDATE statement so a future refactor can't accidentally
+    drop the lifecycle write — that was the entire point of O-4b."""
+    assert "pdp_lifecycle_stage = :new_stage" in runner.UPDATE_SQL
+
+
+def test_scope_queries_select_image_url_and_lifecycle_stage():
+    """compute_lifecycle_stage needs image_url (candidate gate) and
+    pdp_lifecycle_stage (for the before/after delta in the report).
+    Pin the SELECT shape so a future column refactor doesn't silently
+    break the recompute."""
+    for scope_name, sql in runner.SCOPE_QUERIES.items():
+        assert "image_url" in sql, f"{scope_name} SELECT missing image_url"
+        assert "pdp_lifecycle_stage" in sql, f"{scope_name} SELECT missing pdp_lifecycle_stage"

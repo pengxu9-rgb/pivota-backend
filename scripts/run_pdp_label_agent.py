@@ -59,6 +59,7 @@ from services.pdp_label_agent import (  # noqa: E402
     merge_classification_into_row,
     should_classify,
 )
+from services.pdp_lifecycle import compute_lifecycle_stage  # noqa: E402
 
 
 logger = logging.getLogger("run_pdp_label_agent")
@@ -68,8 +69,8 @@ SCOPE_QUERIES = {
     "canonical": """
         SELECT product_key, merchant_id, platform, source_system,
                title, description, brand, product_type, category_path,
-               tags, demographic, use_case_tags, lifestyle_tags,
-               pdp_scope
+               image_url, tags, demographic, use_case_tags, lifestyle_tags,
+               pdp_scope, pdp_lifecycle_stage
         FROM catalog_products
         WHERE (
               pdp_scope = 'multi_merchant_canonical'
@@ -87,8 +88,8 @@ SCOPE_QUERIES = {
     "merchant_owned": """
         SELECT product_key, merchant_id, platform, source_system,
                title, description, brand, product_type, category_path,
-               tags, demographic, use_case_tags, lifestyle_tags,
-               pdp_scope
+               image_url, tags, demographic, use_case_tags, lifestyle_tags,
+               pdp_scope, pdp_lifecycle_stage
         FROM catalog_products
         WHERE pdp_scope = 'merchant_owned'
           AND (
@@ -103,8 +104,8 @@ SCOPE_QUERIES = {
     "all": """
         SELECT product_key, merchant_id, platform, source_system,
                title, description, brand, product_type, category_path,
-               tags, demographic, use_case_tags, lifestyle_tags,
-               pdp_scope
+               image_url, tags, demographic, use_case_tags, lifestyle_tags,
+               pdp_scope, pdp_lifecycle_stage
         FROM catalog_products
         WHERE (
               demographic IS NULL
@@ -129,6 +130,14 @@ UPDATE_SQL = """
                 THEN 'label_agent_v1'
             ELSE category_label_source
         END,
+        -- Phase O-4b: recompute the lifecycle stage from the merged
+        -- row state. Without this, a row promoted from candidate →
+        -- validated by the agent fill stays at candidate forever and
+        -- never surfaces in the O-5 recall live-stage filter. The
+        -- caller computes :new_stage off the merged dict (same gate
+        -- function the 3 ingest paths use), so the column tracks
+        -- monotonically with content fills. mig 077.
+        pdp_lifecycle_stage = :new_stage,
         updated_at      = NOW()
     WHERE product_key = :product_key
 """
@@ -218,6 +227,17 @@ async def _process_one(
     if result.get("reasoning"):
         base["reasoning"] = result["reasoning"]
 
+    # Phase O-4b: compute the new lifecycle stage off the merged row
+    # state — same pure gate function the 3 ingest paths use. Capture
+    # before/after so the run report shows promotions explicitly. The
+    # stage is monotonic with content fills, so this never demotes a
+    # row in practice (LabelAgent only fills NULLs).
+    old_stage = row.get("pdp_lifecycle_stage")
+    new_stage = compute_lifecycle_stage(merged)
+    base["lifecycle_stage_before"] = old_stage
+    base["lifecycle_stage_after"] = new_stage
+    base["lifecycle_promoted"] = old_stage != new_stage
+
     if not apply:
         base["applied"] = False
         return base
@@ -230,6 +250,7 @@ async def _process_one(
             "category_path": merged.get("category_path"),
             "use_case_tags": json.dumps(merged.get("use_case_tags") or []),
             "lifestyle_tags": json.dumps(merged.get("lifestyle_tags") or []),
+            "new_stage": new_stage,
         },
     )
     base["applied"] = True
@@ -284,6 +305,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     per_row: List[Dict[str, Any]] = []
     drop_counter: Counter = Counter()
     fields_filled_counter: Counter = Counter()
+    promotion_counter: Counter = Counter()
     applied = 0
 
     for row in candidates:
@@ -301,6 +323,12 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
             fields_filled_counter[field] += 1
         if result.get("applied"):
             applied += 1
+        if result.get("lifecycle_promoted"):
+            promotion_key = (
+                f"{result.get('lifecycle_stage_before') or 'null'}"
+                f"->{result.get('lifecycle_stage_after')}"
+            )
+            promotion_counter[promotion_key] += 1
 
     return {
         "scope": args.scope,
@@ -312,6 +340,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "applied_count": applied,
         "drop_reason_counts": dict(drop_counter),
         "fields_filled_counts": dict(fields_filled_counter),
+        "lifecycle_promotion_counts": dict(promotion_counter),
         "per_row": per_row,
     }
 
@@ -345,6 +374,11 @@ def _print_summary(report: Dict[str, Any]) -> None:
         print(f"  fields filled:")
         for field, count in sorted(fields.items(), key=lambda x: -x[1]):
             print(f"    {field:24s} {count}")
+    promotions = report.get("lifecycle_promotion_counts") or {}
+    if promotions:
+        print(f"  lifecycle promotions:")
+        for transition, count in sorted(promotions.items(), key=lambda x: -x[1]):
+            print(f"    {transition:30s} {count}")
 
 
 async def _run(args: argparse.Namespace) -> int:
