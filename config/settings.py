@@ -274,6 +274,25 @@ class Settings(BaseSettings):
             if m.strip()
         ]
 
+    # BD cold-start audit — catalog-intelligence integration.
+    # The Pivota-catalog-intelligence service (separate repo, Express +
+    # Puppeteer) does the heavy lifting for product discovery against
+    # cold-target brand sites. When configured, the cold-start endpoint
+    # calls it as the primary discovery path; falls back to in-process
+    # brand_product_discovery when unreachable / not configured.
+    catalog_intelligence_base_url: str = os.getenv(
+        "CATALOG_INTELLIGENCE_BASE_URL", "",
+    )
+    catalog_intelligence_api_key: str = os.getenv(
+        "CATALOG_INTELLIGENCE_API_KEY", "",
+    )
+    # Puppeteer extraction can take 30-90s for large catalogs; this is
+    # a hard ceiling, not a target. Discovery is best-effort — if it
+    # exceeds this, we fall back to lightweight regex discovery.
+    catalog_intelligence_timeout_s: float = float(
+        os.getenv("CATALOG_INTELLIGENCE_TIMEOUT_S", "90"),
+    )
+
     # LLM probe concurrency caps (Phase C prerequisite).
     # Per feedback_llm_call_multipliers.md: PR #278 took backend down
     # when uncapped concurrent probes saturated the upstream LLM
