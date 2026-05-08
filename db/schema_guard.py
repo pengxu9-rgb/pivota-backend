@@ -185,6 +185,53 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Phase D: GSC OAuth + URL submission tables (migration 074).
+            # Fast-mode startup skips db/migrations/, so schema_guard
+            # owns these in production. Idempotent CREATE IF NOT EXISTS
+            # is safe to run on every boot.
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS gsc_oauth_tokens (
+                      merchant_id        TEXT PRIMARY KEY,
+                      refresh_token_enc  TEXT NOT NULL,
+                      access_token_enc   TEXT NULL,
+                      access_token_expires_at TIMESTAMPTZ NULL,
+                      granted_scopes     TEXT[] NOT NULL,
+                      granted_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      authorized_site_url TEXT NOT NULL,
+                      last_refresh_ok_at TIMESTAMPTZ NULL,
+                      last_refresh_error TEXT NULL,
+                      revoked_at         TIMESTAMPTZ NULL
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS gsc_url_submissions (
+                      merchant_id        TEXT NOT NULL,
+                      url                TEXT NOT NULL,
+                      last_status        TEXT NOT NULL,
+                      last_status_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      submitted_at       TIMESTAMPTZ NULL,
+                      indexed_at         TIMESTAMPTZ NULL,
+                      error_message      TEXT NULL,
+                      source_audit_run_id UUID NULL,
+                      PRIMARY KEY (merchant_id, url)
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_gsc_url_submissions_merchant_status
+                      ON gsc_url_submissions (merchant_id, last_status, last_status_at DESC);
+                    """
+                )
+            )
             return
 
         if IS_SQLITE:
