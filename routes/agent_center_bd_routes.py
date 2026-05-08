@@ -240,3 +240,140 @@ async def brand_report(
         agg.get("brand_verdict_label"),
     )
     return {"status": "ok", "brand_report": out}
+
+
+class BdColdStartAuditRequest(BaseModel):
+    """URL-only entry point for BD cold outreach. The operator pastes
+    the brand's homepage URL; backend auto-discovers the brand name +
+    top N products and runs the same audit pipeline as /brand-report.
+
+    For BD doing cold calls to brands they've never engaged with,
+    they have the URL and maybe nothing else. The existing
+    /brand-report form requires title + pdp_url + vendor + type per
+    product — 5-10 minutes of manual fetch-and-paste per target.
+    This endpoint reduces that to one URL.
+    """
+    url: str = Field(..., min_length=8, max_length=2000)
+    max_products: int = Field(3, ge=1, le=_BRAND_REPORT_HARD_MAX_PRODUCTS)
+    provider: str = Field("gemini")
+    max_runs: int = Field(3, ge=1, le=_HARD_MAX_RUNS)
+    include_category_visibility: bool = Field(True)
+
+    @validator("url")
+    def _url_looks_like_url(cls, v: str) -> str:
+        s = v.strip()
+        if not (s.startswith("http://") or s.startswith("https://")):
+            raise ValueError("url must start with http:// or https://")
+        return s
+
+    @validator("provider")
+    def _provider_allowed(cls, v: str) -> str:
+        if v not in {"gemini", "mock"}:
+            raise ValueError("provider must be 'gemini' or 'mock'")
+        return v
+
+
+@router.post("/cold-start-audit")
+async def cold_start_audit(
+    body: BdColdStartAuditRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Auto-discover products from a brand's homepage, then run the
+    full brand audit. Single-URL alternative to /brand-report.
+
+    Discovery strategies tried in order: Shopify sitemap → generic
+    sitemap → homepage link crawl. Returns 422 with diagnostic
+    message when none of them yield products (operator falls back
+    to /brand-report manual entry).
+
+    Cost: same as /brand-report (max_products × 3 scan_modes ×
+    max_runs grounded Gemini calls). Discovery itself is small —
+    a few HTTP fetches against the brand's site.
+    """
+    from services.brand_product_discovery import (
+        BrandProductDiscoveryError,
+        discover_products_from_homepage,
+    )
+
+    try:
+        discovered = await discover_products_from_homepage(
+            body.url, max_products=body.max_products,
+        )
+    except BrandProductDiscoveryError as exc:
+        logger.warning(
+            "BD cold-start audit: discovery failed for url=%s: %s",
+            body.url, exc,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "discovery_failed",
+                "message": str(exc),
+                "fallback": (
+                    "Use POST /api/agent-center/bd/brand-report with "
+                    "manually-entered products."
+                ),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.exception(
+            "BD cold-start audit: unexpected discovery error for url=%s",
+            body.url,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected discovery error: {exc}",
+        )
+
+    if not discovered.get("products"):
+        # Belt-and-suspenders: discovery returned no error but also no
+        # products. Treat as discovery_failed.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "discovery_failed",
+                "message": "Discovery returned zero products; nothing to audit.",
+                "fallback": (
+                    "Use POST /api/agent-center/bd/brand-report with "
+                    "manually-entered products."
+                ),
+            },
+        )
+
+    try:
+        out = await run_brand_report(
+            merchant_name=discovered["merchant_name"],
+            merchant_domain=discovered.get("merchant_domain"),
+            products=discovered["products"],
+            provider=body.provider,
+            max_runs=body.max_runs,
+            include_category_visibility=body.include_category_visibility,
+        )
+    except Exception as exc:
+        raise _map_error(exc) from exc
+
+    agg = out.get("aggregate") or {}
+    logger.info(
+        "BD cold-start audit: url=%s discovered_brand=%s "
+        "discovery_method=%s products_count=%s succeeded=%s "
+        "verdict=%s",
+        body.url,
+        discovered["merchant_name"],
+        discovered.get("discovery_method"),
+        agg.get("products_count"),
+        agg.get("products_succeeded"),
+        agg.get("brand_verdict_label"),
+    )
+    return {
+        "status": "ok",
+        "discovery": {
+            "merchant_name": discovered["merchant_name"],
+            "merchant_domain": discovered.get("merchant_domain"),
+            "discovery_method": discovered.get("discovery_method"),
+            "products_discovered": [
+                {"title": p["title"], "pdp_url": p["pdp_url"]}
+                for p in discovered["products"]
+            ],
+        },
+        "brand_report": out,
+    }
