@@ -348,6 +348,162 @@ async def test_get_index_status_maps_pass_to_indexed(enabled_settings):
 
 
 @pytest.mark.asyncio
+async def test_submit_audit_canonical_urls_skips_when_flag_off(monkeypatch):
+    """Feature flag off → empty list, no API calls attempted."""
+    from services import gsc_integration as mod
+    from config import settings as settings_module
+    monkeypatch.setattr(settings_module.settings, "gsc_integration_enabled", False)
+    result = await mod.submit_audit_canonical_urls(
+        merchant_id="m",
+        brand_report={
+            "per_product": [
+                {
+                    "merchant_pdp_url": "https://agent.pivota.cc/products/sig_x",
+                    "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                },
+            ],
+        },
+    )
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_submit_audit_canonical_urls_skips_non_pivota_canonical(enabled_settings):
+    """Only url_source=pivota_canonical_pdp gets submitted. External
+    URLs / merchant.com URLs flow through different auth (they need
+    per-merchant OAuth on the merchant's own domain)."""
+    from services import gsc_integration as mod
+
+    async def _integrated(_merchant_id):
+        return True
+
+    submit_calls = []
+    async def _fake_submit(merchant_id, url, *, audit_run_id=None):
+        submit_calls.append(url)
+        return {"status": "submitted", "url": url}
+
+    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_integrated)):
+        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
+            result = await mod.submit_audit_canonical_urls(
+                merchant_id="m",
+                brand_report={
+                    "per_product": [
+                        {
+                            "merchant_pdp_url": "https://merchant.com/p/1",
+                            "merchant_view": {"headline": {"url_source": "merchant_external"}},
+                        },
+                        {
+                            "merchant_pdp_url": "https://agent.pivota.cc/products/sig_a",
+                            "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                        },
+                    ],
+                },
+            )
+    # Only the canonical URL was submitted
+    assert submit_calls == ["https://agent.pivota.cc/products/sig_a"]
+    assert len(result) == 1
+    assert result[0]["status"] == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_submit_audit_canonical_urls_skips_when_no_token(enabled_settings):
+    """Merchant hasn't granted access → no submissions attempted.
+    Saves Google API calls + avoids fabricating gsc_url_submissions
+    rows with errors."""
+    from services import gsc_integration as mod
+
+    async def _not_integrated(_merchant_id):
+        return False
+
+    submit_calls = []
+    async def _fake_submit(*a, **kw):
+        submit_calls.append(a)
+        return {"status": "submitted"}
+
+    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_not_integrated)):
+        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
+            result = await mod.submit_audit_canonical_urls(
+                merchant_id="m",
+                brand_report={
+                    "per_product": [
+                        {
+                            "merchant_pdp_url": "https://agent.pivota.cc/products/sig_a",
+                            "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                        },
+                    ],
+                },
+            )
+    assert result == []
+    assert submit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_submit_audit_canonical_urls_dedupes(enabled_settings):
+    """Same URL across per_product reports submitted once."""
+    from services import gsc_integration as mod
+
+    async def _integrated(_): return True
+
+    submit_calls = []
+    async def _fake_submit(merchant_id, url, *, audit_run_id=None):
+        submit_calls.append(url)
+        return {"status": "submitted"}
+
+    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_integrated)):
+        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
+            await mod.submit_audit_canonical_urls(
+                merchant_id="m",
+                brand_report={
+                    "per_product": [
+                        {
+                            "merchant_pdp_url": "https://agent.pivota.cc/products/sig_a",
+                            "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                        },
+                        {
+                            "merchant_pdp_url": "https://agent.pivota.cc/products/sig_a",
+                            "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}},
+                        },
+                    ],
+                },
+            )
+    assert submit_calls == ["https://agent.pivota.cc/products/sig_a"]
+
+
+@pytest.mark.asyncio
+async def test_submit_audit_canonical_urls_swallows_per_url_failures(enabled_settings):
+    """If one URL fails, others still get submitted. Failures are
+    caught + logged, never raised — audit response succeeds."""
+    from services import gsc_integration as mod
+
+    async def _integrated(_): return True
+
+    async def _fake_submit(merchant_id, url, *, audit_run_id=None):
+        if "fail" in url:
+            raise RuntimeError("simulated network failure")
+        return {"status": "submitted"}
+
+    with patch.object(mod, "is_gsc_integrated", AsyncMock(side_effect=_integrated)):
+        with patch.object(mod, "submit_url_to_gsc", AsyncMock(side_effect=_fake_submit)):
+            results = await mod.submit_audit_canonical_urls(
+                merchant_id="m",
+                brand_report={
+                    "per_product": [
+                        {"merchant_pdp_url": "https://agent.pivota.cc/products/sig_ok",
+                         "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}}},
+                        {"merchant_pdp_url": "https://agent.pivota.cc/products/sig_fail",
+                         "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}}},
+                        {"merchant_pdp_url": "https://agent.pivota.cc/products/sig_ok2",
+                         "merchant_view": {"headline": {"url_source": "pivota_canonical_pdp"}}},
+                    ],
+                },
+            )
+    assert len(results) == 3
+    # 2 succeeded, 1 errored
+    statuses = sorted([r["status"] for r in results])
+    assert statuses == ["error", "submitted", "submitted"]
+
+
+@pytest.mark.asyncio
 async def test_get_index_status_maps_neutral_to_pending(enabled_settings):
     from services import gsc_integration as mod
 
