@@ -240,3 +240,199 @@ async def brand_report(
         agg.get("brand_verdict_label"),
     )
     return {"status": "ok", "brand_report": out}
+
+
+# ---------------------------------------------------------------------------
+# Cold-start audit — URL-only entry point for BD outreach
+# ---------------------------------------------------------------------------
+
+
+class BdColdStartAuditRequest(BaseModel):
+    """URL-only entry point for BD cold outreach. The operator pastes
+    the brand's homepage URL; backend orchestrates discovery via:
+
+      1. Pivota-catalog-intelligence service (Puppeteer; primary
+         when configured) — returns rich extracted catalog including
+         variants, pricing, ad copy
+      2. In-process sitemap + link discovery (fallback when
+         catalog-intelligence is unreachable / unconfigured /
+         returns empty for this site)
+
+    All discovered products are upserted to `prospect_products` —
+    every cold audit grows Pivota's catalog of D2C brand data.
+    Subset (top max_products) is sent through run_brand_report.
+
+    For BD doing cold calls to brands they've never engaged with,
+    the existing /brand-report form requires title + pdp_url +
+    vendor + type per product — 5-10 minutes of manual fetch-and-
+    paste per target. This endpoint reduces that to one URL.
+    """
+    url: str = Field(..., min_length=8, max_length=2000)
+    max_products: int = Field(3, ge=1, le=_BRAND_REPORT_HARD_MAX_PRODUCTS)
+    market: str = Field("US", min_length=2, max_length=10)
+    provider: str = Field("gemini")
+    max_runs: int = Field(3, ge=1, le=_HARD_MAX_RUNS)
+    include_category_visibility: bool = Field(True)
+    # Catalog-extract-audit skill's "preflight before seed writes"
+    # pattern. When True, the endpoint runs discovery only — returns
+    # diagnostics + coverage stats + product list — without invoking
+    # the LLM audit pipeline OR persisting to prospect_products.
+    # Lets BD operators inspect extraction quality before committing
+    # to a full audit run + backfill.
+    dry_run: bool = Field(False)
+
+    @validator("url")
+    def _url_looks_like_url(cls, v: str) -> str:
+        s = v.strip()
+        if not (s.startswith("http://") or s.startswith("https://")):
+            raise ValueError("url must start with http:// or https://")
+        return s
+
+    @validator("provider")
+    def _provider_allowed(cls, v: str) -> str:
+        if v not in {"gemini", "mock"}:
+            raise ValueError("provider must be 'gemini' or 'mock'")
+        return v
+
+
+@router.post("/cold-start-audit")
+async def cold_start_audit(
+    body: BdColdStartAuditRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """URL-only BD audit. Auto-discovers brand + products, runs
+    full brand report.
+
+    Returns 422 with diagnostic when discovery fails entirely — BD
+    operator falls back to /brand-report manual entry.
+    """
+    from services.bd_cold_start_service import (
+        BrandDiscoveryError,
+        discover_products_for_audit,
+    )
+
+    try:
+        discovered = await discover_products_for_audit(
+            body.url,
+            max_products=body.max_products,
+            market=body.market,
+            persist=not body.dry_run,
+        )
+    except BrandDiscoveryError as exc:
+        logger.warning(
+            "BD cold-start audit: discovery failed for url=%s: %s",
+            body.url, exc,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "discovery_failed",
+                "message": str(exc),
+                "fallback": (
+                    "Use POST /api/agent-center/bd/brand-report with "
+                    "manually-entered products."
+                ),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "BD cold-start audit: unexpected discovery error for url=%s",
+            body.url,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected discovery error: {exc}",
+        )
+
+    if not discovered.get("products"):
+        # Belt-and-suspenders.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "discovery_failed",
+                "message": "Discovery returned zero products; nothing to audit.",
+                "fallback": (
+                    "Use POST /api/agent-center/bd/brand-report with "
+                    "manually-entered products."
+                ),
+            },
+        )
+
+    # Dry-run short-circuit: return discovery + diagnostics without
+    # running the LLM audit. catalog-extract-audit skill pattern —
+    # operator inspects extraction quality before committing to a
+    # full audit run.
+    if body.dry_run:
+        logger.info(
+            "BD cold-start dry-run: url=%s brand=%s discovery=%s "
+            "products_discovered=%s coverage=%s diagnostics=%s",
+            body.url,
+            discovered["merchant_name"],
+            discovered["discovery_method"],
+            discovered.get("products_discovered_total"),
+            discovered.get("coverage"),
+            discovered.get("diagnostics"),
+        )
+        return {
+            "status": "ok",
+            "dry_run": True,
+            "discovery": _build_discovery_block(discovered),
+        }
+
+    try:
+        out = await run_brand_report(
+            merchant_name=discovered["merchant_name"],
+            merchant_domain=discovered.get("merchant_domain"),
+            products=discovered["products"],
+            provider=body.provider,
+            max_runs=body.max_runs,
+            include_category_visibility=body.include_category_visibility,
+        )
+    except Exception as exc:
+        raise _map_error(exc) from exc
+
+    agg = out.get("aggregate") or {}
+    logger.info(
+        "BD cold-start audit: url=%s brand=%s discovery=%s "
+        "products_audited=%s products_discovered=%s "
+        "products_persisted=%s fallback_used=%s verdict=%s",
+        body.url,
+        discovered["merchant_name"],
+        discovered["discovery_method"],
+        agg.get("products_count"),
+        discovered.get("products_discovered_total"),
+        discovered.get("products_persisted"),
+        discovered.get("fallback_used"),
+        agg.get("brand_verdict_label"),
+    )
+    return {
+        "status": "ok",
+        "discovery": _build_discovery_block(discovered),
+        "brand_report": out,
+    }
+
+
+def _build_discovery_block(discovered: Dict[str, Any]) -> Dict[str, Any]:
+    """Project the orchestrator's output to the response shape. Same
+    structure for full-audit and dry-run responses so the BD portal
+    can render the discovery panel uniformly."""
+    return {
+        "merchant_name": discovered["merchant_name"],
+        "merchant_domain": discovered.get("merchant_domain"),
+        "discovery_method": discovered["discovery_method"],
+        "platform": discovered.get("platform"),
+        "fallback_used": discovered.get("fallback_used"),
+        "products_audited": [
+            {"title": p["title"], "pdp_url": p["pdp_url"]}
+            for p in discovered["products"]
+        ],
+        "products_discovered_total": discovered.get(
+            "products_discovered_total",
+        ),
+        "products_persisted": discovered.get("products_persisted", 0),
+        # catalog-extract-audit skill outputs — diagnostics + coverage
+        # let BD operators judge whether the extraction is trustworthy
+        # before relying on the verdict.
+        "diagnostics": discovered.get("diagnostics"),
+        "coverage": discovered.get("coverage"),
+    }

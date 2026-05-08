@@ -11,16 +11,18 @@ in batches.
 Default is dry-run. Pass --apply to write to the DB.
 
 Usage:
-  # See histogram of stages without touching the DB:
-  python scripts/backfill_pdp_lifecycle_stage.py --limit 1000
+  # See histogram of stages without touching the DB (default --limit
+  # 10000 covers the current ~5k catalog; the run logs a warning if
+  # the cap is hit):
+  python scripts/backfill_pdp_lifecycle_stage.py
 
   # Apply against a small slice first (smoke test):
   DATABASE_URL=... python scripts/backfill_pdp_lifecycle_stage.py \\
     --limit 50 --apply
 
-  # Full backfill:
-  DATABASE_URL=... python scripts/backfill_pdp_lifecycle_stage.py \\
-    --limit 100000 --apply
+  # Full backfill (default --limit 10000 is enough for now; bump
+  # higher if the catalog grows past ~10k):
+  DATABASE_URL=... python scripts/backfill_pdp_lifecycle_stage.py --apply
 
 Idempotency: only processes rows where pdp_lifecycle_stage IS NULL.
 Re-runs are safe — already-staged rows are skipped at SELECT time.
@@ -116,6 +118,9 @@ async def _fetch_candidates(limit: int) -> List[Dict[str, Any]]:
     return out
 
 
+PROGRESS_LOG_EVERY = 250
+
+
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     await _connect_with_retry()
     candidates = await _fetch_candidates(args.limit)
@@ -126,7 +131,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     applied = 0
     sample_rows: List[Dict[str, Any]] = []
 
-    for row in candidates:
+    for idx, row in enumerate(candidates, start=1):
         stage = compute_lifecycle_stage(row)
         stage_counter[stage] += 1
         scope_key = row.get("pdp_scope") or row.get("source_system") or "unknown"
@@ -149,11 +154,30 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
             )
             applied += 1
 
+        # Per-row UPDATEs over Railway proxy can take real wall time on
+        # a full backfill (~5k rows × ~50ms RTT). Log every N rows so
+        # the operator can tell the script is alive even if the next
+        # batch is slow.
+        if idx % PROGRESS_LOG_EVERY == 0:
+            logger.info(
+                "progress %d/%d (apply=%s, applied_so_far=%d)",
+                idx, len(candidates), args.apply, applied,
+            )
+
+    # Surface the limit-cap case so the operator notices instead of
+    # assuming a 1000-row run covered the whole table.
+    if len(candidates) >= args.limit:
+        logger.warning(
+            "hit --limit (%d) — there may be more NULL-stage rows; rerun to process the rest",
+            args.limit,
+        )
+
     return {
         "limit": args.limit,
         "apply": args.apply,
         "candidate_count": len(candidates),
         "applied_count": applied,
+        "limit_hit": len(candidates) >= args.limit,
         "stage_counts": dict(stage_counter),
         "per_scope_stage": {k: dict(v) for k, v in per_scope_stage.items()},
         "sample_rows": sample_rows,
@@ -204,8 +228,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=1000,
-        help="max rows to process per run (default 1000; full table is ~5k)",
+        default=10000,
+        help=(
+            "max rows to process per run (default 10000 — sized to cover the "
+            "current ~5k catalog with headroom; the run logs a warning if "
+            "this cap is hit so you know to rerun)"
+        ),
     )
     parser.add_argument(
         "--apply",
