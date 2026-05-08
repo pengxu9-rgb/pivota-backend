@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-08 (UTC) — **Phase 7b complete in prod**. Probe v17 post-merge: **beauty pass-rate 100% (37/37)**. Skincare_serum lifted 0/2 → 2/2 via PR #1315. Overall 38/53 = 72%. The remaining 14 EMPTY are non-beauty buckets (electronics / fashion_* / home) — pure data gap; Phase 4 expansion required.
+- Last updated: 2026-05-08 (UTC) — **Phase 7b complete in prod**, beauty 37/37 = 100%. Phase 4 electronics scaffolding open as PR #359 but **blocked on Stage 2 validator instrumentation** (Gemini drops 10-12 of 15 candidates silently with no rejection reason). Codex picking up the validator fix next; until that lands, Phase 4 expansion can't reliably gate on validate-rate.
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -71,6 +71,9 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | 7b Step 2 | Wire helper into find_products_multi + dedupe + telemetry + 3 integration tests | ✅ | PIVOTA-Agent #1312, merged → prod commit `91cbcc98` |
 | 7b non-beauty deadline | Gateway-level 6000ms hard deadline on non-beauty primary upstream; authoritative strict-empty on hit; `fpm_primary_deadline_*` telemetry | ✅ | PIVOTA-Agent #1314, merged → prod commit `d98a8704` |
 | 7b ingredient_recall_direct | Extend canonical chain to ingredient_recall_direct path | ✅ | PIVOTA-Agent #1315, merged → prod commit `ee5564c4` (auto-deployed 2026-05-07T23:56). Probe v17 post-merge: **skincare_serum 0/2 → 2/2 PASS** ✅, **beauty 100% (37/37)** ✅, overall 37/53 → 38/53. Net +1 (not +2) because electronics dropped 1/5 → 0/5 in the same probe — cache-flake on the existing cache_miss_sync_filled outliers, not caused by this PR. |
+| 4 electronics — scaffolding | Plan + 15 hand-curated PDP candidates JSONL | ✅ | pivota-backend #359 (`claude/phase-4-electronics`). Doc + data only, no DB writes. |
+| 4 electronics — Stage 2 validate | Gemini URL validator run on the 15 starter candidates | 🛑 **BLOCKED on validator** | First run 5/15 validated, retry 3/15 — gate is ≥12/15 so no Stage 3 ingestion. Most failures are Gemini HTTP 200 with `offers=[]` and **no preserved drop reason**. Validator needs per-candidate `validation_drop_reason` + retry on transient errors before Phase 4 can scale. Codex working on it next. |
+| 4 electronics — validator instrumentation | Add per-candidate drop reasons + retry to gemini_url_validator | 🟡 next codex task | Spec'd in chat; ~80-150 LOC in `services/catalog_enrichment_agent/gemini_url_validator.py` + summary block in `scripts/run_catalog_enrichment.py`. Unblocks #359. |
 
 ---
 
@@ -424,17 +427,34 @@ the recall path doesn't surface lipstick. Fix #1 first, then extend.
 
 ---
 
-## Recommended next steps (post probe v15, Phase 7b shipped 2026-05-07 night)
+## Recommended next steps (post probe v17 + Phase 4 electronics blocker, 2026-05-08)
 
 Phase 7b is in production. Beauty recall is solved (100% PASS across
 lipstick/fragrance/eye/face/skincare). The remaining 14 EMPTY queries
 are entirely non-beauty (electronics 4/5, home 4/4, fashion_*) — pure
 data gap, not recall code.
 
-The architectural era of this work is over. The next era is **catalog
-breadth**.
+Phase 4 electronics scaffolding (PR #359) opened with 15 hand-curated
+PDP candidates but **Stage 2 Gemini validator dropped 10-12 of them
+silently** (no `validation_drop_reason` persisted). Stop-and-fix
+triggered before any DB writes. Validator instrumentation is now a
+blocker for Phase 4 expansion at scale.
 
-1. **Phase 4 expansion to fashion / electronics / home** (top priority).
+Updated priority sequence:
+
+1. **Validator instrumentation (codex)** — add per-candidate
+   `validation_drop_reason` + `validation_drop_detail` + retry on
+   transient errors. ~80-150 LOC in
+   `services/catalog_enrichment_agent/gemini_url_validator.py` +
+   `scripts/run_catalog_enrichment.py`. Spec'd, ready for codex pickup.
+2. **Re-run electronics Stage 2 with diagnostics** — if drops are
+   anti-scraping (apple/amazon 403/429), re-curate JSONL toward
+   target.com / walmart.com / brand-direct stores. If drops are
+   prompt-related, separate small PR to tweak validator prompt for
+   electronics. If drops are transient, retry should fix.
+3. **Once electronics validates ≥12/15** — Stage 3 ingest (dry-run +
+   apply), audit invariants, probe v18. Required: electronics 1/5 → ≥3/5.
+4. **Phase 4 expansion to fashion / electronics / home** (top priority).
    The exact lipstick/fragrance Phase 4 pattern that landed beauty
    coverage now applies. For each new vertical:
    - Prepare 30–50 hand-curated PDP candidates JSONL (mirrors
