@@ -146,6 +146,46 @@ def test_non_dict_per_product_entries_skipped():
     assert len(detected) == 1
 
 
+@pytest.mark.asyncio
+async def test_probe_raises_when_key_unset_and_no_opt_in(monkeypatch):
+    """Source #1 elimination: probe() now RAISES when
+    PIVOTA_AGENT_INTERNAL_API_KEY is unset, instead of silently
+    returning the local mock. This prevents silent pollution of
+    merchant-facing audit / BD report prose. Demand-test opts in
+    via allow_local_mock=True; everyone else fails loud."""
+    from services import agent_center_llm_client as llm_client
+    monkeypatch.setattr(llm_client.settings, "pivota_agent_internal_api_key", None)
+    with pytest.raises(llm_client.AgentCenterLlmClientError) as excinfo:
+        await llm_client.probe(
+            scan_mode="open_product_visibility_test",
+            scan_target_id="t1",
+            merchant_id="m1",
+            store_id="s1",
+            provider="gemini",
+            max_runs=1,
+        )
+    assert "PIVOTA_AGENT_INTERNAL_API_KEY" in str(excinfo.value)
+    assert "refusing" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_probe_local_mock_fires_only_with_explicit_opt_in(monkeypatch):
+    """Demand-test runner opts into local mock by passing
+    allow_local_mock=True. Verify the opt-in actually works."""
+    from services import agent_center_llm_client as llm_client
+    monkeypatch.setattr(llm_client.settings, "pivota_agent_internal_api_key", None)
+    result = await llm_client.probe(
+        scan_mode="open_product_visibility_test",
+        scan_target_id="t1",
+        merchant_id="m1",
+        store_id="s1",
+        provider="mock",
+        max_runs=1,
+        allow_local_mock=True,
+    )
+    assert result["provider"] == "local_mock_no_internal_key"
+
+
 def test_classify_provider_marks_real_only_for_gemini():
     """End-to-end sanity: services.agent_center_bd_report_service
     `_classify_provider` returns is_real=True only for the gemini
