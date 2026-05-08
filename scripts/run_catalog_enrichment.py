@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -56,6 +57,10 @@ def _validated_path(category: str, data_dir: Path) -> Path:
     return data_dir / f"{category}_validated.jsonl"
 
 
+def _validation_summary_path(category: str, data_dir: Path) -> Path:
+    return data_dir / f"{category}_validation_summary.json"
+
+
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
@@ -79,18 +84,72 @@ def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _build_validation_summary(
+    *,
+    category: str,
+    candidates_input: int,
+    results: List[Dict[str, Any]],
+    output_path: Path,
+) -> Dict[str, Any]:
+    drop_counts: Counter = Counter()
+    dropped: List[Dict[str, Any]] = []
+    for row in results:
+        offers = row.get("offers") or []
+        if offers:
+            continue
+        reason = str(row.get("validation_drop_reason") or "unknown_drop")
+        drop_counts[reason] += 1
+        pdp = row.get("pdp") if isinstance(row.get("pdp"), dict) else {}
+        dropped.append({
+            "brand": pdp.get("brand"),
+            "product_name": pdp.get("product_name"),
+            "category_path": pdp.get("category_path"),
+            "validation_drop_reason": reason,
+            "validation_drop_detail": row.get("validation_drop_detail") or "",
+            "validation_attempts": row.get("validation_attempts"),
+            "validation_retried": row.get("validation_retried"),
+        })
+    validated = sum(1 for row in results if row.get("offers"))
+    return {
+        "category": category,
+        "candidates_input": candidates_input,
+        "validated_count": validated,
+        "dropped_count": max(0, len(results) - validated),
+        "drop_reason_counts": dict(sorted(drop_counts.items())),
+        "output_path": str(output_path),
+        "dropped": dropped,
+    }
+
+
+def _format_validation_summary(summary: Dict[str, Any]) -> str:
+    lines = [
+        "Validation summary:",
+        f"  Candidates input: {summary.get('candidates_input', 0)}",
+        f"  Validated (>=1 offer): {summary.get('validated_count', 0)}",
+        f"  Dropped: {summary.get('dropped_count', 0)}",
+    ]
+    for reason, count in (summary.get("drop_reason_counts") or {}).items():
+        lines.append(f"    {reason}: {count}")
+    return "\n".join(lines)
+
+
 async def _validate_with_concurrency(
     candidates: List[Dict[str, Any]],
     *,
     concurrency: int,
     timeout_s: float,
+    max_retries: int,
 ) -> List[Dict[str, Any]]:
     sem = asyncio.Semaphore(max(1, concurrency))
 
     async def _one(cand: Dict[str, Any]) -> Dict[str, Any]:
         async with sem:
             try:
-                return await validate_candidate(cand, timeout_s=timeout_s)
+                return await validate_candidate(
+                    cand,
+                    timeout_s=timeout_s,
+                    max_retries=max_retries,
+                )
             except Exception as exc:
                 logger.exception("validate failed for %s — %s", cand.get("product_name"), exc)
                 return {
@@ -101,6 +160,10 @@ async def _validate_with_concurrency(
                         "attribute_summary": cand.get("attribute_summary"),
                     },
                     "offers": [],
+                    "validation_drop_reason": "validator_exception",
+                    "validation_drop_detail": str(exc)[:500],
+                    "validation_attempts": 1,
+                    "validation_retried": False,
                 }
 
     return await asyncio.gather(*(_one(c) for c in candidates))
@@ -128,17 +191,28 @@ async def _do_validate(args: argparse.Namespace) -> int:
         candidates,
         concurrency=args.concurrency,
         timeout_s=args.timeout,
+        max_retries=args.max_retries,
     )
 
     validated_count = sum(1 for r in results if r.get("offers"))
     rejected_count = len(results) - validated_count
     _write_jsonl(out_path, results)
+    summary = _build_validation_summary(
+        category=args.category,
+        candidates_input=len(candidates),
+        results=results,
+        output_path=out_path,
+    )
+    summary_path = _validation_summary_path(args.category, data_dir)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(_format_validation_summary(summary))
     logger.info(
-        "wrote %s rows to %s (validated=%s rejected=%s)",
+        "wrote %s rows to %s (validated=%s rejected=%s summary=%s)",
         len(results),
         out_path,
         validated_count,
         rejected_count,
+        summary_path,
     )
     return 0
 
@@ -364,6 +438,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=45.0)
+    parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--apply", action="store_true",
                         help="ingest mode: actually INSERT (default is dry-run print-only)")
