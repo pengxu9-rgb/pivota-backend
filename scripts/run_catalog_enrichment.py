@@ -139,6 +139,7 @@ async def _validate_with_concurrency(
     concurrency: int,
     timeout_s: float,
     max_retries: int,
+    max_output_tokens: int,
 ) -> List[Dict[str, Any]]:
     sem = asyncio.Semaphore(max(1, concurrency))
 
@@ -149,6 +150,7 @@ async def _validate_with_concurrency(
                     cand,
                     timeout_s=timeout_s,
                     max_retries=max_retries,
+                    max_output_tokens=max_output_tokens,
                 )
             except Exception as exc:
                 logger.exception("validate failed for %s — %s", cand.get("product_name"), exc)
@@ -192,6 +194,7 @@ async def _do_validate(args: argparse.Namespace) -> int:
         concurrency=args.concurrency,
         timeout_s=args.timeout,
         max_retries=args.max_retries,
+        max_output_tokens=args.max_output_tokens,
     )
 
     validated_count = sum(1 for r in results if r.get("offers"))
@@ -439,6 +442,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--max-retries", type=int, default=1)
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--apply", action="store_true",
                         help="ingest mode: actually INSERT (default is dry-run print-only)")

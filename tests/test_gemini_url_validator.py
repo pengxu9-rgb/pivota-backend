@@ -230,6 +230,7 @@ def test_validate_candidate_retries_once_on_429(monkeypatch):
     result = asyncio.run(validate_candidate(_candidate(), api_key="test", max_retries=1))
 
     assert len(calls) == 2
+    assert calls[0]["json"]["generationConfig"]["maxOutputTokens"] == 4096
     assert len(result["offers"]) == 1
     assert result["validation_attempts"] == 2
     assert result["validation_retried"] is True
