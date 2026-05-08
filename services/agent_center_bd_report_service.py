@@ -2887,6 +2887,15 @@ def _build_merchant_view(
         integration_action = build_integration_action(integration_state)
         if integration_action is not None:
             merged_actions = [integration_action] + merged_actions
+        else:
+            # Phase D scaffolding: when Phase 0 is satisfied (store +
+            # PSP done) but GSC isn't connected yet, surface the GSC
+            # integration as a SECONDARY action high in the list. Not
+            # critical-tier — it's the next step for a merchant who's
+            # already onboarded.
+            if not integration_state.get("gsc_integrated"):
+                from services.gsc_integration import build_gsc_integration_action
+                merged_actions = [build_gsc_integration_action()] + merged_actions
 
     # Stamp a 1-indexed `priority_order` on every action so the
     # frontend can render "Step 1, Step 2..." without re-deriving the
