@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-08 (UTC) — **Phase 7b complete in prod**, beauty 37/37 = 100%. Phase 4 electronics scaffolding (#359) + validator instrumentation (#363) + JSON contract fix via `maxOutputTokens` 1024→4096 (#365) all merged. Validator now passes all three corpora cleanly (electronics 12/15, fragrance 37/50, lipstick 30/51; truncation-class drops 7→0). Stage 3 ingest electronics → probe v18 is the next codex task; data path is otherwise unblocked.
+- Last updated: 2026-05-08 (UTC) — **Strategic pivot from corpus probes to PDP onboarding standardization** (peng: electronics not core business). New track started: `docs/PDP_ONBOARDING_PLAYBOOK.md`. **O-1 shipped** (PR #369, prod commit `310ada4a`): merchant `tags[]` now flows through Shopify ingest into a new JSONB column on `catalog_products`, with at-startup schema guard. Verified in prod (column live, awaiting next Shopify sync to populate). Next: O-2 (4 typed taxonomy columns: price_tier, use_case_tags, lifestyle_tags, demographic).
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -71,6 +71,9 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | 7b Step 2 | Wire helper into find_products_multi + dedupe + telemetry + 3 integration tests | ✅ | PIVOTA-Agent #1312, merged → prod commit `91cbcc98` |
 | 7b non-beauty deadline | Gateway-level 6000ms hard deadline on non-beauty primary upstream; authoritative strict-empty on hit; `fpm_primary_deadline_*` telemetry | ✅ | PIVOTA-Agent #1314, merged → prod commit `d98a8704` |
 | 7b ingredient_recall_direct | Extend canonical chain to ingredient_recall_direct path | ✅ | PIVOTA-Agent #1315, merged → prod commit `ee5564c4` (auto-deployed 2026-05-07T23:56). Probe v17 post-merge: **skincare_serum 0/2 → 2/2 PASS** ✅, **beauty 100% (37/37)** ✅, overall 37/53 → 38/53. Net +1 (not +2) because electronics dropped 1/5 → 0/5 in the same probe — cache-flake on the existing cache_miss_sync_filled outliers, not caused by this PR. |
+| **— PDP Onboarding Standardization track —** | (started 2026-05-08, see `docs/PDP_ONBOARDING_PLAYBOOK.md`) | | |
+| Onboarding playbook + 5 decisions | Maps 3 onboarding paths, 8 gaps, proposed lifecycle, peng agreed to all 5 recommendations | ✅ | PR #369, merged → prod commit `310ada4a` |
+| O-1 — wire merchant tags through Shopify ingest | mig 075 + db/catalog.py mapping + ingest payload + schema_guard at-startup ALTER + tests | ✅ | PR #369. Verified in prod: `catalog_products.tags` JSONB column live on 4690-row catalog. 0 tagged today (waiting on next Shopify sync to populate). 8 tests pass. |
 | 4 electronics — scaffolding | Plan + 15 hand-curated PDP candidates JSONL | ✅ | pivota-backend #359 (`claude/phase-4-electronics`). Doc + data only, no DB writes. |
 | 4 electronics — Stage 2 validate (initial) | Gemini URL validator run on the 15 starter candidates | 🛑 First runs failed gate | 5/15 then 3/15 validated; gate is ≥12/15. Most failures were silent `offers=[]` with no drop reason — instrumentation needed first. |
 | 4 electronics — validator instrumentation | Add per-candidate drop reasons + retry to gemini_url_validator | ✅ done (draft PR #363) | `validation_drop_reason` + `validation_drop_detail` (≤500 char snippet) emitted per drop site; runner now writes a complete audit (success + failure) to validated.jsonl + a `<category>_validation_summary.json`; retry on 429/503/timeout/non-JSON-200/parse-fail; 48-test validator suite passes. |
