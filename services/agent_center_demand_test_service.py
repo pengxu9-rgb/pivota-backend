@@ -252,6 +252,12 @@ async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
             context=context,
             provider=requested_provider,
             max_runs=int((target.get("payload") or {}).get("max_runs") or 3),
+            # Demand-test deliberately uses stub responses on free-tier
+            # preview when PIVOTA_AGENT_INTERNAL_API_KEY is unset — the
+            # runner marks results as `stub_complete` (not `succeeded`)
+            # so callers can distinguish real Gemini runs from stubs.
+            # Merchant audit + BD report MUST NOT pass this flag.
+            allow_local_mock=True,
         )
     except llm_client.AgentCenterLlmClientError as exc:
         # Upstream failure — record terminal state + bubble up.

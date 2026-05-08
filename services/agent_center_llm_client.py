@@ -115,9 +115,10 @@ async def probe(
     merchant_id: str,
     store_id: str,
     context: Optional[Mapping[str, Any]] = None,
-    provider: str = "mock",
+    provider: str,
     max_runs: int = 3,
     timeout_s: Optional[float] = None,
+    allow_local_mock: bool = False,
 ) -> Dict[str, Any]:
     """Run an LLM probe via PIVOTA-Agent.
 
@@ -125,6 +126,17 @@ async def probe(
     >=500, timeout, network error) raises `AgentCenterLlmClientError`. On
     explicit caller-side misuse (the upstream returns 4xx) raises
     `ValueError` so the route layer maps it to 400/422.
+
+    `provider` is required (was: defaulted to "mock", which was a footgun
+    for callers that forgot to set it — they'd silently ask the upstream
+    for synthetic data).
+
+    `allow_local_mock=False` is the default so callers fail loudly when
+    `PIVOTA_AGENT_INTERNAL_API_KEY` is unset. Demand-test runner opts
+    in via `allow_local_mock=True` because its product surface
+    deliberately uses stub responses (`stub_complete` status) on free-
+    tier preview calls. Merchant audit + BD report MUST keep the
+    default to never produce fabricated prose against synthetic data.
     """
     body: Dict[str, Any] = {
         "scan_mode": scan_mode,
@@ -136,13 +148,21 @@ async def probe(
     }
     api_key = (settings.pivota_agent_internal_api_key or "").strip()
     if not api_key:
-        # No upstream secret configured — return the local mock so the
-        # pipeline doesn't break in dev / CI. Production must always
-        # configure the key; absence is loud (logged ERROR) so missing
-        # config is visible.
+        if not allow_local_mock:
+            # Fail loudly. Production must always configure the key.
+            # Without this, callers that don't explicitly opt in to
+            # mock would silently render audit/report prose against
+            # synthetic data — fabricating user-facing content.
+            raise AgentCenterLlmClientError(
+                "PIVOTA_AGENT_INTERNAL_API_KEY is not configured; "
+                "refusing to fall back to local mock data. Pass "
+                "allow_local_mock=True only if your caller explicitly "
+                "handles synthetic responses (e.g., the demand-test "
+                "runner marking results as stub_complete)."
+            )
         logger.error(
-            "PIVOTA_AGENT_INTERNAL_API_KEY not configured; using local mock for "
-            "scan_target=%s scan_mode=%s",
+            "PIVOTA_AGENT_INTERNAL_API_KEY not configured; using local "
+            "mock for scan_target=%s scan_mode=%s (allow_local_mock=True)",
             scan_target_id,
             scan_mode,
         )

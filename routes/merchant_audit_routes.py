@@ -180,6 +180,42 @@ class ProductRef(BaseModel):
     source_product_id: str = Field(..., min_length=1)
 
 
+def _detect_mock_per_product(
+    brand_report: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return the per-product reports whose upstream returned mock /
+    synthetic fallback data. Used by the merchant audit endpoint to
+    refuse shipping fabricated prose.
+
+    Three pollution sources in the audit pipeline:
+
+      1. `_local_mock_result` in services.agent_center_llm_client
+         fires when this backend's PIVOTA_AGENT_INTERNAL_API_KEY is
+         unset (returns provider="local_mock_no_internal_key")
+      2. Upstream Pivota-Agent service's mock fires when its own
+         Gemini key is unset (provider="mock_fallback_no_gemini_key")
+      3. Explicit provider="mock" via pivota_agent_center_mock_gemini
+         flag
+
+    Each produces per_product upstream_status with is_real=False.
+    Without this guard, the audit pipeline would render full
+    diagnostic prose (verdict.explanation, plain_summary, action_items)
+    against the synthetic data — the merchant sees a fabricated
+    report that looks identical to a real run.
+
+    Conservative default: missing/malformed `upstream_status` is
+    treated as REAL (is_real defaults True). Don't reject audits
+    just because a per-product report lost its status field — that's
+    a different bug class.
+    """
+    per_product = brand_report.get("per_product") or []
+    return [
+        p for p in per_product
+        if isinstance(p, dict)
+        and not (p.get("upstream_status") or {}).get("is_real", True)
+    ]
+
+
 class MerchantSelfAuditRequest(BaseModel):
     """1–5 of the merchant's own products. Vendor / type / pdp_url are
     not in the request — they come from catalog_products so the
@@ -422,6 +458,35 @@ async def run_merchant_self_audit(
             run_id=run_id, status="failed", error_message=str(exc),
         )
         raise
+
+    # Mock-data guard: refuse to ship merchant-facing audit prose
+    # against synthetic fallback data. See _detect_mock_per_product
+    # for the full rationale + the three pollution sources.
+    mock_per_product = _detect_mock_per_product(brand_report)
+    if mock_per_product:
+        first_reason = (
+            (mock_per_product[0].get("upstream_status") or {}).get("reason")
+            or "Upstream returned mock data."
+        )
+        await record_audit_run_completed(
+            run_id=run_id,
+            status="failed",
+            error_message=f"upstream_mock_fallback: {first_reason}",
+        )
+        logger.error(
+            "merchant audit refusing to ship mock-derived prose for "
+            "merchant=%s; %d products had upstream_status.is_real=False",
+            merchant_id, len(mock_per_product),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Audit pipeline upstream returned synthetic fallback data; "
+                "refusing to render merchant-facing prose. Check that "
+                "PIVOTA_AGENT_INTERNAL_API_KEY and the upstream's GEMINI_API_KEY "
+                "are configured. Re-run the audit once the upstream is real."
+            ),
+        )
 
     # Phase B: verify Gemini's `competitors_named` self-report against
     # the actual cited articles. Mutates each playbook action's
