@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-08 (UTC) — **Strategic pivot from corpus probes to PDP onboarding standardization** (peng: electronics not core business). New track started: `docs/PDP_ONBOARDING_PLAYBOOK.md`. **O-1 shipped** (PR #369, prod commit `310ada4a`): merchant `tags[]` now flows through Shopify ingest into a new JSONB column on `catalog_products`, with at-startup schema guard. Verified in prod (column live, awaiting next Shopify sync to populate). Next: O-2 (4 typed taxonomy columns: price_tier, use_case_tags, lifestyle_tags, demographic).
+- Last updated: 2026-05-08 (UTC) — **Onboarding standardization track at O-2 ✅**. O-1 (merchant tags) + O-1 followup (all 3 paths) + O-2 (4 typed taxonomy columns + shared helper) all shipped + verified in prod. `services/pdp_taxonomy.py` is the single source of truth for derivation across Path A/B/C. Next: O-3 (LabelAgent — Gemini fills NULL/empty rows from product content).
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -74,6 +74,8 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | **— PDP Onboarding Standardization track —** | (started 2026-05-08, see `docs/PDP_ONBOARDING_PLAYBOOK.md`) | | |
 | Onboarding playbook + 5 decisions | Maps 3 onboarding paths, 8 gaps, proposed lifecycle, peng agreed to all 5 recommendations | ✅ | PR #369, merged → prod commit `310ada4a` |
 | O-1 — wire merchant tags through Shopify ingest | mig 075 + db/catalog.py mapping + ingest payload + schema_guard at-startup ALTER + tests | ✅ | PR #369. Verified in prod: `catalog_products.tags` JSONB column live on 4690-row catalog. 0 tagged today (waiting on next Shopify sync to populate). 8 tests pass. |
+| O-1 followup — extend tags to all 3 paths | Wix adapter explicit `tags=[]`, mirror script extracts from seed_data jsonb (4 paths), agent ingestion JSONL `tags` field | ✅ | PR #372 → main `18cecd61`. 52 tests pass. All 3 paths now write `tags` consistently. |
+| **O-2 — tag taxonomy v1** | mig 076 + 4 columns (price_tier/use_case_tags/lifestyle_tags/demographic) + `services/pdp_taxonomy.py` helper + 3-path wiring + schema_guard + tests | ✅ | PR #374 → main `caa0a850`. Verified in prod: all 4 columns live on 4690-row catalog. 76 tests pass. Conservative deterministic extraction; Phase O-3 LabelAgent fills the long tail. |
 | 4 electronics — scaffolding | Plan + 15 hand-curated PDP candidates JSONL | ✅ | pivota-backend #359 (`claude/phase-4-electronics`). Doc + data only, no DB writes. |
 | 4 electronics — Stage 2 validate (initial) | Gemini URL validator run on the 15 starter candidates | 🛑 First runs failed gate | 5/15 then 3/15 validated; gate is ≥12/15. Most failures were silent `offers=[]` with no drop reason — instrumentation needed first. |
 | 4 electronics — validator instrumentation | Add per-candidate drop reasons + retry to gemini_url_validator | ✅ done (draft PR #363) | `validation_drop_reason` + `validation_drop_detail` (≤500 char snippet) emitted per drop site; runner now writes a complete audit (success + failure) to validated.jsonl + a `<category>_validation_summary.json`; retry on 429/503/timeout/non-JSON-200/parse-fail; 48-test validator suite passes. |
