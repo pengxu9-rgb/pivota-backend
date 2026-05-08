@@ -126,6 +126,67 @@ async def test_catalog_intelligence_normalizes_extracted_products(
     assert p["raw_extracted"]["variant_skus"] == ["sku-1", "sku-2"]
 
 
+def test_normalize_base_url_auto_prepends_scheme():
+    """Footgun fix: env var set without `https://` doesn't silently
+    break catalog-intelligence integration. Was burned by this on
+    gruns.co smoke test."""
+    from services.catalog_intelligence_client import _normalize_base_url
+    assert _normalize_base_url(
+        "pivota-catalog-intelligence-production.up.railway.app"
+    ) == "https://pivota-catalog-intelligence-production.up.railway.app"
+
+
+def test_normalize_base_url_preserves_existing_scheme():
+    from services.catalog_intelligence_client import _normalize_base_url
+    assert _normalize_base_url("https://example.com/") == "https://example.com"
+    assert _normalize_base_url("http://localhost:3000") == "http://localhost:3000"
+
+
+def test_normalize_base_url_handles_empty_or_whitespace():
+    from services.catalog_intelligence_client import _normalize_base_url
+    assert _normalize_base_url("") == ""
+    assert _normalize_base_url("   ") == ""
+    assert _normalize_base_url(None) == ""
+
+
+def test_normalize_base_url_strips_trailing_slash():
+    from services.catalog_intelligence_client import _normalize_base_url
+    assert _normalize_base_url("example.com/") == "https://example.com"
+    assert _normalize_base_url("https://example.com////") == "https://example.com"
+
+
+@pytest.mark.asyncio
+async def test_catalog_intelligence_handles_unsupported_protocol(
+    with_catalog_intelligence, monkeypatch,
+):
+    """Defense-in-depth: if _normalize_base_url somehow lets through
+    an invalid URL (e.g., env var has whitespace mid-string),
+    UnsupportedProtocol is caught + logged at ERROR with the
+    resolved URL so operators can fix the env var."""
+    from config import settings as settings_module
+    from services import catalog_intelligence_client as mod
+    import httpx
+
+    # Simulate a corrupted URL by setting one that bypasses
+    # the normalizer's scheme check.
+    monkeypatch.setattr(
+        settings_module.settings,
+        "catalog_intelligence_base_url",
+        "ftp://wrong-scheme.example",
+    )
+
+    class _Client:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def post(self, *a, **kw):
+            raise httpx.UnsupportedProtocol("bad protocol")
+
+    with patch("httpx.AsyncClient", _Client):
+        result = await mod.extract_catalog(brand="X", domain="x.com")
+    assert result is None  # falls back gracefully
+
+
 @pytest.mark.asyncio
 async def test_catalog_intelligence_returns_none_on_network_error(
     with_catalog_intelligence,

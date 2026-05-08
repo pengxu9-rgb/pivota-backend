@@ -34,6 +34,25 @@ def is_configured() -> bool:
     return bool((settings.catalog_intelligence_base_url or "").strip())
 
 
+def _normalize_base_url(raw: str) -> str:
+    """Ensure the configured URL has a scheme. Without it, httpx
+    raises httpx.UnsupportedProtocol — which, before this fix, got
+    silently swallowed by the bare HTTPError catch and the
+    orchestrator fell back without operators realizing the env var
+    was misconfigured.
+
+    Auto-prepends `https://` (only valid scheme for Railway service
+    URLs in production). Defensive footgun fix — was burned once on
+    gruns.co smoke test; never again.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return s
+    if s.startswith("http://") or s.startswith("https://"):
+        return s.rstrip("/")
+    return f"https://{s.rstrip('/')}"
+
+
 async def extract_catalog(
     *,
     brand: str,
@@ -75,7 +94,7 @@ async def extract_catalog(
         )
         return None
 
-    base = settings.catalog_intelligence_base_url.rstrip("/")
+    base = _normalize_base_url(settings.catalog_intelligence_base_url)
     url = f"{base}/api/extract"
     body = {
         "brand": brand.strip(),
@@ -102,6 +121,36 @@ async def extract_catalog(
             timeout=settings.catalog_intelligence_timeout_s,
         ) as client:
             resp = await client.post(url, json=body, headers=headers)
+    except httpx.UnsupportedProtocol as exc:
+        # Misconfigured env var: bare hostname without scheme.
+        # _normalize_base_url should prevent this now, but still log
+        # loudly if it slips through (e.g., env var contains
+        # whitespace or invalid scheme like "ftp://").
+        logger.error(
+            "catalog_intelligence: env var CATALOG_INTELLIGENCE_BASE_URL "
+            "is malformed — %s. Resolved URL=%r. Fix the env var to "
+            "start with https://",
+            exc, url,
+        )
+        return None
+    except httpx.ConnectError as exc:
+        logger.error(
+            "catalog_intelligence: connection refused / DNS failure "
+            "for %s — service may be down or URL points at the "
+            "wrong host. Resolved URL=%r: %s",
+            domain, url, exc,
+        )
+        return None
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        logger.warning(
+            "catalog_intelligence: timeout for %s after %.0fs — "
+            "Puppeteer extraction may be slow on large catalogs; "
+            "consider increasing CATALOG_INTELLIGENCE_TIMEOUT_S "
+            "(currently %s). Falling back to lightweight discovery.",
+            domain, settings.catalog_intelligence_timeout_s,
+            settings.catalog_intelligence_timeout_s,
+        )
+        return None
     except httpx.HTTPError as exc:
         logger.warning(
             "catalog_intelligence: HTTP error for %s — %s: %s",
