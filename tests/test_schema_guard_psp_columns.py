@@ -44,3 +44,8 @@ async def test_ensure_required_schema_light_adds_merchant_psp_columns_in_fast_mo
     assert any(
         "idx_catalog_products_pivota_signature" in stmt for stmt in executed
     ), "partial unique index for pivota_signature_id not created"
+    # Phase O-1 (mig 075). Without `tags`, ingest_standard_products will
+    # error on insert because the SQLAlchemy mapping in db/catalog.py
+    # declares the column. Same deploy-skipped-migrations failure mode
+    # as the canonical PDP columns above.
+    assert "ADD COLUMN IF NOT EXISTS tags" in catalog_stmt
