@@ -67,6 +67,8 @@ COMPETITION_LIES = [
     "eating your funnel",
     "took your traffic",
     "every retailer-routed query is a customer",
+    "routed elsewhere",  # PARTIAL branch leak — fixed in #TBD
+    "the rest routed",   # same shape, different wording
 ]
 
 # Phrases that assert brand recognition. Only allowed when title_match

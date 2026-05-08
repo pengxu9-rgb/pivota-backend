@@ -847,24 +847,36 @@ def _explain_verdict(
 
     # PARTIAL
     if has_evidence:
+        losing = max(0, (runs_total or 0) - (cited or 0))
         base = (
             f"Mixed result — visibility {visibility_score}/100, "
             f"attribution {attribution_score}/100. Of {runs_total} "
-            f"buyer-intent queries, {cited} cited your URL; the rest "
-            f"routed elsewhere"
+            f"buyer-intent queries, {cited} cited {your_url_label.lower()}"
         )
+        if losing > 0 and retailers_phrase:
+            base += (
+                f"; the other {losing} grounded their answers in "
+                f"third-party sources including {retailers_phrase}"
+            )
+        elif losing > 0:
+            base += f"; the other {losing} did not cite a merchant URL"
         if failed_sample:
             sample = ", ".join(f'"{q[:50]}"' for q in failed_sample[:2])
             base += f". Failing queries include: {sample}"
+        if losing > 0 and retailers_phrase:
+            base += (
+                ". We did not verify whether those sources mention "
+                "your brand or products."
+            )
         base += (
-            ". The actions below show which gap is bigger; close that "
+            " The actions below show which gap is bigger; close that "
             "one first."
         )
         return base
     return (
-        "Mixed result — the product gets surfaced sometimes, and gets "
-        "attributed to the merchant's own URL sometimes, but neither is "
-        "consistent. The action items below show which gap is bigger."
+        "Mixed result — visibility and attribution scores are both "
+        "moderate; neither pattern is consistent across the queries "
+        "tested. The action items below show which gap is bigger."
     )
 
 
@@ -1712,16 +1724,27 @@ def _generate_action_items(
             },
         })
     else:  # PARTIAL
+        losing = max(0, (attribution_runs_total or 0) - (merchant_cited_runs or 0))
         body = (
             f"Visibility {visibility_score}/100, attribution "
             f"{attribution_score}/100. Of {attribution_runs_total} "
             f"buyer-intent queries, {merchant_cited_runs} cited your "
-            f"URL; the rest routed elsewhere"
+            f"URL"
         )
-        if retailers_phrase:
-            body += f" (top: {retailers_phrase})"
+        if losing > 0 and retailers_phrase:
+            body += (
+                f"; the other {losing} grounded their answers in "
+                f"third-party sources including {retailers_phrase}"
+            )
+        elif losing > 0:
+            body += f"; the other {losing} did not cite a merchant URL"
+        if losing > 0 and retailers_phrase:
+            body += (
+                ". We did not verify whether those sources mention "
+                "your brand or products."
+            )
         body += (
-            ". The specific failing queries below are where the gaps "
+            " The specific failing queries below are where the gaps "
             "are — close those first."
         )
         items.append({
