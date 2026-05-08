@@ -52,6 +52,10 @@ catalog_products = Table(
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
     Column("freshness_json", JSONB_TYPE, nullable=True),
+    # Phase O-1 — free-form merchant-provided tags from StandardProduct.tags[]
+    # (Shopify/Wix/WooCommerce sync). JSONB array; NULL on rows predating
+    # mig 075. See docs/PDP_ONBOARDING_PLAYBOOK.md.
+    Column("tags", JSONB_TYPE, nullable=True),
     # Pivota canonical PDP — sig_<32hex> identifying the product's
     # agent.pivota.cc/products/<sig> URL (the AI-channel surface).
     # See migration 071 + services/catalog_sync_service.py:

@@ -50,6 +50,13 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # (fresh / indexing / expected_steady) for Pivota
             # canonical PDPs in merchant_view.diagnosis.
             "pivota_signature_minted_at",
+            # Phase O-1 — see migration 075. The Shopify ingest path
+            # (services/catalog_sync_service.py:ingest_standard_products)
+            # writes merchant-supplied tags into this column. Without
+            # the column the SQLAlchemy mapping in db/catalog.py errors
+            # on insert. Listed here so prod deploys without separately
+            # applying migrations still get the column at startup.
+            "tags",
         },
     ),
 )
@@ -152,7 +159,8 @@ async def ensure_required_schema_light() -> None:
                     ALTER TABLE IF EXISTS catalog_products
                       ADD COLUMN IF NOT EXISTS pivota_signature_id TEXT,
                       ADD COLUMN IF NOT EXISTS pivota_canonical_url TEXT,
-                      ADD COLUMN IF NOT EXISTS pivota_signature_minted_at TIMESTAMPTZ;
+                      ADD COLUMN IF NOT EXISTS pivota_signature_minted_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS tags JSONB;
                     """
                 )
             )

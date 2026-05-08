@@ -641,6 +641,12 @@ async def ingest_standard_products(
                     "brand": brand,
                     "product_type": product.product_type,
                     "category": product.product_type,
+                    # Phase O-1: persist merchant-supplied tags. Always write
+                    # a list (possibly empty) on this path so future operators
+                    # can tell "ingest saw the feed and it was empty" from
+                    # NULL ("row predates the column"). See
+                    # docs/PDP_ONBOARDING_PLAYBOOK.md gap #2 + mig 075.
+                    "tags": list(product.tags or []),
                     "canonical_url": canonical_url,
                     "image_url": product.image_url,
                     "product_payload": raw_product,
