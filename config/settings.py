@@ -238,6 +238,22 @@ class Settings(BaseSettings):
     ranking_w_quality: float = float(os.getenv("AGENT_RANK_W_QUALITY", "0.2"))
     ranking_w_enrichment: float = float(os.getenv("AGENT_RANK_W_ENRICHMENT", "0.2"))
     ranking_w_business: float = float(os.getenv("AGENT_RANK_W_BUSINESS", "0.0"))
+
+    # Phase D wire-up: GSC OAuth + Indexing API + URL Inspection API.
+    # Feature flag: stays OFF until creds are configured + a smoke
+    # test confirms the OAuth callback round-trips. Once flipped on,
+    # the audit's "Grant GSC access" CTA links into the OAuth flow
+    # and the audit pipeline starts consuming gsc_url_submissions
+    # state.
+    gsc_integration_enabled: bool = (
+        os.getenv("GSC_INTEGRATION_ENABLED", "false").lower() == "true"
+    )
+    google_oauth_client_id: str = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+    google_oauth_client_secret: str = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    google_oauth_redirect_uri: str = os.getenv(
+        "GOOGLE_OAUTH_REDIRECT_URI",
+        "https://web-production-fedb.up.railway.app/api/gsc/oauth/callback",
+    )
     
     @property
     def cors_origins(self) -> list:
