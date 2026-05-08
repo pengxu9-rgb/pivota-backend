@@ -445,6 +445,91 @@ async def _record_url_submission_error(
     )
 
 
+async def submit_audit_canonical_urls(
+    *,
+    merchant_id: str,
+    brand_report: Dict[str, Any],
+    audit_run_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Walk a brand_report's per_product reports and submit each
+    Pivota canonical PDP URL (url_source='pivota_canonical_pdp') to
+    GSC's Indexing API. Submissions run in PARALLEL via
+    asyncio.gather so total wall time is bounded by the slowest
+    Google call (~2s) regardless of how many products.
+
+    Best-effort: any failure is caught + recorded in gsc_url_submissions
+    with last_status='error'. Never raises — the audit response
+    succeeds even when submissions fail. The audit's
+    merchant_view.tracking.gsc_submission_status surfaces the
+    aggregate state on the next audit.
+
+    Returns the list of per-URL results for diagnostics + telemetry.
+    Empty list when:
+      - GSC integration disabled (feature flag off)
+      - Merchant has no OAuth tokens (no grant yet)
+      - No products audited via Pivota canonical PDP
+    """
+    import asyncio
+
+    from config.settings import settings
+    if not settings.gsc_integration_enabled:
+        return []
+
+    # Walk per-product reports, collect canonical URLs.
+    urls_to_submit: List[str] = []
+    for report in (brand_report or {}).get("per_product") or []:
+        if not isinstance(report, dict):
+            continue
+        url_source = (
+            (report.get("merchant_view") or {})
+            .get("headline", {})
+            .get("url_source")
+        )
+        if url_source != "pivota_canonical_pdp":
+            continue
+        url = report.get("merchant_pdp_url")
+        if url and isinstance(url, str):
+            urls_to_submit.append(url)
+    # Dedupe while preserving order
+    seen: set = set()
+    unique_urls: List[str] = []
+    for u in urls_to_submit:
+        if u in seen:
+            continue
+        seen.add(u)
+        unique_urls.append(u)
+    if not unique_urls:
+        return []
+
+    # Verify the merchant has tokens before firing submissions; saves
+    # one round-trip per URL when un-integrated.
+    if not await is_gsc_integrated(merchant_id):
+        return []
+
+    async def _safe_submit(url: str) -> Dict[str, Any]:
+        try:
+            return await submit_url_to_gsc(
+                merchant_id, url, audit_run_id=audit_run_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "gsc auto-submit failed for merchant=%s url=%s: %s",
+                merchant_id, url, exc,
+            )
+            return {
+                "status": "error",
+                "url": url,
+                "message": str(exc),
+            }
+
+    results = await asyncio.gather(*[_safe_submit(u) for u in unique_urls])
+    # Annotate with the URL each result came from for diagnostics.
+    for url, result in zip(unique_urls, results):
+        if "url" not in result:
+            result["url"] = url
+    return list(results)
+
+
 def build_gsc_integration_action(
     *,
     onboarding_url: str = "/onboarding/gsc",

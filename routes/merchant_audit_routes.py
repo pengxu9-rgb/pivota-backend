@@ -504,6 +504,37 @@ async def run_merchant_self_audit(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("co-occurrence verification failed: %s", exc)
+
+    # Phase D: auto-submit Pivota canonical PDP URLs to Google Indexing
+    # API for merchants who have granted GSC access. Best-effort — any
+    # failure is recorded in gsc_url_submissions with last_status='error'
+    # and surfaced in merchant_view.tracking.gsc_submission_status.
+    # Audit response succeeds either way. Submissions run in parallel;
+    # total wall time bounded by slowest Google call (~2s) regardless
+    # of N.
+    try:
+        from services.gsc_integration import (
+            get_gsc_submission_state,
+            submit_audit_canonical_urls,
+        )
+        await submit_audit_canonical_urls(
+            merchant_id=merchant_id,
+            brand_report=brand_report,
+            audit_run_id=run_id,
+        )
+        # Refresh the aggregate state AFTER submissions ran, then
+        # mutate every per_product merchant_view.tracking so the
+        # response reflects what just happened (not pre-submit state).
+        submission_state = await get_gsc_submission_state(merchant_id)
+        for report in (brand_report.get("per_product") or []):
+            if not isinstance(report, dict):
+                continue
+            mv = report.get("merchant_view") or {}
+            tracking = mv.get("tracking") or {}
+            tracking["gsc_submission_status"] = submission_state
+            mv["tracking"] = tracking
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("gsc auto-submit failed for merchant=%s: %s", merchant_id, exc)
     aggregate = brand_report.get("aggregate") or {}
     per_product = brand_report.get("per_product") or []
     verdict_labels = [
