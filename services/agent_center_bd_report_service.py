@@ -2941,6 +2941,38 @@ def _build_merchant_view(
                 + merged_actions[insertion_idx:]
             )
 
+    # Phase C scaffolding: when multi-market is enabled and the audit
+    # has per-market results (set by upstream when wired up), surface
+    # the localization action. Returns None when flag is off or
+    # results are insufficient to draw a gap conclusion — better to
+    # omit than to fabricate. Slots in alongside other category-wide
+    # plays (Phase E creator_partnership), before strategic + playbook
+    # actions.
+    from services.multi_market_audit import (
+        build_localization_action,
+        build_markets_aggregate,
+        empty_markets_aggregate,
+    )
+    markets_aggregate_for_actions = empty_markets_aggregate()
+    localization_action = build_localization_action(
+        markets_aggregate=markets_aggregate_for_actions,
+    )
+    if localization_action is not None:
+        insertion_idx = 0
+        for idx, existing in enumerate(merged_actions):
+            if (existing.get("lever") or "") not in (
+                "pivota_integration", "gsc_integration",
+                "creator_partnership",
+            ):
+                insertion_idx = idx
+                break
+            insertion_idx = idx + 1
+        merged_actions = (
+            merged_actions[:insertion_idx]
+            + [localization_action]
+            + merged_actions[insertion_idx:]
+        )
+
     # Stamp a 1-indexed `priority_order` on every action so the
     # frontend can render "Step 1, Step 2..." without re-deriving the
     # ordering. The integration action (if present) is at index 0,
@@ -3051,6 +3083,11 @@ def _build_merchant_view(
             # Each row: {brand, times_mentioned, first_party_visible,
             # first_party_host, host_citations}.
             "competitive_table": competitive_table,
+            # Phase C scaffolding: per-market audit scores. Empty
+            # aggregate when multi-market is disabled (default), so
+            # portal can null-check `enabled`. Per-market dispatch
+            # itself lands in a follow-up PR after staging load test.
+            "markets": markets_aggregate_for_actions,
         },
         "diagnosis": {
             "primary": (competitive_pressure or {}).get("framing"),
