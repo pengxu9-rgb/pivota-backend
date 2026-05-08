@@ -186,17 +186,9 @@ def test_pitch_draft_omits_emit_when_no_competitors_named():
 
 def _registry_entry_for(host: str) -> Dict[str, Any]:
     """Build a test cited_hosts_detailed entry by going through the
-    real classify_host (which reads the registry) — so pitch_recipient
-    is on the entry. Adds times_cited=1."""
+    real classify_host (which reads the registry, including
+    pitch_recipient post-fix). Adds times_cited=1."""
     from services.cited_host_classifier import classify_host
     out = classify_host(host, merchant_category="sleepwear")
     out["times_cited"] = 1
-    # classify_host returns the registry's `pitch_recipient` field
-    # only if we add it to the schema there. Currently classify_host
-    # strips fields it doesn't know about. We need to re-attach it
-    # from the raw registry.
-    from services.cited_host_classifier import _load_registry
-    raw = _load_registry().get((host or "").lower())
-    if raw and isinstance(raw, dict) and "pitch_recipient" in raw:
-        out["pitch_recipient"] = raw["pitch_recipient"]
     return out

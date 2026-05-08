@@ -129,7 +129,7 @@ def classify_host(
     else:
         applies = None
 
-    return {
+    out: Dict[str, Any] = {
         "host": h,
         "type": entry.get("type") or "unclassified",
         "subtype": entry.get("subtype"),
@@ -138,6 +138,16 @@ def classify_host(
         "outreach_hint": entry.get("outreach_hint"),
         "applies_to_merchant_category": applies,
     }
+    # Phase A: pass-through pitch_recipient (when present) so the
+    # playbook engine can build pitch_draft mailto: links. Without
+    # this, classify_host strips the field and pitch_draft is always
+    # None — Phase A unit tests worked around this with a test helper
+    # that manually re-attached pitch_recipient, hiding the production
+    # bug end-to-end.
+    pitch_recipient = entry.get("pitch_recipient")
+    if pitch_recipient is not None:
+        out["pitch_recipient"] = pitch_recipient
+    return out
 
 
 def classify_cited_hosts(
