@@ -50,6 +50,7 @@ async def get_integration_state(merchant_id: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "store_platform_integrated": False,
         "psp_integrated": False,
+        "gsc_integrated": False,
         "fully_integrated": False,
         "missing_pieces": ["store_platform", "psp"],
         "integration_completed_at": None,
@@ -105,11 +106,27 @@ async def get_integration_state(merchant_id: str) -> Dict[str, Any]:
             (live_psp.get("provider") or "").strip().lower() or None
         )
 
+    # GSC integration check (Phase D scaffolding). Best-effort —
+    # gsc_oauth_tokens table may not exist yet (migration unapplied)
+    # in which case we treat as un-integrated. The audit's secondary
+    # GSC action only fires when Phase 0 onboarding (store+PSP) is
+    # already done, so even if this check is permissive-by-error
+    # the user impact is limited to "we asked them to onboard GSC
+    # when they hadn't" — recoverable.
+    try:
+        from services.gsc_integration import is_gsc_integrated
+        out["gsc_integrated"] = await is_gsc_integrated(merchant_id)
+    except Exception:
+        out["gsc_integrated"] = False
+
     missing: List[str] = []
     if not out["store_platform_integrated"]:
         missing.append("store_platform")
     if not out["psp_integrated"]:
         missing.append("psp")
+    # GSC is intentionally NOT in `missing_pieces` for the Phase 0
+    # action — it's a secondary integration that surfaces as its
+    # own action only after store+PSP are done.
     out["missing_pieces"] = missing
     out["fully_integrated"] = not missing
 
