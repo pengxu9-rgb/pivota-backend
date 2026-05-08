@@ -488,6 +488,21 @@ async def _fetch_canonical_search_rows(
     if merchant_id:
         merchant_clause = "AND p.merchant_id = :merchant_id"
         params["merchant_id"] = merchant_id
+    # Phase O-5: hard-filter the global recall pool to live lifecycle
+    # stages so draft/candidate rows (no description, no taxonomy,
+    # not user-ready) don't surface in recall just because the title
+    # matched. The IS NULL clause is a grandfather for the rollout
+    # window between O-4 deploy and the O-6b backfill running — once
+    # backfill confirms 0 NULL rows in prod, the IS NULL branch can
+    # be removed in a follow-up PR. Merchant-scoped queries skip the
+    # filter: a merchant should always see their own products even
+    # while LabelAgent is still ramping their content quality.
+    lifecycle_clause = ""
+    if not merchant_id:
+        lifecycle_clause = (
+            "AND (p.pdp_lifecycle_stage IN ('validated', 'published') "
+            "OR p.pdp_lifecycle_stage IS NULL)"
+        )
     vertical_where = ""
     vertical_score = ""
     if vertical_search:
@@ -534,6 +549,7 @@ async def _fetch_canonical_search_rows(
                 p.truth_tier,
                 p.readiness_tier,
                 p.pdp_scope,
+                p.pdp_lifecycle_stage,
                 p.source_system,
                 p.freshness_json,
                 p.updated_at AS product_updated_at,
@@ -562,7 +578,19 @@ async def _fetch_canonical_search_rows(
                     -- Merchant-scoped queries are unaffected because the
                     -- candidate set is already filtered to one merchant
                     -- whose rows share the same scope.
-                    CASE WHEN p.pdp_scope = 'multi_merchant_canonical' THEN 200 ELSE 0 END
+                    CASE WHEN p.pdp_scope = 'multi_merchant_canonical' THEN 200 ELSE 0 END +
+                    -- Phase O-5: tie-break within the live pool.
+                    -- "published" is a strict superset of canonical
+                    -- scope (Path C agent rows + future manual-approval
+                    -- rows also reach published), so the +60 here
+                    -- doesn't only repeat the pdp_scope=200 boost —
+                    -- it also lifts agent-curated rows that lack the
+                    -- multi_merchant_canonical scope flag. Magnitudes
+                    -- stay below brand-exact (80) and category-prefix
+                    -- (90) so the lifecycle stage acts as a tie-breaker,
+                    -- not a dominating signal.
+                    CASE WHEN p.pdp_lifecycle_stage = 'published' THEN 60 ELSE 0 END +
+                    CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
                     {category_score}
                     {vertical_score}
                 ) AS rank_score
@@ -581,6 +609,7 @@ async def _fetch_canonical_search_rows(
                 {vertical_where}
             )
             {merchant_clause}
+            {lifecycle_clause}
             ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
             LIMIT :candidate_limit
         )
@@ -601,6 +630,7 @@ async def _fetch_canonical_search_rows(
             c.truth_tier,
             c.readiness_tier,
             c.pdp_scope,
+            c.pdp_lifecycle_stage,
             c.source_system,
             c.freshness_json,
             c.product_updated_at,
