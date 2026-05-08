@@ -48,6 +48,31 @@ def test_known_editorial_host_returns_full_annotation():
     assert out["applies_to_merchant_category"] is True
 
 
+def test_known_host_with_pitch_recipient_passes_it_through():
+    """Phase A regression: the playbook engine builds pitch_draft
+    from `host_entry.pitch_recipient`. Without classify_host
+    pass-through, the field gets stripped and pitch_draft is always
+    None in production. The original Phase A unit tests worked
+    around this with a test helper that manually re-attached
+    pitch_recipient — hiding the bug end-to-end. This test verifies
+    the production path surfaces it."""
+    from services.cited_host_classifier import classify_host
+    out = classify_host("forbes.com", merchant_category="sleepwear")
+    assert out.get("pitch_recipient") is not None
+    assert out["pitch_recipient"].get("email")
+
+
+def test_known_host_without_pitch_recipient_omits_field():
+    """Hosts not yet annotated with pitch_recipient (most retailers,
+    long tail of editorial sites) should NOT carry a stub field —
+    the playbook engine treats absent + null the same way (pitch_draft
+    null), so omitting is preferred for cleaner JSON."""
+    from services.cited_host_classifier import classify_host
+    # Pick a host that's in the registry but doesn't have pitch_recipient.
+    out = classify_host("nordstrom.com", merchant_category="sleepwear")
+    assert "pitch_recipient" not in out
+
+
 def test_known_retailer_host_returns_full_annotation():
     from services.cited_host_classifier import classify_host
     out = classify_host("nordstrom.com", merchant_category="sleepwear")
