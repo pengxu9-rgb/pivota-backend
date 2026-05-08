@@ -422,6 +422,23 @@ async def run_merchant_self_audit(
             run_id=run_id, status="failed", error_message=str(exc),
         )
         raise
+
+    # Phase B: verify Gemini's `competitors_named` self-report against
+    # the actual cited articles. Mutates each playbook action's
+    # `evidence.co_occurrence_verification` with the result. Best-effort
+    # — wrapped errors don't fail the audit. Total wall time is bounded
+    # by the slowest fetch (5s) regardless of how many articles, since
+    # verifications run in parallel.
+    try:
+        from services.co_occurrence_finder import (
+            verify_brand_report_co_occurrence,
+        )
+        await verify_brand_report_co_occurrence(
+            brand_report,
+            merchant_brand=str(merchant_name),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("co-occurrence verification failed: %s", exc)
     aggregate = brand_report.get("aggregate") or {}
     per_product = brand_report.get("per_product") or []
     verdict_labels = [
