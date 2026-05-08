@@ -48,21 +48,41 @@ def test_gsc_action_custom_onboarding_url():
 
 
 @pytest.mark.asyncio
-async def test_submit_url_to_gsc_raises_until_configured():
+async def test_submit_url_to_gsc_raises_when_feature_flag_off(monkeypatch):
+    """Feature flag default is False → raise even if creds set."""
     from services.gsc_integration import (
         GscNotConfiguredError,
         submit_url_to_gsc,
     )
+    from config import settings as settings_module
+    monkeypatch.setattr(settings_module.settings, "gsc_integration_enabled", False)
     with pytest.raises(GscNotConfiguredError):
         await submit_url_to_gsc("merch_test", "https://example.com/p/1")
 
 
 @pytest.mark.asyncio
-async def test_get_index_status_raises_until_configured():
+async def test_submit_url_to_gsc_raises_when_creds_missing(monkeypatch):
+    """Flag on but creds unset → raise (don't hit Google with empty client_id)."""
+    from services.gsc_integration import (
+        GscNotConfiguredError,
+        submit_url_to_gsc,
+    )
+    from config import settings as settings_module
+    monkeypatch.setattr(settings_module.settings, "gsc_integration_enabled", True)
+    monkeypatch.setattr(settings_module.settings, "google_oauth_client_id", "")
+    monkeypatch.setattr(settings_module.settings, "google_oauth_client_secret", "")
+    with pytest.raises(GscNotConfiguredError):
+        await submit_url_to_gsc("merch_test", "https://example.com/p/1")
+
+
+@pytest.mark.asyncio
+async def test_get_index_status_raises_when_feature_flag_off(monkeypatch):
     from services.gsc_integration import (
         GscNotConfiguredError,
         get_index_status,
     )
+    from config import settings as settings_module
+    monkeypatch.setattr(settings_module.settings, "gsc_integration_enabled", False)
     with pytest.raises(GscNotConfiguredError):
         await get_index_status("merch_test", "https://example.com/p/1")
 

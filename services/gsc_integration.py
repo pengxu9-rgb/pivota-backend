@@ -1,35 +1,40 @@
 """
-Phase D scaffolding — Google Search Console auto-submit.
+Phase D — Google Search Console auto-submit.
 
-CURRENT STATUS: scaffolding only. The Google API wire-up (real
-google-api-python-client OAuth flow + URL Inspection API calls)
-lands in a follow-up PR once OAuth client credentials are configured
-in Google Cloud Console + the project has GSC API quota approved.
+Wire-up complete. Module reads gsc_oauth_tokens for per-merchant
+credentials, refreshes expired access tokens via Google's token
+endpoint, and calls the Indexing API + URL Inspection API for the
+two action surfaces:
 
-What this module DOES today:
-  - Detect whether a merchant has granted GSC access (presence of
-    a gsc_oauth_tokens row)
-  - Aggregate per-URL submission state from gsc_url_submissions
-  - Stub `submit_url_to_gsc` / `get_index_status` that return a
-    "not_configured" sentinel — callers must handle this gracefully
+  - submit_url_to_gsc: POSTs to indexing.googleapis.com/v3/urlNotifications:publish
+  - get_index_status:  POSTs to searchconsole.googleapis.com/v1/urlInspection/index:inspect
 
-What this module does NOT do yet (follow-up):
-  - OAuth flow (consent screen, token exchange, refresh)
-  - Real GSC URL Inspection API calls
-  - Background job that polls index status periodically
+Both upsert per-URL state into gsc_url_submissions so the audit's
+merchant_view.tracking.gsc_submission_status surfaces accurate
+counts ({submitted, indexed, pending, errors}).
 
-Why scaffold now: the merchant audit pipeline can surface the
-"Grant Pivota GSC access" action + render `tracking.gsc_submission_status`
-the moment merchants have tokens. Wiring up the actual API calls is
-additive — no schema or surface changes needed.
+Disabled by default (settings.gsc_integration_enabled). When the
+flag is off, the API functions raise GscNotConfiguredError so
+callers (audit pipeline, background jobs) degrade gracefully
+without producing fake submission state.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+INDEXING_API_PUBLISH_URL = (
+    "https://indexing.googleapis.com/v3/urlNotifications:publish"
+)
+URL_INSPECTION_URL = (
+    "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect"
+)
 
 
 async def is_gsc_integrated(merchant_id: str) -> bool:
@@ -149,33 +154,294 @@ async def submit_url_to_gsc(
     *,
     audit_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Submit a URL to GSC's URL Inspection API for the merchant's
-    authorized site. Stub for now.
+    """Submit a URL to Google's Indexing API for the merchant's
+    authorized site. Upserts gsc_url_submissions with the response.
 
-    Once wire-up lands:
-      1. Look up OAuth refresh token from gsc_oauth_tokens
-      2. Exchange for access token (cache until expiry)
-      3. POST to GSC URL Inspection API
-      4. Upsert gsc_url_submissions with the response
-      5. Return {status, message, last_status, last_status_at}
+    Returns: {status: 'submitted' | 'error', message, last_status, last_status_at}
     """
-    raise GscNotConfiguredError(
-        "GSC submission API is not yet wired up. Phase D scaffolding "
-        "covers the data model + integration state + action surface; "
-        "the actual google-api-python-client wire-up + OAuth flow "
-        "lands in a follow-up PR once Google Cloud Console "
-        "credentials are configured."
+    _require_enabled()
+    access_token = await _get_valid_access_token(merchant_id)
+    if access_token is None:
+        raise GscNotConfiguredError(
+            f"No active GSC OAuth token for merchant_id={merchant_id}. "
+            f"Merchant must complete /api/gsc/oauth/start first."
+        )
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                INDEXING_API_PUBLISH_URL,
+                json={"url": url, "type": "URL_UPDATED"},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        await _record_url_submission_error(
+            merchant_id, url, str(exc), audit_run_id,
+        )
+        return {
+            "status": "error",
+            "message": f"Network error: {exc}",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if resp.status_code != 200:
+        body = resp.text[:300]
+        logger.error(
+            "GSC indexing publish failed: merchant=%s url=%s status=%d body=%s",
+            merchant_id, url, resp.status_code, body,
+        )
+        await _record_url_submission_error(
+            merchant_id, url, f"http_{resp.status_code}: {body}", audit_run_id,
+        )
+        return {
+            "status": "error",
+            "message": f"Google returned {resp.status_code}",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    submitted_at = datetime.now(timezone.utc)
+    await _upsert_url_submission(
+        merchant_id=merchant_id,
+        url=url,
+        last_status="submitted",
+        submitted_at=submitted_at,
+        indexed_at=None,
+        error_message=None,
+        audit_run_id=audit_run_id,
     )
+    return {
+        "status": "submitted",
+        "message": "Submitted to Google Indexing API",
+        "last_status": "submitted",
+        "last_status_at": submitted_at.isoformat(),
+    }
 
 
 async def get_index_status(
     merchant_id: str,
     url: str,
 ) -> Dict[str, Any]:
-    """Poll GSC's URL Inspection API for current index status. Stub."""
-    raise GscNotConfiguredError(
-        "GSC index status API is not yet wired up. See submit_url_to_gsc "
-        "for the wire-up plan."
+    """Poll URL Inspection API. Updates gsc_url_submissions with the
+    indexed-or-not status. Returns {status, last_status, last_status_at}.
+    """
+    _require_enabled()
+    access_token = await _get_valid_access_token(merchant_id)
+    if access_token is None:
+        raise GscNotConfiguredError(
+            f"No active GSC OAuth token for merchant_id={merchant_id}."
+        )
+    site_url = await _get_authorized_site_url(merchant_id)
+    if not site_url:
+        raise GscNotConfiguredError(
+            "No authorized_site_url on the merchant's OAuth row."
+        )
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                URL_INSPECTION_URL,
+                json={"inspectionUrl": url, "siteUrl": site_url},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        return {
+            "status": "error",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+            "message": f"Network error: {exc}",
+        }
+    if resp.status_code != 200:
+        return {
+            "status": "error",
+            "last_status": "error",
+            "last_status_at": datetime.now(timezone.utc).isoformat(),
+            "message": f"Google returned {resp.status_code}",
+        }
+    body = resp.json() or {}
+    inspection = (body.get("inspectionResult") or {}).get("indexStatusResult") or {}
+    verdict = (inspection.get("verdict") or "").upper()
+    coverage_state = inspection.get("coverageState") or ""
+    # Verdict: PASS = indexed, NEUTRAL/FAIL = not indexed.
+    # coverageState examples: "Submitted and indexed", "Discovered – not indexed",
+    # "Submitted, currently not indexed".
+    indexed = verdict == "PASS"
+    indexed_at = datetime.now(timezone.utc) if indexed else None
+    last_status = "indexed" if indexed else "pending"
+    await _upsert_url_submission(
+        merchant_id=merchant_id,
+        url=url,
+        last_status=last_status,
+        submitted_at=None,  # don't overwrite
+        indexed_at=indexed_at,
+        error_message=None,
+        audit_run_id=None,
+    )
+    return {
+        "status": last_status,
+        "last_status": last_status,
+        "last_status_at": datetime.now(timezone.utc).isoformat(),
+        "verdict": verdict,
+        "coverage_state": coverage_state,
+    }
+
+
+# Internal helpers — token refresh + DB upserts
+
+
+def _require_enabled() -> None:
+    """Raise GscNotConfiguredError if the feature flag is off OR the
+    OAuth client credentials aren't set. Safer than silently hitting
+    Google with empty creds."""
+    from config.settings import settings
+    if not settings.gsc_integration_enabled:
+        raise GscNotConfiguredError(
+            "GSC integration is feature-flagged off "
+            "(GSC_INTEGRATION_ENABLED=false)."
+        )
+    if not settings.google_oauth_client_id or not settings.google_oauth_client_secret:
+        raise GscNotConfiguredError(
+            "GOOGLE_OAUTH_CLIENT_ID / CLIENT_SECRET not configured."
+        )
+
+
+async def _get_valid_access_token(merchant_id: str) -> Optional[str]:
+    """Fetch the merchant's OAuth tokens; refresh access_token if
+    expired. Returns the live access_token, or None if the merchant
+    hasn't granted access (or tokens are corrupted)."""
+    from db.gsc_tokens import get_oauth_tokens, update_access_token, record_refresh_error
+    tokens = await get_oauth_tokens(merchant_id)
+    if not tokens or not tokens.get("refresh_token"):
+        return None
+
+    expires_at = tokens.get("access_token_expires_at")
+    access = tokens.get("access_token")
+    now = datetime.now(timezone.utc)
+    # Refresh when no access_token, or it expires within 60 seconds.
+    if access and expires_at:
+        # Normalize naive datetimes to UTC.
+        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at - timedelta(seconds=60) > now:
+            return access
+
+    new_access, new_expires_at, err = await _refresh_access_token(
+        tokens["refresh_token"],
+    )
+    if err is not None:
+        await record_refresh_error(merchant_id, err)
+        return None
+    await update_access_token(
+        merchant_id=merchant_id,
+        access_token=new_access,
+        access_token_expires_at=new_expires_at,
+    )
+    return new_access
+
+
+async def _refresh_access_token(
+    refresh_token: str,
+) -> tuple[Optional[str], Optional[datetime], Optional[str]]:
+    """Exchange refresh_token for a fresh access_token via Google's
+    token endpoint. Returns (access_token, expires_at, error)."""
+    from config.settings import settings
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "client_id": settings.google_oauth_client_id,
+                    "client_secret": settings.google_oauth_client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                },
+            )
+    except httpx.HTTPError as exc:
+        return (None, None, f"Network error during refresh: {exc}")
+    if resp.status_code != 200:
+        return (None, None, f"http_{resp.status_code}: {resp.text[:300]}")
+    body = resp.json() or {}
+    access = body.get("access_token")
+    expires_in = int(body.get("expires_in") or 3600)
+    if not access:
+        return (None, None, "No access_token in refresh response")
+    return (
+        access,
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+        None,
+    )
+
+
+async def _get_authorized_site_url(merchant_id: str) -> Optional[str]:
+    from db.gsc_tokens import get_oauth_tokens
+    tokens = await get_oauth_tokens(merchant_id)
+    return (tokens or {}).get("authorized_site_url")
+
+
+async def _upsert_url_submission(
+    *,
+    merchant_id: str,
+    url: str,
+    last_status: str,
+    submitted_at: Optional[datetime],
+    indexed_at: Optional[datetime],
+    error_message: Optional[str],
+    audit_run_id: Optional[str],
+) -> None:
+    from db.database import database
+    await database.execute(
+        """
+        INSERT INTO gsc_url_submissions (
+          merchant_id, url, last_status, last_status_at,
+          submitted_at, indexed_at, error_message,
+          source_audit_run_id
+        )
+        VALUES (
+          :merchant_id, :url, :last_status, NOW(),
+          :submitted_at, :indexed_at, :error_message,
+          :audit_run_id
+        )
+        ON CONFLICT (merchant_id, url) DO UPDATE SET
+          last_status = EXCLUDED.last_status,
+          last_status_at = NOW(),
+          submitted_at = COALESCE(EXCLUDED.submitted_at, gsc_url_submissions.submitted_at),
+          indexed_at = COALESCE(EXCLUDED.indexed_at, gsc_url_submissions.indexed_at),
+          error_message = EXCLUDED.error_message
+        """,
+        {
+            "merchant_id": merchant_id,
+            "url": url,
+            "last_status": last_status,
+            "submitted_at": submitted_at,
+            "indexed_at": indexed_at,
+            "error_message": error_message,
+            "audit_run_id": audit_run_id,
+        },
+    )
+
+
+async def _record_url_submission_error(
+    merchant_id: str,
+    url: str,
+    error: str,
+    audit_run_id: Optional[str],
+) -> None:
+    await _upsert_url_submission(
+        merchant_id=merchant_id,
+        url=url,
+        last_status="error",
+        submitted_at=None,
+        indexed_at=None,
+        error_message=error,
+        audit_run_id=audit_run_id,
     )
 
 
