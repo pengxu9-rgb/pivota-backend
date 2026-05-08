@@ -5,13 +5,16 @@
 lands, every backend phase since 1 has been building a ghost catalog
 the gateway can't see.
 
-- Status: **✅ SHIPPED TO PRODUCTION 2026-05-07 night**
+- Status: **✅ SHIPPED TO PRODUCTION 2026-05-08 (UTC) — beauty 100%**
 - Created: 2026-05-07
-- Last updated: 2026-05-07 night (post-merge)
+- Last updated: 2026-05-08 (UTC, post-merge of #1315)
 - Step 1 PR (helper + 16 unit tests): [PIVOTA-Agent #1311](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1311) — merged
 - Step 2 PR (find_products_multi integration): [PIVOTA-Agent #1312](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1312), prod commit `91cbcc98` — merged
 - Step 2.5 PR (non-beauty deadline): [PIVOTA-Agent #1314](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1314), prod commit `d98a8704` — merged
-- **Result: probe v15 (prod) = 69.8% pass-rate, lipstick 9/9, all beauty buckets 100%, `canonical_path_executed`=96.2%**
+- Step 3 PR (ingredient_recall_direct extension): [PIVOTA-Agent #1315](https://github.com/pengxu9-rgb/PIVOTA-Agent/pull/1315), prod commit `ee5564c4` — merged
+- **Result trajectory:**
+  - probe v15 (prod, post Step 2 + 2.5): 69.8%, lipstick 9/9, beauty 35/37 (94.6%)
+  - **probe v17 (prod, post Step 3): 72%, beauty 37/37 = 100% ✅**, skincare_serum 0/2 → 2/2 PASS
 - Owner: peng (review) + codex (Step 2 implementation) + claude (Step 1 + spec)
 - Actual cost so far: ~3 hours Step 1 (helper + tests + spec) + ~2 hours Step 2 (codex implementation, locally green)
 

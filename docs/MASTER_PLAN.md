@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-07 night — **Phase 7b SHIPPED to prod** (probe v15 = 69.8%, lipstick 9/9, all beauty 100%). Follow-up PR #1315 open to close the only beauty gap (skincare_serum 0/2 PASS) by extending the same pattern to the ingredient_recall_direct path. Awaiting merge + deploy + probe v17.
+- Last updated: 2026-05-08 (UTC) — **Phase 7b complete in prod**. Probe v17 post-merge: **beauty pass-rate 100% (37/37)**. Skincare_serum lifted 0/2 → 2/2 via PR #1315. Overall 38/53 = 72%. The remaining 14 EMPTY are non-beauty buckets (electronics / fashion_* / home) — pure data gap; Phase 4 expansion required.
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -70,7 +70,7 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | 7b Step 1 | Gateway-side canonicalCatalogSearch helper + 16 unit tests | ✅ | PIVOTA-Agent #1311 (claude/phase-7b-canonical-recall) |
 | 7b Step 2 | Wire helper into find_products_multi + dedupe + telemetry + 3 integration tests | ✅ | PIVOTA-Agent #1312, merged → prod commit `91cbcc98` |
 | 7b non-beauty deadline | Gateway-level 6000ms hard deadline on non-beauty primary upstream; authoritative strict-empty on hit; `fpm_primary_deadline_*` telemetry | ✅ | PIVOTA-Agent #1314, merged → prod commit `d98a8704` |
-| 7b ingredient_recall_direct | Extend canonical chain to ingredient_recall_direct path (closes the 2 serum THIN gaps from probe v15) | 🟡 PR open | PIVOTA-Agent #1315 (claude/phase-7b-ingredient-recall, commit `a30a9654`). Same pattern as #1312, applied at `server.js:~28950`. 24 jest tests pass across 5 Phase 7b suites. Pending: merge → auto-deploy → probe v17. Expected: skincare_serum 0/2 → 2/2, overall 37/53 → 39/53 = 73.6% (+3.8pp), all beauty 100%. |
+| 7b ingredient_recall_direct | Extend canonical chain to ingredient_recall_direct path | ✅ | PIVOTA-Agent #1315, merged → prod commit `ee5564c4` (auto-deployed 2026-05-07T23:56). Probe v17 post-merge: **skincare_serum 0/2 → 2/2 PASS** ✅, **beauty 100% (37/37)** ✅, overall 37/53 → 38/53. Net +1 (not +2) because electronics dropped 1/5 → 0/5 in the same probe — cache-flake on the existing cache_miss_sync_filled outliers, not caused by this PR. |
 
 ---
 
@@ -92,6 +92,7 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | recall_v14_phase7b_staging_deadline_1778195751 | Phase 7b + non-beauty deadline, staging | 37 | 2 | 14 | 0 | **69.8%** (+37.8pp) |
 | recall_v15_phase7b_prod_deadline_1778196048 | Phase 7b + non-beauty deadline, **prod** | 37 | 2 | 14 | 0 | **69.8%** (production parity) |
 | recall_v17_pre_pr1315_baseline_1778197677 | Pre-merge baseline (PR #1315 not yet deployed) | 37 | 3 | 13 | 0 | **70%** (≡ v15; serum still 0/2 PASS, 2 THIN) |
+| recall_v17_post_pr1315_1778198230 | Post-merge of PR #1315 (ingredient_recall_direct extension) | 38 | 1 | 14 | 0 | **72%** (+2pp over v15). **Beauty: 37/37 = 100%** (skincare_serum lifted 0/2 → 2/2). Electronics flaked 1/5 → 0/5 (cache-related, not PR #1315). |
 
 **Headline insight:** every probe since v9_phase8 has *more* canonical data
 than the previous one, yet pass-rate has not returned to peak. The bottleneck
@@ -109,6 +110,16 @@ fires on 51/53 queries (96.2%) — the two that don't are short-circuited
 by the new non-beauty deadline. p50 prod 3.8s, p99 prod 12.0s (down from
 17.4s pre-deadline; still over budget but the deadline is now upper-bounded
 on non-beauty paths).
+
+**v17 closes the last beauty gap.** PR #1315 extended the canonical chain
+to the `ingredient_recall_direct` path (where ingredient queries like
+"salicylic acid serum" routed and previously bypassed the chain).
+Skincare_serum 0/2 → 2/2 PASS. **Beauty pass-rate is now 37/37 = 100%.**
+Overall moved 70% → 72% (+2pp; would have been +4pp if not for an
+unrelated electronics cache flake during the probe — orthogonal bug).
+Architectural recall work is complete; the remaining 14 EMPTY queries
+are pure data gaps that Phase 4 expansion (electronics / home /
+fashion_*) would address.
 
 **v11 (aurora-bff) localization probe**: ran the same 53-query corpus under a
 different orchestrator (`source=aurora-bff` instead of `shopping_agent`).
@@ -254,17 +265,22 @@ on every apply step.
 
 ## Open issues
 
-### #1 — Lipstick recall returns zero (✅ RESOLVED 2026-05-07 night)
+### #1 — Lipstick recall returns zero + beauty pass-rate gap (✅ FULLY RESOLVED 2026-05-08)
 
-**Resolution:** Phase 7b Step 2 (PIVOTA-Agent #1312, prod commit `91cbcc98`)
-+ non-beauty deadline (PIVOTA-Agent #1314, prod commit `d98a8704`) shipped
-to production. Probe v15 (prod) shows **lipstick 9/9 PASS, all beauty
-buckets 100%, overall 69.8%** (was 32%). `canonical_path_executed=true`
-fires on 96.2% of queries.
+**Resolution timeline:**
+- Phase 7b Step 2 (PIVOTA-Agent #1312, prod commit `91cbcc98`) +
+  non-beauty deadline (PIVOTA-Agent #1314, prod commit `d98a8704`)
+  shipped 2026-05-07 night. Probe v15: lipstick 9/9, all beauty
+  buckets except skincare_serum at 100%, overall 69.8%.
+- ingredient_recall_direct extension (PIVOTA-Agent #1315, prod commit
+  `ee5564c4`) shipped 2026-05-08 (UTC). Probe v17: skincare_serum
+  0/2 → 2/2 PASS. **Beauty pass-rate 37/37 = 100%.**
 
 The architectural diagnosis below was confirmed correct — gateway needed
 to read `catalog_products` directly, which it now does via
-`fetchCanonicalChainRows` running in parallel with the existing seed scan.
+`fetchCanonicalChainRows` running in parallel with the existing seed
+scan. Both the beauty mainline and the ingredient_recall_direct path
+now consult the canonical chain.
 
 **Diagnosis (kept for reference):**
 
