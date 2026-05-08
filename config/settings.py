@@ -239,6 +239,24 @@ class Settings(BaseSettings):
     ranking_w_enrichment: float = float(os.getenv("AGENT_RANK_W_ENRICHMENT", "0.2"))
     ranking_w_business: float = float(os.getenv("AGENT_RANK_W_BUSINESS", "0.0"))
 
+    # LLM probe concurrency caps (Phase C prerequisite).
+    # Per feedback_llm_call_multipliers.md: PR #278 took backend down
+    # when uncapped concurrent probes saturated the upstream LLM
+    # provider. Phase C multi-market would multiply this 3-6x; both
+    # caps must be in place before that lands.
+    #   - global: total in-flight LLM probes across all merchants;
+    #     caps the backend's overall LLM-provider load.
+    #   - per_merchant: in-flight probes for a single merchant_id;
+    #     prevents one merchant's audit from starving others.
+    # Defaults sized for current single-market traffic. Phase C's
+    # multi-market work should re-tune AFTER staging load test.
+    llm_probe_global_max_concurrent: int = int(
+        os.getenv("LLM_PROBE_GLOBAL_MAX_CONCURRENT", "30")
+    )
+    llm_probe_per_merchant_max_concurrent: int = int(
+        os.getenv("LLM_PROBE_PER_MERCHANT_MAX_CONCURRENT", "5")
+    )
+
     # Phase D wire-up: GSC OAuth + Indexing API + URL Inspection API.
     # Feature flag: stays OFF until creds are configured + a smoke
     # test confirms the OAuth callback round-trips. Once flipped on,
