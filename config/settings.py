@@ -239,6 +239,41 @@ class Settings(BaseSettings):
     ranking_w_enrichment: float = float(os.getenv("AGENT_RANK_W_ENRICHMENT", "0.2"))
     ranking_w_business: float = float(os.getenv("AGENT_RANK_W_BUSINESS", "0.0"))
 
+    # Phase C — multi-market audit support (scaffolding).
+    # When the flag is OFF (default), audits run single-market against
+    # audit_default_market_locale. When ON, audits also run probes
+    # for each market in phase_c_enabled_markets and surface per-
+    # market scores in merchant_view.receipts.markets + a
+    # "Localize for market X" action when gap > threshold.
+    #
+    # DO NOT enable in production until:
+    #   1. Concurrency caps from #384 are confirmed stable under
+    #      multi-market load (caps multiply: 3 markets × 5 products
+    #      × 3 probes = 45 probes per audit, bounded by per-merchant
+    #      semaphore)
+    #   2. Staging load test confirms upstream LLM provider doesn't
+    #      hit quota (per feedback_llm_call_multipliers.md)
+    audit_default_market_locale: str = os.getenv(
+        "AUDIT_DEFAULT_MARKET_LOCALE", "en-US",
+    )
+    phase_c_multi_market_enabled: bool = (
+        os.getenv("PHASE_C_MULTI_MARKET_ENABLED", "false").lower() == "true"
+    )
+    # Comma-separated locale list, e.g. "en-US,en-GB,ja-JP". Default
+    # mirrors single-market behavior so flipping the enable flag with
+    # an unset list doesn't accidentally fire a 3-locale audit.
+    phase_c_enabled_markets_raw: str = os.getenv(
+        "PHASE_C_ENABLED_MARKETS", "en-US",
+    )
+
+    @property
+    def phase_c_enabled_markets(self) -> list:
+        return [
+            m.strip()
+            for m in (self.phase_c_enabled_markets_raw or "").split(",")
+            if m.strip()
+        ]
+
     # LLM probe concurrency caps (Phase C prerequisite).
     # Per feedback_llm_call_multipliers.md: PR #278 took backend down
     # when uncapped concurrent probes saturated the upstream LLM
