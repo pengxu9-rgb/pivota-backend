@@ -228,6 +228,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    title, description, brand, product_type, category,
                    category_path, category_confidence, category_label_source,
                    canonical_url, image_url, product_payload, tags,
+                   price_tier, use_case_tags, lifestyle_tags, demographic,
                    pdp_scope, pdp_scope_source, pdp_scope_set_at)
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
@@ -236,6 +237,10 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    :category_path, :category_confidence, :category_label_source,
                    :canonical_url, :image_url, CAST(:product_payload AS jsonb),
                    CAST(:tags AS jsonb),
+                   :price_tier,
+                   CAST(:use_case_tags AS jsonb),
+                   CAST(:lifestyle_tags AS jsonb),
+                   :demographic,
                    :pdp_scope, :pdp_scope_source, NOW())
                 ON CONFLICT (product_key) DO UPDATE SET
                   category_path = EXCLUDED.category_path,
@@ -245,6 +250,10 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                   image_url = EXCLUDED.image_url,
                   product_payload = EXCLUDED.product_payload,
                   tags = EXCLUDED.tags,
+                  price_tier = EXCLUDED.price_tier,
+                  use_case_tags = EXCLUDED.use_case_tags,
+                  lifestyle_tags = EXCLUDED.lifestyle_tags,
+                  demographic = EXCLUDED.demographic,
                   pdp_scope = EXCLUDED.pdp_scope,
                   pdp_scope_source = EXCLUDED.pdp_scope_source,
                   pdp_scope_set_at = NOW(),

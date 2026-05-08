@@ -341,3 +341,105 @@ async def test_ingest_standard_products_persists_merchant_tags(
     assert write.get("tags") == [], (
         "catalog_products write must include tags=[] when merchant feed has no tags"
     )
+
+
+@pytest.mark.asyncio
+async def test_ingest_standard_products_writes_o2_taxonomy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase O-2: ingest_standard_products must populate price_tier /
+    use_case_tags / lifestyle_tags / demographic via derive_taxonomy_v1.
+    Asserts the four new columns land in the catalog_products values
+    dict alongside the existing fields."""
+
+    catalog_products_writes: list[dict] = []
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_upsert_catalog_merchant(**_kwargs):
+        return None
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_products":
+            catalog_products_writes.append(dict(values))
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module, "upsert_catalog_merchant", fake_upsert_catalog_merchant)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+
+    # Product with price + lifestyle + demographic + use-case signals.
+    await module.ingest_standard_products(
+        merchant_id="merch_o2",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_o2",
+                "product_id": "prod_o2",
+                "merchant_id": "merch_o2",
+                "platform": "shopify",
+                "title": "Vegan Daily Moisturizer for Women",
+                "description": "Cruelty-free, fragrance-free formula for everyday use.",
+                "price": 75.0,
+                "currency": "USD",
+                "tags": ["k-beauty"],
+                "variants": [],
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    assert write["price_tier"] == "50_100"
+    assert "vegan" in (write.get("lifestyle_tags") or [])
+    assert "cruelty_free" in (write.get("lifestyle_tags") or [])
+    assert "fragrance_free" in (write.get("lifestyle_tags") or [])
+    assert "daily" in (write.get("use_case_tags") or [])
+    assert write["demographic"] == "women"
+
+    # Product with no taxonomy signals → empty lists / None scalars,
+    # column never missing.
+    catalog_products_writes.clear()
+    await module.ingest_standard_products(
+        merchant_id="merch_o2_blank",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_blank",
+                "product_id": "prod_blank",
+                "merchant_id": "merch_o2_blank",
+                "platform": "shopify",
+                "title": "Generic Item",
+                "price": 250.0,
+                "currency": "USD",
+                "variants": [],
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    assert write["price_tier"] == "200_500"  # always derivable from price
+    assert write["use_case_tags"] == []
+    assert write["lifestyle_tags"] == []
+    assert write["demographic"] is None  # NULL is correct here

@@ -38,6 +38,7 @@ from db.merchant_onboarding import merchant_onboarding
 from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
+from services.pdp_taxonomy import derive_taxonomy_v1
 
 
 logger = logging.getLogger(__name__)
@@ -647,6 +648,17 @@ async def ingest_standard_products(
                     # NULL ("row predates the column"). See
                     # docs/PDP_ONBOARDING_PLAYBOOK.md gap #2 + mig 075.
                     "tags": list(product.tags or []),
+                    # Phase O-2: derived taxonomy v1 — price_tier (deterministic
+                    # from product.price), use_case_tags / lifestyle_tags
+                    # (conservative keyword extraction), demographic (NULL if
+                    # ambiguous). Pure function in services/pdp_taxonomy.py.
+                    # See docs/PDP_ONBOARDING_PLAYBOOK.md + mig 076.
+                    **derive_taxonomy_v1(
+                        price=product.price,
+                        title=product.title,
+                        description=product.description_text or product.description,
+                        tags=list(product.tags or []),
+                    ),
                     "canonical_url": canonical_url,
                     "image_url": product.image_url,
                     "product_payload": raw_product,

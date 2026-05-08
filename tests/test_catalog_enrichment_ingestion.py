@@ -503,3 +503,69 @@ def test_pdp_insert_writes_jsonl_tags_when_supplied():
     result = ingest_validated_record(record)
     pdp_row = result["pdp"]
     assert pdp_row["tags"] == "[]"
+
+
+def test_pdp_insert_writes_o2_taxonomy_columns():
+    """Phase O-2: catalog enrichment agent ingestion must also populate
+    price_tier / use_case_tags / lifestyle_tags / demographic. The
+    helper at services.pdp_taxonomy is the same one Path A and Path B
+    use, so we mainly assert wiring (column present, JSON serialized
+    correctly) rather than re-testing the extractors."""
+
+    # Record with attributes that trigger lifestyle + demographic + use-case
+    record = _record(
+        product_name="Vegan Daily Lipstick for Women",
+        attribute_summary="cruelty-free, everyday wear, retro red",
+        offers=[
+            {
+                "merchant_inferred": "MAC",
+                "destination_url": "https://maccosmetics.com/p/x",
+                "canonical_url": "https://maccosmetics.com/p/x",
+                "image_url": "https://maccosmetics.com/img/x.jpg",
+                "price": 28.0,
+                "in_stock": True,
+                "validated_at": "2026-05-08T00:00:00Z",
+            },
+        ],
+    )
+    result = ingest_validated_record(record)
+    pdp_row = result["pdp"]
+    # price_tier is a scalar; offers[0].price=28 → under_50
+    assert pdp_row["price_tier"] == "under_50"
+    # JSONB columns are JSON-stringified for CAST(:... AS jsonb)
+    assert "vegan" in json.loads(pdp_row["lifestyle_tags"])
+    assert "cruelty_free" in json.loads(pdp_row["lifestyle_tags"])
+    assert "daily" in json.loads(pdp_row["use_case_tags"])
+    assert pdp_row["demographic"] == "women"
+
+    # Record with no signals → consistent empty / None shape
+    record_blank = _record(
+        product_name="Plain Item",
+        attribute_summary="just a thing",
+        offers=[
+            {
+                "merchant_inferred": "Brand",
+                "destination_url": "https://brand.example/p",
+                "canonical_url": "https://brand.example/p",
+                "image_url": "https://brand.example/img.jpg",
+                "price": 150.0,
+                "in_stock": True,
+            },
+        ],
+    )
+    result = ingest_validated_record(record_blank)
+    pdp_row = result["pdp"]
+    assert pdp_row["price_tier"] == "100_200"
+    assert json.loads(pdp_row["use_case_tags"]) == []
+    assert json.loads(pdp_row["lifestyle_tags"]) == []
+    assert pdp_row["demographic"] is None
+
+    # Record with no offers → price_tier is None (no signal)
+    record_no_price = _record(
+        product_name="Vegan Cream",
+        attribute_summary="cruelty-free",
+        offers=[],
+    )
+    # offers=[] is filtered by ingest_validated_record (returns None)
+    result = ingest_validated_record(record_no_price)
+    assert result is None  # confirms no-offer records are dropped early

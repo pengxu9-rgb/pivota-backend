@@ -39,6 +39,8 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from services.pdp_taxonomy import derive_taxonomy_v1
+
 logger = logging.getLogger("catalog_enrichment_agent.ingestion")
 
 AGENT_VERSION = "catalog_enrichment_agent_v1"
@@ -196,8 +198,42 @@ def _build_pdp_insert(
         # Stringified here because run_catalog_enrichment.py wraps the
         # bind value with CAST(:tags AS jsonb).
         "tags": json.dumps(list(pdp_payload.get("tags") or []), ensure_ascii=False),
+        # Phase O-2: derived taxonomy v1. Catalog enrichment agent
+        # candidates rarely have explicit price (validator finds offer
+        # prices, not candidate prices), so price_tier may be NULL —
+        # that's expected. Title + attribute_summary + tags drive the
+        # extractors. Stringified for CAST(:... AS jsonb) in the
+        # runner. mig 076.
+        **_taxonomy_v1_payload(pdp_payload, offers),
         "pdp_scope": DEFAULT_PDP_SCOPE,
         "pdp_scope_source": DEFAULT_PDP_SCOPE_SOURCE,
+    }
+
+
+def _taxonomy_v1_payload(pdp_payload: Dict[str, Any], offers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute the 4 taxonomy v1 columns from a catalog enrichment agent
+    record. Price defaults to the first offer's price when present.
+    Returns the dict shape Postgres expects for jsonb columns wrapped
+    via CAST(:... AS jsonb): scalars stay scalars, lists become JSON
+    string literals."""
+    price = None
+    if offers:
+        raw_price = offers[0].get("price")
+        try:
+            price = float(raw_price) if raw_price is not None else None
+        except (TypeError, ValueError):
+            price = None
+    taxonomy = derive_taxonomy_v1(
+        price=price,
+        title=pdp_payload.get("product_name"),
+        description=pdp_payload.get("attribute_summary"),
+        tags=list(pdp_payload.get("tags") or []),
+    )
+    return {
+        "price_tier": taxonomy["price_tier"],
+        "use_case_tags": json.dumps(taxonomy["use_case_tags"], ensure_ascii=False),
+        "lifestyle_tags": json.dumps(taxonomy["lifestyle_tags"], ensure_ascii=False),
+        "demographic": taxonomy["demographic"],
     }
 
 

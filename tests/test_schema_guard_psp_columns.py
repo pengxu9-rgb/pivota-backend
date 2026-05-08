@@ -49,3 +49,10 @@ async def test_ensure_required_schema_light_adds_merchant_psp_columns_in_fast_mo
     # declares the column. Same deploy-skipped-migrations failure mode
     # as the canonical PDP columns above.
     assert "ADD COLUMN IF NOT EXISTS tags" in catalog_stmt
+    # Phase O-2 (mig 076). All four typed taxonomy columns gated by the
+    # same fail-safe — db/catalog.py mapping declares them, so writes
+    # would error if the columns are missing post-deploy.
+    assert "ADD COLUMN IF NOT EXISTS price_tier" in catalog_stmt
+    assert "ADD COLUMN IF NOT EXISTS use_case_tags" in catalog_stmt
+    assert "ADD COLUMN IF NOT EXISTS lifestyle_tags" in catalog_stmt
+    assert "ADD COLUMN IF NOT EXISTS demographic" in catalog_stmt

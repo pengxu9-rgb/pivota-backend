@@ -56,6 +56,13 @@ catalog_products = Table(
     # (Shopify/Wix/WooCommerce sync). JSONB array; NULL on rows predating
     # mig 075. See docs/PDP_ONBOARDING_PLAYBOOK.md.
     Column("tags", JSONB_TYPE, nullable=True),
+    # Phase O-2 — Pivota-normalized taxonomy v1 (mig 076). Pure
+    # derivation from merchant data + heuristics; NULL when ingest
+    # had no signal (Phase O-3 LabelAgent fills the long tail).
+    Column("price_tier", String(16), nullable=True),
+    Column("use_case_tags", JSONB_TYPE, nullable=True),
+    Column("lifestyle_tags", JSONB_TYPE, nullable=True),
+    Column("demographic", String(16), nullable=True),
     # Pivota canonical PDP — sig_<32hex> identifying the product's
     # agent.pivota.cc/products/<sig> URL (the AI-channel surface).
     # See migration 071 + services/catalog_sync_service.py:
