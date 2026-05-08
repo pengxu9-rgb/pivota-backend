@@ -458,6 +458,180 @@ async def test_orchestrator_rejects_non_http_url():
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_skips_backfill_in_dry_run(
+    with_catalog_intelligence,
+):
+    """Dry-run mode (catalog-extract-audit skill pattern): discovery
+    runs, diagnostics + coverage computed, but NO upsert to
+    prospect_products."""
+    from services import bd_cold_start_service as mod
+    from services import brand_product_discovery as bpd
+    from services import catalog_intelligence_client as ci
+    from db import prospect_products as pp
+
+    async def fake_robots(_): return True
+    async def fake_fetch(_url, _max):
+        return (_gruns_homepage_html(), "ok")
+
+    ci_result = {
+        "products": [
+            {"title": "Strawberry", "pdp_url": "https://gruns.co/products/strawberry",
+             "vendor": None, "product_type": None,
+             "raw_extracted": {
+                 "image_url": "https://gruns.co/cdn/x.jpg",
+                 "variant_skus": ["sku-1"],
+                 "description_raw": "Daily greens for kids",
+             }},
+        ],
+        "platform": "shopify",
+        "diagnostics": {
+            "discovery_strategy": "shopify_json",
+            "failure_category": None,
+            "block_provider": None,
+        },
+    }
+
+    upsert_count = 0
+    async def fake_upsert(**kw):
+        nonlocal upsert_count
+        upsert_count += 1
+        return 1
+
+    with patch.object(bpd, "_robots_allows", AsyncMock(side_effect=fake_robots)):
+        with patch.object(bpd, "_fetch_text", AsyncMock(side_effect=fake_fetch)):
+            with patch.object(ci, "extract_catalog", AsyncMock(return_value=ci_result)):
+                with patch.object(pp, "upsert_discovered_products",
+                                  AsyncMock(side_effect=fake_upsert)):
+                    result = await mod.discover_products_for_audit(
+                        "https://gruns.co/", persist=False,
+                    )
+
+    assert result["discovery_method"] == "catalog_intelligence"
+    assert result["products_persisted"] == 0
+    assert upsert_count == 0  # No DB writes in dry-run
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_surfaces_diagnostics_from_catalog_intelligence(
+    with_catalog_intelligence,
+):
+    """catalog-extract-audit skill output: diagnostics from
+    catalog-intelligence flow through to the orchestrator response
+    so BD operators can judge backfill safety."""
+    from services import bd_cold_start_service as mod
+    from services import brand_product_discovery as bpd
+    from services import catalog_intelligence_client as ci
+    from db import prospect_products as pp
+
+    async def fake_robots(_): return True
+    async def fake_fetch(_url, _max):
+        return (_gruns_homepage_html(), "ok")
+
+    ci_result = {
+        "products": [{"title": "X", "pdp_url": "https://gruns.co/products/x",
+                      "vendor": None, "product_type": None,
+                      "raw_extracted": {"image_url": "https://x", "variant_skus": ["s"]}}],
+        "platform": "shopify",
+        "diagnostics": {
+            "discovery_strategy": "shopify_json",
+            "failure_category": "bot_challenge",
+            "block_provider": "cloudflare",
+            "http_trace": [{"url": "https://gruns.co/", "status": 403}],
+        },
+    }
+
+    async def fake_upsert(**kw): return 1
+
+    with patch.object(bpd, "_robots_allows", AsyncMock(side_effect=fake_robots)):
+        with patch.object(bpd, "_fetch_text", AsyncMock(side_effect=fake_fetch)):
+            with patch.object(ci, "extract_catalog", AsyncMock(return_value=ci_result)):
+                with patch.object(pp, "upsert_discovered_products",
+                                  AsyncMock(side_effect=fake_upsert)):
+                    result = await mod.discover_products_for_audit(
+                        "https://gruns.co/",
+                    )
+
+    diagnostics = result["diagnostics"]
+    assert diagnostics["failure_category"] == "bot_challenge"
+    assert diagnostics["block_provider"] == "cloudflare"
+    assert diagnostics["http_trace"][0]["status"] == 403
+    # Coverage stats present too
+    coverage = result["coverage"]
+    assert coverage is not None
+    assert coverage["products_total"] == 1
+    assert coverage["with_images"] == 1
+    assert coverage["with_variants"] == 1
+    assert coverage["image_coverage_pct"] == 100
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_coverage_is_none_for_fallback_path(
+    with_catalog_intelligence,
+):
+    """Fallback discovery doesn't have raw_extracted (just title +
+    URL from sitemap/links). Coverage stats are None to avoid
+    false-positive "all products are missing images!" warnings —
+    the fallback simply never had that data to begin with."""
+    from services import bd_cold_start_service as mod
+    from services import brand_product_discovery as bpd
+    from services import catalog_intelligence_client as ci
+    from db import prospect_products as pp
+
+    async def fake_robots(_): return True
+    async def fake_fetch(_url, _max):
+        return (_gruns_homepage_html(), "ok")
+
+    fallback_result = {
+        "merchant_name": "Gruns", "merchant_domain": "gruns.co",
+        "products": [{"title": "X", "pdp_url": "https://gruns.co/p/x",
+                      "vendor": None, "product_type": None}],
+        "discovery_method": "shopify_sitemap",
+    }
+
+    async def fake_upsert(**kw): return 1
+
+    with patch.object(bpd, "_robots_allows", AsyncMock(side_effect=fake_robots)):
+        with patch.object(bpd, "_fetch_text", AsyncMock(side_effect=fake_fetch)):
+            with patch.object(ci, "extract_catalog", AsyncMock(return_value=None)):
+                with patch.object(bpd, "discover_products_from_homepage",
+                                  AsyncMock(return_value=fallback_result)):
+                    with patch.object(pp, "upsert_discovered_products",
+                                      AsyncMock(side_effect=fake_upsert)):
+                        result = await mod.discover_products_for_audit(
+                            "https://gruns.co/",
+                        )
+
+    assert result["coverage"] is None
+    assert result["diagnostics"] is None
+
+
+def test_coverage_stats_computes_correctly():
+    """Direct unit test on the helper — boundary behavior."""
+    from services.bd_cold_start_service import _coverage_stats
+    products = [
+        {"raw_extracted": {"image_url": "x.jpg", "variant_skus": ["s1"], "description_raw": "x"}},
+        {"raw_extracted": {"image_url": "", "variants": [{"sku": "s2"}], "description_raw": None}},
+        {"raw_extracted": {"image_urls": ["a.jpg"]}},
+        {"raw_extracted": {}},  # no fields
+    ]
+    stats = _coverage_stats(products)
+    assert stats["products_total"] == 4
+    assert stats["with_images"] == 2  # idx 0 (image_url), idx 2 (image_urls)
+    assert stats["with_variants"] == 2  # idx 0 (variant_skus), idx 1 (variants)
+    assert stats["with_descriptions"] == 1  # idx 0 only
+    assert stats["image_coverage_pct"] == 50
+    assert stats["variant_coverage_pct"] == 50
+
+
+def test_coverage_stats_handles_empty_list():
+    from services.bd_cold_start_service import _coverage_stats
+    stats = _coverage_stats([])
+    assert stats["products_total"] == 0
+    assert stats["image_coverage_pct"] is None
+    assert stats["variant_coverage_pct"] is None
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_continues_when_backfill_db_fails(
     with_catalog_intelligence,
 ):

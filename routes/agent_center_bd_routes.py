@@ -273,6 +273,13 @@ class BdColdStartAuditRequest(BaseModel):
     provider: str = Field("gemini")
     max_runs: int = Field(3, ge=1, le=_HARD_MAX_RUNS)
     include_category_visibility: bool = Field(True)
+    # Catalog-extract-audit skill's "preflight before seed writes"
+    # pattern. When True, the endpoint runs discovery only — returns
+    # diagnostics + coverage stats + product list — without invoking
+    # the LLM audit pipeline OR persisting to prospect_products.
+    # Lets BD operators inspect extraction quality before committing
+    # to a full audit run + backfill.
+    dry_run: bool = Field(False)
 
     @validator("url")
     def _url_looks_like_url(cls, v: str) -> str:
@@ -309,6 +316,7 @@ async def cold_start_audit(
             body.url,
             max_products=body.max_products,
             market=body.market,
+            persist=not body.dry_run,
         )
     except BrandDiscoveryError as exc:
         logger.warning(
@@ -350,6 +358,27 @@ async def cold_start_audit(
             },
         )
 
+    # Dry-run short-circuit: return discovery + diagnostics without
+    # running the LLM audit. catalog-extract-audit skill pattern —
+    # operator inspects extraction quality before committing to a
+    # full audit run.
+    if body.dry_run:
+        logger.info(
+            "BD cold-start dry-run: url=%s brand=%s discovery=%s "
+            "products_discovered=%s coverage=%s diagnostics=%s",
+            body.url,
+            discovered["merchant_name"],
+            discovered["discovery_method"],
+            discovered.get("products_discovered_total"),
+            discovered.get("coverage"),
+            discovered.get("diagnostics"),
+        )
+        return {
+            "status": "ok",
+            "dry_run": True,
+            "discovery": _build_discovery_block(discovered),
+        }
+
     try:
         out = await run_brand_report(
             merchant_name=discovered["merchant_name"],
@@ -378,20 +407,32 @@ async def cold_start_audit(
     )
     return {
         "status": "ok",
-        "discovery": {
-            "merchant_name": discovered["merchant_name"],
-            "merchant_domain": discovered.get("merchant_domain"),
-            "discovery_method": discovered["discovery_method"],
-            "platform": discovered.get("platform"),
-            "fallback_used": discovered.get("fallback_used"),
-            "products_audited": [
-                {"title": p["title"], "pdp_url": p["pdp_url"]}
-                for p in discovered["products"]
-            ],
-            "products_discovered_total": discovered.get(
-                "products_discovered_total",
-            ),
-            "products_persisted": discovered.get("products_persisted", 0),
-        },
+        "discovery": _build_discovery_block(discovered),
         "brand_report": out,
+    }
+
+
+def _build_discovery_block(discovered: Dict[str, Any]) -> Dict[str, Any]:
+    """Project the orchestrator's output to the response shape. Same
+    structure for full-audit and dry-run responses so the BD portal
+    can render the discovery panel uniformly."""
+    return {
+        "merchant_name": discovered["merchant_name"],
+        "merchant_domain": discovered.get("merchant_domain"),
+        "discovery_method": discovered["discovery_method"],
+        "platform": discovered.get("platform"),
+        "fallback_used": discovered.get("fallback_used"),
+        "products_audited": [
+            {"title": p["title"], "pdp_url": p["pdp_url"]}
+            for p in discovered["products"]
+        ],
+        "products_discovered_total": discovered.get(
+            "products_discovered_total",
+        ),
+        "products_persisted": discovered.get("products_persisted", 0),
+        # catalog-extract-audit skill outputs — diagnostics + coverage
+        # let BD operators judge whether the extraction is trustworthy
+        # before relying on the verdict.
+        "diagnostics": discovered.get("diagnostics"),
+        "coverage": discovered.get("coverage"),
     }
