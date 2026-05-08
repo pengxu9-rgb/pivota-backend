@@ -1,0 +1,45 @@
+{
+  "_schema": {
+    "comment": "Phase E: BD-curated creator database for the audit's creator-partnership action. Engineering owns schema correctness; BD owns row correctness (which creators cover which categories, recent coverage of competitor brands, current contact info).",
+    "fields": {
+      "creator_id":        "Stable string ID (snake_case slug)",
+      "display_name":      "Creator's public name as it appears on their channel",
+      "platform":          "youtube | instagram | tiktok | substack | podcast | blog",
+      "platform_handle":   "Their @handle or channel URL slug",
+      "platform_url":      "Direct URL to channel/profile (https://)",
+      "category_tags":     "List of merchant categories this creator covers (sleepwear, fashion, beauty, home, fitness, wellness, etc.)",
+      "audience_size_band":"micro (<10k) | small (10k-100k) | medium (100k-1M) | large (>1M) — band, not exact",
+      "recent_coverage":   "List of competitor brand names this creator has covered in the last 12 months (extracted from PR-F failed_query data + BD-verified)",
+      "contact_method":    "submission_form | direct_email | dm",
+      "contact_url":       "URL or mailto: target — what the merchant clicks to reach them",
+      "sample_brief_template":"Pre-filled outreach brief the merchant can copy/paste, with {merchant_brand} / {recent_competitor} placeholders",
+      "last_verified_at":  "ISO8601 — when BD last confirmed the creator is active + categories are current. Engineers should warn when older than 6 months."
+    },
+    "ranking_signals": {
+      "category_match":    "creator.category_tags includes merchant_category (1.0 weight)",
+      "competitor_overlap":"creator.recent_coverage intersects audit's competitor_brands (0.5 per match)",
+      "audience_fit":      "merchants <$5M revenue match small/medium creators best (0.3 weight when in band)"
+    },
+    "hard_rules": [
+      "Do NOT invent creator names. The matcher returns zero results when the database is empty — better to surface no creator-partnership action than to fabricate candidates.",
+      "Do NOT ship more than 1-2 obviously-fake placeholder entries (creator_id starting with 'example_'). The matcher excludes example_* IDs from production matches.",
+      "BD must verify last_verified_at is within 6 months before re-shipping. Stale rows degrade trust."
+    ]
+  },
+  "creators": [
+    {
+      "creator_id": "example_placeholder_sleepwear_creator",
+      "display_name": "[Example placeholder — BD to replace]",
+      "platform": "youtube",
+      "platform_handle": "example_handle",
+      "platform_url": "https://example.com/placeholder",
+      "category_tags": ["sleepwear", "fashion"],
+      "audience_size_band": "small",
+      "recent_coverage": ["Lunya", "Eberjey"],
+      "contact_method": "submission_form",
+      "contact_url": "https://example.com/contact",
+      "sample_brief_template": "Hi [creator], I'm reaching out about {merchant_brand}. We saw your recent coverage of {recent_competitor} and think our products would fit your audience. [TODO: 1-2 sentence pitch]",
+      "last_verified_at": "2026-05-08"
+    }
+  ]
+}

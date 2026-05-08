@@ -2897,6 +2897,50 @@ def _build_merchant_view(
                 from services.gsc_integration import build_gsc_integration_action
                 merged_actions = [build_gsc_integration_action()] + merged_actions
 
+    # Phase E scaffolding: creator marketplace match. When the audit
+    # surfaced named competitors (category_competitor_brands) AND
+    # we have BD-curated creator candidates in the merchant's
+    # category, emit a creator-partnership action. Returns None
+    # silently when the database is empty — better to omit than to
+    # fabricate candidate creators. This action slots in AFTER
+    # integration actions (those are the highest leverage when
+    # un-integrated) but BEFORE per-host playbook actions (it's a
+    # category-wide play, not host-specific).
+    if category_competitor_brands:
+        from services.creator_matcher import (
+            build_creator_partnership_action,
+            match_creators,
+        )
+        creator_matches = match_creators(
+            merchant_category=merchant_category,
+            competitor_brands=[
+                (b.get("name") or "")
+                for b in category_competitor_brands
+                if isinstance(b, dict)
+            ],
+        )
+        creator_action = build_creator_partnership_action(
+            matches=creator_matches,
+            merchant_category=merchant_category,
+        )
+        if creator_action is not None:
+            # Insert after any integration actions but before strategic
+            # + playbook actions. Find first non-integration action
+            # index and insert there.
+            insertion_idx = 0
+            for idx, existing in enumerate(merged_actions):
+                if (existing.get("lever") or "") not in (
+                    "pivota_integration", "gsc_integration"
+                ):
+                    insertion_idx = idx
+                    break
+                insertion_idx = idx + 1
+            merged_actions = (
+                merged_actions[:insertion_idx]
+                + [creator_action]
+                + merged_actions[insertion_idx:]
+            )
+
     # Stamp a 1-indexed `priority_order` on every action so the
     # frontend can render "Step 1, Step 2..." without re-deriving the
     # ordering. The integration action (if present) is at index 0,
