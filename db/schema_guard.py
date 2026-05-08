@@ -65,6 +65,10 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "use_case_tags",
             "lifestyle_tags",
             "demographic",
+            # Phase O-4 — see migration 077. Onboarding lifecycle
+            # stage (draft/candidate/validated/published/hold/archived).
+            # Recall (Phase O-5) filters on this column.
+            "pdp_lifecycle_stage",
         },
     ),
 )
@@ -172,7 +176,8 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS price_tier VARCHAR(16),
                       ADD COLUMN IF NOT EXISTS use_case_tags JSONB,
                       ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
-                      ADD COLUMN IF NOT EXISTS demographic VARCHAR(16);
+                      ADD COLUMN IF NOT EXISTS demographic VARCHAR(16),
+                      ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
                     """
                 )
             )
@@ -182,6 +187,18 @@ async def ensure_required_schema_light() -> None:
                     CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_products_pivota_signature
                       ON catalog_products (pivota_signature_id)
                       WHERE pivota_signature_id IS NOT NULL;
+                    """
+                )
+            )
+            # Phase O-4: partial index covering only the live recall
+            # stages so the recall-path WHERE clauses (Phase O-5) hit
+            # an index instead of a heap scan.
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_catalog_products_lifecycle_live
+                      ON catalog_products (pdp_lifecycle_stage)
+                      WHERE pdp_lifecycle_stage IN ('validated', 'published');
                     """
                 )
             )

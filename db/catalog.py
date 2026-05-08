@@ -63,6 +63,10 @@ catalog_products = Table(
     Column("use_case_tags", JSONB_TYPE, nullable=True),
     Column("lifestyle_tags", JSONB_TYPE, nullable=True),
     Column("demographic", String(16), nullable=True),
+    # Phase O-4 — onboarding lifecycle stage (mig 077). Computed at
+    # ingest by every path; recall (Phase O-5) filters on
+    # validated|published. See docs/PDP_ONBOARDING_PLAYBOOK.md.
+    Column("pdp_lifecycle_stage", String(16), nullable=True),
     # Pivota canonical PDP — sig_<32hex> identifying the product's
     # agent.pivota.cc/products/<sig> URL (the AI-channel surface).
     # See migration 071 + services/catalog_sync_service.py:

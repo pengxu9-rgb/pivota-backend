@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.mirror_external_seeds_to_catalog_products import (  # noqa: E402
     CATEGORY_CONFIDENCE_REGEX_AT_MIRROR,
     CATEGORY_LABEL_SOURCE_AT_MIRROR,
+    _compute_mirror_lifecycle_stage,
     _extract_tags_from_seed_data,
     resolve_mirror_category_metadata,
 )
@@ -104,3 +105,53 @@ def test_extract_tags_returns_empty_for_non_dict() -> None:
     assert _extract_tags_from_seed_data(None) == []
     assert _extract_tags_from_seed_data([]) == []
     assert _extract_tags_from_seed_data("scrambled string") == []
+
+
+# ---------------------------------------------------------------------------
+# Phase O-4 — lifecycle stage computation on Path B (external seed mirror)
+# ---------------------------------------------------------------------------
+
+
+def test_mirror_lifecycle_validated_when_full_content_and_taxonomy() -> None:
+    """Path B reaches validated when title + image + long description
+    + category_path + at least one taxonomy signal are all present.
+    Path B never reaches published — pdp_scope is NULL in this script."""
+    row = {
+        "title": "Hydrating Vitamin C Serum",
+        "mirrored_description": "Daily-use vegan serum with niacinamide for brightening and hydration support.",
+        "image_url": "https://example.com/serum.jpg",
+    }
+    category_meta = {"category_path": "beauty/skincare/serum"}
+    taxonomy = {
+        "demographic": "women",
+        "use_case_tags": ["daily"],
+        "lifestyle_tags": ["vegan"],
+    }
+    stage = _compute_mirror_lifecycle_stage(
+        row, category_meta, ["k-beauty"], taxonomy
+    )
+    assert stage == "validated"
+
+
+def test_mirror_lifecycle_candidate_when_no_category_path() -> None:
+    """Without category_path the row caps at candidate — same gate as
+    the lifecycle module, applied via the script's helper."""
+    row = {
+        "title": "A Good Product",
+        "mirrored_description": "A long enough description to pass the candidate description gate.",
+        "image_url": "https://example.com/x.jpg",
+    }
+    category_meta = {"category_path": None}
+    taxonomy = {"demographic": None, "use_case_tags": [], "lifestyle_tags": []}
+    stage = _compute_mirror_lifecycle_stage(row, category_meta, [], taxonomy)
+    assert stage == "candidate"
+
+
+def test_mirror_lifecycle_draft_for_thin_content() -> None:
+    """Empty seed → draft. Mirror script must still write the column,
+    not skip it."""
+    row = {"title": None, "mirrored_description": None, "image_url": None}
+    category_meta = {"category_path": None}
+    taxonomy = {"demographic": None, "use_case_tags": [], "lifestyle_tags": []}
+    stage = _compute_mirror_lifecycle_stage(row, category_meta, [], taxonomy)
+    assert stage == "draft"

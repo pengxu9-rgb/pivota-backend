@@ -569,3 +569,44 @@ def test_pdp_insert_writes_o2_taxonomy_columns():
     # offers=[] is filtered by ingest_validated_record (returns None)
     result = ingest_validated_record(record_no_price)
     assert result is None  # confirms no-offer records are dropped early
+
+
+def test_pdp_insert_writes_o4_lifecycle_stage():
+    """Phase O-4: Path C ingestion must populate pdp_lifecycle_stage on
+    every PDP row. Path C rows ship with source_system='catalog_enrichment_agent_v1',
+    which is treated as canonical evidence — so a fully-populated agent
+    row reaches 'published'."""
+
+    # Hand-curated agent record with full content + taxonomy signals.
+    record = _record(
+        product_name="Vegan Daily Lipstick for Women",
+        attribute_summary=(
+            "Cruelty-free retro-red lipstick designed for everyday "
+            "long-wear comfort and bold pigment payoff."
+        ),
+        tags=["k-beauty"],
+    )
+    result = ingest_validated_record(record)
+    pdp_row = result["pdp"]
+    assert "pdp_lifecycle_stage" in pdp_row, (
+        "Path C write must include pdp_lifecycle_stage column (Phase O-4)"
+    )
+    # Has title + image_url (offer) + long description + category_path +
+    # taxonomy + canonical evidence (source_system) → published.
+    assert pdp_row["pdp_lifecycle_stage"] == "published"
+
+    # Thin record: short attribute_summary + no taxonomy hints → caps
+    # at draft (description below candidate min length).
+    thin = _record(
+        product_name="X",
+        attribute_summary="brief",
+    )
+    # canonical_product_name="x" so brand=MAC is still set; pdp passes
+    # the required-fields gate but content is below candidate threshold.
+    result = ingest_validated_record(thin)
+    pdp_row = result["pdp"]
+    # description=attribute_summary='brief' is too short → can't promote
+    # past candidate; image_url present from offer; title present.
+    assert pdp_row["pdp_lifecycle_stage"] in {"draft", "candidate"}
+    # Specifically: 'brief' is 5 chars, well below CANDIDATE_DESCRIPTION_MIN_LEN
+    assert pdp_row["pdp_lifecycle_stage"] == "draft"
