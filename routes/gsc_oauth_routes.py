@@ -112,6 +112,68 @@ def _require_enabled() -> None:
         )
 
 
+@router.get("/status")
+async def oauth_status(
+    merchant_id: str = Query(..., min_length=1),
+):
+    """Diagnostic: returns the merchant's GSC integration state.
+    Doesn't expose tokens — only metadata (presence + grant time +
+    site URL + scopes + last refresh status). Useful for the audit
+    pipeline to decide whether to surface "Grant GSC access" CTA,
+    and for operators to verify the OAuth round-trip persisted.
+    """
+    try:
+        from db.database import database
+        row = await database.fetch_one(
+            """
+            SELECT merchant_id, granted_scopes, authorized_site_url,
+                   granted_at, access_token_expires_at,
+                   last_refresh_ok_at, last_refresh_error, revoked_at
+              FROM gsc_oauth_tokens
+             WHERE merchant_id = :merchant_id
+             LIMIT 1
+            """,
+            {"merchant_id": merchant_id},
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Table missing / DB unreachable — treat as un-integrated.
+        # Don't leak the underlying error class to the response.
+        logger.warning(
+            "gsc_oauth status lookup failed for merchant=%s: %s",
+            merchant_id, exc,
+        )
+        return {
+            "merchant_id": merchant_id,
+            "integrated": False,
+            "reason": "lookup_failed",
+        }
+    if not row:
+        return {
+            "merchant_id": merchant_id,
+            "integrated": False,
+            "reason": "no_oauth_row",
+        }
+    return {
+        "merchant_id": merchant_id,
+        "integrated": row["revoked_at"] is None,
+        "granted_scopes": list(row["granted_scopes"] or []),
+        "authorized_site_url": row["authorized_site_url"],
+        "granted_at": row["granted_at"].isoformat() if row["granted_at"] else None,
+        "access_token_expires_at": (
+            row["access_token_expires_at"].isoformat()
+            if row["access_token_expires_at"] else None
+        ),
+        "last_refresh_ok_at": (
+            row["last_refresh_ok_at"].isoformat()
+            if row["last_refresh_ok_at"] else None
+        ),
+        "last_refresh_error": row["last_refresh_error"],
+        "revoked_at": (
+            row["revoked_at"].isoformat() if row["revoked_at"] else None
+        ),
+    }
+
+
 @router.get("/start")
 async def start_oauth(
     merchant_id: str = Query(..., min_length=1),
