@@ -15,9 +15,16 @@ Usage:
     --category lipstick
 
 Validated JSONL format (one JSON per line):
-  {"pdp": {brand, product_name, category_path, attribute_summary},
+  {"pdp": {brand, product_name, category_path, attribute_summary,
+           tags?},
    "offers": [{merchant_inferred, canonical_url, destination_url,
                image_url, price, in_stock, validated_at, ...}]}
+
+  pdp.tags is optional (Phase O-1 followup). Either a list of strings or
+  a comma-separated string. Persisted to catalog_products.tags. Empty /
+  missing is fine — write [] explicitly to signal "no tags" vs leaving
+  it absent for the runner to default. Future Phase O-3 LabelAgent will
+  fill this for rows where the curator didn't supply tags.
 
 By default reads:
   data/catalog_enrichment/<category>_pdp_candidates.jsonl
@@ -220,7 +227,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    catalog_track, truth_tier, readiness_tier, source_system,
                    title, description, brand, product_type, category,
                    category_path, category_confidence, category_label_source,
-                   canonical_url, image_url, product_payload,
+                   canonical_url, image_url, product_payload, tags,
                    pdp_scope, pdp_scope_source, pdp_scope_set_at)
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
@@ -228,6 +235,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    :title, :description, :brand, :product_type, :category,
                    :category_path, :category_confidence, :category_label_source,
                    :canonical_url, :image_url, CAST(:product_payload AS jsonb),
+                   CAST(:tags AS jsonb),
                    :pdp_scope, :pdp_scope_source, NOW())
                 ON CONFLICT (product_key) DO UPDATE SET
                   category_path = EXCLUDED.category_path,
@@ -236,6 +244,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                   canonical_url = EXCLUDED.canonical_url,
                   image_url = EXCLUDED.image_url,
                   product_payload = EXCLUDED.product_payload,
+                  tags = EXCLUDED.tags,
                   pdp_scope = EXCLUDED.pdp_scope,
                   pdp_scope_source = EXCLUDED.pdp_scope_source,
                   pdp_scope_set_at = NOW(),

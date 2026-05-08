@@ -23,7 +23,7 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -110,6 +110,58 @@ def resolve_mirror_category_metadata(
         "category_label_source": CATEGORY_LABEL_SOURCE_AT_MIRROR,
         "category_label": label,
     }
+
+
+# Phase O-1 followup — common JSONB paths that scrapers / agents put
+# tag-like data in, ordered most-trusted → least-trusted. The mirror
+# returns the FIRST non-empty list it finds. Keeps "scraper schema
+# drift" contained: any new scraper that uses a known path is
+# automatically supported; a new path requires one extension here.
+_SEED_DATA_TAG_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("derived", "recall", "tags"),  # Pivota-derived recall doc
+    ("snapshot", "tags"),            # Shopify-style scraped snapshot
+    ("product", "tags"),             # generic scraper "product" wrapper
+    ("tags",),                        # top-level
+)
+
+
+def _extract_tags_from_seed_data(seed_data: Any) -> List[str]:
+    """Walk seed_data JSONB for tag-like content. Returns [] if none found
+    (the same semantics ingest_standard_products uses on Path A: empty list
+    means "we looked and found nothing", not "field doesn't exist").
+    Always returns deduped, stripped, non-empty strings."""
+    if not isinstance(seed_data, dict):
+        return []
+    for path in _SEED_DATA_TAG_PATHS:
+        node: Any = seed_data
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+            if node is None:
+                break
+        if node is None:
+            continue
+        # Accept either a list or a comma-separated string (some Shopify
+        # snapshots flatten tags to a single string).
+        if isinstance(node, list):
+            values = node
+        elif isinstance(node, str):
+            values = node.split(",")
+        else:
+            continue
+        out: List[str] = []
+        for item in values:
+            if isinstance(item, dict):
+                candidate = str(item.get("name") or item.get("label") or "").strip()
+            else:
+                candidate = str(item or "").strip()
+            if candidate and candidate not in out:
+                out.append(candidate)
+        if out:
+            return out
+    return []
 
 
 async def _table_exists(name: str) -> bool:
@@ -417,6 +469,12 @@ async def _apply(limit: int) -> int:
             product_type=row_dict.get("mirrored_product_type"),
             title=row_dict.get("title"),
         )
+        # Phase O-1 followup: extract tags from seed_data so external
+        # crawl data flows into the canonical tags column. Always writes
+        # a list (possibly empty) to keep semantics consistent with
+        # ingest_standard_products on Path A: empty = "we looked, no tags
+        # found", NULL = "row predates the column".
+        seed_tags = _extract_tags_from_seed_data(row_dict.get("seed_data"))
         product_payload = {
             "external_seed": {
                 "id": row_dict.get("id"),
@@ -469,6 +527,7 @@ async def _apply(limit: int) -> int:
               image_url,
               product_payload,
               freshness_json,
+              tags,
               created_at,
               updated_at
             )
@@ -494,6 +553,7 @@ async def _apply(limit: int) -> int:
               :image_url,
               CAST(:product_payload AS jsonb),
               CAST(:freshness_json AS jsonb),
+              CAST(:tags AS jsonb),
               now(),
               now()
             )
@@ -522,6 +582,7 @@ async def _apply(limit: int) -> int:
                 "image_url": row_dict.get("image_url"),
                 "product_payload": json.dumps(product_payload, ensure_ascii=False, default=_json_default),
                 "freshness_json": json.dumps(freshness_json, ensure_ascii=False, default=_json_default),
+                "tags": json.dumps(seed_tags, ensure_ascii=False),
             },
         )
         if inserted_row:
