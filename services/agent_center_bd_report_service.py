@@ -1082,6 +1082,7 @@ async def run_brand_report(
     max_runs: int = 3,
     include_category_visibility: bool = True,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
+    integration_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run BD probes against up to 5 products of one merchant and
     aggregate into a brand-level report.
@@ -1159,6 +1160,10 @@ async def run_brand_report(
                 # merchant_view.diagnosis.indexing_arc_state's real
                 # phase computation (replaces the static caveat).
                 pivota_signature_minted_at=p.get("pivota_signature_minted_at"),
+                # Phase 0: same merchant-level integration state on
+                # every product report so the integration action
+                # consistently fires (or stays absent) across products.
+                integration_state=integration_state,
             )
             per_product.append(structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
@@ -2766,6 +2771,7 @@ def _build_merchant_view(
     merchant_storefront_name: Optional[str] = None,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     pivota_signature_minted_at: Optional[datetime] = None,
+    integration_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Project the already-computed structured report into a 6-layer
     information architecture the merchant portal can render directly:
@@ -2848,10 +2854,21 @@ def _build_merchant_view(
         merchant_category=merchant_category,
     )
     merged_actions = list(action_items or []) + list(playbook_actions or [])
+
+    # Phase 0: when integration is incomplete, the audit's #1 action
+    # is "Complete Pivota integration" — prepended ahead of all
+    # strategic + playbook actions. When fully integrated, no
+    # integration action is emitted; existing actions take over.
+    if integration_state is not None:
+        from services.merchant_integration_state import build_integration_action
+        integration_action = build_integration_action(integration_state)
+        if integration_action is not None:
+            merged_actions = [integration_action] + merged_actions
+
     # Stamp a 1-indexed `priority_order` on every action so the
     # frontend can render "Step 1, Step 2..." without re-deriving the
-    # ordering. Strategic actions from `_generate_action_items` come
-    # first (lower numbers), per-host playbook actions follow.
+    # ordering. The integration action (if present) is at index 0,
+    # strategic actions next, per-host playbook actions last.
     for i, a in enumerate(merged_actions, start=1):
         a["priority_order"] = i
 
@@ -3010,6 +3027,11 @@ def build_structured_report(
     url_source: Optional[str] = None,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     pivota_signature_minted_at: Optional[datetime] = None,
+    # Phase 0: when present + integration is incomplete, the audit's
+    # #1 action becomes "Complete Pivota integration". Computed once
+    # by the route handler and threaded down so per-product reports
+    # share the same state.
+    integration_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return a single JSON-serializable dict with everything the UI
     needs to render the BD report. Pure function.
@@ -3211,6 +3233,7 @@ def build_structured_report(
         merchant_storefront_name=merchant_name,
         prior_runs=prior_runs,
         pivota_signature_minted_at=pivota_signature_minted_at,
+        integration_state=integration_state,
     )
 
     return {

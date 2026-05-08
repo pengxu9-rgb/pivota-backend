@@ -380,6 +380,23 @@ async def run_merchant_self_audit(
     # historical.
     if run_id:
         prior_runs = [r for r in prior_runs if r.get("run_id") != run_id]
+
+    # Phase 0: integration-state-aware actions. Compute ONCE per audit
+    # (state is merchant-level, not per-product) so the engine can
+    # decide whether to surface "Complete Pivota integration" as the
+    # #1 critical action. Best-effort — any lookup failure produces
+    # an empty state, which means the integration action surfaces by
+    # default (better to over-prompt onboarding than to mislead a
+    # half-integrated merchant into thinking they're done).
+    try:
+        from services.merchant_integration_state import get_integration_state
+        integration_state = await get_integration_state(merchant_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "integration_state lookup failed for merchant %s: %s",
+            merchant_id, exc,
+        )
+        integration_state = None
     try:
         brand_report = await run_brand_report(
             merchant_name=str(merchant_name),
@@ -388,6 +405,7 @@ async def run_merchant_self_audit(
             provider="gemini",
             max_runs=body.max_runs,
             prior_runs=prior_runs,
+            integration_state=integration_state,
         )
     except ValueError as exc:
         await record_audit_run_completed(

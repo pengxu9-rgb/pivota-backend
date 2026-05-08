@@ -154,6 +154,15 @@ def test_action_item_bodies_contain_no_pitch_tokens(verdict_label):
     items = _make_action_items(verdict_label)
     assert items, f"expected at least one action item for {verdict_label}"
     for item in items:
+        # Phase 0 carve-out: lever="pivota_integration" actions
+        # legitimately mention Pivota / in-chat checkout / canonical
+        # PDP — the whole point of that action is to surface Pivota's
+        # value prop where the merchant can act on it. All other
+        # actions must remain pitch-free. See
+        # tests/test_integration_aware_actions.py for that action's
+        # dedicated coverage.
+        if (item.get("lever") or "").lower() == "pivota_integration":
+            continue
         body = item.get("body") or ""
         title = item.get("title") or ""
         for token in PITCH_TOKENS:
