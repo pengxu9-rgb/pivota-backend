@@ -691,6 +691,12 @@ class WixProductAdapter:
         # visible + has a positive price.
         is_orderable = bool(wp.get("visible", True)) and base_price > 0
 
+        # Phase O-1 followup: explicitly pass tags=[] so downstream sees
+        # "ingest saw the feed and it was empty" rather than "field
+        # missing entirely". Wix v3 API does not expose a clean tags
+        # concept (unlike Shopify product.tags). Future Phase O-3 will
+        # have a LabelAgent fill tags from product description /
+        # additionalInfoSections content. For now: empty list, not None.
         product = StandardProduct(
             id=product_id,
             title=name,
@@ -704,6 +710,7 @@ class WixProductAdapter:
             merchant_id=merchant_id,
             status=ProductStatus.ACTIVE,
             variants=variants_out,
+            tags=[],
             orderable=is_orderable,
             created_at=wp.get("dateCreated"),
             updated_at=wp.get("lastUpdated"),

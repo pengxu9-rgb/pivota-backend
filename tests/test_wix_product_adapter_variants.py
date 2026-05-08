@@ -158,3 +158,28 @@ async def test_wix_fetch_products_includes_variants(monkeypatch):
     assert len(products[0].variants) == 1
     assert captured["url"].endswith("/stores/v1/products/query")
     assert captured["json"]["includeVariants"] is True
+
+
+def test_wix_convert_product_emits_explicit_empty_tags():
+    """Phase O-1 followup. Wix v3 API does not expose a clean tags field
+    so the adapter sets tags=[] explicitly. Downstream catalog_products
+    tags column then carries `[]` (not NULL) — semantic: "we looked, no
+    tags from Wix" — same convention as Shopify/Woo/BigCommerce paths.
+    Phase O-3 LabelAgent will fill from content for Wix rows."""
+
+    wp = {
+        "id": "prod_wix_1",
+        "name": "Sample Product",
+        "description": "desc",
+        "visible": True,
+        "priceData": {"price": 10.0, "currency": "USD"},
+        "stock": {"quantity": 5, "inStock": True, "trackQuantity": True},
+    }
+
+    product = WixProductAdapter._convert_product(wp, merchant_id="merch_test")
+    assert product is not None
+    assert product.platform == "wix"
+    # Crucial: tags is the empty list, not None / missing. The
+    # ingest_standard_products write into catalog_products.tags relies
+    # on this being a list.
+    assert product.tags == []

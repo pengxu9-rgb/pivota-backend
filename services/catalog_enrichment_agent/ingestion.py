@@ -123,11 +123,22 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     pdp = record.get("pdp") or {}
     if not isinstance(pdp, dict):
         return {}
+    # Phase O-1 followup: optional tags field in JSONL. Accept either a
+    # list of strings or a comma-separated string (some hand-curated
+    # JSONLs may use either form). Default to []; keep the
+    # "empty list = ingest saw and was empty" semantic from Path A/B.
+    raw_tags = pdp.get("tags")
+    tags: List[str] = []
+    if isinstance(raw_tags, list):
+        tags = [str(t).strip() for t in raw_tags if str(t or "").strip()]
+    elif isinstance(raw_tags, str):
+        tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
     payload = {
         "brand": str(pdp.get("brand") or "").strip(),
         "product_name": str(pdp.get("product_name") or "").strip(),
         "category_path": str(pdp.get("category_path") or "").strip(),
         "attribute_summary": str(pdp.get("attribute_summary") or "").strip(),
+        "tags": tags,
         "agent_version": AGENT_VERSION,
     }
     if not payload["brand"] or not payload["product_name"]:
@@ -178,6 +189,13 @@ def _build_pdp_insert(
         "canonical_url": canonical_url or None,
         "image_url": image_url or None,
         "product_payload": json.dumps({"enrichment_meta": enrichment_meta}),
+        # Phase O-1 followup: persist optional curator-supplied tags from
+        # JSONL (always a list, possibly empty). Same semantic as Path A
+        # and Path B: `[]` means "ingest saw the candidate and the JSONL
+        # didn't list any tags", NULL means "row predates the column".
+        # Stringified here because run_catalog_enrichment.py wraps the
+        # bind value with CAST(:tags AS jsonb).
+        "tags": json.dumps(list(pdp_payload.get("tags") or []), ensure_ascii=False),
         "pdp_scope": DEFAULT_PDP_SCOPE,
         "pdp_scope_source": DEFAULT_PDP_SCOPE_SOURCE,
     }

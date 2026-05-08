@@ -471,3 +471,35 @@ def test_seed_is_out_of_stock_when_offer_marked_oos():
     sd = json.loads(seed["seed_data"])
     assert sd["variants"][0]["availability"] == "out_of_stock"
     assert sd["variants"][0]["in_stock"] is False
+
+
+def test_pdp_insert_writes_jsonl_tags_when_supplied():
+    """Phase O-1 followup. Path C (catalog enrichment agent) JSONL may now
+    carry an optional pdp.tags field — the ingestion path persists it
+    into catalog_products.tags. Stringified because the runner wraps
+    the bind value with CAST(:tags AS jsonb)."""
+
+    # Tag list supplied
+    record = _record(tags=["matte", "retro-red", "long-wear"])
+    result = ingest_validated_record(record)
+    pdp_row = result["pdp"]
+    assert pdp_row["tags"] == json.dumps(
+        ["matte", "retro-red", "long-wear"], ensure_ascii=False
+    )
+
+    # Tags as comma-separated string also supported (curator convenience)
+    record = _record(tags="vegan, cruelty-free")
+    result = ingest_validated_record(record)
+    pdp_row = result["pdp"]
+    assert pdp_row["tags"] == json.dumps(
+        ["vegan", "cruelty-free"], ensure_ascii=False
+    )
+
+    # No tags supplied → still serializes to '[]', not None / missing.
+    # Same semantic as ingest_standard_products on Path A: "we looked,
+    # found no tags" instead of "field absent".
+    record = _record()
+    assert "tags" not in record["pdp"]
+    result = ingest_validated_record(record)
+    pdp_row = result["pdp"]
+    assert pdp_row["tags"] == "[]"
