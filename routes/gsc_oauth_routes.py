@@ -198,15 +198,43 @@ async def oauth_callback(
     sites = await _list_sites(access_token)
     authorized_site_url = _pick_primary_site(sites)
     if not authorized_site_url:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No verified Search Console properties found for this "
-                "Google account. The merchant must verify ownership of "
-                "their site in Search Console (Settings → Ownership) "
-                "before granting Pivota access."
-            ),
+        # Diagnostic: surface the raw site list (urls + permission
+        # levels) in the error so the operator can see whether the
+        # account had ANY properties (vs none), and at what permission
+        # level — distinguishes "wrong Google account" from
+        # "permission level rejected by picker".
+        site_summary = [
+            {
+                "siteUrl": e.get("siteUrl"),
+                "permissionLevel": e.get("permissionLevel"),
+            }
+            for e in (sites.get("siteEntry") or [])
+        ]
+        logger.warning(
+            "gsc_oauth callback: no eligible site found for merchant=%s; "
+            "raw sites list = %s",
+            merchant_id, site_summary,
         )
+        if not site_summary:
+            detail = (
+                "Google returned ZERO Search Console properties for "
+                "the account that just consented. Likely cause: the "
+                "Google account you used for OAuth consent is different "
+                "from the account that has pivota.cc verified. Sign "
+                "out of all Google accounts and re-do the consent flow "
+                "with the account that owns the verified property."
+            )
+        else:
+            levels = sorted({s["permissionLevel"] for s in site_summary if s.get("permissionLevel")})
+            detail = (
+                f"Google returned {len(site_summary)} property/properties for this "
+                f"account but none at permissionLevel siteOwner or "
+                f"siteFullUser. Levels seen: {levels}. The picker only "
+                f"accepts owner-equivalent grants because Indexing API "
+                f"calls require write access. Properties returned: "
+                f"{[s['siteUrl'] for s in site_summary]}"
+            )
+        raise HTTPException(status_code=400, detail=detail)
 
     from db.gsc_tokens import upsert_oauth_tokens
     await upsert_oauth_tokens(
