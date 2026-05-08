@@ -232,6 +232,49 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # BD cold-start audit: prospect_products table (migration 075).
+            # Stores discovered products from cold-target brand audits.
+            # Separate from catalog_products — prospect data is tentative
+            # until the brand onboards.
+            await database.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS prospect_products (
+                      prospect_brand    TEXT NOT NULL,
+                      prospect_domain   TEXT NOT NULL,
+                      url               TEXT NOT NULL,
+                      title             TEXT NULL,
+                      vendor            TEXT NULL,
+                      product_type      TEXT NULL,
+                      discovery_source  TEXT NOT NULL,
+                      raw_extracted     JSONB NULL,
+                      discovered_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      last_audit_run_id UUID NULL,
+                      last_audited_at   TIMESTAMPTZ NULL,
+                      claimed_at                 TIMESTAMPTZ NULL,
+                      claimed_by_merchant_id     TEXT NULL,
+                      PRIMARY KEY (prospect_domain, url)
+                    );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_prospect_products_domain_discovered
+                      ON prospect_products (prospect_domain, discovered_at DESC);
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_prospect_products_unclaimed
+                      ON prospect_products (claimed_at)
+                      WHERE claimed_at IS NULL;
+                    """
+                )
+            )
             return
 
         if IS_SQLITE:
