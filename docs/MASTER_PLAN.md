@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-08 (UTC) — **Phase 7b complete in prod**, beauty 37/37 = 100%. Phase 4 electronics scaffolding (#359) + validator instrumentation (#363) + JSON contract fix via `maxOutputTokens` 1024→4096 (#365) all merged. Validator now passes all three corpora cleanly (electronics 12/15, fragrance 37/50, lipstick 30/51; truncation-class drops 7→0). Stage 3 ingest electronics → probe v18 is the next codex task; data path is otherwise unblocked.
+- Last updated: 2026-05-08 (UTC) — **Phase 4 electronics shipped end-to-end.** Probe v19 (prod, post PIVOTA-Agent #1316) = **40/53 = 75%** (was 38/53 at v17). Electronics: 0/5 → 3/5 PASS + 2 THIN (e-reader queries need more catalog data to cross ≥6). Beauty 37/37 holds. canonical_path_executed=true on 53/53. p99 8.78s (down from 12.0s). The "scale data + gateway extension" loop now has a known-good playbook for any non-beauty bucket.
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -76,8 +76,10 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | 4 electronics — validator instrumentation | Add per-candidate drop reasons + retry to gemini_url_validator | ✅ done (draft PR #363) | `validation_drop_reason` + `validation_drop_detail` (≤500 char snippet) emitted per drop site; runner now writes a complete audit (success + failure) to validated.jsonl + a `<category>_validation_summary.json`; retry on 429/503/timeout/non-JSON-200/parse-fail; 48-test validator suite passes. |
 | 4 electronics — Stage 2 re-run with diagnostics | Run validate against electronics + fragrance + lipstick with the new instrumentation | ✅ run, **gate still failed but root cause now clear** | electronics 8/15 (gemini_json_no_balanced_block: 4, gemini_no_text_parts: 2, gemini_json_decode_failed: 1). fragrance 14/50, lipstick 16/51 — historic Phase 4 ingestions appear to have not enforced ≥12/15. **Root cause: Gemini JSON contract drift, NOT anti-scraping.** Model returns 200 OK with prose / citations-only / truncated-JSON instead of strict JSON. |
 | 4 electronics — fix Gemini JSON contract | Single-variable fix: `maxOutputTokens` 1024 → 4096 (truncation was the dominant root cause; structured output not chosen because grounding+structured-output is Gemini 3-only). | ✅ | PR #365 (codex/phase-4-validator-json-contract) merged → main commit `cf298984`. Re-run gates all met: electronics 8/15 → **12/15** ✅, fragrance 14/50 → **37/50** (74%) ✅, lipstick 16/51 → **30/51** (59%, exactly hits ≥30) ✅. `gemini_json_no_balanced_block` and `gemini_json_decode_failed` both 7 → 0 — the diagnostic numbers cleanly confirmed truncation as the root cause. |
-| 4 electronics — Stage 3 ingest | Dry-run + apply ingestion of 12 validated electronics PDPs into prod | 🟡 next codex task | Branch off main (now has #359 + #363 + #365 merged). Run `validate --category electronics` to regenerate validated.jsonl, then `ingest --category electronics --dry-run` then apply. Audit invariants must hold (legacy=0, sig dup=0, identity dup=0, missing mirror=0). |
-| 4 electronics — Probe v18 | Verify electronics lift after ingestion | 🟡 pending Stage 3 | Required: electronics 1/5 → ≥3/5 PASS, beauty 37/37 holds. If lift confirmed → scale to 30-50 entries. If not → escalate to Phase 7b non-beauty extension. |
+| 4 electronics — Stage 3 ingest | Apply ingestion of validated electronics PDPs into prod | ✅ | Validate 13/15 (2× `gemini_no_text_parts`). Apply: 13 PDPs / 13 SKUs / 22 offers / 22 external seeds. All 4 audit invariants 0. 13 electronics rows in catalog. |
+| 4 electronics — Probe v18 (data-only, gateway not yet wired) | Confirm whether non-beauty path consults catalog after ingest | ✅ ran, **answered "no"** | Electronics 0/5, all 5 hit `shopping_mainline_non_beauty_primary_deadline` despite data being in catalog. Data was in catalog but gateway non-beauty mainline didn't read it — confirmed Phase 7b non-beauty extension was needed. |
+| 4 electronics — Gateway non-beauty canonical recall | Wire canonical chain into shopping_agent non-beauty path with electronics category prefixes | ✅ | PIVOTA-Agent #1316, prod commit `c114bd91`. Adds `electronics/audio/`, `electronics/reading/` prefixes to canonical recall. Non-beauty queries that hit canonical catalog return through main path without waiting on slow upstream deadline. Beauty path unchanged. |
+| 4 electronics — Probe v19 (gateway + data) | Verify electronics lift after gateway extension | ✅ **75% overall (+3pp), electronics 3/5 PASS** | recall_v19_phase4_electronics_canonical_1778223090. Bluetooth earbuds / 蓝牙耳机 / NC headphones under $200 all PASS with 10 products. Kindle alternative + 电子阅读器 THIN with only 3 products each (need more e-reader candidates in catalog to push past ≥6 PASS threshold). Beauty 37/37 holds. canonical_path_executed=true on 53/53. p99 8.78s (down from v17 12.0s); p50 4.3s slight regression but canonical SQL itself is 160-215ms — broader gateway latency. |
 
 ---
 
@@ -100,6 +102,8 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | recall_v15_phase7b_prod_deadline_1778196048 | Phase 7b + non-beauty deadline, **prod** | 37 | 2 | 14 | 0 | **69.8%** (production parity) |
 | recall_v17_pre_pr1315_baseline_1778197677 | Pre-merge baseline (PR #1315 not yet deployed) | 37 | 3 | 13 | 0 | **70%** (≡ v15; serum still 0/2 PASS, 2 THIN) |
 | recall_v17_post_pr1315_1778198230 | Post-merge of PR #1315 (ingredient_recall_direct extension) | 38 | 1 | 14 | 0 | **72%** (+2pp over v15). **Beauty: 37/37 = 100%** (skincare_serum lifted 0/2 → 2/2). Electronics flaked 1/5 → 0/5 (cache-related, not PR #1315). |
+| recall_v18_phase4_electronics_data_only | Electronics data ingested (13 PDPs) but gateway non-beauty path didn't read it; all 5 electronics queries hit non-beauty deadline | data-bound failure | proved gateway extension was needed before data delivers value |
+| recall_v19_phase4_electronics_canonical_1778223090 | Post PIVOTA-Agent #1316 (gateway non-beauty canonical recall) | 40 | 2 | 11 | 0 | **75%** (+3pp). **Electronics 0/5 → 3 PASS / 2 THIN / 0 EMPTY.** Bluetooth earbuds / 蓝牙耳机 / NC headphones under $200 PASS with 10 products each. E-reader queries THIN with 3 products (need ≥6 for PASS — JSONL only had 4 e-reader candidates). Beauty 37/37 hold. canonical_path_executed 53/53. |
 
 **Headline insight:** every probe since v9_phase8 has *more* canonical data
 than the previous one, yet pass-rate has not returned to peak. The bottleneck
@@ -452,20 +456,30 @@ Updated priority sequence:
 2. ✅ **Re-run electronics Stage 2 with diagnostics** — done. Real
    drop pattern: 7/7 are JSON-extraction-layer (no_text_parts,
    no_balanced_block, decode_failed). NOT anti-scraping.
-3. ✅ **Fix Gemini JSON contract (codex)** — done via PR #365.
-   `maxOutputTokens` 1024 → 4096. Single variable, dominant root
-   cause was truncation (not prose, not anti-scraping). All three
-   corpora now meet gate: electronics 12/15, fragrance 37/50,
-   lipstick 30/51. `no_balanced_block` + `decode_failed` 7 → 0.
-4. **Stage 3 ingest electronics (codex, NEXT)** — re-run validate
-   against electronics with the new validator on main, then
-   dry-run + apply. Audit invariants must hold. Probe v18 gate:
-   electronics 1/5 → ≥3/5 PASS, beauty 37/37 holds, no latency
-   regression.
-5. **Phase 4 expansion to fashion / electronics / home** — scale to
-   30-50 entries per category once probe v18 confirms electronics
-   lifts. If electronics doesn't lift, escalate to Phase 7b non-beauty
-   gateway extension before scaling data.
+3. ✅ **Fix Gemini JSON contract** — PR #365 merged. maxOutputTokens
+   1024 → 4096. Truncation was the dominant root cause. All three
+   corpora over gate.
+4. ✅ **Stage 3 ingest electronics + probe v18** — done. v18 revealed
+   gateway non-beauty path didn't read catalog despite data being
+   there. 0/5 PASS.
+5. ✅ **Gateway non-beauty canonical recall (PIVOTA-Agent #1316)** —
+   merged + deployed. Adds `electronics/audio/`, `electronics/reading/`
+   prefixes; non-beauty canonical-hit queries return through main
+   path without waiting on upstream deadline.
+6. ✅ **Probe v19** — 75% overall, electronics 3/5 PASS + 2 THIN
+   (e-readers data-bound). Beauty 37/37 holds.
+7. **Scale electronics data — e-reader heavy batch (codex, NEXT)**.
+   Two THIN queries are e-readers; current JSONL had only 4 e-reader
+   candidates (3 validated). Need ~10-12 more e-readers + ~20 more
+   audio products to push electronics to 5/5 PASS and add slack.
+   Single PR: doc-only + JSONL append, then validate → ingest → probe v20.
+8. **Phase 4 home** — same playbook (data + gateway category prefix).
+   The PIVOTA-Agent gateway will need ANOTHER small extension to add
+   `home/*` category prefixes, similar to #1316 for electronics.
+9. **Phase 4 fashion** — same. Add `fashion/*` prefixes.
+10. **Latency follow-up** — p50 4.3s (regressed from v17's 3.8s) is
+    not from canonical SQL (160-215ms) but broader gateway latency.
+    Investigate after Phase 4 data is filled. Lower priority.
    The exact lipstick/fragrance Phase 4 pattern that landed beauty
    coverage now applies. For each new vertical:
    - Prepare 30–50 hand-curated PDP candidates JSONL (mirrors
