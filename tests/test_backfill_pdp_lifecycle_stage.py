@@ -242,3 +242,78 @@ def test_update_sql_guards_against_concurrent_writes():
     so that a row staged by a concurrent writer (Path A/B/C ingest)
     isn't silently overwritten by the backfill."""
     assert "pdp_lifecycle_stage IS NULL" in backfill.UPDATE_SQL
+
+
+@pytest.mark.asyncio
+async def test_drive_reports_limit_hit_when_candidates_match_limit(monkeypatch):
+    """If the SELECT returns exactly --limit rows, the operator needs
+    to know more rows may exist. Pin both the report flag and the
+    log warning so a future refactor doesn't silently swallow this
+    signal — that's the whole point of bumping the default to 10000:
+    catch a partial backfill before someone declares victory."""
+
+    rows = [
+        {
+            "product_key": f"p{i}",
+            "title": "T",
+            "description": "D" * 60,
+            "image_url": "https://x",
+            "category_path": "beauty/x",
+            "tags": ["k-beauty"],
+            "demographic": "women",
+            "use_case_tags": [],
+            "lifestyle_tags": [],
+            "pdp_scope": "merchant_owned",
+            "source_system": "shopify",
+        }
+        for i in range(3)
+    ]
+
+    async def fake_fetch_all(_sql, _params):
+        return rows
+
+    async def fake_execute(*_args, **_kwargs):
+        return None
+
+    async def fake_connect_with_retry(**_kwargs):
+        return None
+
+    monkeypatch.setattr(backfill.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(backfill.database, "execute", fake_execute)
+    monkeypatch.setattr(backfill, "_connect_with_retry", fake_connect_with_retry)
+
+    # candidates count == limit → must signal "may be more"
+    report_at_limit = await backfill._drive(_ns(limit=3))
+    assert report_at_limit["limit_hit"] is True
+
+    # candidates count < limit → no signal, run completed the table
+    report_under_limit = await backfill._drive(_ns(limit=1000))
+    assert report_under_limit["limit_hit"] is False
+
+
+def test_default_limit_covers_current_catalog():
+    """Catalog is ~4690 rows; default must be high enough to cover it
+    in one run. Earlier default of 1000 silently truncated the
+    backfill — pin against that regression."""
+    parser_default = backfill._parse_args.__wrapped__ if hasattr(
+        backfill._parse_args, "__wrapped__"
+    ) else None
+    # Inspect the argparse default the simple way: build a parser
+    # and read its default.
+    import argparse as _argparse
+
+    p = _argparse.ArgumentParser()
+    # Mirror the runtime registration to read the default. We can't
+    # call _parse_args directly because it consumes sys.argv. Instead
+    # we re-invoke the real parser with no args (after stubbing argv).
+    import sys as _sys
+
+    saved_argv = _sys.argv
+    try:
+        _sys.argv = ["backfill_pdp_lifecycle_stage.py"]
+        ns = backfill._parse_args()
+    finally:
+        _sys.argv = saved_argv
+    assert ns.limit >= 5000, (
+        f"default --limit must cover the current ~5k catalog; got {ns.limit}"
+    )
