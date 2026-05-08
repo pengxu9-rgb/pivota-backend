@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
 
 from db.database import database
 from services.pdp_category_classifier import resolve_path_from_row
+from services.pdp_taxonomy import derive_taxonomy_v1
 
 
 MERCHANT_ID = "external_seed"
@@ -475,6 +476,20 @@ async def _apply(limit: int) -> int:
         # ingest_standard_products on Path A: empty = "we looked, no tags
         # found", NULL = "row predates the column".
         seed_tags = _extract_tags_from_seed_data(row_dict.get("seed_data"))
+        # Phase O-2: derived taxonomy v1 for external-seed mirror rows.
+        # Same pure-function call as Path A. price comes from the seed
+        # row's price_amount; title + description + tags drive the
+        # keyword extractors. mig 076.
+        try:
+            seed_price_value = float(row_dict.get("price_amount")) if row_dict.get("price_amount") is not None else None
+        except (TypeError, ValueError):
+            seed_price_value = None
+        taxonomy = derive_taxonomy_v1(
+            price=seed_price_value,
+            title=row_dict.get("title"),
+            description=row_dict.get("mirrored_description"),
+            tags=seed_tags,
+        )
         product_payload = {
             "external_seed": {
                 "id": row_dict.get("id"),
@@ -528,6 +543,10 @@ async def _apply(limit: int) -> int:
               product_payload,
               freshness_json,
               tags,
+              price_tier,
+              use_case_tags,
+              lifestyle_tags,
+              demographic,
               created_at,
               updated_at
             )
@@ -554,6 +573,10 @@ async def _apply(limit: int) -> int:
               CAST(:product_payload AS jsonb),
               CAST(:freshness_json AS jsonb),
               CAST(:tags AS jsonb),
+              :price_tier,
+              CAST(:use_case_tags AS jsonb),
+              CAST(:lifestyle_tags AS jsonb),
+              :demographic,
               now(),
               now()
             )
@@ -583,6 +606,10 @@ async def _apply(limit: int) -> int:
                 "product_payload": json.dumps(product_payload, ensure_ascii=False, default=_json_default),
                 "freshness_json": json.dumps(freshness_json, ensure_ascii=False, default=_json_default),
                 "tags": json.dumps(seed_tags, ensure_ascii=False),
+                "price_tier": taxonomy["price_tier"],
+                "use_case_tags": json.dumps(taxonomy["use_case_tags"], ensure_ascii=False),
+                "lifestyle_tags": json.dumps(taxonomy["lifestyle_tags"], ensure_ascii=False),
+                "demographic": taxonomy["demographic"],
             },
         )
         if inserted_row:

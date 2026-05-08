@@ -57,6 +57,14 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # on insert. Listed here so prod deploys without separately
             # applying migrations still get the column at startup.
             "tags",
+            # Phase O-2 — see migration 076. Pivota-normalized
+            # taxonomy v1. Same fail-safe pattern: catalog_products
+            # mapping in db/catalog.py declares them, so without these
+            # columns ingest writes will error.
+            "price_tier",
+            "use_case_tags",
+            "lifestyle_tags",
+            "demographic",
         },
     ),
 )
@@ -160,7 +168,11 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS pivota_signature_id TEXT,
                       ADD COLUMN IF NOT EXISTS pivota_canonical_url TEXT,
                       ADD COLUMN IF NOT EXISTS pivota_signature_minted_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS tags JSONB;
+                      ADD COLUMN IF NOT EXISTS tags JSONB,
+                      ADD COLUMN IF NOT EXISTS price_tier VARCHAR(16),
+                      ADD COLUMN IF NOT EXISTS use_case_tags JSONB,
+                      ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
+                      ADD COLUMN IF NOT EXISTS demographic VARCHAR(16);
                     """
                 )
             )
