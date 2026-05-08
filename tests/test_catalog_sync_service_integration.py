@@ -242,3 +242,102 @@ async def test_ingest_standard_products_wraps_merchant_and_product_writes_in_tra
     assert events[:2] == ["enter", "merchant_upsert"]
     assert events.count("enter") == 2
     assert events.count("exit") == 2
+
+
+@pytest.mark.asyncio
+async def test_ingest_standard_products_persists_merchant_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase O-1: StandardProduct.tags[] from the merchant feed must reach
+    catalog_products.tags. Before mig 075 + this wiring, the field was
+    populated upstream and silently dropped at ingest. See
+    docs/PDP_ONBOARDING_PLAYBOOK.md gap #2."""
+
+    catalog_products_writes: list[dict] = []
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_upsert_catalog_merchant(**_kwargs):
+        return None
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_products":
+            catalog_products_writes.append(dict(values))
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module, "upsert_catalog_merchant", fake_upsert_catalog_merchant)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+
+    # Product WITH tags — merchant has diligently tagged it.
+    await module.ingest_standard_products(
+        merchant_id="merch_tagged",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_with_tags",
+                "product_id": "prod_with_tags",
+                "merchant_id": "merch_tagged",
+                "platform": "shopify",
+                "title": "Vitamin C Serum",
+                "price": 28.0,
+                "currency": "USD",
+                "tags": ["serum", "vitamin-c", "anti-aging"],
+                "variants": [],
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    assert "tags" in write, (
+        "catalog_products write must include tags column (Phase O-1)"
+    )
+    assert write["tags"] == ["serum", "vitamin-c", "anti-aging"]
+
+    # Product WITHOUT tags — must still write [] (not NULL or missing key)
+    # so future operators can distinguish "ingest saw merchant feed and
+    # it was empty" from "row predates the column".
+    catalog_products_writes.clear()
+    await module.ingest_standard_products(
+        merchant_id="merch_untagged",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_no_tags",
+                "product_id": "prod_no_tags",
+                "merchant_id": "merch_untagged",
+                "platform": "shopify",
+                "title": "Generic Product",
+                "price": 10.0,
+                "currency": "USD",
+                "variants": [],
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    assert write.get("tags") == [], (
+        "catalog_products write must include tags=[] when merchant feed has no tags"
+    )
