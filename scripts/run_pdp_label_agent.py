@@ -208,6 +208,16 @@ async def _process_one(
         base["skip_reason"] = "agent_filled_nothing"
         return base
 
+    # Capture the actual classified values so dry-run reports are
+    # auditable. Only include fields the agent ACTUALLY filled (not
+    # ones the merge step kept from merchant data) — otherwise the
+    # report would imply the agent had an opinion when it didn't.
+    base["classified_values"] = {f: merged.get(f) for f in actually_filled}
+    base["title"] = row.get("title")
+    base["brand"] = row.get("brand")
+    if result.get("reasoning"):
+        base["reasoning"] = result["reasoning"]
+
     if not apply:
         base["applied"] = False
         return base

@@ -49,7 +49,7 @@ logger = logging.getLogger("pdp_label_agent")
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_TIMEOUT_S = 30.0
-DEFAULT_MAX_RETRIES = 1
+DEFAULT_MAX_RETRIES = 2
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +378,18 @@ def merge_classification_into_row(
 
 _RETRYABLE_STATUS_CODES = {429, 503, 504}
 
+# Parse-time drop reasons that can also be retried — Gemini occasionally
+# returns prose-wrapped output even with structured output enabled, and
+# repeating the call is cheap insurance. Empirically the same product
+# rarely fails twice in a row (drops are non-overlapping across runs in
+# the O-6 canonical dry-runs). Cap retries with max_retries to bound cost.
+_RETRYABLE_PARSE_DROP_REASONS = {
+    "gemini_no_text_parts",
+    "gemini_json_no_balanced_block",
+    "gemini_json_decode_failed",
+    "gemini_response_not_dict",
+}
+
 
 async def classify_pdp(
     row: Dict[str, Any],
@@ -461,6 +473,15 @@ async def classify_pdp(
                 return {**_empty_result(drop_reason=last_drop), "model": model}
 
             parsed = parse_label_response(payload)
+            parse_drop = parsed.get("drop_reason")
+            if parse_drop in _RETRYABLE_PARSE_DROP_REASONS and attempts_left > 0:
+                last_drop = parse_drop
+                logger.info(
+                    "pdp_label_agent: retrying after parse-time drop %s (attempts left: %d)",
+                    parse_drop,
+                    attempts_left,
+                )
+                continue
             parsed["model"] = model
             return parsed
 
