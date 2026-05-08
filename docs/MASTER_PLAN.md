@@ -3,7 +3,7 @@
 **Live source of truth.** Update on every meaningful step. Originated from the
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
-- Last updated: 2026-05-08 (UTC) — **Phase 7b complete in prod**, beauty 37/37 = 100%. Phase 4 electronics scaffolding open as PR #359 but **blocked on Stage 2 validator instrumentation** (Gemini drops 10-12 of 15 candidates silently with no rejection reason). Codex picking up the validator fix next; until that lands, Phase 4 expansion can't reliably gate on validate-rate.
+- Last updated: 2026-05-08 (UTC) — **Phase 7b complete in prod**, beauty 37/37 = 100%. Phase 4 electronics scaffolding open as PR #359; validator instrumentation (PR #363) done and revealed the **real blocker is Gemini JSON contract drift** (200 OK with prose/citations/truncated-JSON instead of strict JSON), not anti-scraping. Fragrance/lipstick re-validate at 14/50 and 16/51 — same contract issue affects those too, suggesting historic Phase 4 ingestions may not have enforced a ≥12/15 gate. Next codex task: tighten Gemini request contract (responseMimeType + responseSchema if compatible with grounding, otherwise stronger prompt + maxOutputTokens bump).
 - Owner: peng
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
@@ -72,8 +72,10 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | 7b non-beauty deadline | Gateway-level 6000ms hard deadline on non-beauty primary upstream; authoritative strict-empty on hit; `fpm_primary_deadline_*` telemetry | ✅ | PIVOTA-Agent #1314, merged → prod commit `d98a8704` |
 | 7b ingredient_recall_direct | Extend canonical chain to ingredient_recall_direct path | ✅ | PIVOTA-Agent #1315, merged → prod commit `ee5564c4` (auto-deployed 2026-05-07T23:56). Probe v17 post-merge: **skincare_serum 0/2 → 2/2 PASS** ✅, **beauty 100% (37/37)** ✅, overall 37/53 → 38/53. Net +1 (not +2) because electronics dropped 1/5 → 0/5 in the same probe — cache-flake on the existing cache_miss_sync_filled outliers, not caused by this PR. |
 | 4 electronics — scaffolding | Plan + 15 hand-curated PDP candidates JSONL | ✅ | pivota-backend #359 (`claude/phase-4-electronics`). Doc + data only, no DB writes. |
-| 4 electronics — Stage 2 validate | Gemini URL validator run on the 15 starter candidates | 🛑 **BLOCKED on validator** | First run 5/15 validated, retry 3/15 — gate is ≥12/15 so no Stage 3 ingestion. Most failures are Gemini HTTP 200 with `offers=[]` and **no preserved drop reason**. Validator needs per-candidate `validation_drop_reason` + retry on transient errors before Phase 4 can scale. Codex working on it next. |
-| 4 electronics — validator instrumentation | Add per-candidate drop reasons + retry to gemini_url_validator | 🟡 next codex task | Spec'd in chat; ~80-150 LOC in `services/catalog_enrichment_agent/gemini_url_validator.py` + summary block in `scripts/run_catalog_enrichment.py`. Unblocks #359. |
+| 4 electronics — Stage 2 validate (initial) | Gemini URL validator run on the 15 starter candidates | 🛑 First runs failed gate | 5/15 then 3/15 validated; gate is ≥12/15. Most failures were silent `offers=[]` with no drop reason — instrumentation needed first. |
+| 4 electronics — validator instrumentation | Add per-candidate drop reasons + retry to gemini_url_validator | ✅ done (draft PR #363) | `validation_drop_reason` + `validation_drop_detail` (≤500 char snippet) emitted per drop site; runner now writes a complete audit (success + failure) to validated.jsonl + a `<category>_validation_summary.json`; retry on 429/503/timeout/non-JSON-200/parse-fail; 48-test validator suite passes. |
+| 4 electronics — Stage 2 re-run with diagnostics | Run validate against electronics + fragrance + lipstick with the new instrumentation | ✅ run, **gate still failed but root cause now clear** | electronics 8/15 (gemini_json_no_balanced_block: 4, gemini_no_text_parts: 2, gemini_json_decode_failed: 1). fragrance 14/50, lipstick 16/51 — historic Phase 4 ingestions appear to have not enforced ≥12/15. **Root cause: Gemini JSON contract drift, NOT anti-scraping.** Model returns 200 OK with prose / citations-only / truncated-JSON instead of strict JSON. |
+| 4 electronics — fix Gemini JSON contract | Tighten validator's request to enforce JSON contract (responseMimeType + responseSchema if compatible with grounding, otherwise stronger prompt + maxOutputTokens bump) | 🟡 next codex task | Spec'd. Diagnose dominant drop pattern from PR #363's `validation_drop_detail` first, pick ONE fix per pattern, re-run all 3 corpora. Required: electronics ≥12/15, fragrance ≥30/50, lipstick ≥30/51. Then Stage 3 ingest + probe v18. |
 
 ---
 
@@ -442,19 +444,24 @@ blocker for Phase 4 expansion at scale.
 
 Updated priority sequence:
 
-1. **Validator instrumentation (codex)** — add per-candidate
-   `validation_drop_reason` + `validation_drop_detail` + retry on
-   transient errors. ~80-150 LOC in
-   `services/catalog_enrichment_agent/gemini_url_validator.py` +
-   `scripts/run_catalog_enrichment.py`. Spec'd, ready for codex pickup.
-2. **Re-run electronics Stage 2 with diagnostics** — if drops are
-   anti-scraping (apple/amazon 403/429), re-curate JSONL toward
-   target.com / walmart.com / brand-direct stores. If drops are
-   prompt-related, separate small PR to tweak validator prompt for
-   electronics. If drops are transient, retry should fix.
-3. **Once electronics validates ≥12/15** — Stage 3 ingest (dry-run +
-   apply), audit invariants, probe v18. Required: electronics 1/5 → ≥3/5.
-4. **Phase 4 expansion to fashion / electronics / home** (top priority).
+1. ✅ **Validator instrumentation (codex)** — done, PR #363 draft.
+   `validation_drop_reason` + `_detail` per drop, retry on transients,
+   summary JSON.
+2. ✅ **Re-run electronics Stage 2 with diagnostics** — done. Real
+   drop pattern: 7/7 are JSON-extraction-layer (no_text_parts,
+   no_balanced_block, decode_failed). NOT anti-scraping.
+3. **Fix Gemini JSON contract (codex, NEXT)** — diagnose dominant
+   drop pattern from PR #363's `validation_drop_detail` (don't
+   speculate), then pick ONE fix per pattern: structured output
+   mode (responseMimeType + responseSchema, if compatible with
+   grounding) OR stricter prompt + maxOutputTokens 1024 → 4096.
+   Required: electronics ≥12/15, fragrance ≥30/50, lipstick ≥30/51.
+4. **Stage 3 ingest electronics** — dry-run + apply, audit
+   invariants. Probe v18 gate: electronics 1/5 → ≥3/5 PASS, beauty
+   37/37 hold.
+5. **Phase 4 expansion to fashion / electronics / home** — scale to
+   30-50 entries per category once Stage 2 + Stage 3 + probe v18
+   pipeline is healthy.
    The exact lipstick/fragrance Phase 4 pattern that landed beauty
    coverage now applies. For each new vertical:
    - Prepare 30–50 hand-curated PDP candidates JSONL (mirrors
