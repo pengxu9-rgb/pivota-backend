@@ -32,6 +32,7 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_TIMEOUT_S = 45.0
 DEFAULT_MAX_RETRIES = 1
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
 MAX_DROP_DETAIL_CHARS = 500
 RETRYABLE_HTTP_STATUSES = {429, 503, 504}
 NO_RETRY_HTTP_STATUSES = {400, 401, 403, 404}
@@ -231,6 +232,7 @@ async def validate_candidate(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     use_grounding: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> Dict[str, Any]:
     """Validate one candidate. Returns a record in the validated.jsonl
     shape: {pdp: {...candidate fields...}, offers: [...validated offers]}.
@@ -268,7 +270,7 @@ async def validate_candidate(
         ],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": max(256, int(max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS)),
         },
     }
     if use_grounding:
