@@ -208,6 +208,16 @@ async def _process_one(
         base["skip_reason"] = "agent_filled_nothing"
         return base
 
+    # Capture the actual classified values so dry-run reports are
+    # auditable. Only include fields the agent ACTUALLY filled (not
+    # ones the merge step kept from merchant data) — otherwise the
+    # report would imply the agent had an opinion when it didn't.
+    base["classified_values"] = {f: merged.get(f) for f in actually_filled}
+    base["title"] = row.get("title")
+    base["brand"] = row.get("brand")
+    if result.get("reasoning"):
+        base["reasoning"] = result["reasoning"]
+
     if not apply:
         base["applied"] = False
         return base
@@ -226,9 +236,35 @@ async def _process_one(
     return base
 
 
+async def _connect_with_retry(*, attempts: int = 3, backoff_s: tuple = (5.0, 15.0, 30.0)) -> None:
+    """Railway's pgbouncer proxy occasionally TCP-stalls connect attempts
+    for 60s+ and then surfaces an asyncio.TimeoutError. Retry with
+    exponential-ish backoff so a transient proxy hiccup doesn't kill an
+    already-in-progress run. Bounded to keep it from waiting forever."""
+    if getattr(database, "is_connected", False):
+        return
+    last_exc: Optional[Exception] = None
+    for i in range(attempts):
+        try:
+            await database.connect()
+            return
+        except (asyncio.TimeoutError, OSError, ConnectionError) as exc:
+            last_exc = exc
+            if i + 1 < attempts:
+                wait = backoff_s[i] if i < len(backoff_s) else backoff_s[-1]
+                logger.warning(
+                    "DB connect attempt %d/%d failed (%s); retrying in %.0fs",
+                    i + 1, attempts, type(exc).__name__, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
+    if last_exc is not None:
+        raise last_exc
+
+
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
-    if not getattr(database, "is_connected", False):
-        await database.connect()
+    await _connect_with_retry()
 
     candidates = await _fetch_candidates(args.scope, args.limit)
     logger.info(

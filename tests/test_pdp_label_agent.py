@@ -385,3 +385,51 @@ async def test_classify_pdp_does_not_retry_on_400(monkeypatch):
     assert result["drop_reason"] == "http_status_400"
     assert len(client.calls) == 1
     assert result.get("drop_detail") == "Bad Request"
+
+
+@pytest.mark.asyncio
+async def test_classify_pdp_retries_on_parse_drop(monkeypatch):
+    """Gemini occasionally returns prose-wrapped output even with
+    structured output enabled. The O-6 canonical dry-runs showed
+    these drops are NON-overlapping across runs (Sennheiser drops
+    once but classifies fine the next call), so a single retry
+    converts most of these into successes."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake_key")
+    # First call: no balanced JSON block in the response text
+    no_block = _MockResponse(
+        status_code=200,
+        json_payload={
+            "candidates": [{"content": {"parts": [{"text": "Sure! Here's my analysis without JSON."}]}}]
+        },
+    )
+    # Retry succeeds
+    classification = {"use_case_tags": ["daily"], "lifestyle_tags": [], "confidence": 0.9}
+    success = _MockResponse(
+        status_code=200,
+        json_payload={
+            "candidates": [{"content": {"parts": [{"text": json.dumps(classification)}]}}]
+        },
+    )
+    client = _MockHttpClient(responses=[no_block, success])
+    result = await classify_pdp({"title": "x"}, max_retries=1, http_client=client)
+    assert result["drop_reason"] is None  # retry recovered
+    assert result["use_case_tags"] == ["daily"]
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_classify_pdp_parse_drop_exhausts_retries(monkeypatch):
+    """If both attempts return prose without JSON, the final
+    drop_reason should reflect the parse failure (not 'exhausted_retries')
+    so the runner can attribute the drop reason correctly."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake_key")
+    no_block = _MockResponse(
+        status_code=200,
+        json_payload={
+            "candidates": [{"content": {"parts": [{"text": "Just chatting, no JSON."}]}}]
+        },
+    )
+    client = _MockHttpClient(responses=[no_block, no_block])
+    result = await classify_pdp({"title": "x"}, max_retries=1, http_client=client)
+    assert result["drop_reason"] == "gemini_json_no_balanced_block"
+    assert len(client.calls) == 2
