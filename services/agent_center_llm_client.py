@@ -50,6 +50,61 @@ _TRANSPORT_RETRY_EXCS = (
 _RETRY_BACKOFF_S = 0.5
 
 
+# Concurrency caps (Phase C prerequisite).
+# Per feedback_llm_call_multipliers.md: PR #278 took the backend down
+# when uncapped concurrent probes saturated the upstream LLM provider.
+# Two semaphores: a single global cap (across all merchants) bounds
+# overall LLM-provider load; a per-merchant lazy-init cap prevents
+# any one merchant's audit from monopolizing the backend.
+#
+# Caps are read from settings on first use (one-shot evaluation) so
+# tests + ops can monkeypatch the settings before any probes fire.
+_GLOBAL_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_PER_MERCHANT_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
+_PER_MERCHANT_LOCK = asyncio.Lock()
+
+
+def _get_global_semaphore() -> asyncio.Semaphore:
+    global _GLOBAL_SEMAPHORE
+    if _GLOBAL_SEMAPHORE is None:
+        raw = settings.llm_probe_global_max_concurrent
+        # Treat None as default; `or 30` would also catch 0, masking
+        # a misconfigured cap. Clamp 0/negative to 1 to avoid a
+        # deadlock-on-every-probe footgun.
+        cap = 30 if raw is None else int(raw)
+        _GLOBAL_SEMAPHORE = asyncio.Semaphore(max(1, cap))
+    return _GLOBAL_SEMAPHORE
+
+
+async def _get_per_merchant_semaphore(merchant_id: str) -> asyncio.Semaphore:
+    """Lazy-init per merchant_id. Bounded growth: each merchant gets
+    one Semaphore; the dict grows once per active merchant. Acceptable
+    for current scale (hundreds, not millions). If we ever hit
+    pressure, an LRU eviction pass is the natural follow-up."""
+    key = (merchant_id or "").strip() or "_unknown_"
+    sem = _PER_MERCHANT_SEMAPHORES.get(key)
+    if sem is not None:
+        return sem
+    async with _PER_MERCHANT_LOCK:
+        # Re-check inside lock to avoid double-init on a race.
+        sem = _PER_MERCHANT_SEMAPHORES.get(key)
+        if sem is not None:
+            return sem
+        raw = settings.llm_probe_per_merchant_max_concurrent
+        cap = 5 if raw is None else int(raw)
+        sem = asyncio.Semaphore(max(1, cap))
+        _PER_MERCHANT_SEMAPHORES[key] = sem
+        return sem
+
+
+def _reset_concurrency_caps_for_test() -> None:
+    """Test hook — drop semaphore state between tests so monkeypatched
+    cap settings take effect on the next probe."""
+    global _GLOBAL_SEMAPHORE
+    _GLOBAL_SEMAPHORE = None
+    _PER_MERCHANT_SEMAPHORES.clear()
+
+
 # Mirror of `PRIMARY_ISSUE_TYPE_BY_SCAN_MODE` in
 # `PIVOTA-Agent/src/internal/agentCenterLlmProbe.js`. Used by the local-mock
 # fallback so the pipeline still produces a sensible synthetic finding when
@@ -174,32 +229,43 @@ async def probe(
         "Content-Type": "application/json",
         "X-Pivota-Internal-Key": api_key,
     }
+
+    # Concurrency caps: acquire per-merchant FIRST (lower priority,
+    # so one merchant's wait doesn't block other merchants from
+    # acquiring the global slot), then global. Both are released
+    # after the HTTP call completes (incl. retries). Order matters
+    # for fairness — global last → released first → other merchants
+    # can move forward immediately after this probe finishes.
+    global_sem = _get_global_semaphore()
+    per_merchant_sem = await _get_per_merchant_semaphore(merchant_id)
     response = None
     last_exc: Optional[BaseException] = None
-    for attempt in (1, 2):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, json=body, headers=headers)
-            break
-        except _TRANSPORT_RETRY_EXCS as exc:
-            last_exc = exc
-            logger.warning(
-                "llm probe transport retry: scan_mode=%s attempt=%s/%s exc=%s(%r)",
-                scan_mode,
-                attempt,
-                2,
-                type(exc).__name__,
-                str(exc),
-            )
-            if attempt == 2:
-                break
-            await asyncio.sleep(_RETRY_BACKOFF_S)
-        except httpx.HTTPError as exc:
-            # Non-retryable httpx error (e.g. timeout, decoding) — surface
-            # immediately with the exception class named so logs aren't blank.
-            raise AgentCenterLlmClientError(
-                f"llm probe transport failed ({type(exc).__name__}): {exc!r}"
-            ) from exc
+    async with per_merchant_sem:
+        async with global_sem:
+            for attempt in (1, 2):
+                try:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        response = await client.post(url, json=body, headers=headers)
+                    break
+                except _TRANSPORT_RETRY_EXCS as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "llm probe transport retry: scan_mode=%s attempt=%s/%s exc=%s(%r)",
+                        scan_mode,
+                        attempt,
+                        2,
+                        type(exc).__name__,
+                        str(exc),
+                    )
+                    if attempt == 2:
+                        break
+                    await asyncio.sleep(_RETRY_BACKOFF_S)
+                except httpx.HTTPError as exc:
+                    # Non-retryable httpx error (e.g. timeout, decoding) — surface
+                    # immediately with the exception class named so logs aren't blank.
+                    raise AgentCenterLlmClientError(
+                        f"llm probe transport failed ({type(exc).__name__}): {exc!r}"
+                    ) from exc
     if response is None:
         # All retries exhausted on retryable transport errors.
         raise AgentCenterLlmClientError(
