@@ -707,3 +707,54 @@ async def test_infer_social_intelligence_partial_failure_surfaces_what_succeeded
     assert result["available"] is True
     assert result["own_presence"]["tiktok"] is not None
     assert result["own_presence"]["instagram"] is None
+
+
+# ---------------------------------------------------------------------------
+# PR-F: parser hardening (_coerce_to_array)
+# ---------------------------------------------------------------------------
+
+from services.bd_brand_signals import _coerce_to_array
+
+
+def test_coerce_to_array_passes_through_lists():
+    assert _coerce_to_array([{"a": 1}, {"a": 2}]) == [{"a": 1}, {"a": 2}]
+    assert _coerce_to_array([]) == []
+
+
+def test_coerce_to_array_unwraps_single_listvalued_field():
+    """Gemini sometimes wraps the array in {"creators": [...]} or
+    {"results": [...]} despite the prompt asking for a bare array."""
+    assert _coerce_to_array({"creators": [{"creator_handle": "x"}]}) == [{"creator_handle": "x"}]
+    assert _coerce_to_array({"results": [1, 2, 3]}) == [1, 2, 3]
+    assert _coerce_to_array({"data": []}) == []
+
+
+def test_coerce_to_array_wraps_single_item_object():
+    """Gemini sometimes returns one item as a bare object when the
+    prompt asked for an array — wrap it so the caller can iterate."""
+    assert _coerce_to_array({"retailer": "Sephora", "confidence": "high"}) == [
+        {"retailer": "Sephora", "confidence": "high"},
+    ]
+    assert _coerce_to_array({"creator_handle": "@x", "follower_band": "10k-100k"}) == [
+        {"creator_handle": "@x", "follower_band": "10k-100k"},
+    ]
+
+
+def test_coerce_to_array_returns_none_for_ambiguous_object():
+    """Object with multiple list fields is ambiguous — don't guess."""
+    assert _coerce_to_array({"a": [1], "b": [2]}) is None
+
+
+def test_coerce_to_array_returns_none_for_object_without_indicators():
+    """Object with no list field and no recognized item-indicator field
+    is meaningless garbage."""
+    assert _coerce_to_array({"unrelated_key": "value"}) is None
+
+
+def test_coerce_to_array_passes_through_none():
+    assert _coerce_to_array(None) is None
+
+
+def test_coerce_to_array_returns_none_for_scalar():
+    assert _coerce_to_array("a string") is None
+    assert _coerce_to_array(42) is None
