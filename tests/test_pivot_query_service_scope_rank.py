@@ -55,17 +55,30 @@ def test_canonical_search_selects_pdp_scope_for_consumers():
 
 def test_canonical_search_filters_to_live_lifecycle_stages_for_global_queries():
     """The whole point of O-5: drafts and candidates (thin content,
-    no taxonomy) must NOT surface in global recall. Pin both the
-    enum and the IS NULL grandfather so a future "tighten the gate"
-    PR is intentional, not accidental."""
+    no taxonomy) must NOT surface in global recall."""
     src = _src(pivot_query_service._fetch_canonical_search_rows)
     assert "p.pdp_lifecycle_stage IN ('validated', 'published')" in src, (
         "global recall must hard-filter on live lifecycle stages "
         "(validated|published) — see PDP_ONBOARDING_PLAYBOOK.md O-5"
     )
-    assert "p.pdp_lifecycle_stage IS NULL" in src, (
-        "the NULL grandfather must remain until O-6b backfill confirms "
-        "0 NULL rows in prod; remove only in a follow-up PR with that evidence"
+
+
+def test_canonical_search_no_longer_grandfathers_null_lifecycle_stage():
+    """Phase O-5b: after O-6b backfill confirmed 0 NULL rows in prod,
+    the original O-5 NULL grandfather (`OR pdp_lifecycle_stage IS NULL`)
+    was removed. Any NULL stage now is a bug — a row that escaped the
+    3 ingest paths' write-time compute. Pin the absence so a future
+    refactor doesn't accidentally re-introduce a fallback that masks
+    the bug by silently surfacing the row.
+
+    Asserting on the SQL form specifically (with the `p.` table alias)
+    so the post-removal comment that explains *what was removed* doesn't
+    trip the pin."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "p.pdp_lifecycle_stage IS NULL" not in src, (
+        "the NULL grandfather (SQL `p.pdp_lifecycle_stage IS NULL`) was "
+        "removed in O-5b — re-introducing it would silently mask ingest-path "
+        "bugs by surfacing un-staged rows"
     )
 
 

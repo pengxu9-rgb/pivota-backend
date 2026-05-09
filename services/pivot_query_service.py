@@ -491,18 +491,17 @@ async def _fetch_canonical_search_rows(
     # Phase O-5: hard-filter the global recall pool to live lifecycle
     # stages so draft/candidate rows (no description, no taxonomy,
     # not user-ready) don't surface in recall just because the title
-    # matched. The IS NULL clause is a grandfather for the rollout
-    # window between O-4 deploy and the O-6b backfill running — once
-    # backfill confirms 0 NULL rows in prod, the IS NULL branch can
-    # be removed in a follow-up PR. Merchant-scoped queries skip the
-    # filter: a merchant should always see their own products even
-    # while LabelAgent is still ramping their content quality.
+    # matched. Phase O-5b tightened this: the original O-5 grandfather
+    # branch (`OR pdp_lifecycle_stage IS NULL`) was removed once the
+    # O-6b backfill confirmed 0 NULL rows in prod. Any NULL stage now
+    # is a bug — a row that escaped the 3 ingest paths' write-time
+    # compute, which means we want it dropped from recall, not silently
+    # surfaced. Merchant-scoped queries still skip the filter: a
+    # merchant should always see their own products even while
+    # LabelAgent is still ramping their content quality.
     lifecycle_clause = ""
     if not merchant_id:
-        lifecycle_clause = (
-            "AND (p.pdp_lifecycle_stage IN ('validated', 'published') "
-            "OR p.pdp_lifecycle_stage IS NULL)"
-        )
+        lifecycle_clause = "AND p.pdp_lifecycle_stage IN ('validated', 'published')"
     vertical_where = ""
     vertical_score = ""
     if vertical_search:
