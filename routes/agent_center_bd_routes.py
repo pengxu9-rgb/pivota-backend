@@ -586,9 +586,14 @@ async def cold_start_audit(
     # background. Operator opts in via audit_competitors=true. Doesn't
     # block the response — returns immediately with status="cohort_queued"
     # and the operator polls /cohort/{run_id} for results.
+    #
+    # PR-2c: extract the parent's modal product_type and force it on
+    # cohort audits so they run the SAME category queries as the
+    # parent — apples-to-apples cross-brand mention matrix.
     cohort_status: Optional[Dict[str, Any]] = None
     if body.audit_competitors and run_id:
         competitor_brands = _aggregate_competitor_brands(per_product, top_n=body.cohort_size)
+        parent_category = _extract_parent_modal_product_type(per_product)
         if competitor_brands:
             import asyncio as _asyncio
             from services.competitor_audit_orchestrator import enqueue_competitor_audits
@@ -603,12 +608,14 @@ async def cold_start_audit(
                     market=body.market,
                     max_runs=body.max_runs,
                     cohort_size=body.cohort_size,
+                    category_override=parent_category,
                 ),
                 name=f"cohort-{run_id}",
             )
             cohort_status = {
                 "queued": True,
                 "competitor_brands": competitor_brands,
+                "category_override": parent_category,
                 "parent_audit_run_id": run_id,
                 "poll_url": f"/api/agent-center/bd/cohort/{run_id}",
             }
@@ -624,6 +631,36 @@ async def cold_start_audit(
         "brand_report": out,
         "cohort": cohort_status,
     }
+
+
+def _extract_parent_modal_product_type(
+    per_product: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Find the most-frequent product_type across the parent audit's
+    products. Used as the category_override for cohort competitor
+    audits (PR-2c) so they run identical category queries.
+
+    Returns None when no product has a product_type, or when the
+    per_product list is empty/malformed. None means "let each cohort
+    competitor use their own auto-inferred category" (legacy
+    behavior).
+    """
+    if not per_product:
+        return None
+    counter: Dict[str, int] = {}
+    for product_report in per_product:
+        if not isinstance(product_report, dict):
+            continue
+        product = product_report.get("product") or {}
+        pt = product.get("product_type")
+        if isinstance(pt, str) and pt.strip():
+            key = pt.strip()
+            counter[key] = counter.get(key, 0) + 1
+    if not counter:
+        return None
+    # Most frequent — ties broken by first-seen (sorted alphabetically
+    # for determinism).
+    return max(sorted(counter.items()), key=lambda kv: kv[1])[0]
 
 
 def _aggregate_competitor_brands(

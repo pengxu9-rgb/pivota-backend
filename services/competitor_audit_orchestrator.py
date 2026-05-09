@@ -152,6 +152,7 @@ async def _audit_one_competitor(
     parent_audit_run_id: str,
     market: str,
     max_runs: int,
+    category_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """End-to-end: resolve domain → discover products → run audit →
     persist competitor_audit_run row. Returns a summary dict for the
@@ -234,6 +235,27 @@ async def _audit_one_competitor(
         summary["reason"] = "discovery_zero_products"
         return summary
 
+    # PR-2c: when category_override is set (parent's modal product_type
+    # passed down from the cold-start route), force it onto every
+    # discovered product so the audit's category_visibility_test asks
+    # the SAME queries as the parent. Apples-to-apples cross-brand
+    # mention matrix.
+    #
+    # Side effect: each cohort competitor's individual visibility/
+    # attribution scores reflect "do they show up in the PARENT'S
+    # category" — not "do they show up in their OWN native category."
+    # That's the right shape for cohort comparison; surface in
+    # evidence so BD operators understand the framing.
+    category_used = None
+    if category_override and category_override.strip():
+        for p in products:
+            p["product_type"] = category_override.strip()
+        category_used = category_override.strip()
+        logger.info(
+            "competitor_orchestrator: forcing category_override=%r on %s products",
+            category_used, brand,
+        )
+
     try:
         out = await run_brand_report(
             merchant_name=discovered.get("merchant_name") or brand,
@@ -261,6 +283,13 @@ async def _audit_one_competitor(
     product_keys = [
         p.get("pdp_url") for p in products if p.get("pdp_url")
     ]
+
+    # Stash the override (or None) into the report so the comparison
+    # helper can surface "audited under: <category>" framing without
+    # a schema change.
+    if category_used is not None and isinstance(out, dict):
+        out.setdefault("_cohort_meta", {})["category_used_for_audit"] = category_used
+
     await record_competitor_run_completed(
         run_id=run_id,
         status="succeeded",
@@ -275,6 +304,7 @@ async def _audit_one_competitor(
     summary["run_id"] = run_id
     summary["visibility"] = agg.get("avg_visibility")
     summary["attribution"] = agg.get("avg_attribution")
+    summary["category_used"] = category_used
     return summary
 
 
@@ -285,6 +315,7 @@ async def enqueue_competitor_audits(
     market: str = "US",
     max_runs: int = 3,
     cohort_size: int = _DEFAULT_COHORT_SIZE,
+    category_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run cohort audits for the top-N competitor brands. Returns a
     summary dict. Designed to be awaited by a background task — the
@@ -293,6 +324,16 @@ async def enqueue_competitor_audits(
     `competitor_brands` is the ordered list from
     extract_category_competitors (most-cited first). We slice to
     cohort_size (capped at HARD_MAX_COHORT_SIZE).
+
+    PR-2c: when `category_override` is provided (the parent audit's
+    modal product_type), every cohort competitor's products get that
+    product_type forced — so each cohort audit asks the SAME category
+    queries as the parent. This produces an apples-to-apples
+    cross-brand mention matrix in the cohort comparison endpoint.
+    Without it, cohort audits run on each competitor's own
+    auto-inferred product_type (Nordic Naturals → "fish oil
+    supplements", SmartyPants → "Kids" — neither comparable to
+    Grüns' "daily gummy vitamins").
     """
     from services.agent_center_llm_client import _get_per_merchant_semaphore
 
@@ -318,6 +359,7 @@ async def enqueue_competitor_audits(
                         parent_audit_run_id=parent_audit_run_id,
                         market=market,
                         max_runs=max_runs,
+                        category_override=category_override,
                     ),
                     timeout=_PER_COMPETITOR_AUDIT_TIMEOUT_S,
                 )
@@ -344,6 +386,7 @@ async def enqueue_competitor_audits(
     return {
         "parent_audit_run_id": parent_audit_run_id,
         "cohort_size": len(cohort),
+        "category_override": category_override,
         "succeeded": succeeded,
         "failed": failed,
         "results": results,
