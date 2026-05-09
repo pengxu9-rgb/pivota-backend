@@ -365,6 +365,16 @@ class BdColdStartAuditRequest(BaseModel):
     # Lets BD operators inspect extraction quality before committing
     # to a full audit run + backfill.
     dry_run: bool = Field(False)
+    # PR-2: opt-in to background cohort audit. When True, after the
+    # parent audit completes, the orchestrator queues audits of the
+    # top-N competitor brands extracted from category_visibility_test
+    # and persists them to competitor_audit_runs linked to this
+    # parent run. Default OFF until staging load test confirms the
+    # multi-LLM-call multiplier is bounded by the per-merchant
+    # semaphore. Operator polls /api/agent-center/bd/cohort/{run_id}
+    # to read results.
+    audit_competitors: bool = Field(False)
+    cohort_size: int = Field(3, ge=1, le=5)
 
     @validator("url")
     def _url_looks_like_url(cls, v: str) -> str:
@@ -571,10 +581,99 @@ async def cold_start_audit(
         synthetic_merchant_id,
         run_id or "(persistence-skipped)",
     )
+
+    # PR-2: optionally fan out to competitor cohort audits in the
+    # background. Operator opts in via audit_competitors=true. Doesn't
+    # block the response — returns immediately with status="cohort_queued"
+    # and the operator polls /cohort/{run_id} for results.
+    cohort_status: Optional[Dict[str, Any]] = None
+    if body.audit_competitors and run_id:
+        competitor_brands = _aggregate_competitor_brands(per_product, top_n=body.cohort_size)
+        if competitor_brands:
+            import asyncio as _asyncio
+            from services.competitor_audit_orchestrator import enqueue_competitor_audits
+            # Fire-and-forget background task. asyncio.create_task is
+            # used (not BackgroundTasks) so the cohort audits keep
+            # running even if the client disconnects after getting
+            # the parent response.
+            _asyncio.create_task(
+                enqueue_competitor_audits(
+                    parent_audit_run_id=run_id,
+                    competitor_brands=competitor_brands,
+                    market=body.market,
+                    max_runs=body.max_runs,
+                    cohort_size=body.cohort_size,
+                ),
+                name=f"cohort-{run_id}",
+            )
+            cohort_status = {
+                "queued": True,
+                "competitor_brands": competitor_brands,
+                "parent_audit_run_id": run_id,
+                "poll_url": f"/api/agent-center/bd/cohort/{run_id}",
+            }
+        else:
+            cohort_status = {
+                "queued": False,
+                "reason": "no competitor brands extracted from audit",
+            }
+
     return {
         "status": "ok",
         "discovery": _build_discovery_block(discovered),
         "brand_report": out,
+        "cohort": cohort_status,
+    }
+
+
+def _aggregate_competitor_brands(
+    per_product: List[Dict[str, Any]],
+    *,
+    top_n: int = 3,
+) -> List[str]:
+    """Union competitor brands across per-product reports, ordered by
+    citation count. Returns the top-N brand names (strings) for the
+    cohort orchestrator. Defensive: tolerates missing fields, garbage
+    shapes, duplicate names with different casing.
+    """
+    counter: Dict[str, int] = {}
+    for product_report in per_product:
+        if not isinstance(product_report, dict):
+            continue
+        cv = product_report.get("category_visibility") or {}
+        brands = cv.get("competitor_brands") or []
+        if not isinstance(brands, list):
+            continue
+        for entry in brands:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            key = name.strip()
+            counter[key] = counter.get(key, 0) + int(entry.get("times_cited") or 1)
+    ordered = sorted(counter.items(), key=lambda kv: -kv[1])
+    return [name for name, _ in ordered[:top_n]]
+
+
+@router.get("/cohort/{parent_audit_run_id}")
+async def get_cohort_audit_results(
+    parent_audit_run_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Return all competitor audit runs for a parent audit. Used by
+    the BD portal cohort dashboard. Polls until the orchestrator
+    finishes (status field on each entry shifts running → succeeded
+    or failed)."""
+    from db.competitor_audit_runs import cohort_for_parent_run
+    runs = await cohort_for_parent_run(parent_audit_run_id=parent_audit_run_id)
+    completed = [r for r in runs if r.get("status") in ("succeeded", "failed")]
+    return {
+        "parent_audit_run_id": parent_audit_run_id,
+        "cohort_size": len(runs),
+        "completed_count": len(completed),
+        "still_running": len(runs) - len(completed),
+        "runs": runs,
     }
 
 
