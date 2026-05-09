@@ -10,7 +10,7 @@ NOTE (v0):
   employee portal UX while the `employee_products_index` rollups are built.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import asyncio
 import csv
 import io
@@ -1157,6 +1157,100 @@ def _normalize_tool(tool: Optional[str]) -> str:
     return t or "*"
 
 
+# Market → expected purchase currency. CSV imports historically wrote
+# whatever currency the source spreadsheet contained, even when it
+# contradicted the market (e.g., 469 KraveBeauty seeds with currency=EUR
+# under market=US). The mismatch surfaced as "$0 / EUR price for US
+# users" in chat. This map is the source of truth for the consistency
+# check; rows whose currency disagrees with the market's expected
+# currency are dropped at import (or have currency normalized).
+MARKET_EXPECTED_CURRENCY: Dict[str, str] = {
+    "US": "USD",
+    "CA": "CAD",
+    "GB": "GBP",
+    "UK": "GBP",
+    "EU": "EUR",
+    "DE": "EUR",
+    "FR": "EUR",
+    "ES": "EUR",
+    "IT": "EUR",
+    "JP": "JPY",
+    "KR": "KRW",
+    "CN": "CNY",
+    "SG": "SGD",
+    "AU": "AUD",
+    "NZ": "NZD",
+    "MX": "MXN",
+    "BR": "BRL",
+    "IN": "INR",
+    "TH": "THB",
+}
+
+
+# Domain TLDs that strongly imply a non-US storefront. If a CSV row
+# has market=US but the product_url's host ends in one of these,
+# the row is almost certainly mislabelled — silently importing it
+# yields wrong-language PDPs in US recall (12 .kr-domain seeds were
+# the trigger for adding this check).
+_NON_US_TLD_PATTERNS: Tuple[str, ...] = (
+    ".kr", ".co.kr",
+    ".jp", ".co.jp",
+    ".de", ".fr", ".es", ".it", ".eu",
+    ".cn", ".com.cn",
+    ".tw", ".com.tw",
+    ".hk", ".com.hk",
+)
+
+
+def validate_market_currency(market: Optional[str], currency: Optional[str]) -> Optional[str]:
+    """Return None if the (market, currency) pair is consistent or the
+    row should be allowed; return a short error tag if the currency
+    contradicts the market.
+
+    Permissive cases (return None):
+      - currency is null/empty (will be filled from market default downstream)
+      - market not in MARKET_EXPECTED_CURRENCY (unknown market — don't block)
+      - currency matches the expected currency for the market
+    """
+    cur_norm = str(currency or "").strip().upper()
+    if not cur_norm:
+        return None
+    market_norm = _normalize_market(market)
+    expected = MARKET_EXPECTED_CURRENCY.get(market_norm)
+    if not expected:
+        return None
+    if cur_norm == expected:
+        return None
+    return f"market_currency_mismatch_market_{market_norm}_currency_{cur_norm}"
+
+
+def validate_market_domain(market: Optional[str], product_url: Optional[str]) -> Optional[str]:
+    """Return None if the URL host is consistent with the market; return
+    a short error tag if a strongly non-US TLD appears under market=US
+    (or symmetric mismatches in the future). Conservative — only
+    blocks the obvious .kr/.jp/.de/etc. cases that have been observed
+    causing wrong-language PDPs in recall."""
+    if not product_url:
+        return None
+    market_norm = _normalize_market(market)
+    if market_norm != "US":
+        # v1: only validate US-market mismatches. Non-US markets often
+        # legitimately import from .com domains (Sephora.fr → market=FR
+        # buying from sephora.com), so the check would over-reject.
+        return None
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(str(product_url).strip()).hostname or "").lower()
+    except Exception:
+        return None
+    if not host:
+        return None
+    for tld in _NON_US_TLD_PATTERNS:
+        if host.endswith(tld):
+            return f"market_domain_mismatch_market_US_host_{host}"
+    return None
+
+
 def _require_http_url(url: str) -> str:
     u = str(url or "").strip()
     if not (u.startswith("http://") or u.startswith("https://")):
@@ -2105,6 +2199,19 @@ async def _import_external_seeds_csv_text(
                 if not external_product_id:
                     raise ValueError("MISSING_EXTERNAL_PRODUCT_ID")
 
+                # Market consistency checks. CSV imports historically wrote
+                # whatever (market, currency, url) tuple appeared in the
+                # spreadsheet, even when fields contradicted — surfacing as
+                # "$0 / EUR price for US users" + "Korean PDP in US recall"
+                # in the shopping-agent chat. Reject the row at import so
+                # bad data never reaches catalog_products.
+                cur_err = validate_market_currency(row_market, price_currency)
+                if cur_err is not None:
+                    raise ValueError(cur_err)
+                domain_err = validate_market_domain(row_market, product_url)
+                if domain_err is not None:
+                    raise ValueError(domain_err)
+
                 group_key = f"{row_market}|{row_tool}|{external_product_id}"
                 groups.setdefault(group_key, {"variants": [], "image_urls": []})
                 gm = group_meta.setdefault(
@@ -2431,6 +2538,17 @@ async def _import_external_seeds_csv_text(
                 external_product_id = str(row.get("external_product_id") or "").strip() or _stable_external_product_id(canonical_url or dest)
                 if not external_product_id:
                     raise ValueError("MISSING_EXTERNAL_PRODUCT_ID")
+
+                # Same market consistency checks as the catalog-export
+                # branch above. Reject mismatched (market, currency) and
+                # (market, domain) at import so bad data doesn't reach
+                # external_product_seeds → catalog_products → recall.
+                cur_err = validate_market_currency(row_market, price_currency)
+                if cur_err is not None:
+                    raise ValueError(cur_err)
+                domain_err = validate_market_domain(row_market, canonical_url or dest)
+                if domain_err is not None:
+                    raise ValueError(domain_err)
 
                 existing_row = None
                 if mode_norm == "upsert":
