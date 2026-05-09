@@ -29,11 +29,22 @@ Honesty rules:
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import httpx
+
 logger = logging.getLogger(__name__)
+
+# Shopify product page URL pattern: any URL whose path ends in
+# /products/{handle}. Used to gate native-JSON refetch (Shopify always
+# exposes products.json at the same path with .json appended). Other
+# storefronts use different patterns; we skip the refetch for them.
+_SHOPIFY_PRODUCT_URL_RE = re.compile(r"/products/[A-Za-z0-9_-]+/?(?:\?.*)?$")
+_SHOPIFY_REFETCH_TIMEOUT_S = 6.0
 
 
 class BrandDiscoveryError(RuntimeError):
@@ -41,6 +52,150 @@ class BrandDiscoveryError(RuntimeError):
     fallback fail to discover any products from the target URL.
     Caller should map to a 422 with diagnostic message + manual-
     entry fallback instruction."""
+
+
+async def _fetch_shopify_native(pdp_url: str) -> Optional[Dict[str, Any]]:
+    """Fetch {pdp_url}.json from a Shopify storefront. Returns the
+    `product` dict (vendor/product_type/tags/etc.) or None on any
+    failure. Best-effort enrichment — the audit pipeline still works
+    when this returns None.
+
+    Shopify exposes a public JSON shape at every PDP URL when you
+    append .json: GET https://store.com/products/foo.json →
+    {product: {vendor: ..., product_type: ..., tags: ...}}. No auth
+    needed. Cheap (~200-500ms typical).
+    """
+    if not pdp_url or not _SHOPIFY_PRODUCT_URL_RE.search(pdp_url):
+        return None
+    url = pdp_url.split("?", 1)[0].rstrip("/") + ".json"
+    try:
+        async with httpx.AsyncClient(
+            timeout=_SHOPIFY_REFETCH_TIMEOUT_S,
+            follow_redirects=True,
+        ) as client:
+            r = await client.get(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Pivota-BD-Audit/1.0",
+                },
+            )
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        logger.debug("shopify native refetch error for %s: %s", url, exc)
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        payload = r.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    product = payload.get("product")
+    return product if isinstance(product, dict) else None
+
+
+async def _enrich_audit_products(
+    products: List[Dict[str, Any]],
+    *,
+    merchant_name: str,
+    domain: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Fill in missing vendor + product_type on the audit-bound subset.
+
+    Strategy stack (tried in order, per product):
+      1. If source already has vendor/product_type (future-proof for
+         when catalog-intelligence starts exposing them), keep them.
+      2. Shopify-native .json refetch — works for any /products/{handle}
+         URL; Shopify always populates `vendor`, sometimes populates
+         `product_type`. Fast, parallel, no auth.
+      3. Vendor fallback to discovered merchant_name (we always have
+         this from the discovery step).
+      4. product_type fallback via brand-level Gemini inference (single
+         call applied to every product lacking a real product_type).
+         See services/bd_brand_category_inferrer.py.
+
+    Returns (enriched_products, diagnostics) where diagnostics records
+    which strategies fired so BD operators can debug from the response
+    without reading logs.
+    """
+    if not products:
+        return products, {"enriched": False, "reason": "no_products"}
+
+    # Step 1+2: parallel Shopify refetch for all products lacking
+    # vendor or product_type. Source-provided values take precedence
+    # over refetch (the refetch is only a fallback).
+    refetch_targets = [
+        i for i, p in enumerate(products)
+        if not (p.get("vendor") and p.get("product_type"))
+    ]
+    refetch_count = 0
+    if refetch_targets:
+        urls = [products[i].get("pdp_url") or "" for i in refetch_targets]
+        results = await asyncio.gather(
+            *[_fetch_shopify_native(u) for u in urls],
+            return_exceptions=True,
+        )
+        for idx, result in zip(refetch_targets, results):
+            if isinstance(result, Exception) or not isinstance(result, dict):
+                continue
+            p = products[idx]
+            native_vendor = (result.get("vendor") or "").strip() or None
+            native_type = (result.get("product_type") or "").strip() or None
+            if not p.get("vendor") and native_vendor:
+                p["vendor"] = native_vendor
+            if not p.get("product_type") and native_type:
+                p["product_type"] = native_type
+            if native_vendor or native_type:
+                refetch_count += 1
+
+    # Step 3: vendor fallback to discovered brand name. By definition
+    # every product on this domain belongs to this brand — vendor=None
+    # is never the right shape.
+    vendor_fallback_count = 0
+    for p in products:
+        if not p.get("vendor") and merchant_name:
+            p["vendor"] = merchant_name
+            vendor_fallback_count += 1
+
+    # Step 4: brand-level category inference. Only fires when at least
+    # one product still lacks product_type after the prior strategies.
+    # Single Gemini call for the whole audit, applied to all products
+    # missing a real product_type.
+    inferred_category: Optional[str] = None
+    products_missing_type = [p for p in products if not p.get("product_type")]
+    if products_missing_type:
+        from services.bd_brand_category_inferrer import infer_brand_category
+        sample_titles = [
+            (p.get("title") or "").strip()
+            for p in products[:6]
+            if p.get("title")
+        ]
+        try:
+            inferred_category = await infer_brand_category(
+                merchant_name,
+                sample_titles,
+                domain=domain,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "bd_cold_start: brand-category inference raised for %r: %s",
+                merchant_name, exc,
+            )
+            inferred_category = None
+        if inferred_category:
+            for p in products_missing_type:
+                p["product_type"] = inferred_category
+
+    diagnostics = {
+        "enriched": True,
+        "shopify_refetch_hits": refetch_count,
+        "vendor_fallback_applied": vendor_fallback_count,
+        "brand_category_inferred": inferred_category,
+        "products_with_vendor": sum(1 for p in products if p.get("vendor")),
+        "products_with_product_type": sum(1 for p in products if p.get("product_type")),
+    }
+    return products, diagnostics
 
 
 def _coverage_stats(raw_products: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -234,6 +389,18 @@ async def discover_products_for_audit(
     # whole point of using catalog-intelligence's wider crawl.
     audit_products = products[:max_products]
 
+    # Enrich the audit-bound subset with vendor + product_type. Without
+    # this, the category_visibility_test gets skipped (bd_report_service
+    # gates on product_type) and templates 9/10/category-mode collapse
+    # for lack of vendor. Three-strategy stack: Shopify-native refetch,
+    # merchant_name vendor fallback, brand-level Gemini category
+    # inference. See _enrich_audit_products for details.
+    audit_products, enrichment_diagnostics = await _enrich_audit_products(
+        audit_products,
+        merchant_name=merchant_name,
+        domain=domain,
+    )
+
     # Step 4: backfill to prospect_products. Best-effort. Skipped
     # entirely when persist=False (dry-run mode — see catalog-extract-
     # audit codex skill's "preflight before any seed writes" pattern).
@@ -271,4 +438,8 @@ async def discover_products_for_audit(
         # catalog-extract-audit skill emits. None when fallback path
         # used (raw_extracted not populated for fallback products).
         "coverage": _coverage_stats(products) if discovery_method == "catalog_intelligence" else None,
+        # Vendor + product_type backfill diagnostics. Surfaces which
+        # strategies fired so BD operators can verify category test
+        # ran on real categorical data (not mock/inferred fallback).
+        "enrichment": enrichment_diagnostics,
     }

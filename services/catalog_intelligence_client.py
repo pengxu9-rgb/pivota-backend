@@ -207,7 +207,14 @@ def _normalize_products(raw: List[Any]) -> List[Dict[str, Any]]:
     """Project the catalog-intelligence ExtractedProduct shape down
     to the {title, pdp_url, vendor, product_type, raw_extracted}
     shape the audit pipeline + prospect_products table expect.
-    Skips entries missing url or title — never synthesizes."""
+    Skips entries missing url or title — never synthesizes.
+
+    `vendor` and `product_type` are read from the source payload when
+    present (forward-compatible for when catalog-intelligence's
+    ExtractedProduct type adds them — currently always None). When
+    absent, downstream enrichment in services/bd_cold_start_service.py
+    fills them via Shopify-native refetch + brand-level inference.
+    """
     out: List[Dict[str, Any]] = []
     for item in raw or []:
         if not isinstance(item, dict):
@@ -216,11 +223,18 @@ def _normalize_products(raw: List[Any]) -> List[Dict[str, Any]]:
         title = (item.get("title") or "").strip()
         if not url or not title:
             continue
+        # Accept either snake_case (Python convention) or camelCase
+        # (TypeScript convention) — catalog-intelligence is a Node
+        # service so its eventual field names may be either.
+        vendor_raw = item.get("vendor") or item.get("brand") or None
+        type_raw = item.get("product_type") or item.get("productType") or None
+        vendor = (vendor_raw or "").strip() or None if isinstance(vendor_raw, str) else None
+        product_type = (type_raw or "").strip() or None if isinstance(type_raw, str) else None
         out.append({
             "title": title,
             "pdp_url": url,
-            "vendor": None,
-            "product_type": None,
+            "vendor": vendor,
+            "product_type": product_type,
             "raw_extracted": item,
         })
     return out
