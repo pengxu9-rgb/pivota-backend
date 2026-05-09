@@ -2925,7 +2925,15 @@ def _build_merchant_view(
     # is "Complete Pivota integration" — prepended ahead of all
     # strategic + playbook actions. When fully integrated, no
     # integration action is emitted; existing actions take over.
-    if integration_state is not None:
+    #
+    # Cold-start exception (BD employee portal): for cold targets
+    # the BD operator isn't going to onboard the merchant from this
+    # dashboard — the integration pitch belongs in pivota_value_prop
+    # (rendered as a separate "How Pivota addresses these gaps"
+    # panel), NOT as the #1 diagnostic action. Skip the prepend so
+    # the action ladder stays purely diagnostic. The pitch content
+    # is unchanged in pivota_value_prop further below.
+    if integration_state is not None and not _is_cold_start_audit(integration_state):
         from services.merchant_integration_state import build_integration_action
         integration_action = build_integration_action(integration_state)
         if integration_action is not None:
@@ -3911,3 +3919,91 @@ def _md_competitor_brand_table(brands: List[Dict[str, Any]], top_n: int = 10) ->
     for entry in brands[:top_n]:
         out.append(f"| {entry['name']} | {entry['times_cited']} |")
     return "\n".join(out)
+
+
+def render_brand_markdown(
+    brand_report: Dict[str, Any],
+    *,
+    discovery: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render a multi-product brand audit into one downloadable markdown
+    document. Wraps render_markdown_from_structured for each per-product
+    report and prepends a brand-level header (merchant name, domain,
+    discovery method, aggregate verdict, products audited count).
+
+    Used by the cold-start export endpoint so BD operators can download
+    the full audit as a single .md file (and from there to PDF via any
+    markdown processor).
+    """
+    sections: List[str] = []
+    merchant_name = brand_report.get("merchant_name") or "Unknown brand"
+    merchant_domain = brand_report.get("merchant_domain") or ""
+    timestamp = brand_report.get("timestamp") or ""
+    aggregate = brand_report.get("aggregate") or {}
+    per_product = brand_report.get("per_product") or []
+
+    sections.append(f"# AI Commerce Readiness Report — {merchant_name}\n")
+    if merchant_domain:
+        sections.append(f"_Domain: `{merchant_domain}`_\n")
+    if timestamp:
+        sections.append(f"_Generated: {timestamp}_\n")
+
+    if discovery:
+        method = discovery.get("discovery_method") or "?"
+        platform = discovery.get("platform") or "?"
+        total = discovery.get("products_discovered_total") or 0
+        audited = len(per_product)
+        sections.append(
+            f"_Discovery: {method} (platform: {platform}) · "
+            f"{audited} of {total} products audited._\n"
+        )
+        enrichment = discovery.get("enrichment") or {}
+        if enrichment.get("brand_category_inferred"):
+            sections.append(
+                f"_Brand category (inferred): "
+                f"**{enrichment['brand_category_inferred']}**._\n"
+            )
+
+    if aggregate:
+        sections.append("\n## Brand-level summary\n")
+        verdict_label = aggregate.get("brand_verdict_label") or "(unknown)"
+        sections.append(f"**Aggregate verdict:** {verdict_label}\n")
+        if aggregate.get("brand_verdict_explanation"):
+            sections.append(aggregate["brand_verdict_explanation"] + "\n")
+        cat_score = aggregate.get("avg_category_visibility")
+        cat_line = (
+            f"**{cat_score}/100**" if cat_score is not None else "_(not measured)_"
+        )
+        sections.append(
+            f"- Average AI visibility: **{aggregate.get('avg_visibility', 0)}/100**\n"
+            f"- Average direct attribution: **{aggregate.get('avg_attribution', 0)}/100**\n"
+            f"- Average category discoverability: {cat_line}\n"
+            f"- Products audited: {aggregate.get('products_count', len(per_product))}\n"
+        )
+
+    cross = brand_report.get("cross_product_competitors") or []
+    if cross:
+        sections.append("\n## Hosts capturing this brand's AI traffic\n")
+        rows = ["| Host | Times cited across products |", "|---|---|"]
+        for entry in cross[:15]:
+            rows.append(
+                f"| `{entry.get('host', '?')}` | {entry.get('times_cited', 0)} |"
+            )
+        sections.append("\n".join(rows) + "\n")
+
+    failed = brand_report.get("failed") or []
+    if failed:
+        sections.append("\n## Products that failed to audit\n")
+        for f in failed:
+            sections.append(
+                f"- `{f.get('product_title', '?')}` — {f.get('reason', 'unknown error')}\n"
+            )
+
+    sections.append("\n---\n")
+    sections.append("\n## Per-product detail\n")
+
+    for idx, product_report in enumerate(per_product, start=1):
+        sections.append(f"\n---\n\n### Product {idx} of {len(per_product)}\n")
+        sections.append(render_markdown_from_structured(product_report))
+
+    return "\n".join(sections)
