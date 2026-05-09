@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -41,6 +42,12 @@ logger = logging.getLogger(__name__)
 
 _SITEMAP_FETCH_TIMEOUT_S = 8.0
 _SITEMAP_MAX_BYTES = 5_000_000  # 5 MB — most sitemaps are <1 MB
+
+# Gemini grounded API — same shape used by gemini_url_validator.py +
+# bd_brand_category_inferrer.py. No new SDK dep.
+_GEMINI_MODEL = "gemini-2.5-flash"
+_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+_GEMINI_TIMEOUT_S = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -671,4 +678,273 @@ async def collect_brand_signals(
         "sitemap_structure": sitemap_structure,
         "robots": robots,
         "seo_signals": seo_signals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PR-C: Gemini-backed brand context (retail / founder / press)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_gemini_api_key() -> Optional[str]:
+    for var in ("GEMINI_API_KEY", "PIVOTA_GEMINI_API_KEY"):
+        value = os.environ.get(var)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _parse_gemini_text(payload: Dict[str, Any]) -> Optional[str]:
+    """Extract concatenated text from Gemini response. Mirrors the
+    pattern used in gemini_url_validator.py."""
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return None
+    parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+    chunks: List[str] = []
+    for p in parts:
+        t = p.get("text")
+        if isinstance(t, str) and t.strip():
+            chunks.append(t)
+    return "\n".join(chunks).strip() or None
+
+
+def _unwrap_json(text: Optional[str]) -> Optional[Any]:
+    """Try to parse JSON from a Gemini response. Strips ``` fences and
+    falls back to extracting the first balanced { or [ block."""
+    if not text:
+        return None
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```\s*$", "", s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        # Pick whichever opener appears first — otherwise we'd grab the
+        # object nested inside an array and lose the array wrapper.
+        i_obj = s.find("{")
+        i_arr = s.find("[")
+        candidates: List[Tuple[int, str, str]] = []
+        if i_obj >= 0:
+            candidates.append((i_obj, "{", "}"))
+        if i_arr >= 0:
+            candidates.append((i_arr, "[", "]"))
+        candidates.sort()
+        for i, opener, closer in candidates:
+            depth = 0
+            for j in range(i, len(s)):
+                if s[j] == opener:
+                    depth += 1
+                elif s[j] == closer:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(s[i:j + 1])
+                        except json.JSONDecodeError:
+                            break
+        return None
+
+
+async def _gemini_grounded_call(prompt: str, *, api_key: str) -> Optional[Dict[str, Any]]:
+    """One grounded call. Returns parsed payload or None on any failure."""
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+        "tools": [{"google_search": {}}],
+    }
+    url = f"{_GEMINI_BASE_URL}/models/{_GEMINI_MODEL}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    try:
+        async with httpx.AsyncClient(timeout=_GEMINI_TIMEOUT_S) as client:
+            r = await client.post(url, headers=headers, json=body)
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        logger.warning("brand_context: HTTP error: %s", exc)
+        return None
+    if r.status_code != 200:
+        logger.warning("brand_context: non-200 %s body=%s", r.status_code, r.text[:300])
+        return None
+    try:
+        return r.json()
+    except json.JSONDecodeError:
+        return None
+
+
+def _build_retail_prompt(brand: str, domain: str) -> str:
+    return f"""You are a retail-distribution analyst. List the top 8 online retailers (department stores, marketplaces, beauty/category specialists) that currently sell products from {brand} ({domain}).
+
+For each retailer give:
+- retailer: the retailer name (e.g. "Sephora", "Amazon", "Target")
+- url: the brand's landing or product page on that retailer site, if you can identify it
+- confidence: "high" (you've seen the brand cited there in grounded results), "medium" (you're inferring from category fit), or "low"
+
+Reply with ONLY a JSON array. No prose, no preamble:
+
+[
+  {{"retailer": "...", "url": "...", "confidence": "high|medium|low"}},
+  ...
+]
+
+If you can't identify any retail presence, reply with: []"""
+
+
+def _build_founder_prompt(brand: str, domain: str) -> str:
+    return f"""You are a brand-research analyst. Find founder + founding context for {brand} ({domain}).
+
+Reply with ONLY a JSON object. No prose:
+
+{{
+  "founders": ["Name 1", "Name 2"],   // founder names; empty array if unknown
+  "founding_year": 2018,              // integer; null if unknown
+  "origin_story": "One-to-two sentence origin: what gap they saw, who started it, why."
+}}
+
+If you can't find verified information, return {{"founders": [], "founding_year": null, "origin_story": null}}."""
+
+
+def _build_press_prompt(brand: str, domain: str) -> str:
+    return f"""You are a media-monitoring analyst. List up to 6 press articles, editorial features, or notable mentions of {brand} ({domain}) from the last 12 months.
+
+For each:
+- publication: name (e.g. "NYMag Strategist", "Forbes Vetted")
+- headline: article headline
+- url: article URL
+- date: publication date (ISO format YYYY-MM-DD if known, else year)
+
+Reply with ONLY a JSON array. No prose:
+
+[
+  {{"publication": "...", "headline": "...", "url": "...", "date": "YYYY-MM-DD"}},
+  ...
+]
+
+If no recent coverage found, reply with []"""
+
+
+async def _infer_retail_presence(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
+    payload = await _gemini_grounded_call(_build_retail_prompt(brand, domain), api_key=api_key)
+    if not payload:
+        return None
+    parsed = _unwrap_json(_parse_gemini_text(payload))
+    if not isinstance(parsed, list):
+        return None
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        retailer = item.get("retailer")
+        if not isinstance(retailer, str) or not retailer.strip():
+            continue
+        confidence = item.get("confidence")
+        if confidence not in ("high", "medium", "low"):
+            confidence = "medium"
+        out.append({
+            "retailer": retailer.strip(),
+            "url": item.get("url") if isinstance(item.get("url"), str) else None,
+            "confidence": confidence,
+        })
+    return out
+
+
+async def _infer_founder_story(brand: str, domain: str, api_key: str) -> Optional[Dict[str, Any]]:
+    payload = await _gemini_grounded_call(_build_founder_prompt(brand, domain), api_key=api_key)
+    if not payload:
+        return None
+    parsed = _unwrap_json(_parse_gemini_text(payload))
+    if not isinstance(parsed, dict):
+        return None
+    founders_raw = parsed.get("founders")
+    founders = (
+        [f for f in founders_raw if isinstance(f, str) and f.strip()]
+        if isinstance(founders_raw, list) else []
+    )
+    year = parsed.get("founding_year")
+    if not isinstance(year, int):
+        year = None
+    origin = parsed.get("origin_story")
+    if not isinstance(origin, str) or not origin.strip():
+        origin = None
+    if not founders and not year and not origin:
+        return None
+    return {
+        "founders": founders,
+        "founding_year": year,
+        "origin_story": origin,
+    }
+
+
+async def _infer_press_coverage(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
+    payload = await _gemini_grounded_call(_build_press_prompt(brand, domain), api_key=api_key)
+    if not payload:
+        return None
+    parsed = _unwrap_json(_parse_gemini_text(payload))
+    if not isinstance(parsed, list):
+        return None
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        pub = item.get("publication")
+        head = item.get("headline")
+        if not (isinstance(pub, str) and pub.strip() and isinstance(head, str) and head.strip()):
+            continue
+        out.append({
+            "publication": pub.strip(),
+            "headline": head.strip(),
+            "url": item.get("url") if isinstance(item.get("url"), str) else None,
+            "date": item.get("date") if isinstance(item.get("date"), str) else None,
+        })
+    return out
+
+
+async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
+    """Three Gemini grounded queries in parallel — retail presence,
+    founder story, press coverage. Each fails gracefully (None /
+    empty) so the caller can render "data not available" instead of
+    fabricating.
+
+    Returns:
+      {
+        "retail_presence": [{retailer, url, confidence}, ...] | null,
+        "founder_story": {founders, founding_year, origin_story} | null,
+        "press_coverage": [{publication, headline, url, date}, ...] | null,
+        "available": bool,  # at least one query succeeded
+      }
+    """
+    api_key = _resolve_gemini_api_key()
+    if not api_key:
+        logger.info("brand_context: no GEMINI_API_KEY; skipping inference for %s", brand)
+        return {
+            "retail_presence": None,
+            "founder_story": None,
+            "press_coverage": None,
+            "available": False,
+        }
+
+    if not brand or not brand.strip() or not domain or not domain.strip():
+        return {
+            "retail_presence": None,
+            "founder_story": None,
+            "press_coverage": None,
+            "available": False,
+        }
+
+    results = await asyncio.gather(
+        _infer_retail_presence(brand, domain, api_key),
+        _infer_founder_story(brand, domain, api_key),
+        _infer_press_coverage(brand, domain, api_key),
+        return_exceptions=True,
+    )
+
+    def _safe(r: Any) -> Any:
+        return r if not isinstance(r, Exception) else None
+
+    retail = _safe(results[0])
+    founder = _safe(results[1])
+    press = _safe(results[2])
+
+    return {
+        "retail_presence": retail,
+        "founder_story": founder,
+        "press_coverage": press,
+        "available": any(x is not None for x in (retail, founder, press)),
     }

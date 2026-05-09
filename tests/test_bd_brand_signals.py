@@ -426,3 +426,119 @@ def test_seo_score_blocks_all_crawlers_flagged():
     robots = {"present": True, "sitemaps_declared": [], "blocks_all_crawlers": True}
     s = _score_seo_completeness(og, jsonld_count=0, robots=robots, sitemap_url_count=0)
     assert "not_blocking_all_crawlers" in s["missing_signals"]
+
+
+# ---------------------------------------------------------------------------
+# PR-C: Gemini-backed brand context (retail / founder / press)
+# ---------------------------------------------------------------------------
+
+import pytest
+from unittest.mock import AsyncMock, patch
+
+from services.bd_brand_signals import (
+    _build_founder_prompt,
+    _build_press_prompt,
+    _build_retail_prompt,
+    _parse_gemini_text,
+    _unwrap_json,
+    infer_brand_context,
+)
+
+
+def test_unwrap_json_strips_fence():
+    assert _unwrap_json("```json\n{\"a\": 1}\n```") == {"a": 1}
+    assert _unwrap_json("```\n[1, 2]\n```") == [1, 2]
+
+
+def test_unwrap_json_finds_first_balanced_object():
+    s = 'Here is the JSON:\n{"founders": ["Alice"], "year": 2020}\nThanks!'
+    assert _unwrap_json(s) == {"founders": ["Alice"], "year": 2020}
+
+
+def test_unwrap_json_finds_first_balanced_array():
+    s = 'Result:\n[{"r": "Sephora"}, {"r": "Ulta"}]\n— end'
+    assert _unwrap_json(s) == [{"r": "Sephora"}, {"r": "Ulta"}]
+
+
+def test_unwrap_json_returns_none_on_garbage():
+    assert _unwrap_json("not json at all") is None
+    assert _unwrap_json("") is None
+    assert _unwrap_json(None) is None
+
+
+def test_parse_gemini_text_extracts_text_parts():
+    payload = {
+        "candidates": [{
+            "content": {"parts": [{"text": "first chunk"}, {"text": "second"}]},
+        }],
+    }
+    assert _parse_gemini_text(payload) == "first chunk\nsecond"
+
+
+def test_parse_gemini_text_handles_empty_response():
+    assert _parse_gemini_text({"candidates": []}) is None
+    assert _parse_gemini_text({}) is None
+
+
+def test_retail_prompt_mentions_brand_and_domain():
+    p = _build_retail_prompt("Grüns", "gruns.co")
+    assert "Grüns" in p
+    assert "gruns.co" in p
+    assert "JSON array" in p
+
+
+def test_founder_prompt_requests_origin_story():
+    p = _build_founder_prompt("Acme", "acme.co")
+    assert "Acme" in p
+    assert "founders" in p
+    assert "founding_year" in p
+    assert "origin_story" in p
+
+
+def test_press_prompt_requests_12_month_window():
+    p = _build_press_prompt("Acme", "acme.co")
+    assert "12 months" in p
+    assert "publication" in p
+
+
+@pytest.mark.asyncio
+async def test_infer_brand_context_no_api_key_returns_unavailable(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("PIVOTA_GEMINI_API_KEY", raising=False)
+    result = await infer_brand_context("Grüns", "gruns.co")
+    assert result["available"] is False
+    assert result["retail_presence"] is None
+    assert result["founder_story"] is None
+    assert result["press_coverage"] is None
+
+
+@pytest.mark.asyncio
+async def test_infer_brand_context_empty_brand_returns_unavailable(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    result = await infer_brand_context("", "gruns.co")
+    assert result["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_infer_brand_context_partial_failure_surfaces_what_succeeded(monkeypatch):
+    """If 1 of 3 Gemini calls returns null, the other 2 should still
+    surface — graceful partial failure."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    async def fake_retail(*args, **kwargs):
+        return [{"retailer": "Amazon", "url": "https://amazon.com/x", "confidence": "high"}]
+
+    async def fake_founder(*args, **kwargs):
+        return None  # this one fails
+
+    async def fake_press(*args, **kwargs):
+        return [{"publication": "NYMag", "headline": "X", "url": None, "date": None}]
+
+    with patch("services.bd_brand_signals._infer_retail_presence", new=AsyncMock(side_effect=fake_retail)), \
+         patch("services.bd_brand_signals._infer_founder_story", new=AsyncMock(side_effect=fake_founder)), \
+         patch("services.bd_brand_signals._infer_press_coverage", new=AsyncMock(side_effect=fake_press)):
+        result = await infer_brand_context("Grüns", "gruns.co")
+    assert result["available"] is True
+    assert result["retail_presence"] == [{"retailer": "Amazon", "url": "https://amazon.com/x", "confidence": "high"}]
+    assert result["founder_story"] is None
+    assert len(result["press_coverage"]) == 1

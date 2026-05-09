@@ -318,17 +318,38 @@ async def discover_products_for_audit(
     # PR-B: brand signals — Open Graph, Schema.org, social handles,
     # sitemap structure, robots, SEO completeness. Pure parsing on the
     # already-fetched homepage HTML; sitemap + robots fetched in
-    # parallel inside collect_brand_signals. Best-effort: errors are
-    # swallowed and we set brand_signals=None so the audit still runs.
-    from services.bd_brand_signals import collect_brand_signals
+    # parallel inside collect_brand_signals.
+    # PR-C: brand context — Gemini grounded queries for retail
+    # presence, founder story, press coverage. 3 parallel calls,
+    # ~20s each (so ~20s total with parallelism). Falls back to
+    # None when GEMINI_API_KEY unset or all calls fail.
+    # Both run in parallel with each other to minimize wall-time.
+    from services.bd_brand_signals import collect_brand_signals, infer_brand_context
     brand_signals: Optional[Dict[str, Any]] = None
+    brand_context: Optional[Dict[str, Any]] = None
     try:
-        brand_signals = await collect_brand_signals(
-            homepage_html, domain, base,
+        brand_signals_task = collect_brand_signals(homepage_html, domain, base)
+        brand_context_task = infer_brand_context(merchant_name, domain)
+        brand_signals_res, brand_context_res = await asyncio.gather(
+            brand_signals_task, brand_context_task, return_exceptions=True,
         )
+        if not isinstance(brand_signals_res, Exception):
+            brand_signals = brand_signals_res
+        else:
+            logger.warning(
+                "bd_cold_start: brand_signals collection failed for %s: %s",
+                domain, brand_signals_res,
+            )
+        if not isinstance(brand_context_res, Exception):
+            brand_context = brand_context_res
+        else:
+            logger.warning(
+                "bd_cold_start: brand_context inference failed for %s: %s",
+                domain, brand_context_res,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "bd_cold_start: brand_signals collection failed for %s: %s",
+            "bd_cold_start: brand intelligence gather failed for %s: %s",
             domain, exc,
         )
 
@@ -464,4 +485,9 @@ async def discover_products_for_audit(
         # directives, SEO completeness score). None when extraction
         # raised — audit still runs without it.
         "brand_signals": brand_signals,
+        # PR-C Gemini-grounded brand context: retail_presence,
+        # founder_story, press_coverage. None when GEMINI_API_KEY
+        # unset OR all 3 calls failed. Each sub-field independently
+        # nullable (one call can succeed while others fail).
+        "brand_context": brand_context,
     }
