@@ -47,6 +47,40 @@ def test_html_entity_decode_handles_nbsp_and_amp() -> None:
     assert "BIS-DIGLYCERYL POLYACYLADIPATE-2 & SQUALANE" == out
 
 
+def test_html_entity_decode_handles_double_encoded_amp() -> None:
+    """Real prod regression 2026-05-09: Glow Recipe Plum Plump
+    description came in as 'Hydrate, plump &amp;amp; balance' — a
+    double-encoded `&`. A single html.unescape call only peels one
+    layer ('&amp;amp;' → '&amp;'), leaving stale entities behind.
+    The auditor previously reported the row as 'fixed' but the
+    persisted value still had `&amp;`. Recursive decode handles this."""
+    raw = "Hydrate, plump &amp;amp; balance"
+    out = html_entity_decode(raw)
+    assert out == "Hydrate, plump & balance"
+    assert "&amp;" not in out
+
+
+def test_html_entity_decode_handles_triple_encoded_apostrophe() -> None:
+    """Defensive — some pipelines triple-encode. The recursive decoder
+    must reach the fully-unescaped form."""
+    raw = "It&amp;amp;rsquo;s nice"  # &amp; → & + amp; → &rsquo; → ’
+    out = html_entity_decode(raw)
+    assert out == "It’s nice"
+
+
+def test_html_entity_decode_caps_iterations_at_5() -> None:
+    """Defensive cap: even pathological inputs that keep self-decoding
+    must terminate. 5 iterations covers all known multi-encode levels."""
+    # `&amp;` → `&` is one iteration. Constructing 6+ levels:
+    raw = "&amp;amp;amp;amp;amp;amp;amp; something"  # 7 levels deep
+    out = html_entity_decode(raw)
+    # After 5 iterations of decoding, some `&amp;` remain — that's OK,
+    # the function still returns a result and doesn't loop forever.
+    assert isinstance(out, str)
+    # And it made progress (less amp; than input)
+    assert out.count("amp;") < raw.count("amp;")
+
+
 def test_html_entity_decode_passes_through_clean_text() -> None:
     """Text without entities is returned unchanged."""
     assert html_entity_decode("clean description") == "clean description"
