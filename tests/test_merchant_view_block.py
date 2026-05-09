@@ -17,6 +17,7 @@ These tests assert:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 
@@ -432,3 +433,166 @@ def test_render_brand_markdown_includes_brand_header_and_per_product_sections():
     # Both products embedded
     assert "Product 1 of 2" in md
     assert "Product 2 of 2" in md
+
+
+# ---------------------------------------------------------------------------
+# PR-1a: trend deltas (_build_history_trend) + prospect_merchant_id
+# ---------------------------------------------------------------------------
+
+from services.agent_center_bd_report_service import (
+    _build_history_trend,
+    _days_between,
+)
+
+
+def test_build_history_trend_returns_none_when_no_prior_runs():
+    assert _build_history_trend([]) is None
+    assert _build_history_trend(None) is None
+
+
+def test_build_history_trend_skips_running_and_failed_runs():
+    """Trend baseline is most-recent SUCCEEDED — running/failed runs
+    don't have valid scores."""
+    runs = [
+        {"status": "running", "visibility_score_avg": None},
+        {"status": "failed", "visibility_score_avg": None},
+    ]
+    assert _build_history_trend(runs) is None
+
+
+def test_build_history_trend_returns_baseline_without_current_scores():
+    """When current_scores not provided (legacy callers), returns
+    most-recent + sparkline series but no delta."""
+    runs = [
+        {
+            "status": "succeeded",
+            "run_id": "run-1",
+            "requested_at": "2026-04-09T10:00:00+00:00",
+            "visibility_score_avg": 50,
+            "attribution_score_avg": 30,
+            "category_visibility_score_avg": 20,
+            "verdict_labels": ["PARTIAL"],
+        },
+    ]
+    out = _build_history_trend(runs)
+    assert out is not None
+    assert out["audits_in_history"] == 1
+    assert out["most_recent_audit"]["visibility"] == 50
+    assert out["delta_from_most_recent"] is None
+    assert len(out["series"]) == 1
+
+
+def test_build_history_trend_computes_delta_when_current_scores_given():
+    """The headline value of PR-1a — '+15 visibility, -5 attribution
+    over 14 days'."""
+    runs = [
+        {
+            "status": "succeeded",
+            "run_id": "run-1",
+            # 14 days ago at audit time
+            "requested_at": (
+                datetime.now(timezone.utc).replace(microsecond=0)
+                - timedelta(days=14)
+            ).isoformat(),
+            "visibility_score_avg": 50,
+            "attribution_score_avg": 30,
+            "category_visibility_score_avg": 20,
+            "verdict_labels": ["PARTIAL"],
+        },
+    ]
+    out = _build_history_trend(
+        runs,
+        current_scores={"visibility": 65, "attribution": 25, "category_visibility": 30},
+    )
+    assert out is not None
+    delta = out["delta_from_most_recent"]
+    assert delta["visibility"] == 15  # 65 - 50
+    assert delta["attribution"] == -5  # 25 - 30
+    assert delta["category_visibility"] == 10  # 30 - 20
+    assert delta["days_since_last_audit"] == 14
+
+
+def test_build_history_trend_delta_handles_missing_current_score():
+    """category_visibility delta is null when the current audit didn't
+    measure it (product_type missing → mode skipped)."""
+    runs = [{
+        "status": "succeeded",
+        "run_id": "r",
+        "requested_at": "2026-04-01T00:00:00+00:00",
+        "visibility_score_avg": 50,
+        "attribution_score_avg": 30,
+        "category_visibility_score_avg": 20,
+    }]
+    out = _build_history_trend(
+        runs,
+        current_scores={"visibility": 60, "attribution": 35, "category_visibility": None},
+    )
+    delta = out["delta_from_most_recent"]
+    assert delta["visibility"] == 10
+    assert delta["attribution"] == 5
+    assert delta["category_visibility"] is None
+
+
+def test_build_history_trend_orders_series_oldest_to_newest():
+    """Sparkline rendering wants oldest → newest. The accessor returns
+    newest-first, so we reverse."""
+    runs = [
+        {"status": "succeeded", "run_id": "r3", "requested_at": "2026-04-09T00:00:00+00:00",
+         "visibility_score_avg": 70, "attribution_score_avg": 40, "category_visibility_score_avg": 30},
+        {"status": "succeeded", "run_id": "r2", "requested_at": "2026-04-02T00:00:00+00:00",
+         "visibility_score_avg": 60, "attribution_score_avg": 35, "category_visibility_score_avg": 25},
+        {"status": "succeeded", "run_id": "r1", "requested_at": "2026-03-26T00:00:00+00:00",
+         "visibility_score_avg": 50, "attribution_score_avg": 30, "category_visibility_score_avg": 20},
+    ]
+    out = _build_history_trend(runs)
+    series = out["series"]
+    assert [p["visibility"] for p in series] == [50, 60, 70]
+
+
+def test_days_between_handles_iso_with_z_suffix():
+    """recent_runs_for_merchant returns ISO with +00:00; older entries
+    might use Z. Both should parse."""
+    iso = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+    assert _days_between(iso) == 7
+
+
+def test_days_between_returns_none_for_garbage():
+    assert _days_between(None) is None
+    assert _days_between("") is None
+    assert _days_between("not a date") is None
+
+
+# ---------------------------------------------------------------------------
+# PR-1a: synthetic prospect_merchant_id helper (in routes/agent_center_bd_routes)
+# ---------------------------------------------------------------------------
+
+from routes.agent_center_bd_routes import _prospect_merchant_id
+
+
+def test_prospect_merchant_id_stable_for_same_domain():
+    """Same domain → same id across calls. Determinism is what enables
+    re-audit-in-30-days trend tracking."""
+    assert _prospect_merchant_id("gruns.co") == _prospect_merchant_id("gruns.co")
+    assert _prospect_merchant_id("https://gruns.co/") == _prospect_merchant_id("gruns.co")
+    assert _prospect_merchant_id("HTTPS://Gruns.CO/products/x") == _prospect_merchant_id("gruns.co")
+
+
+def test_prospect_merchant_id_strips_www_prefix():
+    """www.gruns.co and gruns.co should produce the same id."""
+    assert _prospect_merchant_id("www.gruns.co") == _prospect_merchant_id("gruns.co")
+    assert _prospect_merchant_id("https://www.gruns.co/products/x") == _prospect_merchant_id("gruns.co")
+
+
+def test_prospect_merchant_id_distinct_for_different_domains():
+    assert _prospect_merchant_id("gruns.co") != _prospect_merchant_id("hiya.com")
+
+
+def test_prospect_merchant_id_format():
+    pid = _prospect_merchant_id("gruns.co")
+    assert pid.startswith("prospect_")
+    assert len(pid) == len("prospect_") + 12  # 12-char hex
+
+
+def test_prospect_merchant_id_handles_empty_input():
+    assert _prospect_merchant_id("") == _prospect_merchant_id("")  # deterministic
+    assert _prospect_merchant_id(None) == _prospect_merchant_id(None)

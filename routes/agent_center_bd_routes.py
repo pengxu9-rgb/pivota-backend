@@ -54,6 +54,31 @@ logger = logging.getLogger(__name__)
 _HARD_MAX_RUNS = 8
 
 
+def _prospect_merchant_id(domain_or_url: str) -> str:
+    """Synthesize a stable, deterministic merchant_id for a cold-start
+    prospect so the audit lifecycle can persist to merchant_audit_runs
+    WITHOUT the prospect having actually onboarded as a merchant.
+
+    Format: `prospect_<hex12>` where hex12 is the first 12 chars of
+    SHA-1(normalized_domain). Same domain → same id across audits;
+    different domains never collide. Used by PR-1a so a BD operator
+    can re-audit gruns.co in 30 days and see the trend in
+    merchant_view.tracking.history.
+    """
+    import hashlib
+    import re as _re
+    s = (domain_or_url or "").strip().lower()
+    # Strip scheme + path so https://gruns.co/ and gruns.co produce
+    # the same id.
+    s = _re.sub(r"^https?://", "", s)
+    s = s.split("/", 1)[0]
+    if s.startswith("www."):
+        s = s[4:]
+    if not s:
+        s = "_unknown_"
+    return "prospect_" + hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+
+
 def _detect_mock_reports(reports: list) -> list:
     """Return per-product reports whose upstream returned mock /
     synthetic fallback data. Mirrors the merchant audit route's
@@ -460,6 +485,33 @@ async def cold_start_audit(
         "store_connected_at": None,
     }
 
+    # PR-1a (APM): persist cold-start audit to merchant_audit_runs
+    # under a synthetic prospect id so a BD operator can re-audit
+    # the same target in 30 days and see trend deltas WITHOUT the
+    # prospect having onboarded. Best-effort — DB failures degrade
+    # to "no history captured" but never fail the audit itself.
+    from db.merchant_audit_runs import (
+        record_audit_run_started,
+        record_audit_run_completed,
+        recent_runs_for_merchant,
+    )
+    synthetic_merchant_id = _prospect_merchant_id(
+        discovered.get("merchant_domain") or body.url,
+    )
+    product_keys = [
+        p.get("pdp_url") for p in (discovered.get("products") or [])
+        if p.get("pdp_url")
+    ]
+    run_id = await record_audit_run_started(
+        merchant_id=synthetic_merchant_id,
+        product_keys=product_keys,
+    )
+    prior_runs = await recent_runs_for_merchant(
+        merchant_id=synthetic_merchant_id, limit=5,
+    )
+    if run_id:
+        prior_runs = [r for r in prior_runs if r.get("run_id") != run_id]
+
     try:
         out = await run_brand_report(
             merchant_name=discovered["merchant_name"],
@@ -469,8 +521,12 @@ async def cold_start_audit(
             max_runs=body.max_runs,
             include_category_visibility=body.include_category_visibility,
             integration_state=cold_start_integration_state,
+            prior_runs=prior_runs,
         )
     except Exception as exc:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message=str(exc)[:2000],
+        )
         raise _map_error(exc) from exc
 
     # Mock guard: same protection as /brand-report — cold-start can
@@ -478,13 +534,32 @@ async def cold_start_audit(
     # fell back. Reject before the operator sees fabricated prose.
     mock_reports = _detect_mock_reports(out.get("per_product") or [])
     if mock_reports:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed",
+            error_message="upstream_mock_fallback",
+        )
         _raise_mock_rejection(mock_reports, "cold-start-audit")
 
     agg = out.get("aggregate") or {}
+    per_product = out.get("per_product") or []
+    verdict_labels = [
+        ((p.get("verdict") or {}).get("label") or "")
+        for p in per_product
+    ]
+    await record_audit_run_completed(
+        run_id=run_id,
+        status="succeeded",
+        verdict_labels=[v for v in verdict_labels if v],
+        visibility_score_avg=agg.get("avg_visibility"),
+        attribution_score_avg=agg.get("avg_attribution"),
+        category_visibility_score_avg=agg.get("avg_category_visibility"),
+        report_jsonb=out,
+    )
     logger.info(
         "BD cold-start audit: url=%s brand=%s discovery=%s "
         "products_audited=%s products_discovered=%s "
-        "products_persisted=%s fallback_used=%s verdict=%s",
+        "products_persisted=%s fallback_used=%s verdict=%s "
+        "prospect_id=%s run_id=%s",
         body.url,
         discovered["merchant_name"],
         discovered["discovery_method"],
@@ -493,6 +568,8 @@ async def cold_start_audit(
         discovered.get("products_persisted"),
         discovered.get("fallback_used"),
         agg.get("brand_verdict_label"),
+        synthetic_merchant_id,
+        run_id or "(persistence-skipped)",
     )
     return {
         "status": "ok",
@@ -566,6 +643,32 @@ async def cold_start_audit_export(
         "store_connected_at": None,
     }
 
+    # PR-1a (APM): same persistence as the JSON-returning cold-start
+    # endpoint — both paths write to merchant_audit_runs so trend
+    # tracking works regardless of which the operator uses. Best-
+    # effort: DB failures don't block the export.
+    from db.merchant_audit_runs import (
+        record_audit_run_started,
+        record_audit_run_completed,
+        recent_runs_for_merchant,
+    )
+    synthetic_merchant_id = _prospect_merchant_id(
+        discovered.get("merchant_domain") or body.url,
+    )
+    product_keys = [
+        p.get("pdp_url") for p in (discovered.get("products") or [])
+        if p.get("pdp_url")
+    ]
+    run_id = await record_audit_run_started(
+        merchant_id=synthetic_merchant_id,
+        product_keys=product_keys,
+    )
+    prior_runs = await recent_runs_for_merchant(
+        merchant_id=synthetic_merchant_id, limit=5,
+    )
+    if run_id:
+        prior_runs = [r for r in prior_runs if r.get("run_id") != run_id]
+
     try:
         out = await run_brand_report(
             merchant_name=discovered["merchant_name"],
@@ -575,13 +678,36 @@ async def cold_start_audit_export(
             max_runs=body.max_runs,
             include_category_visibility=body.include_category_visibility,
             integration_state=cold_start_integration_state,
+            prior_runs=prior_runs,
         )
     except Exception as exc:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message=str(exc)[:2000],
+        )
         raise _map_error(exc) from exc
 
     mock_reports = _detect_mock_reports(out.get("per_product") or [])
     if mock_reports:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed",
+            error_message="upstream_mock_fallback",
+        )
         _raise_mock_rejection(mock_reports, "cold-start-audit/export")
+
+    agg = out.get("aggregate") or {}
+    verdict_labels = [
+        ((p.get("verdict") or {}).get("label") or "")
+        for p in (out.get("per_product") or [])
+    ]
+    await record_audit_run_completed(
+        run_id=run_id,
+        status="succeeded",
+        verdict_labels=[v for v in verdict_labels if v],
+        visibility_score_avg=agg.get("avg_visibility"),
+        attribution_score_avg=agg.get("avg_attribution"),
+        category_visibility_score_avg=agg.get("avg_category_visibility"),
+        report_jsonb=out,
+    )
 
     markdown = render_brand_markdown(out, discovery=discovered)
 
