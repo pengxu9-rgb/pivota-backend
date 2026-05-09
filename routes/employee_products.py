@@ -537,9 +537,37 @@ _SEED_DATA_FORCE_TEXT = False
 
 
 def _seed_data_payload(seed_data: Dict[str, Any]) -> Any:
+    """Final funnel for every seed_data persistence path in this file.
+
+    All 9 call sites that build a `values["seed_data"]` row for
+    INSERT/UPDATE go through this function. Hooking the deterministic
+    auditor (services.seed_content_audit.audit_seed_data) here means
+    EVERY seed_data write is auto-cleaned — HTML entities decoded,
+    Fenty-style shade-name prefix stripped from INCI lists, audit
+    stamp written into seed_data.review_summary.
+
+    Without this funnel, codex's external-seeds-backfill / seed-correction
+    skills can call any of the 9 endpoints (CSV catalog import, v1
+    CSV path, manual edit, bulk update, storefront-seed candidate,
+    etc.) and reintroduce dirty content even though the storefront-seed
+    path was already audited (PR #412). PR #412 fixed one of nine
+    paths; this fix closes the remaining eight.
+
+    The auditor is deterministic — no LLM calls, microseconds per row."""
+    if not isinstance(seed_data, dict):
+        # Defensive: legacy callers might pass already-stringified JSON.
+        # Pass through unchanged rather than crash; the audit covers the
+        # main code paths that build dict shapes.
+        if _SEED_DATA_FORCE_TEXT and not isinstance(seed_data, str):
+            return json.dumps(seed_data)
+        return seed_data
+
+    cleaned, audit_summary = audit_seed_data(seed_data)
+    cleaned["review_summary"] = audit_summary
+
     if _SEED_DATA_FORCE_TEXT:
-        return json.dumps(seed_data)
-    return seed_data
+        return json.dumps(cleaned)
+    return cleaned
 
 
 async def _execute_seed_data_stmt(query: str, values: Dict[str, Any]) -> None:
@@ -1842,17 +1870,11 @@ async def _upsert_storefront_referral_seed_candidate(
         existing_seed_data = _ensure_json_obj(dict(existing_row).get("seed_data"))
         seed_data = _preserve_seed_data_review_fields(seed_data, existing_seed_data)
 
-    # Auto-audit on every seed write (2026-05-09 follow-up to PR #409 +
-    # #410). Even with review_summary preserved, raw extraction
-    # content (HTML entities like `&rsquo;`, shade-name prefix
-    # contamination on Fenty INCI lists, etc.) was still landing in
-    # `description` / `pdp_ingredients_raw` because re-extraction
-    # rebuilds those text fields from scratch. Running the auditor
-    # here makes every storefront-seed write produce already-clean
-    # content. The auditor is deterministic (no LLM) so this adds
-    # negligible latency (microseconds per row).
-    seed_data, _audit_summary = audit_seed_data(seed_data)
-    seed_data["review_summary"] = _audit_summary
+    # Note: the actual auto-audit step lives inside `_seed_data_payload`
+    # (the funnel through which every seed_data write in this file
+    # passes). PR #412 originally added an explicit audit call here; it
+    # was removed in favour of the funnel approach so all 9 write paths
+    # in this file get audited centrally without per-call-site repetition.
 
     values = {
         "external_product_id": external_product_id,
