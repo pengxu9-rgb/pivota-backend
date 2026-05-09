@@ -46,3 +46,69 @@ def test_canonical_search_selects_pdp_scope_for_consumers():
         "candidate_skus CTE must include p.pdp_scope and the outer "
         "SELECT must pass it through"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase O-5 — recall live-stage filter + lifecycle rank bonus
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_search_filters_to_live_lifecycle_stages_for_global_queries():
+    """The whole point of O-5: drafts and candidates (thin content,
+    no taxonomy) must NOT surface in global recall. Pin both the
+    enum and the IS NULL grandfather so a future "tighten the gate"
+    PR is intentional, not accidental."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "p.pdp_lifecycle_stage IN ('validated', 'published')" in src, (
+        "global recall must hard-filter on live lifecycle stages "
+        "(validated|published) — see PDP_ONBOARDING_PLAYBOOK.md O-5"
+    )
+    assert "p.pdp_lifecycle_stage IS NULL" in src, (
+        "the NULL grandfather must remain until O-6b backfill confirms "
+        "0 NULL rows in prod; remove only in a follow-up PR with that evidence"
+    )
+
+
+def test_canonical_search_lifecycle_filter_skips_merchant_scoped_queries():
+    """A merchant calling find_products with their own merchant_id
+    should always see their inventory regardless of stage — they
+    haven't promised the gateway anything about taxonomy fill yet,
+    and hiding their candidate-stage products from their own dashboard
+    is wrong."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    # The lifecycle clause must be inside an `if not merchant_id`
+    # branch so merchant-scoped queries skip it.
+    assert "if not merchant_id" in src, (
+        "lifecycle filter must be merchant_id-conditional to keep merchant-scoped "
+        "recall returning all of a merchant's inventory"
+    )
+    assert "lifecycle_clause" in src, (
+        "the merchant_id-conditional lifecycle SQL fragment must be a named variable "
+        "for clarity at the SQL site"
+    )
+
+
+def test_canonical_search_includes_lifecycle_rank_bonus():
+    """Within the live pool, published > validated as a tie-breaker.
+    Pin both magnitudes — they must stay below brand-exact (80) and
+    category-prefix (90) so lifecycle is a tie-breaker, not a
+    dominating signal that overrides query-relevance."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "p.pdp_lifecycle_stage = 'published' THEN 60" in src, (
+        "published-stage rank bonus must be +60 (under brand/category)"
+    )
+    assert "p.pdp_lifecycle_stage = 'validated' THEN 20" in src, (
+        "validated-stage rank bonus must be +20 (small tie-breaker)"
+    )
+
+
+def test_canonical_search_selects_lifecycle_stage_for_observability():
+    """pdp_lifecycle_stage must reach the response so probe tools and
+    dashboards can verify the new filter is doing what we expect
+    in prod traces (e.g., when debugging "why is this row showing up
+    at the top?")."""
+    src = _src(pivot_query_service._fetch_canonical_search_rows)
+    assert "p.pdp_lifecycle_stage" in src and "c.pdp_lifecycle_stage" in src, (
+        "candidate_skus CTE must include p.pdp_lifecycle_stage and the outer "
+        "SELECT must pass it through"
+    )
