@@ -622,4 +622,8 @@ def _build_discovery_block(discovered: Dict[str, Any]) -> Dict[str, Any]:
         # before relying on the verdict.
         "diagnostics": discovered.get("diagnostics"),
         "coverage": discovered.get("coverage"),
+        # PR-B brand-level signals: Open Graph, Schema.org Organization,
+        # social handles, sitemap structure, robots, SEO completeness.
+        # Frontend BrandSnapshot component renders from this block.
+        "brand_signals": discovered.get("brand_signals"),
     }
