@@ -34,10 +34,14 @@ logger = logging.getLogger(__name__)
 
 def _registry() -> List[BaseExecutorAgent]:
     """Lazy import + instantiate all registered agents. Add new
-    agents here in PR-4b/c."""
+    agents here. Order matters when agents depend on each other's
+    side effects (none today — all agents are independent).
+    """
     from services.executor_agents.gsc_url_submission import GscUrlSubmissionAgent
+    from services.executor_agents.sitemap_freshness import SitemapFreshnessAgent
     return [
         GscUrlSubmissionAgent(),
+        SitemapFreshnessAgent(),
     ]
 
 

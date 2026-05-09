@@ -276,3 +276,232 @@ async def test_gsc_agent_caps_submits_per_run():
     assert result.status == "succeeded"
     assert result.evidence["submits_attempted"] == _MAX_SUBMITS_PER_RUN
     assert result.evidence["skipped_for_throttle"] == 100 - _MAX_SUBMITS_PER_RUN
+
+
+# ---------------------------------------------------------------------------
+# PR-4b: SitemapFreshnessAgent
+# ---------------------------------------------------------------------------
+
+from services.executor_agents.sitemap_freshness import (
+    SitemapFreshnessAgent,
+    _classify_severity,
+    _compute_freshness_score,
+    _derive_merchant_host,
+    _normalize_url_for_diff,
+    _parse_sitemap_xml,
+)
+
+
+def test_normalize_url_strips_scheme_www_trailing_slash_query():
+    """All these URLs should normalize to the same key for diff."""
+    variants = [
+        "https://acme.co/products/x",
+        "https://www.acme.co/products/x",
+        "http://acme.co/products/x/",
+        "https://acme.co/products/x?utm_source=email",
+        "acme.co/products/x",
+    ]
+    norms = [_normalize_url_for_diff(v) for v in variants]
+    assert len(set(norms)) == 1
+    assert norms[0] == "acme.co/products/x"
+
+
+def test_normalize_url_returns_none_for_garbage():
+    assert _normalize_url_for_diff(None) is None
+    assert _normalize_url_for_diff("") is None
+    assert _normalize_url_for_diff("   ") is None
+    assert _normalize_url_for_diff("not a url") is None or _normalize_url_for_diff("not a url") == "not a url/"
+
+
+def test_normalize_url_handles_root_path():
+    assert _normalize_url_for_diff("https://acme.co/") == "acme.co/"
+    assert _normalize_url_for_diff("https://acme.co") == "acme.co/"
+
+
+def test_derive_merchant_host_picks_most_common():
+    urls = [
+        "https://acme.co/p/1",
+        "https://acme.co/p/2",
+        "https://acme.co/p/3",
+        "https://different.com/p/1",  # outlier
+    ]
+    assert _derive_merchant_host(urls) == "acme.co"
+
+
+def test_derive_merchant_host_strips_www():
+    urls = ["https://www.acme.co/p/1"]
+    assert _derive_merchant_host(urls) == "acme.co"
+
+
+def test_derive_merchant_host_returns_none_for_empty():
+    assert _derive_merchant_host([]) is None
+    assert _derive_merchant_host(["not a url at all"]) is None
+
+
+def test_parse_sitemap_xml_handles_namespaces():
+    xml = b"""<?xml version="1.0"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://acme.co/p/1</loc></url>
+      <url><loc>https://acme.co/p/2</loc></url>
+    </urlset>"""
+    urls = _parse_sitemap_xml(xml)
+    assert len(urls) == 2
+    assert "https://acme.co/p/1" in urls
+
+
+def test_parse_sitemap_xml_falls_back_to_regex_on_malformed():
+    xml = b"<urlset><url><loc>https://acme.co/p/1</loc></url><url><loc>https://acme.co/p/2</loc></url"
+    urls = _parse_sitemap_xml(xml)
+    assert "https://acme.co/p/1" in urls
+
+
+def test_compute_freshness_score_perfect_alignment():
+    """Catalog and sitemap perfectly aligned → score 1.0."""
+    assert _compute_freshness_score(catalog_count=10, missing_count=0, orphan_count=0) == 1.0
+
+
+def test_compute_freshness_score_weighted_to_missing():
+    """Missing-from-sitemap is weighted heavier than orphans (missing
+    products = direct visibility loss; orphans = SEO noise)."""
+    miss_only = _compute_freshness_score(catalog_count=10, missing_count=2, orphan_count=0)
+    orphan_only = _compute_freshness_score(catalog_count=10, missing_count=0, orphan_count=2)
+    assert miss_only < orphan_only  # same diff size, missing hurts more
+
+
+def test_compute_freshness_score_clamps_at_zero():
+    """Edge case: missing_count > catalog_count shouldn't go negative."""
+    score = _compute_freshness_score(catalog_count=10, missing_count=20, orphan_count=20)
+    assert 0.0 <= score <= 1.0
+
+
+def test_compute_freshness_score_empty_catalog():
+    """No catalog products → vacuous 1.0 (nothing to compare)."""
+    assert _compute_freshness_score(catalog_count=0, missing_count=0, orphan_count=0) == 1.0
+
+
+def test_classify_severity_low_for_minimal_drift():
+    assert _classify_severity(missing_ratio=0.01, orphan_ratio=0.05) == "low"
+
+
+def test_classify_severity_medium_for_moderate_drift():
+    assert _classify_severity(missing_ratio=0.10, orphan_ratio=0.05) == "medium"
+
+
+def test_classify_severity_high_for_major_drift():
+    assert _classify_severity(missing_ratio=0.25, orphan_ratio=0.05) == "high"
+    assert _classify_severity(missing_ratio=0.05, orphan_ratio=0.55) == "high"
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_should_run_false_without_merchant_id():
+    agent = SitemapFreshnessAgent()
+    assert await agent.should_run(ExecutorContext(merchant_id=None)) is False
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_should_run_false_without_catalog():
+    agent = SitemapFreshnessAgent()
+    with patch("services.executor_agents.sitemap_freshness._fetch_merchant_catalog_urls",
+               new=AsyncMock(return_value=[])):
+        assert await agent.should_run(ExecutorContext(merchant_id="m1")) is False
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_should_run_true_when_catalog_exists():
+    agent = SitemapFreshnessAgent()
+    with patch("services.executor_agents.sitemap_freshness._fetch_merchant_catalog_urls",
+               new=AsyncMock(return_value=["https://acme.co/p/1"])):
+        assert await agent.should_run(ExecutorContext(merchant_id="m1")) is True
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_execute_perfect_alignment():
+    """Catalog and sitemap match exactly → succeeded with score 1.0
+    + zero missing/orphan."""
+    agent = SitemapFreshnessAgent()
+    catalog_urls = ["https://acme.co/p/1", "https://acme.co/p/2", "https://acme.co/p/3"]
+    sitemap_urls = list(catalog_urls)
+    with patch("services.executor_agents.sitemap_freshness._fetch_merchant_catalog_urls",
+               new=AsyncMock(return_value=catalog_urls)), \
+         patch("services.executor_agents.sitemap_freshness._fetch_sitemap_urls_recursive",
+               new=AsyncMock(return_value=(sitemap_urls, None))):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.status == "succeeded"
+    assert result.evidence["catalog_url_count"] == 3
+    assert result.evidence["sitemap_url_count"] == 3
+    assert result.evidence["missing_from_sitemap_count"] == 0
+    assert result.evidence["orphan_in_sitemap_count"] == 0
+    assert result.evidence["freshness_score"] == 1.0
+    assert result.evidence["severity"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_execute_detects_missing_products():
+    """5 catalog products, sitemap only has 3 → 2 missing → high
+    severity (40% missing ratio)."""
+    agent = SitemapFreshnessAgent()
+    catalog = [f"https://acme.co/p/{i}" for i in range(5)]
+    sitemap = catalog[:3]  # missing p/3 and p/4
+    with patch("services.executor_agents.sitemap_freshness._fetch_merchant_catalog_urls",
+               new=AsyncMock(return_value=catalog)), \
+         patch("services.executor_agents.sitemap_freshness._fetch_sitemap_urls_recursive",
+               new=AsyncMock(return_value=(sitemap, None))):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.evidence["missing_from_sitemap_count"] == 2
+    assert result.evidence["severity"] == "high"
+    # Sample contains the actual missing URLs
+    missing_sample = result.evidence["missing_from_sitemap_sample"]
+    assert any("p/3" in u for u in missing_sample)
+    assert any("p/4" in u for u in missing_sample)
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_execute_detects_orphans():
+    """Sitemap has URLs that aren't in catalog → orphan_in_sitemap."""
+    agent = SitemapFreshnessAgent()
+    catalog = ["https://acme.co/p/1"]
+    sitemap = ["https://acme.co/p/1", "https://acme.co/p/old-discontinued"]
+    with patch("services.executor_agents.sitemap_freshness._fetch_merchant_catalog_urls",
+               new=AsyncMock(return_value=catalog)), \
+         patch("services.executor_agents.sitemap_freshness._fetch_sitemap_urls_recursive",
+               new=AsyncMock(return_value=(sitemap, None))):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.evidence["orphan_in_sitemap_count"] == 1
+    assert any("old-discontinued" in u for u in result.evidence["orphan_in_sitemap_sample"])
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_execute_normalization_handles_trailing_slash():
+    """Catalog stores 'p/1'; sitemap publishes 'p/1/' — normalization
+    treats them as same product."""
+    agent = SitemapFreshnessAgent()
+    with patch("services.executor_agents.sitemap_freshness._fetch_merchant_catalog_urls",
+               new=AsyncMock(return_value=["https://acme.co/p/1"])), \
+         patch("services.executor_agents.sitemap_freshness._fetch_sitemap_urls_recursive",
+               new=AsyncMock(return_value=(["https://www.acme.co/p/1/?utm_source=email"], None))):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.evidence["missing_from_sitemap_count"] == 0
+    assert result.evidence["orphan_in_sitemap_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_execute_unreachable_sitemap_is_finding():
+    """A 404 on sitemap.xml is itself a finding the merchant needs
+    to fix — surface as failed result with diagnostic."""
+    agent = SitemapFreshnessAgent()
+    with patch("services.executor_agents.sitemap_freshness._fetch_merchant_catalog_urls",
+               new=AsyncMock(return_value=["https://acme.co/p/1"])), \
+         patch("services.executor_agents.sitemap_freshness._fetch_sitemap_urls_recursive",
+               new=AsyncMock(return_value=([], "http_404"))):
+        result = await agent.execute(ExecutorContext(merchant_id="m1"))
+    assert result.status == "failed"
+    assert "sitemap_unreachable" in (result.error_message or "")
+    assert result.evidence["fetch_error"] == "http_404"
+    assert result.evidence["sitemap_url"] == "https://acme.co/sitemap.xml"
+
+
+@pytest.mark.asyncio
+async def test_sitemap_agent_execute_no_merchant_id_returns_skipped():
+    agent = SitemapFreshnessAgent()
+    result = await agent.execute(ExecutorContext(merchant_id=None))
+    assert result.status == "skipped"
