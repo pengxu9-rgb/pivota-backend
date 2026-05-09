@@ -745,6 +745,38 @@ def _unwrap_json(text: Optional[str]) -> Optional[Any]:
         return None
 
 
+def _coerce_to_array(parsed: Any) -> Optional[List[Any]]:
+    """When a Gemini call should have returned an array but might have
+    returned an object wrapper or a single object, recover the array.
+
+    Handles three cases:
+      1. Already a list → return as-is
+      2. Object with a single list-valued field → return that list
+         (e.g. {"creators": [...]} or {"results": [...]})
+      3. Object that looks like a single item → wrap in a list
+         (e.g. Gemini returned one retailer instead of an array of one)
+      4. None or other → return None
+    """
+    if parsed is None:
+        return None
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        # Case 2: single list-valued field — common wrappers Gemini emits
+        list_values = [v for v in parsed.values() if isinstance(v, list)]
+        if len(list_values) == 1:
+            return list_values[0]
+        # Case 3: looks like a single item (has any of the expected
+        # field names from our schemas) — wrap in [obj].
+        item_indicator_fields = {
+            "retailer", "publication", "creator_handle", "brand",
+            "headline", "url", "name",
+        }
+        if any(k in parsed for k in item_indicator_fields):
+            return [parsed]
+    return None
+
+
 async def _gemini_grounded_call(prompt: str, *, api_key: str) -> Optional[Dict[str, Any]]:
     """One grounded call. Returns parsed payload or None on any failure."""
     body = {
@@ -777,14 +809,15 @@ For each retailer give:
 - url: the brand's landing or product page on that retailer site, if you can identify it
 - confidence: "high" (you've seen the brand cited there in grounded results), "medium" (you're inferring from category fit), or "low"
 
-Reply with ONLY a JSON array. No prose, no preamble:
+OUTPUT FORMAT — strict:
+- Reply with a bare JSON array starting with [ and ending with ]
+- Do NOT wrap in markdown fences (```)
+- Do NOT wrap in an outer object like {{"retailers": [...]}}
+- Do NOT add prose before or after
+- If no retailers found, reply with the literal: []
 
-[
-  {{"retailer": "...", "url": "...", "confidence": "high|medium|low"}},
-  ...
-]
-
-If you can't identify any retail presence, reply with: []"""
+Schema per element:
+{{"retailer": "...", "url": "...", "confidence": "high"}}"""
 
 
 def _build_founder_prompt(brand: str, domain: str) -> str:
@@ -810,22 +843,25 @@ For each:
 - url: article URL
 - date: publication date (ISO format YYYY-MM-DD if known, else year)
 
-Reply with ONLY a JSON array. No prose:
+OUTPUT FORMAT — strict:
+- Reply with a bare JSON array starting with [ and ending with ]
+- Do NOT wrap in markdown fences (```)
+- Do NOT wrap in an outer object like {{"press": [...]}}
+- Do NOT add prose before or after
+- If no recent coverage found, reply with the literal: []
 
-[
-  {{"publication": "...", "headline": "...", "url": "...", "date": "YYYY-MM-DD"}},
-  ...
-]
-
-If no recent coverage found, reply with []"""
+Schema per element:
+{{"publication": "...", "headline": "...", "url": "...", "date": "YYYY-MM-DD"}}"""
 
 
 async def _infer_retail_presence(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
     payload = await _gemini_grounded_call(_build_retail_prompt(brand, domain), api_key=api_key)
     if not payload:
         return None
-    parsed = _unwrap_json(_parse_gemini_text(payload))
-    if not isinstance(parsed, list):
+    raw_text = _parse_gemini_text(payload)
+    parsed = _coerce_to_array(_unwrap_json(raw_text))
+    if parsed is None:
+        logger.info("retail_presence: could not coerce response to array; raw=%r", (raw_text or "")[:300])
         return None
     out = []
     for item in parsed:
@@ -876,8 +912,10 @@ async def _infer_press_coverage(brand: str, domain: str, api_key: str) -> Option
     payload = await _gemini_grounded_call(_build_press_prompt(brand, domain), api_key=api_key)
     if not payload:
         return None
-    parsed = _unwrap_json(_parse_gemini_text(payload))
-    if not isinstance(parsed, list):
+    raw_text = _parse_gemini_text(payload)
+    parsed = _coerce_to_array(_unwrap_json(raw_text))
+    if parsed is None:
+        logger.info("press_coverage: could not coerce response to array; raw=%r", (raw_text or "")[:300])
         return None
     out = []
     for item in parsed:
@@ -997,18 +1035,24 @@ def _build_own_presence_prompt(brand: str, platform: str, handle: Optional[str])
 
 {handle_clause}
 
-Reply with ONLY a JSON object. No prose:
+OUTPUT FORMAT — strict:
+- Reply with a bare JSON object starting with {{ and ending with }}
+- Do NOT wrap in markdown fences (```)
+- Do NOT add prose before or after
+- Do NOT wrap in an outer object like {{"data": {{...}}}}
+- Use null for any field you can't verify (don't guess)
 
+Schema:
 {{
-  "follower_estimate": 12000,            // integer estimate of follower count; null if unknown
-  "follower_band": "10k-100k",           // one of: "<10k", "10k-100k", "100k-1M", "1M-10M", ">10M", or null
-  {metric_hint}: 5000,    // numeric estimate; null if unknown
-  "content_focus": "product demos and lifestyle",  // 2-6 word phrase; null if unknown
-  "post_frequency": "3-4 per week",      // qualitative; null if unknown
-  "verified_account": true               // boolean; null if unknown
+  "follower_estimate": 12000,
+  "follower_band": "10k-100k",
+  {metric_hint}: 5000,
+  "content_focus": "product demos and lifestyle",
+  "post_frequency": "3-4 per week",
+  "verified_account": true
 }}
 
-Return null fields when you can't verify — don't guess. Reply with the JSON object only."""
+Allowed values for follower_band: "<10k", "10k-100k", "100k-1M", "1M-10M", ">10M", or null."""
 
 
 def _build_kol_prompt(brand: str, platform: str) -> str:
@@ -1023,14 +1067,15 @@ For each creator give:
 - post_date: ISO date YYYY-MM-DD if known, else year, else null
 - content_summary: one short sentence about the post
 
-Reply with ONLY a JSON array. No prose, no preamble:
+OUTPUT FORMAT — strict:
+- Reply with a bare JSON array starting with [ and ending with ]
+- Do NOT wrap in markdown fences (```)
+- Do NOT wrap in an outer object like {{"creators": [...]}}
+- Do NOT add prose before or after
+- If no endorsements found, reply with the literal: []
 
-[
-  {{"creator_handle": "...", "follower_band": "...", "post_url": "...", "view_count_estimate": 12000, "post_date": "...", "content_summary": "..."}},
-  ...
-]
-
-If no endorsements found, reply with: []"""
+Schema per element:
+{{"creator_handle": "...", "follower_band": "10k-100k", "post_url": null, "view_count_estimate": 12000, "post_date": "2025-01-15", "content_summary": "..."}}"""
 
 
 def _build_competitive_prompt(brand: str, competitors: List[str]) -> str:
@@ -1093,13 +1138,23 @@ async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], 
     )
     if not payload:
         return None
-    parsed = _unwrap_json(_parse_gemini_text(payload))
+    raw_text = _parse_gemini_text(payload)
+    parsed = _unwrap_json(raw_text)
+    # If Gemini wrapped the object in a single-field container, peek inside.
+    if isinstance(parsed, dict) and len(parsed) == 1:
+        only_value = next(iter(parsed.values()))
+        if isinstance(only_value, dict):
+            parsed = only_value
     if not isinstance(parsed, dict):
+        logger.info(
+            "own_presence(%s): could not parse object; raw=%r",
+            platform, (raw_text or "")[:300],
+        )
         return None
     metric_key = "view_per_post_estimate" if platform == "tiktok" else "engagement_rate_estimate"
     out: Dict[str, Any] = {
         "platform": platform,
-        "handle": handle,
+        "handle": handle or _coerce_str(parsed.get("handle")),
         "follower_estimate": _coerce_int(parsed.get("follower_estimate")),
         "follower_band": _coerce_str(parsed.get("follower_band")),
         metric_key: _coerce_int(parsed.get(metric_key)) if platform == "tiktok"
@@ -1108,8 +1163,11 @@ async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], 
         "post_frequency": _coerce_str(parsed.get("post_frequency")),
         "verified_account": parsed.get("verified_account") if isinstance(parsed.get("verified_account"), bool) else None,
     }
-    # Don't surface a fully-empty result.
-    if not any(out[k] for k in ("follower_estimate", "follower_band", "content_focus")):
+    # Surface even partial data — handle alone is meaningful (operator
+    # can click through to verify) and content_focus tells the BD what
+    # the brand actually posts. Only fully-empty (no handle AND no
+    # other field) is suppressed.
+    if not any(out[k] for k in ("handle", "follower_estimate", "follower_band", "content_focus", "post_frequency")):
         return None
     return out
 
@@ -1120,8 +1178,13 @@ async def _infer_kol_endorsements(brand: str, platform: str, api_key: str) -> Op
     )
     if not payload:
         return None
-    parsed = _unwrap_json(_parse_gemini_text(payload))
-    if not isinstance(parsed, list):
+    raw_text = _parse_gemini_text(payload)
+    parsed = _coerce_to_array(_unwrap_json(raw_text))
+    if parsed is None:
+        logger.info(
+            "kol_endorsements(%s): could not coerce response to array; raw=%r",
+            platform, (raw_text or "")[:300],
+        )
         return None
     out: List[Dict[str, Any]] = []
     for item in parsed:
@@ -1151,8 +1214,13 @@ async def _infer_competitive_social(brand: str, competitors: List[str], api_key:
     )
     if not payload:
         return None
-    parsed = _unwrap_json(_parse_gemini_text(payload))
-    if not isinstance(parsed, list):
+    raw_text = _parse_gemini_text(payload)
+    parsed = _coerce_to_array(_unwrap_json(raw_text))
+    if parsed is None:
+        logger.info(
+            "competitive_social: could not coerce response to array; raw=%r",
+            (raw_text or "")[:300],
+        )
         return None
     out: List[Dict[str, Any]] = []
     for item in parsed:
