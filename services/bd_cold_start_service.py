@@ -315,6 +315,23 @@ async def discover_products_for_audit(
         )
     merchant_name = _extract_brand_name(homepage_html, domain)
 
+    # PR-B: brand signals — Open Graph, Schema.org, social handles,
+    # sitemap structure, robots, SEO completeness. Pure parsing on the
+    # already-fetched homepage HTML; sitemap + robots fetched in
+    # parallel inside collect_brand_signals. Best-effort: errors are
+    # swallowed and we set brand_signals=None so the audit still runs.
+    from services.bd_brand_signals import collect_brand_signals
+    brand_signals: Optional[Dict[str, Any]] = None
+    try:
+        brand_signals = await collect_brand_signals(
+            homepage_html, domain, base,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "bd_cold_start: brand_signals collection failed for %s: %s",
+            domain, exc,
+        )
+
     # Step 2: try catalog-intelligence (primary). Best effort —
     # returns None on any failure so we fall back without raising.
     catalog_intelligence_used = False
@@ -442,4 +459,9 @@ async def discover_products_for_audit(
         # strategies fired so BD operators can verify category test
         # ran on real categorical data (not mock/inferred fallback).
         "enrichment": enrichment_diagnostics,
+        # PR-B brand signals (Open Graph, Schema.org Organization,
+        # AggregateRating, social handles, sitemap structure, robots
+        # directives, SEO completeness score). None when extraction
+        # raised — audit still runs without it.
+        "brand_signals": brand_signals,
     }
