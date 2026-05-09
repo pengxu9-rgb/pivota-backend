@@ -240,19 +240,60 @@ def build_cohort_comparison(
 
     matrix = build_brand_mention_matrix(audit_label_to_mentions)
 
+    # PR-2c: surface the category_used_for_audit info from each
+    # cohort run so the comparison renders "all 3 brands audited
+    # under <category>" framing when the parent_category override
+    # was applied.
+    cohort_categories_used: List[Optional[str]] = []
+    for cohort_row in cohort_runs:
+        if cohort_row.get("status") != "succeeded":
+            continue
+        report = cohort_row.get("report_jsonb") or {}
+        meta = report.get("_cohort_meta") or {}
+        cohort_categories_used.append(meta.get("category_used_for_audit"))
+
+    # Determine if we have apples-to-apples comparison: all cohort
+    # competitors audited under the same forced category as the
+    # parent. When yes, downgrade the caveat to a milder framing.
+    same_category_comparison = bool(
+        cohort_categories_used
+        and all(c is not None for c in cohort_categories_used)
+        and len(set(cohort_categories_used)) == 1
+    )
+
+    if same_category_comparison:
+        category = cohort_categories_used[0]
+        caveat = (
+            f"All {succeeded_competitors} cohort competitors were audited under "
+            f"the parent's category ('{category}') — the brand_mention_matrix "
+            f"is a true apples-to-apples comparison: how often Gemini cites each "
+            f"brand when answering buyer queries about '{category}'. "
+            f"Cohort competitors' individual visibility/attribution scores "
+            f"reflect 'are they cited in {parent_label}'s category', NOT 'are "
+            f"they cited in their own native category' — that's the right "
+            f"framing for cross-brand pitch evidence."
+        )
+    else:
+        caveat = (
+            "Audits use auto-generated queries based on each brand's "
+            "product_type. Query texts don't deterministically overlap "
+            "across brands — brand_mention_matrix is the cross-brand "
+            "signal. Per-query rows are per-audit detail. "
+            "(Set category_override at audit time to force apples-to-apples.)"
+        )
+
     return {
         "summary": {
             "parent_brand": parent_label,
             "competitors_audited": succeeded_competitors,
             "brands_named_across_audits": len(matrix["matrix"]),
             "queries_total": len(all_per_query),
+            "category_override_applied": same_category_comparison,
+            "category_used": (
+                cohort_categories_used[0] if same_category_comparison else None
+            ),
         },
         "per_query_breakdown": all_per_query,
         "brand_mention_matrix": matrix,
-        "caveat": (
-            "Audits use auto-generated queries based on each brand's "
-            "product_type. Query texts don't deterministically overlap "
-            "across brands — brand_mention_matrix is the cross-brand "
-            "signal. Per-query rows are per-audit detail."
-        ),
+        "caveat": caveat,
     }

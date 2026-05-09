@@ -220,7 +220,7 @@ async def test_enqueue_caps_cohort_at_hard_max():
     """User passes cohort_size=10; orchestrator caps at HARD_MAX=5."""
     captured_cohort_size: List[int] = []
 
-    async def _fake_audit(brand, parent_audit_run_id, market, max_runs):
+    async def _fake_audit(brand, parent_audit_run_id, market, max_runs, category_override=None):
         return {"competitor_brand": brand, "status": "succeeded"}
 
     async def _fake_sem(*a, **kw):
