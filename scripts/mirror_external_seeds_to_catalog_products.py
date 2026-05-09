@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ from services.pdp_taxonomy import derive_taxonomy_v1
 
 
 MERCHANT_ID = "external_seed"
+MERCHANT_NAME = "External Seed"
 PLATFORM = "external_seed"
 CATALOG_TRACK = "external_referral"
 TRUTH_TIER = "observed"
@@ -43,6 +45,30 @@ READINESS_TIER = "referral_only"
 SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 CATEGORY_CONFIDENCE_REGEX_AT_MIRROR = 0.85
 CATEGORY_LABEL_SOURCE_AT_MIRROR = "regex_backfill_at_mirror"
+
+# Phase 7d: Path B writes the full canonical chain (skus + offers +
+# merchants), matching Phase 7a Path C. Without this, JOIN catalog_offers
+# returns 0 rows for mirrored products → canonical recall surfaces them
+# without prices. The chain shapes here mirror the agent ingest helpers
+# in services/catalog_enrichment_agent/ingestion.py.
+SKU_SUFFIX = "::canonical"
+OFFER_ID_PREFIX = "offer:external_seed:"
+OFFER_MODE = "redirect"
+PRICE_CONFIDENCE_AT_MIRROR = Decimal("0.6")
+
+
+def _derive_mirror_sku_key(product_key: str) -> str:
+    """One canonical SKU per mirrored product. Keeps the chain
+    semantically identical to Path C (`<product_key>::canonical`)."""
+    return f"{product_key}{SKU_SUFFIX}"
+
+
+def _derive_mirror_offer_id(product_key: str) -> str:
+    """Deterministic offer id keyed off product_key. Hashed so the
+    column-length limit (catalog_offers.offer_id is VARCHAR(64) per
+    schema) is safe even for long external_product_id values."""
+    digest = hashlib.sha256(product_key.encode("utf-8")).hexdigest()[:32]
+    return f"{OFFER_ID_PREFIX}{digest}"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -164,6 +190,188 @@ def _extract_tags_from_seed_data(seed_data: Any) -> List[str]:
         if out:
             return out
     return []
+
+
+async def _ensure_external_seed_merchant() -> None:
+    """Phase 7d: idempotent UPSERT of the singleton 'external_seed'
+    merchant row. Path B has all mirrored products under one synthetic
+    merchant — this runs once per --apply invocation so catalog_offers
+    foreign keys resolve cleanly. Cheap; safe to call repeatedly."""
+    await database.execute(
+        """
+        INSERT INTO catalog_merchants
+          (merchant_id, merchant_name, primary_platform, status,
+           source_system, source_ref, metadata_json)
+        VALUES
+          (:merchant_id, :merchant_name, :primary_platform, 'active',
+           :source_system, :source_ref, CAST(:metadata_json AS jsonb))
+        ON CONFLICT (merchant_id) DO UPDATE SET
+          merchant_name = COALESCE(EXCLUDED.merchant_name, catalog_merchants.merchant_name),
+          primary_platform = COALESCE(EXCLUDED.primary_platform, catalog_merchants.primary_platform),
+          status = 'active',
+          source_system = EXCLUDED.source_system,
+          metadata_json = EXCLUDED.metadata_json,
+          updated_at = NOW()
+        """,
+        {
+            "merchant_id": MERCHANT_ID,
+            "merchant_name": MERCHANT_NAME,
+            "primary_platform": PLATFORM,
+            "source_system": SOURCE_SYSTEM,
+            "source_ref": None,
+            "metadata_json": json.dumps(
+                {
+                    "synthetic": True,
+                    "purpose": "Aggregator merchant for external-seed mirrored products",
+                    "owner_phase": "7d",
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+
+
+async def _upsert_canonical_sku_for_mirror_row(
+    product_key: str,
+    row_dict: Dict[str, Any],
+) -> None:
+    """Phase 7d: write the canonical SKU row for a mirrored product.
+    Matches Path C convention — one synthetic 'canonical' SKU per
+    product. The actual variant-level data lives only in seed_data on
+    external_product_seeds; we don't expand variants here because the
+    redirect-flow (offer_mode='redirect') hands the user off to the
+    merchant's storefront for selection."""
+    sku_key = _derive_mirror_sku_key(product_key)
+    sku_payload = {
+        "synthetic_canonical_variant": True,
+        "source": "external_product_seeds_mirror_v1",
+        "external_product_id": row_dict.get("external_product_id"),
+        "destination_url": row_dict.get("destination_url"),
+    }
+    await database.execute(
+        """
+        INSERT INTO catalog_skus
+          (sku_key, product_key, merchant_id, platform,
+           source_product_id, source_variant_id, sku, barcode,
+           title, currency, image_url,
+           visible_attributes, visible_option_labels, ingredient_ids,
+           sku_payload, readiness_tier)
+        VALUES
+          (:sku_key, :product_key, :merchant_id, :platform,
+           :source_product_id, :source_variant_id, :sku, :barcode,
+           :title, :currency, :image_url,
+           CAST(:visible_attributes AS jsonb),
+           CAST(:visible_option_labels AS jsonb),
+           CAST(:ingredient_ids AS jsonb),
+           CAST(:sku_payload AS jsonb), :readiness_tier)
+        ON CONFLICT (sku_key) DO UPDATE SET
+          title = EXCLUDED.title,
+          image_url = EXCLUDED.image_url,
+          currency = EXCLUDED.currency,
+          sku_payload = EXCLUDED.sku_payload,
+          readiness_tier = EXCLUDED.readiness_tier,
+          updated_at = NOW()
+        """,
+        {
+            "sku_key": sku_key,
+            "product_key": product_key,
+            "merchant_id": MERCHANT_ID,
+            "platform": PLATFORM,
+            "source_product_id": row_dict.get("external_product_id"),
+            "source_variant_id": "canonical",
+            "sku": row_dict.get("external_product_id"),
+            "barcode": None,
+            "title": row_dict.get("title"),
+            "currency": row_dict.get("price_currency") or "USD",
+            "image_url": row_dict.get("image_url"),
+            "visible_attributes": json.dumps({}, ensure_ascii=False),
+            "visible_option_labels": json.dumps([], ensure_ascii=False),
+            "ingredient_ids": json.dumps([], ensure_ascii=False),
+            "sku_payload": json.dumps(sku_payload, ensure_ascii=False, default=_json_default),
+            "readiness_tier": READINESS_TIER,
+        },
+    )
+
+
+async def _upsert_canonical_offer_for_mirror_row(
+    product_key: str,
+    row_dict: Dict[str, Any],
+) -> None:
+    """Phase 7d: write the canonical offer row carrying price + currency
+    + availability. This is the field that fixes the "all prices zero"
+    bug observed in chat-mode canonical_chain results — once Path B
+    rows have offers, both `_fetch_canonical_search_rows` (this backend)
+    and PIVOTA-Agent's canonicalCatalogSearch helper can JOIN them and
+    emit a price.
+
+    `price_amount` from external_product_seeds is mapped 1:1 to all
+    three pricing columns (no spread between list/effective/best on
+    this path — the seed has only the displayed retailer price)."""
+    sku_key = _derive_mirror_sku_key(product_key)
+    offer_id = _derive_mirror_offer_id(product_key)
+    raw_price = row_dict.get("price_amount")
+    try:
+        list_price_value = float(raw_price) if raw_price is not None else None
+    except (TypeError, ValueError):
+        list_price_value = None
+    offer_payload = {
+        "source": "external_product_seeds_mirror_v1",
+        "destination_url": row_dict.get("destination_url"),
+        "canonical_url": row_dict.get("canonical_url"),
+        "domain": row_dict.get("domain"),
+        "external_seed_id": row_dict.get("id"),
+        "market": row_dict.get("market"),
+    }
+    await database.execute(
+        """
+        INSERT INTO catalog_offers
+          (offer_id, sku_key, product_key, merchant_id,
+           catalog_track, truth_tier, readiness_tier, offer_mode,
+           channel, availability, inventory_quantity, currency,
+           list_price, merchant_effective_price, estimated_best_price,
+           price_confidence, source_system, source_ref, offer_payload)
+        VALUES
+          (:offer_id, :sku_key, :product_key, :merchant_id,
+           :catalog_track, :truth_tier, :readiness_tier, :offer_mode,
+           :channel, :availability, :inventory_quantity, :currency,
+           :list_price, :merchant_effective_price, :estimated_best_price,
+           :price_confidence, :source_system, :source_ref,
+           CAST(:offer_payload AS jsonb))
+        ON CONFLICT (offer_id) DO UPDATE SET
+          availability = EXCLUDED.availability,
+          inventory_quantity = EXCLUDED.inventory_quantity,
+          currency = EXCLUDED.currency,
+          list_price = EXCLUDED.list_price,
+          merchant_effective_price = EXCLUDED.merchant_effective_price,
+          estimated_best_price = EXCLUDED.estimated_best_price,
+          price_confidence = EXCLUDED.price_confidence,
+          offer_payload = EXCLUDED.offer_payload,
+          updated_at = NOW()
+        """,
+        {
+            "offer_id": offer_id,
+            "sku_key": sku_key,
+            "product_key": product_key,
+            "merchant_id": MERCHANT_ID,
+            "catalog_track": CATALOG_TRACK,
+            "truth_tier": TRUTH_TIER,
+            "readiness_tier": READINESS_TIER,
+            "offer_mode": OFFER_MODE,
+            "channel": "external_referral",
+            "availability": row_dict.get("availability"),
+            "inventory_quantity": None,
+            "currency": row_dict.get("price_currency") or "USD",
+            "list_price": list_price_value,
+            "merchant_effective_price": list_price_value,
+            "estimated_best_price": list_price_value,
+            "price_confidence": (
+                str(PRICE_CONFIDENCE_AT_MIRROR) if list_price_value is not None else None
+            ),
+            "source_system": SOURCE_SYSTEM,
+            "source_ref": row_dict.get("id"),
+            "offer_payload": json.dumps(offer_payload, ensure_ascii=False, default=_json_default),
+        },
+    )
 
 
 def _compute_mirror_lifecycle_stage(
@@ -442,6 +650,11 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
 
 
 async def _apply(limit: int) -> int:
+    # Phase 7d: Path B writes the full canonical chain. The merchant
+    # row is a single synthetic 'external_seed' aggregator — upsert it
+    # once before the per-row loop so catalog_offers FKs resolve.
+    await _ensure_external_seed_merchant()
+
     limit_clause = ""
     values: Dict[str, Any] = {
         "merchant_id": MERCHANT_ID,
@@ -652,6 +865,28 @@ async def _apply(limit: int) -> int:
         )
         if inserted_row:
             inserted += 1
+
+        # Phase 7d: write canonical sku + offer for this product
+        # regardless of whether the catalog_products INSERT was new or
+        # a no-op. The chain inserts use ON CONFLICT DO UPDATE so
+        # existing rows get healed on every --apply pass — that's how
+        # legacy Path B rows (mirrored before 7d) pick up their
+        # missing skus/offers without needing a separate backfill
+        # script. The product_key is the same identifier on both
+        # paths, so chain writes stay attached to the correct PDP.
+        product_key_for_chain = row_dict.get("product_key")
+        if product_key_for_chain:
+            try:
+                await _upsert_canonical_sku_for_mirror_row(product_key_for_chain, row_dict)
+                await _upsert_canonical_offer_for_mirror_row(product_key_for_chain, row_dict)
+            except Exception as exc:
+                # Don't break the whole apply if one row's chain fails
+                # — log and continue. The next --apply pass will retry
+                # via the same idempotent ON CONFLICT path.
+                print(
+                    f"WARNING: chain write failed for product_key={product_key_for_chain}: {exc!r}",
+                    file=sys.stderr,
+                )
     return inserted
 
 
