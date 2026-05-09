@@ -114,7 +114,12 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"nightbalm|lip scrub|scrubstick)\b",
         re.IGNORECASE)),
     ("Lipstick", "beauty/makeup/lip/lipstick", re.compile(
-        r"\b(lipstick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
+        # `lip[\s-]*stick` matches "lipstick", "lip stick", "lip-stick",
+        # and double-space variants. User typos like "lip stick" were
+        # silently classifying as None and falling back to a generic
+        # skincare term list, returning serums/cleansers for lipstick
+        # queries. See lipstick-recall regression 2026-05-09.
+        r"\b(lip[\s-]*stick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
         r"lip gloss|lip oil|lip liner|lip stain|lip tint|pout lip|gloss luxe|"
         r"gloss drip|gloss bomb|gloss stick|gloss stix|lip combo|lip duo)\b",
         re.IGNORECASE)),
