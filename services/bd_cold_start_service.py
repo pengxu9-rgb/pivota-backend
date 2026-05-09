@@ -324,29 +324,51 @@ async def discover_products_for_audit(
     # ~20s each (so ~20s total with parallelism). Falls back to
     # None when GEMINI_API_KEY unset or all calls fail.
     # Both run in parallel with each other to minimize wall-time.
-    from services.bd_brand_signals import collect_brand_signals, infer_brand_context
+    # PR-D adds infer_social_intelligence — 4 Gemini grounded calls
+    # for own TikTok/Instagram presence + KOL endorsements per
+    # platform. The 5th competitive_comparison call is gated on
+    # competitor_brands which the audit produces; not available at
+    # this point, so caller passes None and that call is skipped.
+    # All three brand-intelligence functions run in parallel.
+    from services.bd_brand_signals import (
+        collect_brand_signals, infer_brand_context, infer_social_intelligence,
+    )
     brand_signals: Optional[Dict[str, Any]] = None
     brand_context: Optional[Dict[str, Any]] = None
+    social_intelligence: Optional[Dict[str, Any]] = None
     try:
         brand_signals_task = collect_brand_signals(homepage_html, domain, base)
         brand_context_task = infer_brand_context(merchant_name, domain)
-        brand_signals_res, brand_context_res = await asyncio.gather(
+        # social intelligence needs detected_handles from brand_signals;
+        # but we don't have it yet. Wait for brand_signals first, then
+        # kick off social_intelligence with the result. To keep wall-
+        # time low, run brand_signals + brand_context in parallel first;
+        # social_intelligence runs after brand_signals lands so it can
+        # use the detected social handles.
+        bs_res, bc_res = await asyncio.gather(
             brand_signals_task, brand_context_task, return_exceptions=True,
         )
-        if not isinstance(brand_signals_res, Exception):
-            brand_signals = brand_signals_res
+        if not isinstance(bs_res, Exception):
+            brand_signals = bs_res
         else:
             logger.warning(
                 "bd_cold_start: brand_signals collection failed for %s: %s",
-                domain, brand_signals_res,
+                domain, bs_res,
             )
-        if not isinstance(brand_context_res, Exception):
-            brand_context = brand_context_res
+        if not isinstance(bc_res, Exception):
+            brand_context = bc_res
         else:
             logger.warning(
                 "bd_cold_start: brand_context inference failed for %s: %s",
-                domain, brand_context_res,
+                domain, bc_res,
             )
+        detected_handles = (brand_signals or {}).get("social") if brand_signals else []
+        social_intelligence = await infer_social_intelligence(
+            merchant_name,
+            domain,
+            detected_handles=detected_handles,
+            competitor_brands=None,  # post-audit hook can re-call with audit's competitors
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "bd_cold_start: brand intelligence gather failed for %s: %s",
@@ -490,4 +512,11 @@ async def discover_products_for_audit(
         # unset OR all 3 calls failed. Each sub-field independently
         # nullable (one call can succeed while others fail).
         "brand_context": brand_context,
+        # PR-D Gemini-grounded social intelligence: own TikTok +
+        # Instagram presence (followers, view counts), KOL/creator
+        # endorsements per platform, competitive comparison (gated
+        # on competitor_brands which the audit produces — this
+        # initial call passes None so competitive is omitted; a
+        # follow-up hook can re-call with audit-derived competitors).
+        "social_intelligence": social_intelligence,
     }

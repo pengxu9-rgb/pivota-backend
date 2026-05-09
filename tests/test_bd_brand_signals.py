@@ -542,3 +542,168 @@ async def test_infer_brand_context_partial_failure_surfaces_what_succeeded(monke
     assert result["retail_presence"] == [{"retailer": "Amazon", "url": "https://amazon.com/x", "confidence": "high"}]
     assert result["founder_story"] is None
     assert len(result["press_coverage"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-D: Social-media intelligence (TikTok + Instagram)
+# ---------------------------------------------------------------------------
+
+from services.bd_brand_signals import (
+    _build_competitive_prompt,
+    _build_kol_prompt,
+    _build_own_presence_prompt,
+    _coerce_int,
+    _detected_handle,
+    infer_social_intelligence,
+)
+
+
+def test_detected_handle_lookup():
+    handles = [
+        {"platform": "tiktok", "handle": "grunsdaily", "url": "x"},
+        {"platform": "instagram", "handle": "grunsig", "url": "y"},
+    ]
+    assert _detected_handle(handles, "tiktok") == "grunsdaily"
+    assert _detected_handle(handles, "instagram") == "grunsig"
+    assert _detected_handle(handles, "youtube") is None
+    assert _detected_handle([], "tiktok") is None
+    assert _detected_handle(None, "tiktok") is None
+
+
+def test_coerce_int_handles_thousands_suffix():
+    assert _coerce_int(12000) == 12000
+    assert _coerce_int(12000.5) == 12000
+    assert _coerce_int("12000") == 12000
+    assert _coerce_int("12,000") == 12000
+    assert _coerce_int("12k") == 12000
+    assert _coerce_int("1.5M") == 1500000
+    assert _coerce_int("not a number") is None
+    assert _coerce_int(None) is None
+
+
+def test_own_presence_prompt_includes_handle_when_known():
+    p = _build_own_presence_prompt("Grüns", "tiktok", "grunsdaily")
+    assert "Grüns" in p
+    assert "@grunsdaily" in p
+    assert "TikTok" in p
+    assert "view_per_post_estimate" in p
+
+
+def test_own_presence_prompt_falls_back_to_search_when_no_handle():
+    p = _build_own_presence_prompt("Grüns", "instagram", None)
+    assert "@" not in p.split("Their Instagram handle")[0]  # no handle clause
+    assert "Search for Grüns's official instagram account" in p
+    assert "engagement_rate_estimate" in p
+
+
+def test_kol_prompt_specifies_platform_and_band():
+    p = _build_kol_prompt("Grüns", "tiktok")
+    assert "TikTok" in p
+    assert "10k-1M follower band" in p
+    assert "12 months" in p
+
+
+def test_competitive_prompt_lists_competitors():
+    p = _build_competitive_prompt("Grüns", ["Hiya", "First Day", "Olly"])
+    assert "Hiya, First Day, Olly" in p
+    assert "Grüns" in p
+
+
+@pytest.mark.asyncio
+async def test_infer_social_intelligence_no_api_key_returns_unavailable(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("PIVOTA_GEMINI_API_KEY", raising=False)
+    result = await infer_social_intelligence("Grüns", "gruns.co", [], None)
+    assert result["available"] is False
+    assert result["own_presence"]["tiktok"] is None
+    assert result["competitive_comparison"] is None
+
+
+@pytest.mark.asyncio
+async def test_infer_social_intelligence_skips_competitive_when_no_competitors(monkeypatch):
+    """When competitor_brands is None or empty, the 5th call must be
+    skipped — only 4 grounded calls fire."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    own_call_count = 0
+    kol_call_count = 0
+    comp_call_count = 0
+
+    async def fake_own(brand, platform, handle, api_key):
+        nonlocal own_call_count
+        own_call_count += 1
+        return {"platform": platform, "handle": handle, "follower_estimate": 10000,
+                "follower_band": "10k-100k", "content_focus": "test",
+                "view_per_post_estimate": 5000, "engagement_rate_estimate": None,
+                "post_frequency": None, "verified_account": None}
+
+    async def fake_kol(brand, platform, api_key):
+        nonlocal kol_call_count
+        kol_call_count += 1
+        return [{"creator_handle": "creator", "follower_band": "10k-100k",
+                 "post_url": None, "view_count_estimate": None, "post_date": None,
+                 "content_summary": "x"}]
+
+    async def fake_comp(brand, competitors, api_key):
+        nonlocal comp_call_count
+        comp_call_count += 1
+        return [{"brand": "X"}]
+
+    with patch("services.bd_brand_signals._infer_own_presence", new=AsyncMock(side_effect=fake_own)), \
+         patch("services.bd_brand_signals._infer_kol_endorsements", new=AsyncMock(side_effect=fake_kol)), \
+         patch("services.bd_brand_signals._infer_competitive_social", new=AsyncMock(side_effect=fake_comp)):
+        result = await infer_social_intelligence("Grüns", "gruns.co", [], None)
+    assert result["available"] is True
+    assert own_call_count == 2  # tiktok + instagram
+    assert kol_call_count == 2  # tiktok + instagram
+    assert comp_call_count == 0  # competitive skipped (no competitors)
+    assert result["competitive_comparison"] is None
+
+
+@pytest.mark.asyncio
+async def test_infer_social_intelligence_runs_competitive_when_competitors_provided(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    async def fake_own(*a, **k):
+        return None
+
+    async def fake_kol(*a, **k):
+        return None
+
+    async def fake_comp(brand, competitors, api_key):
+        assert competitors == ["Hiya"]
+        return [{"brand": "Hiya", "tiktok_followers_estimate": 50000,
+                 "instagram_followers_estimate": 180000,
+                 "kol_endorsements_count_estimate": 12,
+                 "gap_summary": "Hiya leads"}]
+
+    with patch("services.bd_brand_signals._infer_own_presence", new=AsyncMock(side_effect=fake_own)), \
+         patch("services.bd_brand_signals._infer_kol_endorsements", new=AsyncMock(side_effect=fake_kol)), \
+         patch("services.bd_brand_signals._infer_competitive_social", new=AsyncMock(side_effect=fake_comp)):
+        result = await infer_social_intelligence("Grüns", "gruns.co", [], ["Hiya"])
+    assert result["available"] is True
+    assert result["competitive_comparison"][0]["brand"] == "Hiya"
+
+
+@pytest.mark.asyncio
+async def test_infer_social_intelligence_partial_failure_surfaces_what_succeeded(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    async def fake_own(brand, platform, handle, api_key):
+        # Only TikTok succeeds; Instagram returns None
+        if platform == "tiktok":
+            return {"platform": "tiktok", "handle": "x", "follower_estimate": 10000,
+                    "follower_band": "10k-100k", "content_focus": "test",
+                    "view_per_post_estimate": None, "engagement_rate_estimate": None,
+                    "post_frequency": None, "verified_account": None}
+        return None
+
+    async def fake_kol(*a, **k):
+        return None
+
+    with patch("services.bd_brand_signals._infer_own_presence", new=AsyncMock(side_effect=fake_own)), \
+         patch("services.bd_brand_signals._infer_kol_endorsements", new=AsyncMock(side_effect=fake_kol)):
+        result = await infer_social_intelligence("Grüns", "gruns.co", [], None)
+    assert result["available"] is True
+    assert result["own_presence"]["tiktok"] is not None
+    assert result["own_presence"]["instagram"] is None

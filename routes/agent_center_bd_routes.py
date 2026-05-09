@@ -629,4 +629,8 @@ def _build_discovery_block(discovered: Dict[str, Any]) -> Dict[str, Any]:
         # PR-C Gemini-grounded brand context: retail presence, founder
         # story, press coverage. Each sub-field independently nullable.
         "brand_context": discovered.get("brand_context"),
+        # PR-D Gemini-grounded social intelligence: own TikTok+IG
+        # presence + KOL endorsements per platform + (optional)
+        # competitive comparison.
+        "social_intelligence": discovered.get("social_intelligence"),
     }
