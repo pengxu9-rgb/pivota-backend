@@ -439,6 +439,27 @@ async def cold_start_audit(
             "discovery": _build_discovery_block(discovered),
         }
 
+    # Cold-start targets are by definition NOT Pivota merchants —
+    # they have no merchant_id, no Shopify OAuth, no PSP connection,
+    # no GSC OAuth grant. So the integration_state is "totally
+    # unintegrated" — which makes Phase 0's "Complete Pivota
+    # integration" CTA the #1 prioritized action (the actual BD
+    # pitch lever for cold outreach). Without this synthetic state,
+    # the audit's merchant_view.actions falls back to legacy
+    # strategic-tier templates only and BD operators don't see the
+    # most important CTA.
+    cold_start_integration_state: Dict[str, Any] = {
+        "store_platform_integrated": False,
+        "psp_integrated": False,
+        "gsc_integrated": False,
+        "fully_integrated": False,
+        "missing_pieces": ["store_platform", "psp"],
+        "integration_completed_at": None,
+        "store_platform_name": None,
+        "psp_provider": None,
+        "store_connected_at": None,
+    }
+
     try:
         out = await run_brand_report(
             merchant_name=discovered["merchant_name"],
@@ -447,6 +468,7 @@ async def cold_start_audit(
             provider=body.provider,
             max_runs=body.max_runs,
             include_category_visibility=body.include_category_visibility,
+            integration_state=cold_start_integration_state,
         )
     except Exception as exc:
         raise _map_error(exc) from exc
