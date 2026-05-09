@@ -3,15 +3,29 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.mirror_external_seeds_to_catalog_products import (  # noqa: E402
     CATEGORY_CONFIDENCE_REGEX_AT_MIRROR,
     CATEGORY_LABEL_SOURCE_AT_MIRROR,
+    MERCHANT_ID,
+    OFFER_ID_PREFIX,
+    PLATFORM,
+    READINESS_TIER,
+    SKU_SUFFIX,
+    SOURCE_SYSTEM,
     _compute_mirror_lifecycle_stage,
+    _derive_mirror_offer_id,
+    _derive_mirror_sku_key,
+    _ensure_external_seed_merchant,
     _extract_tags_from_seed_data,
+    _upsert_canonical_offer_for_mirror_row,
+    _upsert_canonical_sku_for_mirror_row,
     resolve_mirror_category_metadata,
 )
+import scripts.mirror_external_seeds_to_catalog_products as mirror_module  # noqa: E402
 
 
 def test_mirror_insert_classifies_category_path() -> None:
@@ -155,3 +169,196 @@ def test_mirror_lifecycle_draft_for_thin_content() -> None:
     taxonomy = {"demographic": None, "use_case_tags": [], "lifestyle_tags": []}
     stage = _compute_mirror_lifecycle_stage(row, category_meta, [], taxonomy)
     assert stage == "draft"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7d — full canonical chain (catalog_skus + catalog_offers)
+# ---------------------------------------------------------------------------
+
+
+def test_mirror_sku_key_appends_canonical_suffix() -> None:
+    """Path B sku_key must match Path C's `<product_key>::canonical`
+    convention so the chain reads identically across paths."""
+    pk = "prod::external_seed::external_seed::ext_abc123"
+    sku_key = _derive_mirror_sku_key(pk)
+    assert sku_key == f"{pk}::canonical"
+    assert sku_key.endswith(SKU_SUFFIX)
+
+
+def test_mirror_offer_id_is_deterministic_and_prefixed() -> None:
+    """Same product_key → same offer_id. Different product_key → different.
+    Pin the prefix so the offer_id is recognizable in audit trails as a
+    Path-B-mirror-origin offer."""
+    pk_a = "prod::external_seed::external_seed::ext_abc"
+    pk_b = "prod::external_seed::external_seed::ext_def"
+    a1 = _derive_mirror_offer_id(pk_a)
+    a2 = _derive_mirror_offer_id(pk_a)
+    b = _derive_mirror_offer_id(pk_b)
+    assert a1 == a2
+    assert a1 != b
+    assert a1.startswith(OFFER_ID_PREFIX)
+
+
+def test_mirror_offer_id_under_64_chars() -> None:
+    """catalog_offers.offer_id is VARCHAR(64). Path B uses a 32-char
+    sha256 truncation + the 'offer:external_seed:' prefix (20 chars) =
+    52 chars total. Pin so a future prefix change can't blow the limit."""
+    offer_id = _derive_mirror_offer_id("prod::" + "x" * 200)
+    assert len(offer_id) <= 64
+
+
+@pytest.mark.asyncio
+async def test_ensure_external_seed_merchant_upserts_singleton(monkeypatch) -> None:
+    """The synthetic 'external_seed' merchant must exist before any
+    catalog_offers.foreign_key=merchant_id resolves. _apply calls this
+    once per run; the SQL must be idempotent (ON CONFLICT DO UPDATE)."""
+    executed: list = []
+
+    class DummyDB:
+        async def execute(self, sql, params):
+            executed.append({"sql": str(sql), "params": dict(params)})
+
+    monkeypatch.setattr(mirror_module, "database", DummyDB())
+
+    await _ensure_external_seed_merchant()
+
+    assert len(executed) == 1
+    sql = executed[0]["sql"]
+    params = executed[0]["params"]
+    assert "INSERT INTO catalog_merchants" in sql
+    assert "ON CONFLICT (merchant_id) DO UPDATE" in sql
+    assert params["merchant_id"] == MERCHANT_ID
+    assert params["primary_platform"] == PLATFORM
+    assert params["source_system"] == SOURCE_SYSTEM
+
+
+@pytest.mark.asyncio
+async def test_upsert_canonical_sku_writes_path_C_compatible_shape(monkeypatch) -> None:
+    """Sku row from Path B must be readable by the same downstream
+    consumers as Path C — same sku_key convention, same merchant/platform
+    fields, same JSONB column shapes (jsonb-cast strings)."""
+    executed: list = []
+
+    class DummyDB:
+        async def execute(self, sql, params):
+            executed.append({"sql": str(sql), "params": dict(params)})
+
+    monkeypatch.setattr(mirror_module, "database", DummyDB())
+
+    pk = "prod::external_seed::external_seed::ext_abc"
+    row_dict = {
+        "external_product_id": "ext_abc",
+        "title": "Test Product",
+        "image_url": "https://example.com/img.jpg",
+        "price_currency": "USD",
+        "destination_url": "https://example.com/p/x",
+    }
+    await _upsert_canonical_sku_for_mirror_row(pk, row_dict)
+
+    assert len(executed) == 1
+    sql = executed[0]["sql"]
+    params = executed[0]["params"]
+    assert "INSERT INTO catalog_skus" in sql
+    assert "ON CONFLICT (sku_key) DO UPDATE" in sql
+    assert params["sku_key"] == f"{pk}::canonical"
+    assert params["product_key"] == pk
+    assert params["merchant_id"] == MERCHANT_ID
+    assert params["platform"] == PLATFORM
+    assert params["source_product_id"] == "ext_abc"
+    assert params["source_variant_id"] == "canonical"
+    assert params["title"] == "Test Product"
+    assert params["currency"] == "USD"
+    assert params["readiness_tier"] == READINESS_TIER
+    # JSONB columns must be JSON-stringified for CAST(:... AS jsonb)
+    assert isinstance(params["visible_attributes"], str)
+    assert isinstance(params["sku_payload"], str)
+
+
+@pytest.mark.asyncio
+async def test_upsert_canonical_offer_carries_price_amount_into_three_columns(monkeypatch) -> None:
+    """The whole point of Phase 7d: external_product_seeds.price_amount
+    must reach catalog_offers as list_price + merchant_effective_price
+    + estimated_best_price so downstream JOINs surface a price for
+    Path B rows. Pin the 1:1 mapping."""
+    executed: list = []
+
+    class DummyDB:
+        async def execute(self, sql, params):
+            executed.append({"sql": str(sql), "params": dict(params)})
+
+    monkeypatch.setattr(mirror_module, "database", DummyDB())
+
+    pk = "prod::external_seed::external_seed::ext_abc"
+    row_dict = {
+        "id": "eps_123",
+        "external_product_id": "ext_abc",
+        "price_amount": 28.5,
+        "price_currency": "USD",
+        "availability": "in_stock",
+        "destination_url": "https://example.com/p/x",
+        "canonical_url": "https://example.com/p/x",
+        "domain": "example.com",
+        "market": "US",
+    }
+    await _upsert_canonical_offer_for_mirror_row(pk, row_dict)
+
+    assert len(executed) == 1
+    sql = executed[0]["sql"]
+    params = executed[0]["params"]
+    assert "INSERT INTO catalog_offers" in sql
+    assert "ON CONFLICT (offer_id) DO UPDATE" in sql
+    # Price flows into all three pricing columns (single-source seed).
+    assert params["list_price"] == 28.5
+    assert params["merchant_effective_price"] == 28.5
+    assert params["estimated_best_price"] == 28.5
+    assert params["currency"] == "USD"
+    assert params["sku_key"] == f"{pk}::canonical"
+    assert params["product_key"] == pk
+    assert params["merchant_id"] == MERCHANT_ID
+    assert params["catalog_track"] == "external_referral"
+    assert params["offer_mode"] == "redirect"
+    assert params["availability"] == "in_stock"
+    assert params["source_ref"] == "eps_123"
+    # offer_id deterministic from product_key + recognizable prefix
+    assert params["offer_id"].startswith(OFFER_ID_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch) -> None:
+    """If price_amount is NULL on the seed (some scrapers don't extract
+    it), the offer still writes — list_price stays NULL, price_confidence
+    is NULL, and the row appears in catalog_offers so the downstream
+    JOIN doesn't drop the product entirely. Better to surface "price
+    unavailable" than to hide the row."""
+    executed: list = []
+
+    class DummyDB:
+        async def execute(self, sql, params):
+            executed.append({"sql": str(sql), "params": dict(params)})
+
+    monkeypatch.setattr(mirror_module, "database", DummyDB())
+
+    pk = "prod::external_seed::external_seed::ext_xyz"
+    row_dict = {
+        "id": "eps_999",
+        "external_product_id": "ext_xyz",
+        "price_amount": None,
+        "price_currency": None,
+        "availability": "in_stock",
+        "destination_url": "https://example.com/p/y",
+        "canonical_url": None,
+        "domain": "example.com",
+        "market": "US",
+    }
+    await _upsert_canonical_offer_for_mirror_row(pk, row_dict)
+
+    params = executed[0]["params"]
+    assert params["list_price"] is None
+    assert params["merchant_effective_price"] is None
+    assert params["estimated_best_price"] is None
+    # Confidence must be NULL when price is — surfacing 0.6 confidence
+    # on a missing-price row would be a lie.
+    assert params["price_confidence"] is None
+    # Default currency falls back to USD so JOIN consumers don't choke
+    # on NULL string handling.
+    assert params["currency"] == "USD"
