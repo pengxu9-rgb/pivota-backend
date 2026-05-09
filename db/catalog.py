@@ -26,6 +26,10 @@ catalog_merchants = Table(
     Column("source_system", String(64), nullable=True),
     Column("source_ref", String(255), nullable=True),
     Column("metadata_json", JSONB_TYPE, nullable=True),
+    # PR-1b — opt-in for the auto-re-audit scheduler. 'none' | 'weekly'
+    # | 'monthly'. Migration 078_catalog_merchants_audit_schedule.sql
+    # adds the column with default 'none' to existing rows.
+    Column("audit_schedule", String(16), nullable=False, server_default="none"),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
 )

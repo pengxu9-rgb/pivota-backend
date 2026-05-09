@@ -625,10 +625,25 @@ async def startup_event():
     except Exception:
         pass
 
+    # PR-1b: APM auto-re-audit cron. Best-effort — start_scheduler
+    # logs + degrades gracefully if apscheduler is unavailable, so
+    # this won't crash the API on missing dep.
+    try:
+        from services.audit_scheduler import start_scheduler
+        await start_scheduler()
+    except Exception:
+        pass
+
 
 async def shutdown_event():
     await stop_agent_webhook_retry_worker()
     await stop_merchant_webhook_retry_worker()
+    # PR-1b: gracefully stop the audit scheduler.
+    try:
+        from services.audit_scheduler import stop_scheduler
+        await stop_scheduler()
+    except Exception:
+        pass
     await database.disconnect()
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
