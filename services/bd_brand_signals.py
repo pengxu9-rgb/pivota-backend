@@ -948,3 +948,313 @@ async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
         "press_coverage": press,
         "available": any(x is not None for x in (retail, founder, press)),
     }
+
+
+# ---------------------------------------------------------------------------
+# PR-D: Social-media intelligence (TikTok + Instagram)
+# ---------------------------------------------------------------------------
+#
+# Brands prioritize TikTok + Instagram presence when evaluating
+# distribution partners. We surface:
+#   1. Brand's own reach per platform (followers, view-per-post,
+#      content focus)
+#   2. KOL/creator endorsements per platform (top creators in 10k-1M
+#      band who posted about the brand in the last 12 months)
+#   3. Competitive social comparison vs category competitor brands
+#      (gated on competitor list — caller passes audit's
+#      category_competitor_brands when available)
+#
+# Why Gemini grounded vs paid social-intel APIs (Modash / HypeAuditor /
+# Tubular): paid APIs cost $300-10k/mo and need procurement. Gemini
+# grounded gives qualitative answers good enough for a BD pitch
+# artifact (creator names + competitive position reliable; exact
+# follower counts ±20%). UI tags this section "AI-grounded estimates ·
+# verify before pitching" so BD operators don't take counts as gospel.
+# Upgrade path documented in plan: wire each paid API as alternative
+# when configured; fall back to Gemini when not.
+
+
+def _detected_handle(detected: List[Dict[str, str]], platform: str) -> Optional[str]:
+    """Look up the brand's own handle for a platform from PR-B's
+    _extract_social_handles output. Returns None if not detected."""
+    for entry in detected or []:
+        if entry.get("platform") == platform:
+            return entry.get("handle")
+    return None
+
+
+def _build_own_presence_prompt(brand: str, platform: str, handle: Optional[str]) -> str:
+    handle_clause = (
+        f"Their {platform} handle is @{handle}." if handle
+        else f"Search for {brand}'s official {platform} account."
+    )
+    label = "TikTok" if platform == "tiktok" else "Instagram"
+    metric_hint = (
+        '"view_per_post_estimate"' if platform == "tiktok"
+        else '"engagement_rate_estimate"'
+    )
+    return f"""You are a social-media analyst. Estimate {brand}'s own {label} reach.
+
+{handle_clause}
+
+Reply with ONLY a JSON object. No prose:
+
+{{
+  "follower_estimate": 12000,            // integer estimate of follower count; null if unknown
+  "follower_band": "10k-100k",           // one of: "<10k", "10k-100k", "100k-1M", "1M-10M", ">10M", or null
+  {metric_hint}: 5000,    // numeric estimate; null if unknown
+  "content_focus": "product demos and lifestyle",  // 2-6 word phrase; null if unknown
+  "post_frequency": "3-4 per week",      // qualitative; null if unknown
+  "verified_account": true               // boolean; null if unknown
+}}
+
+Return null fields when you can't verify — don't guess. Reply with the JSON object only."""
+
+
+def _build_kol_prompt(brand: str, platform: str) -> str:
+    label = "TikTok" if platform == "tiktok" else "Instagram"
+    return f"""You are a creator-marketing analyst. List up to 8 {label} creators (10k-1M follower band) who have posted about {brand} in the last 12 months.
+
+For each creator give:
+- creator_handle: the @ handle
+- follower_band: one of "10k-100k", "100k-1M", "<10k", ">1M"
+- post_url: link to the specific post if findable, else null
+- view_count_estimate: rough view count, integer or null
+- post_date: ISO date YYYY-MM-DD if known, else year, else null
+- content_summary: one short sentence about the post
+
+Reply with ONLY a JSON array. No prose, no preamble:
+
+[
+  {{"creator_handle": "...", "follower_band": "...", "post_url": "...", "view_count_estimate": 12000, "post_date": "...", "content_summary": "..."}},
+  ...
+]
+
+If no endorsements found, reply with: []"""
+
+
+def _build_competitive_prompt(brand: str, competitors: List[str]) -> str:
+    competitor_list = ", ".join(competitors[:6])
+    return f"""You are a competitive social-media analyst. Compare {brand}'s TikTok + Instagram presence to these competitors: {competitor_list}.
+
+For each competitor brand give:
+- brand: the competitor brand name
+- tiktok_followers_estimate: integer estimate or null
+- instagram_followers_estimate: integer estimate or null
+- kol_endorsements_count_estimate: rough count of KOL posts (10k-1M followers) about that competitor in the last 12 months, integer or null
+- gap_summary: one sentence comparing this competitor's social position to {brand}'s
+
+Reply with ONLY a JSON array. No prose:
+
+[
+  {{"brand": "...", "tiktok_followers_estimate": 50000, "instagram_followers_estimate": 180000, "kol_endorsements_count_estimate": 12, "gap_summary": "..."}},
+  ...
+]
+
+If no comparable data, reply with: []"""
+
+
+_SUFFIX_MULT = {"k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000, "b": 1_000_000_000, "B": 1_000_000_000}
+_SUFFIX_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kKmMbB])$")
+
+
+def _coerce_int(v: Any) -> Optional[int]:
+    """Best-effort numeric coercion. Handles "12,000", "12k", "1.5M",
+    "180,000", etc. Used for follower / view count fields the LLM may
+    return in human-readable shorthand."""
+    if isinstance(v, bool):
+        return None  # bool is a subclass of int — exclude
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        cleaned = v.replace(",", "").strip()
+        m = _SUFFIX_RE.match(cleaned)
+        if m:
+            try:
+                return int(float(m.group(1)) * _SUFFIX_MULT[m.group(2)])
+            except (ValueError, KeyError):
+                return None
+        try:
+            return int(float(cleaned))
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_str(v: Any) -> Optional[str]:
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], api_key: str) -> Optional[Dict[str, Any]]:
+    payload = await _gemini_grounded_call(
+        _build_own_presence_prompt(brand, platform, handle), api_key=api_key,
+    )
+    if not payload:
+        return None
+    parsed = _unwrap_json(_parse_gemini_text(payload))
+    if not isinstance(parsed, dict):
+        return None
+    metric_key = "view_per_post_estimate" if platform == "tiktok" else "engagement_rate_estimate"
+    out: Dict[str, Any] = {
+        "platform": platform,
+        "handle": handle,
+        "follower_estimate": _coerce_int(parsed.get("follower_estimate")),
+        "follower_band": _coerce_str(parsed.get("follower_band")),
+        metric_key: _coerce_int(parsed.get(metric_key)) if platform == "tiktok"
+            else (parsed.get(metric_key) if isinstance(parsed.get(metric_key), (int, float, str)) else None),
+        "content_focus": _coerce_str(parsed.get("content_focus")),
+        "post_frequency": _coerce_str(parsed.get("post_frequency")),
+        "verified_account": parsed.get("verified_account") if isinstance(parsed.get("verified_account"), bool) else None,
+    }
+    # Don't surface a fully-empty result.
+    if not any(out[k] for k in ("follower_estimate", "follower_band", "content_focus")):
+        return None
+    return out
+
+
+async def _infer_kol_endorsements(brand: str, platform: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
+    payload = await _gemini_grounded_call(
+        _build_kol_prompt(brand, platform), api_key=api_key,
+    )
+    if not payload:
+        return None
+    parsed = _unwrap_json(_parse_gemini_text(payload))
+    if not isinstance(parsed, list):
+        return None
+    out: List[Dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        handle = _coerce_str(item.get("creator_handle"))
+        if not handle:
+            continue
+        # Strip leading @ from handle if model included it.
+        handle = handle.lstrip("@")
+        out.append({
+            "creator_handle": handle,
+            "follower_band": _coerce_str(item.get("follower_band")),
+            "post_url": _coerce_str(item.get("post_url")),
+            "view_count_estimate": _coerce_int(item.get("view_count_estimate")),
+            "post_date": _coerce_str(item.get("post_date")),
+            "content_summary": _coerce_str(item.get("content_summary")),
+        })
+    return out
+
+
+async def _infer_competitive_social(brand: str, competitors: List[str], api_key: str) -> Optional[List[Dict[str, Any]]]:
+    if not competitors:
+        return None
+    payload = await _gemini_grounded_call(
+        _build_competitive_prompt(brand, competitors), api_key=api_key,
+    )
+    if not payload:
+        return None
+    parsed = _unwrap_json(_parse_gemini_text(payload))
+    if not isinstance(parsed, list):
+        return None
+    out: List[Dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        name = _coerce_str(item.get("brand"))
+        if not name:
+            continue
+        out.append({
+            "brand": name,
+            "tiktok_followers_estimate": _coerce_int(item.get("tiktok_followers_estimate")),
+            "instagram_followers_estimate": _coerce_int(item.get("instagram_followers_estimate")),
+            "kol_endorsements_count_estimate": _coerce_int(item.get("kol_endorsements_count_estimate")),
+            "gap_summary": _coerce_str(item.get("gap_summary")),
+        })
+    return out
+
+
+async def infer_social_intelligence(
+    brand: str,
+    domain: str,
+    detected_handles: Optional[List[Dict[str, str]]] = None,
+    competitor_brands: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """4-5 Gemini grounded queries in parallel:
+    - own TikTok presence
+    - own Instagram presence
+    - TikTok KOL endorsements (last 12 months)
+    - Instagram KOL endorsements (last 12 months)
+    - Competitive social comparison (only when competitor_brands non-empty)
+
+    Returns:
+      {
+        "own_presence": {
+          "tiktok": {handle, follower_estimate, follower_band, view_per_post_estimate, content_focus, ...} | null,
+          "instagram": {handle, follower_estimate, follower_band, engagement_rate_estimate, content_focus, ...} | null,
+        },
+        "kol_endorsements": {
+          "tiktok": [...] | null,
+          "instagram": [...] | null,
+        },
+        "competitive_comparison": [...] | null,
+        "available": bool,  # at least one signal succeeded
+      }
+
+    Honesty: returns None / empty for any sub-call that failed parse;
+    {available: false} when no GEMINI_API_KEY or when brand+domain
+    inputs are empty. UI renders "data not available — manual research
+    recommended" instead of fabricating.
+
+    LLM-multiplier safety: 4-5 single-shot grounded calls per audit.
+    asyncio.gather parallelism keeps wall-time bounded at ~20s. Per-
+    merchant semaphore (cap=5) in agent_center_llm_client bounds
+    concurrent load across this + the audit probe pipeline.
+    """
+    api_key = _resolve_gemini_api_key()
+    empty = {
+        "own_presence": {"tiktok": None, "instagram": None},
+        "kol_endorsements": {"tiktok": None, "instagram": None},
+        "competitive_comparison": None,
+        "available": False,
+    }
+    if not api_key:
+        logger.info("social_intelligence: no GEMINI_API_KEY; skipping for %s", brand)
+        return empty
+    if not brand or not brand.strip() or not domain or not domain.strip():
+        return empty
+
+    tt_handle = _detected_handle(detected_handles or [], "tiktok")
+    ig_handle = _detected_handle(detected_handles or [], "instagram")
+    competitors = [c for c in (competitor_brands or []) if isinstance(c, str) and c.strip()]
+
+    coros = [
+        _infer_own_presence(brand, "tiktok", tt_handle, api_key),
+        _infer_own_presence(brand, "instagram", ig_handle, api_key),
+        _infer_kol_endorsements(brand, "tiktok", api_key),
+        _infer_kol_endorsements(brand, "instagram", api_key),
+    ]
+    if competitors:
+        coros.append(_infer_competitive_social(brand, competitors, api_key))
+
+    results = await asyncio.gather(*coros, return_exceptions=True)
+
+    def _safe(r: Any) -> Any:
+        return r if not isinstance(r, Exception) else None
+
+    out = {
+        "own_presence": {
+            "tiktok": _safe(results[0]),
+            "instagram": _safe(results[1]),
+        },
+        "kol_endorsements": {
+            "tiktok": _safe(results[2]),
+            "instagram": _safe(results[3]),
+        },
+        "competitive_comparison": _safe(results[4]) if competitors else None,
+    }
+    out["available"] = any(
+        v is not None for v in (
+            out["own_presence"]["tiktok"], out["own_presence"]["instagram"],
+            out["kol_endorsements"]["tiktok"], out["kol_endorsements"]["instagram"],
+            out["competitive_comparison"],
+        )
+    )
+    return out
