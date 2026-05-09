@@ -39,6 +39,7 @@ from services.outbound_links_service import (
     apply_utm,
     make_redirect_token,
 )
+from services.seed_content_audit import audit_seed_data
 from services.external_seed_audit import (
     MARKET_LOCALE_SEGMENT,
     audit_external_seed_row,
@@ -1840,6 +1841,18 @@ async def _upsert_storefront_referral_seed_candidate(
     if existing_row:
         existing_seed_data = _ensure_json_obj(dict(existing_row).get("seed_data"))
         seed_data = _preserve_seed_data_review_fields(seed_data, existing_seed_data)
+
+    # Auto-audit on every seed write (2026-05-09 follow-up to PR #409 +
+    # #410). Even with review_summary preserved, raw extraction
+    # content (HTML entities like `&rsquo;`, shade-name prefix
+    # contamination on Fenty INCI lists, etc.) was still landing in
+    # `description` / `pdp_ingredients_raw` because re-extraction
+    # rebuilds those text fields from scratch. Running the auditor
+    # here makes every storefront-seed write produce already-clean
+    # content. The auditor is deterministic (no LLM) so this adds
+    # negligible latency (microseconds per row).
+    seed_data, _audit_summary = audit_seed_data(seed_data)
+    seed_data["review_summary"] = _audit_summary
 
     values = {
         "external_product_id": external_product_id,
