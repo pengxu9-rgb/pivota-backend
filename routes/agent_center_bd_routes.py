@@ -54,6 +54,66 @@ logger = logging.getLogger(__name__)
 _HARD_MAX_RUNS = 8
 
 
+def _detect_mock_reports(reports: list) -> list:
+    """Return per-product reports whose upstream returned mock /
+    synthetic fallback data. Mirrors the merchant audit route's
+    `_detect_mock_per_product` (PR #366) — applied here to BD
+    routes to close the same fabrication-risk gap.
+
+    Three pollution sources in the audit pipeline (same as merchant
+    side):
+      1. `_local_mock_result` in services.agent_center_llm_client
+         fires when this backend's PIVOTA_AGENT_INTERNAL_API_KEY is
+         unset (returns provider="local_mock_no_internal_key")
+      2. Upstream Pivota-Agent service's mock fires when its own
+         Gemini key is unset (provider="mock_fallback_no_gemini_key")
+      3. Explicit provider="mock" via pivota_agent_center_mock_gemini
+         flag
+
+    Each produces upstream_status with is_real=False. Without this
+    guard, BD routes would render full diagnostic prose against
+    synthetic data — operator sees fabricated audit they might
+    forward to a brand without realizing.
+
+    Conservative default: missing/malformed `upstream_status` is
+    treated as REAL (is_real defaults True). Only explicit False
+    rejects.
+    """
+    return [
+        r for r in (reports or [])
+        if isinstance(r, dict)
+        and not (r.get("upstream_status") or {}).get("is_real", True)
+    ]
+
+
+def _raise_mock_rejection(mock_reports: list, route_name: str) -> None:
+    """Centralized 503 raise for mock-data rejection. Logs the same
+    structured warning the merchant route uses + returns the same
+    error shape so portal code can render a uniform mock banner."""
+    first_reason = (
+        (mock_reports[0].get("upstream_status") or {}).get("reason")
+        or "Upstream returned mock data."
+    )
+    logger.error(
+        "BD %s: refusing to ship mock-derived prose; "
+        "%d products had upstream_status.is_real=False",
+        route_name, len(mock_reports),
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "upstream_mock_fallback",
+            "message": (
+                f"Audit pipeline upstream returned synthetic fallback "
+                f"data ({first_reason!s}); refusing to render BD-facing "
+                f"prose. Check that PIVOTA_AGENT_INTERNAL_API_KEY and "
+                f"the upstream's GEMINI_API_KEY are configured. "
+                f"Re-run the audit once the upstream is real."
+            ),
+        },
+    )
+
+
 class BdExternalMerchantReportRequest(BaseModel):
     merchant_name: str = Field(..., min_length=1, max_length=200)
     merchant_pdp_url: str = Field(..., min_length=8, max_length=2000)
@@ -123,20 +183,13 @@ async def external_merchant_report(
         category_visibility_result=probes.get("category_visibility"),
         provider=body.provider,
     )
+    # Mock guard: refuse to ship BD-facing prose against synthetic
+    # data. Treats single-product report as a list of one for the
+    # shared helper. Mirrors PR #366's merchant-route guard.
+    mock_reports = _detect_mock_reports([report])
+    if mock_reports:
+        _raise_mock_rejection(mock_reports, "external-merchant-report")
     upstream_status = report.get("upstream_status") or {}
-    if not upstream_status.get("is_real"):
-        # Loud log when we shipped mock data despite a real-provider
-        # request — most likely root cause is missing env var on either
-        # backend (PIVOTA_AGENT_INTERNAL_API_KEY) or upstream
-        # (GEMINI_API_KEY). BD runs are useless without real data; ops
-        # should fix before any rep ships a report to a merchant.
-        logger.warning(
-            "BD report fell back to MOCK — requested=%s visibility=%s attribution=%s reason=%s",
-            upstream_status.get("requested_provider"),
-            upstream_status.get("visibility_provider"),
-            upstream_status.get("attribution_provider"),
-            upstream_status.get("reason"),
-        )
     logger.info(
         "BD report generated: merchant=%s product=%s verdict=%s vis=%d attr=%d "
         "requested_provider=%s upstream_visibility=%s is_real=%s",
@@ -220,6 +273,13 @@ async def brand_report(
         )
     except Exception as exc:
         raise _map_error(exc) from exc
+
+    # Mock guard: refuse to ship multi-product BD-facing prose against
+    # synthetic data. Closes the parallel of PR #366's merchant-route
+    # gap that was missed for BD routes.
+    mock_reports = _detect_mock_reports(out.get("per_product") or [])
+    if mock_reports:
+        _raise_mock_rejection(mock_reports, "brand-report")
 
     # Operational signals — log brand-level verdict + how many products
     # succeeded. Helps diagnose when a brand pitch came back weak
@@ -390,6 +450,13 @@ async def cold_start_audit(
         )
     except Exception as exc:
         raise _map_error(exc) from exc
+
+    # Mock guard: same protection as /brand-report — cold-start can
+    # also receive mock-derived per-product reports if upstream
+    # fell back. Reject before the operator sees fabricated prose.
+    mock_reports = _detect_mock_reports(out.get("per_product") or [])
+    if mock_reports:
+        _raise_mock_rejection(mock_reports, "cold-start-audit")
 
     agg = out.get("aggregate") or {}
     logger.info(
