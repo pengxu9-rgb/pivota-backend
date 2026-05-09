@@ -112,7 +112,14 @@ UPDATE_CATALOG_PRODUCTS_SQL = """
 
 async def _fetch_candidates(args: argparse.Namespace) -> List[Dict[str, Any]]:
     sql = _select_sql(force=args.force, limit=args.limit)
-    params: Dict[str, Any] = {"auditor_version": AUDITOR_VERSION}
+    # Only bind params that actually appear in the SQL — sqlalchemy /
+    # databases.text() rejects extra binds with `ArgumentError: This
+    # text() construct doesn't define a bound parameter named ...`.
+    # When force=True the SQL drops the :auditor_version bind, so we
+    # must drop it from params too.
+    params: Dict[str, Any] = {}
+    if not args.force:
+        params["auditor_version"] = AUDITOR_VERSION
     if args.limit > 0:
         params["limit"] = int(args.limit)
     rows = await database.fetch_all(sql, params)
