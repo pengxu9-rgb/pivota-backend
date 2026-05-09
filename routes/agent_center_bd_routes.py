@@ -626,4 +626,7 @@ def _build_discovery_block(discovered: Dict[str, Any]) -> Dict[str, Any]:
         # social handles, sitemap structure, robots, SEO completeness.
         # Frontend BrandSnapshot component renders from this block.
         "brand_signals": discovered.get("brand_signals"),
+        # PR-C Gemini-grounded brand context: retail presence, founder
+        # story, press coverage. Each sub-field independently nullable.
+        "brand_context": discovered.get("brand_context"),
     }
