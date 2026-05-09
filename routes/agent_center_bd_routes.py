@@ -659,22 +659,86 @@ def _aggregate_competitor_brands(
 @router.get("/cohort/{parent_audit_run_id}")
 async def get_cohort_audit_results(
     parent_audit_run_id: str,
+    include_comparison: bool = False,
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     """Return all competitor audit runs for a parent audit. Used by
     the BD portal cohort dashboard. Polls until the orchestrator
     finishes (status field on each entry shifts running → succeeded
-    or failed)."""
+    or failed).
+
+    PR-2b: pass `include_comparison=true` to also receive the
+    per-query breakdown + cross-brand mention matrix (joins this
+    cohort's reports with the parent audit's report). Heavier
+    payload — operators only enable when the cohort is fully
+    completed (still_running == 0).
+    """
     from db.competitor_audit_runs import cohort_for_parent_run
-    runs = await cohort_for_parent_run(parent_audit_run_id=parent_audit_run_id)
+    # Always fetch with include_reports=True when comparison requested
+    # (the cohort runs each carry their own report_jsonb that the
+    # comparison helper needs to read).
+    runs = await cohort_for_parent_run(
+        parent_audit_run_id=parent_audit_run_id,
+        include_reports=include_comparison,
+    )
     completed = [r for r in runs if r.get("status") in ("succeeded", "failed")]
-    return {
+    response: Dict[str, Any] = {
         "parent_audit_run_id": parent_audit_run_id,
         "cohort_size": len(runs),
         "completed_count": len(completed),
         "still_running": len(runs) - len(completed),
-        "runs": runs,
+        # Strip report_jsonb from the wire response — too large for
+        # the polling case. The comparison block carries the parts
+        # operators actually need.
+        "runs": [
+            {k: v for k, v in r.items() if k != "report_jsonb"}
+            for r in runs
+        ],
     }
+
+    if include_comparison:
+        # Fetch parent audit row to get its report_jsonb for the
+        # comparison input. Best-effort: if missing, comparison is
+        # cohort-only (no parent baseline, surfaces in summary).
+        from db.merchant_audit_runs import merchant_audit_runs
+        from db.database import database
+        from services.cohort_comparison import build_cohort_comparison
+
+        parent_report = None
+        parent_label = "(parent unknown)"
+        try:
+            row = await database.fetch_one(
+                merchant_audit_runs.select().where(
+                    merchant_audit_runs.c.run_id == parent_audit_run_id,
+                )
+            )
+            if row:
+                parent_report = dict(row).get("report_jsonb")
+                # Use merchant_id as label for the parent — for cold-
+                # start prospects this is the prospect_<hash> id; the
+                # frontend can pretty-print to brand name. For real
+                # merchant audits, it's the merchant_id.
+                parent_label = dict(row).get("merchant_id") or parent_label
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cohort comparison: parent fetch failed for %s: %s",
+                parent_audit_run_id, exc,
+            )
+
+        # If the parent_report has a merchant_name, use it as the
+        # human-friendly label.
+        if isinstance(parent_report, dict):
+            mn = parent_report.get("merchant_name")
+            if isinstance(mn, str) and mn.strip():
+                parent_label = mn.strip()
+
+        response["comparison"] = build_cohort_comparison(
+            parent_report=parent_report,
+            parent_label=parent_label,
+            cohort_runs=runs,
+        )
+
+    return response
 
 
 @router.post("/cold-start-audit/export")

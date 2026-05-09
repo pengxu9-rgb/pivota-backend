@@ -208,9 +208,18 @@ async def record_competitor_run_completed(
 async def cohort_for_parent_run(
     *,
     parent_audit_run_id: str,
+    include_reports: bool = False,
 ) -> List[Dict[str, Any]]:
     """All competitor audit runs (any status) for one parent. Used by
-    the cohort dashboard endpoint."""
+    the cohort dashboard endpoint.
+
+    Default `include_reports=False` keeps the response payload small
+    for the polling-during-cohort-running case (frontend doesn't need
+    the full report jsonb for each entry, just status + scores).
+    Pass `include_reports=True` from server-side comparison code that
+    needs to read each cohort run's report_jsonb (e.g.
+    services/cohort_comparison.build_cohort_comparison).
+    """
     await ensure_competitor_audit_runs_table()
     try:
         rows = await database.fetch_all(
@@ -229,7 +238,7 @@ async def cohort_for_parent_run(
     out: List[Dict[str, Any]] = []
     for row in rows or []:
         d = dict(row)
-        out.append({
+        entry = {
             "run_id": str(d.get("run_id")) if d.get("run_id") else None,
             "parent_audit_run_id": (
                 str(d.get("parent_audit_run_id"))
@@ -251,7 +260,10 @@ async def cohort_for_parent_run(
             "attribution_score_avg": d.get("attribution_score_avg"),
             "category_visibility_score_avg": d.get("category_visibility_score_avg"),
             "error_message": d.get("error_message"),
-        })
+        }
+        if include_reports:
+            entry["report_jsonb"] = d.get("report_jsonb")
+        out.append(entry)
     return out
 
 
