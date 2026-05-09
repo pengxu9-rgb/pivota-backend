@@ -2439,6 +2439,7 @@ def _build_what_pivota_changes(
 
 def _build_history_trend(
     prior_runs: Optional[List[Dict[str, Any]]],
+    current_scores: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """PR-C: distill the merchant's last few audit runs into a trend
     summary the merchant_view.tracking block can render. None when
@@ -2448,6 +2449,12 @@ def _build_history_trend(
     We use the most-recent succeeded run's scores as the comparison
     baseline — delta from THIS audit shows the merchant whether they're
     moving up, flat, or down since last time.
+
+    PR-1a (APM): when `current_scores` is provided (the just-completed
+    audit's verdict scores), compute `delta_from_most_recent` so the
+    portal can render "+12 visibility, -3 attribution since last
+    audit" badges. None when current_scores absent — caller can still
+    render the sparkline from `series`.
     """
     succeeded = [
         r for r in (prior_runs or [])
@@ -2457,6 +2464,31 @@ def _build_history_trend(
     if not succeeded:
         return None
     most_recent = succeeded[0]
+
+    # Compute delta vs most-recent prior run when current scores
+    # available. None for any score the current audit didn't measure
+    # (e.g. category_visibility skipped because product_type missing
+    # — in that case the delta is meaningless).
+    delta_from_most_recent: Optional[Dict[str, Any]] = None
+    if current_scores:
+        def _delta(curr_key: str, prior_key: str) -> Optional[int]:
+            curr = current_scores.get(curr_key)
+            prior = most_recent.get(prior_key)
+            if curr is None or prior is None:
+                return None
+            return int(curr) - int(prior)
+
+        delta_from_most_recent = {
+            "visibility": _delta("visibility", "visibility_score_avg"),
+            "attribution": _delta("attribution", "attribution_score_avg"),
+            "category_visibility": _delta(
+                "category_visibility", "category_visibility_score_avg",
+            ),
+            "days_since_last_audit": _days_between(
+                most_recent.get("requested_at"),
+            ),
+        }
+
     return {
         "audits_in_history": len(succeeded),
         "most_recent_audit": {
@@ -2467,6 +2499,7 @@ def _build_history_trend(
             "category_visibility": most_recent.get("category_visibility_score_avg"),
             "verdict_labels": most_recent.get("verdict_labels") or [],
         },
+        "delta_from_most_recent": delta_from_most_recent,
         # The series for sparkline rendering (oldest → newest within
         # the history window). Capped at the # of prior_runs we got.
         "series": [
@@ -2479,6 +2512,24 @@ def _build_history_trend(
             for r in reversed(succeeded)
         ],
     }
+
+
+def _days_between(iso_timestamp: Optional[str]) -> Optional[int]:
+    """Return integer days from `iso_timestamp` to now (UTC). None when
+    the input isn't parseable. Helper for trend delta rendering — the
+    portal shows '+12 visibility (over 14 days)' not just '+12'."""
+    if not iso_timestamp:
+        return None
+    try:
+        # Handle both '...Z' and '...+00:00' shapes.
+        s = iso_timestamp.replace("Z", "+00:00")
+        prior = datetime.fromisoformat(s)
+        if prior.tzinfo is None:
+            prior = prior.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    delta = datetime.now(timezone.utc) - prior
+    return max(0, int(delta.total_seconds() // 86400))
 
 
 def _build_failed_queries_detailed(
@@ -2785,6 +2836,7 @@ def _build_tracking_block(
     integration_state: Optional[Dict[str, Any]],
     pivota_baseline: Dict[str, Any],
     your_gap_to_baseline: Dict[str, int],
+    current_scores: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Tracking block for merchant_view. Suppresses content that's
     irrelevant or misleading for cold-start (BD pre-pitch) audits:
@@ -2792,12 +2844,22 @@ def _build_tracking_block(
       - pivota_baseline_reference → showing Pivota's own indexing-up
         figures to a cold target is anti-pitch material
     For real merchant audits, both fields populate as before.
+
+    PR-1a (APM): cold-start audits NOW persist to merchant_audit_runs
+    with a synthetic prospect id (see routes/agent_center_bd_routes
+    cold_start_audit handler). When prior_runs is non-empty for a
+    cold-start target, history STILL renders — operator can re-audit
+    a prospect in 30 days and see trend deltas without onboarding.
+    The history_link gating below stays in place because the
+    /api/merchant-center/audit/history route requires merchant auth
+    that cold-start prospects don't have; portal renders trend from
+    the inline history block instead.
     """
     cold_start = _is_cold_start_audit(integration_state)
     block: Dict[str, Any] = {
         "next_audit_eligible_at": None,
         "history_link": None if cold_start else "/api/merchant-center/audit/history",
-        "history": _build_history_trend(prior_runs),
+        "history": _build_history_trend(prior_runs, current_scores=current_scores),
         "your_gap_to_baseline": your_gap_to_baseline if not cold_start else None,
     }
     if not cold_start:
@@ -3164,6 +3226,11 @@ def _build_merchant_view(
             integration_state=integration_state,
             pivota_baseline=pivota_baseline,
             your_gap_to_baseline=your_gap_to_baseline,
+            current_scores={
+                "visibility": visibility_score,
+                "attribution": attribution_score,
+                "category_visibility": category_visibility_score,
+            },
         ),
         "pivota_value_prop": what_pivota_changes,
     }
