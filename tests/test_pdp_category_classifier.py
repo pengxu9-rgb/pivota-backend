@@ -27,6 +27,14 @@ from services.pdp_category_classifier import (  # noqa: E402
         ("lipstick", "beauty/makeup/lip/"),
         ("matte lipstick under $30", "beauty/makeup/lip/"),
         ("nude lipstick everyday", "beauty/makeup/lip/"),
+        # 2026-05-09 regression: user typed "lip stick" and "lip-stick"
+        # variants in chat; these must classify identically to "lipstick"
+        # so recall hits beauty/makeup/lip/ instead of falling back to
+        # the skincare default term list (sunscreen/cleanser/moisturizer/serum).
+        ("lip stick", "beauty/makeup/lip/"),
+        ("red lip stick", "beauty/makeup/lip/"),
+        ("recommend some lip stick with red color", "beauty/makeup/lip/"),
+        ("lip-stick", "beauty/makeup/lip/"),
         # ZH after PR-04 expansion: "口红" → "口红 lipstick" reaches recall
         ("口红 lipstick", "beauty/makeup/lip/"),
         ("foundation", "beauty/makeup/face/"),
