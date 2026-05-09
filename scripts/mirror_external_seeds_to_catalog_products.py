@@ -278,7 +278,15 @@ async def _upsert_canonical_sku_for_mirror_row(
             "merchant_id": MERCHANT_ID,
             "platform": PLATFORM,
             "source_product_id": row_dict.get("external_product_id"),
-            "source_variant_id": "canonical",
+            # Phase 7d fix: the catalog_skus unique index
+            # `idx_catalog_skus_source_identity` is on
+            # (merchant_id, platform, source_variant_id) — only 3
+            # columns. A literal 'canonical' here makes every Path B
+            # sku collide with the first inserted one. Match Path C
+            # agent's convention (product_key as source_variant_id;
+            # sku_key = source_variant_id + '::canonical') so each
+            # product has a distinct identity tuple.
+            "source_variant_id": product_key,
             "sku": row_dict.get("external_product_id"),
             "barcode": None,
             "title": row_dict.get("title"),

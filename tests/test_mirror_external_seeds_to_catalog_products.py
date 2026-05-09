@@ -265,7 +265,13 @@ async def test_upsert_canonical_sku_writes_path_C_compatible_shape(monkeypatch) 
     assert params["merchant_id"] == MERCHANT_ID
     assert params["platform"] == PLATFORM
     assert params["source_product_id"] == "ext_abc"
-    assert params["source_variant_id"] == "canonical"
+    # Phase 7d fix: source_variant_id = product_key (NOT literal
+    # 'canonical'). The unique index `idx_catalog_skus_source_identity`
+    # is on (merchant_id, platform, source_variant_id) only 3 columns —
+    # so a literal would collide on every row past the first. Pin the
+    # product_key convention (matches Path C agent) so a future refactor
+    # can't accidentally re-introduce the collision.
+    assert params["source_variant_id"] == pk
     assert params["title"] == "Test Product"
     assert params["currency"] == "USD"
     assert params["readiness_tier"] == READINESS_TIER
