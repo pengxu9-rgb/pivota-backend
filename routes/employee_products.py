@@ -466,6 +466,51 @@ def _ensure_json_obj(val: Any) -> Dict[str, Any]:
     return {}
 
 
+# Fields that codex's seed-content-audit + seed-correction skills
+# write into external_product_seeds.seed_data after a manual review.
+# When catalog-intelligence re-extracts a product (via storefront-seed
+# backfill, manual edits, etc.) we MUST NOT clobber these — otherwise
+# the cycle is "codex reviews → backend backfills → review wiped" and
+# all curated data quality work is lost on the next refresh.
+#
+# Found from prod data audit 2026-05-09: 253 rows have `review_summary`,
+# 21 have `reviewed_product_specs_v1`, 12 have `reviewed_ingredient_ids`,
+# 10 have `audit`, 8 have `review_status`, 4 have `audit_quarantine`.
+# All sourced from codex skills per docs/CODEX_SKILLS.md.
+_SEED_DATA_REVIEW_PRESERVE_KEYS: Tuple[str, ...] = (
+    "review_summary",
+    "reviewed_ingredient_ids",
+    "reviewed_product_specs_v1",
+    "review_status",
+    "audit",
+    "audit_quarantine",
+)
+
+
+def _preserve_seed_data_review_fields(
+    new_seed_data: Dict[str, Any],
+    existing_seed_data: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Copy codex-written review/audit fields from `existing_seed_data`
+    into `new_seed_data`. Existing values win — re-extraction never
+    has these fields and shouldn't overwrite them with null.
+
+    Returns the same `new_seed_data` dict (mutated in place + returned
+    for ergonomic chaining)."""
+    if not isinstance(existing_seed_data, dict):
+        return new_seed_data
+    for key in _SEED_DATA_REVIEW_PRESERVE_KEYS:
+        existing_val = existing_seed_data.get(key)
+        if existing_val is None:
+            continue
+        # Skip if the new payload already has a non-null value for this key
+        # (rare, but allows an explicit re-review to win).
+        if new_seed_data.get(key) is not None:
+            continue
+        new_seed_data[key] = existing_val
+    return new_seed_data
+
+
 def _ensure_json_list(val: Any) -> List[Any]:
     if isinstance(val, list):
         return val
@@ -1784,6 +1829,17 @@ async def _upsert_storefront_referral_seed_candidate(
             "variants": list(candidate.get("variants") or []),
         },
     }
+
+    # Preserve codex-curated review/audit fields when re-mirroring an
+    # existing seed. Without this, the catalog-intelligence backfill
+    # cycle wipes review_summary / reviewed_ingredient_ids / audit /
+    # etc. on every run — the user-reported "codex reviewed and
+    # re-backfilled again and again" symptom traces back to this code
+    # path overwriting `seed_data` wholesale. See
+    # _preserve_seed_data_review_fields docstring + audit 2026-05-09.
+    if existing_row:
+        existing_seed_data = _ensure_json_obj(dict(existing_row).get("seed_data"))
+        seed_data = _preserve_seed_data_review_fields(seed_data, existing_seed_data)
 
     values = {
         "external_product_id": external_product_id,
