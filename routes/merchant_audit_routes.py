@@ -559,9 +559,41 @@ async def run_merchant_self_audit(
         run_id or "(persistence-skipped)",
     )
 
+    # PR-4a: dispatch executor agents in the background. Closes the
+    # loop on advisory actions: instead of just rendering "submit your
+    # sitemap to GSC" in the report, the GscUrlSubmissionAgent
+    # actually does it. Best-effort + fire-and-forget — agent failures
+    # don't affect the audit response.
+    executor_summary = None
+    try:
+        import asyncio as _asyncio
+        from services.executor_agents.base import ExecutorContext
+        from services.executor_agents.dispatcher import dispatch_agents
+        ctx = ExecutorContext(
+            merchant_id=merchant_id,
+            parent_audit_run_id=run_id,
+            audit_report=brand_report,
+        )
+        # Fire-and-forget: don't block the response on executor work
+        # (GSC submissions can take ~30s for large catalogs).
+        _asyncio.create_task(
+            dispatch_agents(ctx),
+            name=f"executor-dispatch-{run_id}",
+        )
+        executor_summary = {
+            "queued": True,
+            "poll_via_executor_runs_table": True,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "executor dispatch enqueue failed for merchant=%s: %s",
+            merchant_id, exc,
+        )
+
     return {
         "brand_report": brand_report,
         "rate_limit_remaining": remaining,
+        "executors": executor_summary,
         # product_keys whose audit URL was the Pivota canonical PDP
         # (not the merchant's own URL) — UI surfaces a note that the
         # score reflects Pivota's hosted surface, which is in the
