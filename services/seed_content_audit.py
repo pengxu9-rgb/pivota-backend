@@ -88,20 +88,38 @@ _INGREDIENT_FIELDS_TO_DESHADE: Tuple[str, ...] = (
 )
 
 
+_HTML_DECODE_MAX_ITERATIONS = 5
+
+
 def html_entity_decode(text: Optional[str]) -> Optional[str]:
     """Decode HTML entities (`&rsquo;` → `'`, `&nbsp;` → space, etc.).
-    Returns the input unchanged when not a string."""
+    Returns the input unchanged when not a string.
+
+    **Recursive decode**. Some upstream pipelines double-encode (e.g.
+    `&amp;amp;` for what was originally `&`); a single `html.unescape`
+    call only peels one layer (`&amp;amp;` → `&amp;`), leaving stale
+    entities behind. Confirmed in prod 2026-05-09 on Glow Recipe Plum
+    Plump description (\\"&amp;\\" persisted after one audit pass).
+    Iterate until the string stops changing, capped at
+    _HTML_DECODE_MAX_ITERATIONS to avoid pathological inputs."""
     if text is None or not isinstance(text, str):
         return text
-    return html.unescape(text)
+    for _ in range(_HTML_DECODE_MAX_ITERATIONS):
+        decoded = html.unescape(text)
+        if decoded == text:
+            return decoded
+        text = decoded
+    # Hit the cap — return whatever we got. In practice 1-2 iterations
+    # cover all known cases; 5 is paranoid headroom.
+    return text
 
 
 def has_html_entities(text: Optional[str]) -> bool:
-    """Heuristic: a string contains HTML entities if `html.unescape`
-    returns a different value. Cheap; runs the decode anyway."""
+    """True iff the string contains HTML entities that the recursive
+    decoder would change. Equivalent to: html_entity_decode(text) != text."""
     if not isinstance(text, str):
         return False
-    return html.unescape(text) != text
+    return html_entity_decode(text) != text
 
 
 def strip_shade_name_prefix(ingredients: Optional[str]) -> Optional[str]:
