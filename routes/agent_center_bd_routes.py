@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field, validator
 
 from services.agent_center_bd_report_service import (
@@ -499,6 +499,104 @@ async def cold_start_audit(
         "discovery": _build_discovery_block(discovered),
         "brand_report": out,
     }
+
+
+@router.post("/cold-start-audit/export")
+async def cold_start_audit_export(
+    body: BdColdStartAuditRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Response:
+    """Same as /cold-start-audit but returns the report as a markdown
+    file download instead of JSON. BD operators can then take the .md
+    to a meeting, paste into a deck, or convert to PDF via any
+    markdown processor (e.g. browser print on the rendered HTML).
+
+    Wraps render_brand_markdown over the full brand_report.
+    """
+    from services.bd_cold_start_service import (
+        BrandDiscoveryError,
+        discover_products_for_audit,
+    )
+    from services.agent_center_bd_report_service import render_brand_markdown
+    import re as _re
+
+    try:
+        discovered = await discover_products_for_audit(
+            body.url,
+            max_products=body.max_products,
+            market=body.market,
+            persist=not body.dry_run,
+        )
+    except BrandDiscoveryError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "discovery_failed", "message": str(exc)},
+        )
+
+    if not discovered.get("products"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "discovery_failed",
+                "message": "Discovery returned zero products; nothing to export.",
+            },
+        )
+
+    if body.dry_run:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "dry_run_not_exportable",
+                "message": (
+                    "Markdown export requires a real audit run. "
+                    "Set dry_run=false."
+                ),
+            },
+        )
+
+    cold_start_integration_state: Dict[str, Any] = {
+        "store_platform_integrated": False,
+        "psp_integrated": False,
+        "gsc_integrated": False,
+        "fully_integrated": False,
+        "missing_pieces": ["store_platform", "psp"],
+        "integration_completed_at": None,
+        "store_platform_name": None,
+        "psp_provider": None,
+        "store_connected_at": None,
+    }
+
+    try:
+        out = await run_brand_report(
+            merchant_name=discovered["merchant_name"],
+            merchant_domain=discovered.get("merchant_domain"),
+            products=discovered["products"],
+            provider=body.provider,
+            max_runs=body.max_runs,
+            include_category_visibility=body.include_category_visibility,
+            integration_state=cold_start_integration_state,
+        )
+    except Exception as exc:
+        raise _map_error(exc) from exc
+
+    mock_reports = _detect_mock_reports(out.get("per_product") or [])
+    if mock_reports:
+        _raise_mock_rejection(mock_reports, "cold-start-audit/export")
+
+    markdown = render_brand_markdown(out, discovery=discovered)
+
+    # Filename-safe brand slug. Strip non-alphanum, lowercase.
+    brand = discovered.get("merchant_name") or "brand"
+    slug = _re.sub(r"[^A-Za-z0-9]+", "-", brand).strip("-").lower() or "brand"
+    filename = f"{slug}-readiness-report.md"
+
+    return Response(
+        content=markdown,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
 
 
 def _build_discovery_block(discovered: Dict[str, Any]) -> Dict[str, Any]:

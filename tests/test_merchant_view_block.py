@@ -49,7 +49,10 @@ def _category_run(query: str, *, excerpt: str = "", grounding_sources=None):
     }
 
 
-def _build_invisible_report(url_source: str | None = None) -> Dict[str, Any]:
+def _build_invisible_report(
+    url_source: str | None = None,
+    integration_state: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     """Helper: build a structured report for an INVISIBLE-tier audit
     matching the test merchant's sleepwear scenario shape. Inputs are
     minimal so the assertions can target merchant_view shape precisely."""
@@ -95,6 +98,7 @@ def _build_invisible_report(url_source: str | None = None) -> Dict[str, Any]:
         },
         provider="gemini",
         url_source=url_source,
+        integration_state=integration_state,
     )
 
 
@@ -319,3 +323,112 @@ def test_pivota_value_prop_references_what_pivota_changes():
     and is surfaced in merchant_view under a clearly-labeled key."""
     report = _build_invisible_report()
     assert report["merchant_view"]["pivota_value_prop"] == report["what_pivota_changes"]
+
+
+# ---------------------------------------------------------------------
+# Cold-start gating — Phase 0 demote + tracking suppression for BD
+# employee-portal flow. The cold-start synthetic integration_state
+# (fully_integrated=False AND missing_pieces=[store_platform, psp])
+# signals a non-Pivota target; the integration CTA stays in
+# pivota_value_prop but does NOT prepend to merchant_view.actions.
+# ---------------------------------------------------------------------
+
+
+_COLD_START_STATE: Dict[str, Any] = {
+    "store_platform_integrated": False,
+    "psp_integrated": False,
+    "gsc_integrated": False,
+    "fully_integrated": False,
+    "missing_pieces": ["store_platform", "psp"],
+    "integration_completed_at": None,
+    "store_platform_name": None,
+    "psp_provider": None,
+    "store_connected_at": None,
+}
+
+
+def test_cold_start_does_not_prepend_phase_0_to_actions():
+    """For cold-start audits, the diagnostic action ladder must not be
+    led by 'Complete Pivota integration' — that's pitch material, not
+    a finding. Pitch lives separately in pivota_value_prop."""
+    report = _build_invisible_report(integration_state=_COLD_START_STATE)
+    actions = report["merchant_view"]["actions"]
+    # actions[] should still be populated (data-bound diagnostic items)
+    assert actions, "expected diagnostic actions for INVISIBLE tier"
+    # but NONE should have lever=pivota_integration
+    levers = [a.get("lever") for a in actions]
+    assert "pivota_integration" not in levers, (
+        f"Phase 0 leaked into cold-start actions: {levers}"
+    )
+
+
+def test_cold_start_pivota_value_prop_still_present():
+    """Phase 0 demote doesn't drop the pitch — it only moves it.
+    pivota_value_prop must still surface the integration content."""
+    report = _build_invisible_report(integration_state=_COLD_START_STATE)
+    vp = report["merchant_view"]["pivota_value_prop"]
+    assert vp, "pivota_value_prop should remain populated after Phase 0 demote"
+
+
+def test_merchant_audit_phase_0_still_prepended_when_unintegrated():
+    """Regression guard: the cold-start demote must be narrowly
+    targeted. A real merchant audit (only some pieces missing, not
+    the cold-start "everything missing" shape) must still surface
+    pivota_integration in actions."""
+    only_psp_missing = {
+        "store_platform_integrated": True,
+        "psp_integrated": False,
+        "gsc_integrated": True,
+        "fully_integrated": False,
+        "missing_pieces": ["psp"],
+    }
+    report = _build_invisible_report(integration_state=only_psp_missing)
+    actions = report["merchant_view"]["actions"]
+    levers = [a.get("lever") for a in actions]
+    assert "pivota_integration" in levers, (
+        f"non-cold-start merchant audit should still emit Phase 0: {levers}"
+    )
+
+
+# ---------------------------------------------------------------------
+# Brand-level markdown export — render_brand_markdown wraps per-product
+# rendering with a brand-level header so the cold-start /export
+# endpoint can return one downloadable .md file per audit.
+# ---------------------------------------------------------------------
+
+
+def test_render_brand_markdown_includes_brand_header_and_per_product_sections():
+    from services.agent_center_bd_report_service import render_brand_markdown
+    # Build a 2-product brand_report shape
+    p1 = _build_invisible_report()
+    p2 = _build_invisible_report()
+    brand_report = {
+        "merchant_name": "TestSleepwear",
+        "merchant_domain": "testsleepwear.com",
+        "timestamp": "2026-05-09T05:30:00Z",
+        "aggregate": {
+            "brand_verdict_label": "INVISIBLE",
+            "brand_verdict_explanation": "0/3 cited.",
+            "avg_visibility": 0,
+            "avg_attribution": 0,
+            "avg_category_visibility": None,
+            "products_count": 2,
+        },
+        "cross_product_competitors": [{"host": "nordstrom.com", "times_cited": 2}],
+        "failed": [],
+        "per_product": [p1, p2],
+    }
+    md = render_brand_markdown(brand_report)
+    # Brand header
+    assert "# AI Commerce Readiness Report — TestSleepwear" in md
+    assert "testsleepwear.com" in md
+    # Aggregate section + null category gracefully rendered
+    assert "## Brand-level summary" in md
+    assert "INVISIBLE" in md
+    assert "_(not measured)_" in md  # avg_category_visibility=None
+    # Cross-product hosts table
+    assert "## Hosts capturing this brand's AI traffic" in md
+    assert "nordstrom.com" in md
+    # Both products embedded
+    assert "Product 1 of 2" in md
+    assert "Product 2 of 2" in md
