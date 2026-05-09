@@ -562,9 +562,8 @@ def _build_competitive_pressure(
             )
         framing = (
             f"Of the {len(peers_named)} competitor brands AI agents named "
-            f"in this category, none had a .com that we matched to a "
-            f"grounding source for these queries (the matcher is "
-            f"heuristic — see follow-up on brand-from-grounding detection). "
+            f"in this category, none had their own .com cited in the "
+            f"grounding for these queries. "
             f"{cited_phrase[0].upper() + cited_phrase[1:]}."
         )
 
@@ -1969,16 +1968,11 @@ def _build_what_pivota_changes(
                     "this report measures."
                 ),
                 "pivota_status": (
-                    f"**Indexing-up phase.** "
-                    f"{PIVOTA_PDP_BASELINE_REFERENCE['cited_count']}/"
-                    f"{PIVOTA_PDP_BASELINE_REFERENCE['succeeded_count']} "
-                    f"Pivota canonical PDPs cited in Gemini grounding "
-                    f"as of "
-                    f"{PIVOTA_PDP_BASELINE_REFERENCE['as_of_date']} — "
-                    f"30-90 day arc post-publication, working through "
-                    f"Search Console URL Inspection. See "
-                    f"`reports/pivota-pdp-baseline.md` for live "
-                    f"operational health."
+                    "**Indexing-up phase.** Pivota canonical PDPs are in "
+                    "the typical 30-90 day post-publication arc working "
+                    "through Search Console URL Inspection. The mechanics "
+                    "below are shipped; Google indexing latency is the "
+                    "rate-limiting step before grounded-citation lift."
                 ),
                 "merchant_metric": "attribution_score",
                 "mechanics": [
@@ -2769,6 +2763,55 @@ def _build_competitive_table(
     return rows
 
 
+def _is_cold_start_audit(integration_state: Optional[Dict[str, Any]]) -> bool:
+    """A cold-start audit's integration_state is the synthetic
+    "totally unintegrated" shape minted by /bd/cold-start-audit:
+    fully_integrated=False AND missing_pieces includes both
+    store_platform AND psp. For these targets, history endpoints
+    don't exist (no merchant_id) and Pivota's own indexing baseline
+    is irrelevant context (the merchant hasn't onboarded yet).
+    """
+    if not integration_state:
+        return False
+    if integration_state.get("fully_integrated"):
+        return False
+    missing = integration_state.get("missing_pieces") or []
+    return "store_platform" in missing and "psp" in missing
+
+
+def _build_tracking_block(
+    *,
+    prior_runs: Optional[List[Dict[str, Any]]],
+    integration_state: Optional[Dict[str, Any]],
+    pivota_baseline: Dict[str, Any],
+    your_gap_to_baseline: Dict[str, int],
+) -> Dict[str, Any]:
+    """Tracking block for merchant_view. Suppresses content that's
+    irrelevant or misleading for cold-start (BD pre-pitch) audits:
+      - history_link → cold targets have no merchant_id, no history
+      - pivota_baseline_reference → showing Pivota's own indexing-up
+        figures to a cold target is anti-pitch material
+    For real merchant audits, both fields populate as before.
+    """
+    cold_start = _is_cold_start_audit(integration_state)
+    block: Dict[str, Any] = {
+        "next_audit_eligible_at": None,
+        "history_link": None if cold_start else "/api/merchant-center/audit/history",
+        "history": _build_history_trend(prior_runs),
+        "your_gap_to_baseline": your_gap_to_baseline if not cold_start else None,
+    }
+    if not cold_start:
+        block["pivota_baseline_reference"] = {
+            "visibility": pivota_baseline.get("median_visibility"),
+            "attribution": pivota_baseline.get("median_attribution"),
+            "as_of": pivota_baseline.get("as_of_date"),
+            "indexing_phase": pivota_baseline.get("indexing_phase"),
+        }
+    else:
+        block["pivota_baseline_reference"] = None
+    return block
+
+
 def _build_merchant_view(
     *,
     verdict_label: str,
@@ -3108,19 +3151,12 @@ def _build_merchant_view(
             ),
         },
         "actions": merged_actions,
-        "tracking": {
-            # PR-C populates these from merchant_audit_runs history.
-            "next_audit_eligible_at": None,
-            "history_link": "/api/merchant-center/audit/history",
-            "history": _build_history_trend(prior_runs),
-            "pivota_baseline_reference": {
-                "visibility": pivota_baseline.get("median_visibility"),
-                "attribution": pivota_baseline.get("median_attribution"),
-                "as_of": pivota_baseline.get("as_of_date"),
-                "indexing_phase": pivota_baseline.get("indexing_phase"),
-            },
-            "your_gap_to_baseline": your_gap_to_baseline,
-        },
+        "tracking": _build_tracking_block(
+            prior_runs=prior_runs,
+            integration_state=integration_state,
+            pivota_baseline=pivota_baseline,
+            your_gap_to_baseline=your_gap_to_baseline,
+        ),
         "pivota_value_prop": what_pivota_changes,
     }
 
