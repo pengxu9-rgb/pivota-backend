@@ -46,6 +46,30 @@ def test_select_sql_force_processes_all_rows() -> None:
     assert "review_summary" not in sql
 
 
+@pytest.mark.asyncio
+async def test_fetch_candidates_omits_auditor_version_param_when_force(monkeypatch) -> None:
+    """Regression 2026-05-09: when --force, the SQL drops
+    `:auditor_version`, but the worker was still passing
+    `auditor_version` in the params dict. databases.text() rejects
+    extra binds with ArgumentError. Pin the conditional binding."""
+    captured: list = []
+
+    async def fake_fetch_all(sql, params):
+        captured.append(dict(params))
+        return []
+
+    monkeypatch.setattr(worker.database, "fetch_all", fake_fetch_all)
+
+    await worker._fetch_candidates(_ns(force=True, limit=10))
+    assert "auditor_version" not in captured[0]
+    assert captured[0].get("limit") == 10
+
+    captured.clear()
+    await worker._fetch_candidates(_ns(force=False, limit=10))
+    assert captured[0].get("auditor_version") == worker.AUDITOR_VERSION
+    assert captured[0].get("limit") == 10
+
+
 def test_select_sql_omits_limit_clause_when_zero() -> None:
     """limit=0 means 'all rows' — the LIMIT clause must be skipped
     entirely (Postgres doesn't accept LIMIT 0 as 'no limit')."""
