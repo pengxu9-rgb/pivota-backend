@@ -505,3 +505,401 @@ async def test_sitemap_agent_execute_no_merchant_id_returns_skipped():
     agent = SitemapFreshnessAgent()
     result = await agent.execute(ExecutorContext(merchant_id=None))
     assert result.status == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# PR-4c: ContentBriefGeneratorAgent
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from services.executor_agents.content_brief import (
+    ContentBriefGeneratorAgent,
+    _build_brief_prompt,
+    _derive_brand_from_audit,
+    _extract_failed_category_queries,
+    _parse_brief_response,
+)
+
+
+def _make_audit_with_category_queries(
+    *, merchant_name: str = "TestBrand",
+    products: list,
+) -> dict:
+    """Build a minimal audit_report shape. Each product entry:
+    {queries: [{query, cited_urls_count}], match_details: [{query, matched}]}.
+    """
+    per_product = []
+    for p in products:
+        per_product.append({
+            "category_visibility": {
+                "queries": p.get("queries") or [],
+                "match_details": p.get("match_details") or [],
+            },
+        })
+    return {
+        "merchant_name": merchant_name,
+        "per_product": per_product,
+    }
+
+
+# ---------------------------------------------------------------------------
+# _extract_failed_category_queries
+# ---------------------------------------------------------------------------
+
+
+def test_extract_failed_queries_uses_match_details_strict_signal():
+    """When match_details exists, use `matched=False` as failure
+    signal."""
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [
+            {"query": "q1", "cited_urls_count": 5},
+            {"query": "q2", "cited_urls_count": 0},
+        ],
+        "match_details": [
+            {"query": "q1", "matched": False},  # has citations but brand not in them
+            {"query": "q2", "matched": True},   # zero citations but brand mentioned in evidence
+        ],
+    }])
+    out = _extract_failed_category_queries(audit, cap=10)
+    assert out == ["q1"]
+
+
+def test_extract_failed_queries_falls_back_when_no_match_details():
+    """When match_details is missing, use cited_urls_count==0 as fallback."""
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [
+            {"query": "q1", "cited_urls_count": 0},
+            {"query": "q2", "cited_urls_count": 3},
+        ],
+        "match_details": [],  # missing
+    }])
+    out = _extract_failed_category_queries(audit, cap=10)
+    assert out == ["q1"]
+
+
+def test_extract_failed_queries_dedups_across_products():
+    """Same query appearing in 2 products' category_visibility should
+    be returned once."""
+    audit = _make_audit_with_category_queries(products=[
+        {"queries": [{"query": "q1", "cited_urls_count": 0}], "match_details": [{"query": "q1", "matched": False}]},
+        {"queries": [{"query": "q1", "cited_urls_count": 0}], "match_details": [{"query": "q1", "matched": False}]},
+    ])
+    assert _extract_failed_category_queries(audit, cap=10) == ["q1"]
+
+
+def test_extract_failed_queries_respects_cap():
+    """Top-cap N failed queries returned in audit-order."""
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [{"query": f"q{i}", "cited_urls_count": 0} for i in range(10)],
+        "match_details": [{"query": f"q{i}", "matched": False} for i in range(10)],
+    }])
+    assert _extract_failed_category_queries(audit, cap=3) == ["q0", "q1", "q2"]
+
+
+def test_extract_failed_queries_handles_garbage_input():
+    assert _extract_failed_category_queries(None, cap=5) == []
+    assert _extract_failed_category_queries({}, cap=5) == []
+    assert _extract_failed_category_queries({"per_product": "not a list"}, cap=5) == []
+    assert _extract_failed_category_queries(
+        {"per_product": [{}]}, cap=5,
+    ) == []
+
+
+def test_extract_failed_queries_returns_empty_when_all_succeed():
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [{"query": "q1", "cited_urls_count": 5}],
+        "match_details": [{"query": "q1", "matched": True}],
+    }])
+    assert _extract_failed_category_queries(audit, cap=5) == []
+
+
+# ---------------------------------------------------------------------------
+# _derive_brand_from_audit
+# ---------------------------------------------------------------------------
+
+
+def test_derive_brand_from_audit_uses_merchant_name():
+    audit = {"merchant_name": "Grüns"}
+    assert _derive_brand_from_audit(audit) == "Grüns"
+
+
+def test_derive_brand_from_audit_fallback_when_missing():
+    assert _derive_brand_from_audit({}) == "(brand)"
+    assert _derive_brand_from_audit(None) == "(brand)"
+    assert _derive_brand_from_audit({"merchant_name": "  "}) == "(brand)"
+
+
+# ---------------------------------------------------------------------------
+# _build_brief_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_brief_prompt_interpolates_brand_and_query():
+    p = _build_brief_prompt("Grüns", "best gummy vitamins")
+    assert "Grüns" in p
+    assert "best gummy vitamins" in p
+    assert "JSON object" in p
+    assert "outline_h2_sections" in p
+
+
+def test_brief_prompt_specifies_strict_format():
+    p = _build_brief_prompt("X", "y")
+    assert "Do NOT wrap in markdown fences" in p
+    assert "Do NOT add prose" in p
+
+
+# ---------------------------------------------------------------------------
+# _parse_brief_response
+# ---------------------------------------------------------------------------
+
+
+def _make_gemini_response(text: str) -> dict:
+    return {
+        "candidates": [{"content": {"parts": [{"text": text}]}}],
+    }
+
+
+def test_parse_brief_response_full_shape():
+    brief = {
+        "target_query": "best gummy vitamins",
+        "suggested_title": "The 7 Best Gummy Vitamins of 2026",
+        "suggested_word_count": 1500,
+        "outline_h2_sections": [
+            "What to Look For", "Top Picks", "How We Tested",
+        ],
+        "key_talking_points": [
+            "Most gummies contain 5-10g of added sugar",
+            "Look for third-party testing certifications",
+        ],
+        "competitor_articles": [
+            {"title": "...", "publication": "Healthline", "topics_covered": "..."},
+        ],
+        "differentiation_angle": "Focus on sugar content vs competitors",
+    }
+    out = _parse_brief_response(_make_gemini_response(_json.dumps(brief)))
+    assert out is not None
+    assert out["suggested_title"] == "The 7 Best Gummy Vitamins of 2026"
+    assert len(out["outline_h2_sections"]) == 3
+    assert out["suggested_word_count"] == 1500
+
+
+def test_parse_brief_response_strips_markdown_fence():
+    """Some Gemini responses wrap the JSON in ```json fences despite
+    prompt instruction. Parser strips them."""
+    brief = {"suggested_title": "X", "outline_h2_sections": ["a"]}
+    text = "```json\n" + _json.dumps(brief) + "\n```"
+    out = _parse_brief_response(_make_gemini_response(text))
+    assert out is not None
+    assert out["suggested_title"] == "X"
+
+
+def test_parse_brief_response_extracts_balanced_object_from_prose():
+    """When Gemini returns prose around the JSON, parser finds the
+    first balanced object."""
+    text = (
+        "Sure, here is the brief:\n"
+        '{"suggested_title": "Y", "outline_h2_sections": ["b"]}\n'
+        "Hope that helps!"
+    )
+    out = _parse_brief_response(_make_gemini_response(text))
+    assert out is not None
+    assert out["suggested_title"] == "Y"
+
+
+def test_parse_brief_response_rejects_missing_essentials():
+    """No title or no outline → reject the brief; better empty than
+    half-baked."""
+    no_title = _json.dumps({"outline_h2_sections": ["a"]})
+    no_outline = _json.dumps({"suggested_title": "X"})
+    empty_outline = _json.dumps({"suggested_title": "X", "outline_h2_sections": []})
+    assert _parse_brief_response(_make_gemini_response(no_title)) is None
+    assert _parse_brief_response(_make_gemini_response(no_outline)) is None
+    assert _parse_brief_response(_make_gemini_response(empty_outline)) is None
+
+
+def test_parse_brief_response_handles_garbage():
+    assert _parse_brief_response({}) is None
+    assert _parse_brief_response({"candidates": []}) is None
+    assert _parse_brief_response(_make_gemini_response("not json at all")) is None
+
+
+def test_parse_brief_response_coerces_word_count_string_to_int():
+    """Gemini sometimes returns the word count as a string."""
+    brief_with_str_count = _json.dumps({
+        "suggested_title": "X",
+        "outline_h2_sections": ["a"],
+        "suggested_word_count": "1200",  # string
+    })
+    out = _parse_brief_response(_make_gemini_response(brief_with_str_count))
+    assert out["suggested_word_count"] == 1200
+
+
+# ---------------------------------------------------------------------------
+# ContentBriefGeneratorAgent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_content_brief_should_run_false_without_merchant_id():
+    agent = ContentBriefGeneratorAgent()
+    assert await agent.should_run(ExecutorContext(merchant_id=None)) is False
+
+
+@pytest.mark.asyncio
+async def test_content_brief_should_run_false_without_api_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("PIVOTA_GEMINI_API_KEY", raising=False)
+    agent = ContentBriefGeneratorAgent()
+    assert await agent.should_run(ExecutorContext(merchant_id="m1")) is False
+
+
+@pytest.mark.asyncio
+async def test_content_brief_should_run_false_when_no_failed_queries(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    agent = ContentBriefGeneratorAgent()
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [{"query": "q1", "cited_urls_count": 5}],
+        "match_details": [{"query": "q1", "matched": True}],  # all succeeded
+    }])
+    assert await agent.should_run(
+        ExecutorContext(merchant_id="m1", audit_report=audit),
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_content_brief_should_run_true_when_failed_queries_exist(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    agent = ContentBriefGeneratorAgent()
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [{"query": "q1", "cited_urls_count": 0}],
+        "match_details": [{"query": "q1", "matched": False}],
+    }])
+    assert await agent.should_run(
+        ExecutorContext(merchant_id="m1", audit_report=audit),
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_content_brief_execute_succeeds_when_briefs_generated(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    agent = ContentBriefGeneratorAgent()
+    audit = _make_audit_with_category_queries(merchant_name="Grüns", products=[{
+        "queries": [
+            {"query": "q1", "cited_urls_count": 0},
+            {"query": "q2", "cited_urls_count": 0},
+        ],
+        "match_details": [
+            {"query": "q1", "matched": False},
+            {"query": "q2", "matched": False},
+        ],
+    }])
+
+    async def _fake_generate(brand, query, api_key, *, timeout_s=25.0):
+        return {
+            "target_query": query,
+            "suggested_title": f"Brief for {query}",
+            "suggested_word_count": 1500,
+            "outline_h2_sections": ["intro", "main"],
+            "key_talking_points": ["point 1"],
+            "competitor_articles": [],
+            "differentiation_angle": None,
+        }
+
+    with patch("services.executor_agents.content_brief._generate_brief_for_query",
+               new=AsyncMock(side_effect=_fake_generate)):
+        result = await agent.execute(
+            ExecutorContext(merchant_id="m1", audit_report=audit),
+        )
+    assert result.status == "succeeded"
+    assert result.evidence["briefs_generated"] == 2
+    assert result.evidence["briefs_failed"] == 0
+    assert len(result.evidence["briefs"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_content_brief_execute_partial_failure_still_succeeds(monkeypatch):
+    """Some briefs succeed, others fail → status=succeeded with both
+    counts in evidence (BD operator can dig into failures)."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    agent = ContentBriefGeneratorAgent()
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [
+            {"query": "q1", "cited_urls_count": 0},
+            {"query": "q2", "cited_urls_count": 0},
+        ],
+        "match_details": [
+            {"query": "q1", "matched": False},
+            {"query": "q2", "matched": False},
+        ],
+    }])
+
+    async def _fake_generate(brand, query, api_key, *, timeout_s=25.0):
+        if query == "q2":
+            return None  # fail this one
+        return {
+            "suggested_title": "X", "outline_h2_sections": ["a"],
+            "target_query": query, "suggested_word_count": 1000,
+            "key_talking_points": [], "competitor_articles": [],
+            "differentiation_angle": None,
+        }
+
+    with patch("services.executor_agents.content_brief._generate_brief_for_query",
+               new=AsyncMock(side_effect=_fake_generate)):
+        result = await agent.execute(
+            ExecutorContext(merchant_id="m1", audit_report=audit),
+        )
+    assert result.status == "succeeded"
+    assert result.evidence["briefs_generated"] == 1
+    assert result.evidence["briefs_failed"] == 1
+    assert result.evidence["failures"][0]["query"] == "q2"
+
+
+@pytest.mark.asyncio
+async def test_content_brief_execute_fails_when_all_briefs_fail(monkeypatch):
+    """All Gemini calls failed → status=failed with diagnostic."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    agent = ContentBriefGeneratorAgent()
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [{"query": "q1", "cited_urls_count": 0}],
+        "match_details": [{"query": "q1", "matched": False}],
+    }])
+    with patch("services.executor_agents.content_brief._generate_brief_for_query",
+               new=AsyncMock(return_value=None)):
+        result = await agent.execute(
+            ExecutorContext(merchant_id="m1", audit_report=audit),
+        )
+    assert result.status == "failed"
+    assert "no briefs generated" in (result.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_content_brief_execute_caps_at_max_briefs_per_run(monkeypatch):
+    """Even with 10 failed queries, agent only generates _MAX_BRIEFS_PER_RUN
+    briefs to bound Gemini cost."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    from services.executor_agents.content_brief import _MAX_BRIEFS_PER_RUN
+    agent = ContentBriefGeneratorAgent()
+    audit = _make_audit_with_category_queries(products=[{
+        "queries": [{"query": f"q{i}", "cited_urls_count": 0} for i in range(10)],
+        "match_details": [{"query": f"q{i}", "matched": False} for i in range(10)],
+    }])
+
+    call_count = 0
+    async def _fake_generate(brand, query, api_key, *, timeout_s=25.0):
+        nonlocal call_count
+        call_count += 1
+        return {
+            "suggested_title": "X", "outline_h2_sections": ["a"],
+            "target_query": query, "suggested_word_count": 1000,
+            "key_talking_points": [], "competitor_articles": [],
+            "differentiation_angle": None,
+        }
+
+    with patch("services.executor_agents.content_brief._generate_brief_for_query",
+               new=AsyncMock(side_effect=_fake_generate)):
+        result = await agent.execute(
+            ExecutorContext(merchant_id="m1", audit_report=audit),
+        )
+    assert call_count == _MAX_BRIEFS_PER_RUN
+    assert result.evidence["candidate_queries_total"] == _MAX_BRIEFS_PER_RUN

@@ -37,11 +37,13 @@ def _registry() -> List[BaseExecutorAgent]:
     agents here. Order matters when agents depend on each other's
     side effects (none today — all agents are independent).
     """
+    from services.executor_agents.content_brief import ContentBriefGeneratorAgent
     from services.executor_agents.gsc_url_submission import GscUrlSubmissionAgent
     from services.executor_agents.sitemap_freshness import SitemapFreshnessAgent
     return [
         GscUrlSubmissionAgent(),
         SitemapFreshnessAgent(),
+        ContentBriefGeneratorAgent(),
     ]
 
 
