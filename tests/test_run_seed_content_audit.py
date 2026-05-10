@@ -20,7 +20,7 @@ from scripts import run_seed_content_audit as worker  # noqa: E402
 
 
 def _ns(**kwargs) -> SimpleNamespace:
-    base = {"limit": 0, "apply": False, "force": False}
+    base = {"limit": 0, "apply": False, "force": False, "offset": 0}
     base.update(kwargs)
     return SimpleNamespace(**base)
 
@@ -44,6 +44,47 @@ def test_select_sql_force_processes_all_rows() -> None:
     # No auditor filter when forced
     assert ":auditor_version" not in sql
     assert "review_summary" not in sql
+
+
+def test_select_sql_force_orders_by_id_for_stable_pagination() -> None:
+    """Regression 2026-05-09: under --force, every applied chunk SETs
+    `updated_at = NOW()`, which would push rows to the top of an
+    `ORDER BY updated_at DESC` sort. Subsequent chunks then re-process
+    the same 800 rows instead of advancing through the table.
+    Force mode MUST order by `id` (write-stable) so pagination works."""
+    sql = worker._select_sql(force=True, limit=100)
+    assert "ORDER BY id ASC" in sql
+    # And the default mode keeps the freshness sort
+    sql_default = worker._select_sql(force=False, limit=100)
+    assert "ORDER BY updated_at DESC" in sql_default
+
+
+def test_select_sql_offset_clause_appears_only_when_positive() -> None:
+    """OFFSET must be omitted when offset=0 (no extra bind to chase),
+    and present when offset>0 so paginated force-mode runs work."""
+    assert "OFFSET" not in worker._select_sql(force=True, limit=100, offset=0)
+    sql_with_offset = worker._select_sql(force=True, limit=100, offset=800)
+    assert "OFFSET :offset" in sql_with_offset
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_binds_offset_only_when_positive(monkeypatch) -> None:
+    """Same param-bind discipline as auditor_version: only bind keys
+    that actually appear in the SQL."""
+    captured: list = []
+
+    async def fake_fetch_all(sql, params):
+        captured.append({"sql": str(sql), "params": dict(params)})
+        return []
+
+    monkeypatch.setattr(worker.database, "fetch_all", fake_fetch_all)
+
+    await worker._fetch_candidates(_ns(force=True, limit=100, offset=0))
+    assert "offset" not in captured[0]["params"]
+
+    captured.clear()
+    await worker._fetch_candidates(_ns(force=True, limit=100, offset=800))
+    assert captured[0]["params"]["offset"] == 800
 
 
 @pytest.mark.asyncio
