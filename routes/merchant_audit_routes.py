@@ -834,3 +834,45 @@ async def dismiss_merchant_task(
         )
     updated = await fetch_task(task_id=task_id)
     return {"task": updated}
+
+
+@router.get("/executor-runs")
+async def list_merchant_executor_runs(
+    agent_name: Optional[str] = None,
+    limit: int = 20,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """List executor agent runs for this merchant, newest first.
+    Powers the "what Pivota did for you this week" activity feed
+    (PR-4 executor agents).
+
+    Query params:
+      - `agent_name`: filter to one agent (e.g. 'gsc_url_submission_loop',
+        'sitemap_freshness_monitor', 'content_brief_generator'). Omit
+        to see all agents.
+      - `limit`: 1-100, default 20.
+    """
+    if limit <= 0 or limit > 100:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="limit must be between 1 and 100",
+        )
+    from db.executor_runs import (
+        recent_runs_for_agent,
+        recent_runs_for_merchant as recent_executor_runs_for_merchant,
+    )
+    if agent_name:
+        # Filter at SQL by agent_name; no per-merchant filter, so we
+        # filter in Python afterward (small N — 50-100 entries max).
+        rows = await recent_runs_for_agent(agent_name=agent_name, limit=limit * 3)
+        rows = [r for r in rows if r.get("merchant_id") == merchant_id][:limit]
+    else:
+        rows = await recent_executor_runs_for_merchant(
+            merchant_id=merchant_id, limit=limit,
+        )
+    return {
+        "merchant_id": merchant_id,
+        "agent_name": agent_name,
+        "count": len(rows),
+        "runs": rows,
+    }
