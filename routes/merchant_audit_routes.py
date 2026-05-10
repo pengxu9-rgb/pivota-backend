@@ -590,10 +590,30 @@ async def run_merchant_self_audit(
             merchant_id, exc,
         )
 
+    # PR-6: materialize action_items as tracked merchant_tasks so the
+    # operator gets a queue (status: pending → in_progress → done)
+    # instead of advisory text they have to remember. Best-effort.
+    tasks_summary = None
+    try:
+        from services.task_queue_service import materialize_tasks_from_audit
+        if run_id:
+            tasks_summary = await materialize_tasks_from_audit(
+                merchant_id=merchant_id,
+                audit_run_id=run_id,
+                audit_report=brand_report,
+                integration_state=integration_state,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "task materialization failed for merchant=%s: %s",
+            merchant_id, exc,
+        )
+
     return {
         "brand_report": brand_report,
         "rate_limit_remaining": remaining,
         "executors": executor_summary,
+        "tasks": tasks_summary,
         # product_keys whose audit URL was the Pivota canonical PDP
         # (not the merchant's own URL) — UI surfaces a note that the
         # score reflects Pivota's hosted surface, which is in the
@@ -697,3 +717,120 @@ async def get_merchant_funnel(
     )
     funnel["channel_breakdown"] = breakdown
     return funnel
+
+
+# ---------------------------------------------------------------------------
+# PR-6: human task queue endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/tasks")
+async def list_merchant_tasks(
+    status_filter: Optional[str] = None,
+    limit: int = 50,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """List tasks for this merchant, newest first.
+
+    Query params:
+      - `status_filter`: comma-separated list (e.g. 'pending,in_progress')
+        — defaults to open work (pending + in_progress). Pass 'done,dismissed'
+        for archive view; pass 'all' for everything.
+      - `limit`: 1-200, default 50.
+    """
+    if limit <= 0 or limit > 200:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="limit must be between 1 and 200",
+        )
+    from db.merchant_tasks import list_tasks_for_merchant
+
+    if status_filter is None:
+        statuses = None  # default in accessor: pending + in_progress
+    elif status_filter.strip().lower() == "all":
+        statuses = []  # empty list = no filter (all statuses)
+    else:
+        statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
+
+    tasks = await list_tasks_for_merchant(
+        merchant_id=merchant_id,
+        status_filter=statuses,
+        limit=limit,
+    )
+    return {
+        "merchant_id": merchant_id,
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+
+
+class _TaskStatusUpdate(BaseModel):
+    status: str = Field(..., pattern="^(pending|in_progress|done|failed)$")
+    assigned_to_human: Optional[str] = Field(None, max_length=200)
+    evidence: Optional[Dict[str, Any]] = None
+
+
+@router.patch("/tasks/{task_id}")
+async def update_merchant_task(
+    task_id: str,
+    body: _TaskStatusUpdate,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Update a task's status. Operator can mark it in_progress (taking
+    ownership), done (completed work), or failed (couldn't complete).
+    For dismissal use POST /tasks/{id}/dismiss instead — that requires
+    a reason for the audit trail.
+
+    Cross-merchant access guard: fetches the task first, 404s if it
+    doesn't belong to the auth'd merchant.
+    """
+    from db.merchant_tasks import fetch_task, update_task_status
+
+    task = await fetch_task(task_id=task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    ok = await update_task_status(
+        task_id=task_id,
+        status=body.status,
+        assigned_to_human=body.assigned_to_human,
+        evidence=body.evidence,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=500, detail="task update failed (DB error)",
+        )
+    updated = await fetch_task(task_id=task_id)
+    return {"task": updated}
+
+
+class _TaskDismissBody(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+
+@router.post("/tasks/{task_id}/dismiss")
+async def dismiss_merchant_task(
+    task_id: str,
+    body: _TaskDismissBody,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Dismiss a task with an operator-supplied reason. Stored in
+    dismissed_reason for audit trail. Terminal (can't be undone via
+    update_task_status — would need a fresh task)."""
+    from db.merchant_tasks import dismiss_task, fetch_task
+
+    task = await fetch_task(task_id=task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    ok = await dismiss_task(task_id=task_id, reason=body.reason)
+    if not ok:
+        raise HTTPException(
+            status_code=500, detail="task dismiss failed (DB error)",
+        )
+    updated = await fetch_task(task_id=task_id)
+    return {"task": updated}
