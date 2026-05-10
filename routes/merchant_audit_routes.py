@@ -638,3 +638,62 @@ async def get_merchant_audit_history(
             ),
         },
     }
+
+
+@router.get("/funnel")
+async def get_merchant_funnel(
+    channel: Optional[str] = None,
+    window_days: int = 30,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """PR-5: stage-level conversion funnel for this merchant.
+
+    Query params:
+      - `channel`: filter to one source_channel (e.g. 'ai_agent').
+        Omit to count across all channels.
+      - `window_days`: trailing window for the rollup. Default 30.
+        Capped at 365.
+
+    Response shape:
+      {
+        "merchant_id": str,
+        "source_channel": str | null,
+        "window_days": int,
+        "total_events": int,
+        "stages": [
+          {"stage": "impression", "count": 1234, "conversion_to_next": 0.30, "drop_off_pct": 0.70},
+          ...
+        ],
+        "channel_breakdown": [
+          {"source_channel": "ai_agent", "total_events": 1000},
+          ...
+        ]
+      }
+
+    `channel_breakdown` lets the operator see which channels are
+    active before drilling into one. When the response's `stages` are
+    all zero counts, the merchant has no tracked events in this
+    window — likely PR-5 just shipped and the funnel is still
+    populating.
+    """
+    if window_days <= 0 or window_days > 365:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="window_days must be between 1 and 365",
+        )
+
+    from services.funnel_analytics import (
+        channel_breakdown as _channel_breakdown,
+        compute_funnel,
+    )
+    funnel = await compute_funnel(
+        merchant_id=merchant_id,
+        source_channel=channel,
+        window_days=window_days,
+    )
+    breakdown = await _channel_breakdown(
+        merchant_id=merchant_id,
+        window_days=window_days,
+    )
+    funnel["channel_breakdown"] = breakdown
+    return funnel
