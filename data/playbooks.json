@@ -26,7 +26,7 @@
       "expected_timeline_weeks": [4, 8],
       "pitch_template": {
         "subject_template": "{merchant_name} for an upcoming {host} category roundup",
-        "body_template": "Hi {host} editorial team,\n\nI'm reaching out from {merchant_name}, a {category} brand. I noticed your team has covered {competitors_phrase_short} in recent {category} roundups{example_phrase_short}.\n\n{merchant_name} belongs alongside them — here's why:\n\n[TODO: 2-3 sentences on what makes your product different — a unique materials story, a price-point gap your category is missing, a specific use-case competitors don't address]\n\nI'd love to send 3 product samples for your team to review. Can you share the best shipping address?\n\nThanks for considering,\n{merchant_name}\n[Your name + title]\n[Email + phone]"
+        "body_template": "Hi {host} editorial team,\n\nI'm reaching out from {merchant_name}, a {category} brand. I noticed your team has covered {competitors_phrase_short} in recent {category} roundups{example_phrase_short}.\n\n{merchant_name} belongs alongside them — here's why:\n\n> Customize before sending: 2-3 sentences on your differentiator — a unique ingredient or formulation story, a price-point gap competitors miss, or a specific use-case they don't address.\n\nI'd love to send 3 product samples for your team to review. Can you share the best shipping address?\n\nThanks for considering,\n{merchant_name}"
       }
     },
     "editorial_pitch_fashion": {
@@ -39,7 +39,7 @@
       "expected_timeline_weeks": [6, 12],
       "pitch_template": {
         "subject_template": "{merchant_name} — {category} story for {host}'s editorial team",
-        "body_template": "Hi {host} fashion team,\n\nI'm {merchant_name}, a {category} brand. Fashion editorial wants a STORY, not just a product — here's the angle I'd love to bring you:\n\n[TODO: lead with a TREND or POV — \"satin sleepwear is having a moment because...\", \"Gen-Z is buying loungewear as outerwear and our designs lean into that\", etc. NOT \"here's our product line\"]\n\nFor reference, your team has recently covered {competitors_phrase_short}. {merchant_name}'s angle is differentiated because [TODO: 1 sentence].\n\nHappy to send sample looks and a 100-word seasonal hook. Best contact?\n\n{merchant_name}\n[Your name + title]\n[Email + phone]"
+        "body_template": "Hi {host} fashion team,\n\nI'm {merchant_name}, a {category} brand. Fashion editorial wants a STORY, not just a product — here's the angle I'd love to bring you:\n\n> Customize before sending: lead with a TREND or POV (e.g. \"satin sleepwear is having a moment because…\", \"Gen-Z is buying loungewear as outerwear and our designs lean into that\"). Avoid \"here's our product line.\"\n\nFor reference, your team has recently covered {competitors_phrase_short}.\n\n> Customize before sending: 1 sentence on what makes {merchant_name}'s angle differentiated.\n\nHappy to send sample looks and a 100-word seasonal hook. Best contact?\n\n{merchant_name}"
       }
     },
     "editorial_pitch_beauty": {
@@ -52,7 +52,7 @@
       "expected_timeline_weeks": [4, 10],
       "pitch_template": {
         "subject_template": "{merchant_name} — beauty submission with INCI + clinical for {host}",
-        "body_template": "Hi {host} beauty team,\n\n{merchant_name} here. Beauty editorial wants substantiation, not just samples — sending the full kit upfront so you have what you need:\n\n[TODO attached]: full INCI list, claims breakdown, any clinical / consumer testing data, formulation differentiator\n\nFor context, your team has recently covered {competitors_phrase_short}. {merchant_name}'s clinical / formulation differentiator is [TODO: 1-2 sentences with specifics — % active, novel delivery system, third-party testing result].\n\nPR samples + full doc kit ready to ship. Best address + best contact?\n\n{merchant_name}\n[Your name + title]\n[Email + phone]"
+        "body_template": "Hi {host} beauty team,\n\n{merchant_name} here. Beauty editorial wants substantiation, not just samples — sending the full kit upfront so you have what you need:\n\n> Attach before sending: full INCI list, claims breakdown, any clinical / consumer testing data, formulation differentiator.\n\nFor context, your team has recently covered {competitors_phrase_short}.\n\n> Customize before sending: 1-2 sentences on {merchant_name}'s clinical / formulation differentiator (% active, novel delivery system, third-party testing result, etc.).\n\nPR samples + full doc kit ready to ship. Best address + best contact?\n\n{merchant_name}"
       }
     },
     "editorial_pitch_review_aggregator": {
@@ -65,7 +65,7 @@
       "expected_timeline_weeks": [2, 6],
       "pitch_template": {
         "subject_template": "{merchant_name} listing submission for {host}",
-        "body_template": "Hi {host} curation team,\n\nSubmitting {merchant_name} for inclusion in your database.\n\n[TODO: paste the requested fields from {host}'s listing form — ingredient list, claims, hero product images, brand description]\n\nLet me know if you need additional documentation.\n\n{merchant_name}\n[Your name + title]\n[Email]"
+        "body_template": "Hi {host} curation team,\n\nSubmitting {merchant_name} for inclusion in your database.\n\n> Customize before sending: paste the requested fields from {host}'s listing form (ingredient list, claims, hero product images, brand description).\n\nLet me know if you need additional documentation.\n\n{merchant_name}"
       }
     },
     "wholesale_department_store": {
