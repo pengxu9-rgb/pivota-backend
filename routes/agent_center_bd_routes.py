@@ -625,11 +625,71 @@ async def cold_start_audit(
                 "reason": "no competitor brands extracted from audit",
             }
 
+    # PR-6 cold-start parity: materialize action_items as tracked
+    # merchant_tasks under the synthetic prospect id so the BD operator
+    # gets a queue to work from instead of advisory text. Best-effort.
+    tasks_summary = None
+    if run_id:
+        try:
+            from services.task_queue_service import materialize_tasks_from_audit
+            tasks_summary = await materialize_tasks_from_audit(
+                merchant_id=synthetic_merchant_id,
+                audit_run_id=run_id,
+                audit_report=out,
+                integration_state=cold_start_integration_state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "BD cold-start task materialization failed for "
+                "prospect=%s run_id=%s: %s",
+                synthetic_merchant_id, run_id, exc,
+            )
+
+    # PR-4 cold-start parity: dispatch executor agents (GSC URL
+    # submission, sitemap freshness, content brief generator). Each
+    # agent's should_run() decides whether to fire — most won't on
+    # cold-start because the prospect isn't onboarded, but content
+    # brief generator typically runs on category_visibility failures.
+    executor_summary = None
+    if run_id:
+        try:
+            import asyncio as _asyncio_exec
+            from services.executor_agents.base import ExecutorContext
+            from services.executor_agents.dispatcher import dispatch_agents
+            ctx = ExecutorContext(
+                merchant_id=synthetic_merchant_id,
+                parent_audit_run_id=run_id,
+                audit_report=out,
+            )
+            _asyncio_exec.create_task(
+                dispatch_agents(ctx),
+                name=f"executor-dispatch-coldstart-{run_id}",
+            )
+            executor_summary = {
+                "queued": True,
+                "poll_via_executor_runs_table": True,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "BD cold-start executor dispatch failed for "
+                "prospect=%s run_id=%s: %s",
+                synthetic_merchant_id, run_id, exc,
+            )
+
     return {
         "status": "ok",
         "discovery": _build_discovery_block(discovered),
         "brand_report": out,
         "cohort": cohort_status,
+        # PR-6/UI-3: synthetic merchant_id BD frontend uses to query
+        # /tasks and /executor-runs for this prospect. Stable across
+        # re-audits of the same domain (sha1 hash of normalized
+        # domain) so re-running on gruns.co always produces the same
+        # prospect_id.
+        "prospect_id": synthetic_merchant_id,
+        "audit_run_id": run_id,
+        "tasks": tasks_summary,
+        "executors": executor_summary,
     }
 
 
@@ -959,4 +1019,166 @@ def _build_discovery_block(discovered: Dict[str, Any]) -> Dict[str, Any]:
         # presence + KOL endorsements per platform + (optional)
         # competitive comparison.
         "social_intelligence": discovered.get("social_intelligence"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# UI-3: BD-side task queue + executor-runs read endpoints
+# ---------------------------------------------------------------------------
+#
+# The merchant portal endpoints in routes/merchant_audit_routes.py are
+# gated on get_current_merchant — they require a merchant JWT, which BD
+# operators don't have. These BD wrappers take merchant_id as a query
+# param (typically the prospect_<hash> id returned from cold-start
+# audits) and gate on get_current_employee instead.
+#
+# Read endpoints are unchanged in semantics from the merchant route —
+# same shape, same default filtering. Write endpoints (PATCH / dismiss)
+# are also enabled so a BD operator can mark a prospect's tasks done /
+# dismissed without onboarding the prospect first.
+
+
+@router.get("/tasks")
+async def bd_list_tasks(
+    merchant_id: str,
+    status_filter: Optional[str] = None,
+    limit: int = 50,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """List tasks for any merchant (BD-side; no merchant auth needed).
+    Pass `merchant_id=prospect_<hash>` to drive the BD task queue UI
+    against a cold-start prospect.
+
+    Default filter: open work (pending + in_progress). Pass
+    `status_filter=all` for everything, or comma-list specific statuses.
+    """
+    if limit <= 0 or limit > 200:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="limit must be between 1 and 200",
+        )
+    if not merchant_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="merchant_id query param required",
+        )
+    from db.merchant_tasks import list_tasks_for_merchant
+
+    if status_filter is None:
+        statuses = None
+    elif status_filter.strip().lower() == "all":
+        statuses = []
+    else:
+        statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
+
+    tasks = await list_tasks_for_merchant(
+        merchant_id=merchant_id,
+        status_filter=statuses,
+        limit=limit,
+    )
+    return {
+        "merchant_id": merchant_id,
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+
+
+class _BdTaskStatusUpdate(BaseModel):
+    status: str = Field(..., pattern="^(pending|in_progress|done|failed)$")
+    assigned_to_human: Optional[str] = Field(None, max_length=200)
+    evidence: Optional[Dict[str, Any]] = None
+
+
+@router.patch("/tasks/{task_id}")
+async def bd_update_task(
+    task_id: str,
+    body: _BdTaskStatusUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Update a task's status. BD operator can take ownership
+    (in_progress) or mark complete (done) on a prospect's tasks
+    without merchant onboarding."""
+    from db.merchant_tasks import fetch_task, update_task_status
+
+    task = await fetch_task(task_id=task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    ok = await update_task_status(
+        task_id=task_id,
+        status=body.status,
+        assigned_to_human=body.assigned_to_human,
+        evidence=body.evidence,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=500, detail="task update failed (DB error)",
+        )
+    updated = await fetch_task(task_id=task_id)
+    return {"task": updated}
+
+
+class _BdTaskDismissBody(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+
+@router.post("/tasks/{task_id}/dismiss")
+async def bd_dismiss_task(
+    task_id: str,
+    body: _BdTaskDismissBody,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Dismiss a task with a reason. Terminal."""
+    from db.merchant_tasks import dismiss_task, fetch_task
+
+    task = await fetch_task(task_id=task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    ok = await dismiss_task(task_id=task_id, reason=body.reason)
+    if not ok:
+        raise HTTPException(
+            status_code=500, detail="task dismiss failed (DB error)",
+        )
+    updated = await fetch_task(task_id=task_id)
+    return {"task": updated}
+
+
+@router.get("/executor-runs")
+async def bd_list_executor_runs(
+    merchant_id: str,
+    agent_name: Optional[str] = None,
+    limit: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """List executor agent runs for any merchant (BD-side). Drives
+    the "what Pivota did for this prospect" activity feed — surfaces
+    GSC URL submissions, sitemap diffs, content briefs the agents
+    auto-generated."""
+    if limit <= 0 or limit > 100:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="limit must be between 1 and 100",
+        )
+    if not merchant_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="merchant_id query param required",
+        )
+    from db.executor_runs import (
+        recent_runs_for_agent,
+        recent_runs_for_merchant as recent_executor_runs_for_merchant,
+    )
+    if agent_name:
+        rows = await recent_runs_for_agent(agent_name=agent_name, limit=limit * 3)
+        rows = [r for r in rows if r.get("merchant_id") == merchant_id][:limit]
+    else:
+        rows = await recent_executor_runs_for_merchant(
+            merchant_id=merchant_id, limit=limit,
+        )
+    return {
+        "merchant_id": merchant_id,
+        "agent_name": agent_name,
+        "count": len(rows),
+        "runs": rows,
     }
