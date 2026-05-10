@@ -237,6 +237,79 @@ def _coverage_stats(raw_products: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+# PDP slug patterns that signal a draft / duplicate / test product
+# the operator probably didn't intend to publish for AI-channel
+# discovery. Conservative list — only flags patterns that are
+# unambiguous markers of non-canonical SKUs.
+#
+# Reproduced the Grüns case: Shopify product duplication produced
+# `gruns.co/products/gruns-copy` for a "Mother's Day Bundle - Adults
+# + Kids" SKU. Catalog-intelligence returned this in the first slot;
+# the audit ran against it and scored 0/0/0 even though Grüns'
+# flagship Greens Gummies is famously cited by Forbes/Women's Health.
+_SKETCHY_PDP_SLUG_SUFFIXES = (
+    "-copy", "-clone", "-duplicate",
+    "-draft", "-test", "-temp", "-archive", "-old", "-backup",
+    "_copy", "_clone", "_duplicate",
+    "_draft", "_test", "_temp", "_archive", "_old", "_backup",
+)
+
+
+def _has_sketchy_pdp_slug(product: Dict[str, Any]) -> bool:
+    """Heuristic: does this product's PDP slug end with a Shopify-style
+    duplication / draft suffix? Conservative — checks suffixes only,
+    not arbitrary substring matches (so a genuine product named
+    "vintage-test-tube-display" doesn't trigger).
+    """
+    pdp_url = product.get("pdp_url") or ""
+    if not isinstance(pdp_url, str) or not pdp_url:
+        return False
+    # Extract the last path segment, lowercase, strip query / trailing
+    # slash. /products/gruns-copy → gruns-copy; /products/gruns-copy/?utm=
+    # → gruns-copy.
+    path = pdp_url.split("?", 1)[0].rstrip("/")
+    slug = path.rsplit("/", 1)[-1].lower()
+    return any(slug.endswith(suf) for suf in _SKETCHY_PDP_SLUG_SUFFIXES)
+
+
+def _demote_sketchy_pdp_slugs(
+    products: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Move products with draft / duplicate slugs to the END of the
+    candidate list. Doesn't drop them — if the entire catalog is
+    sketchy slugs (e.g. a brand-new merchant whose only published
+    products are drafts), the audit can still proceed against them
+    rather than failing with no SKUs.
+
+    Logs a structured warning when demotion fires so ops can spot
+    catalogs where catalog-intelligence is over-prioritizing
+    duplicate slugs (and so the BD operator knows the audit ran
+    against the cleaner SKUs).
+    """
+    if not products:
+        return products
+    clean: List[Dict[str, Any]] = []
+    sketchy: List[Dict[str, Any]] = []
+    for p in products:
+        if _has_sketchy_pdp_slug(p):
+            sketchy.append(p)
+        else:
+            clean.append(p)
+    if sketchy and clean:
+        # Only log when we actually changed the order. If everything
+        # is sketchy, the audit picks the same products it would have
+        # anyway — no useful signal in logging.
+        logger.info(
+            "bd_cold_start: demoted %d product(s) with draft/duplicate "
+            "PDP slugs (e.g. %s) to end of audit queue; %d clean "
+            "product(s) take priority",
+            len(sketchy),
+            (sketchy[0].get("pdp_url") or "")[:120],
+            len(clean),
+        )
+    return clean + sketchy
+
+
 async def discover_products_for_audit(
     url: str,
     *,
@@ -447,6 +520,20 @@ async def discover_products_for_audit(
     # Trim to requested audit size. Backfill captures the FULL
     # discovered list (not just the audited subset) — that's the
     # whole point of using catalog-intelligence's wider crawl.
+    #
+    # First, demote draft / duplicate / test SKU slugs to the back of
+    # the queue. Reproduces the Grüns failure: catalog-intelligence
+    # returned "Mother's Day Bundle - Adults + Kids" with PDP slug
+    # `gruns-copy` (a Shopify product duplication). The audit then
+    # probed that obscure seasonal bundle instead of the flagship
+    # Greens Gummies, returning 0/0/0 even though Forbes etc. cite
+    # the flagship verbatim.
+    #
+    # Filter is conservative — moves sketchy slugs to the END of the
+    # candidate list rather than dropping them. If the entire catalog
+    # is sketchy slugs (rare but possible for a new merchant whose
+    # only published products are drafts), the audit still runs.
+    products = _demote_sketchy_pdp_slugs(products)
     audit_products = products[:max_products]
 
     # Enrich the audit-bound subset with vendor + product_type. Without
