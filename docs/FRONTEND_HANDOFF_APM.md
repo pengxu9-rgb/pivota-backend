@@ -442,6 +442,23 @@ The audit pipeline + executor agents are deliberately honest about confidence. T
 - **Cross-channel attribution model**: the funnel surfaces stage counts; "channel X drove conversion Y" multi-touch attribution is a future milestone (post-PR-5 once 90+ days of data accumulate).
 - **Scheduled re-audit toggle UI**: backend has the column (`catalog_merchants.audit_schedule`), no PUT endpoint yet. Either Claude Design specs the UI control + I add the endpoint, or we defer.
 
+## Funnel data quality — known gaps (May 2026 backfill)
+
+After backfilling 90 days of order_events into funnel_events (2,505 rows), two gaps were diagnosed and need follow-up before the funnel chart can render meaningful BD value:
+
+### Gap 1: AI agent impression events are not captured
+- `api_call_events` table is **empty across all 90 days** in production. `log_api_call` is wired into ONE route (`/products/v2/{merchant_id}`) which has zero hits.
+- Real high-traffic agent-facing routes (`agent_search_products` in `routes/agent_api.py:4492` — handles `/agent/v1/.../products/search`) do NOT call `log_api_call`. This means agent search impressions never reach the funnel.
+- Net effect today: funnel shows conversions (orders) but no upstream impressions to compute conversion-from-search rates.
+- **Recommended PR**: instrument `agent_search_products` to fire `background_tasks.add_task(log_api_call, ...)` at each of its 8 return points (or via a `/agent/*` middleware). Risk: critical-path function; changes need staging validation. Not done in PR #429 — defer to focused PR with proper review.
+
+### Gap 2: All backfilled events are `source_channel: unknown`
+- Production `order_events.metadata` does not contain `utm_source` / `source` / `referrer` fields. The funnel_recorder correctly falls back to `unknown` rather than guessing.
+- To get richer channel attribution, the order create / payment intent paths need to start passing utm context through to `log_order_event(metadata=...)`.
+- **Recommended PR**: thread utm context from frontend → checkout payload → order metadata. Touches `routes/agent_api.py` order-create paths. Coordinate with merchant portal team for the frontend half.
+
+Both gaps are honest data-pipeline issues — the funnel infrastructure is sound, the instrumentation surface is incomplete. The funnel chart UI can ship against current data (showing the conversion-only side honestly) and improve as instrumentation lands.
+
 ---
 
 ## Backend reference paths
