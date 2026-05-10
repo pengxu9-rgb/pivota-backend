@@ -25,11 +25,20 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 
-def _run_with_excerpt(brand_excerpt: str, *, sources: List[Dict[str, str]] | None = None,
-                     url_in_grounding: bool = False) -> Dict[str, Any]:
+def _run_with_excerpt(
+    brand_excerpt: str,
+    *,
+    sources: List[Dict[str, str]] | None = None,
+    url_in_grounding: bool = False,
+    llm_self_report: bool = False,
+) -> Dict[str, Any]:
     return {
         "query": "best products",
-        "url_match": {"in_grounding": url_in_grounding},
+        "raw": "{}",
+        "url_match": {
+            "in_grounding": url_in_grounding,
+            "llm_self_report": llm_self_report,
+        },
         "parsed": {"evidence_excerpt": brand_excerpt},
         "grounding_chunks": [s.get("uri") for s in (sources or [])],
         "grounding_sources": sources or [],
@@ -205,10 +214,206 @@ def test_no_name_brand_with_only_excerpt_mentions_scores_zero():
         runs, merchant_host=None, merchant_brand="Chydan",
     )
     # All 3 runs have excerpt_match but no title_match and no
-    # in_grounding → should score 0, NOT 100.
+    # in_grounding AND no llm_self_report → should score 0, NOT 100.
     assert score == 0
     for d in details:
         assert d["excerpt_match"] is True
         assert d["title_match"] is False
         assert d["matched"] is False
         assert d["excerpt_only_signal"] is True
+        assert d["excerpt_corroborated_match"] is False
+
+
+# ---------------------------------------------------------------------
+# 5. Excerpt-corroborated path (Grüns fix)
+# ---------------------------------------------------------------------
+
+
+def test_excerpt_corroborated_with_self_report_and_grounding_credits():
+    """Reproduces the Grüns case: editorial source (Forbes) cites the
+    brand by name, Gemini self-reports brand_appears=true, evidence
+    excerpt contains the brand verbatim, but the brand string never
+    appears in the grounding URL (vertex hash redirector) or title
+    (bare hostname 'forbes.com'). All three signals agree → credit."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        _run_with_excerpt(
+            "Best Green Gummies: Grüns Superfoods Greens Gummies.",
+            sources=[
+                {
+                    "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/abcd",
+                    "title": "forbes.com",
+                },
+            ],
+            llm_self_report=True,
+        ),
+    ]
+    score, details = score_category_visibility(
+        runs, merchant_host="gruns.co", merchant_brand="Grüns",
+    )
+    assert score == 100
+    assert details[0]["excerpt_match"] is True
+    assert details[0]["title_match"] is False
+    assert details[0]["in_grounding"] is False
+    assert details[0]["matched"] is True
+    assert details[0]["excerpt_corroborated_match"] is True
+    assert details[0]["excerpt_only_signal"] is False
+
+
+def test_excerpt_match_with_self_report_but_no_grounding_does_not_credit():
+    """Defense against pure LLM hallucination: excerpt + self-report
+    but no grounding source means Gemini answered without web data —
+    don't trust that answer."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        _run_with_excerpt(
+            "Grüns is a popular daily greens supplement.",
+            sources=[],          # no grounding
+            llm_self_report=True,
+        ),
+    ]
+    score, details = score_category_visibility(
+        runs, merchant_host="gruns.co", merchant_brand="Grüns",
+    )
+    assert score == 0
+    assert details[0]["matched"] is False
+    assert details[0]["excerpt_corroborated_match"] is False
+
+
+def test_self_report_alone_without_excerpt_match_does_not_credit():
+    """Defense against generic LLM agreement: Gemini sometimes returns
+    brand_appears=true as a default-yes even when the answer text
+    doesn't actually mention the brand."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        _run_with_excerpt(
+            "There are many options in this category.",
+            sources=[
+                {"uri": "https://forbes.com/", "title": "forbes.com"},
+            ],
+            llm_self_report=True,
+        ),
+    ]
+    score, details = score_category_visibility(
+        runs, merchant_host="gruns.co", merchant_brand="Grüns",
+    )
+    assert score == 0
+    assert details[0]["matched"] is False
+
+
+def test_gruns_real_audit_two_of_three_queries_credit():
+    """End-to-end reproduction of the real Grüns audit. Of the 3
+    category queries, query 1 had upstream failure (raw=""), queries
+    2 and 3 had excerpt + self-report + grounding source. Expected
+    score: 2 / 2 scoreable runs = 100/100 (NOT 0/3 = 0)."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        # Query 1: empty raw — upstream failure (the "network error").
+        {
+            "query": "best daily greens supplements 2026",
+            "raw": "",
+            "parsed": None,
+            "url_match": {
+                "in_grounding": False,
+                "llm_self_report": None,
+            },
+            "grounding_sources": [],
+        },
+        # Query 2: Forbes citing Grüns by name.
+        _run_with_excerpt(
+            "Best Green Gummies: Grüns Superfoods Greens Gummies.",
+            sources=[
+                {
+                    "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/q2",
+                    "title": "forbes.com",
+                },
+            ],
+            llm_self_report=True,
+        ),
+        # Query 3: trailandkale + Forbes + Women's Health.
+        _run_with_excerpt(
+            "When pitted against AG1, Grüns Daily offers a more "
+            "budget-friendly alternative.",
+            sources=[
+                {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/q3a",
+                 "title": "trailandkale.com"},
+                {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/q3b",
+                 "title": "forbes.com"},
+                {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/q3c",
+                 "title": "womenshealthmag.com"},
+            ],
+            llm_self_report=True,
+        ),
+    ]
+    score, details = score_category_visibility(
+        runs, merchant_host="gruns.co", merchant_brand="Grüns",
+    )
+    # Pre-fix: this returned 0 (3 misses). Post-fix: 100 (2 of 2
+    # scoreable runs matched; query 1 excluded as upstream-failed).
+    assert score == 100
+    assert details[0]["upstream_failed"] is True
+    assert details[1]["matched"] is True
+    assert details[1]["excerpt_corroborated_match"] is True
+    assert details[2]["matched"] is True
+    assert details[2]["excerpt_corroborated_match"] is True
+
+
+# ---------------------------------------------------------------------
+# 6. Upstream-failed runs excluded from denominator
+# ---------------------------------------------------------------------
+
+
+def test_upstream_failed_run_excluded_from_denominator():
+    """When raw="" / parsed=None, the run is upstream-failed (likely
+    a Gemini timeout / empty response). Don't count it as a miss."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        # 1 real match
+        _run_with_excerpt(
+            "",
+            sources=[{"uri": "https://nymag.com/", "title": "Lunya is the top pick"}],
+        ),
+        # 1 upstream failure
+        {
+            "query": "what's new in pajamas this year",
+            "raw": "",
+            "parsed": None,
+            "url_match": {"in_grounding": False, "llm_self_report": False},
+            "grounding_sources": [],
+        },
+    ]
+    score, details = score_category_visibility(
+        runs, merchant_host=None, merchant_brand="Lunya",
+    )
+    # 1 match / 1 scoreable = 100 (NOT 1/2 = 50)
+    assert score == 100
+    assert details[1]["upstream_failed"] is True
+    assert details[1]["matched"] is False
+
+
+def test_all_runs_upstream_failed_returns_zero_with_details():
+    """When every run failed upstream, score is 0 (rather than
+    undefined NaN). Caller's UI uses `details[*].upstream_failed`
+    to render 'couldn't probe' instead of '0/100 score'."""
+    from services.agent_center_bd_report_service import score_category_visibility
+    runs = [
+        {
+            "query": "q1",
+            "raw": "",
+            "parsed": None,
+            "url_match": {"in_grounding": False},
+            "grounding_sources": [],
+        },
+        {
+            "query": "q2",
+            "raw": "   ",
+            "parsed": None,
+            "url_match": {"in_grounding": False},
+            "grounding_sources": [],
+        },
+    ]
+    score, details = score_category_visibility(
+        runs, merchant_host=None, merchant_brand="Lunya",
+    )
+    assert score == 0
+    assert all(d["upstream_failed"] for d in details)

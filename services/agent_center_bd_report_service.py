@@ -297,12 +297,32 @@ def score_category_visibility(
       - merchant URL appears in grounding chunks (`url_match.in_grounding`)
       - merchant brand or host appears in any grounding source title
         ("Beauty of Joseon Official Store" → matches brand "Beauty of Joseon")
-      - merchant brand appears in `evidence_excerpt` text (Gemini quoted
-        the brand name in its grounded answer)
+      - **excerpt-corroborated path** (post-Grüns fix): merchant brand
+        appears in `evidence_excerpt` AND Gemini self-reported
+        `brand_appears: true` (`url_match.llm_self_report`) AND there's
+        at least one grounding source on the run. Defends against the
+        editorial-citation case (Forbes lists 10 brands, Gemini quotes
+        Grüns; brand never appears in the redirector grounding URL or
+        the bare-hostname title — but all three signals agree).
 
-    The LLM's `brand_appears: true` self-report alone is NOT enough —
-    Gemini frequently hallucinates self-attribution. We require textual
-    confirmation in the grounded output.
+    The hallucination defense from the prior implementation:
+      - Excerpt-match alone (without llm_self_report) STILL doesn't
+        credit a run — guards against Gemini paraphrasing a no-name
+        brand into the excerpt without genuine grounding. The 1688
+        no-name-brand test case (test_no_name_brand_with_only_excerpt
+        _mentions_scores_zero) exercises this path.
+      - LLM self-report alone (without excerpt match) STILL doesn't
+        credit — Gemini sometimes self-reports `brand_appears: true`
+        as a generic agreement signal even when the answer doesn't
+        actually mention the brand.
+      - Triple agreement (excerpt + self-report + grounding source)
+        is the threshold for "real editorial citation we should count."
+
+    Upstream-failed runs (`parsed is None` or empty `raw`, typically
+    a Gemini timeout / empty response — what surfaces to operators as
+    a "network error" in the report) are EXCLUDED from the denominator
+    rather than counted as misses. Returned in details with
+    `upstream_failed: True` for transparency.
 
     Returns (score 0–100, per-run match details for audit/UI)."""
     if not runs:
@@ -331,10 +351,39 @@ def score_category_visibility(
 
     details: List[Dict[str, Any]] = []
     matched = 0
+    scoreable_runs = 0
     for run in runs:
+        # Detect upstream failure: empty raw response or unparseable
+        # JSON from Gemini grounded mode. These show up as `raw: ""`
+        # + `parsed: null` in the audit dump and are what operators
+        # see surfaced as a "network error" in the report. Excluding
+        # from denominator avoids dragging the score down for what
+        # is a transient probe failure, not a brand-visibility miss.
+        raw = run.get("raw")
+        parsed_raw = run.get("parsed")
+        upstream_failed = (
+            parsed_raw is None
+            or (isinstance(raw, str) and not raw.strip())
+        )
+        if upstream_failed:
+            details.append({
+                "query": run.get("query") or "",
+                "in_grounding": False,
+                "title_match": False,
+                "excerpt_match": False,
+                "matched": False,
+                "excerpt_only_signal": False,
+                "excerpt_corroborated_match": False,
+                "upstream_failed": True,
+            })
+            continue
+        scoreable_runs += 1
+
         url_match = run.get("url_match") or {}
         in_grounding = bool(url_match.get("in_grounding"))
+        llm_self_report = bool(url_match.get("llm_self_report"))
         sources = _identify_run_sources(run)
+        has_grounding_source = bool(sources)
         title_match = False
         for src in sources:
             label = (src.get("label") or "").lower()
@@ -344,17 +393,21 @@ def score_category_visibility(
             if host_lower and host_lower in label:
                 title_match = True
                 break
-        parsed = run.get("parsed") or {}
+        parsed = parsed_raw or {}
         excerpt = (parsed.get("evidence_excerpt") or "").lower()
         excerpt_match = _brand_in(excerpt)
-        # excerpt_match alone no longer credits a run. Gemini's
-        # evidence excerpt is LLM-generated text and can mention the
-        # brand even when no grounding source cites it (hallucination
-        # / paraphrase). Require corroboration from url_match (the
-        # merchant URL was in grounding chunks) or title_match (a
-        # grounded source title contains the brand). Excerpt-only is
-        # surfaced in `details` as a signal-quality flag, not a hit.
-        is_match = in_grounding or title_match
+        # Three independent paths to a match. The excerpt-corroborated
+        # path requires triple agreement (excerpt text + LLM self-report
+        # + at least one grounding source) — the threshold designed
+        # for the editorial-citation case (Forbes/Women's Health/etc.
+        # cited the brand; bare hostname doesn't contain it). See the
+        # test_excerpt_corroborated_with_self_report_and_grounding
+        # _credits + test_no_name_brand_with_only_excerpt_mentions
+        # _scores_zero pair for the discriminator.
+        excerpt_corroborated = (
+            excerpt_match and llm_self_report and has_grounding_source
+        )
+        is_match = in_grounding or title_match or excerpt_corroborated
         if is_match:
             matched += 1
         details.append({
@@ -363,9 +416,21 @@ def score_category_visibility(
             "title_match": title_match,
             "excerpt_match": excerpt_match,
             "matched": is_match,
-            "excerpt_only_signal": (excerpt_match and not is_match),
+            # excerpt_only_signal flag retained for backwards-compat
+            # with the existing UI; now means "excerpt match alone
+            # didn't qualify as corroborated" (no llm_self_report or
+            # no grounding source).
+            "excerpt_only_signal": (
+                excerpt_match and not is_match
+            ),
+            "excerpt_corroborated_match": excerpt_corroborated,
+            "upstream_failed": False,
         })
-    score = round((matched / len(runs)) * 100)
+    if scoreable_runs == 0:
+        # Every run failed upstream — score is undefined, not zero.
+        # Caller's UI surfaces this as "couldn't probe" not "scored 0".
+        return (0, details)
+    score = round((matched / scoreable_runs) * 100)
     return (score, details)
 
 
