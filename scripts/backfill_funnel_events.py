@@ -325,13 +325,21 @@ async def main_async(args: argparse.Namespace) -> int:
         await database.connect()
     await ensure_funnel_events_table()
 
-    cutoff_after = datetime.now(timezone.utc) - timedelta(days=int(args.days))
+    # api_call_events / order_events were created with TIMESTAMP (no tz)
+    # in the original schema. Pass offset-NAIVE datetimes to the SQL
+    # query to avoid asyncpg's "can't subtract offset-naive and offset-
+    # aware" error. The semantic value is the same — both sides are UTC.
+    cutoff_after = (
+        datetime.now(timezone.utc) - timedelta(days=int(args.days))
+    ).replace(tzinfo=None)
     cutoff_before: Optional[datetime] = None
     if args.cutoff:
         try:
-            cutoff_before = datetime.fromisoformat(args.cutoff.replace("Z", "+00:00"))
-            if cutoff_before.tzinfo is None:
-                cutoff_before = cutoff_before.replace(tzinfo=timezone.utc)
+            parsed = datetime.fromisoformat(args.cutoff.replace("Z", "+00:00"))
+            # Normalize to naive-UTC for the SQL query.
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            cutoff_before = parsed
         except ValueError:
             logger.error("Invalid --cutoff timestamp: %r (need ISO-8601)", args.cutoff)
             return 2
