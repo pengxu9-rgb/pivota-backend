@@ -413,7 +413,11 @@ def score_category_visibility(
                 title_match = True
                 break
         parsed = parsed_raw or {}
-        excerpt = (parsed.get("evidence_excerpt") or "").lower()
+        # Preserve the original-case evidence excerpt for renderer
+        # surfacing (PR-7e). The lowercase copy below is only used
+        # for case-insensitive brand matching.
+        excerpt_text = (parsed.get("evidence_excerpt") or "").strip()
+        excerpt = excerpt_text.lower()
         excerpt_match = _brand_in(excerpt)
         # Three independent paths to a match. The excerpt-corroborated
         # path requires triple agreement (excerpt text + LLM self-report
@@ -429,6 +433,13 @@ def score_category_visibility(
         is_match = in_grounding or title_match or excerpt_corroborated
         if is_match:
             matched += 1
+        # Capture top source labels for renderer attribution. Limit
+        # to first 3 to keep payload size bounded.
+        source_labels = [
+            (src.get("label") or "").strip()
+            for src in sources[:3]
+            if (src.get("label") or "").strip()
+        ]
         details.append({
             "query": run.get("query") or "",
             "in_grounding": in_grounding,
@@ -444,6 +455,13 @@ def score_category_visibility(
             ),
             "excerpt_corroborated_match": excerpt_corroborated,
             "upstream_failed": False,
+            # PR-7e: preserve the verbatim excerpt + source labels so
+            # downstream renderers can build evidence_quotes without
+            # re-walking raw_runs. Only attached when the brand was
+            # actually mentioned in the excerpt — keeps payload size
+            # bounded and avoids leaking unrelated quotes.
+            "evidence_excerpt_text": excerpt_text if excerpt_match else None,
+            "source_labels": source_labels,
         })
     if scoreable_runs == 0:
         # Every run failed upstream — score is undefined, not zero.
@@ -2238,13 +2256,31 @@ def _build_what_pivota_changes(
             },
         ],
         "platform_coverage": {
-            "shipped": ["Shopify"],
-            "roadmap": ["WooCommerce", "Wix", "PrestaShop"],
+            # Multi-platform: end-to-end order writeback adapters for
+            # Shopify, WooCommerce, and BigCommerce all live in
+            # routes/order_routes.py; sync_order_to_connected_store
+            # dispatches by platform. Wix is currently audit-ready
+            # (read-only audit + manual order routing) pending the
+            # Wix App OAuth + Stores API writeback integration. Custom
+            # / headless storefronts are supported via a lightweight
+            # engineering-scoped integration of the merchant's order
+            # API (typical 1-2 weeks).
+            "shipped": ["Shopify", "WooCommerce", "BigCommerce"],
+            "audit_only": ["Wix"],
+            "custom_integration": (
+                "Custom-built and headless storefronts (Saleor, Medusa, "
+                "Next.js + commerce backend, etc.) are supported via "
+                "engineering-scoped integration of the merchant's "
+                "order-creation API; typical scope 1-2 weeks."
+            ),
             "note": (
-                "Shopify path is wired end-to-end and verified with a test "
-                "merchant. Adapters for Woo / Wix / PrestaShop exist in the "
-                "codebase but the order-completion dispatch is hardcoded to "
-                "Shopify today; multi-platform wiring is on the Q3 roadmap."
+                "Multi-platform: Shopify, WooCommerce, and BigCommerce "
+                "are wired end-to-end for in-chat agent checkout → "
+                "order forwarding into the merchant's existing admin. "
+                "Wix supports the audit + agent-channel discovery path "
+                "today; automated order writeback is on the Q3 roadmap. "
+                "Any other platform — including custom-built and "
+                "headless — is supported via lightweight integration."
             ),
         },
         "outcome": (
@@ -2919,6 +2955,50 @@ def _is_cold_start_audit(integration_state: Optional[Dict[str, Any]]) -> bool:
     return "store_platform" in missing and "psp" in missing
 
 
+def _build_evidence_quotes(
+    category_match_details: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """PR-7e: Extract verbatim Gemini-grounded evidence quotes that
+    mention the merchant brand. Filtered to highest-confidence: only
+    excerpt-corroborated runs (excerpt + LLM self-report + grounding
+    source) qualify, so excerpt-only Gemini paraphrases (the no-name
+    1688-case hallucination class) are excluded.
+
+    Output is a list of `{query, excerpt_text, source_labels,
+    attribution_path}` for the renderer to display as quote boxes.
+    Excerpt text is preserved in original case.
+
+    Truncation rule: keep all qualifying quotes. They're already
+    filtered to corroborated matches (typically 0-3 per audit), and
+    the renderer can decide to display only the top N if needed.
+    """
+    if not category_match_details:
+        return []
+    quotes: List[Dict[str, Any]] = []
+    for d in category_match_details:
+        excerpt_text = d.get("evidence_excerpt_text")
+        if not excerpt_text:
+            continue
+        # Only surface excerpts where the brand was named AND
+        # corroborated by LLM self-report + grounding source. Excerpt-
+        # match alone falls through into the no-quote bucket — those
+        # are likely Gemini paraphrasing, not actual editorial
+        # citations.
+        if not d.get("excerpt_corroborated_match"):
+            continue
+        # Truncate very long excerpts (>500 chars) to keep quote-box
+        # rendering readable; preserve enough context for credibility.
+        if len(excerpt_text) > 500:
+            excerpt_text = excerpt_text[:497].rstrip() + "..."
+        quotes.append({
+            "query": d.get("query") or "",
+            "excerpt_text": excerpt_text,
+            "source_labels": d.get("source_labels") or [],
+            "attribution_path": "merchant_named_in_grounded_excerpt",
+        })
+    return quotes
+
+
 def _build_tracking_block(
     *,
     prior_runs: Optional[List[Dict[str, Any]]],
@@ -2927,22 +3007,28 @@ def _build_tracking_block(
     your_gap_to_baseline: Dict[str, int],
     current_scores: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Tracking block for merchant_view. Suppresses content that's
-    irrelevant or misleading for cold-start (BD pre-pitch) audits:
-      - history_link → cold targets have no merchant_id, no history
-      - pivota_baseline_reference → showing Pivota's own indexing-up
-        figures to a cold target is anti-pitch material
-    For real merchant audits, both fields populate as before.
+    """Tracking block for merchant_view.
 
-    PR-1a (APM): cold-start audits NOW persist to merchant_audit_runs
-    with a synthetic prospect id (see routes/agent_center_bd_routes
-    cold_start_audit handler). When prior_runs is non-empty for a
-    cold-start target, history STILL renders — operator can re-audit
-    a prospect in 30 days and see trend deltas without onboarding.
-    The history_link gating below stays in place because the
-    /api/merchant-center/audit/history route requires merchant auth
-    that cold-start prospects don't have; portal renders trend from
-    the inline history block instead.
+    PR-11 (post-Grüns review): pivota_baseline_reference is now
+    populated for BOTH cold-start and onboarded audits, but with
+    `pitch_framing` context that lets the renderer present it as
+    forward-looking pitch material rather than a damning "0/0
+    baseline" headline. Prior behavior was to null this for cold-
+    start to avoid anti-pitch framing — but that left renderers
+    with nothing to show, and the surrounding `what_pivota_changes`
+    narrative referenced a baseline number that never appeared in
+    structured data.
+
+    `your_gap_to_baseline` remains cold-start-null because the
+    "your scores minus baseline" math has no meaning before the
+    merchant has been audited as an onboarded merchant.
+
+    Other fields:
+      - history_link → cold targets have no merchant_id, no history
+        endpoint access; remains gated.
+      - history → built from prior_runs whenever those exist (even
+        for cold-start prospect ids). PR-1a re-audit trend works
+        cross-cold-start.
     """
     cold_start = _is_cold_start_audit(integration_state)
     block: Dict[str, Any] = {
@@ -2951,16 +3037,98 @@ def _build_tracking_block(
         "history": _build_history_trend(prior_runs, current_scores=current_scores),
         "your_gap_to_baseline": your_gap_to_baseline if not cold_start else None,
     }
-    if not cold_start:
-        block["pivota_baseline_reference"] = {
-            "visibility": pivota_baseline.get("median_visibility"),
-            "attribution": pivota_baseline.get("median_attribution"),
-            "as_of": pivota_baseline.get("as_of_date"),
-            "indexing_phase": pivota_baseline.get("indexing_phase"),
-        }
-    else:
-        block["pivota_baseline_reference"] = None
+    # Always populate baseline reference. The pitch_framing field
+    # tells the renderer how to present it (positive forward-looking
+    # for indexing-up phase vs comparable-to-merchant for steady-
+    # state). Renderers should prefer pitch_framing over the raw
+    # numeric baseline when it's available.
+    indexing_phase = pivota_baseline.get("indexing_phase") or "steady-state"
+    block["pivota_baseline_reference"] = {
+        "visibility": pivota_baseline.get("median_visibility"),
+        "attribution": pivota_baseline.get("median_attribution"),
+        "as_of": pivota_baseline.get("as_of_date"),
+        "indexing_phase": indexing_phase,
+        "sample_size_pdps": pivota_baseline.get("sample_size_pdps"),
+        "pitch_framing": _baseline_pitch_framing(
+            indexing_phase=indexing_phase,
+            cold_start=cold_start,
+            baseline_visibility=pivota_baseline.get("median_visibility") or 0,
+            baseline_attribution=pivota_baseline.get("median_attribution") or 0,
+        ),
+    }
     return block
+
+
+def _baseline_pitch_framing(
+    *,
+    indexing_phase: str,
+    cold_start: bool,
+    baseline_visibility: int,
+    baseline_attribution: int,
+) -> Dict[str, str]:
+    """Forward-looking framing for the Pivota canonical-PDP baseline.
+    Renderer uses this in place of just showing the raw baseline
+    number, so a 0/0 baseline reads as a 30-90 day Google indexing
+    arc (correct) rather than as a Pivota failure (wrong)."""
+    if indexing_phase == "indexing-up":
+        if cold_start:
+            return {
+                "headline": (
+                    "Pivota canonical PDPs are in the typical 30-90 day "
+                    "Google indexing arc post-publication. Mechanics "
+                    "(canonical PDP + Schema.org + sitemap + Search "
+                    "Console URL Inspection cadence) are shipped; "
+                    "Google's crawl latency is the rate-limiting step "
+                    "before grounded-citation lift."
+                ),
+                "what_to_expect_post_onboarding": (
+                    "After 30-90 days of co-investment with Pivota's "
+                    "Search Console URL Inspection cadence, your "
+                    "canonical PDPs progress through the indexing arc "
+                    "and surface in grounded LLM answers for the "
+                    "category queries you should own."
+                ),
+                "honest_caveat": (
+                    "Pivota's own canonical PDPs currently surface "
+                    f"{baseline_visibility}/{baseline_attribution} "
+                    "in Gemini grounded retrieval — this is the "
+                    "indexing-up phase reality, not steady-state. "
+                    "Steady-state benchmarks will replace this anchor "
+                    "as Pivota's seeded PDPs mature."
+                ),
+            }
+        # Onboarded merchant in indexing-up phase
+        return {
+            "headline": (
+                "Pivota canonical PDPs for your catalog are in the "
+                "30-90 day Google indexing arc. Mechanics shipped; "
+                "indexing latency is the rate-limiting step."
+            ),
+            "what_to_expect_post_onboarding": (
+                "Re-audit at 30 and 90 days post-onboarding for "
+                "paired before/after lift on the same SKUs."
+            ),
+            "honest_caveat": (
+                f"Today's baseline: {baseline_visibility}/"
+                f"{baseline_attribution}. Steady-state benchmarks "
+                "will replace this as PDPs mature past the indexing "
+                "arc."
+            ),
+        }
+    # Steady-state phase
+    return {
+        "headline": (
+            f"Pivota canonical PDPs (current baseline: "
+            f"{baseline_visibility}/{baseline_attribution}) provide "
+            "a comparable benchmark for AI-channel attribution at "
+            "steady state."
+        ),
+        "what_to_expect_post_onboarding": (
+            "Your scores after 30-90 days of Pivota onboarding can "
+            "be compared directly against this steady-state baseline."
+        ),
+        "honest_caveat": "",
+    }
 
 
 def _build_merchant_view(
@@ -3500,6 +3668,12 @@ def build_structured_report(
         {"host": h, "times_cited": c}
         for h, c in competitors.most_common(15)
     ]
+    # PR-7e: extract verbatim Gemini-grounded evidence quotes that
+    # mention the merchant brand by name with editorial-grade
+    # corroboration. These power the renderer's "evidence quote box"
+    # surface — the highest-leverage element in a polished audit
+    # because they're verbatim what Gemini said about the brand.
+    evidence_quotes = _build_evidence_quotes(category_match_details)
     action_items = _generate_action_items(
         verdict_label=verdict_label,
         visibility_runs=visibility_runs,
@@ -3585,6 +3759,12 @@ def build_structured_report(
         "action_items": action_items,
         "competitive_pressure": competitive_pressure,
         "what_pivota_changes": what_pivota_changes,
+        # PR-7e: verbatim Gemini-grounded quotes that mention the
+        # merchant brand by name with editorial-grade corroboration.
+        # Renderers should surface these as quote boxes — highest-
+        # leverage report element because they're verbatim what
+        # Gemini said about the brand.
+        "evidence_quotes": evidence_quotes,
         "merchant_view": merchant_view,
         "visibility": {
             "score": visibility_score,

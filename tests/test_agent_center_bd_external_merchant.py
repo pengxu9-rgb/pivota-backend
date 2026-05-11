@@ -1647,10 +1647,15 @@ def test_checkout_loop_chain_has_six_steps_each_with_evidence() -> None:
     assert "merch_38fa56d5118b9974" in last_step["evidence"]
 
 
-def test_checkout_loop_platform_coverage_honest_about_shopify_only() -> None:
-    """Platform coverage explicitly lists Shopify as shipped + Wix /
-    Woo / PrestaShop on roadmap. Honest disclosure protects BD pitch
-    from over-promising."""
+def test_checkout_loop_platform_coverage_multi_platform_messaging() -> None:
+    """PR-10a (post-Grüns review): platform coverage now reflects
+    actual code state — Shopify + WooCommerce + BigCommerce all
+    shipped end-to-end (per routes/order_routes.py adapters); Wix
+    audit-ready; custom storefronts via lightweight integration.
+
+    Replaces the prior 'Shopify-only honest disclosure' framing,
+    which was actively misleading since Woo + BC adapters were
+    already shipped."""
     from services.agent_center_bd_report_service import build_structured_report
     report = build_structured_report(
         merchant_name="X",
@@ -1663,10 +1668,22 @@ def test_checkout_loop_platform_coverage_honest_about_shopify_only() -> None:
         provider="gemini",
     )
     pc = report["what_pivota_changes"]["checkout_loop"]["platform_coverage"]
+    # All three real-adapter platforms now reported as shipped
     assert "Shopify" in pc["shipped"]
-    assert any("woo" in p.lower() for p in pc["roadmap"])
-    assert any("wix" in p.lower() for p in pc["roadmap"])
-    assert "Q3" in pc["note"] or "roadmap" in pc["note"].lower()
+    assert "WooCommerce" in pc["shipped"]
+    assert "BigCommerce" in pc["shipped"]
+    # Wix is audit-only (writeback adapter on Q3 roadmap)
+    assert "Wix" in (pc.get("audit_only") or [])
+    # Custom integration disclosure exists
+    assert pc.get("custom_integration"), "custom_integration tier expected"
+    # Note copy reflects multi-platform stance, not Shopify-only
+    note_lower = pc["note"].lower()
+    assert "multi-platform" in note_lower
+    assert "woocommerce" in note_lower
+    # Should NOT claim Woo / BC are roadmap (they're shipped)
+    roadmap = pc.get("roadmap") or []
+    assert "WooCommerce" not in roadmap
+    assert "BigCommerce" not in roadmap
 
 
 def test_render_markdown_includes_discovery_lift_and_checkout_loop() -> None:
