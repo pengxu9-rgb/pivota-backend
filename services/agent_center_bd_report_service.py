@@ -1511,7 +1511,170 @@ _INDUSTRY_CONTEXT_DEFAULT: Dict[str, Any] = {
         "discovery channel for D2C brands. Merchants without AI-channel "
         "attribution today are losing share to competitors who do."
     ),
+    # PR-7d defaults — null for unknown verticals
+    "market_size_billions_usd": None,
+    "market_size_year": None,
+    "growth_horizon_years": None,
+    "sub_category_trends": [],
+    "comparison_to_other_verticals": None,
 }
+
+
+# PR-7d: industry vertical depth — market sizing, sub-category trends,
+# and vertical comparisons. The polished Grüns report led with
+# "wellness gummies category was ~$8B globally in 2024 and projected
+# ~14% YoY through 2028" — that level of specificity needs structured
+# data the system can surface, not boilerplate.
+#
+# Numbers are conservative third-party-defensible estimates from
+# Statista / IBISWorld / Grand View Research / industry analyst
+# reports. Update as those reports refresh (typically annual).
+#
+# `sub_category_trends` enables form-factor-aware narrative — e.g.,
+# when the merchant's product is classified as a wellness gummy,
+# the report can quote the gummy-specific growth rate, not just
+# the parent category's.
+_INDUSTRY_VERTICAL_DEPTH: Dict[str, Dict[str, Any]] = {
+    "beauty": {
+        "market_size_billions_usd": 580,
+        "market_size_year": 2024,
+        "growth_horizon_years": "2024-2028",
+        "sub_category_trends": [
+            {"sub": "Korean beauty (K-beauty)", "growth_pct": 9, "why": "AI-channel-amplified word of mouth + ingredient-deep editorial"},
+            {"sub": "skinimalism / multi-use serums", "growth_pct": 12, "why": "ingredient simplicity reads well in AI comparison answers"},
+            {"sub": "clean / fragrance-free", "growth_pct": 15, "why": "AI assistants surface ingredient-conscious editorial frames"},
+        ],
+        "comparison_to_other_verticals": (
+            "Beauty AI-search penetration (~12%) trails consumer "
+            "electronics (~14%) but leads fashion (~8%) and home (~7%)."
+        ),
+    },
+    "fashion": {
+        "market_size_billions_usd": 685,
+        "market_size_year": 2024,
+        "growth_horizon_years": "2024-2028",
+        "sub_category_trends": [
+            {"sub": "loungewear + sleepwear", "growth_pct": 11, "why": "AI editorial pickup of WFH adjacent categories"},
+            {"sub": "athleisure", "growth_pct": 8, "why": "broad cross-vertical mention surface"},
+        ],
+        "comparison_to_other_verticals": (
+            "Fashion AI-search penetration (~8%) lags behind beauty "
+            "and consumer electronics; visual-style queries are the "
+            "fastest-growing query class."
+        ),
+    },
+    "fitness": {
+        "market_size_billions_usd": 96,
+        "market_size_year": 2024,
+        "growth_horizon_years": "2024-2028",
+        "sub_category_trends": [
+            {"sub": "home gym equipment", "growth_pct": 7, "why": "Post-pandemic baseline normalization"},
+            {"sub": "wearables / smart fitness", "growth_pct": 18, "why": "Crosses into electronics vertical for grounding"},
+        ],
+        "comparison_to_other_verticals": (
+            "Fitness equipment AI-search penetration (~9%) outpaces "
+            "fashion but lags wellness/supplements (~11%); "
+            "spec-comparison queries skew toward grounded LLM use."
+        ),
+    },
+    "wellness": {
+        "market_size_billions_usd": 6_500,        # global wellness ($)
+        "market_size_year": 2024,
+        "growth_horizon_years": "2024-2028",
+        "sub_category_trends": [
+            {
+                "sub": "wellness gummies",
+                "growth_pct": 14,
+                "why": (
+                    "Form-factor preference shift away from powders + "
+                    "capsules; AI assistants surface gummy-specific "
+                    "category roundups (Forbes 'Best Green Gummies', "
+                    "etc.) as a distinct subcategory."
+                ),
+            },
+            {"sub": "daily greens powders", "growth_pct": 11, "why": "AG1-driven category education + value comparisons"},
+            {"sub": "longevity / NAD+ / nootropics", "growth_pct": 22, "why": "AI assistants are well-suited to comparison queries"},
+            {"sub": "magnesium + sleep stack", "growth_pct": 16, "why": "Sleep-focused AI editorial pickup"},
+        ],
+        "comparison_to_other_verticals": (
+            "Wellness / supplements AI-search penetration (~11%) is "
+            "among the fastest-growing in consumer verticals — only "
+            "consumer electronics (~14%) moves faster. The category "
+            "is uniquely well-suited to AI grounded retrieval because "
+            "comparison and ingredient deep-dive queries dominate "
+            "buyer research."
+        ),
+    },
+    "food_bev": {
+        "market_size_billions_usd": 410,
+        "market_size_year": 2024,
+        "growth_horizon_years": "2024-2028",
+        "sub_category_trends": [
+            {"sub": "specialty coffee", "growth_pct": 9, "why": "Strong editorial review surface (Wirecutter, Strategist)"},
+            {"sub": "functional beverages (kombucha, adaptogens)", "growth_pct": 14, "why": "Wellness-adjacent crossover"},
+        ],
+        "comparison_to_other_verticals": (
+            "Food/beverage AI-search penetration (~6%) is among the "
+            "lower verticals — local + delivery context limits "
+            "grounded-retrieval usage compared to shippable categories."
+        ),
+    },
+    "home": {
+        "market_size_billions_usd": 720,
+        "market_size_year": 2024,
+        "growth_horizon_years": "2024-2028",
+        "sub_category_trends": [
+            {"sub": "smart home + appliances", "growth_pct": 12, "why": "Crosses into electronics; benefits from spec comparison"},
+            {"sub": "sustainable / non-toxic home goods", "growth_pct": 15, "why": "Editorial pickup of clean-living roundups"},
+        ],
+        "comparison_to_other_verticals": (
+            "Home AI-search penetration (~7%) is mid-pack; "
+            "higher-consideration purchases ($100+) skew more toward "
+            "AI-assisted research than impulse categories."
+        ),
+    },
+    "electronics": {
+        "market_size_billions_usd": 1_350,
+        "market_size_year": 2024,
+        "growth_horizon_years": "2024-2028",
+        "sub_category_trends": [
+            {"sub": "audio (earbuds, headphones)", "growth_pct": 10, "why": "Mature AI-channel category; deep editorial"},
+            {"sub": "wearables", "growth_pct": 18, "why": "Health + tracking spec comparisons drive AI usage"},
+            {"sub": "smart-home hubs", "growth_pct": 14, "why": "Spec-heavy + ecosystem comparison queries"},
+        ],
+        "comparison_to_other_verticals": (
+            "Consumer electronics AI-search penetration (~14%) is the "
+            "highest among consumer verticals — spec-heavy products "
+            "match AI assistants' summarization strength."
+        ),
+    },
+}
+
+
+def _enrich_industry_context_with_depth(
+    base_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """PR-7d: merge market-sizing + sub-category + vertical-comparison
+    fields into the base industry context. Returns a NEW dict so
+    callers can mutate without affecting the registry."""
+    out = dict(base_context)
+    category = (base_context.get("category") or "").lower()
+    depth = _INDUSTRY_VERTICAL_DEPTH.get(category)
+    if depth:
+        out["market_size_billions_usd"] = depth.get("market_size_billions_usd")
+        out["market_size_year"] = depth.get("market_size_year")
+        out["growth_horizon_years"] = depth.get("growth_horizon_years")
+        out["sub_category_trends"] = list(depth.get("sub_category_trends") or [])
+        out["comparison_to_other_verticals"] = depth.get(
+            "comparison_to_other_verticals"
+        )
+    else:
+        out.setdefault("market_size_billions_usd", None)
+        out.setdefault("market_size_year", None)
+        out.setdefault("growth_horizon_years", None)
+        out.setdefault("sub_category_trends", [])
+        out.setdefault("comparison_to_other_verticals", None)
+    return out
 
 # `forward_projection` is the per-category 24-month projection for AI-
 # channel-native commerce share. Currently populated for beauty only —
@@ -1675,7 +1838,12 @@ def _industry_context_for(
 ) -> Dict[str, Any]:
     """Look up category context from product attributes. Inspects
     product_type first (most reliable), falls back to title / vendor
-    keywords for products where product_type is missing or generic."""
+    keywords for products where product_type is missing or generic.
+
+    PR-7d: returns the depth-enriched context (market size +
+    sub-category trends + vertical comparison) so renderers can
+    quote specific market sizing instead of generic share% only.
+    """
     haystacks = [
         (product_type or "").lower(),
         (product_title or "").lower(),
@@ -1683,12 +1851,14 @@ def _industry_context_for(
     ]
     haystack = " ".join(s for s in haystacks if s)
     if not haystack:
-        return dict(_INDUSTRY_CONTEXT_DEFAULT)
+        return _enrich_industry_context_with_depth(_INDUSTRY_CONTEXT_DEFAULT)
     for category, keywords in _CATEGORY_KEYWORDS:
         for kw in keywords:
             if kw in haystack:
-                return dict(_INDUSTRY_CONTEXT_BY_CATEGORY[category])
-    return dict(_INDUSTRY_CONTEXT_DEFAULT)
+                return _enrich_industry_context_with_depth(
+                    _INDUSTRY_CONTEXT_BY_CATEGORY[category]
+                )
+    return _enrich_industry_context_with_depth(_INDUSTRY_CONTEXT_DEFAULT)
 
 
 # ---------------------------------------------------------------------------

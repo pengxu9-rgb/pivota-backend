@@ -86,8 +86,9 @@ def _load_registry() -> Dict[str, Dict[str, Any]]:
 
 
 def _unclassified(host: Optional[str]) -> Dict[str, Any]:
-    return {
-        "host": (host or "").strip().lower() or None,
+    h = (host or "").strip().lower() or None
+    out: Dict[str, Any] = {
+        "host": h,
         "type": "unclassified",
         "subtype": None,
         "categories": [],
@@ -95,6 +96,170 @@ def _unclassified(host: Optional[str]) -> Dict[str, Any]:
         "outreach_hint": None,
         "applies_to_merchant_category": None,
     }
+    # PR-7c: even for unclassified hosts, the enrichment fallback
+    # maps may still know about them (e.g. a host in the
+    # _DEFAULT_TIER_BY_HOST map but not in the registry JSON yet).
+    # Renderer expects these fields to always be present (nullable).
+    if h:
+        out["tier"] = _default_tier_for_host(h, "unclassified")
+        out["editorial_cadence"] = _default_cadence_for_host(h)
+        out["ai_grounding_weight"] = _default_grounding_weight_for_host(h)
+        out["expected_outreach_cycle_weeks"] = (
+            _default_outreach_cycle_weeks(out["editorial_cadence"], None)
+        )
+    else:
+        out["tier"] = None
+        out["editorial_cadence"] = None
+        out["ai_grounding_weight"] = None
+        out["expected_outreach_cycle_weeks"] = None
+    return out
+
+
+# PR-7c: tier + cadence + ai_grounding_weight defaults for hosts that
+# don't have explicit values in the registry JSON. Backfilled from the
+# top-cited hosts across our audit history. Future PR can populate
+# the registry JSON with explicit values per host (this map is the
+# fallback for hosts where explicit values aren't yet set).
+_DEFAULT_TIER_BY_HOST: Dict[str, int] = {
+    # Tier 1 — top-tier review sites + magazines with broad reach
+    "nytimes.com": 1,            # Wirecutter
+    "nymag.com": 1,              # The Strategist
+    "forbes.com": 1,              # Forbes Vetted
+    "wsj.com": 1,
+    "bloomberg.com": 1,
+    "vogue.com": 1,
+    "harpersbazaar.com": 1,
+    "elle.com": 1,
+    "cosmopolitan.com": 1,
+    "allure.com": 1,
+    "womenshealthmag.com": 1,
+    "mensjournal.com": 1,
+    "menshealth.com": 1,
+    "today.com": 1,
+    "people.com": 1,
+    "self.com": 1,
+    "shape.com": 1,
+    "byrdie.com": 1,
+    "refinery29.com": 1,
+    "esquire.com": 1,
+    "vanityfair.com": 1,
+    "wired.com": 1,
+    "engadget.com": 1,
+    "theverge.com": 1,
+    "cnet.com": 1,
+    "techcrunch.com": 1,
+    # Tier 2 — niche review sites with disproportionate AI-grounding
+    # influence in their vertical
+    "trailandkale.com": 2,
+    "outsideonline.com": 2,
+    "runnersworld.com": 2,
+    "bicycling.com": 2,
+    "businessinsider.com": 2,
+    "popsci.com": 2,
+    "yahoo.com": 2,
+    "msn.com": 2,
+    "vice.com": 2,
+    "thecut.com": 2,
+    "fashionista.com": 2,
+    "whowhatwear.com": 2,
+    "intothegloss.com": 2,
+    "cupofjo.com": 2,
+    "purewow.com": 2,
+    "thespruce.com": 2,
+    "apartmenttherapy.com": 2,
+    "bonappetit.com": 2,
+    "epicurious.com": 2,
+    # Tier 3 — niche / personal-brand bloggers with regional or
+    # category-specific influence
+    "mindbodygreen.com": 3,
+    "wellandgood.com": 3,
+    "bridestory.com": 3,
+}
+
+
+_DEFAULT_CADENCE_BY_HOST: Dict[str, str] = {
+    # Quarterly refresh cycle — Forbes Vetted, Wirecutter, etc.
+    "forbes.com": "quarterly",
+    "nytimes.com": "quarterly",        # Wirecutter
+    "nymag.com": "quarterly",
+    "today.com": "quarterly",
+    "wired.com": "quarterly",
+    "techcrunch.com": "continuous",     # rolling reviews
+    # Annual / biannual roundup publishers
+    "womenshealthmag.com": "annual",
+    "menshealth.com": "annual",
+    "self.com": "annual",
+    "shape.com": "annual",
+    "vogue.com": "biannual",
+    "harpersbazaar.com": "biannual",
+    "elle.com": "biannual",
+    "cosmopolitan.com": "biannual",
+    # Continuous editorial — daily-ish posts
+    "businessinsider.com": "continuous",
+    "yahoo.com": "continuous",
+    "msn.com": "continuous",
+}
+
+
+_DEFAULT_GROUNDING_WEIGHT_BY_HOST: Dict[str, str] = {
+    # High = consistently appears in Gemini grounding for category
+    # queries across multiple verticals
+    "forbes.com": "high",
+    "nytimes.com": "high",
+    "nymag.com": "high",
+    "wired.com": "high",
+    "theverge.com": "high",
+    "wirecutter.com": "high",
+    # Medium = appears in vertical-specific grounding
+    "trailandkale.com": "medium",
+    "outsideonline.com": "medium",
+    "womenshealthmag.com": "medium",
+    "menshealth.com": "medium",
+    "today.com": "medium",
+    "byrdie.com": "medium",
+    "allure.com": "medium",
+    # Low = rare appearance; defensive default for unknown hosts
+}
+
+
+def _default_tier_for_host(host: str, host_type: str) -> Optional[int]:
+    """Tier from explicit registry entry, then from default map,
+    then heuristic from host_type. Returns None when no signal."""
+    explicit = _DEFAULT_TIER_BY_HOST.get(host)
+    if explicit:
+        return explicit
+    # Heuristic from type: editorial review_site → tier 2 default;
+    # retailer/marketplace → no tier (tier concept is editorial-only)
+    if host_type == "editorial":
+        return 3  # Conservative default for unknown editorial sources
+    return None
+
+
+def _default_cadence_for_host(host: str) -> Optional[str]:
+    return _DEFAULT_CADENCE_BY_HOST.get(host)
+
+
+def _default_grounding_weight_for_host(host: str) -> Optional[str]:
+    return _DEFAULT_GROUNDING_WEIGHT_BY_HOST.get(host)
+
+
+def _default_outreach_cycle_weeks(
+    cadence: Optional[str], host_type: Optional[str],
+) -> Optional[List[int]]:
+    """Default outreach cycle range based on cadence + host type.
+    Returns [low, high] weeks the merchant should expect from pitch
+    to inclusion-in-grounded-LLM-answers."""
+    if cadence == "continuous":
+        return [2, 4]      # rolling editorial
+    if cadence == "quarterly":
+        return [4, 8]
+    if cadence == "biannual":
+        return [8, 16]
+    if cadence == "annual":
+        return [12, 24]
+    if host_type == "retailer":
+        return [12, 26]    # wholesale onboarding cycles
+    return None
 
 
 def classify_host(
@@ -129,9 +294,10 @@ def classify_host(
     else:
         applies = None
 
+    host_type = entry.get("type") or "unclassified"
     out: Dict[str, Any] = {
         "host": h,
-        "type": entry.get("type") or "unclassified",
+        "type": host_type,
         "subtype": entry.get("subtype"),
         "categories": categories,
         "coverage_note": entry.get("coverage_note"),
@@ -147,6 +313,25 @@ def classify_host(
     pitch_recipient = entry.get("pitch_recipient")
     if pitch_recipient is not None:
         out["pitch_recipient"] = pitch_recipient
+
+    # PR-7c: tier + cadence + grounding weight + outreach cycle.
+    # Prefer explicit values from the registry JSON; fall back to
+    # default maps for known top-cited hosts; fall back to None for
+    # unknowns. Renderer can show "Tier 1 publisher · quarterly
+    # refresh · high AI grounding influence" when populated.
+    out["tier"] = entry.get("tier") or _default_tier_for_host(h, host_type)
+    out["editorial_cadence"] = (
+        entry.get("editorial_cadence")
+        or _default_cadence_for_host(h)
+    )
+    out["ai_grounding_weight"] = (
+        entry.get("ai_grounding_weight")
+        or _default_grounding_weight_for_host(h)
+    )
+    out["expected_outreach_cycle_weeks"] = (
+        entry.get("expected_outreach_cycle_weeks")
+        or _default_outreach_cycle_weeks(out["editorial_cadence"], host_type)
+    )
     return out
 
 
