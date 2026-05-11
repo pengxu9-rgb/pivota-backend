@@ -264,6 +264,44 @@ async def probe(
     Other providers ("gemini", "mock", future "chatgpt"/"claude")
     continue to route through PIVOTA-Agent via HTTP.
     """
+    # PR-7-orchestrator: when caller passes provider="auto" (or
+    # "auto:strategy"), let the orchestrator pick the actual provider
+    # based on scan_mode + cost + capability. Existing callers passing
+    # a specific provider id ("gemini", "deepseek") bypass this and
+    # route directly — backwards compatible.
+    if provider.startswith("auto"):
+        from services.llm_providers.orchestrator import (
+            STRATEGY_SINGLE_BEST,
+            parse_provider_spec,
+            select_provider,
+        )
+        _, strategy_override = parse_provider_spec(provider)
+        chosen_strategy = strategy_override or STRATEGY_SINGLE_BEST
+        chosen_provider = select_provider(
+            scan_mode=scan_mode,
+            strategy=chosen_strategy,
+            merchant_id=merchant_id,
+        )
+        logger.info(
+            "orchestrator: selected provider=%s for scan_mode=%s "
+            "strategy=%s merchant_id=%s",
+            chosen_provider, scan_mode, chosen_strategy, merchant_id,
+        )
+        # Recurse with the resolved provider id; subsequent dispatch
+        # logic (Deepseek branch + upstream HTTP fallthrough) handles
+        # the actual call.
+        return await probe(
+            scan_mode=scan_mode,
+            scan_target_id=scan_target_id,
+            merchant_id=merchant_id,
+            store_id=store_id,
+            context=context,
+            provider=chosen_provider,
+            max_runs=max_runs,
+            timeout_s=timeout_s,
+            allow_local_mock=allow_local_mock,
+        )
+
     # PR-3a Deepseek dispatch: backend-direct, no upstream HTTP call.
     if provider == "deepseek":
         return await _probe_via_deepseek(
