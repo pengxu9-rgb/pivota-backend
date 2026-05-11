@@ -3873,6 +3873,29 @@ def build_structured_report(
         product_vendor=product_vendor,
         product_title=product_title,
     )
+
+    # PR-7b: form factor + price band classification. Per-product
+    # classification is keyword-deterministic (gummy/powder/capsule/
+    # liquid/etc.); price band is bucketed from numeric price when
+    # available. Cohort-level summary surfaces "merchant is only
+    # gummy in cohort" insights via the form_factor_summary field.
+    from services.product_form_factor_classifier import (
+        build_cohort_form_factor_summary,
+        classify_product,
+    )
+    merchant_product_classification = classify_product(
+        product_title=product_title,
+        product_type=product_type,
+    )
+    cohort_form_factor = build_cohort_form_factor_summary(
+        merchant_brand=merchant_brand,
+        merchant_form_factor=merchant_product_classification.get("form_factor"),
+        competitor_brands=category_competitor_brands or [],
+        cohort_audit_runs=None,  # cohort runs aren't in scope here;
+                                  # cohort orchestrator passes them
+                                  # separately via the cohort comparison
+                                  # endpoint
+    )
     what_pivota_changes = _build_what_pivota_changes(
         merchant_name=merchant_name,
         merchant_pdp_url=merchant_pdp_url,
@@ -3970,6 +3993,11 @@ def build_structured_report(
             "title": product_title,
             "vendor": product_vendor or None,
             "product_type": product_type or None,
+            # PR-7b: form factor + price band classification (keyword-
+            # deterministic). Renderers can show "Greens Gummies
+            # (gummy, premium tier)" without re-deriving.
+            "form_factor": merchant_product_classification.get("form_factor"),
+            "price_band": merchant_product_classification.get("price_band"),
         },
         "provider": provider,
         "upstream_status": upstream_status,
@@ -3996,6 +4024,12 @@ def build_structured_report(
         # leverage report element because they're verbatim what
         # Gemini said about the brand.
         "evidence_quotes": evidence_quotes,
+        # PR-7b: cohort form-factor summary — surfaces "merchant is
+        # the only gummy in the 15-competitor cohort" type insights.
+        # When merchant_owns_unique_form_factor=True, renderer can
+        # call out the structural moat. Empty when merchant
+        # form_factor wasn't classifiable.
+        "cohort_form_factor": cohort_form_factor,
         # PR-8a: strategic executive summary — multi-paragraph
         # narrative arc keyed off detected score archetype. The
         # opening of the polished report; renderers should surface
