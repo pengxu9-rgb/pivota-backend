@@ -1707,6 +1707,180 @@ def _truncate_query(q: str, n: int = 60) -> str:
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
+# ---------------------------------------------------------------------------
+# PR-8b — Recommendation engine v2 metadata enrichment
+# ---------------------------------------------------------------------------
+# Pre-PR action items shipped with severity + title + body + optional
+# evidence only. Polished reports add execution metadata: who owns
+# the action, what KPI tracks it, what outcome to expect, what phase
+# the action belongs to. This metadata isn't generated per-action by
+# hand (would require touching every items.append call across the
+# 5 verdict-tier branches + playbook engine); instead, it's derived
+# from action lever + title + severity by `_enrich_action_items_v2`
+# at the END of the action-generation pipeline.
+#
+# `phase` (week_1_to_4 / week_4_to_12 / week_12_to_24) feeds into
+# PR-8c (implementation roadmap generator) which groups actions
+# into phases for the rendered roadmap table.
+#
+# `depends_on` is intentionally left null in v1 — auto-detecting
+# action dependencies is hard and PR-8c's phased ordering already
+# implies most dependencies. Renderer can wire dependency arrows
+# when a future PR populates the field explicitly.
+
+# Maps action `lever` (set by playbook engine for per-host actions) to
+# the team that owns execution. Strategic actions (no lever set) fall
+# through to the title/keyword-based heuristic below.
+_OWNER_BY_LEVER: Dict[str, str] = {
+    "editorial_outreach": "merchant_brand_team",
+    "wholesale_onboarding": "merchant_growth_team",
+    "creator_partnership": "merchant_brand_team",
+    "marketplace_listing": "merchant_growth_team",
+    "research": "joint",
+}
+
+
+def _v2_metadata_for_action(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive owner / kpi_to_track / expected_outcome / phase for a
+    single action item. Pure function — keyed on existing fields
+    (severity, title, lever, evidence). No LLM call.
+    """
+    severity = (item.get("severity") or "medium").lower()
+    title = (item.get("title") or "").lower()
+    lever = (item.get("lever") or "").lower()
+
+    # Owner: prefer explicit lever mapping (per-host playbook actions
+    # carry one), then keyword heuristic on the title.
+    owner = _OWNER_BY_LEVER.get(lever)
+    if owner is None:
+        if any(s in title for s in (
+            "index", "search console", "sitemap", "schema",
+            "canonical", "url inspection",
+        )):
+            owner = "pivota_ops"
+        elif any(s in title for s in (
+            "pitch", "outreach", "editorial", "press",
+            "content brief", "creator",
+        )):
+            owner = "merchant_brand_team"
+        elif any(s in title for s in (
+            "monitor", "drift", "rerun", "re-audit",
+            "track", "watch",
+        )):
+            owner = "joint"
+        elif any(s in title for s in (
+            "wholesale", "marketplace", "listing", "retail",
+        )):
+            owner = "merchant_growth_team"
+        elif any(s in title for s in ("investigate", "research")):
+            owner = "joint"
+        else:
+            owner = "joint"
+
+    # Phase: severity + lever drive the time-bucket assignment.
+    # Critical actions land in week_1_to_4 (immediate); medium-severity
+    # editorial pitches in week_4_to_12 (publication cycle latency);
+    # low-severity monitoring in week_12_to_24 (ongoing cadence).
+    if severity == "critical":
+        phase = "week_1_to_4"
+    elif severity == "high":
+        phase = "week_1_to_4" if owner == "pivota_ops" else "week_4_to_12"
+    elif severity == "medium":
+        phase = "week_4_to_12"
+    else:  # low
+        phase = "week_12_to_24"
+
+    # KPI + expected outcome: title-keyword-driven defaults. Keep
+    # these short and concrete — renderer surfaces them as a single-
+    # line "What to track" + "Expected outcome" pair.
+    kpi_to_track: Optional[str] = None
+    expected_outcome: Optional[str] = None
+    if "index" in title or "search console" in title or "sitemap" in title:
+        kpi_to_track = "Number of canonical PDPs indexed by Google"
+        expected_outcome = (
+            "First grounded citations of the merchant URL within "
+            "30-60 days; full PDP citation share in 60-90 days."
+        )
+    elif "pitch" in title or "outreach" in title or "editorial" in title:
+        kpi_to_track = (
+            "Editorial inclusion confirmation + Google index date "
+            "of the published page"
+        )
+        expected_outcome = (
+            "New citation propagates to grounded LLM answers "
+            "within 4-8 weeks of publication."
+        )
+    elif "content brief" in title:
+        kpi_to_track = "Briefs delivered to merchant content team"
+        expected_outcome = (
+            "Brief becomes published content; new content indexed; "
+            "reflected in next-cycle re-audit."
+        )
+    elif "wholesale" in title or "marketplace" in title:
+        kpi_to_track = "Listing approval + first cited query"
+        expected_outcome = (
+            "Listing live within 6-12 weeks; AI grounded answers "
+            "reflect new listing within an additional 4-8 weeks."
+        )
+    elif "monitor" in title or "drift" in title or "track" in title:
+        kpi_to_track = (
+            "Quarterly trend report on AI-channel citation share"
+        )
+        expected_outcome = (
+            "Erosion detected within 30 days; citation drift "
+            "surfaced for immediate action."
+        )
+    elif "investigate" in title:
+        kpi_to_track = "Outreach decision (pursue / dismiss)"
+        expected_outcome = (
+            "Host added to registry or marked as noise; informs "
+            "subsequent audits."
+        )
+    elif "reclaim" in title or "capture" in title:
+        kpi_to_track = (
+            "First-party citation rate in named-product queries"
+        )
+        expected_outcome = (
+            "1+ of N named-product queries cites merchant URL "
+            "directly within 90 days."
+        )
+    elif "schema" in title or "structured data" in title:
+        kpi_to_track = "PDPs validated as schema-clean by Google's tester"
+        expected_outcome = (
+            "Cleaner schema improves grounded retrieval scoring; "
+            "reflected in next-cycle re-audit."
+        )
+
+    return {
+        "owner": owner,
+        "phase": phase,
+        "kpi_to_track": kpi_to_track,
+        "expected_outcome": expected_outcome,
+        # depends_on is null in v1; PR-8c roadmap may populate later.
+        "depends_on": [],
+    }
+
+
+def _enrich_action_items_v2(
+    action_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """PR-8b: enrich every action item with v2 execution metadata
+    (owner / phase / kpi_to_track / expected_outcome / depends_on).
+
+    Mutates the items in place + returns them so callers can chain.
+    Defensive: any item that already has these fields is left
+    unchanged (allows test fixtures + future code to pre-set them).
+    """
+    for item in action_items or []:
+        meta = _v2_metadata_for_action(item)
+        for key, value in meta.items():
+            # Don't overwrite explicit values (e.g. test fixtures or
+            # playbook engine that hand-crafts owner per-host).
+            if key not in item or item.get(key) is None:
+                item[key] = value
+    return action_items
+
+
 def _generate_action_items(
     *,
     verdict_label: str,
@@ -3349,6 +3523,14 @@ def _build_merchant_view(
     # strategic actions next, per-host playbook actions last.
     for i, a in enumerate(merged_actions, start=1):
         a["priority_order"] = i
+
+    # PR-8b: enrich action items with v2 execution metadata (owner,
+    # phase, kpi_to_track, expected_outcome, depends_on). Mutates in
+    # place; renderer surfaces these alongside title/body/severity.
+    # Runs LAST so any explicit values (test fixtures, future
+    # per-action hand-tuning) take precedence — the enricher only
+    # fills missing fields.
+    _enrich_action_items_v2(merged_actions)
 
     plain_summary = _build_visibility_plain_summary(
         verdict_label=verdict_label,
