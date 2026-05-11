@@ -3731,6 +3731,28 @@ def build_structured_report(
         integration_state=integration_state,
     )
 
+    # PR-8a (post-Grüns synthesis layer): build the strategic
+    # executive summary — multi-paragraph narrative arc keyed off
+    # detected score archetype. Surfaces as report.executive_summary
+    # for renderers that want the narrative opening.
+    from services.audit_narrative_builder import build_executive_summary
+    top_cited_publishers_for_narrative = [
+        h.get("host") for h in (competitor_hosts_list or [])[:3]
+        if h.get("host")
+    ]
+    executive_summary = build_executive_summary(
+        merchant_name=merchant_name,
+        visibility_score=visibility_score,
+        attribution_score=attribution_score,
+        category_visibility_score=category_score,
+        evidence_quotes=evidence_quotes,
+        cited_publishers=top_cited_publishers_for_narrative,
+        competitor_brands=category_competitor_brands or [],
+        industry_blurb=industry_context.get("blurb", ""),
+        industry_share_pct=industry_context.get("ai_search_share_pct"),
+        verdict_pill_text=_verdict_display_label(verdict_label),
+    )
+
     return {
         "merchant_name": merchant_name,
         "merchant_pdp_url": merchant_pdp_url,
@@ -3765,6 +3787,12 @@ def build_structured_report(
         # leverage report element because they're verbatim what
         # Gemini said about the brand.
         "evidence_quotes": evidence_quotes,
+        # PR-8a: strategic executive summary — multi-paragraph
+        # narrative arc keyed off detected score archetype. The
+        # opening of the polished report; renderers should surface
+        # this BEFORE the verdict label / score table for the most
+        # compelling read.
+        "executive_summary": executive_summary,
         "merchant_view": merchant_view,
         "visibility": {
             "score": visibility_score,
