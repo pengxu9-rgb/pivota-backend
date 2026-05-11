@@ -158,6 +158,21 @@ class Settings(BaseSettings):
         os.getenv("AGENT_CENTER_LLM_PROBE_TIMEOUT_S", "30")
     )
 
+    # Deepseek V4 multi-LLM probe (PR-3a). When DEEPSEEK_API_KEY is
+    # configured, the backend can probe Deepseek directly (bypassing
+    # the upstream PIVOTA-Agent codex stack) for any audit that
+    # passes provider="deepseek". Lets us ship multi-LLM coverage
+    # in backend Python without waiting for codex round-trip.
+    deepseek_api_key: Optional[str] = os.getenv("DEEPSEEK_API_KEY")
+    deepseek_api_base_url: str = os.getenv(
+        "DEEPSEEK_API_BASE_URL", "https://api.deepseek.com",
+    )
+    # Default model — override per-environment if Deepseek releases a
+    # newer V4 successor. V3.1 is currently the most-capable Deepseek
+    # chat model with native function-calling + structured-output
+    # support, which the probe relies on for predictable JSON outputs.
+    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
     # Platform Orders ACP Integration
     enable_platform_orders_acp: bool = os.getenv("FEATURE_PLATFORM_ORDERS_ACP", "false").lower() == "true"
     platform_orders_acp_url: str = os.getenv(
