@@ -163,6 +163,69 @@ def _local_mock_result(
     }
 
 
+async def _probe_via_deepseek(
+    *,
+    scan_mode: str,
+    context: Optional[Mapping[str, Any]],
+    merchant_id: str,
+    max_runs: int,
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """PR-3a Deepseek dispatch — runs a Deepseek probe through the
+    backend-direct client, applying the same per-merchant + global
+    semaphores as the upstream-routed Gemini probe.
+
+    Pulls product/brand/URL out of `context` (caller-supplied):
+      - product_title (required for visibility/attribution scan modes)
+      - product_type (required for category_visibility_test)
+      - merchant_brand
+      - merchant_pdp_url
+
+    Returns the V1 result dict matching the upstream Gemini probe so
+    the downstream BD report builder consumes it identically.
+    """
+    from services.llm_providers.deepseek_probe import (
+        DeepseekProbeError, probe_one_scan_mode,
+    )
+    api_key = (settings.deepseek_api_key or "").strip()
+    if not api_key:
+        raise AgentCenterLlmClientError(
+            "DEEPSEEK_API_KEY is not configured; cannot route "
+            "provider='deepseek' probes."
+        )
+    ctx = dict(context or {})
+    product_title = (ctx.get("product_title") or "").strip()
+    if not product_title:
+        # Without product context the probe queries are meaningless;
+        # surface as caller error so the route layer maps to 422.
+        raise ValueError(
+            "context.product_title is required when provider='deepseek'"
+        )
+    timeout = float(
+        timeout_s if timeout_s is not None
+        else settings.agent_center_llm_probe_timeout_s
+    )
+    global_sem = _get_global_semaphore()
+    per_merchant_sem = await _get_per_merchant_semaphore(merchant_id)
+    async with per_merchant_sem:
+        async with global_sem:
+            try:
+                return await probe_one_scan_mode(
+                    scan_mode=scan_mode,
+                    product_title=product_title,
+                    product_type=ctx.get("product_type"),
+                    merchant_brand=ctx.get("merchant_brand"),
+                    merchant_pdp_url=ctx.get("merchant_pdp_url"),
+                    max_runs=max_runs,
+                    api_key=api_key,
+                    timeout_s=timeout,
+                )
+            except DeepseekProbeError as exc:
+                raise AgentCenterLlmClientError(
+                    f"Deepseek probe failed: {exc}"
+                ) from exc
+
+
 async def probe(
     *,
     scan_mode: str,
@@ -192,7 +255,25 @@ async def probe(
     deliberately uses stub responses (`stub_complete` status) on free-
     tier preview calls. Merchant audit + BD report MUST keep the
     default to never produce fabricated prose against synthetic data.
+
+    **Provider dispatch (PR-3a):** `provider="deepseek"` routes to a
+    backend-direct Deepseek client (services/llm_providers/
+    deepseek_probe.py), bypassing the upstream PIVOTA-Agent codex
+    stack. The result shape is normalized to V1 so downstream code
+    (scorers, report builder) consumes Deepseek results identically.
+    Other providers ("gemini", "mock", future "chatgpt"/"claude")
+    continue to route through PIVOTA-Agent via HTTP.
     """
+    # PR-3a Deepseek dispatch: backend-direct, no upstream HTTP call.
+    if provider == "deepseek":
+        return await _probe_via_deepseek(
+            scan_mode=scan_mode,
+            context=context,
+            merchant_id=merchant_id,
+            max_runs=max_runs,
+            timeout_s=timeout_s,
+        )
+
     body: Dict[str, Any] = {
         "scan_mode": scan_mode,
         "scan_target_id": scan_target_id,
