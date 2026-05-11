@@ -3935,6 +3935,16 @@ def build_structured_report(
         verdict_pill_text=_verdict_display_label(verdict_label),
     )
 
+    # PR-8c: implementation roadmap — groups PR-8b enriched action
+    # items by their `phase` field into time-windowed buckets with
+    # rolled-up owners + expected outcomes. Renderer surfaces this
+    # as the "Implementation Roadmap" section between recommendations
+    # and Pivota commitments.
+    from services.audit_roadmap_builder import build_implementation_roadmap
+    implementation_roadmap = build_implementation_roadmap(
+        merchant_view.get("actions") or []
+    )
+
     return {
         "merchant_name": merchant_name,
         "merchant_pdp_url": merchant_pdp_url,
@@ -3975,6 +3985,11 @@ def build_structured_report(
         # this BEFORE the verdict label / score table for the most
         # compelling read.
         "executive_summary": executive_summary,
+        # PR-8c: implementation roadmap — phased rollup of action
+        # items with rolled-up owners + expected outcomes per phase.
+        # Renderer surfaces between recommendations and Pivota
+        # commitments. Empty phases array when no recognized actions.
+        "implementation_roadmap": implementation_roadmap,
         "merchant_view": merchant_view,
         "visibility": {
             "score": visibility_score,
