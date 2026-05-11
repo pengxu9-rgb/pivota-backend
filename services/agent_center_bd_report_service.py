@@ -3945,6 +3945,23 @@ def build_structured_report(
         merchant_view.get("actions") or []
     )
 
+    # PR-8d: Pivota commitments — explicit "what we deliver / what
+    # we don't promise" block, platform-aware so disclosures are
+    # accurate per merchant. Renderer surfaces between roadmap and
+    # methodology / appendix.
+    from services.audit_pivota_commitments_builder import (
+        build_pivota_commitments,
+    )
+    _is_cold = _is_cold_start_audit(integration_state)
+    _merchant_platform = (
+        (integration_state or {}).get("store_platform_name")
+        if integration_state else None
+    )
+    pivota_commitments = build_pivota_commitments(
+        merchant_platform=_merchant_platform,
+        cold_start=_is_cold,
+    )
+
     return {
         "merchant_name": merchant_name,
         "merchant_pdp_url": merchant_pdp_url,
@@ -3990,6 +4007,10 @@ def build_structured_report(
         # Renderer surfaces between recommendations and Pivota
         # commitments. Empty phases array when no recognized actions.
         "implementation_roadmap": implementation_roadmap,
+        # PR-8d: Pivota commitments — explicit "what we deliver /
+        # what we don't promise" block, platform-aware. Renderer
+        # surfaces between roadmap and methodology.
+        "pivota_commitments": pivota_commitments,
         "merchant_view": merchant_view,
         "visibility": {
             "score": visibility_score,
