@@ -331,6 +331,30 @@ async def _process_one_audit_run_inner(
                 return True
             current_stage = mar.STAGE_COMPLETED
 
+            # P4.5: pre-render all 5 audience projections from the
+            # canonical tables (evidence_items + readiness_findings
+            # + action_plan_items just written in the verifying
+            # stage). Cached in report_projections so
+            # GET /api/audits/{id}?audience=X is a fast read.
+            # Best-effort: failure here doesn't poison the
+            # completed transition that already succeeded.
+            try:
+                from services.audit_projection_builder import (
+                    build_and_persist_all_projections,
+                )
+                proj_summary = await build_and_persist_all_projections(
+                    audit_run_id=run_id,
+                )
+                logger.info(
+                    "audit_run_worker: projections built for run_id=%s: %s",
+                    run_id, proj_summary,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "audit_run_worker: projection build raised for "
+                    "run_id=%s: %s", run_id, exc,
+                )
+
         logger.info(
             "audit_run_worker: completed run_id=%s merchant=%s",
             run_id, merchant_id,
