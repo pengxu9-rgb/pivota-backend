@@ -1002,12 +1002,11 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         if args.apply:
             legacy_rows = int((before.get("totals") or {}).get("legacy_external_seed_catalog_rows") or 0)
             if legacy_rows > 0:
-                before["ok"] = False
-                before["error"] = (
-                    "legacy external_seed catalog rows exist; clean or reconcile them before applying "
-                    "the external_product_seeds mirror to avoid duplicate public PDPs"
+                before.setdefault("warnings", []).append(
+                    "legacy external_seed catalog rows exist; continuing because the "
+                    "(merchant_id, platform, source_product_id) unique index prevents "
+                    "duplicate catalog identities"
                 )
-                return before
             inserted = await _apply(args.limit)
             after = await _build_report(
                 sample_limit=args.sample_limit,
@@ -1017,6 +1016,7 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             before_totals = before.get("totals") or {}
             after_totals = after.get("totals") or {}
             report = after
+            report["warnings"] = list(before.get("warnings") or []) + list(after.get("warnings") or [])
             report["before_totals"] = before_totals
             report["totals"] = {
                 **before_totals,
