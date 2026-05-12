@@ -253,6 +253,37 @@ async def _process_one_audit_run_inner(
         # discrete transition so the GET /api/audits/{id} timeline
         # has a clear marker between probing + materializing. -----
         if current_stage == mar.STAGE_SCORING:
+            # Surface the scoring stage in partial_result_jsonb so
+            # GET /api/audits/{id} has a marker between probing and
+            # materializing — without this, the per-stage progress
+            # UI shows a gap (Gate 5 run c7164016... was missing the
+            # scoring key entirely). Best-effort: failure here doesn't
+            # block the transition since record_partial_result is its
+            # own try/except.
+            if brand_report is not None:
+                _agg = brand_report.get("aggregate") or {}
+                await mar.record_partial_result(
+                    run_id=run_id, worker_id=WORKER_ID,
+                    partial_result_jsonb={
+                        "scoring": {
+                            "verdict_label": brand_report.get(
+                                "verdict_label",
+                            ),
+                            "products_succeeded": _agg.get(
+                                "products_succeeded",
+                            ),
+                            "products_failed": _agg.get(
+                                "products_failed",
+                            ),
+                            "avg_visibility": _agg.get(
+                                "avg_visibility",
+                            ),
+                            "avg_attribution": _agg.get(
+                                "avg_attribution",
+                            ),
+                        },
+                    },
+                )
             ok = await mar.transition_stage(
                 run_id=run_id,
                 from_stage=mar.STAGE_SCORING,

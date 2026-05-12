@@ -77,6 +77,31 @@ def _agent_registry_by_name() -> Dict[str, Any]:
     }
 
 
+def _coerce_jsonb_to_dict(value: Any) -> Optional[Dict[str, Any]]:
+    """JSONB columns from the `databases` library may return as
+    either a parsed dict OR a raw JSON string, depending on whether
+    asyncpg's JSONB codec was registered. The previous Gate 5 run
+    raised:
+        AttributeError: 'str' object has no attribute 'get'
+    inside _hydrate_executor_context — payload_jsonb was a string,
+    and `(payload_jsonb or {}).get(\"extra\")` blew up. Be defensive
+    at the read boundary so downstream callers can rely on dict
+    semantics."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            import json
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+
 async def _hydrate_executor_context(
     *,
     merchant_id: Optional[str],
@@ -100,14 +125,21 @@ async def _hydrate_executor_context(
                 run_id=parent_audit_run_id,
             )
             if row:
-                audit_report = row.get("report_jsonb")
+                # report_jsonb may also come back as a string under
+                # the same codec-registration race; coerce defensively.
+                audit_report = _coerce_jsonb_to_dict(
+                    row.get("report_jsonb")
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "executor_run_worker: failed to load audit report "
                 "for parent=%s: %s", parent_audit_run_id, exc,
             )
 
-    extra = (payload_jsonb or {}).get("extra") or {}
+    payload_dict = _coerce_jsonb_to_dict(payload_jsonb) or {}
+    extra = payload_dict.get("extra") or {}
+    if not isinstance(extra, dict):
+        extra = {}
     return ExecutorContext(
         merchant_id=merchant_id,
         parent_audit_run_id=parent_audit_run_id,
