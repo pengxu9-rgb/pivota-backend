@@ -457,6 +457,7 @@ async def _run_single_query(
             "grounding_chunks": [],
             "grounding_sources": [],
             "url_match": None,
+            "_usage": {"input_tokens": None, "output_tokens": None},
         }
     choices = api_response.get("choices") or []
     raw_text = ""
@@ -474,6 +475,9 @@ async def _run_single_query(
         grounding_sources=grounding_sources,
         raw_text=raw_text,
     )
+    # P2.5b: extract usage tokens for cost telemetry. Deepseek's
+    # OpenAI-compatible response uses prompt_tokens + completion_tokens.
+    usage_block = api_response.get("usage") or {}
     return {
         "query": query,
         "raw": raw_text,
@@ -481,6 +485,13 @@ async def _run_single_query(
         "grounding_chunks": grounding_chunks,
         "grounding_sources": grounding_sources,
         "url_match": url_match,
+        # Per-run usage so the outer probe_one_scan_mode can sum.
+        # None values when Deepseek omits the block (rare but possible
+        # on rate-limit / partial responses).
+        "_usage": {
+            "input_tokens": usage_block.get("prompt_tokens"),
+            "output_tokens": usage_block.get("completion_tokens"),
+        },
     }
 
 
@@ -565,6 +576,8 @@ async def probe_one_scan_mode(
     Caller is expected to wrap this in the per-merchant + global
     semaphores (the dispatcher in agent_center_llm_client does so).
     """
+    import time as _time
+    _telemetry_started_at = _time.perf_counter()
     api_key = (api_key or settings.deepseek_api_key or "").strip()
     if not api_key:
         raise DeepseekProbeError(
@@ -583,6 +596,11 @@ async def probe_one_scan_mode(
         # No queries to run (e.g., category_visibility with no
         # product_type). Return an empty-but-shaped result so the
         # caller's pipeline doesn't blow up.
+        await _record_deepseek_telemetry(
+            scan_mode=scan_mode, status="succeeded",
+            started_at_perf=_telemetry_started_at,
+            input_tokens=0, output_tokens=0,
+        )
         return {
             "scan_mode": scan_mode,
             "provider": "deepseek",
@@ -611,6 +629,36 @@ async def probe_one_scan_mode(
         runs=raw_runs,
         visibility_score=scores["visibility_score"],
     )
+    # P2.5b: aggregate per-run token usage so the outer `usage` block
+    # has real numbers + cost telemetry can be recorded. None values
+    # in per-run _usage (rate-limit responses, etc.) are treated as
+    # zero rather than skewing the row count.
+    total_in = sum(
+        int((r.get("_usage") or {}).get("input_tokens") or 0)
+        for r in raw_runs
+    )
+    total_out = sum(
+        int((r.get("_usage") or {}).get("output_tokens") or 0)
+        for r in raw_runs
+    )
+    succeeded_runs = sum(
+        1 for r in raw_runs if (r.get("parsed") is not None)
+    )
+    await _record_deepseek_telemetry(
+        scan_mode=scan_mode,
+        # `succeeded` here means we got a response back (even if some
+        # individual queries within failed). `failed` would only fire
+        # on uncaught exceptions, which are caught + returned as
+        # upstream-failed shapes by _run_single_query above.
+        status="succeeded" if succeeded_runs > 0 else "failed",
+        started_at_perf=_telemetry_started_at,
+        input_tokens=total_in,
+        output_tokens=total_out,
+        error_message=(
+            None if succeeded_runs > 0
+            else "all_runs_returned_upstream_failed_shape"
+        ),
+    )
     return {
         "scan_mode": scan_mode,
         "provider": "deepseek",
@@ -618,11 +666,70 @@ async def probe_one_scan_mode(
         "scores": scores,
         "findings": findings,
         "usage": {
-            # Deepseek's response includes usage; we don't aggregate
-            # it across runs here for now (would require accumulating
-            # from each api_response). Future enhancement.
-            "input_tokens": 0,
-            "output_tokens": 0,
+            "input_tokens": total_in,
+            "output_tokens": total_out,
         },
         "raw_runs": raw_runs,
     }
+
+
+async def _record_deepseek_telemetry(
+    *,
+    scan_mode: str,
+    status: str,
+    started_at_perf: float,
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    error_message: Optional[str] = None,
+) -> None:
+    """P2.5b: best-effort telemetry record for one Deepseek probe
+    call. Pulls audit_run_id + merchant_id from the audit_telemetry
+    context; computes cost via provider_registry rates."""
+    try:
+        import time as _time
+        from db.llm_probe_runs import (
+            compute_cost_usd, record_probe_run,
+        )
+        from services.audit_telemetry_context import (
+            current_audit_context,
+        )
+        from services.llm_providers.provider_registry import (
+            get_provider,
+        )
+        ctx = current_audit_context()
+        latency_ms = int(
+            (_time.perf_counter() - started_at_perf) * 1000.0,
+        )
+        cost_usd = None
+        try:
+            p = get_provider("deepseek")
+            if p is not None:
+                cost_usd = compute_cost_usd(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_per_1k_input_tokens_usd=(
+                        p.cost_per_1k_input_tokens_usd
+                    ),
+                    cost_per_1k_output_tokens_usd=(
+                        p.cost_per_1k_output_tokens_usd
+                    ),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        await record_probe_run(
+            provider="deepseek",
+            scan_mode=scan_mode,
+            status=status,
+            merchant_id=ctx.merchant_id,
+            audit_run_id=ctx.audit_run_id,
+            latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+            error_message=error_message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "_record_deepseek_telemetry suppressed error: %s",
+            str(exc)[:200],
+        )

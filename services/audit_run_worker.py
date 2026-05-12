@@ -94,6 +94,45 @@ async def process_one_audit_run() -> bool:
     merchant_domain: Optional[str] = None
     integration_state: Optional[Dict[str, Any]] = None
 
+    # P2.5b: scope every probe call inside this audit run with the
+    # audit_run_id + merchant_id so probe call sites can attribute
+    # cost telemetry without threading params through 4–6 stack frames.
+    from services.audit_telemetry_context import audit_telemetry
+    async with audit_telemetry(
+        run_id=run_id, merchant_id=merchant_id,
+    ):
+        return await _process_one_audit_run_inner(
+            run_id=run_id,
+            merchant_id=merchant_id,
+            product_keys=product_keys,
+            current_stage=current_stage,
+            brand_report=brand_report,
+            products=products,
+            pivota_url_used=pivota_url_used,
+            merchant_name=merchant_name,
+            merchant_domain=merchant_domain,
+            integration_state=integration_state,
+        )
+
+
+async def _process_one_audit_run_inner(
+    *,
+    run_id: str,
+    merchant_id: str,
+    product_keys: List[str],
+    current_stage: str,
+    brand_report: Optional[Dict[str, Any]],
+    products: List[Dict[str, Any]],
+    pivota_url_used: List[str],
+    merchant_name: str,
+    merchant_domain: Optional[str],
+    integration_state: Optional[Dict[str, Any]],
+) -> bool:
+    """The actual stage-driving body, scoped inside an
+    audit_telemetry() context manager so probe call sites can read
+    audit_run_id + merchant_id via contextvars.
+    """
+    from db import merchant_audit_runs as mar
     try:
         # ----- queued → discovering -----
         if current_stage == mar.STAGE_QUEUED:
