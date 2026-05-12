@@ -80,6 +80,42 @@ _CAPABILITIES: Dict[str, StorePlatformCapabilities] = {
         purchase_status="requires_external_platform_checkout_validation",
         purchase_requirement="external_platform_checkout_or_platform_live_quote_adapter",
     ),
+    # PR-10c: Custom-built and headless storefronts. Audit + AI-channel
+    # discovery work without any integration. Order writeback requires a
+    # lightweight engineering integration against the merchant's own
+    # order API (typical scope: 1-2 weeks).
+    #
+    # Distinct from "unknown" — these merchants have explicitly told us
+    # they're on a non-major platform, so downstream copy can be
+    # specific ("your custom order API") rather than evasive.
+    "custom": StorePlatformCapabilities(
+        platform="custom",
+        supports_live_quote=False,
+        supports_live_inventory_check=False,
+        supports_platform_checkout=False,
+        supports_platform_order_writeback=False,
+        supports_inventory_reservation=False,
+        supports_inventory_hold=False,
+        supports_authorize_capture=False,
+        supports_auto_void=False,
+        supports_auto_refund=False,
+        purchase_status="requires_custom_integration_for_order_writeback",
+        purchase_requirement="merchant_custom_order_api_credentials_or_manual_fulfillment",
+    ),
+    "headless_generic": StorePlatformCapabilities(
+        platform="headless_generic",
+        supports_live_quote=False,
+        supports_live_inventory_check=False,
+        supports_platform_checkout=False,
+        supports_platform_order_writeback=False,
+        supports_inventory_reservation=False,
+        supports_inventory_hold=False,
+        supports_authorize_capture=False,
+        supports_auto_void=False,
+        supports_auto_refund=False,
+        purchase_status="requires_custom_integration_for_order_writeback",
+        purchase_requirement="merchant_headless_commerce_api_credentials_or_manual_fulfillment",
+    ),
 }
 
 
