@@ -841,6 +841,7 @@ async def get_cohort_audit_results(
 @router.post("/cold-start-audit/export")
 async def cold_start_audit_export(
     body: BdColdStartAuditRequest,
+    format: str = "md",
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Response:
     """Same as /cold-start-audit but returns the report as a markdown
@@ -974,12 +975,59 @@ async def cold_start_audit_export(
     # env var picks v1 (default, existing) or v2 (polished structure
     # matching the hand-written Grüns PDF). Once v2 has soaked, the
     # default flips.
-    renderer = select_renderer()
-    markdown = renderer(out, discovery=discovered)
+    # PR-9b: format query param picks markdown (default) / html / pdf.
+    fmt = (format or "md").strip().lower()
 
     # Filename-safe brand slug. Strip non-alphanum, lowercase.
     brand = discovered.get("merchant_name") or "brand"
     slug = _re.sub(r"[^A-Za-z0-9]+", "-", brand).strip("-").lower() or "brand"
+
+    if fmt in ("html", "pdf"):
+        from services.audit_html_renderer import (
+            html_to_pdf_bytes,
+            render_brand_html_v2,
+        )
+        html_str = render_brand_html_v2(out, discovery=discovered)
+        if fmt == "pdf":
+            pdf_bytes = html_to_pdf_bytes(html_str)
+            if pdf_bytes is not None:
+                filename = f"{slug}-readiness-report.pdf"
+                return Response(
+                    content=pdf_bytes,
+                    media_type="application/pdf",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                    },
+                )
+            # PDF conversion not available (weasyprint not installed) —
+            # fall back to HTML download with a header so client knows.
+            logger.warning(
+                "PDF conversion unavailable; falling back to HTML for "
+                "cold-start audit export of %s",
+                discovered.get("merchant_domain"),
+            )
+            filename = f"{slug}-readiness-report.html"
+            return Response(
+                content=html_str,
+                media_type="text/html; charset=utf-8",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-Pivota-PDF-Fallback": "weasyprint_not_installed",
+                },
+            )
+        # fmt == "html"
+        filename = f"{slug}-readiness-report.html"
+        return Response(
+            content=html_str,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    # Default: markdown
+    renderer = select_renderer()
+    markdown = renderer(out, discovery=discovered)
     filename = f"{slug}-readiness-report.md"
 
     return Response(
