@@ -9,6 +9,12 @@ Job registration happens at start-up time. Currently registers:
 - `daily_audit_check` — fires at 03:00 UTC daily, calls
   jobs/scheduled_audit_job.run_scheduled_audits which queries
   catalog_merchants for due re-audits.
+- `audit_run_worker_tick` — fires every 10 seconds, calls
+  services/audit_run_worker.run_audit_worker_tick which drains
+  STAGE_QUEUED rows from merchant_audit_runs (P2.2).
+- `audit_run_lease_reaper` — fires every 60 seconds, calls
+  services/audit_run_worker.run_stale_lease_reaper_tick to
+  release expired worker leases as a backstop.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -63,10 +69,41 @@ async def start_scheduler() -> None:
             misfire_grace_time=3600,  # tolerate 1 hour late
             coalesce=True,            # only run once if multiple firings queued
         )
+
+        # P2.2: drive queued audit_runs through the async lifecycle.
+        # No production traffic flows here until P2.3 ships POST
+        # /api/audits, so the tick is a safe no-op until then. 10s
+        # interval keeps queue latency low without hammering the DB.
+        from services.audit_run_worker import (
+            run_audit_worker_tick,
+            run_stale_lease_reaper_tick,
+        )
+        scheduler.add_job(
+            run_audit_worker_tick,
+            "interval",
+            seconds=10,
+            id="audit_run_worker_tick",
+            replace_existing=True,
+            # Don't queue up multiple ticks if one runs long; one
+            # tick already drains MAX_RUNS_PER_TICK runs.
+            coalesce=True,
+            max_instances=1,
+        )
+        scheduler.add_job(
+            run_stale_lease_reaper_tick,
+            "interval",
+            seconds=60,
+            id="audit_run_lease_reaper",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
-            "audit_scheduler: started with daily_audit_check at 03:00 UTC"
+            "audit_scheduler: started with daily_audit_check (03:00 UTC) "
+            "+ audit_run_worker_tick (10s) "
+            "+ audit_run_lease_reaper (60s)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
