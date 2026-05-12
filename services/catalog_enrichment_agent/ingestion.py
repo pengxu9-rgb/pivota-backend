@@ -39,6 +39,7 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from services.catalog_identity import make_content_key
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
@@ -214,6 +215,18 @@ def _build_pdp_insert(
         "pdp_lifecycle_stage": _lifecycle_stage_for_agent_pdp(pdp_payload, offers, canonical_url, image_url),
         "pdp_scope": DEFAULT_PDP_SCOPE,
         "pdp_scope_source": DEFAULT_PDP_SCOPE_SOURCE,
+        # Stage 1 (mig 083): content-derived identity. Path C is the
+        # path most likely to share a content_key with Path A/B rows
+        # (same physical product enriched by the agent + scraped by
+        # the mirror + sold via a connected merchant). Agent payloads
+        # typically don't carry GTIN at the candidate stage — gtin
+        # arrives later via offers. Stage 2 auto-grouper will pick up
+        # cross-path matches via brand+title alone.
+        "content_key": make_content_key(
+            pdp_payload.get("brand"),
+            pdp_payload.get("product_name"),
+            pdp_payload.get("gtin") or None,
+        ),
     }
 
 

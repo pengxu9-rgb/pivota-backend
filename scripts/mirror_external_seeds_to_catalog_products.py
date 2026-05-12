@@ -35,6 +35,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database
+from services.catalog_identity import make_content_key
 from services.pdp_category_classifier import resolve_path_from_row
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
@@ -819,6 +820,7 @@ async def _apply(limit: int) -> int:
               lifestyle_tags,
               demographic,
               pdp_lifecycle_stage,
+              content_key,
               created_at,
               updated_at
             )
@@ -850,6 +852,7 @@ async def _apply(limit: int) -> int:
               CAST(:lifestyle_tags AS jsonb),
               :demographic,
               :pdp_lifecycle_stage,
+              :content_key,
               now(),
               now()
             )
@@ -884,6 +887,17 @@ async def _apply(limit: int) -> int:
                 "lifestyle_tags": json.dumps(taxonomy["lifestyle_tags"], ensure_ascii=False),
                 "demographic": taxonomy["demographic"],
                 "pdp_lifecycle_stage": mirror_lifecycle_stage,
+                # Stage 1 (mig 083): content-derived identity. Mirror
+                # paths typically don't carry a GTIN on the seed, so
+                # content_key for external_seed rows is brand+title-
+                # only; that's acceptable because Stage 2's auto-grouper
+                # tolerates GTIN absence by falling back to brand+title
+                # trigram for cross-merchant matching.
+                "content_key": make_content_key(
+                    row_dict.get("mirrored_brand"),
+                    row_dict.get("title"),
+                    None,
+                ),
             },
         )
         if inserted_row:
