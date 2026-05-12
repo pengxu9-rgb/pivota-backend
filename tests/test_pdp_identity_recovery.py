@@ -1,4 +1,5 @@
 from services.pdp_identity_recovery import (
+    build_attached_external_seed_group_member_proposal,
     build_exact_legacy_attachment_proposal,
     build_multi_merchant_group_proposals,
     build_singleton_group_proposal,
@@ -197,6 +198,56 @@ def test_stale_title_attachment_proposal_rejects_title_only_different_brand() ->
             "candidate_source_product_id": "new",
             "candidate_title": "Hydrating Serum",
             "candidate_brand": "Brand B",
+        }
+    )
+
+    assert proposal is None
+
+
+def test_attached_external_seed_group_member_proposal_uses_existing_product_group() -> None:
+    proposal = build_attached_external_seed_group_member_proposal(
+        {
+            "id": "eps_winona",
+            "external_product_id": "ext_winona_channel",
+            "attached_product_key": "prod::merch_1::shopify::100",
+            "product_group_id": "pg_catalog_abc",
+            "existing_external_group_id": None,
+        }
+    )
+
+    assert proposal is not None
+    assert proposal.action == "upsert_product_group_member"
+    assert proposal.high_confidence is True
+    assert proposal.reason == "attached_external_seed_product_group_member"
+    assert proposal.product_key == "prod::merch_1::shopify::100"
+    assert proposal.product_group_id == "pg_catalog_abc"
+    assert proposal.merchant_id == "external_seed"
+    assert proposal.platform == "external_seed"
+    assert proposal.source_product_id == "ext_winona_channel"
+    assert proposal.is_primary is False
+
+
+def test_attached_external_seed_group_member_proposal_skips_existing_member() -> None:
+    proposal = build_attached_external_seed_group_member_proposal(
+        {
+            "id": "eps_winona",
+            "external_product_id": "ext_winona_channel",
+            "attached_product_key": "prod::merch_1::shopify::100",
+            "product_group_id": "pg_catalog_abc",
+            "existing_external_group_id": "pg_catalog_abc",
+        }
+    )
+
+    assert proposal is None
+
+
+def test_attached_external_seed_group_member_proposal_requires_current_product_key() -> None:
+    proposal = build_attached_external_seed_group_member_proposal(
+        {
+            "id": "eps_legacy",
+            "external_product_id": "ext_legacy",
+            "attached_product_key": "merch_1|shopify|100",
+            "product_group_id": "pg_catalog_abc",
         }
     )
 

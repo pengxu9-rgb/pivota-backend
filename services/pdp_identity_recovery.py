@@ -98,6 +98,7 @@ class IdentityRecoveryProposal:
         return self.confidence >= 0.95 and self.reason in {
             "internal_product_missing_group",
             "exact_title_brand_multi_merchant",
+            "attached_external_seed_product_group_member",
             "legacy_attached_key_exact_product_key",
             "legacy_attached_key_exact_title_same_merchant",
         }
@@ -294,6 +295,42 @@ def build_stale_title_attachment_proposal(seed_row: Dict[str, Any]) -> Optional[
     )
 
 
+def build_attached_external_seed_group_member_proposal(
+    seed_row: Dict[str, Any],
+) -> Optional[IdentityRecoveryProposal]:
+    """Attach an already-curated external seed as a seller member.
+
+    external_product_seeds.attached_product_key is the review-gated edge from
+    an external referral row to an internal catalog product. PDP offers are
+    driven by product_group_members, so the attached seed must also be present
+    as an external_seed group member before PDP v2 can show it as another
+    merchant offer.
+    """
+    seed_id = _clean(seed_row.get("id"))
+    external_product_id = _clean(seed_row.get("external_product_id"))
+    attached_product_key = _clean(seed_row.get("attached_product_key"))
+    product_group_id = _clean(seed_row.get("product_group_id"))
+    existing_external_group_id = _clean(seed_row.get("existing_external_group_id"))
+    if not (seed_id and external_product_id and attached_product_key and product_group_id):
+        return None
+    if not attached_product_key.startswith("prod::"):
+        return None
+    if existing_external_group_id == product_group_id:
+        return None
+    return IdentityRecoveryProposal(
+        action="upsert_product_group_member",
+        confidence=0.99,
+        reason="attached_external_seed_product_group_member",
+        seed_id=seed_id,
+        product_key=attached_product_key,
+        product_group_id=product_group_id,
+        merchant_id="external_seed",
+        platform="external_seed",
+        source_product_id=external_product_id,
+        is_primary=False,
+    )
+
+
 async def fetch_internal_group_gap_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
@@ -462,10 +499,55 @@ async def fetch_legacy_attachment_rows(*, limit: int, offset: int) -> List[Dict[
     return [dict(row) for row in rows or []]
 
 
+async def fetch_attached_external_seed_group_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        WITH attached AS (
+          SELECT eps.id,
+                 eps.external_product_id,
+                 eps.title AS seed_title,
+                 eps.attached_product_key,
+                 eps.domain,
+                 cp.product_key,
+                 cp.merchant_id,
+                 cp.platform,
+                 cp.source_product_id,
+                 cp.title AS product_title,
+                 cp.brand AS product_brand,
+                 pgm.product_group_id,
+                 existing.product_group_id AS existing_external_group_id
+          FROM external_product_seeds eps
+          JOIN catalog_products cp
+            ON cp.product_key = eps.attached_product_key
+          LEFT JOIN product_group_members pgm
+            ON pgm.merchant_id = cp.merchant_id
+           AND pgm.platform = cp.platform
+           AND pgm.platform_product_id = cp.source_product_id
+          LEFT JOIN product_group_members existing
+            ON existing.merchant_id = 'external_seed'
+           AND existing.platform = 'external_seed'
+           AND existing.platform_product_id = eps.external_product_id
+          WHERE eps.status = 'active'
+            AND NULLIF(BTRIM(COALESCE(eps.external_product_id, '')), '') IS NOT NULL
+            AND NULLIF(BTRIM(COALESCE(eps.attached_product_key, '')), '') IS NOT NULL
+            AND eps.attached_product_key LIKE 'prod::%'
+          ORDER BY eps.updated_at DESC NULLS LAST, eps.created_at DESC NULLS LAST, eps.id ASC
+          LIMIT :limit OFFSET :offset
+        )
+        SELECT *
+        FROM attached
+        WHERE existing_external_group_id IS DISTINCT FROM product_group_id
+        """,
+        {"limit": int(limit), "offset": int(offset)},
+    )
+    return [dict(row) for row in rows or []]
+
+
 async def build_recovery_proposals(*, limit: int, offset: int) -> Dict[str, Any]:
     group_rows = await fetch_internal_group_gap_rows(limit=limit, offset=offset)
     multi_merchant_rows = await fetch_multi_merchant_candidate_rows(limit=limit, offset=offset)
     legacy_rows = await fetch_legacy_attachment_rows(limit=limit, offset=offset)
+    attached_external_seed_rows = await fetch_attached_external_seed_group_rows(limit=limit, offset=offset)
 
     proposals: List[IdentityRecoveryProposal] = []
     rejected: List[Dict[str, Any]] = []
@@ -492,6 +574,19 @@ async def build_recovery_proposals(*, limit: int, offset: int) -> Dict[str, Any]
                     "reason": "legacy_attachment_not_high_confidence",
                 }
             )
+    for row in attached_external_seed_rows:
+        proposal = build_attached_external_seed_group_member_proposal(row)
+        if proposal:
+            proposals.append(proposal)
+        else:
+            rejected.append(
+                {
+                    "seed_id": row.get("id"),
+                    "external_product_id": row.get("external_product_id"),
+                    "attached_product_key": row.get("attached_product_key"),
+                    "reason": "attached_external_seed_missing_product_group",
+                }
+            )
 
     by_action: Dict[str, int] = {}
     for proposal in proposals:
@@ -502,7 +597,13 @@ async def build_recovery_proposals(*, limit: int, offset: int) -> Dict[str, Any]
             "internal_group_gap_rows": len(group_rows),
             "multi_merchant_candidate_rows": len(multi_merchant_rows),
             "legacy_attachment_rows": len(legacy_rows),
-            "total": len(group_rows) + len(multi_merchant_rows) + len(legacy_rows),
+            "attached_external_seed_group_rows": len(attached_external_seed_rows),
+            "total": (
+                len(group_rows)
+                + len(multi_merchant_rows)
+                + len(legacy_rows)
+                + len(attached_external_seed_rows)
+            ),
         },
         "proposal_counts": by_action,
         "proposals": [proposal.to_dict() for proposal in proposals],
