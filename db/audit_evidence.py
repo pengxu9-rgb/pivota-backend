@@ -1,0 +1,769 @@
+"""P4.2 — canonical evidence/finding/action/verification/projection accessors.
+
+Python interface to the 5 tables introduced by db/migrations/
+086_canonical_evidence_model.sql. Mirrors the P2.1 / P3.1 pattern:
+
+  - SQLAlchemy Table definitions (so SELECTs can use the .c.column API)
+  - Inline DDL backstop (per-statement tolerant) for hermetic test envs
+  - Best-effort write accessors — DB failures log + return None
+    rather than raising, so dual-write paths in P4.3-P4.5 don't
+    take down the legacy JSONB pipeline if the new tables are
+    unavailable
+
+This module is intentionally only data plumbing. The synthesis logic
+that produces evidence_type / finding_type values lives in
+services/audit_evidence_builder.py (a follow-up). The 5-audience
+projection logic lives in services/audit_projection_builder.py (P4.5).
+
+Phase 4 dual-write strategy:
+  - Legacy: agent_center_bd_report_service.build_structured_report
+    continues to populate report_jsonb as it does today
+  - New: at the same code points, also call insert_evidence_item /
+    insert_finding / insert_action so the canonical tables stay
+    in sync
+  - Phase 6 retires the legacy JSONB once consumers migrate
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import (
+    ARRAY,
+    Column, DateTime, Index, Integer, Table, Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+
+from db.database import database, metadata
+
+logger = logging.getLogger(__name__)
+
+
+# =====================================================================
+# Evidence type taxonomy. Validated at insert time; rows with an
+# unknown evidence_type are coerced to 'custom' + the original
+# value preserved in payload_jsonb._raw_type so we don't lose data.
+# =====================================================================
+
+EVIDENCE_TYPE_GROUNDING_CHUNK = "grounding_chunk"
+EVIDENCE_TYPE_COMPETITOR_MENTION = "competitor_mention"
+EVIDENCE_TYPE_URL_MATCH = "url_match"
+EVIDENCE_TYPE_MISSING_SIGNAL = "missing_signal"
+EVIDENCE_TYPE_INDUSTRY_STAT = "industry_stat"
+EVIDENCE_TYPE_CUSTOM = "custom"
+
+VALID_EVIDENCE_TYPES = frozenset({
+    EVIDENCE_TYPE_GROUNDING_CHUNK,
+    EVIDENCE_TYPE_COMPETITOR_MENTION,
+    EVIDENCE_TYPE_URL_MATCH,
+    EVIDENCE_TYPE_MISSING_SIGNAL,
+    EVIDENCE_TYPE_INDUSTRY_STAT,
+    EVIDENCE_TYPE_CUSTOM,
+})
+
+
+# Finding type taxonomy. Each value maps to a specific synthesis
+# template downstream (PR-8a archetype detection). Adding a new
+# finding type means adding it here + handling it in the synthesis
+# layer.
+
+FINDING_VISIBLE_VIA_RETAILERS_ONLY = "merchant_visible_via_retailers_only"
+FINDING_FORM_FACTOR_UNIQUE = "form_factor_unique_in_cohort"
+FINDING_CATEGORY_VISIBILITY_LOW = "category_visibility_low"
+FINDING_ATTRIBUTION_GAP_WITH_EDITORIAL = (
+    "attribution_gap_with_strong_editorial"
+)
+FINDING_INTEGRATION_INCOMPLETE = "integration_state_incomplete"
+FINDING_FIRST_PARTY_INDEXING_GAP = "first_party_pdp_indexing_gap"
+FINDING_NO_KOL_ENDORSEMENTS = "no_kol_endorsements_detected"
+FINDING_CORPORATE_OWNERSHIP_KNOWN = "corporate_ownership_known"
+FINDING_BASELINE_REFERENCE_AVAILABLE = "baseline_reference_available"
+
+# Free-form finding types are accepted; the taxonomy above documents
+# the ones with synthesis-layer handlers. Other types still insert
+# but won't drive narrative templates.
+
+
+# Action lever taxonomy. Mirrors data/playbooks.json lever values.
+LEVER_PIVOTA_INTEGRATION = "pivota_integration"
+LEVER_CONTENT_CREATION = "content_creation"
+LEVER_PDP_OPTIMIZATION = "pdp_optimization"
+LEVER_SITEMAP_HYGIENE = "sitemap_hygiene"
+LEVER_KOL_OUTREACH = "kol_outreach"
+LEVER_EDITORIAL_OUTREACH = "editorial_outreach"
+
+
+# Severity values used by both findings + actions.
+SEVERITY_CRITICAL = "critical"
+SEVERITY_HIGH = "high"
+SEVERITY_MEDIUM = "medium"
+SEVERITY_LOW = "low"
+VALID_SEVERITIES = frozenset({
+    SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW,
+})
+
+
+# Owner values used by actions.
+OWNER_PIVOTA_OPS = "pivota_ops"
+OWNER_MERCHANT_BRAND = "merchant_brand_team"
+OWNER_MERCHANT_GROWTH = "merchant_growth_team"
+OWNER_MERCHANT_TECH = "merchant_tech_team"
+OWNER_JOINT = "joint"
+VALID_OWNERS = frozenset({
+    OWNER_PIVOTA_OPS, OWNER_MERCHANT_BRAND, OWNER_MERCHANT_GROWTH,
+    OWNER_MERCHANT_TECH, OWNER_JOINT,
+})
+
+
+# Phase values.
+PHASE_WEEK_1_TO_4 = "week_1_to_4"
+PHASE_WEEK_4_TO_12 = "week_4_to_12"
+PHASE_WEEK_12_TO_24 = "week_12_to_24"
+
+
+# Verifier IDs for the Phase 5 verify loop. Documented here so the
+# Phase 5 worker knows what to enqueue.
+VERIFIER_PDP_RENDERS = "pdp_renders"
+VERIFIER_PDP_IN_SITEMAP = "pdp_in_sitemap"
+VERIFIER_GSC_URL_SUBMITTED = "gsc_url_submitted"
+VERIFIER_GSC_INDEXING_STATUS = "gsc_indexing_status"
+VERIFIER_PIVOTA_INTERNAL_RETRIEVAL = "pivota_internal_retrieval"
+VERIFIER_FRONTEND_AGENT_CITE = "frontend_agent_cite"
+VERIFIER_PUBLIC_LLM_CITATION = "public_llm_citation_movement"
+
+VALID_VERIFIERS = frozenset({
+    VERIFIER_PDP_RENDERS, VERIFIER_PDP_IN_SITEMAP,
+    VERIFIER_GSC_URL_SUBMITTED, VERIFIER_GSC_INDEXING_STATUS,
+    VERIFIER_PIVOTA_INTERNAL_RETRIEVAL,
+    VERIFIER_FRONTEND_AGENT_CITE,
+    VERIFIER_PUBLIC_LLM_CITATION,
+})
+
+
+# Audience IDs for the 5-audience projection.
+AUDIENCE_EMPLOYEE_BD = "employee_bd"
+AUDIENCE_MERCHANT = "merchant"
+AUDIENCE_INTERNAL_OPS = "internal_ops"
+AUDIENCE_PIVOTA_PDP_FEED = "pivota_pdp_feed"
+AUDIENCE_FRONTEND_AGENT_FEED = "frontend_agent_feed"
+
+VALID_AUDIENCES = frozenset({
+    AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
+    AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
+    AUDIENCE_FRONTEND_AGENT_FEED,
+})
+
+
+# =====================================================================
+# SQLAlchemy Tables
+# =====================================================================
+
+evidence_items = Table(
+    "evidence_items",
+    metadata,
+    Column("evidence_id", UUID(as_uuid=False), primary_key=True),
+    Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("product_key", Text, nullable=True),
+    Column("probe_run_id", UUID(as_uuid=False), nullable=True),
+    Column("evidence_type", Text, nullable=False),
+    Column("payload_jsonb", JSONB, nullable=False),
+    Column("confidence", Integer, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Index("idx_evidence_items_audit_run", "audit_run_id", "created_at"),
+    Index("idx_evidence_items_type", "evidence_type", "audit_run_id"),
+    extend_existing=True,
+)
+
+
+readiness_findings = Table(
+    "readiness_findings",
+    metadata,
+    Column("finding_id", UUID(as_uuid=False), primary_key=True),
+    Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("product_key", Text, nullable=True),
+    Column("finding_type", Text, nullable=False),
+    Column("severity", Text, nullable=False, server_default="medium"),
+    Column("payload_jsonb", JSONB, nullable=False),
+    Column("confidence", Integer, nullable=True),
+    Column("short_summary", Text, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Index("idx_findings_audit_run", "audit_run_id", "created_at"),
+    Index("idx_findings_type", "finding_type", "audit_run_id"),
+    extend_existing=True,
+)
+
+
+action_plan_items = Table(
+    "action_plan_items",
+    metadata,
+    Column("action_id", UUID(as_uuid=False), primary_key=True),
+    Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("product_key", Text, nullable=True),
+    Column("parent_finding_id", UUID(as_uuid=False), nullable=True),
+    Column("severity", Text, nullable=False, server_default="medium"),
+    Column("lever", Text, nullable=False),
+    Column("title", Text, nullable=False),
+    Column("body", Text, nullable=True),
+    Column("owner", Text, nullable=True),
+    Column("kpi_to_track", Text, nullable=True),
+    Column("expected_outcome", Text, nullable=True),
+    Column("phase", Text, nullable=True),
+    Column("depends_on", ARRAY(UUID(as_uuid=False)), nullable=True),
+    Column("materialized_task_id", UUID(as_uuid=False), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Index(
+        "idx_actions_audit_run",
+        "audit_run_id", "severity", "created_at",
+    ),
+    extend_existing=True,
+)
+
+
+verification_runs = Table(
+    "verification_runs",
+    metadata,
+    Column("verify_id", UUID(as_uuid=False), primary_key=True),
+    Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("product_key", Text, nullable=True),
+    Column("verifier_id", Text, nullable=False),
+    Column("status", Text, nullable=False, server_default="pending"),
+    Column("evidence_jsonb", JSONB, nullable=True),
+    Column("error_message", Text, nullable=True),
+    Column("last_checked_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True), nullable=True),
+    Index("idx_verify_audit_run", "audit_run_id", "verifier_id"),
+    extend_existing=True,
+)
+
+
+report_projections = Table(
+    "report_projections",
+    metadata,
+    Column("projection_id", UUID(as_uuid=False), primary_key=True),
+    Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("audience", Text, nullable=False),
+    Column("payload_jsonb", JSONB, nullable=False),
+    Column("builder_version", Text, nullable=False),
+    Column("built_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "audit_run_id", "audience",
+        name="uq_report_projections_audit_audience",
+    ),
+    extend_existing=True,
+)
+
+
+# =====================================================================
+# DDL backstop — per-statement tolerant (matches P2.1/P3.1 pattern)
+# =====================================================================
+
+_DDL_READY = False
+_DDL_LOCK = asyncio.Lock()
+
+
+_DDL_STATEMENTS = [
+    # evidence_items
+    """
+    CREATE TABLE IF NOT EXISTS evidence_items (
+        evidence_id    UUID PRIMARY KEY,
+        audit_run_id   UUID NOT NULL,
+        product_key    TEXT NULL,
+        probe_run_id   UUID NULL,
+        evidence_type  TEXT NOT NULL,
+        payload_jsonb  JSONB NOT NULL,
+        confidence     INTEGER NULL,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_evidence_items_audit_run "
+    "ON evidence_items (audit_run_id, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_items_type "
+    "ON evidence_items (evidence_type, audit_run_id);",
+
+    # readiness_findings
+    """
+    CREATE TABLE IF NOT EXISTS readiness_findings (
+        finding_id     UUID PRIMARY KEY,
+        audit_run_id   UUID NOT NULL,
+        product_key    TEXT NULL,
+        finding_type   TEXT NOT NULL,
+        severity       TEXT NOT NULL DEFAULT 'medium',
+        payload_jsonb  JSONB NOT NULL,
+        confidence     INTEGER NULL,
+        short_summary  TEXT NULL,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_findings_audit_run "
+    "ON readiness_findings (audit_run_id, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_findings_type "
+    "ON readiness_findings (finding_type, audit_run_id);",
+
+    # action_plan_items
+    """
+    CREATE TABLE IF NOT EXISTS action_plan_items (
+        action_id              UUID PRIMARY KEY,
+        audit_run_id           UUID NOT NULL,
+        product_key            TEXT NULL,
+        parent_finding_id      UUID NULL,
+        severity               TEXT NOT NULL DEFAULT 'medium',
+        lever                  TEXT NOT NULL,
+        title                  TEXT NOT NULL,
+        body                   TEXT NULL,
+        owner                  TEXT NULL,
+        kpi_to_track           TEXT NULL,
+        expected_outcome       TEXT NULL,
+        phase                  TEXT NULL,
+        depends_on             UUID[] NULL,
+        materialized_task_id   UUID NULL,
+        created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_actions_audit_run "
+    "ON action_plan_items (audit_run_id, severity, created_at);",
+
+    # verification_runs
+    """
+    CREATE TABLE IF NOT EXISTS verification_runs (
+        verify_id        UUID PRIMARY KEY,
+        audit_run_id     UUID NOT NULL,
+        product_key      TEXT NULL,
+        verifier_id      TEXT NOT NULL,
+        status           TEXT NOT NULL DEFAULT 'pending',
+        evidence_jsonb   JSONB NULL,
+        error_message    TEXT NULL,
+        last_checked_at  TIMESTAMPTZ NULL,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at     TIMESTAMPTZ NULL
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_verify_audit_run "
+    "ON verification_runs (audit_run_id, verifier_id);",
+
+    # report_projections
+    """
+    CREATE TABLE IF NOT EXISTS report_projections (
+        projection_id     UUID PRIMARY KEY,
+        audit_run_id      UUID NOT NULL,
+        audience          TEXT NOT NULL,
+        payload_jsonb     JSONB NOT NULL,
+        builder_version   TEXT NOT NULL,
+        built_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (audit_run_id, audience)
+    );
+    """,
+]
+
+
+async def ensure_audit_evidence_tables() -> None:
+    """Per-statement-tolerant backstop. Postgres prod runs the .sql
+    migration directly; this inline DDL covers hermetic test envs
+    where partial-index syntax isn't supported (matches P2.1/P3.1)."""
+    global _DDL_READY
+    if _DDL_READY:
+        return
+    async with _DDL_LOCK:
+        if _DDL_READY:
+            return
+        for stmt in _DDL_STATEMENTS:
+            try:
+                await database.execute(stmt)
+            except Exception as exc:
+                logger.debug(
+                    "ensure_audit_evidence_tables skip stmt: %s | %s",
+                    str(exc)[:120], stmt[:80],
+                )
+        _DDL_READY = True
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# =====================================================================
+# Validation helpers — coerce unknown values rather than reject
+# =====================================================================
+
+def _coerce_evidence_type(t: str) -> str:
+    if t in VALID_EVIDENCE_TYPES:
+        return t
+    return EVIDENCE_TYPE_CUSTOM
+
+
+def _coerce_severity(s: Optional[str]) -> str:
+    if s in VALID_SEVERITIES:
+        return s
+    return SEVERITY_MEDIUM
+
+
+def _coerce_owner(o: Optional[str]) -> Optional[str]:
+    if o is None or o in VALID_OWNERS:
+        return o
+    # Unknown owners are stored as-is; new owner types added to the
+    # taxonomy later will work without backfill. This trades strict
+    # validation for evolution-friendliness.
+    return o
+
+
+# =====================================================================
+# Write accessors — best-effort. Return new UUID on success, None
+# on persistence failure (caller's legacy JSONB write still happens).
+# =====================================================================
+
+
+async def insert_evidence_item(
+    *,
+    audit_run_id: str,
+    evidence_type: str,
+    payload: Dict[str, Any],
+    product_key: Optional[str] = None,
+    probe_run_id: Optional[str] = None,
+    confidence: Optional[int] = None,
+) -> Optional[str]:
+    """Best-effort write. Unknown evidence_type is coerced to
+    'custom' with the original value preserved in payload_jsonb.
+    Returns the new evidence_id, or None on persistence failure."""
+    await ensure_audit_evidence_tables()
+    coerced_type = _coerce_evidence_type(evidence_type)
+    safe_payload = dict(payload or {})
+    if coerced_type == EVIDENCE_TYPE_CUSTOM and evidence_type != EVIDENCE_TYPE_CUSTOM:
+        safe_payload["_raw_type"] = evidence_type
+    evidence_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            evidence_items.insert().values(
+                evidence_id=evidence_id,
+                audit_run_id=audit_run_id,
+                product_key=product_key,
+                probe_run_id=probe_run_id,
+                evidence_type=coerced_type,
+                payload_jsonb=safe_payload,
+                confidence=(
+                    int(confidence) if confidence is not None else None
+                ),
+                created_at=_now_utc(),
+            )
+        )
+        return evidence_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "insert_evidence_item failed audit_run=%s type=%s: %s",
+            audit_run_id, evidence_type, str(exc)[:200],
+        )
+        return None
+
+
+async def insert_finding(
+    *,
+    audit_run_id: str,
+    finding_type: str,
+    payload: Dict[str, Any],
+    product_key: Optional[str] = None,
+    severity: Optional[str] = None,
+    confidence: Optional[int] = None,
+    short_summary: Optional[str] = None,
+) -> Optional[str]:
+    """Best-effort write. finding_type is stored as-given (the
+    synthesis layer documents the canonical taxonomy but free-form
+    types are accepted)."""
+    await ensure_audit_evidence_tables()
+    finding_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            readiness_findings.insert().values(
+                finding_id=finding_id,
+                audit_run_id=audit_run_id,
+                product_key=product_key,
+                finding_type=finding_type,
+                severity=_coerce_severity(severity),
+                payload_jsonb=dict(payload or {}),
+                confidence=(
+                    int(confidence) if confidence is not None else None
+                ),
+                short_summary=(
+                    short_summary[:2000] if short_summary else None
+                ),
+                created_at=_now_utc(),
+            )
+        )
+        return finding_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "insert_finding failed audit_run=%s type=%s: %s",
+            audit_run_id, finding_type, str(exc)[:200],
+        )
+        return None
+
+
+async def insert_action(
+    *,
+    audit_run_id: str,
+    lever: str,
+    title: str,
+    body: Optional[str] = None,
+    product_key: Optional[str] = None,
+    parent_finding_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    owner: Optional[str] = None,
+    kpi_to_track: Optional[str] = None,
+    expected_outcome: Optional[str] = None,
+    phase: Optional[str] = None,
+    depends_on: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Best-effort write. Returns the new action_id or None."""
+    await ensure_audit_evidence_tables()
+    action_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            action_plan_items.insert().values(
+                action_id=action_id,
+                audit_run_id=audit_run_id,
+                product_key=product_key,
+                parent_finding_id=parent_finding_id,
+                severity=_coerce_severity(severity),
+                lever=lever,
+                title=title[:500] if title else "(untitled)",
+                body=body[:5000] if body else None,
+                owner=_coerce_owner(owner),
+                kpi_to_track=(
+                    kpi_to_track[:500] if kpi_to_track else None
+                ),
+                expected_outcome=(
+                    expected_outcome[:500] if expected_outcome else None
+                ),
+                phase=phase,
+                depends_on=list(depends_on) if depends_on else None,
+                created_at=_now_utc(),
+            )
+        )
+        return action_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "insert_action failed audit_run=%s lever=%s: %s",
+            audit_run_id, lever, str(exc)[:200],
+        )
+        return None
+
+
+async def link_action_to_task(
+    *, action_id: str, task_id: str,
+) -> bool:
+    """Update action_plan_items.materialized_task_id after the
+    task materializer creates the merchant_tasks row. Lets us
+    join from action back to its tracking task."""
+    await ensure_audit_evidence_tables()
+    try:
+        await database.execute(
+            action_plan_items.update()
+            .where(action_plan_items.c.action_id == action_id)
+            .values(materialized_task_id=task_id)
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "link_action_to_task failed action=%s task=%s: %s",
+            action_id, task_id, str(exc)[:200],
+        )
+        return False
+
+
+async def insert_verification_run(
+    *,
+    audit_run_id: str,
+    verifier_id: str,
+    product_key: Optional[str] = None,
+    status: str = "pending",
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+    error_message: Optional[str] = None,
+) -> Optional[str]:
+    """Best-effort write. Phase 5 worker calls this when starting
+    a verifier; subsequent transitions go through update_verification_run."""
+    await ensure_audit_evidence_tables()
+    if verifier_id not in VALID_VERIFIERS:
+        logger.warning(
+            "insert_verification_run: unknown verifier_id %r "
+            "for audit_run=%s — inserting anyway",
+            verifier_id, audit_run_id,
+        )
+    verify_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            verification_runs.insert().values(
+                verify_id=verify_id,
+                audit_run_id=audit_run_id,
+                product_key=product_key,
+                verifier_id=verifier_id,
+                status=status,
+                evidence_jsonb=evidence_jsonb,
+                error_message=(
+                    error_message[:2000] if error_message else None
+                ),
+                created_at=_now_utc(),
+            )
+        )
+        return verify_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "insert_verification_run failed: %s", str(exc)[:200],
+        )
+        return None
+
+
+async def upsert_projection(
+    *,
+    audit_run_id: str,
+    audience: str,
+    payload: Dict[str, Any],
+    builder_version: str,
+) -> Optional[str]:
+    """Insert or replace the projection for (audit_run, audience).
+    The UNIQUE constraint forces replace semantics — re-rendering
+    overwrites the existing row.
+
+    Implementation: try insert; on unique-constraint violation,
+    update. Two round-trips in the conflict case, one in the
+    common case. Acceptable since projections are written at
+    audit completion (low volume) not on every request.
+    """
+    await ensure_audit_evidence_tables()
+    if audience not in VALID_AUDIENCES:
+        logger.warning(
+            "upsert_projection: unknown audience %r — accepting",
+            audience,
+        )
+    projection_id = str(uuid.uuid4())
+    now = _now_utc()
+    try:
+        await database.execute(
+            report_projections.insert().values(
+                projection_id=projection_id,
+                audit_run_id=audit_run_id,
+                audience=audience,
+                payload_jsonb=payload,
+                builder_version=builder_version,
+                built_at=now,
+            )
+        )
+        return projection_id
+    except Exception:
+        # Likely unique-constraint conflict (existing projection).
+        # Fall through to update.
+        try:
+            await database.execute(
+                report_projections.update()
+                .where(
+                    report_projections.c.audit_run_id == audit_run_id,
+                    report_projections.c.audience == audience,
+                )
+                .values(
+                    payload_jsonb=payload,
+                    builder_version=builder_version,
+                    built_at=now,
+                )
+            )
+            return None  # updated — no new projection_id
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "upsert_projection failed audit_run=%s aud=%s: %s",
+                audit_run_id, audience, str(exc)[:200],
+            )
+            return None
+
+
+# =====================================================================
+# Read accessors
+# =====================================================================
+
+
+async def list_evidence_for_run(
+    *, audit_run_id: str,
+    evidence_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """All evidence rows for one audit. Optional type filter."""
+    await ensure_audit_evidence_tables()
+    try:
+        q = evidence_items.select().where(
+            evidence_items.c.audit_run_id == audit_run_id,
+        )
+        if evidence_type is not None:
+            q = q.where(evidence_items.c.evidence_type == evidence_type)
+        q = q.order_by(evidence_items.c.created_at)
+        rows = await database.fetch_all(q)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_evidence_for_run failed for %s: %s",
+            audit_run_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in (rows or [])]
+
+
+async def list_findings_for_run(
+    *, audit_run_id: str,
+) -> List[Dict[str, Any]]:
+    """All findings for one audit, ordered by created_at."""
+    await ensure_audit_evidence_tables()
+    try:
+        rows = await database.fetch_all(
+            readiness_findings.select()
+            .where(readiness_findings.c.audit_run_id == audit_run_id)
+            .order_by(readiness_findings.c.created_at)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_findings_for_run failed for %s: %s",
+            audit_run_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in (rows or [])]
+
+
+async def list_actions_for_run(
+    *, audit_run_id: str,
+) -> List[Dict[str, Any]]:
+    """All actions for one audit, ordered by severity (critical
+    first) then created_at."""
+    await ensure_audit_evidence_tables()
+    try:
+        rows = await database.fetch_all(
+            action_plan_items.select()
+            .where(action_plan_items.c.audit_run_id == audit_run_id)
+            .order_by(action_plan_items.c.created_at)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_actions_for_run failed for %s: %s",
+            audit_run_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in (rows or [])]
+
+
+async def fetch_projection(
+    *, audit_run_id: str, audience: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the cached projection for (audit_run, audience), or
+    None if not yet built."""
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            report_projections.select().where(
+                report_projections.c.audit_run_id == audit_run_id,
+                report_projections.c.audience == audience,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_projection failed audit_run=%s aud=%s: %s",
+            audit_run_id, audience, str(exc)[:200],
+        )
+        return None
+    if row is None:
+        return None
+    return dict(row)
