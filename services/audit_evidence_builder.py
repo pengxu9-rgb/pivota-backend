@@ -310,17 +310,29 @@ def extract_actions(
       {lever, title, body, severity, owner, kpi_to_track,
        expected_outcome, phase, product_key?}
 
-    Sources in the brand_report:
-      - per_product[*].action_items (PR-6 / P1.1)
-      - per_product[*].action_ladder (PR-8b enriched)
-      - per_product[*].pivota_commitments (PR-8d) — these are
-        NOT actions (they're commitments / disclosures), skip
-      - per_product[*].implementation_roadmap (PR-8c) — these are
-        phase containers; their nested activities ARE actions
+    Sources in the brand_report (priority order):
+      - per_product[*].merchant_view.actions — the AUTHORITATIVE
+        unified merged list (action_items + playbook_actions +
+        integration_action; built by build_structured_report and
+        enriched by _enrich_action_items_v2)
+      - per_product[*].action_items (legacy PR-6 / P1.1 flat list —
+        kept for back-compat with older fixtures / replayed audits)
+      - per_product[*].action_ladder (legacy PR-8b enriched bucket)
+      - per_product[*].implementation_roadmap (PR-8c phase
+        containers; nested activities ARE actions)
 
     De-dup: if the same (lever, title) appears for multiple products
     (e.g. brand-level "complete Pivota integration"), keep only the
     first. Brand-level actions are written with product_key=None.
+
+    Pre-fix history: extract_actions previously ONLY looked at
+    per_product[*].action_items. After build_structured_report's
+    merchant_view refactor, actions moved to merchant_view.actions
+    and the per_product.action_items field became stale. Combined
+    with _normalize_action's strict `lever`-required rule (and
+    _generate_action_items not setting lever today), 100% of
+    actions got dropped — Gate 5 of the deploy validation pipeline
+    observed action_plan_items=0 across multiple production audits.
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(brand_report, dict):
@@ -328,24 +340,40 @@ def extract_actions(
 
     seen: set = set()  # (lever, title) tuples we've already emitted
 
+    def _emit(action: Any, product_key: Optional[str]) -> None:
+        normalized = _normalize_action(action, product_key)
+        if normalized is None:
+            return
+        dedupe_key = (normalized["lever"], normalized["title"])
+        if dedupe_key in seen:
+            return
+        seen.add(dedupe_key)
+        out.append(normalized)
+
     for product in (brand_report.get("per_product") or []):
         if not isinstance(product, dict):
             continue
         product_key = _product_key_from_report(product)
 
-        # action_items: the PR-6 / P1.1 flat list
-        for action in (product.get("action_items") or []):
-            normalized = _normalize_action(action, product_key)
-            if normalized is None:
-                continue
-            dedupe_key = (normalized["lever"], normalized["title"])
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            out.append(normalized)
+        # PRIMARY source: per_product[*].merchant_view.actions
+        # build_structured_report puts the unified merged list here
+        # (see agent_center_bd_report_service.py:3840 — "actions":
+        # merged_actions in _build_merchant_view's return value).
+        merchant_view = product.get("merchant_view") or {}
+        if isinstance(merchant_view, dict):
+            for action in (merchant_view.get("actions") or []):
+                _emit(action, product_key)
 
-        # action_ladder: PR-8b enriched. Nested under
-        # `actions` (or sometimes the top-level value IS the list).
+        # Legacy back-compat path 1: per_product[*].action_items.
+        # Modern builders don't emit at this path but test fixtures
+        # and older audits may still have it populated. Kept so the
+        # extractor doesn't regress for any existing audit replay.
+        for action in (product.get("action_items") or []):
+            _emit(action, product_key)
+
+        # Legacy back-compat path 2: per_product[*].action_ladder.
+        # Nested under `actions` (or sometimes the top-level value
+        # IS the list).
         ladder = product.get("action_ladder") or {}
         if isinstance(ladder, dict):
             ladder_actions = ladder.get("actions") or []
@@ -354,14 +382,7 @@ def extract_actions(
         else:
             ladder_actions = []
         for action in ladder_actions:
-            normalized = _normalize_action(action, product_key)
-            if normalized is None:
-                continue
-            dedupe_key = (normalized["lever"], normalized["title"])
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            out.append(normalized)
+            _emit(action, product_key)
 
         # implementation_roadmap: PR-8c phase containers. Each
         # phase has an `activities` list; each activity is an
@@ -376,41 +397,104 @@ def extract_actions(
                 continue
             phase_id = phase_block.get("phase_id") or phase_block.get("label")
             for activity in (phase_block.get("activities") or []):
-                # activities can be plain strings or action dicts
-                if isinstance(activity, str):
-                    # No lever info — skip; would require guessing
+                # activities can be plain strings or action dicts;
+                # only dicts are normalizable.
+                if not isinstance(activity, dict):
                     continue
-                normalized = _normalize_action(activity, product_key)
-                if normalized is None:
-                    continue
-                # Inject the phase from the roadmap container
+                # Inject phase from the roadmap container if the
+                # activity itself didn't specify one. Copy first so
+                # we don't mutate the brand_report.
+                activity_copy = dict(activity)
                 if (
-                    not normalized.get("phase")
+                    not activity_copy.get("phase")
                     and isinstance(phase_id, str)
                     and phase_id in _VALID_PHASES
                 ):
-                    normalized["phase"] = phase_id
-                dedupe_key = (normalized["lever"], normalized["title"])
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                out.append(normalized)
+                    activity_copy["phase"] = phase_id
+                _emit(activity_copy, product_key)
 
     return out
+
+
+# Fallback lever assigned when an action source produces an item
+# without one. The lever column is a categorization tag; missing
+# levers should NOT cause the whole action to be dropped (which is
+# what the prior strict-required rule did, costing us every
+# severity+title-only action that _generate_action_items emits).
+_DEFAULT_LEVER = "general_recommendation"
+
+
+def _derive_lever_from_title(title: str) -> str:
+    """Best-effort lever inference from action title keywords. Used
+    as a fallback when an action dict has no explicit lever field
+    (typical for _generate_action_items output, which is
+    severity+title+body+evidence shaped without a categorization
+    tag). Keeps action_plan_items.lever meaningful for grouping
+    without forcing every caller to remember to set it."""
+    if not title:
+        return _DEFAULT_LEVER
+    title_lower = title.lower()
+    # Most specific signals first.
+    if (
+        "search console" in title_lower
+        or "indexing" in title_lower
+        or "index your" in title_lower  # matches "Index your canonical PDPs"
+        or "url inspection" in title_lower
+        or "sitemap" in title_lower
+        or "canonical pdp" in title_lower
+    ):
+        return "indexing_acceleration"
+    if (
+        "editorial" in title_lower
+        or "publisher" in title_lower
+        or "outreach" in title_lower
+        or "pitch" in title_lower
+    ):
+        return "editorial_outreach"
+    if (
+        "content" in title_lower
+        or "brief" in title_lower
+        or "article" in title_lower
+    ):
+        return "content_publishing"
+    if (
+        "competitor" in title_lower
+        or "cohort" in title_lower
+        or "competitive" in title_lower
+    ):
+        return "competitive_response"
+    if (
+        "integration" in title_lower
+        or "onboard" in title_lower
+        or "pivota" in title_lower
+    ):
+        return "pivota_integration"
+    return _DEFAULT_LEVER
 
 
 def _normalize_action(
     raw: Any, product_key: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     """Normalize a raw action dict (from various report shapes) to
-    the insert_action contract. Returns None if the action lacks
-    the minimum required fields (lever + title)."""
+    the insert_action contract. Returns None ONLY if the action
+    lacks a title — every action must be human-presentable. Missing
+    lever is tolerated (derived from title keywords) so the
+    severity+title-only shape produced by _generate_action_items
+    persists instead of being silently dropped.
+
+    Pre-fix this required (lever AND title); the strict rule meant
+    every _generate_action_items output was rejected, since that
+    function emits severity+title+body+evidence shaped dicts with
+    no `lever` field set. Gate 5 of deploy validation observed
+    action_plan_items=0 across multiple production audits because
+    of this.
+    """
     if not isinstance(raw, dict):
         return None
-    lever = (raw.get("lever") or "").strip()
     title = (raw.get("title") or "").strip()
-    if not lever or not title:
+    if not title:
         return None
+    lever = (raw.get("lever") or "").strip() or _derive_lever_from_title(title)
 
     # Phase validation — only emit phases the canonical taxonomy
     # accepts. PR-8c emits these labels directly so this is mostly
