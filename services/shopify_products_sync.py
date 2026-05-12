@@ -292,3 +292,156 @@ async def sync_shopify_products_for_merchant(
         "syncedAt": datetime.utcnow().isoformat(),
         "lastError": last_error,
     }
+
+
+# ---------------------------------------------------------------------------
+# Lightweight presence refresh — Stage 2a follow-up.
+# ---------------------------------------------------------------------------
+#
+# The full sync above (sync_shopify_products_for_merchant) runs through
+# the entire catalog ingest pipeline: taxonomy derivation, SKU upserts,
+# offer writes, beauty profiles, field facts. That's appropriate when
+# the merchant's catalog content has changed. It's also slow — minutes
+# for a few hundred products — which is what made codex's Stage 2a
+# bootstrap fail (proxy timeouts on /sync/{merchant_id}, SSH lifetime
+# on direct service calls, unreliable nohup).
+#
+# For the sync-hygiene loop (Stage 2a's sweep), we only need ONE
+# signal: "which source_product_ids currently exist on the upstream
+# Shopify store?" Everything else can be derived from existing rows.
+# So we fetch IDs only, bump last_seen_in_sync_at + sync_status='live'
+# for matching rows, bump catalog_merchants.last_full_sync_at, and
+# return. No taxonomy, no SKU writes, no offer writes — completes in
+# seconds for catalogs up to ~5000 products.
+#
+# Usage pattern (per merchant, nightly or on-demand):
+#   1. POST /admin/sync/refresh-presence/{merchant_id}
+#   2. python3 scripts/sweep_stale_catalog_products.py --merchant-id M
+#   3. (optionally) --apply once dry-run looks right
+
+async def refresh_merchant_presence(
+    *,
+    merchant_id: str,
+    per_page: int = 250,
+    max_pages: int = 50,
+) -> Dict[str, Any]:
+    """Lightweight: fetches current Shopify product IDs for the merchant,
+    bumps last_seen_in_sync_at + sync_status='live' on matching
+    catalog_products rows, bumps catalog_merchants.last_full_sync_at.
+
+    Raises ShopifyProductsSyncError subclasses on credential / auth /
+    rate-limit failures (same exception hierarchy as the full sync, so
+    routes can map them to the same HTTP statuses).
+
+    Note: this DOES NOT detect stale rows — that's the sweep's job
+    (scripts/sweep_stale_catalog_products.py). This function only
+    establishes "what's currently live"; the sweep computes "what's
+    been live for the last N hours" from last_seen_in_sync_at."""
+    credentials = await _get_shopify_store_credentials(merchant_id)
+
+    live_ids: set[str] = set()
+    pages = 0
+    page_token: Optional[str] = None
+    truncated = False
+    truncated_reason: Optional[str] = None
+
+    while pages < max_pages:
+        products, next_token, error = await fetch_merchant_products(
+            merchant_id=merchant_id,
+            platform="shopify",
+            credentials=credentials,
+            limit=per_page,
+            page_token=page_token,
+        )
+        pages += 1
+
+        if error:
+            lower = str(error).lower()
+            if "rate limit" in lower or "429" in lower:
+                raise ShopifyProductsSyncRateLimitError(error)
+            if "401" in lower or "403" in lower or "unauthorized" in lower or "forbidden" in lower:
+                raise ShopifyProductsSyncAuthError(error)
+            raise ShopifyProductsSyncError(error)
+
+        if next_token == SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE:
+            truncated = True
+            truncated_reason = "next_page_token_unparseable"
+            next_token = None
+
+        for sp in products or []:
+            # StandardProduct.product_id is the platform id; fall back
+            # to .id if the adapter didn't fill product_id. Both are
+            # how Path A's _upsert_by_pk keys source_product_id.
+            pid = str(sp.product_id or sp.id or "").strip()
+            if pid:
+                live_ids.add(pid)
+
+        if not next_token:
+            break
+        page_token = next_token
+
+    # Bump last_seen_in_sync_at + sync_status for matching rows. Done
+    # in chunks because asyncpg's parameter limit caps array binds
+    # around ~32k for some Postgres versions; chunk to be safe.
+    rows_touched = 0
+    if live_ids:
+        ids_list = list(live_ids)
+        chunk_size = 1000
+        async with database.transaction():
+            for start in range(0, len(ids_list), chunk_size):
+                chunk = ids_list[start:start + chunk_size]
+                result = await database.execute(
+                    """
+                    UPDATE catalog_products
+                    SET last_seen_in_sync_at = NOW(),
+                        sync_status = 'live',
+                        updated_at = NOW()
+                    WHERE merchant_id = :merchant_id
+                      AND platform = 'shopify'
+                      AND source_product_id = ANY(:ids)
+                    """,
+                    {"merchant_id": merchant_id, "ids": chunk},
+                )
+                if result is not None:
+                    try:
+                        rows_touched += int(result)
+                    except (TypeError, ValueError):
+                        pass
+            # Always bump last_full_sync_at — even if 0 rows matched,
+            # this records "we successfully reached Shopify and listed
+            # products" so the sweep can run. If live_ids is empty
+            # (merchant deleted everything), the sweep correctly
+            # tombstones all existing rows.
+            await database.execute(
+                """
+                UPDATE catalog_merchants
+                SET last_full_sync_at = NOW(),
+                    updated_at = NOW()
+                WHERE merchant_id = :merchant_id
+                """,
+                {"merchant_id": merchant_id},
+            )
+    else:
+        # No live IDs returned. Still bump last_full_sync_at — we did
+        # reach Shopify; an empty result is itself a signal the sweep
+        # should act on.
+        await database.execute(
+            """
+            UPDATE catalog_merchants
+            SET last_full_sync_at = NOW(),
+                updated_at = NOW()
+            WHERE merchant_id = :merchant_id
+            """,
+            {"merchant_id": merchant_id},
+        )
+
+    return {
+        "merchant_id": merchant_id,
+        "shop_domain": credentials.get("shop_domain"),
+        "live_ids_fetched": len(live_ids),
+        "rows_touched": rows_touched,
+        "pages_fetched": pages,
+        "truncated": truncated,
+        "truncated_reason": truncated_reason,
+        "refreshed_at": datetime.utcnow().isoformat(),
+    }
