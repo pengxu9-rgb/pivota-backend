@@ -1161,7 +1161,7 @@ async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
     keys = sorted({_clean(key) for key in product_keys if _clean(key)})
     if not keys:
         return 0
-    result = await database.execute(
+    rows = await database.fetch_all(
         """
         UPDATE catalog_products cp
         SET pdp_scope = :scope,
@@ -1197,6 +1197,7 @@ async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
                 AND own.platform_product_id = cp.source_product_id
             )
           )
+        RETURNING cp.product_key
         """,
         {
             "scope": SCOPE_CANONICAL,
@@ -1204,8 +1205,7 @@ async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
             "product_keys": keys,
         },
     )
-    match = re.search(r"\bUPDATE\s+(\d+)", str(result or ""))
-    return int(match.group(1)) if match else len(keys)
+    return len(rows or [])
 
 
 async def apply_recovery_proposals(
