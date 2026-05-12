@@ -300,6 +300,68 @@ async def test_gsc_indexing_failed_when_url_not_yet_submitted(
 # =====================================================================
 
 
+# =====================================================================
+# P5.8.4 — assert the indexing-status verifier reads the actual
+# indexed_at column, not submitted_at. The original P5.4 code shipped
+# with this bug; the verifier-review caught it; this test makes sure
+# it doesn't regress.
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_gsc_indexing_exposes_indexed_at_distinct_from_submitted_at(
+    monkeypatch,
+):
+    """If the row has DIFFERENT submitted_at + indexed_at timestamps,
+    the verifier MUST surface the indexed_at value in evidence
+    (the merchant-facing timestamp). Catches the P0-4 bug class
+    where the SELECT statement and the read site drift."""
+    from services.verifiers import gsc_indexing_status as v
+    submitted_ts = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    indexed_ts = datetime(2026, 5, 8, tzinfo=timezone.utc)
+    _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_gsc_db(
+        monkeypatch,
+        submission_row={
+            "last_status": "indexed",
+            "submitted_at": submitted_ts,
+            "indexed_at": indexed_ts,
+            "source_audit_run_id": "audit-1",
+            "error_message": None,
+        },
+    )
+    result = await v.run_gsc_indexing_status(_ctx(
+        verifier_id="gsc_indexing_status",
+    ))
+    assert result.status == "succeeded"
+    # indexed_at evidence MUST be the indexed_at timestamp, NOT the
+    # submitted_at timestamp (the original P5.4 bug).
+    assert result.evidence_jsonb["indexed_at"] == indexed_ts.isoformat()
+    assert result.evidence_jsonb["submitted_at"] == submitted_ts.isoformat()
+    # The two must NOT be equal — proves the verifier doesn't read
+    # the same column for both fields.
+    assert (
+        result.evidence_jsonb["indexed_at"]
+        != result.evidence_jsonb["submitted_at"]
+    )
+
+
+def test_gsc_url_submitted_select_statement_includes_indexed_at():
+    """Schema-coupling check: the SELECT in _fetch_submission_row
+    must include indexed_at, otherwise gsc_indexing_status reads a
+    missing column and silently falls back to None (or worse, an
+    aliased value). Catches the SELECT-vs-read drift bug class."""
+    import inspect
+    from services.verifiers import gsc_url_submitted
+    src = inspect.getsource(gsc_url_submitted._fetch_submission_row)
+    # The SELECT clause must include indexed_at as a column.
+    assert "indexed_at" in src, (
+        "_fetch_submission_row SELECT omits indexed_at; "
+        "gsc_indexing_status will silently report None / "
+        "submitted_at value as indexed_at"
+    )
+
+
 def test_both_gsc_verifiers_register_at_import():
     import services.verifiers  # noqa: F401
     from services.verification_run_worker import (

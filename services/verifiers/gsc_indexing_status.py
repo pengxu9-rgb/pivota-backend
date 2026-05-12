@@ -96,10 +96,12 @@ async def run_gsc_indexing_status(
 
     last_status = (sub_row.get("last_status") or "").strip().lower()
     evidence["last_status"] = last_status
-    evidence["indexed_at"] = _iso_or_none(sub_row.get("submitted_at"))
-    # NOTE: gsc_url_submissions has both submitted_at + indexed_at;
-    # surface the latter when present (P5.4 follow-up if we find
-    # the column shape needs richer handling).
+    # P5.8.4: read the actual indexed_at column (NOT submitted_at).
+    # The P5.4 first cut had a bug where this read submitted_at and
+    # exposed it as indexed_at to merchants — fabricated indexing
+    # timestamps violated feedback_mock_data_never_to_merchant.md.
+    evidence["submitted_at"] = _iso_or_none(sub_row.get("submitted_at"))
+    evidence["indexed_at"] = _iso_or_none(sub_row.get("indexed_at"))
 
     if last_status == "indexed":
         return VerifierResult(
