@@ -5,8 +5,8 @@ the column nullable; new writes (Path A/B/C/D) populate it; this script
 fills in the existing ~thousands of legacy rows.
 
 What it does:
-  1. SELECT product_key, brand, title, optional GTIN from catalog_skus
-     for rows where catalog_products.content_key IS NULL.
+  1. SELECT a stable product_key-ordered window of catalog_products,
+     plus optional GTIN from catalog_skus.
   2. Compute content_key via services.catalog_identity.make_content_key.
   3. UPDATE catalog_products.content_key for each row.
 
@@ -29,8 +29,10 @@ Usage:
     python3 scripts/backfill_content_key.py --apply --limit 0
 
 Note: --limit 0 means "no limit". --offset always honored when --limit>0.
-Ordering is by id ASC (write-stable — UPDATE doesn't change id, so
-chunks don't re-process the same rows even under --apply).
+Ordering is by product_key ASC (write-stable — UPDATE doesn't change
+product_key, so chunks don't re-process the same rows even under
+--apply). Each chunk reads the full window and only updates rows whose
+content_key is still NULL.
 """
 
 from __future__ import annotations
@@ -52,9 +54,15 @@ logger = logging.getLogger(__name__)
 
 
 def _select_sql(*, limit: int, offset: int) -> str:
-    """Pull rows that don't have content_key yet. id ASC ordering is
-    stable under concurrent UPDATEs of unrelated columns — id is
-    immutable, so paginating with --offset is reliable across chunks."""
+    """Pull a stable product_key-ordered window.
+
+    Important: do not filter content_key IS NULL in this SELECT. If the
+    SELECT filters NULL rows and the operator applies offset chunks, the
+    previous chunk's UPDATE removes rows from the filtered set and later
+    offsets skip legacy rows. Windowing over all catalog_products keeps
+    offset pagination stable; the UPDATE below remains guarded by
+    content_key IS NULL.
+    """
     limit_clause = "LIMIT :limit" if limit > 0 else ""
     offset_clause = "OFFSET :offset" if offset > 0 else ""
     # LEFT JOIN catalog_skus to fish a GTIN-like value for rows whose
@@ -63,8 +71,8 @@ def _select_sql(*, limit: int, offset: int) -> str:
     # just get content_key from brand+title with gtin=None.
     return f"""
         SELECT
-          cp.id,
           cp.product_key,
+          cp.content_key,
           cp.brand,
           cp.title,
           (SELECT s.barcode FROM catalog_skus s
@@ -72,8 +80,7 @@ def _select_sql(*, limit: int, offset: int) -> str:
                AND s.barcode IS NOT NULL
              LIMIT 1) AS gtin
         FROM catalog_products cp
-        WHERE cp.content_key IS NULL
-        ORDER BY cp.id ASC
+        ORDER BY cp.product_key ASC
         {limit_clause}
         {offset_clause}
     """
@@ -83,7 +90,7 @@ UPDATE_SQL = """
     UPDATE catalog_products
     SET content_key = :content_key,
         updated_at = NOW()
-    WHERE id = :id
+    WHERE product_key = :product_key
       AND content_key IS NULL
 """
 
@@ -111,12 +118,16 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "considered": len(rows),
         "key_computed": 0,
         "key_null_brand_or_title_missing": 0,
+        "skipped_already_keyed": 0,
         "updated": 0,
         "skipped_no_op_in_dry_run": 0,
     }
     samples: List[Dict[str, Any]] = []
 
     for row in rows:
+        if row.get("content_key"):
+            outcomes["skipped_already_keyed"] += 1
+            continue
         key = make_content_key(row.get("brand"), row.get("title"), row.get("gtin"))
         if key is None:
             outcomes["key_null_brand_or_title_missing"] += 1
@@ -124,7 +135,6 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         outcomes["key_computed"] += 1
         if len(samples) < 5:
             samples.append({
-                "id": row["id"],
                 "product_key": row["product_key"],
                 "brand": row.get("brand"),
                 "title": row.get("title"),
@@ -134,7 +144,10 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         if not args.apply:
             outcomes["skipped_no_op_in_dry_run"] += 1
             continue
-        rc = await database.execute(UPDATE_SQL, {"id": row["id"], "content_key": key})
+        rc = await database.execute(
+            UPDATE_SQL,
+            {"product_key": row["product_key"], "content_key": key},
+        )
         # `databases.execute` returns rowcount-equivalent for UPDATE
         if rc is None or rc:
             outcomes["updated"] += 1

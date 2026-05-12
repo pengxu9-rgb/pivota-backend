@@ -2,7 +2,7 @@
 
 The backfill is the one-off mechanism that turns legacy catalog_products
 rows (predating mig 083) into content_key-keyed rows. Tests pin:
-  - SELECT shape (only NULL content_key rows, id ASC ordering)
+  - SELECT shape (stable product_key window; UPDATE guards NULL rows)
   - LIMIT / OFFSET binding discipline
   - Dry-run does not call execute
   - Apply skips rows where brand or title are empty (make_content_key returns None)
@@ -34,14 +34,14 @@ def _ns(**kw) -> SimpleNamespace:
 # ---------------------------------------------------------------------------
 
 
-def test_select_sql_filters_to_null_content_key_rows_ordered_by_id() -> None:
-    """The backfill must only touch rows that don't yet have a key
-    (otherwise a re-run would needlessly UPDATE every row). Ordering
-    by id ASC keeps pagination stable across --apply chunks (id is
-    immutable; UPDATE doesn't change it)."""
+def test_select_sql_uses_stable_product_key_window() -> None:
+    """The SELECT must page over a stable all-row window. Filtering to
+    NULL content_key rows before OFFSET would skip rows after previous
+    chunks update content_key."""
     sql = backfill._select_sql(limit=100, offset=0)
-    assert "content_key IS NULL" in sql
-    assert "ORDER BY cp.id ASC" in sql
+    assert "cp.content_key" in sql
+    assert "WHERE cp.content_key IS NULL" not in sql
+    assert "ORDER BY cp.product_key ASC" in sql
 
 
 def test_select_sql_limit_clause_only_when_positive() -> None:
@@ -99,9 +99,9 @@ async def test_drive_dry_run_does_not_execute_updates(monkeypatch) -> None:
     """Default invocation must NEVER call database.execute. Operators
     expect --dry-run reporting to be side-effect free."""
     rows = [
-        {"id": 1, "product_key": "p1", "brand": "Glow Recipe",
+        {"product_key": "p1", "content_key": None, "brand": "Glow Recipe",
          "title": "Plum Plump Hyaluronic Serum", "gtin": None},
-        {"id": 2, "product_key": "p2", "brand": "MAC",
+        {"product_key": "p2", "content_key": None, "brand": "MAC",
          "title": "Lipstick Russian Red", "gtin": "0773602443796"},
     ]
     execute_calls: list = []
@@ -132,9 +132,9 @@ async def test_drive_apply_executes_one_update_per_eligible_row(monkeypatch) -> 
     """--apply: each computed-key row gets one UPDATE. The UPDATE SQL
     only touches the content_key column (NOT seed_data / product_payload)."""
     rows = [
-        {"id": 1, "product_key": "p1", "brand": "Glow Recipe",
+        {"product_key": "p1", "content_key": None, "brand": "Glow Recipe",
          "title": "Plum Plump Serum", "gtin": None},
-        {"id": 2, "product_key": "p2", "brand": "MAC",
+        {"product_key": "p2", "content_key": None, "brand": "MAC",
          "title": "Lipstick", "gtin": "0773602443796"},
     ]
     executed: list = []
@@ -160,6 +160,7 @@ async def test_drive_apply_executes_one_update_per_eligible_row(monkeypatch) -> 
         assert "product_payload" not in call["sql"]
         # Idempotency guard: only UPDATEs when content_key IS NULL
         assert "content_key IS NULL" in call["sql"]
+        assert "WHERE product_key = :product_key" in call["sql"]
     assert report["outcome_counts"]["updated"] == 2
 
 
@@ -170,11 +171,11 @@ async def test_drive_skips_rows_with_empty_brand_or_title(monkeypatch) -> None:
     skips the UPDATE. These rows stay NULL on content_key — Stage 2's
     auto-grouper will skip them too."""
     rows = [
-        {"id": 1, "product_key": "p1", "brand": "", "title": "Title",
+        {"product_key": "p1", "content_key": None, "brand": "", "title": "Title",
          "gtin": None},
-        {"id": 2, "product_key": "p2", "brand": None, "title": "T2",
+        {"product_key": "p2", "content_key": None, "brand": None, "title": "T2",
          "gtin": None},
-        {"id": 3, "product_key": "p3", "brand": "Brand", "title": "",
+        {"product_key": "p3", "content_key": None, "brand": "Brand", "title": "",
          "gtin": None},
     ]
     executed: list = []
@@ -201,7 +202,7 @@ async def test_drive_report_includes_sample_outcomes(monkeypatch) -> None:
     """Operators want to eyeball a few examples before flipping to
     --apply across the full table. Sample size capped at 5."""
     rows = [
-        {"id": i, "product_key": f"p{i}", "brand": "B",
+        {"product_key": f"p{i}", "content_key": None, "brand": "B",
          "title": f"T{i}", "gtin": None}
         for i in range(20)
     ]
@@ -223,6 +224,36 @@ async def test_drive_report_includes_sample_outcomes(monkeypatch) -> None:
     for s in report["samples"]:
         assert "content_key" in s and s["content_key"].startswith("ck_")
         assert "brand" in s and "title" in s
+
+
+@pytest.mark.asyncio
+async def test_drive_skips_already_keyed_rows_in_stable_window(monkeypatch) -> None:
+    """Stable-window pagination reads all rows; rows already keyed must
+    not be updated again."""
+    rows = [
+        {"product_key": "p1", "content_key": "ck_" + "1" * 32, "brand": "B", "title": "T1", "gtin": None},
+        {"product_key": "p2", "content_key": None, "brand": "B", "title": "T2", "gtin": None},
+    ]
+    executed: list = []
+
+    async def fake_fetch_all(_sql, _params):
+        return rows
+
+    async def fake_execute(sql, params):
+        executed.append({"sql": str(sql), "params": params})
+        return 1
+
+    monkeypatch.setattr(backfill.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(backfill.database, "execute", fake_execute)
+    monkeypatch.setattr(backfill.database, "is_connected", True)
+
+    report = await backfill._drive(_ns(apply=True))
+
+    assert report["outcome_counts"]["considered"] == 2
+    assert report["outcome_counts"]["skipped_already_keyed"] == 1
+    assert report["outcome_counts"]["key_computed"] == 1
+    assert len(executed) == 1
+    assert executed[0]["params"]["product_key"] == "p2"
 
 
 # ---------------------------------------------------------------------------
