@@ -22,6 +22,12 @@ Job registration happens at start-up time. Currently registers:
   individual short-lived actions, not multi-minute audits.
 - `executor_run_lease_reaper` — fires every 60 seconds, calls
   services/executor_run_worker.run_executor_lease_reaper_tick.
+- `verification_run_worker_tick` — fires every 30 seconds, calls
+  services/verification_run_worker.run_verification_worker_tick
+  which drains pending verification_runs rows (P5.2). Slower
+  cadence than executor worker because verifiers are not latency-
+  critical.
+- `verification_run_lease_reaper` — fires every 60 seconds.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -134,6 +140,34 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # P5.2: drive verification_runs through the durable queue.
+        # No production traffic until P5.7 enqueues at audit
+        # completion AND P5.3-P5.6 register verifiers — both gates
+        # close before the first non-stub work flows. Until then,
+        # the tick is a safe no-op against an empty queue.
+        from services.verification_run_worker import (
+            run_verification_worker_tick,
+            run_verification_lease_reaper_tick,
+        )
+        scheduler.add_job(
+            run_verification_worker_tick,
+            "interval",
+            seconds=30,
+            id="verification_run_worker_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+        scheduler.add_job(
+            run_verification_lease_reaper_tick,
+            "interval",
+            seconds=60,
+            id="verification_run_lease_reaper",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
@@ -141,7 +175,9 @@ async def start_scheduler() -> None:
             "+ audit_run_worker_tick (10s) "
             "+ audit_run_lease_reaper (60s) "
             "+ executor_run_worker_tick (5s) "
-            "+ executor_run_lease_reaper (60s)"
+            "+ executor_run_lease_reaper (60s) "
+            "+ verification_run_worker_tick (30s) "
+            "+ verification_run_lease_reaper (60s)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
