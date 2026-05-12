@@ -469,22 +469,128 @@ def test_extract_actions_assigns_phase_from_roadmap_container():
     assert actions[0]["phase"] == "week_4_to_12"
 
 
-def test_extract_actions_skips_missing_lever_or_title():
+def test_extract_actions_requires_title_but_tolerates_missing_lever():
+    """Title is the only mandatory field — every action must be
+    human-presentable. Missing lever is tolerated (derived from
+    title keywords) because _generate_action_items emits
+    severity+title+body+evidence shaped dicts WITHOUT a lever, and
+    dropping all those silently was the action_plan_items=0 bug."""
     from services.audit_evidence_builder import extract_actions
     report = {
         "per_product": [{
             "product_key": "p-1",
             "action_items": [
-                {"lever": "sitemap_hygiene"},  # no title
-                {"title": "X"},  # no lever
-                {"lever": "", "title": ""},
+                {"lever": "sitemap_hygiene"},   # no title → dropped
+                {"title": "Index your canonical PDPs"},  # no lever → derived
+                {"lever": "", "title": ""},     # both empty → dropped
                 {"lever": "content_creation", "title": "OK"},
             ],
         }],
     }
     actions = extract_actions(report)
+    titles = [a["title"] for a in actions]
+    assert "Index your canonical PDPs" in titles, (
+        "Action with title but no explicit lever must be kept — "
+        "lever should be derived from title keywords"
+    )
+    assert "OK" in titles
+    assert len(actions) == 2
+    # The lever-less action got "indexing_acceleration" via keyword
+    # match on "Index" / "canonical PDPs".
+    by_title = {a["title"]: a for a in actions}
+    assert by_title["Index your canonical PDPs"]["lever"] == "indexing_acceleration"
+
+
+def test_extract_actions_reads_from_merchant_view_actions():
+    """build_structured_report's unified merged list lives at
+    per_product[*].merchant_view.actions. Before this fix,
+    extract_actions only read from per_product[*].action_items,
+    which build_structured_report no longer populates — every
+    Gate 5 production audit observed action_plan_items=0 as a
+    result. This test pins the merchant_view.actions path so the
+    extractor doesn't silently regress to the legacy-only shape."""
+    from services.audit_evidence_builder import extract_actions
+    report = {
+        "per_product": [{
+            "product_key": "p-1",
+            "merchant_view": {
+                "actions": [
+                    {
+                        "severity": "critical",
+                        "title": "Submit sitemap to Search Console",
+                        "body": "Indexing acceleration body",
+                    },
+                    {
+                        "severity": "high",
+                        "title": "Pitch to editorial publishers",
+                        "owner": "merchant_brand_team",
+                        "kpi_to_track": "publisher_citations",
+                    },
+                ],
+            },
+        }],
+    }
+    actions = extract_actions(report)
+    titles = sorted(a["title"] for a in actions)
+    assert titles == [
+        "Pitch to editorial publishers",
+        "Submit sitemap to Search Console",
+    ]
+    # Derived levers from title keywords:
+    by_title = {a["title"]: a for a in actions}
+    assert by_title[
+        "Submit sitemap to Search Console"
+    ]["lever"] == "indexing_acceleration"
+    assert by_title[
+        "Pitch to editorial publishers"
+    ]["lever"] == "editorial_outreach"
+    # PR-8b owner/kpi propagate:
+    assert by_title[
+        "Pitch to editorial publishers"
+    ]["owner"] == "merchant_brand_team"
+    assert by_title[
+        "Pitch to editorial publishers"
+    ]["kpi_to_track"] == "publisher_citations"
+
+
+def test_extract_actions_dedupes_between_merchant_view_and_legacy_action_items():
+    """When both per_product[*].merchant_view.actions AND the legacy
+    per_product[*].action_items contain the same (lever, title), we
+    keep only one. Real audits have both populated in some cases
+    because builders write to both during the migration window."""
+    from services.audit_evidence_builder import extract_actions
+    duplicate_action = {
+        "lever": "content_creation",
+        "title": "Same Action",
+    }
+    report = {
+        "per_product": [{
+            "product_key": "p-1",
+            "merchant_view": {"actions": [duplicate_action]},
+            "action_items": [duplicate_action],
+        }],
+    }
+    actions = extract_actions(report)
     assert len(actions) == 1
-    assert actions[0]["title"] == "OK"
+
+
+def test_normalize_action_default_lever_for_unmatched_title():
+    """When title doesn't match any keyword group, lever falls back
+    to general_recommendation rather than dropping the action."""
+    from services.audit_evidence_builder import extract_actions
+    report = {
+        "per_product": [{
+            "product_key": "p-1",
+            "merchant_view": {
+                "actions": [
+                    {"title": "Some unrecognizable advice"},
+                ],
+            },
+        }],
+    }
+    actions = extract_actions(report)
+    assert len(actions) == 1
+    assert actions[0]["lever"] == "general_recommendation"
 
 
 def test_extract_actions_drops_invalid_phase_values():
