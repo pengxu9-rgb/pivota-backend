@@ -355,6 +355,34 @@ async def _process_one_audit_run_inner(
                     "run_id=%s: %s", run_id, exc,
                 )
 
+            # P5.7: enqueue verification_runs (one per
+            # (product_key, verifier_id) tuple). The
+            # verification_run_worker drains these on its 30s tick.
+            # public_llm_citation_movement rows get not_before set
+            # to 30 days from now (P5.6). Best-effort.
+            try:
+                from services.audit_verification_enqueuer import (
+                    enqueue_verifications_for_completed_audit,
+                )
+                from datetime import datetime as _dt, timezone as _tz
+                verify_summary = (
+                    await enqueue_verifications_for_completed_audit(
+                        audit_run_id=run_id,
+                        merchant_id=merchant_id,
+                        product_keys=product_keys,
+                        completed_at=_dt.now(_tz.utc),
+                    )
+                )
+                logger.info(
+                    "audit_run_worker: verifications enqueued "
+                    "for run_id=%s: %s", run_id, verify_summary,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "audit_run_worker: verification enqueue raised "
+                    "for run_id=%s: %s", run_id, exc,
+                )
+
         logger.info(
             "audit_run_worker: completed run_id=%s merchant=%s",
             run_id, merchant_id,

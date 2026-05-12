@@ -71,6 +71,12 @@ class _VerifAccessors:
 def _patch_worker_deps(
     monkeypatch, *, claim_payload, registry_overrides=None,
 ):
+    """Patch the worker's DB accessors + verifier lookup. We
+    monkey-patch _lookup_verifier rather than touching
+    _verifier_registry directly so the global registry (populated
+    by services.verifiers at import time) isn't polluted across
+    tests — a real production verifier registered by import
+    side-effect must remain available to other tests."""
     from db import audit_evidence as ae
     from services import verification_run_worker as worker
 
@@ -92,32 +98,15 @@ def _patch_worker_deps(
         accessors.mark_verification_failed_with_retry,
     )
 
-    # Replace the global registry with controlled state. Snapshot
-    # what was there + restore on teardown.
-    original_registry = dict(worker._verifier_registry)
+    # Test-local registry. _lookup_verifier reads from this
+    # controlled dict; the real _verifier_registry is left
+    # untouched.
+    test_registry = dict(registry_overrides or {})
 
-    def restore_registry():
-        worker._verifier_registry.clear()
-        worker._verifier_registry.update(original_registry)
+    def fake_lookup(verifier_id):
+        return test_registry.get(verifier_id)
 
-    worker._verifier_registry.clear()
-    if registry_overrides:
-        worker._verifier_registry.update(registry_overrides)
-    monkeypatch.undo  # keep ref; pytest cleans on test teardown
-    # Use monkeypatch.setattr with a setter that restores via finalizer
-    # — simpler: register a finalizer.
-    import inspect
-    request = None
-    # Find the test's request fixture by walking the stack — instead
-    # of that gymnastic, use monkeypatch's own restore for the
-    # module-level dict by saving it as an attribute pre-test and
-    # registering the restore in monkeypatch.
-    monkeypatch.setattr(
-        worker, "_verifier_registry",
-        dict(worker._verifier_registry),
-    )
-    # The setattr above replaced the global with a new dict; restore
-    # to the original `original_registry` after test.
+    monkeypatch.setattr(worker, "_lookup_verifier", fake_lookup)
     return accessors
 
 
@@ -322,9 +311,13 @@ async def test_unknown_verifier_marks_blocked_to_avoid_loop(
 async def test_registry_replace_does_not_raise(monkeypatch):
     """register_verifier must tolerate replacement (tests do this
     via monkey-patch). The replacement is logged at debug, not
-    warning, to avoid noise."""
+    warning, to avoid noise.
+
+    Cleans up the test registration at teardown so the global
+    registry isn't polluted for sibling tests (P5.7's drift test
+    asserts the registered-set matches VERIFIER_SPECS exactly)."""
     from services.verification_run_worker import (
-        register_verifier, VerifierResult,
+        _verifier_registry, register_verifier, VerifierResult,
     )
 
     async def v1(ctx):
@@ -333,8 +326,12 @@ async def test_registry_replace_does_not_raise(monkeypatch):
     async def v2(ctx):
         return VerifierResult(status="failed")
 
-    register_verifier("test_verifier_xyz", v1)
-    register_verifier("test_verifier_xyz", v2)  # replacement; OK
+    key = "test_verifier_xyz_for_replacement_check"
+    register_verifier(key, v1)
+    register_verifier(key, v2)  # replacement; OK
+
+    # Clean up so the drift test stays clean
+    _verifier_registry.pop(key, None)
 
 
 def test_verifier_result_default_evidence_is_none():
