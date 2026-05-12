@@ -799,6 +799,48 @@ async def insert_verification_run(
         return None
 
 
+def _json_safe(value: Any) -> Any:
+    """Recursively coerce asyncpg-native Python types into JSON-safe
+    primitives. Without this, projection payloads built from DB rows
+    fail at JSONB serialization with errors like:
+        Object of type UUID is not JSON serializable
+
+    Handles the three types asyncpg returns that stdlib json.dumps
+    rejects:
+      - uuid.UUID         → str (canonical hex form)
+      - datetime/date     → ISO 8601 string
+      - decimal.Decimal   → float (precision loss accepted; projections
+                            are presentational, not source-of-truth)
+
+    Walks dict/list/tuple/set recursively. Pass-through for str/int/
+    float/bool/None. Anything else falls through unchanged — if a
+    builder ever returns a custom dataclass, the serialization error
+    will surface at the JSONB boundary as it does today, but UUIDs
+    (the common case in P4/P5 audit-row pass-through) are now safe.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    # Imported lazily — datetime.date is parent of datetime; check
+    # AFTER datetime so isoformat keeps time component for datetimes.
+    from datetime import date as _date
+    if isinstance(value, _date):
+        return value.isoformat()
+    from decimal import Decimal
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 async def upsert_projection(
     *,
     audit_run_id: str,
@@ -822,6 +864,13 @@ async def upsert_projection(
             "upsert_projection: unknown audience %r — accepting",
             audience,
         )
+    # Coerce UUID / datetime / Decimal to JSON-safe primitives before
+    # asyncpg hands the payload to json.dumps for JSONB storage.
+    # employee_bd in particular pass-throughs DB rows that include
+    # evidence_id / finding_id / action_id (all UUID columns); without
+    # this, that projection fails with "Object of type UUID is not
+    # JSON serializable" and never persists. See PR-projection-uuid-fix.
+    safe_payload = _json_safe(payload)
     projection_id = str(uuid.uuid4())
     now = _now_utc()
     try:
@@ -831,7 +880,7 @@ async def upsert_projection(
                 audit_run_id=audit_run_id,
                 merchant_id=merchant_id,
                 audience=audience,
-                payload_jsonb=payload,
+                payload_jsonb=safe_payload,
                 builder_version=builder_version,
                 built_at=now,
             )
@@ -849,7 +898,7 @@ async def upsert_projection(
                 )
                 .values(
                     merchant_id=merchant_id,
-                    payload_jsonb=payload,
+                    payload_jsonb=safe_payload,
                     builder_version=builder_version,
                     built_at=now,
                 )
