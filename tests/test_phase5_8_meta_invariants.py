@@ -390,3 +390,64 @@ def test_worker_modules_have_no_unresolvable_internal_imports():
         "actually executes in test). Fix the import path:\n  "
         + "\n  ".join(problems)
     )
+
+
+# =====================================================================
+# 8. SQLAlchemy text() vs PostgreSQL `::cast` collision
+# =====================================================================
+
+
+def test_no_param_double_colon_cast_in_raw_sql():
+    """SQLAlchemy text() parameter parser reads `:name` as a bound
+    parameter. PostgreSQL's `::type` cast operator looks like a
+    continuation of the parameter name to that parser, so
+    `:patch::jsonb` is parsed as a SINGLE parameter named
+    'patch:jsonb' instead of `:patch` + `::jsonb` cast.
+
+    The bug: SQLAlchemy then can't resolve 'patch' to the provided
+    bound parameter, and raises:
+        This text() construct doesn't define a bound parameter
+        named 'patch'
+
+    record_partial_result (db/merchant_audit_runs.py) shipped with
+    this exact pattern, breaking partial_result writes silently in
+    prod (lifecycle's best-effort try/except swallowed the error).
+    Gate 5 of the deploy validation pipeline caught it on run
+    52b789f2-98e2-4799-968b-88ad0d50279c.
+
+    The codebase already has the correct pattern at 6+ other sites:
+    `CAST(:param AS JSONB)`. This meta-test fails if anyone reintro-
+    duces `:param::type` in production SQL.
+    """
+    pattern = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)::([a-zA-Z_]+)")
+    problems = []
+    for root in ("db", "services"):
+        for py_file in (_REPO_ROOT / root).rglob("*.py"):
+            text = py_file.read_text()
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                # Skip lines that are obviously not SQL (imports,
+                # type hints, docstrings/comments). The bug only
+                # manifests inside strings passed to database.execute
+                # / text() / similar — so require the colon-cast to
+                # appear in a string-literal context. Heuristic: line
+                # contains a quote AND the pattern.
+                if '"' not in line and "'" not in line:
+                    continue
+                if line.lstrip().startswith("#"):
+                    continue
+                m = pattern.search(line)
+                if m is None:
+                    continue
+                problems.append(
+                    f"{py_file.relative_to(_REPO_ROOT)}:{lineno} — "
+                    f"`:{m.group(1)}::{m.group(2)}` "
+                    f"breaks SQLAlchemy text() parser. "
+                    f"Use `CAST(:{m.group(1)} AS {m.group(2).upper()})` "
+                    f"instead. (line: {line.strip()[:120]})"
+                )
+
+    assert not problems, (
+        "Production SQL contains `:param::type` PostgreSQL-cast "
+        "syntax that breaks SQLAlchemy text() parameter binding:\n  "
+        + "\n  ".join(problems)
+    )
