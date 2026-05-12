@@ -263,14 +263,46 @@ async def _process_one_audit_run_inner(
                 return True
             current_stage = mar.STAGE_VERIFYING
 
-        # ----- verifying: co-occurrence + GSC URL submission -----
+        # ----- verifying: co-occurrence + GSC URL submission +
+        # P4.3 shadow-write evidence_items + readiness_findings -----
         if current_stage == mar.STAGE_VERIFYING and brand_report is not None:
+            # P4.3: derive canonical evidence + findings from the
+            # brand_report and persist into the new tables. Best-
+            # effort — failures inside the builder don't poison the
+            # rest of verifying. Phase 6 will retire the legacy
+            # report_jsonb once consumers migrate.
+            try:
+                from services.audit_evidence_builder import (
+                    persist_canonical_evidence,
+                )
+                canonical_summary = await persist_canonical_evidence(
+                    audit_run_id=run_id, brand_report=brand_report,
+                )
+                logger.info(
+                    "audit_run_worker: canonical evidence persisted "
+                    "for run_id=%s: %s", run_id, canonical_summary,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "audit_run_worker: persist_canonical_evidence "
+                    "raised for run_id=%s: %s", run_id, exc,
+                )
+                canonical_summary = {
+                    "evidence_items_inserted": 0,
+                    "findings_inserted": 0,
+                    "error": str(exc)[:200],
+                }
+
             verify_summary = await _run_verifiers(
                 merchant_id=merchant_id,
                 run_id=run_id,
                 brand_report=brand_report,
                 merchant_name=merchant_name,
             )
+            # P4.3: surface canonical-evidence write counts in the
+            # verifying partial_result so GET /api/audits/{id} can
+            # show whether the shadow-write succeeded.
+            verify_summary["canonical_evidence"] = canonical_summary
             await mar.record_partial_result(
                 run_id=run_id, worker_id=WORKER_ID,
                 partial_result_jsonb={"verifying": verify_summary},
