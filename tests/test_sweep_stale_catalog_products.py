@@ -59,6 +59,9 @@ def test_find_stale_sql_only_targets_live_rows() -> None:
     # tz-aware. SQL casts via AT TIME ZONE 'UTC' so asyncpg doesn't
     # error on mixed comparison (regression fix 2026-05-12).
     assert "created_at < (:stale_before AT TIME ZONE 'UTC')" in sql
+    # Codex review 2026-05-12 P0: scope by platform so a Shopify
+    # presence-refresh doesn't tombstone Wix/manual rows.
+    assert "AND platform = :platform" in sql
 
 
 def test_find_archive_sql_only_targets_stale_rows() -> None:
@@ -67,6 +70,26 @@ def test_find_archive_sql_only_targets_stale_rows() -> None:
     same way as created_at (regression fix 2026-05-12)."""
     sql = sweep.FIND_ARCHIVE_SQL
     assert "sync_status = 'stale'" in sql
+    assert "updated_at < (:archive_before AT TIME ZONE 'UTC')" in sql
+    # Codex review 2026-05-12 P0: platform-scoped archive transition
+    # mirrors the stale transition.
+    assert "AND platform = :platform" in sql
+
+
+def test_update_to_stale_sql_reasserts_stale_predicate() -> None:
+    """Codex review 2026-05-12 P1: UPDATE must re-check the stale
+    predicate to avoid clobbering a row whose last_seen_in_sync_at
+    was bumped by a concurrent presence-refresh between SELECT and
+    UPDATE. Without this, the sweep could tombstone freshly-live rows."""
+    sql = sweep.UPDATE_TO_STALE_SQL
+    # Stale predicate present in the UPDATE WHERE, not just SELECT
+    assert "last_seen_in_sync_at < :stale_before" in sql
+    assert "created_at < (:stale_before AT TIME ZONE 'UTC')" in sql
+
+
+def test_update_to_archived_sql_reasserts_archive_predicate() -> None:
+    """Same race-safety guarantee for the stale → archived transition."""
+    sql = sweep.UPDATE_TO_ARCHIVED_SQL
     assert "updated_at < (:archive_before AT TIME ZONE 'UTC')" in sql
 
 
@@ -87,6 +110,7 @@ def _ns(**kw) -> SimpleNamespace:
     base = {
         "apply": False, "merchant_id": None,
         "grace_hours": 24, "archive_days": 7,
+        "platform": "shopify",
     }
     base.update(kw)
     return SimpleNamespace(**base)

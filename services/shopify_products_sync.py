@@ -379,6 +379,19 @@ async def refresh_merchant_presence(
         if not next_token:
             break
         page_token = next_token
+    else:
+        # Loop exited via `pages < max_pages` becoming false WITHOUT
+        # hitting the `if not next_token: break` exit. We capped before
+        # exhausting the cursor — Shopify still has more products
+        # downstream. Mark truncated; do NOT bump last_full_sync_at
+        # below. If we did, the sweep would tombstone the un-scanned
+        # tail (products beyond page max_pages would have stale
+        # last_seen_in_sync_at and the sweep would archive them).
+        # Caught by codex review 2026-05-12: silent data loss risk
+        # at scale (≥max_pages × per_page products).
+        if page_token is not None:
+            truncated = True
+            truncated_reason = "max_pages_reached_with_more_pages_available"
 
     # Bump last_seen_in_sync_at + sync_status for matching rows. Done
     # in chunks because asyncpg's parameter limit caps array binds
@@ -410,11 +423,30 @@ async def refresh_merchant_presence(
                     {"merchant_id": merchant_id, "ids": chunk},
                 )
                 rows_touched += len(returned or [])
-            # Always bump last_full_sync_at — even if 0 rows matched,
-            # this records "we successfully reached Shopify and listed
-            # products" so the sweep can run. If live_ids is empty
-            # (merchant deleted everything), the sweep correctly
-            # tombstones all existing rows.
+            # Bump last_full_sync_at ONLY when the scan was complete.
+            # Truncated scans (max_pages exhausted with more pages
+            # available) MUST NOT bump — the sweep would otherwise
+            # tombstone the un-scanned tail of the catalog. Caught by
+            # codex review 2026-05-12.
+            if not truncated:
+                await database.execute(
+                    """
+                    UPDATE catalog_merchants
+                    SET last_full_sync_at = NOW(),
+                        updated_at = NOW()
+                    WHERE merchant_id = :merchant_id
+                    """,
+                    {"merchant_id": merchant_id},
+                )
+    else:
+        # No live IDs returned. Two cases:
+        #   (a) merchant deleted everything — empty Shopify catalog,
+        #       sweep should tombstone all existing rows. Bump.
+        #   (b) scan errored before any product was fetched — but in
+        #       that case we'd have raised above, so we wouldn't reach
+        #       here. So this branch always means (a).
+        # Still gated on `not truncated` for symmetry / safety.
+        if not truncated:
             await database.execute(
                 """
                 UPDATE catalog_merchants
@@ -424,19 +456,6 @@ async def refresh_merchant_presence(
                 """,
                 {"merchant_id": merchant_id},
             )
-    else:
-        # No live IDs returned. Still bump last_full_sync_at — we did
-        # reach Shopify; an empty result is itself a signal the sweep
-        # should act on.
-        await database.execute(
-            """
-            UPDATE catalog_merchants
-            SET last_full_sync_at = NOW(),
-                updated_at = NOW()
-            WHERE merchant_id = :merchant_id
-            """,
-            {"merchant_id": merchant_id},
-        )
 
     return {
         "merchant_id": merchant_id,

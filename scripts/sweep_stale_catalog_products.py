@@ -83,6 +83,15 @@ SELECT_MERCHANTS_SQL = """
 #       Clear signal: this row was supposed to appear in the recent
 #       sync but didn't. Upstream deleted it.
 #
+# Platform scope (codex review 2026-05-12 P0): catalog_merchants.
+# last_full_sync_at is currently a per-merchant timestamp, but
+# refresh_merchant_presence only refreshes Shopify rows. If a merchant
+# has mixed-platform rows (Shopify + Wix + manual), a Shopify refresh
+# would falsely tombstone the others because their
+# last_seen_in_sync_at stays old. Filter the sweep to the platform
+# whose presence-refresh actually ran. Default 'shopify' since that's
+# the only platform with a refresh path today; --platform overrides.
+#
 # Timezone note: last_seen_in_sync_at is TIMESTAMPTZ (mig 084) while
 # created_at is plain TIMESTAMP (predates tz-aware columns in this
 # repo). asyncpg can't bind one parameter against both types in a
@@ -99,6 +108,7 @@ FIND_STALE_SQL = """
            created_at
     FROM catalog_products
     WHERE merchant_id = :merchant_id
+      AND platform = :platform
       AND sync_status = 'live'
       AND (
         (last_seen_in_sync_at IS NOT NULL
@@ -119,6 +129,7 @@ FIND_ARCHIVE_SQL = """
     SELECT product_key, updated_at
     FROM catalog_products
     WHERE merchant_id = :merchant_id
+      AND platform = :platform
       AND sync_status = 'stale'
       AND updated_at < (:archive_before AT TIME ZONE 'UTC')
 """
@@ -130,6 +141,13 @@ UPDATE_TO_STALE_SQL = """
         updated_at = NOW()
     WHERE product_key = :product_key
       AND sync_status = 'live'
+      AND (
+        (last_seen_in_sync_at IS NOT NULL
+         AND last_seen_in_sync_at < :stale_before)
+        OR
+        (last_seen_in_sync_at IS NULL
+         AND created_at < (:stale_before AT TIME ZONE 'UTC'))
+      )
 """
 
 
@@ -139,6 +157,7 @@ UPDATE_TO_ARCHIVED_SQL = """
         updated_at = NOW()
     WHERE product_key = :product_key
       AND sync_status = 'stale'
+      AND updated_at < (:archive_before AT TIME ZONE 'UTC')
 """
 
 
@@ -149,6 +168,7 @@ async def _sweep_merchant(
     grace_hours: int,
     archive_days: int,
     apply: bool,
+    platform: str = "shopify",
 ) -> Dict[str, Any]:
     """Sweep one merchant. Returns counters + sample rows."""
     # GRACE_HOURS before last_full_sync_at is the "stale" threshold.
@@ -174,11 +194,11 @@ async def _sweep_merchant(
 
     stale_candidates = await database.fetch_all(
         FIND_STALE_SQL,
-        {"merchant_id": merchant_id, "stale_before": stale_before},
+        {"merchant_id": merchant_id, "platform": platform, "stale_before": stale_before},
     )
     archive_candidates = await database.fetch_all(
         FIND_ARCHIVE_SQL,
-        {"merchant_id": merchant_id, "archive_before": archive_before},
+        {"merchant_id": merchant_id, "platform": platform, "archive_before": archive_before},
     )
 
     stale_count = 0
@@ -193,7 +213,14 @@ async def _sweep_merchant(
         if not apply:
             stale_count += 1
             continue
-        rc = await database.execute(UPDATE_TO_STALE_SQL, {"product_key": row_dict["product_key"]})
+        # UPDATE re-asserts the stale predicate so a concurrent
+        # presence-refresh between SELECT and UPDATE can't clobber a
+        # row that's just been bumped back to live. Codex review
+        # 2026-05-12 P1.
+        rc = await database.execute(
+            UPDATE_TO_STALE_SQL,
+            {"product_key": row_dict["product_key"], "stale_before": stale_before},
+        )
         if rc is None or rc:
             stale_count += 1
 
@@ -204,12 +231,16 @@ async def _sweep_merchant(
         if not apply:
             archived_count += 1
             continue
-        rc = await database.execute(UPDATE_TO_ARCHIVED_SQL, {"product_key": row_dict["product_key"]})
+        rc = await database.execute(
+            UPDATE_TO_ARCHIVED_SQL,
+            {"product_key": row_dict["product_key"], "archive_before": archive_before},
+        )
         if rc is None or rc:
             archived_count += 1
 
     return {
         "merchant_id": merchant_id,
+        "platform": platform,
         "last_full_sync_at": last_full_sync_at.isoformat(),
         "stale_threshold_before": stale_before.isoformat(),
         "marked_stale": stale_count,
@@ -243,6 +274,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
             grace_hours=args.grace_hours,
             archive_days=args.archive_days,
             apply=args.apply,
+            platform=args.platform,
         )
         per_merchant.append(result)
         if "marked_stale" in result:
@@ -280,6 +312,13 @@ def _parse_args() -> argparse.Namespace:
         "--archive-days", type=int, default=7,
         help="Stale rows older than this many days become 'archived' (out of recall, "
         "kept for redirect). Default 7.",
+    )
+    p.add_argument(
+        "--platform", type=str, default="shopify",
+        help="Platform to sweep. Sweep tombstones rows of this platform only — "
+        "refresh_merchant_presence today only refreshes Shopify, so a sweep across "
+        "all platforms would falsely tombstone Wix/manual rows that never participated "
+        "in the refresh. Default 'shopify'. Codex review 2026-05-12 P0.",
     )
     return p.parse_args()
 

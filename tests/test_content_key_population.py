@@ -81,6 +81,58 @@ def test_path_c_pdp_insert_uses_gtin_when_present() -> None:
     assert expected != no_gtin
 
 
+def test_path_c_build_pdp_payload_propagates_gtin_from_jsonl() -> None:
+    """Codex review 2026-05-12 P0: _build_pdp_payload had been dropping
+    the gtin field entirely, even though _build_pdp_insert reads it for
+    content_key derivation. A JSONL record with a real GTIN would
+    silently land as a no-GTIN content_key, diverging from Path A's
+    GTIN-included key for the same product."""
+    from services.catalog_enrichment_agent.ingestion import _build_pdp_payload
+
+    record = {
+        "pdp": {
+            "brand": "MAC",
+            "product_name": "Lipstick Russian Red",
+            "gtin": "0773602443796",
+            "category_path": "Beauty/Makeup/Lips",
+        }
+    }
+    payload = _build_pdp_payload(record)
+    assert payload.get("gtin") == "0773602443796"
+
+
+def test_path_c_build_pdp_payload_also_accepts_barcode_alias() -> None:
+    """Some upstream JSONLs use 'barcode' instead of 'gtin' (matches
+    Shopify's StandardProduct convention). Accept either; gtin takes
+    precedence if both are set."""
+    from services.catalog_enrichment_agent.ingestion import _build_pdp_payload
+
+    record_barcode = {
+        "pdp": {
+            "brand": "X", "product_name": "Y",
+            "barcode": "0773602443796",
+        }
+    }
+    assert _build_pdp_payload(record_barcode).get("gtin") == "0773602443796"
+
+    record_both = {
+        "pdp": {
+            "brand": "X", "product_name": "Y",
+            "gtin": "real_gtin", "barcode": "fallback",
+        }
+    }
+    assert _build_pdp_payload(record_both).get("gtin") == "real_gtin"
+
+
+def test_path_c_build_pdp_payload_returns_none_gtin_when_neither_field_set() -> None:
+    """No gtin and no barcode → None, not empty string. Lets
+    make_content_key cleanly skip the GTIN segment."""
+    from services.catalog_enrichment_agent.ingestion import _build_pdp_payload
+
+    record = {"pdp": {"brand": "X", "product_name": "Y"}}
+    assert _build_pdp_payload(record).get("gtin") is None
+
+
 def test_make_content_key_returns_none_when_brand_or_title_missing() -> None:
     """Contract check — no brand or no title → None. The writer binds
     NULL into the INSERT. Stage 1 partial index excludes NULLs."""

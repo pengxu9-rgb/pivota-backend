@@ -317,3 +317,52 @@ async def test_refresh_presence_respects_max_pages_cap(monkeypatch) -> None:
     out = await refresh_merchant_presence(merchant_id="m", max_pages=3)
     assert out["pages_fetched"] == 3
     assert out["live_ids_fetched"] == 3
+
+
+@pytest.mark.asyncio
+async def test_refresh_presence_marks_truncated_and_skips_last_full_sync_bump(monkeypatch) -> None:
+    """Codex review 2026-05-12 P0: hitting max_pages with more pages
+    available is a TRUNCATED scan, not a complete one. Bumping
+    last_full_sync_at would let the sweep tombstone the un-scanned
+    tail of the catalog. After fix: truncated=True, no UPDATE on
+    catalog_merchants."""
+    executed: List[Dict[str, Any]] = []
+    _install_fake_db(monkeypatch, executed=executed)
+    _install_fake_credentials(monkeypatch, creds={"shop_domain": "x", "access_token": "x"})
+    # Three pages, each returns a non-None next_token → we'd keep going
+    # forever. max_pages=3 forces a cap with cursor still active.
+    _install_fake_fetcher(monkeypatch, [
+        ([_FakeStandardProduct(product_id=f"p{i}")], f"cur_{i+1}", None)
+        for i in range(5)
+    ])
+
+    out = await refresh_merchant_presence(merchant_id="m_huge", max_pages=3)
+    assert out["truncated"] is True
+    assert out["truncated_reason"] == "max_pages_reached_with_more_pages_available"
+    # catalog_merchants.last_full_sync_at must NOT have been bumped
+    cm_updates = [e for e in executed if "UPDATE catalog_merchants" in e["sql"]]
+    assert cm_updates == []
+    # The catalog_products UPDATE for in-window IDs still happens —
+    # the scanned subset IS live, we just can't conclude the unscanned
+    # tail is stale.
+    cp_updates = [e for e in executed if "UPDATE catalog_products" in e["sql"]]
+    assert len(cp_updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_presence_complete_scan_still_bumps_last_full_sync(monkeypatch) -> None:
+    """Inverse of the truncation test: when the cursor exhausts before
+    max_pages, the scan IS complete and last_full_sync_at MUST bump
+    so the sweep can run."""
+    executed: List[Dict[str, Any]] = []
+    _install_fake_db(monkeypatch, executed=executed)
+    _install_fake_credentials(monkeypatch, creds={"shop_domain": "x", "access_token": "x"})
+    _install_fake_fetcher(monkeypatch, [
+        ([_FakeStandardProduct(product_id="p1")], "cur_2", None),
+        ([_FakeStandardProduct(product_id="p2")], None, None),  # cursor done
+    ])
+
+    out = await refresh_merchant_presence(merchant_id="m_small", max_pages=10)
+    assert out["truncated"] is False
+    cm_updates = [e for e in executed if "UPDATE catalog_merchants" in e["sql"]]
+    assert len(cm_updates) == 1  # bumped once
