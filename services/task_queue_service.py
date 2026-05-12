@@ -128,6 +128,13 @@ async def materialize_tasks_from_audit(
     materialized = 0
     skipped_pitch = 0
     failures = 0
+    # P5.8.3: track which canonical action_plan_items each
+    # materialized task corresponds to, so the worker can call
+    # link_action_to_task and populate action_plan_items.
+    # materialized_task_id. Without this the canonical field
+    # stays permanently NULL and the merchant-portal task→action
+    # join breaks.
+    links_established = 0
     for action in actions:
         if cold_start and action.get("lever") in _PITCH_ONLY_LEVERS:
             skipped_pitch += 1
@@ -143,20 +150,93 @@ async def materialize_tasks_from_audit(
         )
         if task_id:
             materialized += 1
+            # Find the canonical action_plan_items row for this
+            # (audit_run, lever, title) and link the task back.
+            # Match is best-effort: if extract_actions didn't emit
+            # a canonical row (e.g., title drift), the link is
+            # skipped silently — better to materialize the task
+            # than to block on a missing link.
+            try:
+                ok = await _link_task_to_canonical_action(
+                    audit_run_id=audit_run_id,
+                    lever=action.get("lever"),
+                    title=action.get("title"),
+                    task_id=task_id,
+                )
+                if ok:
+                    links_established += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "task_queue: link_action_to_task raised for "
+                    "task=%s: %s", task_id, str(exc)[:200],
+                )
         else:
             failures += 1
 
     logger.info(
-        "task_queue: audit=%s merchant=%s materialized=%d skipped_pitch=%d failures=%d",
-        audit_run_id, merchant_id, materialized, skipped_pitch, failures,
+        "task_queue: audit=%s merchant=%s materialized=%d "
+        "links=%d skipped_pitch=%d failures=%d",
+        audit_run_id, merchant_id, materialized, links_established,
+        skipped_pitch, failures,
     )
     return {
         "audit_run_id": audit_run_id,
         "materialized": materialized,
+        "links_established": links_established,
         "skipped_pitch_only": skipped_pitch,
         "failures": failures,
         "action_items_total": len(actions),
     }
+
+
+async def _link_task_to_canonical_action(
+    *,
+    audit_run_id: str,
+    lever: Optional[str],
+    title: Optional[str],
+    task_id: str,
+) -> bool:
+    """P5.8.3 helper: find the canonical action_plan_items row that
+    corresponds to this task and call link_action_to_task. Returns
+    True on link, False when no match (e.g., extract_actions
+    dropped the action via dedup or title drift)."""
+    if not lever or not title or not task_id or not audit_run_id:
+        return False
+    try:
+        from db.audit_evidence import (
+            action_plan_items, link_action_to_task,
+        )
+        from db.database import database
+        row = await database.fetch_one(
+            action_plan_items.select()
+            .where(
+                action_plan_items.c.audit_run_id == audit_run_id,
+                action_plan_items.c.lever == lever,
+                action_plan_items.c.title == title,
+            )
+            .limit(1)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "_link_task_to_canonical_action lookup raised for "
+            "audit=%s lever=%s: %s",
+            audit_run_id, lever, str(exc)[:200],
+        )
+        return False
+    if row is None:
+        return False
+    action_id = row[0] if hasattr(row, "__getitem__") else None
+    try:
+        from db.audit_evidence import link_action_to_task
+        return await link_action_to_task(
+            action_id=str(action_id), task_id=task_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "link_action_to_task call raised for action=%s task=%s: %s",
+            action_id, task_id, str(exc)[:200],
+        )
+        return False
 
 
 async def materialize_task_from_executor(
