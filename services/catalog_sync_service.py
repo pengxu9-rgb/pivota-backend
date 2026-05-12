@@ -38,6 +38,7 @@ from db.merchant_onboarding import merchant_onboarding
 from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
+from services.catalog_identity import make_content_key
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
@@ -693,6 +694,12 @@ async def ingest_standard_products(
                     "pivota_signature_id": pivota_fields["pivota_signature_id"],
                     "pivota_canonical_url": pivota_fields["pivota_canonical_url"],
                     "pivota_signature_minted_at": pivota_fields["pivota_signature_minted_at"],
+                    # Stage 1 of the PDP architecture roadmap (mig 083):
+                    # content-derived identity. Same physical product
+                    # across merchants/paths gets the same content_key,
+                    # which Stage 2 uses to auto-group product_group_members.
+                    # See services/catalog_identity.py + plan.
+                    "content_key": make_content_key(brand, product.title, product.barcode),
                     "freshness_json": {
                         "updated_at": product.updated_at.isoformat() if product.updated_at else None,
                         "observed_at": _utcnow().isoformat(),

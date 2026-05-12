@@ -1,0 +1,271 @@
+"""Tests for services/catalog_identity.py.
+
+These are the contract tests for Stage 1's identity layer. Every Stage
+2+ assumption (auto-grouping by content_key, agent_pdp_view keyed on
+it, recall layer preferring primary by content_key) depends on these
+properties holding stable:
+
+  - same brand + title + gtin → same key, always
+  - same brand + title + missing gtin → same key
+  - missing brand or title → None (don't create a deceptive key)
+  - normalization absorbs cosmetic variation (case, whitespace,
+    Inc/LLC, registered marks, diacritics)
+  - GTIN is normalized (strip non-digits) so "0773602443796" and
+    "773602443796" and "773-602-443796" all collide
+
+Failures here break the architecture roadmap. Be paranoid.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from services.catalog_identity import (  # noqa: E402
+    is_content_key,
+    make_content_key,
+    normalize_brand,
+    normalize_gtin,
+    normalize_title,
+)
+
+
+# ---------------------------------------------------------------------------
+# normalize_brand
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_brand_lowercases_and_trims() -> None:
+    assert normalize_brand("  Glow Recipe  ") == "glow recipe"
+
+
+def test_normalize_brand_strips_inc_llc_corp_suffixes() -> None:
+    """'Glow Recipe', 'Glow Recipe Inc.', 'Glow Recipe LLC' all
+    represent the same brand — must produce the same key."""
+    assert normalize_brand("Glow Recipe Inc.") == "glow recipe"
+    assert normalize_brand("Glow Recipe LLC") == "glow recipe"
+    assert normalize_brand("Glow Recipe Corp") == "glow recipe"
+    assert normalize_brand("Glow Recipe Co.") == "glow recipe"
+    assert normalize_brand("Glow Recipe Company") == "glow recipe"
+
+
+def test_normalize_brand_strips_registered_and_trademark_marks() -> None:
+    """Marks anywhere in the string get removed — both unicode glyphs
+    and ASCII forms."""
+    assert normalize_brand("Tylenol®") == "tylenol"
+    assert normalize_brand("Tide™") == "tide"
+    assert normalize_brand("Brand (R)") == "brand"
+    assert normalize_brand("Brand (TM)") == "brand"
+
+
+def test_normalize_brand_empty_or_none_is_empty_string() -> None:
+    """Empty inputs return '' — caller decides whether to use the key
+    at all. make_content_key returns None in this case."""
+    assert normalize_brand(None) == ""
+    assert normalize_brand("") == ""
+    assert normalize_brand("   ") == ""
+
+
+def test_normalize_brand_handles_non_string() -> None:
+    """Defensive — don't crash on int/dict."""
+    assert normalize_brand(123) == ""
+    assert normalize_brand({"x": 1}) == ""
+
+
+# ---------------------------------------------------------------------------
+# normalize_title
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_title_lowercases() -> None:
+    assert normalize_title("Plum Plump Hyaluronic Serum") == "plum plump hyaluronic serum"
+
+
+def test_normalize_title_strips_diacritics() -> None:
+    """'Crème' and 'Creme' are the same product surfaced with different
+    encoding. NFKD normalize + drop combining marks unifies them."""
+    assert normalize_title("Crème de la Mer") == normalize_title("Creme de la Mer")
+
+
+def test_normalize_title_keeps_hyphens_drops_other_punctuation() -> None:
+    """Hyphens are identity-bearing ('Anti-Aging' is a distinct phrase).
+    Apostrophes / commas / parens are cosmetic — strip."""
+    out = normalize_title("Anti-Aging Cream, Original (NEW!)")
+    assert "anti-aging" in out  # hyphen kept
+    assert "," not in out
+    assert "(" not in out
+    assert "!" not in out
+
+
+def test_normalize_title_keeps_digits_and_units() -> None:
+    """Size IS identity — 30ml vs 50ml are different products. Don't
+    strip numbers or unit letters."""
+    out = normalize_title("Lipstick 3.5g")
+    assert "3" in out and "5" in out and "g" in out
+
+
+def test_normalize_title_collapses_internal_whitespace() -> None:
+    assert normalize_title("foo   bar  baz") == "foo bar baz"
+
+
+def test_normalize_title_empty_or_none_is_empty() -> None:
+    assert normalize_title(None) == ""
+    assert normalize_title("") == ""
+    assert normalize_title("   ") == ""
+
+
+# ---------------------------------------------------------------------------
+# normalize_gtin
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_gtin_canonicalizes_to_14_digit_form() -> None:
+    """GS1 canonical form is GTIN-14 — UPC-A (12), EAN-13 (13), and
+    GTIN-14 all left-pad to 14 digits with leading zeros. Separators
+    stripped. After normalize, the same physical product's GTIN
+    matches regardless of which form the source data uses."""
+    # UPC-A (12-digit) → GTIN-14
+    assert normalize_gtin("773602443796") == "00773602443796"
+    # GTIN-13 (13-digit) → GTIN-14
+    assert normalize_gtin("0773602443796") == "00773602443796"
+    # GTIN-14 (14-digit) → identity
+    assert normalize_gtin("00773602443796") == "00773602443796"
+    # Separators stripped, then padded
+    assert normalize_gtin("773-602-443796") == "00773602443796"
+    assert normalize_gtin("  773 602 443796  ") == "00773602443796"
+
+
+def test_normalize_gtin_passes_through_malformed_long_codes() -> None:
+    """15+ digit input is malformed (no standard GTIN is that long).
+    Pass through rather than truncate so we don't silently merge
+    unrelated codes."""
+    assert normalize_gtin("1" * 16) == "1" * 16
+
+
+def test_normalize_gtin_empty_or_none_is_empty() -> None:
+    assert normalize_gtin(None) == ""
+    assert normalize_gtin("") == ""
+
+
+# ---------------------------------------------------------------------------
+# make_content_key — the load-bearing function
+# ---------------------------------------------------------------------------
+
+
+def test_make_content_key_returns_none_on_empty_brand() -> None:
+    """Empty brand → None. We don't want every brand-less seed to
+    collide on the same key — that would defeat the whole purpose."""
+    assert make_content_key("", "title", "gtin") is None
+    assert make_content_key(None, "title", "gtin") is None
+    assert make_content_key("   ", "title", "gtin") is None
+
+
+def test_make_content_key_returns_none_on_empty_title() -> None:
+    """Same logic — empty title means no identity signal."""
+    assert make_content_key("brand", "", "gtin") is None
+    assert make_content_key("brand", None, "gtin") is None
+
+
+def test_make_content_key_returns_none_when_only_gtin_present() -> None:
+    """Brand + title are both required. GTIN alone isn't enough
+    because the same GTIN under different brand/title would be a data
+    quality bug we'd want to surface, not silently dedup."""
+    assert make_content_key("", "", "0773602443796") is None
+
+
+def test_make_content_key_format_is_ck_prefix_plus_32_hex() -> None:
+    """Pin the wire format — Stage 3 routes will dispatch on this
+    prefix shape."""
+    key = make_content_key("Brand", "Title")
+    assert key is not None
+    assert key.startswith("ck_")
+    assert len(key) == 35  # 'ck_' + 32 hex
+    assert all(c in "0123456789abcdef" for c in key[3:])
+
+
+def test_make_content_key_is_deterministic() -> None:
+    """Same inputs → same key, always. The whole architecture depends
+    on this."""
+    k1 = make_content_key("Glow Recipe", "Plum Plump Serum", "0123456789")
+    k2 = make_content_key("Glow Recipe", "Plum Plump Serum", "0123456789")
+    assert k1 == k2
+
+
+def test_make_content_key_normalizes_inputs() -> None:
+    """Cosmetic variation in brand/title doesn't change the key. This
+    is what makes Path A (Shopify) and Path B (external_seed) produce
+    the same key for the same physical product."""
+    a = make_content_key("Glow Recipe", "Plum Plump Hyaluronic Serum")
+    b = make_content_key("Glow Recipe Inc.", "PLUM PLUMP HYALURONIC SERUM")
+    c = make_content_key("  glow recipe  ", "Plum  Plump  Hyaluronic  Serum")
+    assert a == b == c
+
+
+def test_make_content_key_with_and_without_gtin_differ() -> None:
+    """The presence of a GTIN tightens identity. Same brand + title
+    with GTIN should be a DIFFERENT key from without GTIN — otherwise
+    we'd silently dedup pre-GTIN catalog rows with post-GTIN ones,
+    which is a real-world data integrity risk."""
+    without = make_content_key("Brand", "Title")
+    with_gtin = make_content_key("Brand", "Title", "0123456789")
+    assert without != with_gtin
+
+
+def test_make_content_key_different_gtins_produce_different_keys() -> None:
+    """Two products with the same brand + title but different GTINs
+    are different products (e.g. shade variants with their own GTINs)."""
+    k1 = make_content_key("MAC", "Lipstick", "0000000001")
+    k2 = make_content_key("MAC", "Lipstick", "0000000002")
+    assert k1 != k2
+
+
+def test_make_content_key_gtin_normalization_collapses_separators() -> None:
+    """Hyphens / spaces in GTIN shouldn't break dedup."""
+    k1 = make_content_key("MAC", "Lipstick", "0773602443796")
+    k2 = make_content_key("MAC", "Lipstick", "773-602-443796")
+    k3 = make_content_key("MAC", "Lipstick", "0773 602 443796")
+    assert k1 == k2 == k3
+
+
+def test_make_content_key_different_brand_same_title_differs() -> None:
+    """A product titled the same way under different brands isn't the
+    same physical product."""
+    a = make_content_key("Brand A", "Lipstick")
+    b = make_content_key("Brand B", "Lipstick")
+    assert a != b
+
+
+def test_make_content_key_different_title_same_brand_differs() -> None:
+    """Shade / size variants distinguished by title MUST get different
+    keys. Otherwise auto-grouping would over-merge."""
+    a = make_content_key("MAC", "Lipstick Russian Red")
+    b = make_content_key("MAC", "Lipstick Velvet Teddy")
+    assert a != b
+
+
+# ---------------------------------------------------------------------------
+# is_content_key
+# ---------------------------------------------------------------------------
+
+
+def test_is_content_key_recognizes_valid_keys() -> None:
+    """The Stage 3 endpoint needs to dispatch on id format. Pin the
+    recognition predicate so it can't drift."""
+    key = make_content_key("Brand", "Title")
+    assert is_content_key(key) is True
+
+
+def test_is_content_key_rejects_other_id_formats() -> None:
+    """sig_*, ext_*, raw IDs, and garbage all return False."""
+    assert is_content_key("sig_abc123") is False
+    assert is_content_key("ext_abc123") is False
+    assert is_content_key("12345678") is False
+    assert is_content_key("") is False
+    assert is_content_key(None) is False
+    assert is_content_key(123) is False
+    # Right prefix, wrong length
+    assert is_content_key("ck_short") is False
+    # Right prefix + length, non-hex
+    assert is_content_key("ck_" + "Z" * 32) is False

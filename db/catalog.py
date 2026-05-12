@@ -84,6 +84,12 @@ catalog_products = Table(
     # + services/pivota_indexing_arc.py. Nullable for now because the
     # backfill sets pre-existing rows to their created_at.
     Column("pivota_signature_minted_at", DateTime, nullable=True),
+    # Stage 1 of the PDP architecture roadmap (mig 083). Content-derived
+    # product identity: same physical product across merchants/paths
+    # produces the same content_key. See services/catalog_identity.py
+    # + plans/rosy-mixing-bengio.md. Nullable for rows predating mig
+    # 083; backfilled by scripts/backfill_content_key.py.
+    Column("content_key", Text, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index(
@@ -98,6 +104,15 @@ catalog_products = Table(
         "pivota_signature_id",
         unique=True,
         postgresql_where=Column("pivota_signature_id").isnot(None),
+    ),
+    # Stage 1 (mig 083): NON-UNIQUE partial index. Stage 1 is the
+    # visibility step — we WANT duplicates to be visible so Stage 2
+    # can auto-group them. Stage 4 may tighten to UNIQUE on
+    # (content_key, merchant_id) once the auto-grouper is stable.
+    Index(
+        "idx_catalog_products_content_key",
+        "content_key",
+        postgresql_where=Column("content_key").isnot(None),
     ),
 )
 

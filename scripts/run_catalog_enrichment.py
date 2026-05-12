@@ -230,7 +230,8 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    canonical_url, image_url, product_payload, tags,
                    price_tier, use_case_tags, lifestyle_tags, demographic,
                    pdp_lifecycle_stage,
-                   pdp_scope, pdp_scope_source, pdp_scope_set_at)
+                   pdp_scope, pdp_scope_source, pdp_scope_set_at,
+                   content_key)
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
                    :catalog_track, :truth_tier, :readiness_tier, :source_system,
@@ -243,7 +244,8 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    CAST(:lifestyle_tags AS jsonb),
                    :demographic,
                    :pdp_lifecycle_stage,
-                   :pdp_scope, :pdp_scope_source, NOW())
+                   :pdp_scope, :pdp_scope_source, NOW(),
+                   :content_key)
                 ON CONFLICT (product_key) DO UPDATE SET
                   category_path = EXCLUDED.category_path,
                   category_confidence = EXCLUDED.category_confidence,
@@ -260,6 +262,10 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                   pdp_scope = EXCLUDED.pdp_scope,
                   pdp_scope_source = EXCLUDED.pdp_scope_source,
                   pdp_scope_set_at = NOW(),
+                  -- Stage 1 (mig 083): keep content_key fresh on re-runs
+                  -- but only when EXCLUDED has a value. NULL on a re-run
+                  -- shouldn't wipe an already-populated key.
+                  content_key = COALESCE(EXCLUDED.content_key, catalog_products.content_key),
                   updated_at = NOW()
                 """,
                 pdp,

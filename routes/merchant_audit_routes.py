@@ -52,6 +52,7 @@ from db.merchant_audit_runs import (
 )
 from db.merchant_onboarding import get_merchant_onboarding
 from services.agent_center_bd_report_service import run_brand_report
+from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from utils.auth import get_current_merchant
 from utils.logger import logger
@@ -570,6 +571,23 @@ async def run_merchant_self_audit(
                 # C-4 PR-D: also writes pivota_signature_minted_at so
                 # the next audit's indexing-arc state is computed
                 # from a real timestamp.
+                # Stage 1 (mig 083): if this row predates content_key
+                # (NULL), back-fill at the same time. Brand+title only;
+                # the SELECT above doesn't pull GTIN. Caller is the
+                # audit codepath, not an ingest — backfill_content_key
+                # script will fill GTIN where it exists from elsewhere.
+                # `or None` keeps the UPDATE a no-op when brand or
+                # title are empty (make_content_key returns None then).
+                _lazy_content_key = make_content_key(
+                    r["brand"], r["title"], None
+                )
+                _update_values = {
+                    "pivota_signature_id": fields["pivota_signature_id"],
+                    "pivota_canonical_url": pivota_url,
+                    "pivota_signature_minted_at": pivota_minted_at,
+                }
+                if _lazy_content_key:
+                    _update_values["content_key"] = _lazy_content_key
                 await database.execute(
                     catalog_products.update()
                     .where(
@@ -577,11 +595,7 @@ async def run_merchant_self_audit(
                         catalog_products.c.platform == r["platform"],
                         catalog_products.c.source_product_id == r["source_product_id"],
                     )
-                    .values(
-                        pivota_signature_id=fields["pivota_signature_id"],
-                        pivota_canonical_url=pivota_url,
-                        pivota_signature_minted_at=pivota_minted_at,
-                    )
+                    .values(**_update_values)
                 )
             pdp_url = pivota_url
             url_source = "pivota_canonical_pdp"
