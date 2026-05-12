@@ -32,6 +32,7 @@ Resume semantics:
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
 import socket
 import traceback
@@ -192,14 +193,39 @@ async def _process_one_audit_run_inner(
             from services.agent_center_bd_report_service import (
                 run_brand_report,
             )
-            brand_report = await run_brand_report(
-                merchant_name=str(merchant_name),
-                merchant_domain=merchant_domain,
-                products=products,
-                provider="gemini",
-                max_runs=3,
-                integration_state=integration_state,
+            # P5.8.6c: lease-heartbeat task. Original code called
+            # extend_lease ONCE at the start of probing (15min
+            # lease). For a 5-product cold-start audit with
+            # grounded category visibility, run_brand_report
+            # routinely runs >15min; lease expires mid-probe,
+            # reaper releases, sibling worker reclaims, RE-RUNS
+            # all the LLM probes from scratch — doubles LLM cost
+            # + the original worker's results vanish (subsequent
+            # guarded writes fail). Heartbeat: extend every 5min,
+            # cancel when run_brand_report returns. Per
+            # feedback_llm_call_multipliers.md this is the
+            # category PR #278 hit.
+            heartbeat_task = asyncio.create_task(
+                _lease_heartbeat(
+                    run_id=run_id,
+                    interval_seconds=300,  # 5 min
+                    lease_seconds=LONG_STAGE_LEASE_SECONDS,
+                ),
+                name=f"audit-lease-heartbeat-{run_id[:8]}",
             )
+            try:
+                brand_report = await run_brand_report(
+                    merchant_name=str(merchant_name),
+                    merchant_domain=merchant_domain,
+                    products=products,
+                    provider="gemini",
+                    max_runs=3,
+                    integration_state=integration_state,
+                )
+            finally:
+                heartbeat_task.cancel()
+                # Don't await — fire-and-forget cancellation.
+                # The task's cleanup is best-effort.
             aggregate = brand_report.get("aggregate") or {}
             await mar.record_partial_result(
                 run_id=run_id, worker_id=WORKER_ID,
@@ -325,24 +351,25 @@ async def _process_one_audit_run_inner(
             cost_summary = await _aggregate_cost_summary_for_run(
                 run_id=run_id, brand_report=brand_report,
             )
-            ok = await mar.transition_stage(
-                run_id=run_id,
-                from_stage=mar.STAGE_VERIFYING,
-                to_stage=mar.STAGE_COMPLETED,
-                worker_id=WORKER_ID,
-                cost_summary_jsonb=cost_summary,
-            )
-            if not ok:
-                return True
-            current_stage = mar.STAGE_COMPLETED
 
-            # P4.5: pre-render all 5 audience projections from the
-            # canonical tables (evidence_items + readiness_findings
-            # + action_plan_items just written in the verifying
-            # stage). Cached in report_projections so
-            # GET /api/audits/{id}?audience=X is a fast read.
-            # Best-effort: failure here doesn't poison the
-            # completed transition that already succeeded.
+            # P5.8.6c: post-completion durability. Previously
+            # projection-build + verification-enqueue ran AFTER
+            # transition_stage(completed). If the worker crashed
+            # between transition + enqueue, the audit was "done"
+            # but NO verifications ever fired (and the projection
+            # cache stayed empty). Nothing back-filled because the
+            # reaper only reclaims active stages.
+            #
+            # Fix: do projection-build + verification-enqueue
+            # BEFORE the transition_stage(completed). The work is
+            # idempotent (P5.8.2 made evidence/findings/actions
+            # idempotent; upsert_projection has UNIQUE
+            # (audit_run_id, audience); enqueue_verifications uses
+            # idempotency keys). If the worker crashes mid-step,
+            # the reaper releases the lease, a sibling worker
+            # reclaims at stage=verifying, re-runs the side effects
+            # (cheap dedupe-noops), then transitions cleanly to
+            # completed.
             try:
                 from services.audit_projection_builder import (
                     build_and_persist_all_projections,
@@ -360,17 +387,12 @@ async def _process_one_audit_run_inner(
                     "run_id=%s: %s", run_id, exc,
                 )
 
-            # P5.7: enqueue verification_runs (one per
-            # (product_key, verifier_id) tuple). The
-            # verification_run_worker drains these on its 30s tick.
-            # public_llm_citation_movement rows get not_before set
-            # to 30 days from now (P5.6). Best-effort.
             try:
                 from services.audit_verification_enqueuer import (
                     enqueue_verifications_for_completed_audit,
                 )
                 from datetime import datetime as _dt, timezone as _tz
-                verify_summary = (
+                verifications_summary = (
                     await enqueue_verifications_for_completed_audit(
                         audit_run_id=run_id,
                         merchant_id=merchant_id,
@@ -380,13 +402,28 @@ async def _process_one_audit_run_inner(
                 )
                 logger.info(
                     "audit_run_worker: verifications enqueued "
-                    "for run_id=%s: %s", run_id, verify_summary,
+                    "for run_id=%s: %s", run_id, verifications_summary,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "audit_run_worker: verification enqueue raised "
                     "for run_id=%s: %s", run_id, exc,
                 )
+
+            # Only NOW transition to completed. If we reach this
+            # line, projections are warm + verifications are
+            # enqueued. The transition is the atomic "this audit
+            # is done" commit point.
+            ok = await mar.transition_stage(
+                run_id=run_id,
+                from_stage=mar.STAGE_VERIFYING,
+                to_stage=mar.STAGE_COMPLETED,
+                worker_id=WORKER_ID,
+                cost_summary_jsonb=cost_summary,
+            )
+            if not ok:
+                return True
+            current_stage = mar.STAGE_COMPLETED
 
         logger.info(
             "audit_run_worker: completed run_id=%s merchant=%s",
@@ -779,3 +816,50 @@ async def _aggregate_cost_summary_for_run(
             run_id, exc,
         )
     return _placeholder_cost_summary(brand_report)
+
+
+async def _lease_heartbeat(
+    *,
+    run_id: str,
+    interval_seconds: int,
+    lease_seconds: int,
+) -> None:
+    """P5.8.6c: keep the audit_run's lease fresh while a long
+    stage (probing) runs. Cancels cleanly via task.cancel() when
+    the stage completes.
+
+    Why an asyncio task and not periodic in-band calls:
+      - run_brand_report is one big async call; we can't
+        interleave extend_lease without restructuring the report
+        builder.
+      - Cancelling the heartbeat via task.cancel() in a `finally`
+        is the standard pattern.
+
+    Stops if extend_lease returns False (lease already stolen).
+    No point hammering UPDATE if we've lost the row — the worker's
+    final transition_stage will also fail, signaling correctly.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            from db import merchant_audit_runs as mar
+            ok = await mar.extend_lease(
+                run_id=run_id, worker_id=WORKER_ID,
+                lease_seconds=lease_seconds,
+            )
+            if not ok:
+                logger.warning(
+                    "_lease_heartbeat: lost lease for run_id=%s; "
+                    "stopping heartbeat", run_id,
+                )
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_lease_heartbeat: extend raised for run_id=%s: %s; "
+                "continuing", run_id, str(exc)[:200],
+            )
