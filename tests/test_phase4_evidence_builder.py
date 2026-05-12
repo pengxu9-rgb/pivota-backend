@@ -325,6 +325,222 @@ async def test_persist_canonical_evidence_counts_failures(monkeypatch):
     assert summary["findings_failed"] == 1
 
 
+# =====================================================================
+# Action extraction (P4.4)
+# =====================================================================
+
+
+def _report_with_actions() -> Dict[str, Any]:
+    """A minimal report with all 3 action-source shapes:
+    action_items (PR-6), action_ladder (PR-8b), and
+    implementation_roadmap (PR-8c)."""
+    return {
+        "aggregate": {"avg_visibility": 50},
+        "per_product": [{
+            "product_key": "shopify::sp-1",
+            "action_items": [
+                {
+                    "lever": "pivota_integration",
+                    "title": "Complete Pivota integration",
+                    "body": "Install the app + connect GSC",
+                    "severity": "critical",
+                },
+                {
+                    "lever": "sitemap_hygiene",
+                    "title": "Submit sitemap to GSC",
+                    "severity": "high",
+                },
+            ],
+            "action_ladder": {
+                "actions": [
+                    {
+                        "lever": "content_creation",
+                        "title": "Draft 3 publisher briefs",
+                        "severity": "medium",
+                        "owner": "merchant_brand_team",
+                        "kpi_to_track": "first-party citation rate",
+                        "expected_outcome": "1 of 3 queries cites merchant URL within 90 days",
+                        "phase": "week_4_to_12",
+                    },
+                ],
+            },
+            "implementation_roadmap": {
+                "phases": [
+                    {
+                        "phase_id": "week_1_to_4",
+                        "activities": [
+                            {
+                                "lever": "pdp_optimization",
+                                "title": "Improve PDP titles",
+                                "severity": "medium",
+                            },
+                        ],
+                    },
+                ],
+            },
+        }],
+    }
+
+
+def test_extract_actions_pulls_from_all_three_shapes():
+    """action_items + action_ladder.actions + roadmap.phases[*].
+    activities — all 3 sources contribute to the canonical list."""
+    from services.audit_evidence_builder import extract_actions
+    actions = extract_actions(_report_with_actions())
+    # 2 from action_items + 1 from action_ladder + 1 from roadmap = 4
+    assert len(actions) == 4
+    titles = sorted(a["title"] for a in actions)
+    assert titles == [
+        "Complete Pivota integration",
+        "Draft 3 publisher briefs",
+        "Improve PDP titles",
+        "Submit sitemap to GSC",
+    ]
+
+
+def test_extract_actions_propagates_pr_8b_fields():
+    """PR-8b owner / KPI / expected_outcome / phase / severity
+    must thread through to insert_action."""
+    from services.audit_evidence_builder import extract_actions
+    actions = extract_actions(_report_with_actions())
+    brief = next(
+        a for a in actions if a["title"] == "Draft 3 publisher briefs"
+    )
+    assert brief["owner"] == "merchant_brand_team"
+    assert brief["kpi_to_track"] == "first-party citation rate"
+    assert brief["phase"] == "week_4_to_12"
+    assert brief["severity"] == "medium"
+
+
+def test_extract_actions_dedupes_across_sources():
+    """If the same (lever, title) appears in multiple sources for
+    the same product, only the first wins. Prevents double-insert
+    when a roadmap activity duplicates an action_items entry."""
+    from services.audit_evidence_builder import extract_actions
+    report = {
+        "per_product": [{
+            "product_key": "p-1",
+            "action_items": [
+                {"lever": "sitemap_hygiene", "title": "Submit sitemap"},
+            ],
+            "action_ladder": {
+                "actions": [
+                    # Same (lever, title) as the action_items entry above
+                    {
+                        "lever": "sitemap_hygiene",
+                        "title": "Submit sitemap",
+                        "owner": "merchant_tech_team",
+                    },
+                ],
+            },
+        }],
+    }
+    actions = extract_actions(report)
+    assert len(actions) == 1
+    # First-write wins: the action_items version (no owner)
+    assert actions[0]["owner"] is None
+
+
+def test_extract_actions_assigns_phase_from_roadmap_container():
+    """A roadmap activity that doesn't have its own `phase` field
+    inherits the parent phase block's phase_id."""
+    from services.audit_evidence_builder import extract_actions
+    report = {
+        "per_product": [{
+            "product_key": "p-1",
+            "implementation_roadmap": {
+                "phases": [
+                    {
+                        "phase_id": "week_4_to_12",
+                        "activities": [
+                            {
+                                "lever": "kol_outreach",
+                                "title": "Brief 2 micro-influencers",
+                                # No `phase` on this activity
+                            },
+                        ],
+                    },
+                ],
+            },
+        }],
+    }
+    actions = extract_actions(report)
+    assert len(actions) == 1
+    assert actions[0]["phase"] == "week_4_to_12"
+
+
+def test_extract_actions_skips_missing_lever_or_title():
+    from services.audit_evidence_builder import extract_actions
+    report = {
+        "per_product": [{
+            "product_key": "p-1",
+            "action_items": [
+                {"lever": "sitemap_hygiene"},  # no title
+                {"title": "X"},  # no lever
+                {"lever": "", "title": ""},
+                {"lever": "content_creation", "title": "OK"},
+            ],
+        }],
+    }
+    actions = extract_actions(report)
+    assert len(actions) == 1
+    assert actions[0]["title"] == "OK"
+
+
+def test_extract_actions_drops_invalid_phase_values():
+    """Phases outside the canonical taxonomy (week_1_to_4 /
+    4_to_12 / 12_to_24) are dropped rather than persisted as
+    garbage."""
+    from services.audit_evidence_builder import extract_actions
+    report = {
+        "per_product": [{
+            "product_key": "p-1",
+            "action_items": [
+                {
+                    "lever": "content_creation",
+                    "title": "X",
+                    "phase": "next_quarter",  # bogus
+                },
+            ],
+        }],
+    }
+    actions = extract_actions(report)
+    assert actions[0]["phase"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_canonical_actions_via_insert_action(monkeypatch):
+    """persist_canonical_evidence now also writes actions. The
+    summary should include actions_inserted + actions_failed."""
+    from services import audit_evidence_builder as builder
+    import db.audit_evidence as ae
+
+    inserted_actions: List[Dict[str, Any]] = []
+
+    async def fake_insert_action(**kwargs):
+        inserted_actions.append(kwargs)
+        return f"a-{len(inserted_actions)}"
+
+    # Stub the other accessors so we focus on actions
+    monkeypatch.setattr(ae, "insert_evidence_item",
+                        lambda **kw: _async_none())
+    monkeypatch.setattr(ae, "insert_finding",
+                        lambda **kw: _async_none())
+    monkeypatch.setattr(ae, "insert_action", fake_insert_action)
+
+    summary = await builder.persist_canonical_evidence(
+        audit_run_id="a-1",
+        brand_report=_report_with_actions(),
+    )
+    assert summary["actions_inserted"] == 4
+    assert summary["actions_failed"] == 0
+    assert all(a["audit_run_id"] == "a-1" for a in inserted_actions)
+
+
+async def _async_none():
+    return None
+
+
 @pytest.mark.asyncio
 async def test_persist_swallows_accessor_exceptions(monkeypatch):
     """An exception inside the accessor (vs. just returning None)
