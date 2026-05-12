@@ -30,6 +30,11 @@ catalog_merchants = Table(
     # | 'monthly'. Migration 078_catalog_merchants_audit_schedule.sql
     # adds the column with default 'none' to existing rows.
     Column("audit_schedule", String(16), nullable=False, server_default="none"),
+    # Stage 2a (mig 084): timestamp of the merchant's most recent
+    # successful Path A full sync. Used by the sweep to compare per-row
+    # last_seen_in_sync_at — without it we couldn't tell "merchant
+    # hasn't synced lately" from "row was deleted from upstream."
+    Column("last_full_sync_at", DateTime, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
 )
@@ -90,6 +95,16 @@ catalog_products = Table(
     # + plans/rosy-mixing-bengio.md. Nullable for rows predating mig
     # 083; backfilled by scripts/backfill_content_key.py.
     Column("content_key", Text, nullable=True),
+    # Stage 2a (mig 084): Path A sync hygiene. Path A's _upsert_by_pk
+    # sets last_seen_in_sync_at=NOW() on every write. NULL on rows from
+    # non-sync paths (external_seed mirror, enrichment agent) or rows
+    # predating mig 084.
+    Column("last_seen_in_sync_at", DateTime, nullable=True),
+    # Stage 2a (mig 084): sync lifecycle. 'live' (default) | 'stale' |
+    # 'archived'. Sweep flips to stale when last_seen falls behind
+    # catalog_merchants.last_full_sync_at by GRACE_HOURS. Recall layer
+    # filters on sync_status='live'.
+    Column("sync_status", String(16), nullable=False, server_default="live"),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index(
@@ -113,6 +128,15 @@ catalog_products = Table(
         "idx_catalog_products_content_key",
         "content_key",
         postgresql_where=Column("content_key").isnot(None),
+    ),
+    # Stage 2a (mig 084): partial index on the non-live tail. Most
+    # recall queries filter sync_status='live' (the default); sweep
+    # + admin dashboards scan stale/archived rows specifically.
+    Index(
+        "idx_catalog_products_sync_status_non_live",
+        "sync_status",
+        "last_seen_in_sync_at",
+        postgresql_where=Column("sync_status") != "live",
     ),
 )
 
