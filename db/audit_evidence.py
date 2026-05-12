@@ -1233,72 +1233,72 @@ async def mark_verification_failed_with_retry(
     error_message: str,
     evidence_jsonb: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Failed-attempt handling. If retry_count < max_retries:
+    """Failed-attempt handling. If retry_count + 1 < max_retries:
     transition back to PENDING + bump retry_count. Otherwise
     transition to EXHAUSTED_RETRIES (terminal). Returns the new
-    status string for the caller's logging."""
+    status string for caller logging.
+
+    P5.8.6: atomic — single UPDATE with CASE on status +
+    `retry_count + 1`. Same fix pattern as
+    mark_executor_run_failed_with_retry (db/executor_runs.py).
+    Eliminates the SELECT-then-UPDATE race where a reaper between
+    the two queries could null claimed_by_worker, leaving the
+    UPDATE to silently no-op + retry_count never incrementing.
+    """
     await ensure_audit_evidence_tables()
+    now = _now_utc()
+    query = """
+        UPDATE verification_runs
+           SET retry_count = retry_count + 1,
+               status = CASE
+                   WHEN retry_count + 1 < max_retries THEN 'pending'
+                   ELSE 'exhausted_retries'
+               END,
+               last_checked_at = :now,
+               completed_at = CASE
+                   WHEN retry_count + 1 < max_retries THEN completed_at
+                   ELSE :now
+               END,
+               claimed_by_worker = CASE
+                   WHEN retry_count + 1 < max_retries THEN NULL
+                   ELSE claimed_by_worker
+               END,
+               claimed_until = CASE
+                   WHEN retry_count + 1 < max_retries THEN NULL
+                   ELSE claimed_until
+               END,
+               error_message = :error_message,
+               evidence_jsonb = COALESCE(:evidence_jsonb, evidence_jsonb)
+         WHERE verify_id = :verify_id
+           AND status = 'claimed'
+           AND claimed_by_worker = :worker_id
+         RETURNING status
+    """
+    import json as _json
     try:
-        from sqlalchemy.sql import select
         row = await database.fetch_one(
-            select(
-                verification_runs.c.retry_count,
-                verification_runs.c.max_retries,
-            ).where(
-                verification_runs.c.verify_id == verify_id,
-                verification_runs.c.claimed_by_worker == worker_id,
-            )
+            query,
+            {
+                "verify_id": verify_id,
+                "worker_id": worker_id,
+                "now": now,
+                "error_message": error_message[:2000],
+                "evidence_jsonb": (
+                    _json.dumps(evidence_jsonb)
+                    if evidence_jsonb is not None
+                    else None
+                ),
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "mark_verification_failed_with_retry read failed "
-            "for verify=%s: %s", verify_id, str(exc)[:200],
+            "mark_verification_failed_with_retry atomic UPDATE "
+            "failed for verify=%s: %s", verify_id, str(exc)[:200],
         )
         return VERIFICATION_STATUS_FAILED
     if row is None:
         return VERIFICATION_STATUS_FAILED
-    d = dict(row)
-    next_retry = int(d.get("retry_count") or 0) + 1
-    max_r = int(d.get("max_retries") or 2)
-    now = _now_utc()
-    if next_retry < max_r:
-        new_status = VERIFICATION_STATUS_PENDING
-        values = {
-            "status": new_status,
-            "retry_count": next_retry,
-            "claimed_by_worker": None,
-            "claimed_until": None,
-            "last_checked_at": now,
-            "error_message": error_message[:2000],
-        }
-    else:
-        new_status = VERIFICATION_STATUS_EXHAUSTED_RETRIES
-        values = {
-            "status": new_status,
-            "retry_count": next_retry,
-            "completed_at": now,
-            "last_checked_at": now,
-            "error_message": error_message[:2000],
-        }
-    if evidence_jsonb is not None:
-        values["evidence_jsonb"] = evidence_jsonb
-    try:
-        await database.execute(
-            verification_runs.update()
-            .where(
-                verification_runs.c.verify_id == verify_id,
-                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
-                verification_runs.c.claimed_by_worker == worker_id,
-            )
-            .values(**values)
-        )
-        return new_status
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "mark_verification_failed_with_retry write failed "
-            "for verify=%s: %s", verify_id, str(exc)[:200],
-        )
-        return VERIFICATION_STATUS_FAILED
+    return dict(row).get("status") or VERIFICATION_STATUS_FAILED
 
 
 async def extend_verification_lease(

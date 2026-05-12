@@ -552,83 +552,93 @@ async def mark_executor_run_failed_with_retry(
     error_message: str,
     error_jsonb: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Failed-attempt handling. If retry_count < max_retries:
+    """Failed-attempt handling. If retry_count + 1 < max_retries:
     increment retry_count, transition back to STAGE_QUEUED so a
     sibling worker can claim. Otherwise transition to
     STAGE_EXHAUSTED_RETRIES (terminal).
 
-    Returns the new stage string the row landed in (queued or
-    exhausted_retries) for the caller's logging.
+    P5.8.6: atomic — single UPDATE with CASE expression on stage +
+    `retry_count + 1` increment. The original was SELECT-then-
+    UPDATE which had a race: between the SELECT (line 567 of P3.1)
+    and the UPDATE (line 616), the reaper could null
+    claimed_by_worker. The UPDATE would then no-op silently +
+    retry_count never incremented + retry budget effectively
+    infinite for stuck rows.
+
+    Returns the new stage string for caller logging.
     """
     await ensure_executor_runs_table()
-    # Read current retry state to decide.
-    try:
-        from sqlalchemy.sql import select
-        row = await database.fetch_one(
-            select(
-                executor_runs.c.retry_count,
-                executor_runs.c.max_retries,
-            ).where(
-                executor_runs.c.run_id == run_id,
-                executor_runs.c.claimed_by_worker == worker_id,
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "mark_executor_run_failed_with_retry read failed "
-            "for run_id=%s: %s", run_id, str(exc)[:200],
-        )
-        return STAGE_FAILED  # caller logs; row stays in 'claimed'
-    if row is None:
-        # Lost the lease — sibling worker already retook it.
-        return STAGE_FAILED
-    d = dict(row)
-    next_retry = int(d.get("retry_count") or 0) + 1
-    max_r = int(d.get("max_retries") or 3)
     now = _now_utc()
-    if next_retry < max_r:
-        # Retry path — transition back to queued + bump retry_count.
-        # Clear the lease so a sibling worker can immediately claim.
-        new_stage = STAGE_QUEUED
-        values = {
-            "stage": new_stage,
-            "stage_updated_at": now,
-            "retry_count": next_retry,
-            "claimed_by_worker": None,
-            "claimed_until": None,
-            "error_message": error_message[:2000],
-            "error_jsonb": error_jsonb,
-            "status": "running",  # legacy column
-        }
-    else:
-        # Retry budget exhausted — terminal.
-        new_stage = STAGE_EXHAUSTED_RETRIES
-        values = {
-            "stage": new_stage,
-            "stage_updated_at": now,
-            "completed_at": now,
-            "retry_count": next_retry,
-            "error_message": error_message[:2000],
-            "error_jsonb": error_jsonb,
-            "status": "failed",  # legacy column
-        }
+    # Single atomic UPDATE. RETURNING gives us the new stage so we
+    # know whether the row landed in queued (retry) or
+    # exhausted_retries (terminal) without re-querying.
+    #
+    # Logic:
+    #   IF retry_count + 1 < max_retries:
+    #     stage = 'queued', clear lease, increment retry_count
+    #   ELSE:
+    #     stage = 'exhausted_retries', set completed_at, increment
+    query = """
+        UPDATE executor_runs
+           SET retry_count = retry_count + 1,
+               stage = CASE
+                   WHEN retry_count + 1 < max_retries THEN 'queued'
+                   ELSE 'exhausted_retries'
+               END,
+               stage_updated_at = :now,
+               completed_at = CASE
+                   WHEN retry_count + 1 < max_retries THEN completed_at
+                   ELSE :now
+               END,
+               claimed_by_worker = CASE
+                   WHEN retry_count + 1 < max_retries THEN NULL
+                   ELSE claimed_by_worker
+               END,
+               claimed_until = CASE
+                   WHEN retry_count + 1 < max_retries THEN NULL
+                   ELSE claimed_until
+               END,
+               status = CASE
+                   WHEN retry_count + 1 < max_retries THEN 'running'
+                   ELSE 'failed'
+               END,
+               error_message = :error_message,
+               error_jsonb = :error_jsonb
+         WHERE run_id = :run_id
+           AND stage = 'claimed'
+           AND claimed_by_worker = :worker_id
+         RETURNING stage
+    """
+    import json as _json
     try:
-        await database.execute(
-            executor_runs.update()
-            .where(
-                executor_runs.c.run_id == run_id,
-                executor_runs.c.stage == STAGE_CLAIMED,
-                executor_runs.c.claimed_by_worker == worker_id,
-            )
-            .values(**values)
+        row = await database.fetch_one(
+            query,
+            {
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "now": now,
+                "error_message": error_message[:2000],
+                # JSONB column accepts dict via the databases driver,
+                # but the raw-SQL path needs explicit serialization
+                # because we're not going through the SQLAlchemy
+                # Table.update() shape that auto-coerces.
+                "error_jsonb": (
+                    _json.dumps(error_jsonb) if error_jsonb is not None
+                    else None
+                ),
+            },
         )
-        return new_stage
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "mark_executor_run_failed_with_retry write failed "
-            "for run_id=%s: %s", run_id, str(exc)[:200],
+            "mark_executor_run_failed_with_retry atomic UPDATE "
+            "failed for run_id=%s: %s", run_id, str(exc)[:200],
         )
         return STAGE_FAILED
+    if row is None:
+        # Lost the lease before the UPDATE matched — sibling worker
+        # already retook + advanced this row. No-op cleanly.
+        return STAGE_FAILED
+    return dict(row).get("stage") or STAGE_FAILED
 
 
 async def fetch_executor_run_by_id(
