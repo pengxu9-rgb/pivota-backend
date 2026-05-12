@@ -28,6 +28,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Index,
+    Integer,
     Table,
     Text,
 )
@@ -50,6 +51,18 @@ executor_runs = Table(
     Column("status", Text, nullable=False),
     Column("evidence_jsonb", JSONB, nullable=True),
     Column("error_message", Text, nullable=True),
+    # P3.1: durable work-queue columns. See
+    # db/migrations/085_executor_runs_durability.sql for column-level
+    # commentary.
+    Column("stage", Text, nullable=False, server_default="succeeded"),
+    Column("stage_updated_at", DateTime(timezone=True), nullable=True),
+    Column("claimed_by_worker", Text, nullable=True),
+    Column("claimed_until", DateTime(timezone=True), nullable=True),
+    Column("retry_count", Integer, nullable=False, server_default="0"),
+    Column("max_retries", Integer, nullable=False, server_default="3"),
+    Column("error_jsonb", JSONB, nullable=True),
+    Column("payload_jsonb", JSONB, nullable=True),
+    Column("idempotency_key", Text, nullable=True),
     Index("idx_executor_runs_agent_recent", "agent_name", "requested_at"),
     Index("idx_executor_runs_merchant_recent", "merchant_id", "requested_at"),
     Index(
@@ -58,6 +71,49 @@ executor_runs = Table(
     ),
     extend_existing=True,
 )
+
+
+# P3.1: state machine constants. The work queue's lifecycle:
+#   queued → claimed → succeeded
+#                     → failed → (re-enqueue) → claimed → ...
+#                     → exhausted_retries (when retry_count == max_retries)
+STAGE_QUEUED = "queued"
+STAGE_CLAIMED = "claimed"
+STAGE_SUCCEEDED = "succeeded"
+STAGE_FAILED = "failed"
+STAGE_EXHAUSTED_RETRIES = "exhausted_retries"
+
+ACTIVE_STAGES = frozenset({STAGE_QUEUED, STAGE_CLAIMED})
+TERMINAL_STAGES = frozenset({
+    STAGE_SUCCEEDED, STAGE_FAILED, STAGE_EXHAUSTED_RETRIES,
+})
+
+# Validate state transitions before any UPDATE so a worker race or
+# stale read can't silently corrupt the queue.
+VALID_STAGE_TRANSITIONS: dict = {
+    STAGE_QUEUED: {STAGE_CLAIMED},
+    STAGE_CLAIMED: {
+        STAGE_SUCCEEDED, STAGE_FAILED, STAGE_QUEUED,
+        STAGE_EXHAUSTED_RETRIES,
+    },
+    STAGE_SUCCEEDED: set(),
+    STAGE_FAILED: set(),
+    STAGE_EXHAUSTED_RETRIES: set(),
+}
+
+
+def is_valid_stage_transition(from_stage: str, to_stage: str) -> bool:
+    """Return True iff the transition is in the canonical state
+    machine. Worker calls this before UPDATE to catch races early."""
+    return to_stage in VALID_STAGE_TRANSITIONS.get(from_stage, set())
+
+
+# Default lease for a claimed executor_run. Worker can extend on
+# claim if it knows the agent runs long (sitemap fetch, GSC submit).
+DEFAULT_LEASE_SECONDS = 300
+
+# Stale-lease grace period before reclaim runs.
+STALE_LEASE_GRACE_SECONDS = 30
 
 
 _DDL_READY = False
@@ -85,25 +141,56 @@ _DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_executor_runs_parent_audit "
     "ON executor_runs (parent_audit_run_id, requested_at DESC) "
     "WHERE parent_audit_run_id IS NOT NULL;",
+    # P3.1: durable work-queue columns. Schema-guard backstop for
+    # environments where db/migrations/085_executor_runs_durability.sql
+    # hasn't been applied yet. Each ALTER is idempotent.
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'succeeded';",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ;",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS claimed_by_worker TEXT;",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ;",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 3;",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS error_jsonb JSONB;",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS payload_jsonb JSONB;",
+    "ALTER TABLE executor_runs "
+    "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_executor_runs_worker_pull "
+    "ON executor_runs (stage, claimed_until, requested_at) "
+    "WHERE stage IN ('queued', 'claimed');",
+    "CREATE INDEX IF NOT EXISTS idx_executor_runs_idempotency "
+    "ON executor_runs (idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL "
+    "AND stage IN ('queued', 'claimed');",
 ]
 
 
 async def ensure_executor_runs_table() -> None:
+    """Per-statement-tolerant backstop. Postgres prod runs the .sql
+    migrations directly; this inline DDL covers hermetic test
+    environments where partial-index syntax + ADD COLUMN IF NOT
+    EXISTS aren't supported (matches the P2.1 pattern)."""
     global _DDL_READY
     if _DDL_READY:
         return
     async with _DDL_LOCK:
         if _DDL_READY:
             return
-        try:
-            for stmt in _DDL_STATEMENTS:
+        for stmt in _DDL_STATEMENTS:
+            try:
                 await database.execute(stmt)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "ensure_executor_runs_table failed (best-effort): %s",
-                str(exc)[:200],
-            )
-            return
+            except Exception as exc:
+                logger.debug(
+                    "ensure_executor_runs_table skip stmt: %s | %s",
+                    str(exc)[:120], stmt[:80],
+                )
         _DDL_READY = True
 
 
@@ -265,3 +352,368 @@ async def runs_for_audit(
         )
         return []
     return [_row_to_dict(r) for r in (rows or [])]
+
+
+# =====================================================================
+# P3.1 — durable work-queue accessors. Used by:
+#   - services/executor_agents/dispatcher.py → enqueue_executor_run
+#                                              + find_in_flight_by_idem
+#   - services/executor_run_worker.py → claim_next +
+#                                       mark_succeeded /
+#                                       mark_failed_with_retry +
+#                                       release_stale_leases
+# =====================================================================
+
+
+async def enqueue_executor_run(
+    *,
+    agent_name: str,
+    merchant_id: Optional[str] = None,
+    parent_audit_run_id: Optional[str] = None,
+    payload_jsonb: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
+    max_retries: int = 3,
+) -> Optional[str]:
+    """Insert a row in stage='queued' for the executor_run_worker
+    to claim. Returns the run_id, or None on persistence failure.
+    """
+    await ensure_executor_runs_table()
+    run_id = str(uuid.uuid4())
+    now = _now_utc()
+    try:
+        await database.execute(
+            executor_runs.insert().values(
+                run_id=run_id,
+                agent_name=agent_name,
+                merchant_id=merchant_id,
+                parent_audit_run_id=parent_audit_run_id,
+                requested_at=now,
+                # Legacy `status` aligned with `stage` during the
+                # dual-key window — old readers see 'running'.
+                status="running",
+                stage=STAGE_QUEUED,
+                stage_updated_at=now,
+                payload_jsonb=payload_jsonb,
+                idempotency_key=idempotency_key,
+                max_retries=int(max_retries),
+            )
+        )
+        return run_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "enqueue_executor_run failed for agent=%s: %s",
+            agent_name, str(exc)[:200],
+        )
+        return None
+
+
+async def find_in_flight_executor_run_by_idempotency(
+    *, idempotency_key: str,
+) -> Optional[str]:
+    """Return the run_id of any in-flight executor run matching this
+    idempotency key, or None. Dispatcher calls this before enqueueing
+    to dedupe re-audits that would otherwise produce duplicate
+    executor work."""
+    if not idempotency_key:
+        return None
+    await ensure_executor_runs_table()
+    try:
+        from sqlalchemy.sql import select
+        row = await database.fetch_one(
+            select(executor_runs.c.run_id)
+            .where(
+                executor_runs.c.idempotency_key == idempotency_key,
+                executor_runs.c.stage.in_(list(ACTIVE_STAGES)),
+            )
+            .limit(1)
+        )
+        if row is None:
+            return None
+        return str(row[0])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "find_in_flight_executor_run_by_idempotency failed: %s",
+            str(exc)[:200],
+        )
+        return None
+
+
+async def claim_next_pending_executor_run(
+    *, worker_id: str, lease_seconds: int = DEFAULT_LEASE_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim the oldest queued or stale-leased run.
+    Returns the claimed row dict, or None if nothing to claim.
+    SKIP LOCKED makes it safe under multiple workers."""
+    await ensure_executor_runs_table()
+    now = _now_utc()
+    new_until = datetime.fromtimestamp(
+        now.timestamp() + lease_seconds, tz=timezone.utc,
+    )
+    query = """
+        UPDATE executor_runs
+           SET claimed_by_worker = :worker_id,
+               claimed_until     = :new_until,
+               stage             = 'claimed',
+               stage_updated_at  = :now
+         WHERE run_id = (
+             SELECT run_id
+               FROM executor_runs
+              WHERE stage IN ('queued', 'claimed')
+                AND (
+                    claimed_until IS NULL
+                 OR claimed_until < :now
+                )
+              ORDER BY requested_at ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+         )
+        RETURNING run_id, agent_name, merchant_id,
+                  parent_audit_run_id, payload_jsonb,
+                  idempotency_key, retry_count, max_retries,
+                  requested_at
+    """
+    try:
+        row = await database.fetch_one(
+            query,
+            {"worker_id": worker_id, "new_until": new_until, "now": now},
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        return {
+            "run_id": str(d.get("run_id")),
+            "agent_name": d.get("agent_name"),
+            "merchant_id": d.get("merchant_id"),
+            "parent_audit_run_id": (
+                str(d.get("parent_audit_run_id"))
+                if d.get("parent_audit_run_id") else None
+            ),
+            "payload_jsonb": d.get("payload_jsonb"),
+            "idempotency_key": d.get("idempotency_key"),
+            "retry_count": int(d.get("retry_count") or 0),
+            "max_retries": int(d.get("max_retries") or 3),
+            "requested_at": (
+                d["requested_at"].isoformat()
+                if isinstance(d.get("requested_at"), datetime)
+                else None
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "claim_next_pending_executor_run failed for worker_id=%s: %s",
+            worker_id, str(exc)[:200],
+        )
+        return None
+
+
+async def mark_executor_run_succeeded(
+    *,
+    run_id: str,
+    worker_id: str,
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Terminal succeeded transition. Guarded on worker ownership."""
+    await ensure_executor_runs_table()
+    now = _now_utc()
+    values: Dict[str, Any] = {
+        "stage": STAGE_SUCCEEDED,
+        "stage_updated_at": now,
+        "completed_at": now,
+        # Keep legacy `status` aligned during the dual-key window.
+        "status": "succeeded",
+    }
+    if evidence_jsonb is not None:
+        values["evidence_jsonb"] = evidence_jsonb
+    try:
+        result = await database.execute(
+            executor_runs.update()
+            .where(
+                executor_runs.c.run_id == run_id,
+                executor_runs.c.stage == STAGE_CLAIMED,
+                executor_runs.c.claimed_by_worker == worker_id,
+            )
+            .values(**values)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_executor_run_succeeded failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return False
+
+
+async def mark_executor_run_failed_with_retry(
+    *,
+    run_id: str,
+    worker_id: str,
+    error_message: str,
+    error_jsonb: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Failed-attempt handling. If retry_count < max_retries:
+    increment retry_count, transition back to STAGE_QUEUED so a
+    sibling worker can claim. Otherwise transition to
+    STAGE_EXHAUSTED_RETRIES (terminal).
+
+    Returns the new stage string the row landed in (queued or
+    exhausted_retries) for the caller's logging.
+    """
+    await ensure_executor_runs_table()
+    # Read current retry state to decide.
+    try:
+        from sqlalchemy.sql import select
+        row = await database.fetch_one(
+            select(
+                executor_runs.c.retry_count,
+                executor_runs.c.max_retries,
+            ).where(
+                executor_runs.c.run_id == run_id,
+                executor_runs.c.claimed_by_worker == worker_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_executor_run_failed_with_retry read failed "
+            "for run_id=%s: %s", run_id, str(exc)[:200],
+        )
+        return STAGE_FAILED  # caller logs; row stays in 'claimed'
+    if row is None:
+        # Lost the lease — sibling worker already retook it.
+        return STAGE_FAILED
+    d = dict(row)
+    next_retry = int(d.get("retry_count") or 0) + 1
+    max_r = int(d.get("max_retries") or 3)
+    now = _now_utc()
+    if next_retry < max_r:
+        # Retry path — transition back to queued + bump retry_count.
+        # Clear the lease so a sibling worker can immediately claim.
+        new_stage = STAGE_QUEUED
+        values = {
+            "stage": new_stage,
+            "stage_updated_at": now,
+            "retry_count": next_retry,
+            "claimed_by_worker": None,
+            "claimed_until": None,
+            "error_message": error_message[:2000],
+            "error_jsonb": error_jsonb,
+            "status": "running",  # legacy column
+        }
+    else:
+        # Retry budget exhausted — terminal.
+        new_stage = STAGE_EXHAUSTED_RETRIES
+        values = {
+            "stage": new_stage,
+            "stage_updated_at": now,
+            "completed_at": now,
+            "retry_count": next_retry,
+            "error_message": error_message[:2000],
+            "error_jsonb": error_jsonb,
+            "status": "failed",  # legacy column
+        }
+    try:
+        await database.execute(
+            executor_runs.update()
+            .where(
+                executor_runs.c.run_id == run_id,
+                executor_runs.c.stage == STAGE_CLAIMED,
+                executor_runs.c.claimed_by_worker == worker_id,
+            )
+            .values(**values)
+        )
+        return new_stage
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_executor_run_failed_with_retry write failed "
+            "for run_id=%s: %s", run_id, str(exc)[:200],
+        )
+        return STAGE_FAILED
+
+
+async def fetch_executor_run_by_id(
+    *, run_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read one executor_run row including the new lifecycle fields."""
+    await ensure_executor_runs_table()
+    try:
+        row = await database.fetch_one(
+            executor_runs.select().where(
+                executor_runs.c.run_id == run_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_executor_run_by_id failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return None
+    if row is None:
+        return None
+    d = dict(row)
+    base = _row_to_dict(row)
+    # Add the durable-queue fields the basic _row_to_dict didn't
+    # know about (it's the legacy fire-and-forget shape).
+    base.update({
+        "stage": d.get("stage"),
+        "stage_updated_at": (
+            d["stage_updated_at"].isoformat()
+            if isinstance(d.get("stage_updated_at"), datetime)
+            else None
+        ),
+        "retry_count": int(d.get("retry_count") or 0),
+        "max_retries": int(d.get("max_retries") or 3),
+        "error_jsonb": d.get("error_jsonb"),
+        "payload_jsonb": d.get("payload_jsonb"),
+        "idempotency_key": d.get("idempotency_key"),
+    })
+    return base
+
+
+async def release_stale_executor_leases(
+    *, grace_seconds: int = STALE_LEASE_GRACE_SECONDS,
+) -> int:
+    """Reclaim leases that are past expiry + grace. Returns the
+    count released. Background reaper backstop — claim_next already
+    tolerates stale leases inline."""
+    await ensure_executor_runs_table()
+    cutoff = datetime.fromtimestamp(
+        _now_utc().timestamp() - grace_seconds, tz=timezone.utc,
+    )
+    query = """
+        UPDATE executor_runs
+           SET stage             = 'queued',
+               claimed_by_worker = NULL,
+               claimed_until     = NULL
+         WHERE claimed_until IS NOT NULL
+           AND claimed_until < :cutoff
+           AND stage = 'claimed'
+    """
+    try:
+        result = await database.execute(query, {"cutoff": cutoff})
+        if isinstance(result, int):
+            return result
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "release_stale_executor_leases failed: %s", str(exc)[:200],
+        )
+        return 0
+
+
+def compute_executor_idempotency_key(
+    *,
+    agent_name: str,
+    merchant_id: Optional[str],
+    parent_audit_run_id: Optional[str],
+) -> str:
+    """Pure helper — sha256 of the dedupe tuple. Dispatcher calls
+    this before enqueue so re-running the same audit doesn't
+    enqueue duplicate executor work for in-flight rows."""
+    import hashlib
+    components = [
+        (agent_name or "").strip(),
+        (merchant_id or "").strip(),
+        (parent_audit_run_id or "").strip(),
+    ]
+    return hashlib.sha256("|".join(components).encode("utf-8")).hexdigest()
