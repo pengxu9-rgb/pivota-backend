@@ -68,6 +68,21 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
             if not isinstance(title, str) or not title.strip():
                 continue
             lever = a.get("lever")
+            # PR-codex-review-followup: derive lever from title when
+            # absent (matches the same fallback in
+            # services/audit_evidence_builder._normalize_action). Both
+            # producers MUST share the same derivation rule so the
+            # canonical action_plan_items row + the materialized task
+            # have the same (lever, title) tuple — without this,
+            # _link_task_to_canonical_action below cannot match a
+            # task whose action came from _generate_action_items (no
+            # explicit lever set), and action_plan_items.
+            # materialized_task_id stays NULL forever for those rows.
+            if not lever:
+                from services.audit_evidence_builder import (
+                    _derive_lever_from_title,
+                )
+                lever = _derive_lever_from_title(title.strip())
             # Dedup key: lever when present (stable cross-product ID),
             # else title.
             key = (lever or title).lower()

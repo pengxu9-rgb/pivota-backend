@@ -387,6 +387,17 @@ async def build_and_persist_all_projections(
     findings = await list_findings_for_run(audit_run_id=audit_run_id)
     actions = await list_actions_for_run(audit_run_id=audit_run_id)
 
+    # PR-codex-review-followup: the per-audience builders include a
+    # merchant_id field inside the payload, but the report_projections
+    # table also has its own merchant_id COLUMN (added by migration
+    # 088 for the schema-tenancy invariant). The column was staying
+    # NULL because this loop didn't pass merchant_id through to
+    # upsert_projection. Pull it from the audit row once and thread
+    # it through.
+    merchant_id_for_row = (
+        audit_row.get("merchant_id") if audit_row else None
+    )
+
     for audience in VALID_AUDIENCES:
         try:
             payload = build_projection(
@@ -404,6 +415,7 @@ async def build_and_persist_all_projections(
                 audience=audience,
                 payload=payload,
                 builder_version=_BUILDER_VERSION,
+                merchant_id=merchant_id_for_row,
             )
             summary["projections_built"] += 1
         except Exception as exc:  # noqa: BLE001
