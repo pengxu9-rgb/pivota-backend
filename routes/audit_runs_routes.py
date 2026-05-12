@@ -217,14 +217,24 @@ async def create_audit_run(
     )
 
 
-@router.get("/{run_id}", response_model=AuditRunDetail)
+@router.get("/{run_id}")
 async def get_audit_run(
     run_id: str,
+    audience: Optional[str] = None,
     auth_merchant_id: str = Depends(get_current_merchant),
-) -> AuditRunDetail:
-    """Fetch the current state of an audit run. Returns the canonical
-    shape with stage, partial_result, report (when terminal), cost
-    summary, and error info."""
+):
+    """Fetch the current state of an audit run.
+
+    Default (no `?audience` param): returns the canonical shape with
+    stage, partial_result, report (when terminal), cost summary,
+    and error info — matches the P2.3 contract.
+
+    With `?audience=X`: returns the cached P4.5 projection for that
+    audience. Valid values: employee_bd, merchant, internal_ops,
+    pivota_pdp_feed, frontend_agent_feed. If the projection hasn't
+    been built yet (audit not at stage=completed), returns 409
+    Conflict pointing the caller at the no-audience read.
+    """
     row = await fetch_audit_run_by_id(run_id=run_id)
     if row is None:
         raise HTTPException(
@@ -237,6 +247,41 @@ async def get_audit_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Audit run {run_id} not found",
         )
+
+    # P4.5: if the caller asked for a specific audience projection,
+    # return the cached shape (or 409 if not yet built).
+    if audience is not None:
+        from db.audit_evidence import (
+            VALID_AUDIENCES, fetch_projection,
+        )
+        if audience not in VALID_AUDIENCES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Unknown audience {audience!r}. Valid values: "
+                    f"{sorted(VALID_AUDIENCES)}"
+                ),
+            )
+        proj = await fetch_projection(
+            audit_run_id=run_id, audience=audience,
+        )
+        if proj is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": (
+                        f"Projection for audience {audience!r} not yet "
+                        f"built. Audit run may not be at stage=completed."
+                    ),
+                    "current_stage": row.get("stage"),
+                    "fallback": (
+                        f"GET /api/audits/{run_id} (no audience) "
+                        f"returns the canonical shape."
+                    ),
+                },
+            )
+        return proj.get("payload_jsonb")
+
     return AuditRunDetail(**row)
 
 
