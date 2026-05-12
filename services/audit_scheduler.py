@@ -141,14 +141,23 @@ async def start_scheduler() -> None:
         )
 
         # P5.2: drive verification_runs through the durable queue.
-        # No production traffic until P5.7 enqueues at audit
-        # completion AND P5.3-P5.6 register verifiers — both gates
-        # close before the first non-stub work flows. Until then,
-        # the tick is a safe no-op against an empty queue.
+        # P5.3: import services.verifiers to trigger register_verifier
+        # side-effects (each verifier module registers itself at
+        # import time).
         from services.verification_run_worker import (
             run_verification_worker_tick,
             run_verification_lease_reaper_tick,
         )
+        try:
+            import services.verifiers  # noqa: F401 — side-effect import
+        except Exception as exc:  # noqa: BLE001
+            # If verifier imports break, the worker still ticks
+            # against an empty registry — better than scheduler
+            # init failing entirely.
+            logger.warning(
+                "audit_scheduler: verifier registration failed: %s",
+                exc,
+            )
         scheduler.add_job(
             run_verification_worker_tick,
             "interval",
