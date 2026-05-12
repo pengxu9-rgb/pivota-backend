@@ -4647,13 +4647,26 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                 sections.append("\n".join(chain_rows) + "\n")
             pc = cl.get("platform_coverage") or {}
             if pc:
+                # PR-codex-review-followup: platform_coverage shape
+                # changed from `{shipped, roadmap}` to `{shipped,
+                # audit_only, custom_integration, note}` in PR-10a +
+                # PR-10c. The legacy `roadmap` key no longer exists,
+                # so this section was rendering "Roadmap: (none)"
+                # forever while the actually-useful audit_only +
+                # custom_integration disclosures stayed invisible.
                 shipped_list = ", ".join(pc.get("shipped") or [])
-                roadmap_list = ", ".join(pc.get("roadmap") or [])
+                audit_only_list = ", ".join(pc.get("audit_only") or [])
                 sections.append(
                     f"**Platform coverage.** "
-                    f"Today: {shipped_list or '(none)'}. "
-                    f"Roadmap: {roadmap_list or '(none)'}.\n"
+                    f"Shipped end-to-end: {shipped_list or '(none)'}. "
+                    f"Audit + manual order routing: "
+                    f"{audit_only_list or '(none)'}.\n"
                 )
+                if pc.get("custom_integration"):
+                    sections.append(
+                        f"_Custom / headless storefronts: "
+                        f"{pc['custom_integration']}_\n"
+                    )
                 if pc.get("note"):
                     sections.append(f"_{pc['note']}_\n")
             if cl.get("outcome"):
