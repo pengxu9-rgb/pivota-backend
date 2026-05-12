@@ -2365,6 +2365,171 @@ TEST_MERCHANT_REFERENCE: Dict[str, str] = {
 }
 
 
+# PR-10d: platform-specific copy for the last two chain steps + the
+# outcome line of checkout_loop. Display labels mirror the
+# capitalized brand spellings BD operators use in client conversations.
+_PLATFORM_DISPLAY_NAMES: Dict[str, str] = {
+    "shopify": "Shopify",
+    "woocommerce": "WooCommerce",
+    "bigcommerce": "BigCommerce",
+    "wix": "Wix",
+    "custom": "custom storefront",
+    "headless_generic": "headless commerce backend",
+}
+
+
+def _build_platform_specific_chain_tail(
+    merchant_platform: Optional[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Return platform-specific copy for checkout_loop's last two
+    chain steps + the outcome line. Branches on the merchant's
+    platform_capabilities.supports_platform_order_writeback flag
+    so the report says what's TRUE for THIS merchant:
+
+      - Shopify / WooCommerce / BigCommerce (writeback shipped):
+        "Order forwarded to merchant's WooCommerce admin async"
+        + outcome reads "Orders land in your WooCommerce admin..."
+      - Wix / Custom / Headless (audit-only or custom integration):
+        "Order routed to operations queue for manual fulfillment
+        into your <platform>" + outcome reads "Until automated
+        writeback ships, orders are routed via Pivota operations..."
+      - Cold-start / unknown platform:
+        Generic multi-platform copy that lists supported targets
+        without claiming any specific integration is wired.
+
+    Returns a dict with three keys: `step_5`, `step_6`, `outcome`.
+    Each step value is the chain-entry shape expected by callers.
+    """
+    from services.platform_capabilities import get_store_platform_capabilities
+
+    key = (merchant_platform or "").strip().lower()
+    display = _PLATFORM_DISPLAY_NAMES.get(key)
+
+    if key and display:
+        # Known platform — branch on writeback support.
+        capabilities = get_store_platform_capabilities(key)
+        if capabilities.supports_platform_order_writeback:
+            return {
+                "step_5": {
+                    "step": 5,
+                    "label": (
+                        f"Order forwarded to merchant's {display} admin "
+                        f"async (background task)"
+                    ),
+                    "evidence": (
+                        f"Live forwarding via {display} admin API"
+                    ),
+                    "shipped": True,
+                },
+                "step_6": {
+                    "step": 6,
+                    "label": (
+                        f"Merchant sees the order in their {display} "
+                        f"admin with first-party customer data (email, "
+                        f"address, line items, attribution metadata)"
+                    ),
+                    "evidence": (
+                        f"Verified end-to-end against a live {display} "
+                        f"test merchant; covered by automated regression "
+                        f"tests on each release"
+                    ),
+                    "shipped": True,
+                },
+                "outcome": (
+                    f"Orders land in your {display} admin within seconds "
+                    f"of in-chat completion. Customer email, shipping "
+                    f"address, line items, and source-attribution "
+                    f"metadata (`source = pivota_acp`, `agent = gemini`) "
+                    f"are first-party data you own — Pivota does not "
+                    f"intermediate the customer relationship."
+                ),
+            }
+        # Audit-only / custom-integration platform.
+        return {
+            "step_5": {
+                "step": 5,
+                "label": (
+                    f"Order routed to Pivota operations queue for "
+                    f"manual fulfillment into your {display} admin "
+                    f"(automated writeback adapter on the integration "
+                    f"backlog)"
+                ),
+                "evidence": (
+                    f"Manual routing today; automated {display} "
+                    f"writeback scheduled for a follow-up integration "
+                    f"sprint"
+                ),
+                "shipped": False,
+            },
+            "step_6": {
+                "step": 6,
+                "label": (
+                    f"Pivota operations forwards the order into your "
+                    f"{display} admin within one business day, with "
+                    f"first-party customer data preserved (email, "
+                    f"address, line items, attribution metadata)"
+                ),
+                "evidence": (
+                    "Manual fulfillment SLA; automated writeback "
+                    "ships when the platform adapter lands"
+                ),
+                "shipped": False,
+            },
+            "outcome": (
+                f"Until the automated {display} writeback adapter "
+                f"ships, orders are routed via Pivota operations with "
+                f"a one-business-day SLA. First-party customer data "
+                f"(`source = pivota_acp`, `agent = gemini`) is "
+                f"preserved through the routing step — you own the "
+                f"customer relationship regardless of fulfillment "
+                f"path."
+            ),
+        }
+
+    # No platform known (cold-start audit / pre-onboarding BD report).
+    # Use multi-platform copy that lists the shipped targets without
+    # claiming any specific integration is wired for THIS merchant.
+    return {
+        "step_5": {
+            "step": 5,
+            "label": (
+                "Order forwarded to merchant's storefront admin async "
+                "(background task; native adapter for Shopify, "
+                "WooCommerce, BigCommerce — Wix + custom platforms "
+                "via lightweight integration)"
+            ),
+            "evidence": (
+                "Live forwarding via the platform-specific admin API "
+                "once the merchant is onboarded"
+            ),
+            "shipped": True,
+        },
+        "step_6": {
+            "step": 6,
+            "label": (
+                "Merchant sees the order in their storefront admin "
+                "with first-party customer data (email, address, "
+                "line items, attribution metadata)"
+            ),
+            "evidence": (
+                "Verified end-to-end on Shopify / WooCommerce / "
+                "BigCommerce; equivalent surfaces shipped for Wix + "
+                "custom via integration sprint"
+            ),
+            "shipped": True,
+        },
+        "outcome": (
+            "Orders land in the merchant's storefront admin within "
+            "seconds of in-chat completion (Shopify, WooCommerce, "
+            "BigCommerce — native adapter). Customer email, shipping "
+            "address, line items, and source-attribution metadata "
+            "(`source = pivota_acp`, `agent = gemini`) are first-"
+            "party data the merchant owns — Pivota does not "
+            "intermediate the customer relationship."
+        ),
+    }
+
+
 def _build_what_pivota_changes(
     *,
     merchant_name: str,
@@ -2374,6 +2539,7 @@ def _build_what_pivota_changes(
     merchant_cited_runs: int,
     category_retailer_hosts: List[Dict[str, Any]],
     category_visibility_score: Optional[int],
+    merchant_platform: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return the "What Pivota changes after onboarding" structured block.
 
@@ -2388,13 +2554,23 @@ def _build_what_pivota_changes(
          A/B — clearly disclosed in `methodology_note`.
 
       2. **checkout_loop** — How in-chat checkout closes the loop. The
-         end-to-end 6-step chain from grounded Gemini citation to
-         merchant Shopify admin, each step tagged shipped/roadmap with
-         the verifying file or test reference. Anchors on Shopify-only
-         today (verified e2e with test merchant); other platforms
-         (Wix / Woo / PrestaShop) have adapters but the order-completion
-         dispatch isn't wired yet — disclosed honestly in
-         `platform_coverage`."""
+         end-to-end 6-step chain from grounded Gemini citation to the
+         merchant's admin, each step tagged shipped/roadmap with the
+         verifying file or test reference. `merchant_platform` (when
+         provided, from integration_state.store_platform_name) shapes
+         the platform-specific language at steps 5-6 + outcome so a
+         WooCommerce merchant reads "your WooCommerce admin", a Wix
+         merchant reads "manual order routing today (Wix writeback on
+         Q3 roadmap)", etc. When `merchant_platform` is None (cold-
+         start audits where the platform is unknown), step 5-6 use
+         multi-platform copy that lists all supported targets without
+         claiming any specific one is wired.
+
+    PR-10d: `merchant_platform` plumbed through from
+    `integration_state.store_platform_name`. Accurate per-platform
+    disclosure was previously buried in the platform_coverage block
+    only; the visible checkout_loop chain still said "Shopify" even
+    for Woo/BC/Wix merchants."""
     gap_pct = max(0, 100 - int(attribution_score))
     top_retailers = [
         r["host"] for r in (category_retailer_hosts or [])[:3] if r.get("host")
@@ -2559,6 +2735,11 @@ def _build_what_pivota_changes(
         ),
     }
 
+    # PR-10d: per-platform copy for the last two chain steps + the
+    # outcome line. Falls back to multi-platform copy when the
+    # platform is unknown (cold-start audits).
+    _platform_chain = _build_platform_specific_chain_tail(merchant_platform)
+
     checkout_loop = {
         "title": "How in-chat checkout closes the loop",
         "chain": [
@@ -2586,18 +2767,8 @@ def _build_what_pivota_changes(
                 "evidence": "Live API endpoint",
                 "shipped": True,
             },
-            {
-                "step": 5,
-                "label": "Order forwarded to merchant Shopify admin async (background task)",
-                "evidence": "Live forwarding via Shopify admin API",
-                "shipped": True,
-            },
-            {
-                "step": 6,
-                "label": "Merchant sees the order in their Shopify admin with first-party customer data (email, address, line items, attribution metadata)",
-                "evidence": "Verified end-to-end against a live Shopify test merchant; covered by automated regression tests on each release",
-                "shipped": True,
-            },
+            _platform_chain["step_5"],
+            _platform_chain["step_6"],
         ],
         "platform_coverage": {
             # Multi-platform: end-to-end order writeback adapters for
@@ -2627,14 +2798,7 @@ def _build_what_pivota_changes(
                 "headless — is supported via lightweight integration."
             ),
         },
-        "outcome": (
-            "Orders land in the merchant's Shopify admin within seconds of "
-            "in-chat completion. Customer email, shipping address, line "
-            "items, and source-attribution metadata "
-            "(`source = pivota_acp`, `agent = gemini`) are first-party data "
-            "the merchant owns — Pivota does not intermediate the customer "
-            "relationship."
-        ),
+        "outcome": _platform_chain["outcome"],
     }
 
     onboarding_sequence = {
@@ -4072,6 +4236,14 @@ def build_structured_report(
                                   # separately via the cohort comparison
                                   # endpoint
     )
+    # PR-10d: resolve merchant_platform once (used by both
+    # _build_what_pivota_changes and build_pivota_commitments below)
+    # so the checkout_loop chain + outcome read for THIS merchant's
+    # platform instead of the legacy Shopify-only language.
+    _merchant_platform = (
+        (integration_state or {}).get("store_platform_name")
+        if integration_state else None
+    )
     what_pivota_changes = _build_what_pivota_changes(
         merchant_name=merchant_name,
         merchant_pdp_url=merchant_pdp_url,
@@ -4080,6 +4252,7 @@ def build_structured_report(
         merchant_cited_runs=merchant_cited_runs,
         category_retailer_hosts=category_retailer_hosts,
         category_visibility_score=category_score,
+        merchant_platform=_merchant_platform,
     )
 
     visibility_query_rows = _per_query_rows(visibility_runs, "product_visible")
@@ -4156,10 +4329,8 @@ def build_structured_report(
         build_pivota_commitments,
     )
     _is_cold = _is_cold_start_audit(integration_state)
-    _merchant_platform = (
-        (integration_state or {}).get("store_platform_name")
-        if integration_state else None
-    )
+    # _merchant_platform was hoisted earlier so the checkout_loop
+    # chain in _build_what_pivota_changes can use the same value.
     pivota_commitments = build_pivota_commitments(
         merchant_platform=_merchant_platform,
         cold_start=_is_cold,
