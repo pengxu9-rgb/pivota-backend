@@ -632,11 +632,23 @@ async def startup_event():
     # PR-1b: APM auto-re-audit cron. Best-effort — start_scheduler
     # logs + degrades gracefully if apscheduler is unavailable, so
     # this won't crash the API on missing dep.
+    #
+    # NOTE: scheduler init failures (import errors in worker modules,
+    # apscheduler version mismatches, etc.) were previously swallowed
+    # silently here, producing a deployment where audit endpoints
+    # accepted requests but no worker tick ever drained the queue.
+    # Log the exception with traceback so the boot-time failure is
+    # visible in logs while preserving the best-effort contract.
     try:
         from services.audit_scheduler import start_scheduler
         await start_scheduler()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception(
+            "audit_scheduler boot failed (continuing degraded; "
+            "audit endpoints will accept requests but no worker will "
+            "drain them until this is fixed): %s",
+            exc,
+        )
 
 
 async def shutdown_event():
