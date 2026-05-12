@@ -760,6 +760,12 @@ app.include_router(agent_center_admin_router)  # Agent Center: stuck-run inspect
 app.include_router(agent_center_bd_router)  # Agent Center: BD external-merchant AI visibility report
 app.include_router(merchant_audit_router)  # Merchant self-service AI Commerce Readiness audit (legacy synchronous)
 app.include_router(audit_runs_router)  # P2.3: async audit_runs lifecycle (POST/GET/cancel/list at /api/audits)
+
+# Operational endpoint: report APScheduler health (running? jobs registered?).
+# Root logger filters app-level INFO on Railway prod, so the scheduler success
+# log line never surfaces in log fetches; this endpoint provides direct state.
+from routes.scheduler_health import router as scheduler_health_router
+app.include_router(scheduler_health_router)
 app.include_router(gsc_oauth_router)  # Phase D: Google Search Console OAuth start + callback
 app.include_router(pivota_canonical_router)  # Public canonical PDP resolver (sig_* → product) + sitemap list
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
