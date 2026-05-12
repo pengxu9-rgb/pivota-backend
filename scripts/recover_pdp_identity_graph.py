@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Review-gated PDP identity graph repair.
 
-Dry-run is read-only. Apply mode writes only high-confidence identity edges:
-product_group_members, external_product_seeds.attached_product_key, and
-catalog_products.pdp_scope. It never writes external_product_seeds.seed_data or
-catalog_products.product_payload.
+Dry-run is read-only. Apply mode writes only high-confidence deterministic
+identity edges: product_group_members, external_product_seeds.attached_product_key,
+and catalog_products.pdp_scope. It never writes external_product_seeds.seed_data
+or catalog_products.product_payload.
 """
 
 from __future__ import annotations

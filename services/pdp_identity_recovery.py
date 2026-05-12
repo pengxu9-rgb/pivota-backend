@@ -20,7 +20,10 @@ from services.pdp_scope_classifier import SCOPE_CANONICAL
 
 
 IDENTITY_RECOVERY_SOURCE = "pdp_identity_recovery"
-DEFAULT_PROPOSER = "pdp_identity_recovery_20260511"
+DEFAULT_PROPOSER = "pdp_identity_graph_repair_20260512"
+EXTERNAL_SEED_MERCHANT_ID = "external_seed"
+EXTERNAL_SEED_PLATFORM = "external_seed"
+DEFAULT_SUSPECT_MERCHANT_IDS = ("merch_efbc46b4619cfbdf",)
 
 
 def _clean(value: Any) -> str:
@@ -78,6 +81,13 @@ def deterministic_product_group_id(product_key: str) -> str:
     return f"pg_catalog_{digest}"
 
 
+def deterministic_ext_identity_group_id(attached_product_key: str) -> str:
+    """Stable group id for review-gated ext:* product identities."""
+    identity_key = _clean(attached_product_key).lower()
+    digest = hashlib.sha256(identity_key.encode("utf-8")).hexdigest()[:16]
+    return f"pg_ext_{digest}"
+
+
 @dataclass(frozen=True)
 class IdentityRecoveryProposal:
     action: str
@@ -99,6 +109,8 @@ class IdentityRecoveryProposal:
             "internal_product_missing_group",
             "exact_title_brand_multi_merchant",
             "attached_external_seed_product_group_member",
+            "external_seed_catalog_missing_group",
+            "ext_identity_attached_key_group_member",
             "legacy_attached_key_exact_product_key",
             "legacy_attached_key_exact_title_same_merchant",
         }
@@ -331,6 +343,80 @@ def build_attached_external_seed_group_member_proposal(
     )
 
 
+def build_external_seed_catalog_group_member_proposal(
+    row: Dict[str, Any],
+) -> Optional[IdentityRecoveryProposal]:
+    """Create a singleton group for mirrored external_seed catalog offers.
+
+    Rows that already participate in a duplicated ext:* identity are handled by
+    build_ext_identity_group_member_proposal so the same product does not first
+    get a singleton group and then immediately move to the identity group.
+    """
+    product_key = _clean(row.get("product_key"))
+    source_product_id = _clean(row.get("source_product_id"))
+    merchant_id = _clean(row.get("merchant_id"))
+    platform = _clean(row.get("platform")).lower()
+    existing_group = _clean(row.get("product_group_id"))
+    ext_identity_cluster_key = _clean(row.get("ext_identity_cluster_key"))
+    offer_count = int(row.get("offer_count") or 0)
+    if not (
+        product_key
+        and source_product_id
+        and merchant_id == EXTERNAL_SEED_MERCHANT_ID
+        and platform == EXTERNAL_SEED_PLATFORM
+    ):
+        return None
+    if offer_count <= 0 or existing_group or ext_identity_cluster_key:
+        return None
+    return IdentityRecoveryProposal(
+        action="upsert_product_group_member",
+        confidence=1.0,
+        reason="external_seed_catalog_missing_group",
+        product_key=product_key,
+        product_group_id=deterministic_product_group_id(product_key),
+        merchant_id=EXTERNAL_SEED_MERCHANT_ID,
+        platform=EXTERNAL_SEED_PLATFORM,
+        source_product_id=source_product_id,
+        is_primary=True,
+    )
+
+
+def build_ext_identity_group_member_proposal(row: Dict[str, Any]) -> Optional[IdentityRecoveryProposal]:
+    """Group external offers that share the same review-gated ext:* identity."""
+    attached_product_key = _clean(row.get("attached_product_key"))
+    product_key = _clean(row.get("product_key"))
+    external_product_id = _clean(row.get("external_product_id") or row.get("source_product_id"))
+    existing_group = _clean(row.get("product_group_id"))
+    existing_is_primary = bool(row.get("is_primary"))
+    cluster_external_products = int(row.get("cluster_external_products") or 0)
+    primary_rank = int(row.get("primary_rank") or 0)
+    has_offer = bool(row.get("has_offer"))
+    if not (
+        attached_product_key.startswith("ext:")
+        and product_key
+        and external_product_id
+        and cluster_external_products >= 2
+        and has_offer
+    ):
+        return None
+    product_group_id = deterministic_ext_identity_group_id(attached_product_key)
+    should_be_primary = primary_rank == 1
+    if existing_group == product_group_id and existing_is_primary == should_be_primary:
+        return None
+    return IdentityRecoveryProposal(
+        action="upsert_product_group_member",
+        confidence=0.99,
+        reason="ext_identity_attached_key_group_member",
+        seed_id=_clean(row.get("id")) or None,
+        product_key=product_key,
+        product_group_id=product_group_id,
+        merchant_id=EXTERNAL_SEED_MERCHANT_ID,
+        platform=EXTERNAL_SEED_PLATFORM,
+        source_product_id=external_product_id,
+        is_primary=should_be_primary,
+    )
+
+
 async def fetch_internal_group_gap_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
@@ -543,8 +629,128 @@ async def fetch_attached_external_seed_group_rows(*, limit: int, offset: int) ->
     return [dict(row) for row in rows or []]
 
 
+async def fetch_external_seed_catalog_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        WITH duplicate_ext_identities AS (
+          SELECT attached_product_key
+          FROM external_product_seeds
+          WHERE status = 'active'
+            AND attached_product_key LIKE 'ext:%'
+          GROUP BY attached_product_key
+          HAVING COUNT(DISTINCT external_product_id) >= 2
+        ),
+        seed_identity AS (
+          SELECT DISTINCT ON (eps.external_product_id)
+                 eps.external_product_id,
+                 eps.attached_product_key
+          FROM external_product_seeds eps
+          JOIN duplicate_ext_identities dei
+            ON dei.attached_product_key = eps.attached_product_key
+          WHERE eps.status = 'active'
+            AND NULLIF(BTRIM(COALESCE(eps.external_product_id, '')), '') IS NOT NULL
+          ORDER BY eps.external_product_id, eps.updated_at DESC NULLS LAST, eps.id ASC
+        )
+        SELECT cp.product_key,
+               cp.merchant_id,
+               cp.platform,
+               cp.source_product_id,
+               cp.title,
+               cp.brand,
+               cp.pdp_scope,
+               cp.pdp_lifecycle_stage,
+               pgm.product_group_id,
+               pgm.is_primary,
+               seed_identity.attached_product_key AS ext_identity_cluster_key,
+               (
+                 SELECT COUNT(*)
+                 FROM catalog_offers co
+                 WHERE co.product_key = cp.product_key
+               ) AS offer_count
+        FROM catalog_products cp
+        LEFT JOIN product_group_members pgm
+          ON pgm.merchant_id = cp.merchant_id
+         AND pgm.platform = cp.platform
+         AND pgm.platform_product_id = cp.source_product_id
+        LEFT JOIN seed_identity
+          ON seed_identity.external_product_id = cp.source_product_id
+        WHERE cp.merchant_id = 'external_seed'
+          AND cp.platform = 'external_seed'
+          AND cp.source_product_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM catalog_offers co WHERE co.product_key = cp.product_key
+          )
+        ORDER BY cp.updated_at DESC NULLS LAST, cp.product_key ASC
+        LIMIT :limit OFFSET :offset
+        """,
+        {"limit": int(limit), "offset": int(offset)},
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def fetch_ext_identity_cluster_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        WITH duplicate_ext_identities AS (
+          SELECT attached_product_key,
+                 COUNT(DISTINCT external_product_id)::int AS cluster_external_products,
+                 COUNT(DISTINCT domain)::int AS cluster_domains
+          FROM external_product_seeds
+          WHERE status = 'active'
+            AND attached_product_key LIKE 'ext:%'
+            AND NULLIF(BTRIM(COALESCE(external_product_id, '')), '') IS NOT NULL
+          GROUP BY attached_product_key
+          HAVING COUNT(DISTINCT external_product_id) >= 2
+        ),
+        ext_rows AS (
+          SELECT eps.id,
+                 eps.external_product_id,
+                 eps.attached_product_key,
+                 eps.title AS seed_title,
+                 eps.domain,
+                 dei.cluster_external_products,
+                 dei.cluster_domains,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY eps.attached_product_key
+                   ORDER BY eps.domain ASC NULLS LAST, eps.external_product_id ASC
+                 ) AS primary_rank
+          FROM external_product_seeds eps
+          JOIN duplicate_ext_identities dei
+            ON dei.attached_product_key = eps.attached_product_key
+          WHERE eps.status = 'active'
+          ORDER BY eps.attached_product_key ASC, eps.external_product_id ASC
+          LIMIT :limit OFFSET :offset
+        )
+        SELECT ext_rows.*,
+               cp.product_key,
+               cp.source_product_id,
+               cp.title AS product_title,
+               cp.brand AS product_brand,
+               pgm.product_group_id,
+               COALESCE(pgm.is_primary, FALSE) AS is_primary,
+               EXISTS (
+                 SELECT 1 FROM catalog_offers co WHERE co.product_key = cp.product_key
+               ) AS has_offer
+        FROM ext_rows
+        LEFT JOIN catalog_products cp
+          ON cp.merchant_id = 'external_seed'
+         AND cp.platform = 'external_seed'
+         AND cp.source_product_id = ext_rows.external_product_id
+        LEFT JOIN product_group_members pgm
+          ON pgm.merchant_id = 'external_seed'
+         AND pgm.platform = 'external_seed'
+         AND pgm.platform_product_id = ext_rows.external_product_id
+        ORDER BY ext_rows.attached_product_key ASC, ext_rows.external_product_id ASC
+        """,
+        {"limit": int(limit), "offset": int(offset)},
+    )
+    return [dict(row) for row in rows or []]
+
+
 async def build_recovery_proposals(*, limit: int, offset: int) -> Dict[str, Any]:
     group_rows = await fetch_internal_group_gap_rows(limit=limit, offset=offset)
+    external_seed_catalog_rows = await fetch_external_seed_catalog_rows(limit=limit, offset=offset)
+    ext_identity_rows = await fetch_ext_identity_cluster_rows(limit=limit, offset=offset)
     multi_merchant_rows = await fetch_multi_merchant_candidate_rows(limit=limit, offset=offset)
     legacy_rows = await fetch_legacy_attachment_rows(limit=limit, offset=offset)
     attached_external_seed_rows = await fetch_attached_external_seed_group_rows(limit=limit, offset=offset)
@@ -562,6 +768,28 @@ async def build_recovery_proposals(*, limit: int, offset: int) -> Dict[str, Any]
         proposal = build_singleton_group_proposal(row)
         if proposal:
             proposals.append(proposal)
+    for row in external_seed_catalog_rows:
+        proposal = build_external_seed_catalog_group_member_proposal(row)
+        if proposal:
+            proposals.append(proposal)
+    for row in ext_identity_rows:
+        proposal = build_ext_identity_group_member_proposal(row)
+        if proposal:
+            proposals.append(proposal)
+        else:
+            reason = "ext_identity_not_high_confidence"
+            if not row.get("product_key"):
+                reason = "ext_identity_missing_external_seed_catalog_product"
+            elif not row.get("has_offer"):
+                reason = "ext_identity_missing_catalog_offer"
+            rejected.append(
+                {
+                    "seed_id": row.get("id"),
+                    "external_product_id": row.get("external_product_id"),
+                    "attached_product_key": row.get("attached_product_key"),
+                    "reason": reason,
+                }
+            )
     for row in legacy_rows:
         proposal = build_exact_legacy_attachment_proposal(row) or build_stale_title_attachment_proposal(row)
         if proposal:
@@ -589,25 +817,259 @@ async def build_recovery_proposals(*, limit: int, offset: int) -> Dict[str, Any]
             )
 
     by_action: Dict[str, int] = {}
+    by_reason: Dict[str, int] = {}
     for proposal in proposals:
         by_action[proposal.action] = by_action.get(proposal.action, 0) + 1
+        by_reason[proposal.reason] = by_reason.get(proposal.reason, 0) + 1
 
     return {
         "rows_considered": {
             "internal_group_gap_rows": len(group_rows),
+            "external_seed_catalog_rows": len(external_seed_catalog_rows),
+            "ext_identity_rows": len(ext_identity_rows),
             "multi_merchant_candidate_rows": len(multi_merchant_rows),
             "legacy_attachment_rows": len(legacy_rows),
             "attached_external_seed_group_rows": len(attached_external_seed_rows),
             "total": (
                 len(group_rows)
+                + len(external_seed_catalog_rows)
+                + len(ext_identity_rows)
                 + len(multi_merchant_rows)
                 + len(legacy_rows)
                 + len(attached_external_seed_rows)
             ),
         },
         "proposal_counts": by_action,
+        "proposal_reason_counts": by_reason,
         "proposals": [proposal.to_dict() for proposal in proposals],
         "rejected": rejected,
+    }
+
+
+async def build_identity_graph_audit_report(
+    *,
+    limit: int,
+    offset: int,
+    suspect_merchant_ids: Sequence[str] = DEFAULT_SUSPECT_MERCHANT_IDS,
+) -> Dict[str, Any]:
+    suspect_ids = sorted({_clean(value) for value in suspect_merchant_ids if _clean(value)})
+    if not suspect_ids:
+        suspect_ids = ["__none__"]
+    recovery = await build_recovery_proposals(limit=limit, offset=offset)
+    external_seed_coverage = await database.fetch_one(
+        """
+        SELECT COUNT(*)::int AS external_seed_catalog_products,
+               COUNT(*) FILTER (
+                 WHERE EXISTS (SELECT 1 FROM catalog_offers co WHERE co.product_key = cp.product_key)
+               )::int AS with_offers,
+               COUNT(*) FILTER (
+                 WHERE EXISTS (
+                   SELECT 1
+                   FROM product_group_members pgm
+                   WHERE pgm.merchant_id = 'external_seed'
+                     AND pgm.platform = 'external_seed'
+                     AND pgm.platform_product_id = cp.source_product_id
+                 )
+               )::int AS with_group_member,
+               COUNT(*) FILTER (WHERE cp.pdp_scope = 'multi_merchant_canonical')::int AS multi_merchant_scope,
+               COUNT(*) FILTER (WHERE cp.pdp_lifecycle_stage IN ('validated','published'))::int AS live_lifecycle
+        FROM catalog_products cp
+        WHERE cp.merchant_id = 'external_seed'
+        """
+    )
+    prod_attachment_coverage = await database.fetch_one(
+        """
+        WITH eps AS (
+          SELECT id, external_product_id, attached_product_key
+          FROM external_product_seeds
+          WHERE status = 'active'
+            AND attached_product_key LIKE 'prod::%'
+        ),
+        attached AS (
+          SELECT eps.*,
+                 cp.product_key AS parent_product_key,
+                 pgm.product_group_id AS parent_product_group_id,
+                 EXISTS (
+                   SELECT 1
+                   FROM product_group_members em
+                   WHERE em.product_group_id = pgm.product_group_id
+                     AND em.merchant_id = 'external_seed'
+                     AND em.platform = 'external_seed'
+                     AND em.platform_product_id = eps.external_product_id
+                 ) AS has_external_seed_member
+          FROM eps
+          LEFT JOIN catalog_products cp
+            ON cp.product_key = eps.attached_product_key
+          LEFT JOIN product_group_members pgm
+            ON pgm.merchant_id = cp.merchant_id
+           AND pgm.platform = cp.platform
+           AND pgm.platform_product_id = cp.source_product_id
+        )
+        SELECT COUNT(*)::int AS prod_key_attached_rows,
+               COUNT(*) FILTER (WHERE parent_product_key IS NOT NULL)::int AS parent_catalog_exists,
+               COUNT(*) FILTER (WHERE parent_product_group_id IS NOT NULL)::int AS parent_group_exists,
+               COUNT(*) FILTER (WHERE has_external_seed_member)::int AS external_member_same_group,
+               COUNT(*) FILTER (
+                 WHERE parent_product_group_id IS NOT NULL AND NOT has_external_seed_member
+               )::int AS missing_external_member
+        FROM attached
+        """
+    )
+    ext_identity_coverage = await database.fetch_one(
+        """
+        WITH eps AS (
+          SELECT attached_product_key, external_product_id, domain
+          FROM external_product_seeds
+          WHERE status = 'active'
+            AND attached_product_key LIKE 'ext:%'
+        ),
+        clusters AS (
+          SELECT attached_product_key,
+                 COUNT(DISTINCT external_product_id)::int AS external_products,
+                 COUNT(DISTINCT domain)::int AS domains
+          FROM eps
+          GROUP BY attached_product_key
+          HAVING COUNT(DISTINCT external_product_id) > 1
+        ),
+        rows AS (
+          SELECT eps.*,
+                 clusters.external_products,
+                 clusters.domains,
+                 cp.product_key,
+                 pgm.product_group_id
+          FROM eps
+          JOIN clusters ON clusters.attached_product_key = eps.attached_product_key
+          LEFT JOIN catalog_products cp
+            ON cp.merchant_id = 'external_seed'
+           AND cp.platform = 'external_seed'
+           AND cp.source_product_id = eps.external_product_id
+          LEFT JOIN product_group_members pgm
+            ON pgm.merchant_id = 'external_seed'
+           AND pgm.platform = 'external_seed'
+           AND pgm.platform_product_id = eps.external_product_id
+        )
+        SELECT COUNT(DISTINCT attached_product_key)::int AS duplicate_ext_identity_clusters,
+               COUNT(DISTINCT attached_product_key) FILTER (WHERE domains > 1)::int AS multi_domain_clusters,
+               COUNT(*)::int AS external_products_in_duplicate_clusters,
+               COUNT(*) FILTER (WHERE product_key IS NOT NULL)::int AS catalog_product_exists,
+               COUNT(*) FILTER (WHERE product_group_id IS NOT NULL)::int AS has_any_group_member
+        FROM rows
+        """
+    )
+    review_only = await database.fetch_one(
+        """
+        WITH base AS (
+          SELECT cp.product_key,
+                 cp.source_product_id,
+                 lower(regexp_replace(coalesce(cp.canonical_url,''), '^https?://([^/]+).*$','\\1')) AS domain,
+                 regexp_replace(lower(btrim(coalesce(cp.title,''))), '[^a-z0-9%+]+', ' ', 'g') AS title_norm,
+                 regexp_replace(lower(btrim(coalesce(cp.brand,''))), '[^a-z0-9%+]+', ' ', 'g') AS brand_norm,
+                 pgm.product_group_id
+          FROM catalog_products cp
+          LEFT JOIN product_group_members pgm
+            ON pgm.merchant_id = 'external_seed'
+           AND pgm.platform = 'external_seed'
+           AND pgm.platform_product_id = cp.source_product_id
+          WHERE cp.merchant_id = 'external_seed'
+            AND EXISTS (SELECT 1 FROM catalog_offers co WHERE co.product_key = cp.product_key)
+        ),
+        clusters AS (
+          SELECT title_norm, brand_norm,
+                 COUNT(DISTINCT product_key)::int AS products,
+                 COUNT(DISTINCT domain)::int AS domains,
+                 COUNT(DISTINCT product_group_id) FILTER (WHERE product_group_id IS NOT NULL)::int AS groups,
+                 COUNT(*) FILTER (WHERE product_group_id IS NULL)::int AS missing_group_rows
+          FROM base
+          WHERE title_norm <> '' AND brand_norm <> ''
+          GROUP BY title_norm, brand_norm
+          HAVING COUNT(DISTINCT product_key) > 1
+             AND COUNT(DISTINCT domain) > 1
+        )
+        SELECT COUNT(*)::int AS exact_title_brand_multi_domain_clusters,
+               COALESCE(SUM(products), 0)::int AS products,
+               COUNT(*) FILTER (WHERE groups > 1 OR missing_group_rows > 0)::int AS review_only_unmerged_clusters,
+               COALESCE(SUM(products) FILTER (WHERE groups > 1 OR missing_group_rows > 0), 0)::int AS review_only_products
+        FROM clusters
+        """
+    )
+    suspect_cache = await database.fetch_one(
+        """
+        SELECT COUNT(*)::int AS suspect_catalog_products,
+               COUNT(*) FILTER (
+                 WHERE EXISTS (SELECT 1 FROM catalog_offers co WHERE co.product_key = cp.product_key)
+               )::int AS with_offers,
+               COUNT(*) FILTER (WHERE cp.pdp_scope = 'multi_merchant_canonical')::int AS multi_merchant_scope,
+               COUNT(*) FILTER (WHERE cp.pdp_lifecycle_stage IN ('validated','published'))::int AS live_lifecycle
+        FROM catalog_products cp
+        WHERE cp.merchant_id = ANY(:suspect_merchant_ids)
+        """,
+        {"suspect_merchant_ids": suspect_ids},
+    )
+    merchant_anchor_breakdown = await database.fetch_all(
+        """
+        WITH store_status AS (
+          SELECT merchant_id, platform,
+                 bool_or(status = 'active') AS has_active_store,
+                 array_agg(DISTINCT status ORDER BY status) AS store_statuses,
+                 array_agg(DISTINCT domain ORDER BY domain) AS domains
+          FROM merchant_stores
+          GROUP BY merchant_id, platform
+        )
+        SELECT cp.merchant_id,
+               cp.platform,
+               COALESCE(mo.status, 'NO_MERCHANT') AS merchant_status,
+               COALESCE(ss.has_active_store, FALSE) AS has_active_store,
+               cp.merchant_id = ANY(:suspect_merchant_ids) AS suspect_cache_cohort,
+               ss.store_statuses,
+               ss.domains,
+               COUNT(DISTINCT cp.product_key)::int AS products,
+               COUNT(DISTINCT cp.product_key) FILTER (
+                 WHERE EXISTS (SELECT 1 FROM catalog_offers co WHERE co.product_key = cp.product_key)
+               )::int AS products_with_offers,
+               COUNT(DISTINCT cp.product_key) FILTER (WHERE cp.pdp_scope = 'multi_merchant_canonical')::int AS multi_merchant_scope,
+               COUNT(DISTINCT cp.product_key) FILTER (WHERE cp.pdp_lifecycle_stage IN ('validated','published'))::int AS live_lifecycle
+        FROM catalog_products cp
+        LEFT JOIN merchant_onboarding mo ON mo.merchant_id = cp.merchant_id
+        LEFT JOIN store_status ss ON ss.merchant_id = cp.merchant_id AND ss.platform = cp.platform
+        WHERE cp.merchant_id <> 'external_seed'
+        GROUP BY cp.merchant_id, cp.platform, COALESCE(mo.status, 'NO_MERCHANT'),
+                 COALESCE(ss.has_active_store, FALSE), cp.merchant_id = ANY(:suspect_merchant_ids),
+                 ss.store_statuses, ss.domains
+        ORDER BY products DESC, cp.merchant_id ASC
+        """,
+        {"suspect_merchant_ids": suspect_ids},
+    )
+    external = dict(external_seed_coverage or {})
+    prod_attachment = dict(prod_attachment_coverage or {})
+    ext_identity = dict(ext_identity_coverage or {})
+    review = dict(review_only or {})
+    suspect = dict(suspect_cache or {})
+    root_causes = {
+        "missing_external_seed_group_member": max(
+            0, int(external.get("with_offers") or 0) - int(external.get("with_group_member") or 0)
+        ),
+        "stale_or_suspect_merchant_cache": int(suspect.get("suspect_catalog_products") or 0),
+        "unpromoted_ext_identity_products": max(
+            0,
+            int(ext_identity.get("catalog_product_exists") or 0)
+            - int(ext_identity.get("has_any_group_member") or 0),
+        ),
+        "review_only_exact_title_brand_products": int(review.get("review_only_products") or 0),
+        "prod_key_attachment_missing_external_member": int(prod_attachment.get("missing_external_member") or 0),
+    }
+    return {
+        "dry_run": True,
+        "limit": int(limit),
+        "offset": int(offset),
+        "suspect_merchant_ids": suspect_ids,
+        "root_cause_counts": root_causes,
+        "merchant_anchor_breakdown": [dict(row) for row in merchant_anchor_breakdown or []],
+        "external_seed_catalog_group_coverage": external,
+        "prod_key_attachment_coverage": prod_attachment,
+        "ext_identity_duplicate_coverage": ext_identity,
+        "review_only_exact_title_brand_multi_domain": review,
+        "suspect_cache_cohort": suspect,
+        "proposal_preview": recovery,
     }
 
 
@@ -723,6 +1185,17 @@ async def _promote_canonical_scopes(product_keys: Sequence[str]) -> int:
                 AND own.platform = cp.platform
                 AND own.platform_product_id = cp.source_product_id
             )
+            OR EXISTS (
+              SELECT 1
+              FROM product_group_members own
+              JOIN product_group_members peer
+                ON peer.product_group_id = own.product_group_id
+               AND peer.platform_product_id <> own.platform_product_id
+              WHERE cp.merchant_id = 'external_seed'
+                AND own.merchant_id = cp.merchant_id
+                AND own.platform = cp.platform
+                AND own.platform_product_id = cp.source_product_id
+            )
           )
         """,
         {
@@ -774,8 +1247,12 @@ async def apply_recovery_proposals(
         promoted_scope_count = await _promote_canonical_scopes(touched_product_keys)
 
     counts: Dict[str, int] = {}
+    reason_counts: Dict[str, int] = {}
     for item in applied:
         counts[item["action"]] = counts.get(item["action"], 0) + 1
+        reason = str(item.get("reason") or "")
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
     return {
         "status": "success",
         "proposer": proposer,
@@ -783,6 +1260,7 @@ async def apply_recovery_proposals(
         "rejected_count": len(rejected),
         "promoted_scope_count": promoted_scope_count,
         "applied_counts": counts,
+        "applied_reason_counts": reason_counts,
         "applied": applied,
         "rejected": rejected,
     }

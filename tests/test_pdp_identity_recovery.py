@@ -1,9 +1,12 @@
 from services.pdp_identity_recovery import (
     build_attached_external_seed_group_member_proposal,
+    build_ext_identity_group_member_proposal,
+    build_external_seed_catalog_group_member_proposal,
     build_exact_legacy_attachment_proposal,
     build_multi_merchant_group_proposals,
     build_singleton_group_proposal,
     build_stale_title_attachment_proposal,
+    deterministic_ext_identity_group_id,
     deterministic_product_group_id,
     make_catalog_product_key,
     parse_legacy_attached_product_key,
@@ -248,6 +251,101 @@ def test_attached_external_seed_group_member_proposal_requires_current_product_k
             "external_product_id": "ext_legacy",
             "attached_product_key": "merch_1|shopify|100",
             "product_group_id": "pg_catalog_abc",
+        }
+    )
+
+    assert proposal is None
+
+
+def test_external_seed_catalog_group_member_proposal_builds_singleton() -> None:
+    product_key = make_catalog_product_key("external_seed", "external_seed", "ext_mac")
+    proposal = build_external_seed_catalog_group_member_proposal(
+        {
+            "product_key": product_key,
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_product_id": "ext_mac",
+            "offer_count": 1,
+            "product_group_id": None,
+        }
+    )
+
+    assert proposal is not None
+    assert proposal.action == "upsert_product_group_member"
+    assert proposal.reason == "external_seed_catalog_missing_group"
+    assert proposal.high_confidence is True
+    assert proposal.product_group_id == deterministic_product_group_id(product_key)
+    assert proposal.merchant_id == "external_seed"
+    assert proposal.platform == "external_seed"
+    assert proposal.source_product_id == "ext_mac"
+    assert proposal.is_primary is True
+
+
+def test_external_seed_catalog_group_member_proposal_skips_ext_identity_cluster() -> None:
+    proposal = build_external_seed_catalog_group_member_proposal(
+        {
+            "product_key": make_catalog_product_key("external_seed", "external_seed", "ext_mac"),
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_product_id": "ext_mac",
+            "offer_count": 1,
+            "product_group_id": None,
+            "ext_identity_cluster_key": "ext:mac-russian-red-matte-lipstick::e470b265",
+        }
+    )
+
+    assert proposal is None
+
+
+def test_ext_identity_group_id_is_stable_and_key_scoped() -> None:
+    key = "ext:mac-russian-red-matte-lipstick::e470b265"
+
+    assert deterministic_ext_identity_group_id(key) == deterministic_ext_identity_group_id(key.upper())
+    assert deterministic_ext_identity_group_id(key).startswith("pg_ext_")
+    assert deterministic_ext_identity_group_id(key) != deterministic_ext_identity_group_id(
+        "ext:mac-diva-matte-lipstick::dbee98fb"
+    )
+
+
+def test_ext_identity_group_member_proposal_uses_shared_identity_group() -> None:
+    attached_key = "ext:mac-russian-red-matte-lipstick::e470b265"
+    proposal = build_ext_identity_group_member_proposal(
+        {
+            "id": "seed:mac",
+            "external_product_id": "mac:62c89320b830814c",
+            "attached_product_key": attached_key,
+            "product_key": make_catalog_product_key("external_seed", "external_seed", "mac:62c89320b830814c"),
+            "product_group_id": None,
+            "cluster_external_products": 2,
+            "primary_rank": 1,
+            "has_offer": True,
+        }
+    )
+
+    assert proposal is not None
+    assert proposal.action == "upsert_product_group_member"
+    assert proposal.reason == "ext_identity_attached_key_group_member"
+    assert proposal.high_confidence is True
+    assert proposal.product_group_id == deterministic_ext_identity_group_id(attached_key)
+    assert proposal.merchant_id == "external_seed"
+    assert proposal.platform == "external_seed"
+    assert proposal.source_product_id == "mac:62c89320b830814c"
+    assert proposal.is_primary is True
+
+
+def test_ext_identity_group_member_proposal_skips_existing_correct_member() -> None:
+    attached_key = "ext:mac-russian-red-matte-lipstick::e470b265"
+    proposal = build_ext_identity_group_member_proposal(
+        {
+            "id": "seed:mac",
+            "external_product_id": "mac:62c89320b830814c",
+            "attached_product_key": attached_key,
+            "product_key": make_catalog_product_key("external_seed", "external_seed", "mac:62c89320b830814c"),
+            "product_group_id": deterministic_ext_identity_group_id(attached_key),
+            "is_primary": True,
+            "cluster_external_products": 2,
+            "primary_rank": 1,
+            "has_offer": True,
         }
     )
 
