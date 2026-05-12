@@ -854,7 +854,8 @@ async def cold_start_audit_export(
         BrandDiscoveryError,
         discover_products_for_audit,
     )
-    from services.agent_center_bd_report_service import render_brand_markdown
+    from services.agent_center_bd_report_service import render_brand_markdown  # noqa: F401 (kept for backwards compat with v1 renderer fallback)
+    from services.audit_markdown_renderer_v2 import select_renderer
     import re as _re
 
     try:
@@ -969,7 +970,12 @@ async def cold_start_audit_export(
         report_jsonb=out,
     )
 
-    markdown = render_brand_markdown(out, discovery=discovered)
+    # PR-9a: feature-flagged renderer selection. AUDIT_RENDERER_VERSION
+    # env var picks v1 (default, existing) or v2 (polished structure
+    # matching the hand-written Grüns PDF). Once v2 has soaked, the
+    # default flips.
+    renderer = select_renderer()
+    markdown = renderer(out, discovery=discovered)
 
     # Filename-safe brand slug. Strip non-alphanum, lowercase.
     brand = discovered.get("merchant_name") or "brand"
