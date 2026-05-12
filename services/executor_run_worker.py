@@ -78,28 +78,13 @@ def _agent_registry_by_name() -> Dict[str, Any]:
 
 
 def _coerce_jsonb_to_dict(value: Any) -> Optional[Dict[str, Any]]:
-    """JSONB columns from the `databases` library may return as
-    either a parsed dict OR a raw JSON string, depending on whether
-    asyncpg's JSONB codec was registered. The previous Gate 5 run
-    raised:
-        AttributeError: 'str' object has no attribute 'get'
-    inside _hydrate_executor_context — payload_jsonb was a string,
-    and `(payload_jsonb or {}).get(\"extra\")` blew up. Be defensive
-    at the read boundary so downstream callers can rely on dict
-    semantics."""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            import json
-            parsed = json.loads(value)
-            if isinstance(parsed, dict):
-                return parsed
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return None
+    """Re-export of db._jsonb_safe.coerce_jsonb_to_dict so existing
+    callers in this module keep their local name. The shared helper
+    centralizes the JSONB-as-string defense across all read boundaries
+    (executor hydration here; projection builder readers; future
+    consumers)."""
+    from db._jsonb_safe import coerce_jsonb_to_dict as _shared
+    return _shared(value)
 
 
 async def _hydrate_executor_context(

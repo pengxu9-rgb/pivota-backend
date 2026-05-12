@@ -32,6 +32,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
+from db._jsonb_safe import _json_safe
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,8 @@ async def record_task_created(
                 status="pending",
                 assigned_to_agent=assigned_to_agent,
                 assigned_to_human=assigned_to_human,
-                evidence_jsonb=evidence,
+                # JSONB write boundary — coerce UUID/datetime/Decimal.
+                evidence_jsonb=_json_safe(evidence) if evidence else evidence,
                 created_at=now,
                 updated_at=now,
             )

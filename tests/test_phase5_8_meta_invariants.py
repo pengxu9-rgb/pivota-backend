@@ -336,19 +336,25 @@ def test_verifier_specs_matches_register_verifier_calls_grep_check():
 
 def test_worker_modules_have_no_unresolvable_internal_imports():
     """Function-local `from db.X import Y` style imports inside the
-    worker stack must point at modules that actually exist. P5.8.8
-    happened because services/audit_run_worker.py:513 had
-    `from db.catalog_products import catalog_products`, but the table
-    object lives in `db.catalog`. The discovering-stage code path is
-    skipped by unit tests (mocked away), so the broken import only
-    surfaced when a real audit ran on prod — and Gate 4 of the deploy
+    worker stack must point at modules that actually exist AND
+    expose the named symbols. P5.8.8 happened because
+    services/audit_run_worker.py:513 had `from db.catalog_products
+    import catalog_products`, but the table object lives in
+    `db.catalog`. The discovering-stage code path is skipped by
+    unit tests (mocked away), so the broken import only surfaced
+    when a real audit ran on prod — and Gate 4 of the deploy
     pipeline blocked there.
 
     This test parses each worker module's AST, finds every
-    `ImportFrom` node (top-level + function-local), and tries to
-    import each db.* / services.* / routes.* / config.* / utils.* /
-    jobs.* module by name. Anything unresolvable surfaces as a
-    failure here, BEFORE the code reaches production.
+    `ImportFrom` node (top-level + function-local), and:
+      1. Resolves the module name (catches `db.catalog_products`
+         where `db.catalog_products` doesn't exist).
+      2. Resolves each imported symbol via getattr (catches
+         `from db.catalog import some_renamed_thing` where the
+         module exists but the symbol does not).
+
+    Wildcard imports (`from db.X import *`) are skipped — symbol
+    resolution is undefined for those.
     """
     worker_files = [
         _REPO_ROOT / "services/audit_run_worker.py",
@@ -376,11 +382,33 @@ def test_worker_modules_have_no_unresolvable_internal_imports():
             ):
                 continue
             try:
-                __import__(mod)
+                imported = __import__(mod, fromlist=["*"])
             except Exception as exc:  # noqa: BLE001
                 problems.append(
                     f"{path.name}:{node.lineno} — "
-                    f"cannot import {mod!r}: {exc!s}"
+                    f"cannot import module {mod!r}: {exc!s}"
+                )
+                continue
+            # Symbol resolution: each `name` in `from mod import x, y`
+            # must exist on the module object OR be importable as a
+            # submodule (`from db import merchant_audit_runs as mar`
+            # style — Python doesn't auto-bind submodules onto the
+            # parent namespace until they're imported).
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                if hasattr(imported, alias.name):
+                    continue
+                # Try resolving as a submodule.
+                try:
+                    __import__(f"{mod}.{alias.name}")
+                    continue  # submodule import succeeded
+                except Exception:  # noqa: BLE001
+                    pass
+                problems.append(
+                    f"{path.name}:{node.lineno} — "
+                    f"{mod!r} has no attribute "
+                    f"{alias.name!r}"
                 )
 
     assert not problems, (
@@ -388,6 +416,102 @@ def test_worker_modules_have_no_unresolvable_internal_imports():
         "blow up at runtime when the code path is exercised "
         "(unit tests mock the surrounding logic, so the import never "
         "actually executes in test). Fix the import path:\n  "
+        + "\n  ".join(problems)
+    )
+
+
+# =====================================================================
+# 9. JSONB write boundaries route through _json_safe
+# =====================================================================
+
+
+def test_jsonb_writes_in_db_modules_route_through_json_safe():
+    """Every place that assigns a JSONB column value via SQLAlchemy
+    `.values(...)` should coerce the payload through `_json_safe`
+    first. PR #477 + #479 fixed three of these sites; codex review
+    found four more in db/merchant_audit_runs.py, db/executor_runs.py,
+    and db/audit_evidence.py:801. Without coercion, any payload that
+    contains a UUID (probe_run_id, evidence_id, audit_run_id, etc.)
+    fails JSONB serialization and the write silently no-ops (worst
+    case: appears completed but produces zero downstream rows, the
+    Gate 5 action_plan_items=0 class of bug).
+
+    The check is a pragmatic grep: for every `*_jsonb = <expr>` or
+    `*_jsonb=<expr>` assignment inside files in db/, the right-hand
+    side should reference `_json_safe` somewhere on the same line OR
+    be a documented exception. False-positives are listed in
+    _JSONB_WRITE_EXCEPTIONS so they don't gum up CI.
+    """
+    # Documented exceptions — any line containing one of these
+    # substrings is skipped. Each captures a known-safe pattern:
+    _JSONB_WRITE_EXCEPTIONS = {
+        # Already-coerced sentinel value names. Variables prefixed
+        # with `safe_` or named `_json_safe(...)` are guaranteed to
+        # have been through the coercer.
+        "_json_safe(",
+        "safe_payload",
+        "safe_evidence",
+        # Table schema definitions — not runtime writes.
+        "Column(",
+        # Row reads (column appears as a row.get() target, not an
+        # insert/update LHS).
+        "d.get(",
+        "row.get(",
+        ".get(\"payload_jsonb\")",
+        ".get(\"evidence_jsonb\")",
+        ".get(\"report_jsonb\")",
+        ".get(\"error_jsonb\")",
+        ".get(\"cost_summary_jsonb\")",
+        ".get(\"partial_result_jsonb\")",
+        ".get(\"attribution_jsonb\")",
+        # Raw-SQL fragments inside string literals. The check uses
+        # the heuristic "contains SQL operator/keyword on the same
+        # line" — patterns like `evidence_jsonb = :evidence_jsonb`,
+        # `SET col = COALESCE(...)`, `=  '{}'::jsonb`.
+        "COALESCE(",
+        " = :",
+        ":patch::jsonb",                    # legacy SQL — already
+                                            # caught by meta-test #8
+        "CAST(:patch AS JSONB)",            # post-fix SQL
+        # Migration DDL.
+        "ADD COLUMN",
+        "ALTER COLUMN",
+        # SQL SELECT/UPDATE/INSERT keyword as a continuation token.
+        "RETURNING",
+    }
+    pattern = re.compile(
+        r'\b\w+_jsonb\s*=\s*'
+    )
+    problems = []
+    for py_file in (_REPO_ROOT / "db").glob("*.py"):
+        if py_file.name.startswith("_"):
+            continue
+        text = py_file.read_text()
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.lstrip()
+            if (
+                stripped.startswith("#")
+                or stripped.startswith("\"\"\"")
+                or stripped.startswith("'''")
+            ):
+                continue
+            if not pattern.search(line):
+                continue
+            # Skip whitelisted exception patterns.
+            if any(ex in line for ex in _JSONB_WRITE_EXCEPTIONS):
+                continue
+            problems.append(
+                f"{py_file.name}:{lineno} — assigns *_jsonb without "
+                f"_json_safe(): {line.strip()[:140]}"
+            )
+
+    assert not problems, (
+        "JSONB write site(s) bypass the _json_safe coercion at the "
+        "write boundary. Any UUID/datetime/Decimal in the payload "
+        "will fail JSONB serialization silently. Add _json_safe(...) "
+        "around the value, OR (if the line is a false positive) add "
+        "a matching substring to _JSONB_WRITE_EXCEPTIONS in this "
+        "test:\n  "
         + "\n  ".join(problems)
     )
 

@@ -35,6 +35,8 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+
+from db._jsonb_safe import _json_safe
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
@@ -304,7 +306,10 @@ async def record_audit_run_completed(
         if audited_via_pivota_canonical is not None:
             values["audited_via_pivota_canonical"] = list(audited_via_pivota_canonical)
         if report_jsonb is not None:
-            values["report_jsonb"] = report_jsonb
+            # JSONB write boundary — coerce UUID/datetime/Decimal to
+            # JSON-safe primitives. Mirrors the upsert_projection /
+            # insert_evidence_item defense from PR #477 + #479.
+            values["report_jsonb"] = _json_safe(report_jsonb)
         if error_message is not None:
             values["error_message"] = error_message[:2000]
         await database.execute(
@@ -627,15 +632,16 @@ async def transition_stage(
         values["status"] = (
             "succeeded" if to_stage == STAGE_COMPLETED else "failed"
         )
+    # JSONB write boundary — coerce UUID/datetime/Decimal here too.
     if error_jsonb is not None:
-        values["error_jsonb"] = error_jsonb
+        values["error_jsonb"] = _json_safe(error_jsonb)
         if to_stage == STAGE_FAILED:
             # Mirror short message into legacy column for old UIs.
             msg = error_jsonb.get("message") if isinstance(error_jsonb, dict) else None
             if isinstance(msg, str):
                 values["error_message"] = msg[:2000]
     if cost_summary_jsonb is not None:
-        values["cost_summary_jsonb"] = cost_summary_jsonb
+        values["cost_summary_jsonb"] = _json_safe(cost_summary_jsonb)
     try:
         result = await database.execute(
             merchant_audit_runs.update()
@@ -702,7 +708,10 @@ async def record_partial_result(
             {
                 "run_id": run_id,
                 "worker_id": worker_id,
-                "patch": json.dumps(partial_result_jsonb or {}),
+                # _json_safe before json.dumps so UUID/datetime/Decimal
+                # in the patch (e.g., canonical_evidence summary with
+                # asyncpg-typed values) don't blow up serialization.
+                "patch": json.dumps(_json_safe(partial_result_jsonb or {})),
                 "now": _now_utc(),
             },
         )
