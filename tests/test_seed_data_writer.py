@@ -465,8 +465,12 @@ async def test_upsert_accepts_higher_quality_recovery_against_locked_field(monke
 
 @pytest.mark.asyncio
 async def test_upsert_no_op_when_proposal_identical_to_current(monkeypatch) -> None:
-    """Re-running a backfill that produces the exact same content
-    should be a no-op — no UPDATE, no proposal row."""
+    """Re-running a backfill that produces the exact same content on
+    every field — lockable AND non-lockable — yields status='no_change'
+    and no UPDATE on external_product_seeds. Proposal row IS still
+    inserted for forensic completeness ('codex tried, content already
+    correct'). 'no_change' must be in the seed_data_proposals.status
+    CHECK constraint (migration 082)."""
     fake = _FakeDB(current_row={
         "seed_data": {"description": "Same text."},
         "content_lock": {},
@@ -480,13 +484,64 @@ async def test_upsert_no_op_when_proposal_identical_to_current(monkeypatch) -> N
         proposer="idempotent_caller",
     )
 
-    assert result.status in ("no_change", "merged")  # 'no_change' if no other fields differ
-    # And specifically: no UPDATE on external_product_seeds when only
-    # lockable fields are unchanged. (We allow proposal-row insertion
-    # for forensic completeness.)
-    if result.status == "no_change":
-        update_calls = [e for e in fake.executed if "UPDATE external_product_seeds" in e["sql"]]
-        assert update_calls == []
+    assert result.status == "no_change"
+    # No UPDATE on external_product_seeds when nothing changed
+    update_calls = [e for e in fake.executed if "UPDATE external_product_seeds" in e["sql"]]
+    assert update_calls == []
+    # Proposal row still inserted (forensic record)
+    proposal_inserts = [e for e in fake.executed if "INSERT INTO seed_data_proposals" in e["sql"]]
+    assert len(proposal_inserts) == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_writes_when_only_non_lockable_fields_change(monkeypatch) -> None:
+    """Regression 2026-05-12: codex's MAC recovery proposal only
+    touched non-lockable fields (canonical_url, image_url, variants —
+    skipping description which was already correct). The original
+    writer marked this as 'no_change' which failed the
+    seed_data_proposals.status CHECK constraint and bombed before any
+    write. After fix: this case correctly yields status='merged',
+    inserts the proposal as 'merged' upfront, and applies the
+    non-lockable changes to external_product_seeds."""
+    fake = _FakeDB(current_row={
+        "seed_data": {
+            "description": "Lipstick in Russian Red.",  # lockable, unchanged
+            "image_url": "https://cdn/old.jpg",          # NON-lockable, changing
+            "price_amount": 22.00,                         # NON-lockable, changing
+        },
+        "content_lock": {},
+    })
+    _install_fake_db(monkeypatch, fake)
+
+    proposal = {
+        "description": "Lipstick in Russian Red.",   # identical
+        "image_url": "https://cdn/new.jpg",            # new image
+        "price_amount": 24.00,                          # new price
+        "variants": [{"sku": "v1"}, {"sku": "v2"}],   # new variants
+    }
+    result = await writer.upsert_seed_data(
+        seed_id="eps_mac",
+        external_product_id="mac_russian_red",
+        proposed_seed_data=proposal,
+        proposer="recovery_archive_20260506",
+        source="archive_restore",
+    )
+
+    assert result.status == "merged"
+    # The UPDATE must fire (non-lockable fields changed)
+    update_calls = [e for e in fake.executed if "UPDATE external_product_seeds" in e["sql"]]
+    assert len(update_calls) == 1
+    persisted = json.loads(update_calls[0]["params"]["seed_data"])
+    assert persisted["image_url"] == "https://cdn/new.jpg"
+    assert persisted["price_amount"] == 24.00
+    assert persisted["variants"] == [{"sku": "v1"}, {"sku": "v2"}]
+    # Lockable field unchanged (no merge decision fired for it)
+    assert persisted["description"] == "Lipstick in Russian Red."
+    # Proposal was inserted with status='merged' (not 'no_change') —
+    # otherwise the CHECK constraint would reject the INSERT.
+    proposal_inserts = [e for e in fake.executed if "INSERT INTO seed_data_proposals" in e["sql"]]
+    assert len(proposal_inserts) == 1
+    assert proposal_inserts[0]["params"]["status"] == "merged"
 
 
 @pytest.mark.asyncio

@@ -104,9 +104,14 @@ CREATE TABLE IF NOT EXISTS seed_data_proposals (
   audit_summary JSONB,
   -- Per-field quality scores: {"description": 87.3, "pdp_ingredients_raw": 92.0}
   quality_score JSONB,
-  -- Status workflow above
+  -- Status workflow above. Includes 'no_change' for forensic records of
+  -- proposals where the candidate matched current state on every field
+  -- (the writer still inserts the row for audit-trail completeness).
+  -- 'no_change' was missing from the 081 ship; added inline 2026-05-12
+  -- so fresh installs get the right constraint shape. Prod schema is
+  -- aligned by migration 082_seed_data_proposals_allow_no_change.sql.
   status TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'approved', 'rejected', 'merged', 'superseded')),
+    CHECK (status IN ('pending', 'approved', 'rejected', 'merged', 'superseded', 'no_change')),
   -- Why the service made its decision (lock violation, score lower, etc.)
   decision_reason TEXT,
   -- Snapshot of the fields that would change, taken at decision time.

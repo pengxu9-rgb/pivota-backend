@@ -347,10 +347,26 @@ async def upsert_seed_data(
     quality_score = {d.field: d.new_score for d in decisions}
     field_decisions_payload = [_decision_payload(d) for d in decisions]
 
-    # Step 4: record proposal
-    proposal_status = "merged" if has_any_merge else (
-        "rejected" if has_any_field_change else "no_change"
-    )
+    # Step 4: record proposal.
+    # 'merged' covers two cases: at least one lockable field merges OR
+    # non-lockable fields (price, images, URL, variants) changed. The
+    # original 081 ship computed status off `has_any_merge` only, which
+    # forced legitimate non-lockable-only writes through 'no_change' —
+    # and 'no_change' wasn't in the CHECK constraint either, so the
+    # INSERT failed before any write happened (codex hit this on
+    # 2026-05-12 recovering MAC variant images). Both issues fixed
+    # together: migration 082 adds 'no_change' to the CHECK; this
+    # branch routes non-lockable-only writes to 'merged' correctly.
+    if has_any_merge or has_non_lockable_change:
+        proposal_status = "merged"
+    elif has_any_field_change:
+        # Some fields were rejected, none merged → recovery proposal
+        # was strictly weaker. Forensic record kept.
+        proposal_status = "rejected"
+    else:
+        # Truly identical proposal (every field == current). Still
+        # logged so codex can see "I tried, it was already correct."
+        proposal_status = "no_change"
     proposal_id = await _insert_proposal_row(
         seed_id=seed_id,
         external_product_id=external_product_id,
