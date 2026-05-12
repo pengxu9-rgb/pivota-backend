@@ -15,6 +15,13 @@ Job registration happens at start-up time. Currently registers:
 - `audit_run_lease_reaper` — fires every 60 seconds, calls
   services/audit_run_worker.run_stale_lease_reaper_tick to
   release expired worker leases as a backstop.
+- `executor_run_worker_tick` — fires every 5 seconds, calls
+  services/executor_run_worker.run_executor_worker_tick which
+  drains STAGE_QUEUED rows from executor_runs (P3.2). Faster
+  cadence than audit_run_worker because executor agents are
+  individual short-lived actions, not multi-minute audits.
+- `executor_run_lease_reaper` — fires every 60 seconds, calls
+  services/executor_run_worker.run_executor_lease_reaper_tick.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -98,12 +105,43 @@ async def start_scheduler() -> None:
             coalesce=True,
             max_instances=1,
         )
+
+        # P3.2: drive queued executor_runs through the durable work
+        # queue. No production traffic flows here until P3.3 migrates
+        # the dispatcher to enqueue instead of fire-and-forget. 5s
+        # interval (faster than audit worker) since executor agents
+        # are short-lived (seconds, not minutes).
+        from services.executor_run_worker import (
+            run_executor_worker_tick,
+            run_executor_lease_reaper_tick,
+        )
+        scheduler.add_job(
+            run_executor_worker_tick,
+            "interval",
+            seconds=5,
+            id="executor_run_worker_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+        scheduler.add_job(
+            run_executor_lease_reaper_tick,
+            "interval",
+            seconds=60,
+            id="executor_run_lease_reaper",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
             "audit_scheduler: started with daily_audit_check (03:00 UTC) "
             "+ audit_run_worker_tick (10s) "
-            "+ audit_run_lease_reaper (60s)"
+            "+ audit_run_lease_reaper (60s) "
+            "+ executor_run_worker_tick (5s) "
+            "+ executor_run_lease_reaper (60s)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
