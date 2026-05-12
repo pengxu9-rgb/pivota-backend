@@ -70,6 +70,22 @@ merchant_audit_runs = Table(
     Column("audited_via_pivota_canonical", ARRAY(Text), nullable=True),
     Column("report_jsonb", JSONB, nullable=True),
     Column("error_message", Text, nullable=True),
+    # P2.1: async lifecycle columns (migration 083). See
+    # db/migrations/083_audit_runs_async_lifecycle.sql for the
+    # column-level commentary.
+    Column("stage", Text, nullable=False, server_default="completed"),
+    Column("stage_updated_at", DateTime(timezone=True), nullable=True),
+    Column("partial_result_jsonb", JSONB, nullable=True),
+    Column("error_jsonb", JSONB, nullable=True),
+    Column("cost_summary_jsonb", JSONB, nullable=True),
+    Column("idempotency_key", Text, nullable=True),
+    Column("cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("requested_by_user_id", Text, nullable=True),
+    Column(
+        "subject_type", Text, nullable=False, server_default="merchant",
+    ),
+    Column("claimed_by_worker", Text, nullable=True),
+    Column("claimed_until", DateTime(timezone=True), nullable=True),
     Index(
         "idx_merchant_audit_runs_merchant_window",
         "merchant_id",
@@ -77,6 +93,54 @@ merchant_audit_runs = Table(
     ),
     extend_existing=True,
 )
+
+
+# P2.1: state machine constants. The valid transition map enforces
+# audit runs can't skip stages (queued → discovering, not queued →
+# completed) or move backwards. Worker uses this to validate writes.
+STAGE_QUEUED = "queued"
+STAGE_DISCOVERING = "discovering"
+STAGE_PROBING = "probing"
+STAGE_SCORING = "scoring"
+STAGE_MATERIALIZING = "materializing"
+STAGE_VERIFYING = "verifying"
+STAGE_COMPLETED = "completed"
+STAGE_FAILED = "failed"
+STAGE_CANCELLED = "cancelled"
+
+# Active stages that the worker can pick up. queued is the initial
+# state; the rest indicate work is mid-flight (used for stale-lease
+# reclaim too).
+ACTIVE_STAGES = frozenset({
+    STAGE_QUEUED, STAGE_DISCOVERING, STAGE_PROBING,
+    STAGE_SCORING, STAGE_MATERIALIZING, STAGE_VERIFYING,
+})
+
+TERMINAL_STAGES = frozenset({
+    STAGE_COMPLETED, STAGE_FAILED, STAGE_CANCELLED,
+})
+
+# Allowed transitions. Worker MUST validate before UPDATE; an invalid
+# transition is a bug (worker reading stale state, race condition,
+# etc.) and should raise loudly.
+VALID_STAGE_TRANSITIONS: dict = {
+    STAGE_QUEUED: {STAGE_DISCOVERING, STAGE_FAILED, STAGE_CANCELLED},
+    STAGE_DISCOVERING: {STAGE_PROBING, STAGE_FAILED, STAGE_CANCELLED},
+    STAGE_PROBING: {STAGE_SCORING, STAGE_FAILED, STAGE_CANCELLED},
+    STAGE_SCORING: {STAGE_MATERIALIZING, STAGE_FAILED, STAGE_CANCELLED},
+    STAGE_MATERIALIZING: {STAGE_VERIFYING, STAGE_FAILED, STAGE_CANCELLED},
+    STAGE_VERIFYING: {STAGE_COMPLETED, STAGE_FAILED, STAGE_CANCELLED},
+    # Terminal stages — no transitions out
+    STAGE_COMPLETED: set(),
+    STAGE_FAILED: set(),
+    STAGE_CANCELLED: set(),
+}
+
+
+def is_valid_stage_transition(from_stage: str, to_stage: str) -> bool:
+    """Return True iff the transition is in the canonical state
+    machine. Worker calls this before UPDATE to catch races early."""
+    return to_stage in VALID_STAGE_TRANSITIONS.get(from_stage, set())
 
 
 _DDL_READY = False
@@ -103,6 +167,42 @@ _DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_merchant_window "
     "ON merchant_audit_runs (merchant_id, requested_at DESC);",
+    # P2.1: async lifecycle columns. Schema-guard backstop for
+    # environments where db/migrations/083_audit_runs_async_lifecycle.sql
+    # hasn't been applied yet. Each ALTER is idempotent
+    # (IF NOT EXISTS) so re-running is safe.
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'completed';",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS partial_result_jsonb JSONB;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS error_jsonb JSONB;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS cost_summary_jsonb JSONB;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS requested_by_user_id TEXT;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS subject_type TEXT NOT NULL "
+    "DEFAULT 'merchant';",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS claimed_by_worker TEXT;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ;",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_worker_pull "
+    "ON merchant_audit_runs (stage, claimed_until, requested_at) "
+    "WHERE stage IN ('queued', 'discovering', 'probing', 'scoring', "
+    "'materializing', 'verifying');",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_idempotency "
+    "ON merchant_audit_runs (idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL "
+    "AND stage IN ('queued', 'discovering', 'probing', 'scoring', "
+    "'materializing', 'verifying');",
 ]
 
 
@@ -116,15 +216,20 @@ async def ensure_merchant_audit_runs_table() -> None:
     async with _DDL_LOCK:
         if _DDL_READY:
             return
-        try:
-            for stmt in _DDL_STATEMENTS:
+        # Per-statement tolerance. Postgres prod runs the .sql
+        # migrations directly; this inline DDL is only a backstop
+        # for hermetic test environments. Some statements (partial
+        # indexes with WHERE ... IN, ADD COLUMN IF NOT EXISTS) are
+        # Postgres-flavored and fail-and-skip is fine on SQLite.
+        for stmt in _DDL_STATEMENTS:
+            try:
                 await database.execute(stmt)
-        except Exception as exc:
-            logger.warning(
-                "ensure_merchant_audit_runs_table failed (best-effort): %s",
-                str(exc)[:200],
-            )
-            return
+            except Exception as exc:
+                logger.debug(
+                    "ensure_merchant_audit_runs_table skip stmt "
+                    "(best-effort): %s | %s",
+                    str(exc)[:120], stmt[:100],
+                )
         _DDL_READY = True
 
 
@@ -308,3 +413,458 @@ async def recent_runs_for_merchant(
             ),
         })
     return out
+
+
+# =====================================================================
+# P2.1 — async lifecycle accessors. Used by:
+#   - POST /api/audits          → enqueue_audit_run
+#                               + find_in_flight_by_idempotency_key
+#   - GET  /api/audits/{id}     → fetch_audit_run_by_id
+#   - POST /api/audits/{id}/cancel → cancel_audit_run
+#   - audit_run_worker.py       → claim_next_pending_run +
+#                                 transition_stage +
+#                                 record_partial_result +
+#                                 extend_lease +
+#                                 release_stale_leases
+# =====================================================================
+
+# Default lease length. Worker calls extend_lease() before each long
+# stage transition. 600s gives a stage room to run + a bit of buffer
+# before another worker steals it as a stale lease.
+DEFAULT_LEASE_SECONDS = 600
+
+# How long a lease can sit past its expiry before reclaim runs.
+# Prevents a flapping worker from stealing a lease the original holder
+# is about to renew.
+STALE_LEASE_GRACE_SECONDS = 30
+
+
+async def enqueue_audit_run(
+    *,
+    merchant_id: str,
+    product_keys: List[str],
+    subject_type: str = "merchant",
+    idempotency_key: Optional[str] = None,
+    requested_by_user_id: Optional[str] = None,
+) -> Optional[str]:
+    """Insert a row in `stage='queued'` for the worker to pick up.
+
+    Returns the new run_id, or None on persistence failure (caller
+    decides whether to fall back to the legacy synchronous path or
+    surface a 5xx).
+    """
+    await ensure_merchant_audit_runs_table()
+    run_id = str(uuid.uuid4())
+    now = _now_utc()
+    try:
+        await database.execute(
+            merchant_audit_runs.insert().values(
+                run_id=run_id,
+                merchant_id=merchant_id,
+                requested_at=now,
+                # Legacy `status` kept aligned with `stage` during
+                # the dual-key window — old readers see 'running'
+                # and new readers see 'queued'.
+                status="running",
+                stage=STAGE_QUEUED,
+                stage_updated_at=now,
+                product_keys=list(product_keys or []),
+                subject_type=subject_type,
+                idempotency_key=idempotency_key,
+                requested_by_user_id=requested_by_user_id,
+            )
+        )
+        return run_id
+    except Exception as exc:
+        logger.warning(
+            "enqueue_audit_run failed for merchant_id=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return None
+
+
+async def find_in_flight_by_idempotency_key(
+    *, idempotency_key: str,
+) -> Optional[str]:
+    """Return the run_id of any in-flight run matching this
+    idempotency_key, or None. POST /api/audits calls this before
+    enqueue_audit_run to dedupe burst submits.
+    """
+    if not idempotency_key:
+        return None
+    await ensure_merchant_audit_runs_table()
+    try:
+        from sqlalchemy.sql import select
+        row = await database.fetch_one(
+            select(merchant_audit_runs.c.run_id)
+            .where(
+                merchant_audit_runs.c.idempotency_key == idempotency_key,
+                merchant_audit_runs.c.stage.in_(list(ACTIVE_STAGES)),
+            )
+            .limit(1)
+        )
+        if row is None:
+            return None
+        return str(row[0])
+    except Exception as exc:
+        logger.warning(
+            "find_in_flight_by_idempotency_key failed: %s",
+            str(exc)[:200],
+        )
+        return None
+
+
+async def claim_next_pending_run(
+    *, worker_id: str, lease_seconds: int = DEFAULT_LEASE_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim the oldest queued or stale-leased run for
+    this worker. Returns the claimed row dict, or None if nothing
+    to claim.
+
+    Uses a CTE-style UPDATE ... WHERE run_id = (SELECT ... FOR
+    UPDATE SKIP LOCKED LIMIT 1) RETURNING. SKIP LOCKED is what
+    makes this safe under multiple worker processes.
+    """
+    await ensure_merchant_audit_runs_table()
+    now = _now_utc()
+    new_until = datetime.fromtimestamp(
+        now.timestamp() + lease_seconds, tz=timezone.utc,
+    )
+    # Raw SQL — SQLAlchemy core doesn't have a clean CTE+UPDATE+
+    # RETURNING composer, and this is hot-path worker code that
+    # benefits from being explicit.
+    query = """
+        UPDATE merchant_audit_runs
+           SET claimed_by_worker = :worker_id,
+               claimed_until     = :new_until,
+               stage_updated_at  = :now
+         WHERE run_id = (
+             SELECT run_id
+               FROM merchant_audit_runs
+              WHERE stage IN (
+                  'queued', 'discovering', 'probing', 'scoring',
+                  'materializing', 'verifying'
+              )
+                AND (
+                    claimed_until IS NULL
+                 OR claimed_until < :now
+                )
+                AND cancelled_at IS NULL
+              ORDER BY requested_at ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+         )
+        RETURNING run_id, merchant_id, stage, product_keys,
+                  subject_type, idempotency_key,
+                  requested_by_user_id, partial_result_jsonb,
+                  requested_at
+    """
+    try:
+        row = await database.fetch_one(
+            query,
+            {"worker_id": worker_id, "new_until": new_until, "now": now},
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        return {
+            "run_id": str(d.get("run_id")),
+            "merchant_id": d.get("merchant_id"),
+            "stage": d.get("stage"),
+            "product_keys": list(d.get("product_keys") or []),
+            "subject_type": d.get("subject_type"),
+            "idempotency_key": d.get("idempotency_key"),
+            "requested_by_user_id": d.get("requested_by_user_id"),
+            "partial_result_jsonb": d.get("partial_result_jsonb"),
+            "requested_at": (
+                d["requested_at"].isoformat()
+                if isinstance(d.get("requested_at"), datetime)
+                else None
+            ),
+        }
+    except Exception as exc:
+        logger.warning(
+            "claim_next_pending_run failed for worker_id=%s: %s",
+            worker_id, str(exc)[:200],
+        )
+        return None
+
+
+async def transition_stage(
+    *,
+    run_id: str,
+    from_stage: str,
+    to_stage: str,
+    worker_id: str,
+    error_jsonb: Optional[Dict[str, Any]] = None,
+    cost_summary_jsonb: Optional[Dict[str, Any]] = None,
+    completed_at_if_terminal: bool = True,
+) -> bool:
+    """Atomic stage transition guarded by from_stage AND
+    claimed_by_worker. Returns True on success; False means another
+    worker stole the lease, the row was cancelled, or the from_stage
+    was wrong (caller should reload + decide).
+
+    Validates the transition against VALID_STAGE_TRANSITIONS first.
+    """
+    if not is_valid_stage_transition(from_stage, to_stage):
+        logger.error(
+            "transition_stage rejected invalid transition "
+            "%s → %s for run_id=%s",
+            from_stage, to_stage, run_id,
+        )
+        return False
+    await ensure_merchant_audit_runs_table()
+    now = _now_utc()
+    values: Dict[str, Any] = {
+        "stage": to_stage,
+        "stage_updated_at": now,
+    }
+    if to_stage in TERMINAL_STAGES and completed_at_if_terminal:
+        values["completed_at"] = now
+        # Keep legacy `status` aligned for old readers during the
+        # dual-key window. Phase 4 cleanup will drop this.
+        values["status"] = (
+            "succeeded" if to_stage == STAGE_COMPLETED else "failed"
+        )
+    if error_jsonb is not None:
+        values["error_jsonb"] = error_jsonb
+        if to_stage == STAGE_FAILED:
+            # Mirror short message into legacy column for old UIs.
+            msg = error_jsonb.get("message") if isinstance(error_jsonb, dict) else None
+            if isinstance(msg, str):
+                values["error_message"] = msg[:2000]
+    if cost_summary_jsonb is not None:
+        values["cost_summary_jsonb"] = cost_summary_jsonb
+    try:
+        result = await database.execute(
+            merchant_audit_runs.update()
+            .where(
+                merchant_audit_runs.c.run_id == run_id,
+                merchant_audit_runs.c.stage == from_stage,
+                merchant_audit_runs.c.claimed_by_worker == worker_id,
+                merchant_audit_runs.c.cancelled_at.is_(None),
+            )
+            .values(**values)
+        )
+        # databases lib returns rowcount as the result for UPDATE;
+        # if the WHERE didn't match, the transition was rejected.
+        if isinstance(result, int):
+            return result > 0
+        # Some backends return None — assume success and let the
+        # next read catch a problem.
+        return True
+    except Exception as exc:
+        logger.warning(
+            "transition_stage failed for run_id=%s (%s→%s): %s",
+            run_id, from_stage, to_stage, str(exc)[:200],
+        )
+        return False
+
+
+async def record_partial_result(
+    *,
+    run_id: str,
+    worker_id: str,
+    partial_result_jsonb: Dict[str, Any],
+) -> bool:
+    """Merge a stage's partial output into partial_result_jsonb.
+    Worker calls this at the END of each stage so GET /audits/{id}
+    can render progressive UI. Guarded on worker ownership.
+
+    The merge is shallow — caller is expected to namespace by stage
+    (e.g., {"discovering": {...}, "probing": {...}}).
+    """
+    await ensure_merchant_audit_runs_table()
+    # JSONB || JSONB merges shallowly in Postgres. Run as raw SQL
+    # to avoid round-tripping the existing JSON to Python.
+    query = """
+        UPDATE merchant_audit_runs
+           SET partial_result_jsonb = COALESCE(partial_result_jsonb, '{}'::jsonb)
+                                     || :patch::jsonb,
+               stage_updated_at     = :now
+         WHERE run_id = :run_id
+           AND claimed_by_worker = :worker_id
+           AND cancelled_at IS NULL
+    """
+    try:
+        await database.execute(
+            query,
+            {
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "patch": json.dumps(partial_result_jsonb or {}),
+                "now": _now_utc(),
+            },
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "record_partial_result failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return False
+
+
+async def extend_lease(
+    *, run_id: str, worker_id: str,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+) -> bool:
+    """Push claimed_until forward. Worker calls this before any
+    stage that may run longer than DEFAULT_LEASE_SECONDS so a
+    sibling worker doesn't reclaim the lease mid-stage.
+    """
+    await ensure_merchant_audit_runs_table()
+    new_until = datetime.fromtimestamp(
+        _now_utc().timestamp() + lease_seconds, tz=timezone.utc,
+    )
+    try:
+        await database.execute(
+            merchant_audit_runs.update()
+            .where(
+                merchant_audit_runs.c.run_id == run_id,
+                merchant_audit_runs.c.claimed_by_worker == worker_id,
+            )
+            .values(claimed_until=new_until)
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "extend_lease failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return False
+
+
+async def cancel_audit_run(*, run_id: str) -> bool:
+    """Mark a run cancelled. Worker checks cancelled_at before each
+    stage transition; in-flight stages run to completion of their
+    current step then bail.
+    """
+    await ensure_merchant_audit_runs_table()
+    now = _now_utc()
+    try:
+        await database.execute(
+            merchant_audit_runs.update()
+            .where(
+                merchant_audit_runs.c.run_id == run_id,
+                merchant_audit_runs.c.stage.in_(list(ACTIVE_STAGES)),
+            )
+            .values(
+                cancelled_at=now,
+                # Don't transition to STAGE_CANCELLED here — let the
+                # worker's next transition_stage call finalize. That
+                # keeps the state-machine validation consistent
+                # (only the worker that holds the lease writes the
+                # terminal stage).
+            )
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "cancel_audit_run failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return False
+
+
+async def fetch_audit_run_by_id(
+    *, run_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read a single run for GET /api/audits/{id}. Returns the new
+    canonical shape: stage + partial_result + cost_summary + error
+    + the report payload when the run has reached completed.
+    """
+    await ensure_merchant_audit_runs_table()
+    try:
+        row = await database.fetch_one(
+            merchant_audit_runs.select().where(
+                merchant_audit_runs.c.run_id == run_id,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "fetch_audit_run_by_id failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return None
+    if row is None:
+        return None
+    d = dict(row)
+    return {
+        "run_id": str(d.get("run_id")) if d.get("run_id") else None,
+        "merchant_id": d.get("merchant_id"),
+        "subject_type": d.get("subject_type"),
+        "stage": d.get("stage"),
+        "stage_updated_at": (
+            d["stage_updated_at"].isoformat()
+            if isinstance(d.get("stage_updated_at"), datetime)
+            else None
+        ),
+        "requested_at": (
+            d["requested_at"].isoformat()
+            if isinstance(d.get("requested_at"), datetime)
+            else None
+        ),
+        "completed_at": (
+            d["completed_at"].isoformat()
+            if isinstance(d.get("completed_at"), datetime)
+            else None
+        ),
+        "cancelled_at": (
+            d["cancelled_at"].isoformat()
+            if isinstance(d.get("cancelled_at"), datetime)
+            else None
+        ),
+        "product_keys": list(d.get("product_keys") or []),
+        "verdict_labels": list(d.get("verdict_labels") or []),
+        "visibility_score_avg": d.get("visibility_score_avg"),
+        "attribution_score_avg": d.get("attribution_score_avg"),
+        "category_visibility_score_avg": d.get("category_visibility_score_avg"),
+        "audited_via_pivota_canonical": list(
+            d.get("audited_via_pivota_canonical") or []
+        ),
+        "partial_result_jsonb": d.get("partial_result_jsonb"),
+        "report_jsonb": d.get("report_jsonb"),
+        "cost_summary_jsonb": d.get("cost_summary_jsonb"),
+        "error_jsonb": d.get("error_jsonb"),
+        "error_message": d.get("error_message"),
+        "idempotency_key": d.get("idempotency_key"),
+        "requested_by_user_id": d.get("requested_by_user_id"),
+    }
+
+
+async def release_stale_leases(
+    *, grace_seconds: int = STALE_LEASE_GRACE_SECONDS,
+) -> int:
+    """Reclaim leases that are past expiry + grace. Returns the
+    count released. Background reaper calls this on its own cadence;
+    claim_next_pending_run also tolerates stale leases inline so
+    the reaper is a backstop, not the primary path.
+    """
+    await ensure_merchant_audit_runs_table()
+    now = _now_utc()
+    cutoff = datetime.fromtimestamp(
+        now.timestamp() - grace_seconds, tz=timezone.utc,
+    )
+    query = """
+        UPDATE merchant_audit_runs
+           SET claimed_by_worker = NULL,
+               claimed_until     = NULL
+         WHERE claimed_until IS NOT NULL
+           AND claimed_until < :cutoff
+           AND stage IN (
+               'queued', 'discovering', 'probing', 'scoring',
+               'materializing', 'verifying'
+           )
+    """
+    try:
+        result = await database.execute(query, {"cutoff": cutoff})
+        if isinstance(result, int):
+            return result
+        return 0
+    except Exception as exc:
+        logger.warning(
+            "release_stale_leases failed: %s", str(exc)[:200],
+        )
+        return 0
