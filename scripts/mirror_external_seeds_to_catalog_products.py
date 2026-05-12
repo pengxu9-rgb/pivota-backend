@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mirror active standalone external_product_seeds into catalog_products.
+Mirror active external_product_seeds into catalog_products.
 
 This is intentionally a narrow bridge for the canonical PDP migration:
   - source table: external_product_seeds
@@ -12,6 +12,10 @@ This is intentionally a narrow bridge for the canonical PDP migration:
 It is idempotent. Dry-run is the default; pass --apply to insert missing
 catalog_products rows. Existing catalog_products rows are not overwritten.
 Run scripts/backfill_pivota_canonical_pdp.py --apply afterwards to mint sig_*.
+
+Attached seeds are included. Those rows already represent review-gated product
+identity edges, and PDP offer fusion needs the mirrored catalog_product/offer
+chain behind the external_seed group member.
 """
 
 from __future__ import annotations
@@ -440,11 +444,24 @@ async def _required_schema() -> Dict[str, Any]:
 
 
 COMMON_CTES = """
-WITH active_standalone AS (
+WITH active_all AS (
   SELECT *
   FROM external_product_seeds
   WHERE lower(coalesce(status, '')) = 'active'
-    AND coalesce(attached_product_key, '') = ''
+),
+active_standalone AS (
+  SELECT *
+  FROM active_all
+  WHERE coalesce(attached_product_key, '') = ''
+),
+active_attached AS (
+  SELECT *
+  FROM active_all
+  WHERE coalesce(attached_product_key, '') <> ''
+),
+active_mirrorable AS (
+  SELECT *
+  FROM active_all
 ),
 ranked AS (
   SELECT
@@ -514,7 +531,7 @@ ranked AS (
       ),
       ''
     ) AS mirrored_category
-  FROM active_standalone eps
+  FROM active_mirrorable eps
   WHERE nullif(btrim(coalesce(eps.external_product_id, '')), '') IS NOT NULL
 ),
 candidates AS (
@@ -558,10 +575,13 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
         SELECT
           (SELECT count(*) FROM external_product_seeds) AS external_total,
           (SELECT count(*) FROM external_product_seeds WHERE lower(coalesce(status, '')) = 'active') AS external_active,
+          (SELECT count(*) FROM active_all) AS active_all,
           (SELECT count(*) FROM active_standalone) AS active_standalone,
+          (SELECT count(*) FROM active_attached) AS active_attached,
           (SELECT count(*) FROM active_standalone WHERE nullif(btrim(coalesce(external_product_id, '')), '') IS NULL) AS active_standalone_missing_external_product_id,
-          (SELECT count(*) FROM ranked WHERE duplicate_count > 1) AS duplicate_active_standalone_rows,
-          (SELECT count(*) FROM (SELECT external_product_id FROM ranked GROUP BY external_product_id HAVING count(*) > 1) d) AS duplicate_active_standalone_groups,
+          (SELECT count(*) FROM active_attached WHERE nullif(btrim(coalesce(external_product_id, '')), '') IS NULL) AS active_attached_missing_external_product_id,
+          (SELECT count(*) FROM ranked WHERE duplicate_count > 1) AS duplicate_active_mirrorable_rows,
+          (SELECT count(*) FROM (SELECT external_product_id FROM ranked GROUP BY external_product_id HAVING count(*) > 1) d) AS duplicate_active_mirrorable_groups,
           (SELECT count(*) FROM ranked WHERE rn = 1 AND length(external_product_id) > 128) AS skipped_source_product_id_too_long,
           (SELECT count(*) FROM ranked WHERE rn = 1 AND length('prod::external_seed::external_seed::' || external_product_id) > 255) AS skipped_product_key_too_long,
           (SELECT count(*) FROM ranked WHERE rn = 1 AND nullif(btrim(coalesce(title, '')), '') IS NULL) AS skipped_missing_title,
@@ -591,6 +611,7 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
           market,
           tool,
           domain,
+          attached_product_key,
           title,
           destination_url,
           image_url,
@@ -683,6 +704,7 @@ async def _apply(limit: int) -> int:
           'prod::external_seed::external_seed::' || external_product_id AS product_key,
           id,
           external_product_id,
+          attached_product_key,
           market,
           tool,
           domain,
@@ -915,10 +937,13 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     for key in [
         "external_total",
         "external_active",
+        "active_all",
         "active_standalone",
+        "active_attached",
         "active_standalone_missing_external_product_id",
-        "duplicate_active_standalone_rows",
-        "duplicate_active_standalone_groups",
+        "active_attached_missing_external_product_id",
+        "duplicate_active_mirrorable_rows",
+        "duplicate_active_mirrorable_groups",
         "skipped_source_product_id_too_long",
         "skipped_product_key_too_long",
         "skipped_missing_title",

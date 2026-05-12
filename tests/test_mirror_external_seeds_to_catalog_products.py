@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.mirror_external_seeds_to_catalog_products import (  # noqa: E402
     CATEGORY_CONFIDENCE_REGEX_AT_MIRROR,
     CATEGORY_LABEL_SOURCE_AT_MIRROR,
+    COMMON_CTES,
     MERCHANT_ID,
     OFFER_ID_PREFIX,
     PLATFORM,
@@ -26,6 +27,14 @@ from scripts.mirror_external_seeds_to_catalog_products import (  # noqa: E402
     resolve_mirror_category_metadata,
 )
 import scripts.mirror_external_seeds_to_catalog_products as mirror_module  # noqa: E402
+
+
+def test_mirror_query_includes_attached_seed_rows() -> None:
+    """Attached seeds are review-gated seller edges, so the mirror must
+    create their catalog product/offer chain too."""
+    assert "active_attached AS" in COMMON_CTES
+    assert "active_mirrorable AS" in COMMON_CTES
+    assert "FROM active_mirrorable eps" in COMMON_CTES
 
 
 def test_mirror_insert_classifies_category_path() -> None:
