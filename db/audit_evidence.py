@@ -596,6 +596,11 @@ async def insert_evidence_item(
     safe_payload = dict(payload or {})
     if coerced_type == EVIDENCE_TYPE_CUSTOM and evidence_type != EVIDENCE_TYPE_CUSTOM:
         safe_payload["_raw_type"] = evidence_type
+    # Coerce UUID / datetime / Decimal at the JSONB write boundary
+    # (mirrors upsert_projection's PR #477 fix). Builders sometimes
+    # pass-through asyncpg-returned columns; without this, a single
+    # UUID anywhere in the payload tree breaks the whole insert.
+    safe_payload = _json_safe(safe_payload)
     evidence_id = str(uuid.uuid4())
     try:
         await database.execute(
@@ -616,9 +621,14 @@ async def insert_evidence_item(
         )
         return evidence_id
     except Exception as exc:  # noqa: BLE001
-        # ON CONFLICT (unique violation on idempotency_key) lands
-        # here. Logged at debug since it's expected on re-run.
-        logger.debug(
+        # ON CONFLICT (unique violation on idempotency_key) is the
+        # expected case on re-run. But genuine errors (JSONB
+        # encoder failures, FK violations, etc.) also land here —
+        # and on Railway prod, root logger filters at WARNING so
+        # logger.debug is invisible. Always log at WARNING; the
+        # caller distinguishes "deduped" from "failed" via the
+        # post-insert SELECT it already does.
+        logger.warning(
             "insert_evidence_item idempotent-skip or failed "
             "audit_run=%s type=%s key=%s: %s",
             audit_run_id, evidence_type,
@@ -656,7 +666,9 @@ async def insert_finding(
                 product_key=product_key,
                 finding_type=finding_type,
                 severity=_coerce_severity(severity),
-                payload_jsonb=dict(payload or {}),
+                # JSONB write boundary — coerce UUID/datetime/Decimal
+                # to JSON-safe primitives (see insert_evidence_item).
+                payload_jsonb=_json_safe(dict(payload or {})),
                 confidence=(
                     int(confidence) if confidence is not None else None
                 ),
@@ -669,7 +681,8 @@ async def insert_finding(
         )
         return finding_id
     except Exception as exc:  # noqa: BLE001
-        logger.debug(
+        # See insert_evidence_item — WARNING for prod visibility.
+        logger.warning(
             "insert_finding idempotent-skip or failed "
             "audit_run=%s type=%s: %s",
             audit_run_id, finding_type, str(exc)[:200],
@@ -727,7 +740,8 @@ async def insert_action(
         )
         return action_id
     except Exception as exc:  # noqa: BLE001
-        logger.debug(
+        # See insert_evidence_item — WARNING for prod visibility.
+        logger.warning(
             "insert_action idempotent-skip or failed "
             "audit_run=%s lever=%s: %s",
             audit_run_id, lever, str(exc)[:200],

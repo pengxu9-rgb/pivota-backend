@@ -678,10 +678,19 @@ async def record_partial_result(
     await ensure_merchant_audit_runs_table()
     # JSONB || JSONB merges shallowly in Postgres. Run as raw SQL
     # to avoid round-tripping the existing JSON to Python.
+    #
+    # IMPORTANT: use CAST(:patch AS JSONB), NOT :patch::jsonb.
+    # SQLAlchemy's text() parameter parser treats `:` as bind-param
+    # introducer, so `:patch::jsonb` is read as one parameter name
+    # 'patch:jsonb', not as :patch + ::jsonb cast. The bound value
+    # then mismatches and SQLAlchemy raises:
+    #   This text() construct doesn't define a bound parameter
+    #   named 'patch'
+    # Every other JSONB call site in the codebase uses CAST(...).
     query = """
         UPDATE merchant_audit_runs
            SET partial_result_jsonb = COALESCE(partial_result_jsonb, '{}'::jsonb)
-                                     || :patch::jsonb,
+                                     || CAST(:patch AS JSONB),
                stage_updated_at     = :now
          WHERE run_id = :run_id
            AND claimed_by_worker = :worker_id
