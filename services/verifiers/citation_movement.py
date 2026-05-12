@@ -65,10 +65,14 @@ logger = logging.getLogger(__name__)
 # but the verifier can choose to use fewer if cost is a concern.
 _REPROBE_MAX_RUNS = 3
 
-# Provider for the re-probe. Use "auto" so the orchestrator picks
-# the cheapest option (per the per-merchant daily cost cap +
-# global cap from PR-7).
-_REPROBE_PROVIDER = "auto"
+# P5.8.6: was "auto" — but the orchestrator can pick a DIFFERENT
+# provider than the original audit used, which makes the score
+# delta apples-to-oranges. Now we extract the baseline audit's
+# provider from report_jsonb and pin the re-probe to it. The
+# constant below is the fallback when the audit's provider can't
+# be determined (treated as configuration drift; the verifier
+# returns blocked rather than substituting).
+_REPROBE_PROVIDER_FALLBACK_BLOCKED = None  # sentinel: not allowed
 
 
 async def _extract_baseline_score(
@@ -124,6 +128,42 @@ async def _extract_baseline_score(
     return None
 
 
+async def _extract_baseline_provider(
+    *, audit_run_id: str,
+) -> Optional[str]:
+    """P5.8.6: pull the LLM provider the original audit used from
+    report_jsonb. The reprobe MUST hit the same provider to make
+    score-delta comparison meaningful — comparing gemini_baseline
+    vs deepseek_reprobe would conflate cross-LLM variance with
+    actual visibility movement.
+
+    The provider field on brand_report is set by run_brand_report
+    (services/agent_center_bd_report_service.py). When the original
+    audit used `provider="auto"`, the orchestrator's chosen provider
+    is recorded too — we read whichever is present.
+
+    Returns None when the audit's report doesn't carry provider info
+    (very old audits pre-PR-7) — caller returns blocked rather than
+    substituting a different provider.
+    """
+    try:
+        from db.merchant_audit_runs import fetch_audit_run_by_id
+        row = await fetch_audit_run_by_id(run_id=audit_run_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    report = row.get("report_jsonb") or {}
+    if not isinstance(report, dict):
+        return None
+    # Brand-report top-level "provider" field is the canonical
+    # location set by run_brand_report's return shape.
+    provider = report.get("provider")
+    if isinstance(provider, str) and provider.strip():
+        return provider.strip()
+    return None
+
+
 def _classify_movement(
     *, baseline: int, reprobed: int,
 ) -> str:
@@ -166,9 +206,31 @@ async def run_citation_movement(
             },
         )
 
+    # P5.8.6: pin reprobe to the baseline audit's provider. Cross-
+    # LLM comparison is meaningless (gemini's category_visibility
+    # vs deepseek's category_visibility carry different score
+    # distributions). When the baseline provider can't be
+    # determined, return blocked rather than substituting.
+    baseline_provider = await _extract_baseline_provider(
+        audit_run_id=context.audit_run_id,
+    )
+    if not baseline_provider:
+        return VerifierResult(
+            status="blocked",
+            error_message="baseline_provider_unavailable",
+            evidence_jsonb={
+                "audit_run_id": context.audit_run_id,
+                "baseline_category_visibility_score": baseline,
+                "reason": (
+                    "Original audit's report_jsonb does not carry "
+                    "the LLM provider. Cross-LLM reprobe would be "
+                    "apples-to-oranges; refusing to substitute."
+                ),
+            },
+        )
+
     # Re-run a single category_visibility probe. Same product info
-    # as the original audit; provider=auto so the orchestrator
-    # cost-routes.
+    # AND same provider as the original audit.
     title = product.get("title") or ""
     try:
         from services.agent_center_llm_client import probe
@@ -182,7 +244,7 @@ async def run_citation_movement(
                 "merchant_brand": product.get("brand"),
                 "product_type": None,  # category context
             },
-            provider=_REPROBE_PROVIDER,
+            provider=baseline_provider,
             max_runs=_REPROBE_MAX_RUNS,
         )
     except Exception as exc:  # noqa: BLE001
@@ -192,6 +254,7 @@ async def run_citation_movement(
             evidence_jsonb={
                 "audit_run_id": context.audit_run_id,
                 "baseline_category_visibility_score": baseline,
+                "baseline_provider": baseline_provider,
                 "product_key": context.product_key,
             },
         )
@@ -225,6 +288,9 @@ async def run_citation_movement(
         "score_movement": movement,
         "reprobed_at": datetime.now(timezone.utc).isoformat(),
         "reprobe_max_runs": _REPROBE_MAX_RUNS,
+        # P5.8.6: persist the pinned provider so the projection +
+        # ops dashboard can confirm baseline-vs-reprobe symmetry.
+        "baseline_provider": baseline_provider,
     }
 
     # Per docstring: the verifier MEASURES movement; both

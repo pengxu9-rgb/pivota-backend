@@ -534,8 +534,14 @@ def _coerce_evidence_type(t: str) -> str:
 
 
 def _coerce_severity(s: Optional[str]) -> str:
-    if s in VALID_SEVERITIES:
-        return s
+    """P5.8.6: case-insensitive match. The original was strict
+    equality, so `"CRITICAL"` or `"High"` (which PR-8b's
+    recommendation engine can emit when paraphrasing Gemini output)
+    silently fell back to "medium" — wrong severity, wrong sort
+    order in the merchant action queue."""
+    s_normalized = (s or "").strip().lower()
+    if s_normalized in VALID_SEVERITIES:
+        return s_normalized
     return SEVERITY_MEDIUM
 
 
@@ -1293,6 +1299,42 @@ async def mark_verification_failed_with_retry(
             "for verify=%s: %s", verify_id, str(exc)[:200],
         )
         return VERIFICATION_STATUS_FAILED
+
+
+async def extend_verification_lease(
+    *,
+    verify_id: str,
+    worker_id: str,
+    lease_seconds: int = LONG_VERIFICATION_LEASE_SECONDS,
+) -> bool:
+    """P5.8.6: extend a verification's lease. The worker calls this
+    right after claim for verifiers known to run long (e.g.,
+    public_llm_citation_movement which does an LLM probe that takes
+    minutes, not seconds). Guarded on worker ownership — returns
+    False when the lease has been stolen.
+    """
+    await ensure_audit_evidence_tables()
+    new_until = datetime.fromtimestamp(
+        _now_utc().timestamp() + lease_seconds, tz=timezone.utc,
+    )
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.claimed_by_worker == worker_id,
+            )
+            .values(claimed_until=new_until)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "extend_verification_lease failed for verify=%s: %s",
+            verify_id, str(exc)[:200],
+        )
+        return False
 
 
 async def release_stale_verification_leases(

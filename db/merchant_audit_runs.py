@@ -713,13 +713,22 @@ async def extend_lease(
     """Push claimed_until forward. Worker calls this before any
     stage that may run longer than DEFAULT_LEASE_SECONDS so a
     sibling worker doesn't reclaim the lease mid-stage.
+
+    P5.8.6: returns False when rowcount==0. The WHERE clause filters
+    on `claimed_by_worker == worker_id` so if the lease has already
+    been stolen (reaper released + sibling reclaimed), the UPDATE
+    matches no rows. The original code returned True unconditionally,
+    so the worker would keep executing thinking it owned the lease,
+    then ALL subsequent guarded UPDATEs (record_partial_result,
+    transition_stage) would silently no-op and the worker's progress
+    would vanish. Now the worker has a signal to abort early.
     """
     await ensure_merchant_audit_runs_table()
     new_until = datetime.fromtimestamp(
         _now_utc().timestamp() + lease_seconds, tz=timezone.utc,
     )
     try:
-        await database.execute(
+        result = await database.execute(
             merchant_audit_runs.update()
             .where(
                 merchant_audit_runs.c.run_id == run_id,
@@ -727,6 +736,11 @@ async def extend_lease(
             )
             .values(claimed_until=new_until)
         )
+        # `databases` returns rowcount as the result for UPDATE on
+        # Postgres; some backends return None. Treat int==0 as lost-
+        # lease; treat None or int>0 as held.
+        if isinstance(result, int):
+            return result > 0
         return True
     except Exception as exc:
         logger.warning(
