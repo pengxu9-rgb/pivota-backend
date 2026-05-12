@@ -37,14 +37,58 @@ class ExecutorContext:
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
+# P1.1: structured agent result contract. Each agent declares what
+# kind of follow-up its result warrants — dispatcher uses this to
+# decide whether to materialize a human task, queue a verification
+# run, or take no further action.
+RESULT_TYPE_DIRECT_ACTION_COMPLETED = "direct_action_completed"
+RESULT_TYPE_HUMAN_TASK_RECOMMENDED = "human_task_recommended"
+RESULT_TYPE_VERIFICATION_NEEDED = "verification_needed"
+RESULT_TYPE_NO_OP = "no_op"
+
+VALID_RESULT_TYPES = frozenset({
+    RESULT_TYPE_DIRECT_ACTION_COMPLETED,
+    RESULT_TYPE_HUMAN_TASK_RECOMMENDED,
+    RESULT_TYPE_VERIFICATION_NEEDED,
+    RESULT_TYPE_NO_OP,
+})
+
+
 @dataclass
 class ExecutorResult:
     """Return value from execute(). Persisted as-is into
     executor_runs.evidence_jsonb (status + error_message land in
-    their own columns)."""
+    their own columns).
+
+    P1.1: result_type drives dispatcher follow-up:
+      - direct_action_completed (default for backwards compat): no
+        further action — agent did the work itself
+      - human_task_recommended: dispatcher materializes a
+        merchant_tasks row using task_title/body/severity/owner
+      - verification_needed: dispatcher enqueues a verification_runs
+        row (Phase 5 scaffold; Phase 1 just records the intent in
+        evidence)
+      - no_op: agent decided not to act; nothing to follow up on
+    """
     status: str  # 'succeeded' | 'failed' | 'skipped'
     evidence: Dict[str, Any] = field(default_factory=dict)
     error_message: Optional[str] = None
+
+    # P1.1 — structured follow-up contract
+    result_type: str = RESULT_TYPE_DIRECT_ACTION_COMPLETED
+
+    # Populated when result_type == HUMAN_TASK_RECOMMENDED.
+    # Dispatcher passes these to materialize_task_from_executor.
+    task_title: Optional[str] = None
+    task_body: Optional[str] = None
+    task_severity: Optional[str] = None  # critical | high | medium | low
+    task_owner: Optional[str] = None
+    task_lever: Optional[str] = None
+
+    # Populated when result_type == VERIFICATION_NEEDED.
+    # Phase 1 just records this in evidence; Phase 5 will route it
+    # to verification_runs.
+    verification_request: Optional[Dict[str, Any]] = None
 
 
 class BaseExecutorAgent(ABC):

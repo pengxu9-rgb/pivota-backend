@@ -275,7 +275,12 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
         "status": d.get("status"),
         "assigned_to_agent": d.get("assigned_to_agent"),
         "assigned_to_human": d.get("assigned_to_human"),
+        # P1.1 dual-key shim: emit both `evidence` (legacy) and
+        # `evidence_jsonb` (matches column name + frontend type).
+        # Frontend reads `evidence_jsonb ?? evidence`. Drop the
+        # legacy key after the dual-key window in Phase 2.
         "evidence": d.get("evidence_jsonb"),
+        "evidence_jsonb": d.get("evidence_jsonb"),
         "created_at": (
             d["created_at"].isoformat()
             if isinstance(d.get("created_at"), datetime) else None

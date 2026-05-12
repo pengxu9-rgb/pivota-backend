@@ -346,7 +346,45 @@ class ContentBriefGeneratorAgent(BaseExecutorAgent):
         # merchant has actionable artifact. Only fail when zero
         # briefs were generated.
         if briefs:
-            return ExecutorResult(status="succeeded", evidence=evidence)
+            # P1.1: a content brief is a deliverable for the merchant
+            # content team to write the article from. Emit a human
+            # task so it shows up in the merchant's task queue.
+            from services.executor_agents.base import (
+                RESULT_TYPE_HUMAN_TASK_RECOMMENDED,
+            )
+            queries_phrase = ", ".join(
+                f'"{b.get("query", "")}"'
+                for b in briefs[:3]
+                if b.get("query")
+            )
+            if not queries_phrase:
+                queries_phrase = "category-visibility queries"
+            task_title = (
+                f"Write {len(briefs)} content brief"
+                f"{'s' if len(briefs) != 1 else ''} for failed "
+                f"category visibility queries"
+            )
+            task_body = (
+                f"Pivota's content brief generator produced "
+                f"{len(briefs)} drafted brief"
+                f"{'s' if len(briefs) != 1 else ''} for queries where "
+                f"your brand is currently invisible in AI-channel "
+                f"category answers (e.g. {queries_phrase}). Each "
+                f"brief includes target query, top-cited competitors, "
+                f"suggested headline, outline, and word count. Your "
+                f"content team writes the article; Pivota submits it "
+                f"to indexing in the next audit cycle."
+            )
+            return ExecutorResult(
+                status="succeeded",
+                evidence=evidence,
+                result_type=RESULT_TYPE_HUMAN_TASK_RECOMMENDED,
+                task_title=task_title,
+                task_body=task_body,
+                task_severity="medium",
+                task_owner="merchant_brand_team",
+                task_lever="content_creation",
+            )
         return ExecutorResult(
             status="failed",
             error_message="no briefs generated (all Gemini calls failed)",

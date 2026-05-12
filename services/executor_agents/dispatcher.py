@@ -21,12 +21,13 @@ optimization once we have multiple agents per audit.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from services.executor_agents.base import (
     BaseExecutorAgent,
     ExecutorContext,
     ExecutorResult,
+    RESULT_TYPE_HUMAN_TASK_RECOMMENDED,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,16 +111,66 @@ async def dispatch_agents(
             evidence_jsonb=result.evidence,
             error_message=result.error_message,
         )
+
+        # P1.1: route the result based on result_type. Pre-P1.1 agents
+        # default to RESULT_TYPE_DIRECT_ACTION_COMPLETED (the current
+        # behavior — no follow-up). Agents that opt in get follow-up
+        # actions: human_task_recommended materializes a task row;
+        # verification_needed records intent in the executor run's
+        # evidence (Phase 5 will route it to verification_runs).
+        materialized_task_id: Optional[str] = None
+        if (
+            result.status == "succeeded"
+            and result.result_type == RESULT_TYPE_HUMAN_TASK_RECOMMENDED
+            and result.task_title
+            and context.merchant_id
+            and run_id
+        ):
+            try:
+                from services.task_queue_service import (
+                    materialize_task_from_executor,
+                )
+                materialized_task_id = await materialize_task_from_executor(
+                    merchant_id=context.merchant_id,
+                    executor_run_id=run_id,
+                    agent_name=agent.name,
+                    title=result.task_title,
+                    body=result.task_body or "",
+                    severity=result.task_severity or "medium",
+                    lever=result.task_lever,
+                    parent_audit_run_id=context.parent_audit_run_id,
+                    evidence=result.evidence,
+                )
+                logger.info(
+                    "executor_dispatcher: %s materialized task %s "
+                    "for merchant=%s",
+                    agent.name, materialized_task_id, context.merchant_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Materialization failure must NOT lose the executor
+                # result. Log + continue — the run + evidence are
+                # already persisted; ops can retry materialization
+                # manually if needed.
+                logger.warning(
+                    "executor_dispatcher: materialize_task_from_executor "
+                    "raised for %s run_id=%s: %s",
+                    agent.name, run_id, exc,
+                )
+
         summary["results"].append({
             "agent_name": agent.name,
             "run_id": run_id,
             "status": result.status,
+            "result_type": result.result_type,
             "evidence": result.evidence,
             "error_message": result.error_message,
+            "materialized_task_id": materialized_task_id,
         })
         logger.info(
-            "executor_dispatcher: %s ran for merchant=%s status=%s",
+            "executor_dispatcher: %s ran for merchant=%s status=%s "
+            "result_type=%s materialized_task=%s",
             agent.name, context.merchant_id, result.status,
+            result.result_type, materialized_task_id,
         )
 
     return summary
