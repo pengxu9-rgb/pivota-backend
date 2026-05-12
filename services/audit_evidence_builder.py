@@ -440,35 +440,70 @@ def _normalize_action(
 
 
 async def persist_canonical_evidence(
-    *, audit_run_id: str, brand_report: Dict[str, Any],
+    *,
+    audit_run_id: str,
+    brand_report: Dict[str, Any],
+    merchant_id: Optional[str] = None,
 ) -> Dict[str, int]:
-    """Extract + persist evidence_items + readiness_findings for
-    one brand_report. Best-effort: each write goes through
-    insert_evidence_item / insert_finding which already swallow
-    persistence errors. Returns a count summary for the worker's
+    """Extract + persist evidence_items + readiness_findings +
+    action_plan_items for one brand_report.
+
+    P5.8.2 idempotency: each insert is keyed by a deterministic
+    sha256(audit_run_id|item_type|item_signature). On worker
+    crash + reclaim, re-running persist hits the partial unique
+    index on (audit_run_id, idempotency_key) → ON CONFLICT skips
+    instead of doubling rows. Idempotent-skips are counted in
+    `*_deduped` so the summary distinguishes them from genuine
+    persistence failures.
+
+    P5.8.1 tenancy: merchant_id is plumbed through every accessor
+    call so the canonical tables carry merchant scope at the
+    column level.
+
+    Best-effort: persistence failures don't fail the audit
+    lifecycle. Returns a count summary for the worker's
     partial_result tracking.
     """
     from db.audit_evidence import (
+        compute_canonical_idempotency_key,
         insert_action, insert_evidence_item, insert_finding,
     )
 
     summary = {
         "evidence_items_inserted": 0,
+        "evidence_items_deduped": 0,  # P5.8.2
         "evidence_items_failed": 0,
         "findings_inserted": 0,
+        "findings_deduped": 0,
         "findings_failed": 0,
         "actions_inserted": 0,
+        "actions_deduped": 0,
         "actions_failed": 0,
     }
 
-    for ev in extract_evidence_items(brand_report):
+    # Pre-flight: count what we'll attempt to insert. Lets us
+    # distinguish "ON CONFLICT skipped a row that exists" (deduped)
+    # from "INSERT raised an unrelated error" (failed). With the
+    # accessor returning None for both cases, we re-query after
+    # each loop to attribute the None correctly.
+
+    extracted_evidence = list(extract_evidence_items(brand_report))
+    for ev in extracted_evidence:
+        signature = _evidence_signature(ev)
+        idem_key = compute_canonical_idempotency_key(
+            audit_run_id=audit_run_id,
+            item_type="evidence",
+            item_signature=signature,
+        )
         try:
             new_id = await insert_evidence_item(
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 evidence_type=ev["evidence_type"],
                 payload=ev["payload"],
                 product_key=ev.get("product_key"),
                 confidence=ev.get("confidence"),
+                idempotency_key=idem_key,
             )
         except Exception as exc:  # noqa: BLE001 — defensive
             logger.warning(
@@ -478,20 +513,36 @@ async def persist_canonical_evidence(
             )
             new_id = None
         if new_id is None:
-            summary["evidence_items_failed"] += 1
+            # Attribute via re-lookup: if the row exists with our
+            # idempotency_key it's a dedupe-skip, else a real failure.
+            existed = await _evidence_exists_by_idem(
+                audit_run_id=audit_run_id, idempotency_key=idem_key,
+            )
+            if existed:
+                summary["evidence_items_deduped"] += 1
+            else:
+                summary["evidence_items_failed"] += 1
         else:
             summary["evidence_items_inserted"] += 1
 
     for finding in extract_findings(brand_report):
+        signature = _finding_signature(finding)
+        idem_key = compute_canonical_idempotency_key(
+            audit_run_id=audit_run_id,
+            item_type="finding",
+            item_signature=signature,
+        )
         try:
             new_id = await insert_finding(
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 finding_type=finding["finding_type"],
                 payload=finding["payload"],
                 severity=finding.get("severity"),
                 product_key=finding.get("product_key"),
                 confidence=finding.get("confidence"),
                 short_summary=finding.get("short_summary"),
+                idempotency_key=idem_key,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -501,15 +552,28 @@ async def persist_canonical_evidence(
             )
             new_id = None
         if new_id is None:
-            summary["findings_failed"] += 1
+            existed = await _finding_exists_by_idem(
+                audit_run_id=audit_run_id, idempotency_key=idem_key,
+            )
+            if existed:
+                summary["findings_deduped"] += 1
+            else:
+                summary["findings_failed"] += 1
         else:
             summary["findings_inserted"] += 1
 
     # P4.4: action_plan_items dual-write. Same best-effort pattern.
     for action in extract_actions(brand_report):
+        signature = _action_signature(action)
+        idem_key = compute_canonical_idempotency_key(
+            audit_run_id=audit_run_id,
+            item_type="action",
+            item_signature=signature,
+        )
         try:
             new_id = await insert_action(
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 lever=action["lever"],
                 title=action["title"],
                 body=action.get("body"),
@@ -519,6 +583,7 @@ async def persist_canonical_evidence(
                 expected_outcome=action.get("expected_outcome"),
                 phase=action.get("phase"),
                 product_key=action.get("product_key"),
+                idempotency_key=idem_key,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -528,11 +593,122 @@ async def persist_canonical_evidence(
             )
             new_id = None
         if new_id is None:
-            summary["actions_failed"] += 1
+            existed = await _action_exists_by_idem(
+                audit_run_id=audit_run_id, idempotency_key=idem_key,
+            )
+            if existed:
+                summary["actions_deduped"] += 1
+            else:
+                summary["actions_failed"] += 1
         else:
             summary["actions_inserted"] += 1
 
     return summary
+
+
+# =====================================================================
+# P5.8.2 — idempotency-signature + exists-by-idem helpers
+# =====================================================================
+
+
+def _evidence_signature(ev: Dict[str, Any]) -> str:
+    """Deterministic substring distinguishing one evidence item
+    from another for the same audit. Stable across worker re-runs
+    because brand_report → extract_evidence_items is deterministic.
+
+    Two evidence items collapse iff they would represent the same
+    canonical truth (same type + product + host + excerpt prefix).
+    """
+    payload = ev.get("payload") or {}
+    excerpt = (payload.get("excerpt_text") or "")[:80]
+    host = payload.get("host") or ""
+    matched_url = payload.get("matched_url") or ""
+    return "|".join([
+        str(ev.get("evidence_type") or ""),
+        str(ev.get("product_key") or ""),
+        host, excerpt, matched_url,
+    ])
+
+
+def _finding_signature(finding: Dict[str, Any]) -> str:
+    """One finding per (type, product) within an audit. Re-running
+    extract_findings on the same brand_report produces the same
+    signature → ON CONFLICT skip."""
+    return "|".join([
+        str(finding.get("finding_type") or ""),
+        str(finding.get("product_key") or ""),
+    ])
+
+
+def _action_signature(action: Dict[str, Any]) -> str:
+    """One action per (lever, title, product). Title is truncated
+    to 80 chars so minor prose churn from Gemini between re-runs
+    doesn't produce a fresh signature."""
+    return "|".join([
+        str(action.get("lever") or ""),
+        str(action.get("product_key") or ""),
+        (action.get("title") or "")[:80],
+    ])
+
+
+async def _evidence_exists_by_idem(
+    *, audit_run_id: str, idempotency_key: str,
+) -> bool:
+    """Lookup helper after a None return from insert_evidence_item.
+    Distinguishes "ON CONFLICT (existing row) → idempotent skip"
+    from "INSERT raised an unrelated error → real failure"."""
+    from db.audit_evidence import evidence_items
+    from db.database import database
+    try:
+        row = await database.fetch_one(
+            evidence_items.select()
+            .where(
+                evidence_items.c.audit_run_id == audit_run_id,
+                evidence_items.c.idempotency_key == idempotency_key,
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _finding_exists_by_idem(
+    *, audit_run_id: str, idempotency_key: str,
+) -> bool:
+    from db.audit_evidence import readiness_findings
+    from db.database import database
+    try:
+        row = await database.fetch_one(
+            readiness_findings.select()
+            .where(
+                readiness_findings.c.audit_run_id == audit_run_id,
+                readiness_findings.c.idempotency_key == idempotency_key,
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _action_exists_by_idem(
+    *, audit_run_id: str, idempotency_key: str,
+) -> bool:
+    from db.audit_evidence import action_plan_items
+    from db.database import database
+    try:
+        row = await database.fetch_one(
+            action_plan_items.select()
+            .where(
+                action_plan_items.c.audit_run_id == audit_run_id,
+                action_plan_items.c.idempotency_key == idempotency_key,
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # =====================================================================

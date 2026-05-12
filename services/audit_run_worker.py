@@ -275,8 +275,13 @@ async def _process_one_audit_run_inner(
                 from services.audit_evidence_builder import (
                     persist_canonical_evidence,
                 )
+                # P5.8.1/2: pass merchant_id so canonical rows carry
+                # tenant scope at the column level + idempotency keys
+                # prevent doubling on worker crash + reclaim.
                 canonical_summary = await persist_canonical_evidence(
-                    audit_run_id=run_id, brand_report=brand_report,
+                    audit_run_id=run_id,
+                    brand_report=brand_report,
+                    merchant_id=merchant_id,
                 )
                 logger.info(
                     "audit_run_worker: canonical evidence persisted "
