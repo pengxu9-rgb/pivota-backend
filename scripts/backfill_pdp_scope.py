@@ -65,13 +65,16 @@ async def _fetch_batch(batch_size: int) -> List[Dict[str, Any]]:
                  + COALESCE((
                      SELECT COUNT(DISTINCT eps.domain)
                      FROM external_product_seeds eps
-                     WHERE eps.attached_product_key = u.product_key
+                     WHERE eps.attached_product_key IN (
+                         u.product_key,
+                         (u.merchant_id || '|' || u.platform || '|' || u.source_product_id)
+                       )
                        AND eps.status = 'active'
                        AND eps.domain IS NOT NULL
                    ), 0)
                ) AS seller_count
         FROM (
-            SELECT product_key, merchant_id, category_label_source
+            SELECT product_key, merchant_id, platform, source_product_id, category_label_source
             FROM catalog_products
             WHERE pdp_scope = 'unverified'
             LIMIT :limit
