@@ -3873,6 +3873,12 @@ def build_structured_report(
     # by the route handler and threaded down so per-product reports
     # share the same state.
     integration_state: Optional[Dict[str, Any]] = None,
+    # PR-7a: brand_context dict from upstream infer_brand_context
+    # call. When provided, the executive summary builder can quote
+    # corporate intel ("Unilever-owned brand") in the opening
+    # paragraph. Cold-start audits that didn't call infer_brand_context
+    # pass None — narrative falls back to non-corporate framing.
+    brand_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return a single JSON-serializable dict with everything the UI
     needs to render the BD report. Pure function.
@@ -4126,6 +4132,10 @@ def build_structured_report(
         industry_blurb=industry_context.get("blurb", ""),
         industry_share_pct=industry_context.get("ai_search_share_pct"),
         verdict_pill_text=_verdict_display_label(verdict_label),
+        # PR-7a: corporate intel from brand_context.corporate, when
+        # available. Used by the editorial-archetype paragraph to
+        # weave "{merchant_name}, a {parent}-owned brand" framing.
+        corporate=(brand_context or {}).get("corporate"),
     )
 
     # PR-8c: implementation roadmap — groups PR-8b enriched action

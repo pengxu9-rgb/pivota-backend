@@ -153,6 +153,45 @@ def _format_competitor_count(competitor_brands: List[Dict[str, Any]]) -> str:
     return f"{n} direct competitor brands surfaced"
 
 
+def _corporate_intel_phrase(
+    corporate: Optional[Dict[str, Any]],
+) -> str:
+    """PR-7a: render the corporate intel as a 1-clause sentence
+    fragment that can be woven into an opening paragraph. Empty
+    string when no corporate intel available — the caller's
+    paragraph drops the fragment cleanly."""
+    if not corporate:
+        return ""
+    parent = corporate.get("parent_company")
+    status = corporate.get("ownership_status")
+    funding = corporate.get("funding_stage")
+    valuation = corporate.get("valuation_band_usd")
+    if status == "acquired" and parent:
+        year = corporate.get("parent_acquisition_year")
+        if year:
+            return f", a {parent}-owned brand (acquired {year})"
+        return f", a {parent}-owned brand"
+    if status == "subsidiary" and parent:
+        return f", a subsidiary of {parent}"
+    if status == "public":
+        return ", a publicly-traded brand"
+    if funding == "ipo":
+        return ", a publicly-traded brand"
+    if funding in ("series_c", "series_d_plus"):
+        if valuation == "1b_plus":
+            return ", a unicorn-status venture-backed brand"
+        return ", a late-stage venture-backed brand"
+    if funding in ("series_a", "series_b"):
+        return ", a venture-backed brand"
+    if funding == "seed":
+        return ", an early-stage brand"
+    if funding == "bootstrapped":
+        return ", an independent bootstrapped brand"
+    if funding == "pe_owned" and parent:
+        return f", a {parent}-portfolio brand"
+    return ""
+
+
 def _build_editorial_strong_attr_weak(
     *,
     merchant_name: str,
@@ -165,13 +204,15 @@ def _build_editorial_strong_attr_weak(
     industry_blurb: str,
     industry_share_pct: Optional[int],
     verdict_pill_text: str,
+    corporate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The Grüns archetype: paradox framing — visible in editorial,
     weak in first-party attribution. Highest pitch leverage.
 
     Composition:
       Para 1 — opens with merchant's strength (editorial validation,
-        category position), then introduces the paradox: this strength
+        category position, optional corporate context like
+        "Unilever-owned"), then introduces the paradox: this strength
         doesn't currently translate to first-party attribution.
       Para 2 — names the AI channel surface this audit measured + why
         it matters (industry growth rate).
@@ -180,6 +221,7 @@ def _build_editorial_strong_attr_weak(
     """
     pubs_phrase = _format_publisher_list(cited_publishers)
     comp_phrase = _format_competitor_count(competitor_brands)
+    corporate_phrase = _corporate_intel_phrase(corporate)
     cat_score_phrase = (
         f"top-tier ({category_visibility_score}/100)"
         if category_visibility_score is not None
@@ -187,11 +229,11 @@ def _build_editorial_strong_attr_weak(
     )
 
     para_1 = (
-        f"{merchant_name} is *visible* in AI-assisted shopping search — "
-        f"but as a brand consumers learn about, not as a destination "
-        f"consumers are routed to. Category-level discoverability is "
-        f"{cat_score_phrase}: when consumers ask AI assistants "
-        f"category questions"
+        f"{merchant_name}{corporate_phrase} is *visible* in AI-assisted "
+        f"shopping search — but as a brand consumers learn about, not "
+        f"as a destination consumers are routed to. Category-level "
+        f"discoverability is {cat_score_phrase}: when consumers ask "
+        f"AI assistants category questions"
     )
     if pubs_phrase:
         para_1 += (
@@ -468,6 +510,7 @@ def build_executive_summary(
     industry_blurb: str,
     industry_share_pct: Optional[int],
     verdict_pill_text: str,
+    corporate: Optional[Dict[str, Any]] = None,    # PR-7a
 ) -> Dict[str, Any]:
     """Top-level entry point — picks the right archetype builder and
     returns the executive_summary block.
@@ -520,6 +563,7 @@ def build_executive_summary(
             return _build_editorial_strong_attr_weak(
                 evidence_quotes=evidence_quotes,
                 competitor_brands=competitor_brands,
+                corporate=corporate,                # PR-7a
                 **common_kwargs,
             )
         if archetype == ARCH_FULLY_INVISIBLE:

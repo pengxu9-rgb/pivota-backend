@@ -908,6 +908,111 @@ async def _infer_founder_story(brand: str, domain: str, api_key: str) -> Optiona
     }
 
 
+def _build_corporate_prompt(brand: str, domain: str) -> str:
+    """PR-7a corporate intel prompt. Asks Gemini for ownership +
+    funding signals only, with strict null defaults to prevent
+    hallucination of corporate facts."""
+    return (
+        f"Research the corporate ownership and funding status of "
+        f"the brand '{brand}' (website: {domain}). Respond ONLY with "
+        f"a JSON object of this exact shape:\n"
+        f'{{\n'
+        f'  "ownership_status": "independent" | "acquired" | '
+        f'"public" | "subsidiary" | null,\n'
+        f'  "parent_company": "<name>" | null,\n'
+        f'  "parent_acquisition_year": <integer> | null,\n'
+        f'  "funding_stage": "bootstrapped" | "seed" | "series_a" | '
+        f'"series_b" | "series_c" | "series_d_plus" | "ipo" | "pe_owned" | null,\n'
+        f'  "valuation_band_usd": "under_10m" | "10m_to_100m" | '
+        f'"100m_to_1b" | "1b_plus" | null,\n'
+        f'  "confidence": "high" | "medium" | "low"\n'
+        f'}}\n'
+        f"Use null for any field you cannot establish with high "
+        f"confidence from public sources. Acquisition signals MUST "
+        f"come from a confirmed press release or SEC filing — do "
+        f"not infer from tone or rumor. Set confidence='low' if any "
+        f"field required a non-trivial inference."
+    )
+
+
+async def _infer_corporate_intel(
+    brand: str, domain: str, api_key: str,
+) -> Optional[Dict[str, Any]]:
+    """PR-7a: surface corporate ownership / funding signals (e.g.
+    'Grüns is owned by Unilever'). Single grounded probe; conservative
+    null defaults; rejects responses with confidence='low' on
+    ownership_status to defend against hallucinated acquisitions.
+    """
+    payload = await _gemini_grounded_call(
+        _build_corporate_prompt(brand, domain), api_key=api_key,
+    )
+    if not payload:
+        return None
+    parsed = _unwrap_json(_parse_gemini_text(payload))
+    if not isinstance(parsed, dict):
+        return None
+
+    confidence = parsed.get("confidence")
+    if confidence not in ("high", "medium", "low"):
+        confidence = "low"
+
+    ownership_status = parsed.get("ownership_status")
+    if ownership_status not in (
+        "independent", "acquired", "public", "subsidiary",
+    ):
+        ownership_status = None
+
+    # Hallucination defense: if model claims acquired/subsidiary at
+    # low confidence, downgrade to null. Acquisition claims are
+    # high-stakes — better to omit than to fabricate.
+    if (
+        ownership_status in ("acquired", "subsidiary")
+        and confidence == "low"
+    ):
+        ownership_status = None
+
+    parent = parsed.get("parent_company")
+    if not isinstance(parent, str) or not parent.strip():
+        parent = None
+    elif ownership_status not in ("acquired", "subsidiary"):
+        # Parent only meaningful when ownership_status confirms it
+        parent = None
+
+    acq_year = parsed.get("parent_acquisition_year")
+    if not isinstance(acq_year, int) or acq_year < 1900 or acq_year > 2100:
+        acq_year = None
+
+    funding_stage = parsed.get("funding_stage")
+    if funding_stage not in (
+        "bootstrapped", "seed", "series_a", "series_b",
+        "series_c", "series_d_plus", "ipo", "pe_owned",
+    ):
+        funding_stage = None
+
+    valuation_band = parsed.get("valuation_band_usd")
+    if valuation_band not in (
+        "under_10m", "10m_to_100m", "100m_to_1b", "1b_plus",
+    ):
+        valuation_band = None
+
+    # If everything is null, return None so downstream renderers
+    # know we don't have corporate intel for this brand
+    if not any([
+        ownership_status, parent, acq_year, funding_stage,
+        valuation_band,
+    ]):
+        return None
+
+    return {
+        "ownership_status": ownership_status,
+        "parent_company": parent,
+        "parent_acquisition_year": acq_year,
+        "funding_stage": funding_stage,
+        "valuation_band_usd": valuation_band,
+        "confidence": confidence,
+    }
+
+
 async def _infer_press_coverage(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
     payload = await _gemini_grounded_call(_build_press_prompt(brand, domain), api_key=api_key)
     if not payload:
@@ -935,16 +1040,21 @@ async def _infer_press_coverage(brand: str, domain: str, api_key: str) -> Option
 
 
 async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
-    """Three Gemini grounded queries in parallel — retail presence,
-    founder story, press coverage. Each fails gracefully (None /
-    empty) so the caller can render "data not available" instead of
-    fabricating.
+    """Four Gemini grounded queries in parallel — retail presence,
+    founder story, press coverage, **corporate intel (PR-7a)**.
+    Each fails gracefully (None / empty) so the caller can render
+    "data not available" instead of fabricating.
 
     Returns:
       {
         "retail_presence": [{retailer, url, confidence}, ...] | null,
         "founder_story": {founders, founding_year, origin_story} | null,
         "press_coverage": [{publication, headline, url, date}, ...] | null,
+        "corporate": {
+          "ownership_status", "parent_company",
+          "parent_acquisition_year", "funding_stage",
+          "valuation_band_usd", "confidence"
+        } | null,                                                # PR-7a
         "available": bool,  # at least one query succeeded
       }
     """
@@ -955,6 +1065,7 @@ async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
             "retail_presence": None,
             "founder_story": None,
             "press_coverage": None,
+            "corporate": None,
             "available": False,
         }
 
@@ -963,6 +1074,7 @@ async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
             "retail_presence": None,
             "founder_story": None,
             "press_coverage": None,
+            "corporate": None,
             "available": False,
         }
 
@@ -970,6 +1082,7 @@ async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
         _infer_retail_presence(brand, domain, api_key),
         _infer_founder_story(brand, domain, api_key),
         _infer_press_coverage(brand, domain, api_key),
+        _infer_corporate_intel(brand, domain, api_key),    # PR-7a
         return_exceptions=True,
     )
 
@@ -979,12 +1092,14 @@ async def infer_brand_context(brand: str, domain: str) -> Dict[str, Any]:
     retail = _safe(results[0])
     founder = _safe(results[1])
     press = _safe(results[2])
+    corporate = _safe(results[3])
 
     return {
         "retail_presence": retail,
         "founder_story": founder,
         "press_coverage": press,
-        "available": any(x is not None for x in (retail, founder, press)),
+        "corporate": corporate,
+        "available": any(x is not None for x in (retail, founder, press, corporate)),
     }
 
 
