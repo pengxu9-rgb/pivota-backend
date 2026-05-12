@@ -777,8 +777,25 @@ def _coerce_to_array(parsed: Any) -> Optional[List[Any]]:
     return None
 
 
-async def _gemini_grounded_call(prompt: str, *, api_key: str) -> Optional[Dict[str, Any]]:
-    """One grounded call. Returns parsed payload or None on any failure."""
+async def _gemini_grounded_call(
+    prompt: str,
+    *,
+    api_key: str,
+    scan_mode: str = "bd_grounded_lookup",
+) -> Optional[Dict[str, Any]]:
+    """One grounded call. Returns parsed payload or None on any failure.
+
+    P2.5b: scan_mode is recorded into llm_probe_runs for cost
+    attribution. Callers in this module pass the inference name
+    (e.g., "bd_retail_presence", "bd_corporate_intel") so the
+    cost rollup distinguishes which inferences ran.
+
+    Note: Gemini's REST API doesn't return token usage in the
+    response body, so input_tokens + output_tokens + cost_usd are
+    recorded as None. Latency + status are still captured.
+    """
+    import time as _time
+    _telemetry_started_at = _time.perf_counter()
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
@@ -791,14 +808,77 @@ async def _gemini_grounded_call(prompt: str, *, api_key: str) -> Optional[Dict[s
             r = await client.post(url, headers=headers, json=body)
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         logger.warning("brand_context: HTTP error: %s", exc)
+        await _record_bd_telemetry(
+            scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message=f"transport: {type(exc).__name__}",
+        )
         return None
     if r.status_code != 200:
         logger.warning("brand_context: non-200 %s body=%s", r.status_code, r.text[:300])
+        await _record_bd_telemetry(
+            scan_mode=scan_mode,
+            status=(
+                "rate_limited" if r.status_code == 429 else "failed"
+            ),
+            started_at_perf=_telemetry_started_at,
+            error_message=f"http_{r.status_code}",
+        )
         return None
     try:
-        return r.json()
+        result = r.json()
     except json.JSONDecodeError:
+        await _record_bd_telemetry(
+            scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message="non_json_response",
+        )
         return None
+    await _record_bd_telemetry(
+        scan_mode=scan_mode, status="succeeded",
+        started_at_perf=_telemetry_started_at,
+    )
+    return result
+
+
+async def _record_bd_telemetry(
+    *,
+    scan_mode: str,
+    status: str,
+    started_at_perf: float,
+    error_message: Optional[str] = None,
+) -> None:
+    """P2.5b: best-effort telemetry record for one BD grounded call.
+    Gemini REST API doesn't return token usage, so input/output
+    tokens + cost are None — the row still captures latency + status
+    for per-merchant call-count accounting."""
+    try:
+        import time as _time
+        from db.llm_probe_runs import record_probe_run
+        from services.audit_telemetry_context import (
+            current_audit_context,
+        )
+        ctx = current_audit_context()
+        latency_ms = int(
+            (_time.perf_counter() - started_at_perf) * 1000.0,
+        )
+        await record_probe_run(
+            provider="gemini",
+            scan_mode=scan_mode,
+            status=status,
+            merchant_id=ctx.merchant_id,
+            audit_run_id=ctx.audit_run_id,
+            latency_ms=latency_ms,
+            input_tokens=None,
+            output_tokens=None,
+            cost_usd=None,
+            error_message=error_message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "_record_bd_telemetry suppressed error: %s",
+            str(exc)[:200],
+        )
 
 
 def _build_retail_prompt(brand: str, domain: str) -> str:
@@ -855,7 +935,10 @@ Schema per element:
 
 
 async def _infer_retail_presence(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
-    payload = await _gemini_grounded_call(_build_retail_prompt(brand, domain), api_key=api_key)
+    payload = await _gemini_grounded_call(
+        _build_retail_prompt(brand, domain),
+        api_key=api_key, scan_mode="bd_retail_presence",
+    )
     if not payload:
         return None
     raw_text = _parse_gemini_text(payload)
@@ -882,7 +965,10 @@ async def _infer_retail_presence(brand: str, domain: str, api_key: str) -> Optio
 
 
 async def _infer_founder_story(brand: str, domain: str, api_key: str) -> Optional[Dict[str, Any]]:
-    payload = await _gemini_grounded_call(_build_founder_prompt(brand, domain), api_key=api_key)
+    payload = await _gemini_grounded_call(
+        _build_founder_prompt(brand, domain),
+        api_key=api_key, scan_mode="bd_founder_story",
+    )
     if not payload:
         return None
     parsed = _unwrap_json(_parse_gemini_text(payload))
@@ -945,6 +1031,7 @@ async def _infer_corporate_intel(
     """
     payload = await _gemini_grounded_call(
         _build_corporate_prompt(brand, domain), api_key=api_key,
+        scan_mode="bd_corporate_intel",
     )
     if not payload:
         return None
@@ -1014,7 +1101,10 @@ async def _infer_corporate_intel(
 
 
 async def _infer_press_coverage(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
-    payload = await _gemini_grounded_call(_build_press_prompt(brand, domain), api_key=api_key)
+    payload = await _gemini_grounded_call(
+        _build_press_prompt(brand, domain),
+        api_key=api_key, scan_mode="bd_press_coverage",
+    )
     if not payload:
         return None
     raw_text = _parse_gemini_text(payload)
@@ -1249,7 +1339,8 @@ def _coerce_str(v: Any) -> Optional[str]:
 
 async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], api_key: str) -> Optional[Dict[str, Any]]:
     payload = await _gemini_grounded_call(
-        _build_own_presence_prompt(brand, platform, handle), api_key=api_key,
+        _build_own_presence_prompt(brand, platform, handle),
+        api_key=api_key, scan_mode="bd_own_presence",
     )
     if not payload:
         return None
@@ -1289,7 +1380,8 @@ async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], 
 
 async def _infer_kol_endorsements(brand: str, platform: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
     payload = await _gemini_grounded_call(
-        _build_kol_prompt(brand, platform), api_key=api_key,
+        _build_kol_prompt(brand, platform),
+        api_key=api_key, scan_mode="bd_kol_endorsements",
     )
     if not payload:
         return None
@@ -1325,7 +1417,8 @@ async def _infer_competitive_social(brand: str, competitors: List[str], api_key:
     if not competitors:
         return None
     payload = await _gemini_grounded_call(
-        _build_competitive_prompt(brand, competitors), api_key=api_key,
+        _build_competitive_prompt(brand, competitors),
+        api_key=api_key, scan_mode="bd_competitive_social",
     )
     if not payload:
         return None

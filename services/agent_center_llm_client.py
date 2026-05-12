@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
@@ -29,6 +30,81 @@ import httpx
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+async def _record_probe_telemetry(
+    *,
+    provider: str,
+    scan_mode: str,
+    status: str,
+    started_at_perf: float,
+    result: Optional[Dict[str, Any]] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """P2.5b: best-effort telemetry record after every probe call.
+    Pulls audit_run_id + merchant_id from the audit_telemetry context
+    so we don't have to thread them through every call signature.
+
+    Token + cost extraction: result['usage'] from upstream PIVOTA-Agent
+    contains input_tokens + output_tokens when available. Cost is
+    computed via provider_registry rates. When result/usage is missing
+    (mock fallback, error path, partial response), the row is still
+    inserted with None for the cost fields — telemetry coverage beats
+    perfect cost data.
+    """
+    try:
+        from db.llm_probe_runs import (
+            compute_cost_usd, record_probe_run,
+        )
+        from services.audit_telemetry_context import (
+            current_audit_context,
+        )
+        ctx = current_audit_context()
+        latency_ms = int(
+            (time.perf_counter() - started_at_perf) * 1000.0,
+        )
+        usage = (result or {}).get("usage") if isinstance(result, dict) else None
+        input_tokens = None
+        output_tokens = None
+        cost_usd = None
+        if isinstance(usage, dict):
+            input_tokens = usage.get("input_tokens")
+            output_tokens = usage.get("output_tokens")
+            try:
+                from services.llm_providers.provider_registry import (
+                    get_provider,
+                )
+                p = get_provider(provider)
+                if p is not None:
+                    cost_usd = compute_cost_usd(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cost_per_1k_input_tokens_usd=(
+                            p.cost_per_1k_input_tokens_usd
+                        ),
+                        cost_per_1k_output_tokens_usd=(
+                            p.cost_per_1k_output_tokens_usd
+                        ),
+                    )
+            except Exception:  # noqa: BLE001
+                pass  # cost is nice-to-have; row still records
+        await record_probe_run(
+            provider=provider,
+            scan_mode=scan_mode,
+            status=status,
+            merchant_id=ctx.merchant_id,
+            audit_run_id=ctx.audit_run_id,
+            latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+            error_message=error_message,
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry never fails calls
+        logger.debug(
+            "_record_probe_telemetry suppressed error: %s",
+            str(exc)[:200],
+        )
 
 
 # Retry once on transport-layer errors (connection reset, read error,
@@ -340,6 +416,26 @@ async def probe(
             scan_target_id,
             scan_mode,
         )
+        # P2.5b: record mock-fallback as a telemetry row so global
+        # cost-cap accounting doesn't get fooled into thinking nothing
+        # was spent. Latency for mock is negligible but not zero —
+        # use 0 so the row is unambiguously distinguishable from real
+        # provider calls.
+        from services.audit_telemetry_context import (
+            current_audit_context,
+        )
+        try:
+            from db.llm_probe_runs import record_probe_run
+            ctx = current_audit_context()
+            await record_probe_run(
+                provider="mock", scan_mode=scan_mode,
+                status="mock_fallback",
+                merchant_id=ctx.merchant_id,
+                audit_run_id=ctx.audit_run_id,
+                latency_ms=0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return _local_mock_result(scan_mode, max_runs)
 
     url = _resolve_endpoint_url()
@@ -359,6 +455,10 @@ async def probe(
     per_merchant_sem = await _get_per_merchant_semaphore(merchant_id)
     response = None
     last_exc: Optional[BaseException] = None
+    # P2.5b: start latency timer BEFORE semaphore acquisition so wait
+    # time for a busy global slot also counts toward observed latency
+    # — matters for tuning the per-merchant + global concurrency caps.
+    _telemetry_started_at = time.perf_counter()
     async with per_merchant_sem:
         async with global_sem:
             for attempt in (1, 2):
@@ -387,12 +487,25 @@ async def probe(
                     ) from exc
     if response is None:
         # All retries exhausted on retryable transport errors.
+        await _record_probe_telemetry(
+            provider=provider, scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message=(
+                f"transport_failed: "
+                f"{type(last_exc).__name__ if last_exc else 'unknown'}"
+            ),
+        )
         raise AgentCenterLlmClientError(
             f"llm probe transport failed after retry "
             f"({type(last_exc).__name__ if last_exc else 'unknown'}): {last_exc!r}"
         ) from last_exc
 
     if response.status_code >= 500:
+        await _record_probe_telemetry(
+            provider=provider, scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message=f"upstream_5xx_{response.status_code}",
+        )
         raise AgentCenterLlmClientError(
             f"llm probe upstream {response.status_code}: {response.text[:200]}"
         )
@@ -400,6 +513,11 @@ async def probe(
         # Upstream rejected the request (bad scan_mode / missing field /
         # auth mismatch). Surface as ValueError so the route layer turns
         # it into 400.
+        await _record_probe_telemetry(
+            provider=provider, scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message=f"upstream_4xx_{response.status_code}",
+        )
         raise ValueError(
             f"llm probe rejected by upstream ({response.status_code}): "
             f"{response.text[:200]}"
@@ -408,14 +526,36 @@ async def probe(
     try:
         payload = response.json()
     except Exception as exc:
+        await _record_probe_telemetry(
+            provider=provider, scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message=f"non_json_response: {exc}",
+        )
         raise AgentCenterLlmClientError(f"llm probe non-JSON response: {exc}") from exc
 
     if not isinstance(payload, dict) or not payload.get("ok"):
+        await _record_probe_telemetry(
+            provider=provider, scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message="response_not_ok",
+        )
         raise AgentCenterLlmClientError(
             f"llm probe response not ok: {str(payload)[:200]}"
         )
 
     result = payload.get("result")
     if not isinstance(result, dict):
+        await _record_probe_telemetry(
+            provider=provider, scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message="missing_result_object",
+        )
         raise AgentCenterLlmClientError("llm probe response missing `result` object")
+
+    # Success — record cost/usage telemetry then return.
+    await _record_probe_telemetry(
+        provider=provider, scan_mode=scan_mode, status="succeeded",
+        started_at_perf=_telemetry_started_at,
+        result=result,
+    )
     return result
