@@ -685,14 +685,7 @@ async def _apply(limit: int) -> int:
     await _ensure_external_seed_merchant()
 
     limit_clause = ""
-    values: Dict[str, Any] = {
-        "merchant_id": MERCHANT_ID,
-        "platform": PLATFORM,
-        "catalog_track": CATALOG_TRACK,
-        "truth_tier": TRUTH_TIER,
-        "readiness_tier": READINESS_TIER,
-        "source_system": SOURCE_SYSTEM,
-    }
+    values: Dict[str, Any] = {}
     if limit > 0:
         limit_clause = "LIMIT :limit"
         values["limit"] = limit
