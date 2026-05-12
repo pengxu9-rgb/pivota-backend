@@ -181,10 +181,14 @@ async def test_full_happy_path_stage_sequence(monkeypatch):
     # at least one lease extension before their work.
     assert len(fake.lease_extensions) >= 3
 
-    # Partial results recorded at: discovering, probing, materializing,
-    # verifying. (scoring is a no-op transition with no work.)
+    # Partial results recorded at: discovering, probing, scoring,
+    # materializing, verifying. (PR #482 added the scoring entry so
+    # GET /api/audits/{id}'s per-stage progress UI doesn't have a
+    # gap between probing and materializing.)
     keys = [list(p.keys())[0] for p in fake.partial_results]
-    assert keys == ["discovering", "probing", "materializing", "verifying"]
+    assert keys == [
+        "discovering", "probing", "scoring", "materializing", "verifying",
+    ]
 
     # Legacy aggregate write happened so dual-key consumers see a
     # populated row even before they migrate.
