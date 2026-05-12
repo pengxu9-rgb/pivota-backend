@@ -225,11 +225,17 @@ class MerchantSelfAuditRequest(BaseModel):
     max_runs: int = Field(3, ge=1, le=5)
 
 
-# P2.4: poll budget for the opt-in async-pipeline compat path. 30s
-# matches the legacy synchronous wall-time merchants are used to.
-# Tunable via env (AUDIT_COMPAT_POLL_BUDGET_S) so staging can validate
-# the budget against real audit runtimes before tightening.
-_COMPAT_POLL_BUDGET_SECONDS = 30
+# P2.4: poll budget for the opt-in async-pipeline compat path.
+#
+# P5.8.6 update: dropped from 30s → 5s. The operational review found
+# that 30s polls were the dominant cause of connection-pool exhaustion
+# under modest legacy traffic — each poll held an HTTP handler + DB
+# connection for the full window. With the new async pipeline, audits
+# rarely complete in <30s anyway (worker tick is 10s + 6 stages); the
+# 5s budget reliably returns 202 fast, letting the merchant portal
+# poll GET /api/audits/{id} from the client side without tying up
+# server resources.
+_COMPAT_POLL_BUDGET_SECONDS = 5
 _COMPAT_POLL_INTERVAL_SECONDS = 1.0
 
 

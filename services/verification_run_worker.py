@@ -56,6 +56,15 @@ WORKER_ID = (
 MAX_RUNS_PER_TICK = 5
 
 
+# P5.8.6: verifiers that run long enough that the default 120s
+# claim lease is unsafe. The worker calls extend_verification_lease
+# right after claim for these. Most are HTTP probes (seconds);
+# citation_movement is the outlier because it re-runs an LLM probe.
+_LONG_RUNNING_VERIFIERS = frozenset({
+    "public_llm_citation_movement",
+})
+
+
 # =====================================================================
 # Verifier contract
 # =====================================================================
@@ -160,6 +169,26 @@ async def process_one_verification_run() -> bool:
         verify_id, verifier_id, audit_run_id, product_key,
         retry_count + 1,
     )
+
+    # P5.8.6: extend lease for known-long verifiers. The default
+    # claim lease is 120s — fine for HTTP probes but way too short
+    # for public_llm_citation_movement which runs a full LLM
+    # category_visibility probe (minutes, not seconds). Without
+    # extension, the lease expires mid-probe, reaper releases, a
+    # sibling worker re-runs the probe → wasted LLM cost +
+    # exhausted_retries on a verifier that was actually working.
+    if verifier_id in _LONG_RUNNING_VERIFIERS:
+        ok = await ae.extend_verification_lease(
+            verify_id=verify_id, worker_id=WORKER_ID,
+            lease_seconds=ae.LONG_VERIFICATION_LEASE_SECONDS,
+        )
+        if not ok:
+            logger.info(
+                "verification_run_worker: lost lease at extend "
+                "for verify=%s (sibling stole during claim→extend)",
+                verify_id,
+            )
+            return True
 
     verifier_func = _lookup_verifier(verifier_id)
     if verifier_func is None:

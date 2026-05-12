@@ -40,16 +40,24 @@ logger = logging.getLogger(__name__)
 _TIMEOUT_S = 10.0
 
 
-def _backend_base_url() -> str:
+def _backend_base_url() -> Optional[str]:
     """The backend's own base URL. Used so the verifier hits the
     same instance it's running in (or a sibling pod) rather than
-    the frontend's agent.pivota.cc. Defaults to localhost for
-    test envs; prod sets PIVOTA_BACKEND_INTERNAL_URL."""
-    import os
-    return (
-        os.getenv("PIVOTA_BACKEND_INTERNAL_URL")
-        or "http://localhost:8000"
-    ).rstrip("/")
+    the frontend's agent.pivota.cc.
+
+    P5.8.5: reads from config/settings.py (pivota_backend_internal_url)
+    instead of os.getenv directly. Returns None when unset, which
+    the verifier interprets as "GSC-style blocked: not configured"
+    rather than retry-storming against a localhost fallback. Tests
+    can still set PIVOTA_BACKEND_INTERNAL_URL=... in env.
+    """
+    try:
+        from config.settings import settings
+        url = (settings.pivota_backend_internal_url or "").strip()
+    except Exception:  # noqa: BLE001 — defensive in case settings import fails
+        import os
+        url = (os.getenv("PIVOTA_BACKEND_INTERNAL_URL") or "").strip()
+    return url.rstrip("/") if url else None
 
 
 async def run_pivota_internal_retrieval(
@@ -81,6 +89,22 @@ async def run_pivota_internal_retrieval(
     expected_merchant_id = product.get("merchant_id")
 
     base = _backend_base_url()
+    # P5.8.5: returns blocked (not retryable) when the backend's
+    # internal URL isn't configured. Better than retry-storming
+    # against localhost in Railway prod.
+    if base is None:
+        return VerifierResult(
+            status="blocked",
+            error_message="pivota_backend_internal_url_not_configured",
+            evidence_jsonb={
+                "sig_id": sig_id,
+                "reason": (
+                    "PIVOTA_BACKEND_INTERNAL_URL env var unset; "
+                    "configure on Railway web service before this "
+                    "verifier can run"
+                ),
+            },
+        )
     resolver_url = f"{base}/products/{sig_id}"
 
     try:

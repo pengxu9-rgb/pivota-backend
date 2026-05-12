@@ -226,11 +226,16 @@ evidence_items = Table(
     metadata,
     Column("evidence_id", UUID(as_uuid=False), primary_key=True),
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    # P5.8.1: tenancy at the column level (was: route-layer only)
+    Column("merchant_id", Text, nullable=True),
     Column("product_key", Text, nullable=True),
     Column("probe_run_id", UUID(as_uuid=False), nullable=True),
     Column("evidence_type", Text, nullable=False),
     Column("payload_jsonb", JSONB, nullable=False),
     Column("confidence", Integer, nullable=True),
+    # P5.8.1: idempotency key — deterministic per (audit, item-sig);
+    # paired with partial unique index for ON CONFLICT DO NOTHING.
+    Column("idempotency_key", Text, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Index("idx_evidence_items_audit_run", "audit_run_id", "created_at"),
     Index("idx_evidence_items_type", "evidence_type", "audit_run_id"),
@@ -243,12 +248,14 @@ readiness_findings = Table(
     metadata,
     Column("finding_id", UUID(as_uuid=False), primary_key=True),
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("merchant_id", Text, nullable=True),  # P5.8.1
     Column("product_key", Text, nullable=True),
     Column("finding_type", Text, nullable=False),
     Column("severity", Text, nullable=False, server_default="medium"),
     Column("payload_jsonb", JSONB, nullable=False),
     Column("confidence", Integer, nullable=True),
     Column("short_summary", Text, nullable=True),
+    Column("idempotency_key", Text, nullable=True),  # P5.8.1
     Column("created_at", DateTime(timezone=True), nullable=False),
     Index("idx_findings_audit_run", "audit_run_id", "created_at"),
     Index("idx_findings_type", "finding_type", "audit_run_id"),
@@ -261,6 +268,7 @@ action_plan_items = Table(
     metadata,
     Column("action_id", UUID(as_uuid=False), primary_key=True),
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("merchant_id", Text, nullable=True),  # P5.8.1
     Column("product_key", Text, nullable=True),
     Column("parent_finding_id", UUID(as_uuid=False), nullable=True),
     Column("severity", Text, nullable=False, server_default="medium"),
@@ -273,6 +281,7 @@ action_plan_items = Table(
     Column("phase", Text, nullable=True),
     Column("depends_on", ARRAY(UUID(as_uuid=False)), nullable=True),
     Column("materialized_task_id", UUID(as_uuid=False), nullable=True),
+    Column("idempotency_key", Text, nullable=True),  # P5.8.1
     Column("created_at", DateTime(timezone=True), nullable=False),
     Index(
         "idx_actions_audit_run",
@@ -287,6 +296,7 @@ verification_runs = Table(
     metadata,
     Column("verify_id", UUID(as_uuid=False), primary_key=True),
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("merchant_id", Text, nullable=True),  # P5.8.7
     Column("product_key", Text, nullable=True),
     Column("verifier_id", Text, nullable=False),
     Column("status", Text, nullable=False, server_default="pending"),
@@ -313,6 +323,7 @@ report_projections = Table(
     metadata,
     Column("projection_id", UUID(as_uuid=False), primary_key=True),
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("merchant_id", Text, nullable=True),  # P5.8.1
     Column("audience", Text, nullable=False),
     Column("payload_jsonb", JSONB, nullable=False),
     Column("builder_version", Text, nullable=False),
@@ -444,6 +455,53 @@ _DDL_STATEMENTS = [
         UNIQUE (audit_run_id, audience)
     );
     """,
+
+    # P5.8.1: merchant_id + idempotency_key on canonical tables
+    # (matches migration 088). Two-layer tenancy + idempotent
+    # writes via partial unique indexes. ALTERs are idempotent.
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_items_merchant "
+    "ON evidence_items (merchant_id, audit_run_id) "
+    "WHERE merchant_id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_items_idempotency "
+    "ON evidence_items (audit_run_id, idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL;",
+
+    "ALTER TABLE readiness_findings "
+    "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "ALTER TABLE readiness_findings "
+    "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_findings_merchant "
+    "ON readiness_findings (merchant_id, audit_run_id) "
+    "WHERE merchant_id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_idempotency "
+    "ON readiness_findings (audit_run_id, idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL;",
+
+    "ALTER TABLE action_plan_items "
+    "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "ALTER TABLE action_plan_items "
+    "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_actions_merchant "
+    "ON action_plan_items (merchant_id, audit_run_id) "
+    "WHERE merchant_id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_idempotency "
+    "ON action_plan_items (audit_run_id, idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL;",
+
+    "ALTER TABLE report_projections "
+    "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_projections_merchant "
+    "ON report_projections (merchant_id, audience);",
+
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_merchant "
+    "ON verification_runs (merchant_id, audit_run_id) "
+    "WHERE merchant_id IS NOT NULL;",
 ]
 
 
@@ -483,8 +541,14 @@ def _coerce_evidence_type(t: str) -> str:
 
 
 def _coerce_severity(s: Optional[str]) -> str:
-    if s in VALID_SEVERITIES:
-        return s
+    """P5.8.6: case-insensitive match. The original was strict
+    equality, so `"CRITICAL"` or `"High"` (which PR-8b's
+    recommendation engine can emit when paraphrasing Gemini output)
+    silently fell back to "medium" — wrong severity, wrong sort
+    order in the merchant action queue."""
+    s_normalized = (s or "").strip().lower()
+    if s_normalized in VALID_SEVERITIES:
+        return s_normalized
     return SEVERITY_MEDIUM
 
 
@@ -508,13 +572,25 @@ async def insert_evidence_item(
     audit_run_id: str,
     evidence_type: str,
     payload: Dict[str, Any],
+    merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
     probe_run_id: Optional[str] = None,
     confidence: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort write. Unknown evidence_type is coerced to
     'custom' with the original value preserved in payload_jsonb.
-    Returns the new evidence_id, or None on persistence failure."""
+
+    P5.8.1: merchant_id + idempotency_key plumbed through for
+    two-layer tenancy + idempotent re-runs. When idempotency_key
+    is set and a row already exists for (audit_run_id,
+    idempotency_key), the partial unique index causes an ON
+    CONFLICT — we catch + return the existing-row marker rather
+    than the new uuid.
+
+    Returns the new evidence_id, or None on persistence failure /
+    idempotent skip.
+    """
     await ensure_audit_evidence_tables()
     coerced_type = _coerce_evidence_type(evidence_type)
     safe_payload = dict(payload or {})
@@ -526,6 +602,7 @@ async def insert_evidence_item(
             evidence_items.insert().values(
                 evidence_id=evidence_id,
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 product_key=product_key,
                 probe_run_id=probe_run_id,
                 evidence_type=coerced_type,
@@ -533,14 +610,19 @@ async def insert_evidence_item(
                 confidence=(
                     int(confidence) if confidence is not None else None
                 ),
+                idempotency_key=idempotency_key,
                 created_at=_now_utc(),
             )
         )
         return evidence_id
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "insert_evidence_item failed audit_run=%s type=%s: %s",
-            audit_run_id, evidence_type, str(exc)[:200],
+        # ON CONFLICT (unique violation on idempotency_key) lands
+        # here. Logged at debug since it's expected on re-run.
+        logger.debug(
+            "insert_evidence_item idempotent-skip or failed "
+            "audit_run=%s type=%s key=%s: %s",
+            audit_run_id, evidence_type,
+            (idempotency_key or "")[:16], str(exc)[:200],
         )
         return None
 
@@ -550,14 +632,19 @@ async def insert_finding(
     audit_run_id: str,
     finding_type: str,
     payload: Dict[str, Any],
+    merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
     severity: Optional[str] = None,
     confidence: Optional[int] = None,
     short_summary: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort write. finding_type is stored as-given (the
     synthesis layer documents the canonical taxonomy but free-form
-    types are accepted)."""
+    types are accepted).
+
+    P5.8.1: merchant_id + idempotency_key for two-layer tenancy +
+    idempotent re-runs (matches insert_evidence_item)."""
     await ensure_audit_evidence_tables()
     finding_id = str(uuid.uuid4())
     try:
@@ -565,6 +652,7 @@ async def insert_finding(
             readiness_findings.insert().values(
                 finding_id=finding_id,
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 product_key=product_key,
                 finding_type=finding_type,
                 severity=_coerce_severity(severity),
@@ -575,13 +663,15 @@ async def insert_finding(
                 short_summary=(
                     short_summary[:2000] if short_summary else None
                 ),
+                idempotency_key=idempotency_key,
                 created_at=_now_utc(),
             )
         )
         return finding_id
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "insert_finding failed audit_run=%s type=%s: %s",
+        logger.debug(
+            "insert_finding idempotent-skip or failed "
+            "audit_run=%s type=%s: %s",
             audit_run_id, finding_type, str(exc)[:200],
         )
         return None
@@ -593,6 +683,7 @@ async def insert_action(
     lever: str,
     title: str,
     body: Optional[str] = None,
+    merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
     parent_finding_id: Optional[str] = None,
     severity: Optional[str] = None,
@@ -601,8 +692,12 @@ async def insert_action(
     expected_outcome: Optional[str] = None,
     phase: Optional[str] = None,
     depends_on: Optional[List[str]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
-    """Best-effort write. Returns the new action_id or None."""
+    """Best-effort write. Returns the new action_id or None.
+
+    P5.8.1: merchant_id + idempotency_key for two-layer tenancy +
+    idempotent re-runs."""
     await ensure_audit_evidence_tables()
     action_id = str(uuid.uuid4())
     try:
@@ -610,6 +705,7 @@ async def insert_action(
             action_plan_items.insert().values(
                 action_id=action_id,
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 product_key=product_key,
                 parent_finding_id=parent_finding_id,
                 severity=_coerce_severity(severity),
@@ -625,13 +721,15 @@ async def insert_action(
                 ),
                 phase=phase,
                 depends_on=list(depends_on) if depends_on else None,
+                idempotency_key=idempotency_key,
                 created_at=_now_utc(),
             )
         )
         return action_id
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "insert_action failed audit_run=%s lever=%s: %s",
+        logger.debug(
+            "insert_action idempotent-skip or failed "
+            "audit_run=%s lever=%s: %s",
             audit_run_id, lever, str(exc)[:200],
         )
         return None
@@ -707,6 +805,7 @@ async def upsert_projection(
     audience: str,
     payload: Dict[str, Any],
     builder_version: str,
+    merchant_id: Optional[str] = None,
 ) -> Optional[str]:
     """Insert or replace the projection for (audit_run, audience).
     The UNIQUE constraint forces replace semantics — re-rendering
@@ -730,6 +829,7 @@ async def upsert_projection(
             report_projections.insert().values(
                 projection_id=projection_id,
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 audience=audience,
                 payload_jsonb=payload,
                 builder_version=builder_version,
@@ -748,6 +848,7 @@ async def upsert_projection(
                     report_projections.c.audience == audience,
                 )
                 .values(
+                    merchant_id=merchant_id,
                     payload_jsonb=payload,
                     builder_version=builder_version,
                     built_at=now,
@@ -860,6 +961,32 @@ async def fetch_projection(
 # =====================================================================
 
 
+def compute_canonical_idempotency_key(
+    *,
+    audit_run_id: str,
+    item_type: str,
+    item_signature: str,
+) -> str:
+    """P5.8.2 helper. Deterministic key per (audit, item-class,
+    item-content). Lets persist_canonical_evidence be idempotent
+    across worker re-runs: same input → same key → second INSERT
+    hits the partial unique index and ON CONFLICT skips.
+
+    item_type: "evidence" | "finding" | "action"
+    item_signature: caller-chosen distinguishing substring (e.g.,
+      for evidence: f"{evidence_type}|{product_key}|{host}|{excerpt[:50]}";
+      for finding: f"{finding_type}|{product_key}";
+      for action: f"{lever}|{product_key}|{title[:50]}").
+    """
+    import hashlib
+    components = [
+        (audit_run_id or "").strip(),
+        (item_type or "").strip(),
+        (item_signature or "").strip(),
+    ]
+    return hashlib.sha256("|".join(components).encode("utf-8")).hexdigest()
+
+
 def compute_verification_idempotency_key(
     *,
     audit_run_id: str,
@@ -911,6 +1038,7 @@ async def enqueue_verification_run(
     *,
     audit_run_id: str,
     verifier_id: str,
+    merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
     not_before: Optional[datetime] = None,
     max_retries: int = 2,
@@ -933,6 +1061,7 @@ async def enqueue_verification_run(
             verification_runs.insert().values(
                 verify_id=verify_id,
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 product_key=product_key,
                 verifier_id=verifier_id,
                 status=VERIFICATION_STATUS_PENDING,
@@ -1113,72 +1242,108 @@ async def mark_verification_failed_with_retry(
     error_message: str,
     evidence_jsonb: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Failed-attempt handling. If retry_count < max_retries:
+    """Failed-attempt handling. If retry_count + 1 < max_retries:
     transition back to PENDING + bump retry_count. Otherwise
     transition to EXHAUSTED_RETRIES (terminal). Returns the new
-    status string for the caller's logging."""
+    status string for caller logging.
+
+    P5.8.6: atomic — single UPDATE with CASE on status +
+    `retry_count + 1`. Same fix pattern as
+    mark_executor_run_failed_with_retry (db/executor_runs.py).
+    Eliminates the SELECT-then-UPDATE race where a reaper between
+    the two queries could null claimed_by_worker, leaving the
+    UPDATE to silently no-op + retry_count never incrementing.
+    """
     await ensure_audit_evidence_tables()
+    now = _now_utc()
+    query = """
+        UPDATE verification_runs
+           SET retry_count = retry_count + 1,
+               status = CASE
+                   WHEN retry_count + 1 < max_retries THEN 'pending'
+                   ELSE 'exhausted_retries'
+               END,
+               last_checked_at = :now,
+               completed_at = CASE
+                   WHEN retry_count + 1 < max_retries THEN completed_at
+                   ELSE :now
+               END,
+               claimed_by_worker = CASE
+                   WHEN retry_count + 1 < max_retries THEN NULL
+                   ELSE claimed_by_worker
+               END,
+               claimed_until = CASE
+                   WHEN retry_count + 1 < max_retries THEN NULL
+                   ELSE claimed_until
+               END,
+               error_message = :error_message,
+               evidence_jsonb = COALESCE(:evidence_jsonb, evidence_jsonb)
+         WHERE verify_id = :verify_id
+           AND status = 'claimed'
+           AND claimed_by_worker = :worker_id
+         RETURNING status
+    """
+    import json as _json
     try:
-        from sqlalchemy.sql import select
         row = await database.fetch_one(
-            select(
-                verification_runs.c.retry_count,
-                verification_runs.c.max_retries,
-            ).where(
-                verification_runs.c.verify_id == verify_id,
-                verification_runs.c.claimed_by_worker == worker_id,
-            )
+            query,
+            {
+                "verify_id": verify_id,
+                "worker_id": worker_id,
+                "now": now,
+                "error_message": error_message[:2000],
+                "evidence_jsonb": (
+                    _json.dumps(evidence_jsonb)
+                    if evidence_jsonb is not None
+                    else None
+                ),
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "mark_verification_failed_with_retry read failed "
-            "for verify=%s: %s", verify_id, str(exc)[:200],
+            "mark_verification_failed_with_retry atomic UPDATE "
+            "failed for verify=%s: %s", verify_id, str(exc)[:200],
         )
         return VERIFICATION_STATUS_FAILED
     if row is None:
         return VERIFICATION_STATUS_FAILED
-    d = dict(row)
-    next_retry = int(d.get("retry_count") or 0) + 1
-    max_r = int(d.get("max_retries") or 2)
-    now = _now_utc()
-    if next_retry < max_r:
-        new_status = VERIFICATION_STATUS_PENDING
-        values = {
-            "status": new_status,
-            "retry_count": next_retry,
-            "claimed_by_worker": None,
-            "claimed_until": None,
-            "last_checked_at": now,
-            "error_message": error_message[:2000],
-        }
-    else:
-        new_status = VERIFICATION_STATUS_EXHAUSTED_RETRIES
-        values = {
-            "status": new_status,
-            "retry_count": next_retry,
-            "completed_at": now,
-            "last_checked_at": now,
-            "error_message": error_message[:2000],
-        }
-    if evidence_jsonb is not None:
-        values["evidence_jsonb"] = evidence_jsonb
+    return dict(row).get("status") or VERIFICATION_STATUS_FAILED
+
+
+async def extend_verification_lease(
+    *,
+    verify_id: str,
+    worker_id: str,
+    lease_seconds: int = LONG_VERIFICATION_LEASE_SECONDS,
+) -> bool:
+    """P5.8.6: extend a verification's lease. The worker calls this
+    right after claim for verifiers known to run long (e.g.,
+    public_llm_citation_movement which does an LLM probe that takes
+    minutes, not seconds). Guarded on worker ownership — returns
+    False when the lease has been stolen.
+    """
+    await ensure_audit_evidence_tables()
+    new_until = datetime.fromtimestamp(
+        _now_utc().timestamp() + lease_seconds, tz=timezone.utc,
+    )
     try:
-        await database.execute(
+        result = await database.execute(
             verification_runs.update()
             .where(
                 verification_runs.c.verify_id == verify_id,
-                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
                 verification_runs.c.claimed_by_worker == worker_id,
             )
-            .values(**values)
+            .values(claimed_until=new_until)
         )
-        return new_status
+        if isinstance(result, int):
+            return result > 0
+        return True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "mark_verification_failed_with_retry write failed "
-            "for verify=%s: %s", verify_id, str(exc)[:200],
+            "extend_verification_lease failed for verify=%s: %s",
+            verify_id, str(exc)[:200],
         )
-        return VERIFICATION_STATUS_FAILED
+        return False
 
 
 async def release_stale_verification_leases(

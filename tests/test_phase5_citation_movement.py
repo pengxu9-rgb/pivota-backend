@@ -208,6 +208,19 @@ def _patch_baseline(monkeypatch, baseline=None):
     )
 
 
+def _patch_baseline_provider(monkeypatch, provider="gemini"):
+    """P5.8.6: tests need to stub the baseline-provider lookup.
+    The default 'gemini' matches what the original P5.6 test
+    fixtures assumed (audit ran with provider='gemini')."""
+    async def fake_provider(*, audit_run_id):
+        return provider
+
+    from services.verifiers import citation_movement
+    monkeypatch.setattr(
+        citation_movement, "_extract_baseline_provider", fake_provider,
+    )
+
+
 def _patch_probe(monkeypatch, *, scores=None, raise_exc=None):
     captured: Dict[str, Any] = {"calls": []}
 
@@ -228,6 +241,7 @@ async def test_succeeded_when_score_improved_after_30d(monkeypatch):
     with movement=improved in evidence."""
     from services.verifiers import citation_movement as v
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline_provider(monkeypatch)  # P5.8.6
     _patch_baseline(monkeypatch, baseline=50)
     _patch_probe(
         monkeypatch, scores={"category_visibility_score": 65},
@@ -248,6 +262,7 @@ async def test_succeeded_when_score_regressed_after_30d(monkeypatch):
     whether to action."""
     from services.verifiers import citation_movement as v
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline_provider(monkeypatch)  # P5.8.6
     _patch_baseline(monkeypatch, baseline=60)
     _patch_probe(
         monkeypatch, scores={"category_visibility_score": 30},
@@ -262,6 +277,7 @@ async def test_succeeded_when_score_regressed_after_30d(monkeypatch):
 async def test_succeeded_when_unchanged_within_noise(monkeypatch):
     from services.verifiers import citation_movement as v
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline_provider(monkeypatch)  # P5.8.6
     _patch_baseline(monkeypatch, baseline=55)
     _patch_probe(
         monkeypatch, scores={"category_visibility_score": 53},
@@ -277,6 +293,7 @@ async def test_blocked_when_no_baseline_available(monkeypatch):
     Verifier can't run without baseline."""
     from services.verifiers import citation_movement as v
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline_provider(monkeypatch)  # P5.8.6
     _patch_baseline(monkeypatch, baseline=None)
     result = await v.run_citation_movement(_ctx())
     assert result.status == "blocked"
@@ -297,6 +314,7 @@ async def test_failed_when_probe_raises(monkeypatch):
     (retryable)."""
     from services.verifiers import citation_movement as v
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline_provider(monkeypatch)  # P5.8.6
     _patch_baseline(monkeypatch, baseline=50)
     _patch_probe(monkeypatch, raise_exc=RuntimeError("rate limited"))
     result = await v.run_citation_movement(_ctx())
@@ -310,6 +328,7 @@ async def test_failed_when_probe_returns_no_score(monkeypatch):
     in the result — failed (retryable)."""
     from services.verifiers import citation_movement as v
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline_provider(monkeypatch)  # P5.8.6
     _patch_baseline(monkeypatch, baseline=50)
     _patch_probe(monkeypatch, scores={"different_metric": 99})
     result = await v.run_citation_movement(_ctx())
@@ -321,20 +340,56 @@ async def test_failed_when_probe_returns_no_score(monkeypatch):
 async def test_probe_called_with_category_visibility_scan_mode(
     monkeypatch,
 ):
-    """Verifies the verifier requests the right scan_mode +
-    provider — important since provider='auto' engages the cost-
-    routed orchestrator (don't burn budget on a fixed-provider
-    re-probe)."""
+    """Verifies the verifier requests the right scan_mode + the
+    PINNED baseline provider (P5.8.6). Was previously 'auto' but
+    that conflated cross-LLM variance with citation movement."""
     from services.verifiers import citation_movement as v
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline_provider(monkeypatch)  # P5.8.6: default 'gemini'
     _patch_baseline(monkeypatch, baseline=50)
     captured = _patch_probe(
         monkeypatch, scores={"category_visibility_score": 50},
     )
     await v.run_citation_movement(_ctx())
     assert captured["calls"][0]["scan_mode"] == "category_visibility_test"
-    assert captured["calls"][0]["provider"] == "auto"
+    # P5.8.6: pinned to baseline provider (default 'gemini')
+    assert captured["calls"][0]["provider"] == "gemini"
     assert captured["calls"][0]["merchant_id"] == "merch-1"
+
+
+@pytest.mark.asyncio
+async def test_blocked_when_baseline_provider_unavailable(monkeypatch):
+    """P5.8.6: when the audit's report_jsonb doesn't carry the
+    LLM provider used at baseline, the verifier MUST refuse to
+    substitute (cross-LLM comparison is apples-to-oranges).
+    Returns blocked, not failed (terminal, no retry)."""
+    from services.verifiers import citation_movement as v
+    _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline(monkeypatch, baseline=50)
+    _patch_baseline_provider(monkeypatch, provider=None)
+    result = await v.run_citation_movement(_ctx())
+    assert result.status == "blocked"
+    assert "baseline_provider_unavailable" in result.error_message
+
+
+@pytest.mark.asyncio
+async def test_probe_uses_pinned_baseline_provider_not_auto(
+    monkeypatch,
+):
+    """P5.8.6: verifier MUST call probe() with the baseline
+    provider, not 'auto'. Catches regression where someone resets
+    the provider back to the orchestrator default."""
+    from services.verifiers import citation_movement as v
+    _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_baseline(monkeypatch, baseline=50)
+    _patch_baseline_provider(monkeypatch, provider="deepseek")
+    captured = _patch_probe(
+        monkeypatch, scores={"category_visibility_score": 50},
+    )
+    await v.run_citation_movement(_ctx())
+    assert captured["calls"][0]["provider"] == "deepseek"
+    # Must NOT be "auto" — that's the bug class
+    assert captured["calls"][0]["provider"] != "auto"
 
 
 def test_citation_movement_registers():

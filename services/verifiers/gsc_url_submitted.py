@@ -72,8 +72,8 @@ async def _fetch_submission_row(
     try:
         row = await database.fetch_one(
             """
-            SELECT last_status, submitted_at, source_audit_run_id,
-                   error_message
+            SELECT last_status, submitted_at, indexed_at,
+                   source_audit_run_id, error_message
               FROM gsc_url_submissions
              WHERE merchant_id = :merchant_id
                AND url = :url

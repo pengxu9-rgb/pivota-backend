@@ -138,6 +138,7 @@ async def enqueue_verifications_for_completed_audit(
             new_id = await enqueue_verification_run(
                 audit_run_id=audit_run_id,
                 verifier_id=verifier_id,
+                merchant_id=merchant_id,  # P5.8.7
                 product_key=product_key,
                 not_before=not_before,
                 idempotency_key=idempotency_key,
