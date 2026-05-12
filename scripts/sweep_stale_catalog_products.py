@@ -82,6 +82,16 @@ SELECT_MERCHANTS_SQL = """
 #   (b) last_seen_in_sync_at < merchant's last_full_sync_at - grace.
 #       Clear signal: this row was supposed to appear in the recent
 #       sync but didn't. Upstream deleted it.
+#
+# Timezone note: last_seen_in_sync_at is TIMESTAMPTZ (mig 084) while
+# created_at is plain TIMESTAMP (predates tz-aware columns in this
+# repo). asyncpg can't bind one parameter against both types in a
+# single OR — it raises "can't subtract offset-naive and offset-aware
+# datetimes". So we use SQL casts: bind one tz-aware threshold and
+# convert it to a naive timestamp via AT TIME ZONE 'UTC' for the
+# created_at branch. created_at is treated as UTC by convention
+# everywhere else in this codebase (services/* use _utcnow() which
+# returns naive UTC; PG default is UTC session timezone).
 FIND_STALE_SQL = """
     SELECT product_key,
            last_seen_in_sync_at,
@@ -95,7 +105,7 @@ FIND_STALE_SQL = """
          AND last_seen_in_sync_at < :stale_before)
         OR
         (last_seen_in_sync_at IS NULL
-         AND created_at < :stale_before)
+         AND created_at < (:stale_before AT TIME ZONE 'UTC'))
       )
 """
 
@@ -103,12 +113,14 @@ FIND_STALE_SQL = """
 # For tombstoned rows that have been stale long enough, archive them.
 # 'archived' means: out of recall, but the row is preserved for sig_*
 # URL redirect compatibility (an LLM might still cite the old URL).
+# updated_at is plain TIMESTAMP (same convention as created_at), so
+# we also AT TIME ZONE 'UTC' the bound aware timestamp for comparison.
 FIND_ARCHIVE_SQL = """
     SELECT product_key, updated_at
     FROM catalog_products
     WHERE merchant_id = :merchant_id
       AND sync_status = 'stale'
-      AND updated_at < :archive_before
+      AND updated_at < (:archive_before AT TIME ZONE 'UTC')
 """
 
 
@@ -140,20 +152,25 @@ async def _sweep_merchant(
 ) -> Dict[str, Any]:
     """Sweep one merchant. Returns counters + sample rows."""
     # GRACE_HOURS before last_full_sync_at is the "stale" threshold.
-    # We compute it in Python with an interval expression in the SQL
-    # to avoid timezone surprises across Python/PG boundaries.
     import datetime as _dt
     if last_full_sync_at is None:
         return {"merchant_id": merchant_id, "skipped_reason": "no_sync_yet"}
     if not isinstance(last_full_sync_at, _dt.datetime):
         return {"merchant_id": merchant_id, "skipped_reason": "bad_sync_timestamp"}
 
+    # Force tz-aware UTC for both thresholds. last_full_sync_at comes
+    # from a TIMESTAMPTZ column so asyncpg returns it aware — but if
+    # ever returned naive (e.g. test fixture), assume UTC. The SQL
+    # casts naive PG columns (created_at / updated_at) at compare time.
+    if last_full_sync_at.tzinfo is None:
+        last_full_sync_at = last_full_sync_at.replace(tzinfo=_dt.timezone.utc)
+
     stale_before = last_full_sync_at - _dt.timedelta(hours=grace_hours)
     # Archive cutoff is independent: stale rows that have been stale
     # for archive_days get archived. We approximate "how long has it
     # been stale" by the row's updated_at (the sweep bumps updated_at
     # when it sets sync_status='stale').
-    archive_before = _dt.datetime.now(tz=last_full_sync_at.tzinfo) - _dt.timedelta(days=archive_days)
+    archive_before = _dt.datetime.now(tz=_dt.timezone.utc) - _dt.timedelta(days=archive_days)
 
     stale_candidates = await database.fetch_all(
         FIND_STALE_SQL,
