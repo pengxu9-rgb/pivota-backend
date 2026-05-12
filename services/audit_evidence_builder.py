@@ -50,6 +50,23 @@ CONFIDENCE_FINDING_HIGH = 85
 CONFIDENCE_FINDING_MEDIUM = 65
 
 
+# Allowed phase values (mirrors db.audit_evidence.PHASE_*). Unknown
+# values default to None — the action still inserts, just without
+# a phase classification.
+_VALID_PHASES = frozenset({
+    "week_1_to_4", "week_4_to_12", "week_12_to_24",
+})
+
+
+# Lever taxonomy. Mirrors db.audit_evidence.LEVER_* but kept as a
+# string set here so the extractor doesn't have to import the
+# accessor module just to validate.
+_VALID_LEVERS = frozenset({
+    "pivota_integration", "content_creation", "pdp_optimization",
+    "sitemap_hygiene", "kol_outreach", "editorial_outreach",
+})
+
+
 # =====================================================================
 # Evidence extraction
 # =====================================================================
@@ -281,6 +298,143 @@ def extract_findings(
 
 
 # =====================================================================
+# Action extraction
+# =====================================================================
+
+
+def extract_actions(
+    brand_report: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return a list of action-item dicts ready for insert_action.
+    Each dict has the PR-8b shape:
+      {lever, title, body, severity, owner, kpi_to_track,
+       expected_outcome, phase, product_key?}
+
+    Sources in the brand_report:
+      - per_product[*].action_items (PR-6 / P1.1)
+      - per_product[*].action_ladder (PR-8b enriched)
+      - per_product[*].pivota_commitments (PR-8d) — these are
+        NOT actions (they're commitments / disclosures), skip
+      - per_product[*].implementation_roadmap (PR-8c) — these are
+        phase containers; their nested activities ARE actions
+
+    De-dup: if the same (lever, title) appears for multiple products
+    (e.g. brand-level "complete Pivota integration"), keep only the
+    first. Brand-level actions are written with product_key=None.
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(brand_report, dict):
+        return out
+
+    seen: set = set()  # (lever, title) tuples we've already emitted
+
+    for product in (brand_report.get("per_product") or []):
+        if not isinstance(product, dict):
+            continue
+        product_key = _product_key_from_report(product)
+
+        # action_items: the PR-6 / P1.1 flat list
+        for action in (product.get("action_items") or []):
+            normalized = _normalize_action(action, product_key)
+            if normalized is None:
+                continue
+            dedupe_key = (normalized["lever"], normalized["title"])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            out.append(normalized)
+
+        # action_ladder: PR-8b enriched. Nested under
+        # `actions` (or sometimes the top-level value IS the list).
+        ladder = product.get("action_ladder") or {}
+        if isinstance(ladder, dict):
+            ladder_actions = ladder.get("actions") or []
+        elif isinstance(ladder, list):
+            ladder_actions = ladder
+        else:
+            ladder_actions = []
+        for action in ladder_actions:
+            normalized = _normalize_action(action, product_key)
+            if normalized is None:
+                continue
+            dedupe_key = (normalized["lever"], normalized["title"])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            out.append(normalized)
+
+        # implementation_roadmap: PR-8c phase containers. Each
+        # phase has an `activities` list; each activity is an
+        # action with the phase pre-set.
+        roadmap = product.get("implementation_roadmap") or {}
+        if isinstance(roadmap, dict):
+            phases = roadmap.get("phases") or []
+        else:
+            phases = []
+        for phase_block in phases:
+            if not isinstance(phase_block, dict):
+                continue
+            phase_id = phase_block.get("phase_id") or phase_block.get("label")
+            for activity in (phase_block.get("activities") or []):
+                # activities can be plain strings or action dicts
+                if isinstance(activity, str):
+                    # No lever info — skip; would require guessing
+                    continue
+                normalized = _normalize_action(activity, product_key)
+                if normalized is None:
+                    continue
+                # Inject the phase from the roadmap container
+                if (
+                    not normalized.get("phase")
+                    and isinstance(phase_id, str)
+                    and phase_id in _VALID_PHASES
+                ):
+                    normalized["phase"] = phase_id
+                dedupe_key = (normalized["lever"], normalized["title"])
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                out.append(normalized)
+
+    return out
+
+
+def _normalize_action(
+    raw: Any, product_key: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Normalize a raw action dict (from various report shapes) to
+    the insert_action contract. Returns None if the action lacks
+    the minimum required fields (lever + title)."""
+    if not isinstance(raw, dict):
+        return None
+    lever = (raw.get("lever") or "").strip()
+    title = (raw.get("title") or "").strip()
+    if not lever or not title:
+        return None
+
+    # Phase validation — only emit phases the canonical taxonomy
+    # accepts. PR-8c emits these labels directly so this is mostly
+    # a passthrough.
+    phase = raw.get("phase")
+    if phase and phase not in _VALID_PHASES:
+        phase = None
+
+    # owner / kpi / outcome are optional PR-8b fields; pass through
+    # what's present, leave others None.
+    return {
+        "lever": lever,
+        "title": title,
+        "body": (raw.get("body") or "").strip() or None,
+        "severity": raw.get("severity"),
+        "owner": raw.get("owner"),
+        "kpi_to_track": raw.get("kpi_to_track"),
+        "expected_outcome": raw.get("expected_outcome"),
+        "phase": phase,
+        "product_key": product_key,
+    }
+
+
+# =====================================================================
 # Persist — calls the P4.2 accessors
 # =====================================================================
 
@@ -294,13 +448,17 @@ async def persist_canonical_evidence(
     persistence errors. Returns a count summary for the worker's
     partial_result tracking.
     """
-    from db.audit_evidence import insert_evidence_item, insert_finding
+    from db.audit_evidence import (
+        insert_action, insert_evidence_item, insert_finding,
+    )
 
     summary = {
         "evidence_items_inserted": 0,
         "evidence_items_failed": 0,
         "findings_inserted": 0,
         "findings_failed": 0,
+        "actions_inserted": 0,
+        "actions_failed": 0,
     }
 
     for ev in extract_evidence_items(brand_report):
@@ -346,6 +504,33 @@ async def persist_canonical_evidence(
             summary["findings_failed"] += 1
         else:
             summary["findings_inserted"] += 1
+
+    # P4.4: action_plan_items dual-write. Same best-effort pattern.
+    for action in extract_actions(brand_report):
+        try:
+            new_id = await insert_action(
+                audit_run_id=audit_run_id,
+                lever=action["lever"],
+                title=action["title"],
+                body=action.get("body"),
+                severity=action.get("severity"),
+                owner=action.get("owner"),
+                kpi_to_track=action.get("kpi_to_track"),
+                expected_outcome=action.get("expected_outcome"),
+                phase=action.get("phase"),
+                product_key=action.get("product_key"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "persist_canonical_evidence: insert_action "
+                "raised for audit=%s: %s",
+                audit_run_id, str(exc)[:200],
+            )
+            new_id = None
+        if new_id is None:
+            summary["actions_failed"] += 1
+        else:
+            summary["actions_inserted"] += 1
 
     return summary
 
