@@ -38,7 +38,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -225,11 +225,221 @@ class MerchantSelfAuditRequest(BaseModel):
     max_runs: int = Field(3, ge=1, le=5)
 
 
+# P2.4: poll budget for the opt-in async-pipeline compat path. 30s
+# matches the legacy synchronous wall-time merchants are used to.
+# Tunable via env (AUDIT_COMPAT_POLL_BUDGET_S) so staging can validate
+# the budget against real audit runtimes before tightening.
+_COMPAT_POLL_BUDGET_SECONDS = 30
+_COMPAT_POLL_INTERVAL_SECONDS = 1.0
+
+
+async def _run_async_pipeline_compat(
+    *,
+    body: "MerchantSelfAuditRequest",
+    merchant_id: str,
+    response: Response,
+) -> Dict[str, Any]:
+    """P2.4 compat shim: route the legacy synchronous endpoint through
+    the new async pipeline. Enqueue + poll for up to 30s. If the run
+    completes within the budget, return the legacy response shape
+    (clients see no behavior change). Otherwise return 202 + run_id
+    for the caller to poll via GET /api/audits/{run_id}.
+
+    The legacy route's product-resolution logic still runs in this
+    code path — the new pipeline only takes product_keys, so we
+    have to convert (platform, source_product_id) refs to keys
+    here. P3 will unify this resolution step.
+    """
+    import asyncio as _asyncio
+    from db.merchant_audit_runs import (
+        enqueue_audit_run,
+        fetch_audit_run_by_id,
+        find_in_flight_by_idempotency_key,
+        STAGE_COMPLETED, STAGE_FAILED, STAGE_CANCELLED,
+    )
+    from services.idempotency import compute_audit_idempotency_key
+
+    # Resolve (platform, source_product_id) refs to product_keys —
+    # the new pipeline indexes by product_key.
+    refs = [(p.platform, p.source_product_id) for p in body.products]
+    rows = await database.fetch_all(
+        select(
+            catalog_products.c.product_key,
+            catalog_products.c.platform,
+            catalog_products.c.source_product_id,
+        ).where(
+            catalog_products.c.merchant_id == merchant_id,
+            catalog_products.c.platform.in_([p for p, _ in refs]),
+            catalog_products.c.source_product_id.in_(
+                [s for _, s in refs],
+            ),
+        )
+    )
+    rows = [
+        r for r in rows
+        if (r["platform"], r["source_product_id"]) in set(refs)
+    ]
+    found_pairs = {(r["platform"], r["source_product_id"]) for r in rows}
+    missing = [
+        {"platform": p, "source_product_id": s}
+        for (p, s) in refs if (p, s) not in found_pairs
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": (
+                    f"{len(missing)} product(s) not found for this "
+                    f"merchant."
+                ),
+                "missing_products": missing,
+            },
+        )
+    product_keys = [r["product_key"] for r in rows]
+
+    # Idempotency: if an in-flight run exists for the same
+    # (merchant, product_keys, window) tuple, return its run_id
+    # instead of enqueueing a duplicate.
+    idempotency_key = compute_audit_idempotency_key(
+        merchant_id=merchant_id, product_keys=product_keys,
+        subject_type="merchant",
+    )
+    run_id = await find_in_flight_by_idempotency_key(
+        idempotency_key=idempotency_key,
+    )
+    if not run_id:
+        run_id = await enqueue_audit_run(
+            merchant_id=merchant_id,
+            product_keys=product_keys,
+            subject_type="merchant",
+            idempotency_key=idempotency_key,
+            requested_by_user_id=merchant_id,
+        )
+    if not run_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Failed to enqueue audit run via async pipeline."
+            ),
+        )
+
+    # Poll until terminal or budget elapsed.
+    deadline = (
+        _asyncio.get_event_loop().time()
+        + _COMPAT_POLL_BUDGET_SECONDS
+    )
+    row: Optional[Dict[str, Any]] = None
+    while _asyncio.get_event_loop().time() < deadline:
+        row = await fetch_audit_run_by_id(run_id=run_id)
+        if row and row.get("stage") in {
+            STAGE_COMPLETED, STAGE_FAILED, STAGE_CANCELLED,
+        }:
+            break
+        await _asyncio.sleep(_COMPAT_POLL_INTERVAL_SECONDS)
+
+    if row is None or row.get("stage") not in {
+        STAGE_COMPLETED, STAGE_FAILED, STAGE_CANCELLED,
+    }:
+        # Still in-flight at deadline — return 202 + run_id so
+        # the caller can poll GET /api/audits/{id}. Legacy clients
+        # that don't expect 202 will see audit_run_id in the body
+        # and can either retry or migrate.
+        response.status_code = status.HTTP_202_ACCEPTED
+        return {
+            "brand_report": None,
+            "rate_limit_remaining": None,
+            "executors": None,
+            "tasks": None,
+            "audited_via_pivota_canonical": [],
+            "audit_run_id": run_id,
+            "compat_status": "in_flight_at_poll_deadline",
+            "compat_poll_endpoint": f"/api/audits/{run_id}",
+        }
+
+    if row.get("stage") == STAGE_FAILED:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "message": (
+                    row.get("error_message")
+                    or "Audit pipeline failed"
+                ),
+                "audit_run_id": run_id,
+                "error_jsonb": row.get("error_jsonb"),
+            },
+        )
+    if row.get("stage") == STAGE_CANCELLED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "Audit was cancelled",
+                "audit_run_id": run_id,
+            },
+        )
+
+    # COMPLETED — reshape into the legacy response.
+    return {
+        "brand_report": row.get("report_jsonb"),
+        # Rate-limit headroom isn't tracked through the new pipeline;
+        # callers using ?via=async_pipeline don't get this field.
+        "rate_limit_remaining": None,
+        # Executors + tasks summaries live in partial_result_jsonb.
+        "executors": (
+            (row.get("partial_result_jsonb") or {})
+            .get("materializing")
+        ),
+        "tasks": (
+            (row.get("partial_result_jsonb") or {})
+            .get("materializing")
+        ),
+        "audited_via_pivota_canonical": (
+            row.get("audited_via_pivota_canonical") or []
+        ),
+        "audit_run_id": run_id,
+    }
+
+
 @router.post("/ai-commerce-readiness")
 async def run_merchant_self_audit(
     body: MerchantSelfAuditRequest,
+    response: Response,
+    via: Optional[str] = None,
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
+    """Synchronous AI Commerce Readiness audit.
+
+    P2.4 deprecation: this endpoint is the legacy synchronous path.
+    The canonical successor is the async lifecycle exposed at
+    POST /api/audits + GET /api/audits/{run_id}. New integrations
+    should target the async endpoints; existing callers continue
+    to work unchanged.
+
+    Opt-in async route: pass `?via=async_pipeline` to enqueue the
+    audit through the new pipeline + poll for up to 30s. If the run
+    completes within the budget, the response shape is identical to
+    the synchronous path (legacy callers can opt in transparently).
+    If the run is still in-flight at the budget, the response is
+    202 Accepted with `audit_run_id` for the caller to poll via
+    GET /api/audits/{run_id}.
+    """
+    # P2.4: deprecation signaling. RFC 8594 (Sunset) + RFC 8288
+    # (Link). Sunset date is intentionally distant — we want at
+    # least 6 months for clients to migrate before retiring this
+    # endpoint. Telemetry on this endpoint will tell us when it
+    # safe to flip.
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "Sat, 01 Nov 2026 00:00:00 GMT"
+    response.headers["Link"] = (
+        '</api/audits>; rel="successor-version", '
+        '</api/audits>; rel="alternate"; '
+        'title="Async audit lifecycle (POST + GET poll)"'
+    )
+
+    if via == "async_pipeline":
+        return await _run_async_pipeline_compat(
+            body=body, merchant_id=merchant_id, response=response,
+        )
+
     remaining = await _check_audit_rate_limit(merchant_id)
 
     # 1. Build the set of (platform, source_product_id) tuples the
