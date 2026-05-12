@@ -700,6 +700,18 @@ async def ingest_standard_products(
                     # which Stage 2 uses to auto-group product_group_members.
                     # See services/catalog_identity.py + plan.
                     "content_key": make_content_key(brand, product.title, product.barcode),
+                    # Stage 2a (mig 084): mark this row as freshly seen
+                    # in a Path A sync. The nightly sweep
+                    # (scripts/sweep_stale_catalog_products.py) compares
+                    # this against catalog_merchants.last_full_sync_at
+                    # to detect rows whose upstream Shopify products
+                    # were deleted (the MOYU cohort pattern).
+                    "last_seen_in_sync_at": _utcnow(),
+                    # Default stays 'live' on insert. Reasserted here
+                    # on UPDATE so a row that the sweep previously
+                    # marked 'stale' returns to 'live' once the merchant
+                    # restores it upstream.
+                    "sync_status": "live",
                     "freshness_json": {
                         "updated_at": product.updated_at.isoformat() if product.updated_at else None,
                         "observed_at": _utcnow().isoformat(),
@@ -1013,6 +1025,21 @@ async def ingest_standard_products(
                 "completed_at": _utcnow(),
             },
         )
+
+    # Stage 2a (mig 084): bump catalog_merchants.last_full_sync_at on
+    # successful sync completion. The sweep
+    # (scripts/sweep_stale_catalog_products.py) uses this as the
+    # ground-truth "merchant synced at" timestamp to compare each
+    # row's last_seen_in_sync_at against. Without it, the sweep can't
+    # tell "merchant hasn't synced lately" from "upstream deleted
+    # this row." Stamped only when the function reaches this line —
+    # any earlier exception leaves the previous timestamp intact, so
+    # a partial-failure sync doesn't trigger spurious tombstoning.
+    await database.execute(
+        catalog_merchants.update()
+        .where(catalog_merchants.c.merchant_id == merchant_id)
+        .values(last_full_sync_at=_utcnow())
+    )
     return stats
 
 

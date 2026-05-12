@@ -503,6 +503,17 @@ async def _fetch_canonical_search_rows(
             "AND (p.pdp_lifecycle_stage IN ('validated', 'published') "
             "OR p.pdp_lifecycle_stage IS NULL)"
         )
+
+    # Stage 2a (mig 084): hide stale/archived rows from cross-merchant
+    # recall. A row that's been tombstoned by
+    # scripts/sweep_stale_catalog_products.py shouldn't show up in the
+    # agent's "find me a foundation brush" results. Merchant-scoped
+    # queries skip this filter so the merchant can still see their
+    # own historical rows (and the operator dashboard can surface
+    # them for cleanup). See plans/rosy-mixing-bengio.md Stage 2a.
+    sync_status_clause = ""
+    if not merchant_id:
+        sync_status_clause = "AND p.sync_status = 'live'"
     vertical_where = ""
     vertical_score = ""
     if vertical_search:
@@ -610,6 +621,7 @@ async def _fetch_canonical_search_rows(
             )
             {merchant_clause}
             {lifecycle_clause}
+            {sync_status_clause}
             ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
             LIMIT :candidate_limit
         )
