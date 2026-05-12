@@ -137,11 +137,18 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         tags = [str(t).strip() for t in raw_tags if str(t or "").strip()]
     elif isinstance(raw_tags, str):
         tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+    # Codex review 2026-05-12 P0: gtin was dropped here even though
+    # _build_pdp_insert reads it for content_key computation. A JSONL
+    # record with a real GTIN would produce a no-GTIN content_key,
+    # diverging from Path A's GTIN-included key for the same product.
+    # Pass through unchanged; downstream callers handle empty values.
+    gtin_raw = pdp.get("gtin") or pdp.get("barcode") or ""
     payload = {
         "brand": str(pdp.get("brand") or "").strip(),
         "product_name": str(pdp.get("product_name") or "").strip(),
         "category_path": str(pdp.get("category_path") or "").strip(),
         "attribute_summary": str(pdp.get("attribute_summary") or "").strip(),
+        "gtin": str(gtin_raw).strip() if gtin_raw else None,
         "tags": tags,
         "agent_version": AGENT_VERSION,
     }
