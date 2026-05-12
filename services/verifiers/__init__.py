@@ -27,4 +27,5 @@ from services.verifiers import (  # noqa: F401
     pivota_internal_retrieval,
     gsc_url_submitted,
     gsc_indexing_status,
+    frontend_agent_cite,
 )
