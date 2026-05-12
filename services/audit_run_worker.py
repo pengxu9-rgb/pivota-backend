@@ -246,12 +246,15 @@ async def process_one_audit_run() -> bool:
                 brand_report=brand_report,
                 pivota_url_used=pivota_url_used,
             )
+            cost_summary = await _aggregate_cost_summary_for_run(
+                run_id=run_id, brand_report=brand_report,
+            )
             ok = await mar.transition_stage(
                 run_id=run_id,
                 from_stage=mar.STAGE_VERIFYING,
                 to_stage=mar.STAGE_COMPLETED,
                 worker_id=WORKER_ID,
-                cost_summary_jsonb=_compute_cost_summary(brand_report),
+                cost_summary_jsonb=cost_summary,
             )
             if not ok:
                 return True
@@ -595,29 +598,56 @@ async def _record_final_report_fields(
         )
 
 
-def _compute_cost_summary(
+def _placeholder_cost_summary(
     brand_report: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Aggregate per-probe cost into the cost_summary_jsonb shape.
-
-    P2.5 wires `db/llm_probe_runs` as the canonical telemetry source;
-    this helper currently emits a placeholder shape so downstream
-    consumers can start consuming the field. Once P2.5 lands, this
-    function reads from llm_probe_runs by audit_run_id and produces
-    real numbers.
-    """
+    """Fallback shape when llm_probe_runs has no rows for this audit
+    (e.g., the orchestrator's record_probe_run wiring hasn't shipped
+    yet, or every probe failed before recording). Coarse counters
+    only — no per-call cost truth."""
     if not brand_report:
         return None
     aggregate = brand_report.get("aggregate") or {}
-    per_product = brand_report.get("per_product") or []
     return {
-        # Placeholder — P2.5 fills with real per-call telemetry.
         "providers": [],
         "total_input_tokens": None,
         "total_output_tokens": None,
         "estimated_cost_usd": None,
-        # Coarse counters that don't need llm_probe_runs.
         "products_probed": aggregate.get("products_succeeded"),
         "products_failed": aggregate.get("products_failed"),
-        "_telemetry_source": "placeholder_pending_p2_5",
+        "_telemetry_source": "placeholder_no_probe_runs_recorded",
     }
+
+
+def _compute_cost_summary(
+    brand_report: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Sync wrapper kept for backwards compat with tests that
+    reference the helper directly. Returns the placeholder shape
+    when called synchronously; the worker's actual completion path
+    calls _aggregate_cost_summary_for_run for the real rollup.
+    """
+    return _placeholder_cost_summary(brand_report)
+
+
+async def _aggregate_cost_summary_for_run(
+    *,
+    run_id: str,
+    brand_report: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Async helper that actually queries llm_probe_runs for the
+    real per-provider cost rollup. Falls back to the placeholder
+    shape when no rows exist (telemetry not yet wired into every
+    probe call site, or the audit failed before any probe ran).
+    """
+    try:
+        from db.llm_probe_runs import aggregate_cost_for_run
+        rollup = await aggregate_cost_for_run(audit_run_id=run_id)
+        if rollup is not None:
+            return rollup
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "audit_run_worker: cost rollup failed for run_id=%s: %s",
+            run_id, exc,
+        )
+    return _placeholder_cost_summary(brand_report)
