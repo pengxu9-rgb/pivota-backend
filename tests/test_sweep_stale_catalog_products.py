@@ -55,14 +55,19 @@ def test_find_stale_sql_only_targets_live_rows() -> None:
     # signal so we don't immediately tombstone fresh writes that
     # predate the column.
     assert "last_seen_in_sync_at IS NULL" in sql
-    assert "created_at < :stale_before" in sql
+    # created_at is plain TIMESTAMP (naive); stale_before is bound
+    # tz-aware. SQL casts via AT TIME ZONE 'UTC' so asyncpg doesn't
+    # error on mixed comparison (regression fix 2026-05-12).
+    assert "created_at < (:stale_before AT TIME ZONE 'UTC')" in sql
 
 
 def test_find_archive_sql_only_targets_stale_rows() -> None:
-    """Archive transition is stale → archived. Never live → archived."""
+    """Archive transition is stale → archived. Never live → archived.
+    updated_at is plain TIMESTAMP so we cast the aware threshold the
+    same way as created_at (regression fix 2026-05-12)."""
     sql = sweep.FIND_ARCHIVE_SQL
     assert "sync_status = 'stale'" in sql
-    assert "updated_at < :archive_before" in sql
+    assert "updated_at < (:archive_before AT TIME ZONE 'UTC')" in sql
 
 
 def test_update_sql_idempotency_guards() -> None:
@@ -191,6 +196,72 @@ async def test_sweep_merchant_apply_writes_two_update_statements(monkeypatch) ->
     assert "catalog_offers" not in sqls
     assert "external_product_seeds" not in sqls
     assert "seed_data" not in sqls
+
+
+@pytest.mark.asyncio
+async def test_sweep_merchant_binds_tz_aware_thresholds(monkeypatch) -> None:
+    """Regression 2026-05-12: asyncpg refused to bind a tz-aware
+    threshold against the OR clause that compares against
+    `created_at` (plain TIMESTAMP). The fix forces both thresholds
+    (stale_before and archive_before) to tz-aware UTC datetimes; the
+    SQL casts via AT TIME ZONE 'UTC' for naive-column comparisons.
+    Without this, prod fails with 'can't subtract offset-naive and
+    offset-aware datetimes'."""
+    last_sync = _fake_now()  # already tz-aware UTC
+    captured: List[Dict[str, Any]] = []
+
+    async def fake_fetch_all(sql, params):
+        captured.append(dict(params))
+        return []
+
+    async def fake_execute(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sweep.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(sweep.database, "execute", fake_execute)
+
+    await sweep._sweep_merchant(
+        merchant_id="m", last_full_sync_at=last_sync,
+        grace_hours=24, archive_days=7, apply=False,
+    )
+    # stale_before passed to FIND_STALE_SQL must be tz-aware
+    stale_before = captured[0]["stale_before"]
+    assert stale_before.tzinfo is not None
+    # archive_before passed to FIND_ARCHIVE_SQL must be tz-aware
+    archive_before = captured[1]["archive_before"]
+    assert archive_before.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_merchant_coerces_naive_last_full_sync_to_utc(monkeypatch) -> None:
+    """Edge case: if last_full_sync_at comes back naive (test fixtures,
+    legacy data path, etc.), assume UTC and re-tag with tzinfo. Don't
+    crash on the subtraction below."""
+    import datetime as _dt
+    last_sync_naive = _dt.datetime(2026, 5, 12, 12, 0, 0)
+    assert last_sync_naive.tzinfo is None  # confirm precondition
+
+    captured: List[Dict[str, Any]] = []
+
+    async def fake_fetch_all(sql, params):
+        captured.append(dict(params))
+        return []
+
+    async def fake_execute(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sweep.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(sweep.database, "execute", fake_execute)
+
+    # Should not raise
+    await sweep._sweep_merchant(
+        merchant_id="m", last_full_sync_at=last_sync_naive,
+        grace_hours=24, archive_days=7, apply=False,
+    )
+    # Resulting threshold is tz-aware UTC
+    stale_before = captured[0]["stale_before"]
+    assert stale_before.tzinfo is not None
+    assert stale_before == _dt.datetime(2026, 5, 11, 12, 0, 0, tzinfo=_dt.timezone.utc)
 
 
 @pytest.mark.asyncio

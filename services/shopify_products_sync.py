@@ -383,6 +383,12 @@ async def refresh_merchant_presence(
     # Bump last_seen_in_sync_at + sync_status for matching rows. Done
     # in chunks because asyncpg's parameter limit caps array binds
     # around ~32k for some Postgres versions; chunk to be safe.
+    #
+    # Counter via fetch_all on RETURNING product_key, not via
+    # database.execute()'s rowcount (which asyncpg returns as None
+    # for bulk UPDATEs through the `databases` lib — caused the
+    # cosmetic `rows_touched: 0` report on 2026-05-12 even when 741
+    # rows were actually updated).
     rows_touched = 0
     if live_ids:
         ids_list = list(live_ids)
@@ -390,7 +396,7 @@ async def refresh_merchant_presence(
         async with database.transaction():
             for start in range(0, len(ids_list), chunk_size):
                 chunk = ids_list[start:start + chunk_size]
-                result = await database.execute(
+                returned = await database.fetch_all(
                     """
                     UPDATE catalog_products
                     SET last_seen_in_sync_at = NOW(),
@@ -399,14 +405,11 @@ async def refresh_merchant_presence(
                     WHERE merchant_id = :merchant_id
                       AND platform = 'shopify'
                       AND source_product_id = ANY(:ids)
+                    RETURNING product_key
                     """,
                     {"merchant_id": merchant_id, "ids": chunk},
                 )
-                if result is not None:
-                    try:
-                        rows_touched += int(result)
-                    except (TypeError, ValueError):
-                        pass
+                rows_touched += len(returned or [])
             # Always bump last_full_sync_at — even if 0 rows matched,
             # this records "we successfully reached Shopify and listed
             # products" so the sweep can run. If live_ids is empty

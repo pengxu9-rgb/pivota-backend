@@ -53,16 +53,40 @@ class _FakeTxn:
         return False
 
 
-def _install_fake_db(monkeypatch, *, executed: List[Dict[str, Any]], txn_factory=None) -> None:
-    """Replace sps.database with a fake. Captures every execute() call."""
+def _install_fake_db(
+    monkeypatch,
+    *,
+    executed: List[Dict[str, Any]],
+    txn_factory=None,
+    update_returning_rows: Optional[int] = None,
+) -> None:
+    """Replace sps.database with a fake. Captures every execute() and
+    fetch_all() call. The presence-refresh UPDATE uses RETURNING +
+    fetch_all to count actually-touched rows, so we mimic that here:
+    if update_returning_rows is set, fetch_all on the UPDATE statement
+    returns that many fake-row dicts."""
 
     async def fake_execute(sql, params=None):
-        executed.append({"sql": str(sql), "params": params or {}})
+        executed.append({"sql": str(sql), "params": params or {}, "kind": "execute"})
         return None
+
+    async def fake_fetch_all(sql, params=None):
+        executed.append({"sql": str(sql), "params": params or {}, "kind": "fetch_all"})
+        if "UPDATE catalog_products" in sql and "RETURNING" in sql:
+            n = update_returning_rows
+            if n is None:
+                # Default: pretend every bound ID matched a row
+                ids = (params or {}).get("ids") or []
+                n = len(ids)
+            return [{"product_key": f"p{i}"} for i in range(n)]
+        return []
 
     class _DB:
         def execute(self, sql, params=None):
             return fake_execute(sql, params)
+
+        def fetch_all(self, sql, params=None):
+            return fake_fetch_all(sql, params)
 
         def transaction(self):
             return (txn_factory or _FakeTxn)()
@@ -129,13 +153,20 @@ async def test_refresh_presence_bumps_last_seen_for_live_ids(monkeypatch) -> Non
 
     assert out["live_ids_fetched"] == 3
     assert out["pages_fetched"] == 1
-    # Two UPDATE statements: one bulk update on catalog_products, one
-    # on catalog_merchants. NO INSERTs, no other tables.
+    # Regression 2026-05-12: rows_touched used to always return 0
+    # because asyncpg's database.execute() returns None for bulk
+    # UPDATE rowcounts. Fixed by switching to RETURNING + fetch_all.
+    # All 3 bound IDs match in the fake DB, so rows_touched=3.
+    assert out["rows_touched"] == 3
+    # Two SQL statements: bulk update on catalog_products (via
+    # fetch_all because we read RETURNING), one execute on
+    # catalog_merchants. NO INSERTs, no other tables.
     sqls = [e["sql"] for e in executed]
     sql_joined = "\n".join(sqls)
     assert "UPDATE catalog_products" in sql_joined
     assert "SET last_seen_in_sync_at = NOW()" in sql_joined
     assert "sync_status = 'live'" in sql_joined
+    assert "RETURNING product_key" in sql_joined
     assert "UPDATE catalog_merchants" in sql_joined
     assert "SET last_full_sync_at = NOW()" in sql_joined
     # NEVER writes to seed_data, product_payload, catalog_offers, catalog_skus
