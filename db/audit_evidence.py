@@ -145,6 +145,64 @@ VALID_VERIFIERS = frozenset({
 })
 
 
+# Verification status state machine (P5.1). Reuses the existing
+# `status` column on verification_runs as the canonical state.
+#
+# Lifecycle:
+#   pending → claimed → succeeded
+#                     → failed → (re-enqueue back to pending) → ...
+#                     → exhausted_retries (terminal)
+#                     → blocked (terminal — upstream unavailable;
+#                                NOT a soft failure, don't retry)
+VERIFICATION_STATUS_PENDING = "pending"
+VERIFICATION_STATUS_CLAIMED = "claimed"
+VERIFICATION_STATUS_SUCCEEDED = "succeeded"
+VERIFICATION_STATUS_FAILED = "failed"
+VERIFICATION_STATUS_EXHAUSTED_RETRIES = "exhausted_retries"
+VERIFICATION_STATUS_BLOCKED = "blocked"
+
+VERIFICATION_ACTIVE = frozenset({
+    VERIFICATION_STATUS_PENDING, VERIFICATION_STATUS_CLAIMED,
+})
+VERIFICATION_TERMINAL = frozenset({
+    VERIFICATION_STATUS_SUCCEEDED, VERIFICATION_STATUS_FAILED,
+    VERIFICATION_STATUS_EXHAUSTED_RETRIES,
+    VERIFICATION_STATUS_BLOCKED,
+})
+
+VALID_VERIFICATION_TRANSITIONS: dict = {
+    VERIFICATION_STATUS_PENDING: {VERIFICATION_STATUS_CLAIMED},
+    VERIFICATION_STATUS_CLAIMED: {
+        VERIFICATION_STATUS_SUCCEEDED, VERIFICATION_STATUS_FAILED,
+        VERIFICATION_STATUS_PENDING,
+        VERIFICATION_STATUS_EXHAUSTED_RETRIES,
+        VERIFICATION_STATUS_BLOCKED,
+    },
+    VERIFICATION_STATUS_SUCCEEDED: set(),
+    VERIFICATION_STATUS_FAILED: set(),
+    VERIFICATION_STATUS_EXHAUSTED_RETRIES: set(),
+    VERIFICATION_STATUS_BLOCKED: set(),
+}
+
+
+def is_valid_verification_transition(
+    from_status: str, to_status: str,
+) -> bool:
+    return to_status in VALID_VERIFICATION_TRANSITIONS.get(
+        from_status, set(),
+    )
+
+
+# Verifier-specific lease durations. Most verifiers are quick HTTP
+# fetches (default 120s); the citation-movement verifier needs much
+# longer since it re-runs probe queries.
+DEFAULT_VERIFICATION_LEASE_SECONDS = 120
+LONG_VERIFICATION_LEASE_SECONDS = 600  # for citation_movement
+
+# Grace period before reclaim runs.
+VERIFICATION_STALE_LEASE_GRACE_SECONDS = 30
+
+
 # Audience IDs for the 5-audience projection.
 AUDIENCE_EMPLOYEE_BD = "employee_bd"
 AUDIENCE_MERCHANT = "merchant"
@@ -237,6 +295,14 @@ verification_runs = Table(
     Column("last_checked_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True), nullable=True),
+    # P5.1: durable work-queue columns. See db/migrations/
+    # 087_verification_runs_durability.sql for column commentary.
+    Column("claimed_by_worker", Text, nullable=True),
+    Column("claimed_until", DateTime(timezone=True), nullable=True),
+    Column("retry_count", Integer, nullable=False, server_default="0"),
+    Column("max_retries", Integer, nullable=False, server_default="2"),
+    Column("not_before", DateTime(timezone=True), nullable=True),
+    Column("idempotency_key", Text, nullable=True),
     Index("idx_verify_audit_run", "audit_run_id", "verifier_id"),
     extend_existing=True,
 )
@@ -345,6 +411,26 @@ _DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_verify_audit_run "
     "ON verification_runs (audit_run_id, verifier_id);",
+    # P5.1: durable work-queue columns. ALTERs are idempotent.
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS claimed_by_worker TEXT;",
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ;",
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 2;",
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;",
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_worker_pull "
+    "ON verification_runs (status, claimed_until, not_before, created_at) "
+    "WHERE status IN ('pending', 'claimed');",
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_idempotency "
+    "ON verification_runs (idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL "
+    "AND status IN ('pending', 'claimed');",
 
     # report_projections
     """
@@ -767,3 +853,385 @@ async def fetch_projection(
     if row is None:
         return None
     return dict(row)
+
+
+# =====================================================================
+# P5.1 — verification_runs worker-pull accessors
+# =====================================================================
+
+
+def compute_verification_idempotency_key(
+    *,
+    audit_run_id: str,
+    verifier_id: str,
+    product_key: Optional[str] = None,
+) -> str:
+    """Stable sha256 of the dedupe tuple. The enqueue path (P5.7)
+    calls this so re-firing the enqueue at audit completion doesn't
+    create duplicate verification_runs rows for in-flight verifiers."""
+    import hashlib
+    components = [
+        (audit_run_id or "").strip(),
+        (verifier_id or "").strip(),
+        (product_key or "").strip(),
+    ]
+    return hashlib.sha256("|".join(components).encode("utf-8")).hexdigest()
+
+
+async def find_in_flight_verification_by_idempotency(
+    *, idempotency_key: str,
+) -> Optional[str]:
+    """Pre-enqueue dedupe. Returns the verify_id of any in-flight
+    row matching this key, or None."""
+    if not idempotency_key:
+        return None
+    await ensure_audit_evidence_tables()
+    try:
+        from sqlalchemy.sql import select
+        row = await database.fetch_one(
+            select(verification_runs.c.verify_id)
+            .where(
+                verification_runs.c.idempotency_key == idempotency_key,
+                verification_runs.c.status.in_(list(VERIFICATION_ACTIVE)),
+            )
+            .limit(1)
+        )
+        if row is None:
+            return None
+        return str(row[0])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "find_in_flight_verification_by_idempotency failed: %s",
+            str(exc)[:200],
+        )
+        return None
+
+
+async def enqueue_verification_run(
+    *,
+    audit_run_id: str,
+    verifier_id: str,
+    product_key: Optional[str] = None,
+    not_before: Optional[datetime] = None,
+    max_retries: int = 2,
+    idempotency_key: Optional[str] = None,
+) -> Optional[str]:
+    """Insert a verification_runs row in status='pending' for the
+    worker to claim. The enqueue path (P5.7 at audit completion)
+    typically calls find_in_flight_verification_by_idempotency
+    first to dedupe."""
+    await ensure_audit_evidence_tables()
+    if verifier_id not in VALID_VERIFIERS:
+        logger.warning(
+            "enqueue_verification_run: unknown verifier_id %r "
+            "for audit_run=%s — inserting anyway",
+            verifier_id, audit_run_id,
+        )
+    verify_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            verification_runs.insert().values(
+                verify_id=verify_id,
+                audit_run_id=audit_run_id,
+                product_key=product_key,
+                verifier_id=verifier_id,
+                status=VERIFICATION_STATUS_PENDING,
+                not_before=not_before,
+                max_retries=int(max_retries),
+                idempotency_key=idempotency_key,
+                created_at=_now_utc(),
+            )
+        )
+        return verify_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "enqueue_verification_run failed verifier=%s audit=%s: %s",
+            verifier_id, audit_run_id, str(exc)[:200],
+        )
+        return None
+
+
+async def claim_next_pending_verification(
+    *,
+    worker_id: str,
+    lease_seconds: int = DEFAULT_VERIFICATION_LEASE_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim the oldest pending or stale-leased
+    verification. Skips rows where not_before > NOW() (the citation
+    movement verifier sets this to audit_completed_at + 30 days).
+    SKIP LOCKED makes this safe under multiple workers.
+    """
+    await ensure_audit_evidence_tables()
+    now = _now_utc()
+    new_until = datetime.fromtimestamp(
+        now.timestamp() + lease_seconds, tz=timezone.utc,
+    )
+    query = """
+        UPDATE verification_runs
+           SET claimed_by_worker = :worker_id,
+               claimed_until     = :new_until,
+               status            = 'claimed',
+               last_checked_at   = :now
+         WHERE verify_id = (
+             SELECT verify_id
+               FROM verification_runs
+              WHERE status IN ('pending', 'claimed')
+                AND (
+                    claimed_until IS NULL
+                 OR claimed_until < :now
+                )
+                AND (
+                    not_before IS NULL
+                 OR not_before < :now
+                )
+              ORDER BY created_at ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+         )
+        RETURNING verify_id, audit_run_id, product_key, verifier_id,
+                  retry_count, max_retries, idempotency_key,
+                  created_at
+    """
+    try:
+        row = await database.fetch_one(
+            query,
+            {"worker_id": worker_id, "new_until": new_until, "now": now},
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        return {
+            "verify_id": str(d.get("verify_id")),
+            "audit_run_id": (
+                str(d.get("audit_run_id"))
+                if d.get("audit_run_id") else None
+            ),
+            "product_key": d.get("product_key"),
+            "verifier_id": d.get("verifier_id"),
+            "retry_count": int(d.get("retry_count") or 0),
+            "max_retries": int(d.get("max_retries") or 2),
+            "idempotency_key": d.get("idempotency_key"),
+            "created_at": (
+                d["created_at"].isoformat()
+                if isinstance(d.get("created_at"), datetime)
+                else None
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "claim_next_pending_verification failed for worker=%s: %s",
+            worker_id, str(exc)[:200],
+        )
+        return None
+
+
+async def mark_verification_succeeded(
+    *,
+    verify_id: str,
+    worker_id: str,
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Terminal succeeded transition. Guarded on worker ownership."""
+    await ensure_audit_evidence_tables()
+    now = _now_utc()
+    values: Dict[str, Any] = {
+        "status": VERIFICATION_STATUS_SUCCEEDED,
+        "completed_at": now,
+        "last_checked_at": now,
+    }
+    if evidence_jsonb is not None:
+        values["evidence_jsonb"] = evidence_jsonb
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+            )
+            .values(**values)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_verification_succeeded failed for verify=%s: %s",
+            verify_id, str(exc)[:200],
+        )
+        return False
+
+
+async def mark_verification_blocked(
+    *,
+    verify_id: str,
+    worker_id: str,
+    error_message: str,
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Terminal blocked transition — upstream system unavailable
+    (e.g., GSC consent revoked, agent.pivota.cc 503). NOT a retry
+    candidate; if the upstream comes back, a new audit re-enqueues
+    a fresh verification_runs row."""
+    await ensure_audit_evidence_tables()
+    now = _now_utc()
+    values: Dict[str, Any] = {
+        "status": VERIFICATION_STATUS_BLOCKED,
+        "completed_at": now,
+        "last_checked_at": now,
+        "error_message": (
+            error_message[:2000] if error_message else None
+        ),
+    }
+    if evidence_jsonb is not None:
+        values["evidence_jsonb"] = evidence_jsonb
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+            )
+            .values(**values)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_verification_blocked failed for verify=%s: %s",
+            verify_id, str(exc)[:200],
+        )
+        return False
+
+
+async def mark_verification_failed_with_retry(
+    *,
+    verify_id: str,
+    worker_id: str,
+    error_message: str,
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Failed-attempt handling. If retry_count < max_retries:
+    transition back to PENDING + bump retry_count. Otherwise
+    transition to EXHAUSTED_RETRIES (terminal). Returns the new
+    status string for the caller's logging."""
+    await ensure_audit_evidence_tables()
+    try:
+        from sqlalchemy.sql import select
+        row = await database.fetch_one(
+            select(
+                verification_runs.c.retry_count,
+                verification_runs.c.max_retries,
+            ).where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.claimed_by_worker == worker_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_verification_failed_with_retry read failed "
+            "for verify=%s: %s", verify_id, str(exc)[:200],
+        )
+        return VERIFICATION_STATUS_FAILED
+    if row is None:
+        return VERIFICATION_STATUS_FAILED
+    d = dict(row)
+    next_retry = int(d.get("retry_count") or 0) + 1
+    max_r = int(d.get("max_retries") or 2)
+    now = _now_utc()
+    if next_retry < max_r:
+        new_status = VERIFICATION_STATUS_PENDING
+        values = {
+            "status": new_status,
+            "retry_count": next_retry,
+            "claimed_by_worker": None,
+            "claimed_until": None,
+            "last_checked_at": now,
+            "error_message": error_message[:2000],
+        }
+    else:
+        new_status = VERIFICATION_STATUS_EXHAUSTED_RETRIES
+        values = {
+            "status": new_status,
+            "retry_count": next_retry,
+            "completed_at": now,
+            "last_checked_at": now,
+            "error_message": error_message[:2000],
+        }
+    if evidence_jsonb is not None:
+        values["evidence_jsonb"] = evidence_jsonb
+    try:
+        await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+            )
+            .values(**values)
+        )
+        return new_status
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_verification_failed_with_retry write failed "
+            "for verify=%s: %s", verify_id, str(exc)[:200],
+        )
+        return VERIFICATION_STATUS_FAILED
+
+
+async def release_stale_verification_leases(
+    *,
+    grace_seconds: int = VERIFICATION_STALE_LEASE_GRACE_SECONDS,
+) -> int:
+    """Reaper backstop. claim_next_pending_verification already
+    tolerates stale leases inline; this guarantees progress when a
+    worker hangs in a way that prevents it from re-claiming.
+    Returns the number of rows reset to pending."""
+    await ensure_audit_evidence_tables()
+    cutoff = datetime.fromtimestamp(
+        _now_utc().timestamp() - grace_seconds, tz=timezone.utc,
+    )
+    query = """
+        UPDATE verification_runs
+           SET status            = 'pending',
+               claimed_by_worker = NULL,
+               claimed_until     = NULL
+         WHERE claimed_until IS NOT NULL
+           AND claimed_until < :cutoff
+           AND status = 'claimed'
+    """
+    try:
+        result = await database.execute(query, {"cutoff": cutoff})
+        if isinstance(result, int):
+            return result
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "release_stale_verification_leases failed: %s",
+            str(exc)[:200],
+        )
+        return 0
+
+
+async def list_verifications_for_run(
+    *, audit_run_id: str,
+) -> List[Dict[str, Any]]:
+    """All verification rows for one audit. Used by the merchant /
+    employee projections to show verifier status alongside the
+    finding/evidence/action set."""
+    await ensure_audit_evidence_tables()
+    try:
+        rows = await database.fetch_all(
+            verification_runs.select()
+            .where(verification_runs.c.audit_run_id == audit_run_id)
+            .order_by(verification_runs.c.created_at)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_verifications_for_run failed for %s: %s",
+            audit_run_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in (rows or [])]
