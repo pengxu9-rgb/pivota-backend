@@ -296,6 +296,7 @@ verification_runs = Table(
     metadata,
     Column("verify_id", UUID(as_uuid=False), primary_key=True),
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
+    Column("merchant_id", Text, nullable=True),  # P5.8.7
     Column("product_key", Text, nullable=True),
     Column("verifier_id", Text, nullable=False),
     Column("status", Text, nullable=False, server_default="pending"),
@@ -495,6 +496,12 @@ _DDL_STATEMENTS = [
     "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
     "CREATE INDEX IF NOT EXISTS idx_projections_merchant "
     "ON report_projections (merchant_id, audience);",
+
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_merchant "
+    "ON verification_runs (merchant_id, audit_run_id) "
+    "WHERE merchant_id IS NOT NULL;",
 ]
 
 
@@ -1031,6 +1038,7 @@ async def enqueue_verification_run(
     *,
     audit_run_id: str,
     verifier_id: str,
+    merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
     not_before: Optional[datetime] = None,
     max_retries: int = 2,
@@ -1053,6 +1061,7 @@ async def enqueue_verification_run(
             verification_runs.insert().values(
                 verify_id=verify_id,
                 audit_run_id=audit_run_id,
+                merchant_id=merchant_id,
                 product_key=product_key,
                 verifier_id=verifier_id,
                 status=VERIFICATION_STATUS_PENDING,

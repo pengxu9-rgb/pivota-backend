@@ -88,6 +88,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_idempotency
   WHERE idempotency_key IS NOT NULL;
 
 -- =======================================================================
+-- verification_runs (P5.1 table — also audit-scoped, also missed
+-- merchant_id in the original schema)
+-- =======================================================================
+
+ALTER TABLE verification_runs
+  ADD COLUMN IF NOT EXISTS merchant_id TEXT;
+
+UPDATE verification_runs v
+   SET merchant_id = m.merchant_id
+  FROM merchant_audit_runs m
+ WHERE v.audit_run_id = m.run_id
+   AND v.merchant_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_verification_runs_merchant
+  ON verification_runs (merchant_id, audit_run_id)
+  WHERE merchant_id IS NOT NULL;
+
+-- =======================================================================
 -- report_projections
 -- =======================================================================
 
