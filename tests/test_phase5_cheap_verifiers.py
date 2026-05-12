@@ -308,6 +308,38 @@ async def test_pdp_in_sitemap_failed_on_sitemap_error(monkeypatch):
 # =====================================================================
 
 
+def _patch_backend_url(monkeypatch, url: str = "http://test-backend:8000"):
+    """P5.8.5: verifier reads from settings.pivota_backend_internal_url.
+    Tests need to set it (or monkey-patch _backend_base_url directly)
+    so the verifier doesn't return blocked:not_configured."""
+    from services.verifiers import pivota_internal_retrieval
+    monkeypatch.setattr(
+        pivota_internal_retrieval,
+        "_backend_base_url",
+        lambda: url,
+    )
+
+
+@pytest.mark.asyncio
+async def test_internal_retrieval_blocked_when_backend_url_unconfigured(
+    monkeypatch,
+):
+    """P5.8.5: when PIVOTA_BACKEND_INTERNAL_URL is unset (no
+    fallback), the verifier returns blocked:not_configured. The
+    original P5.3 code defaulted to localhost:8000 which would
+    retry-storm against the wrong target in Railway prod."""
+    from services.verifiers import pivota_internal_retrieval
+    _patch_product_loader(monkeypatch, product=_sample_product())
+    # Simulate the env var being unset
+    from services.verifiers import pivota_internal_retrieval as v
+    monkeypatch.setattr(v, "_backend_base_url", lambda: None)
+    result = (
+        await v.run_pivota_internal_retrieval(_ctx())
+    )
+    assert result.status == "blocked"
+    assert "not_configured" in result.error_message
+
+
 @pytest.mark.asyncio
 async def test_internal_retrieval_succeeded_on_roundtrip_match(
     monkeypatch,
@@ -315,6 +347,7 @@ async def test_internal_retrieval_succeeded_on_roundtrip_match(
     """200 + product_key + merchant_id match → succeeded."""
     from services.verifiers import pivota_internal_retrieval
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_backend_url(monkeypatch)  # P5.8.5
     body = {
         "product": {
             "product_key": "shopify::sp-1",
@@ -344,6 +377,7 @@ async def test_internal_retrieval_blocked_on_404(monkeypatch):
     from catalog, which is a structural gap)."""
     from services.verifiers import pivota_internal_retrieval
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_backend_url(monkeypatch)  # P5.8.5
     _patch_httpx_for(
         pivota_internal_retrieval,
         response=_FakeResponse(status_code=404),
@@ -366,6 +400,7 @@ async def test_internal_retrieval_blocked_on_roundtrip_mismatch(
     re-key, sig collision). Not retryable."""
     from services.verifiers import pivota_internal_retrieval
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_backend_url(monkeypatch)  # P5.8.5
     body = {
         "product": {
             "product_key": "shopify::sp-DIFFERENT",
@@ -392,6 +427,7 @@ async def test_internal_retrieval_failed_on_5xx(monkeypatch):
     """5xx → failed (retryable)."""
     from services.verifiers import pivota_internal_retrieval
     _patch_product_loader(monkeypatch, product=_sample_product())
+    _patch_backend_url(monkeypatch)  # P5.8.5
     _patch_httpx_for(
         pivota_internal_retrieval,
         response=_FakeResponse(status_code=503),

@@ -154,6 +154,24 @@ class Settings(BaseSettings):
         or os.getenv("AGENT_API_KEY")
         or os.getenv("PIVOTA_AGENT_INTERNAL_API_KEY")
     )
+    # P5.8.5: Pivota backend's own base URL, used by the
+    # pivota_internal_retrieval verifier (P5.3) to hit the
+    # GET /products/{sig_id} resolver from within the worker.
+    # Unlike pivota_agent_internal_url (which points OUT to the
+    # upstream PIVOTA-Agent), this points back into THIS service
+    # so the verifier can confirm canonical-sig consistency from
+    # the same instance / pod.
+    #
+    # On Railway use http://${RAILWAY_PRIVATE_DOMAIN}:8000 (private
+    # networking; cheaper + lower latency than going through the
+    # public domain). Setting to empty string DISABLES the verifier
+    # — the run_pivota_internal_retrieval verifier returns
+    # blocked:not_configured rather than retry-storming against a
+    # bogus URL.
+    pivota_backend_internal_url: Optional[str] = (
+        os.getenv("PIVOTA_BACKEND_INTERNAL_URL")
+    )
+
     agent_center_llm_probe_timeout_s: float = float(
         os.getenv("AGENT_CENTER_LLM_PROBE_TIMEOUT_S", "30")
     )
