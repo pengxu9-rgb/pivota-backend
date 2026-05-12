@@ -510,7 +510,7 @@ async def _resolve_merchant_and_products(
     them under a single helper).
     """
     from db.database import database
-    from db.catalog_products import catalog_products
+    from db.catalog import catalog_products
     from db.merchant_onboarding import get_merchant_onboarding
     from services.catalog_sync_service import (
         make_pivota_canonical_fields,

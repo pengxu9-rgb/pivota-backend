@@ -327,3 +327,66 @@ def test_verifier_specs_matches_register_verifier_calls_grep_check():
         f"  in specs but not registered: {only_in_specs}\n"
         f"  registered but not in specs: {only_in_register}"
     )
+
+
+# =====================================================================
+# 7. Function-local internal-import resolvability
+# =====================================================================
+
+
+def test_worker_modules_have_no_unresolvable_internal_imports():
+    """Function-local `from db.X import Y` style imports inside the
+    worker stack must point at modules that actually exist. P5.8.8
+    happened because services/audit_run_worker.py:513 had
+    `from db.catalog_products import catalog_products`, but the table
+    object lives in `db.catalog`. The discovering-stage code path is
+    skipped by unit tests (mocked away), so the broken import only
+    surfaced when a real audit ran on prod — and Gate 4 of the deploy
+    pipeline blocked there.
+
+    This test parses each worker module's AST, finds every
+    `ImportFrom` node (top-level + function-local), and tries to
+    import each db.* / services.* / routes.* / config.* / utils.* /
+    jobs.* module by name. Anything unresolvable surfaces as a
+    failure here, BEFORE the code reaches production.
+    """
+    worker_files = [
+        _REPO_ROOT / "services/audit_run_worker.py",
+        _REPO_ROOT / "services/executor_run_worker.py",
+        _REPO_ROOT / "services/verification_run_worker.py",
+        _REPO_ROOT / "services/audit_evidence_builder.py",
+        _REPO_ROOT / "services/audit_projection_builder.py",
+        _REPO_ROOT / "services/audit_verification_enqueuer.py",
+    ]
+    internal_prefixes = (
+        "db.", "services.", "routes.", "config.", "utils.", "jobs.",
+    )
+    problems = []
+    for path in worker_files:
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            mod = node.module or ""
+            if not any(
+                mod == p[:-1] or mod.startswith(p)
+                for p in internal_prefixes
+            ):
+                continue
+            try:
+                __import__(mod)
+            except Exception as exc:  # noqa: BLE001
+                problems.append(
+                    f"{path.name}:{node.lineno} — "
+                    f"cannot import {mod!r}: {exc!s}"
+                )
+
+    assert not problems, (
+        "Worker modules have unresolvable internal imports — these will "
+        "blow up at runtime when the code path is exercised "
+        "(unit tests mock the surrounding logic, so the import never "
+        "actually executes in test). Fix the import path:\n  "
+        + "\n  ".join(problems)
+    )
