@@ -222,6 +222,7 @@ from routes.employee_agents_management import router as employee_agents_manageme
 from routes.employee_agents_simple import router as employee_agents_simple_router
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
 from routes.admin_run_migration import router as admin_run_migration_router
+from routes.admin_run_migration_081 import router as admin_run_migration_081_router
 from routes.admin_fix_agents import router as admin_fix_agents_router
 from routes.admin_fix_agent_metrics import router as admin_fix_agent_metrics_router
 from routes.admin_fix_agent_metrics_v2 import router as admin_fix_agent_metrics_v2_router
@@ -830,6 +831,7 @@ app.include_router(merchant_agent_bank_router)  # Merchant view agent bank info
 
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
 app.include_router(admin_run_migration_router)  # Database migrations via API
+app.include_router(admin_run_migration_081_router)  # Run migration 081 - Seed content lock/proposals
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
 if settings.platform_onboarding_v2_enabled:
