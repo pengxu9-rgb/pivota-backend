@@ -65,80 +65,54 @@ async def test_executor_result_default_evidence():
 
 @pytest.mark.asyncio
 async def test_dispatcher_skips_agent_when_should_run_false():
-    """Agent with should_run=False is evaluated but not executed.
-    Persistence should NOT be called for it."""
+    """Agent with should_run=False is evaluated but NOT enqueued.
+    enqueue_executor_run should not be called for it (P3.3 contract)."""
     from services.executor_agents import dispatcher
-    started = AsyncMock(return_value="run-1")
-    completed = AsyncMock()
+    enqueue = AsyncMock(return_value="run-1")
+    find_idem = AsyncMock(return_value=None)
     with patch.object(dispatcher, "_registry", lambda: [_NoopAgent(run_decision=False)]), \
-         patch("db.executor_runs.record_executor_run_started", started), \
-         patch("db.executor_runs.record_executor_run_completed", completed):
+         patch("db.executor_runs.enqueue_executor_run", enqueue), \
+         patch("db.executor_runs.find_in_flight_executor_run_by_idempotency", find_idem):
         result = await dispatcher.dispatch_agents(
             ExecutorContext(merchant_id="m1"),
         )
     assert result["agents_evaluated"] == 1
-    assert result["agents_executed"] == 0
-    assert result["results"] == []
-    started.assert_not_called()
-    completed.assert_not_called()
+    assert result["agents_enqueued"] == 0
+    assert result["runs"] == []
+    enqueue.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_executes_agent_when_should_run_true():
-    """Agent with should_run=True gets started + completed via DB."""
+async def test_dispatcher_enqueues_agent_when_should_run_true():
+    """Agent with should_run=True gets enqueued via the new durable
+    work queue (P3.3). The dispatcher does NOT call execute() — the
+    worker does that on its tick."""
     from services.executor_agents import dispatcher
-    started = AsyncMock(return_value="run-2")
-    completed = AsyncMock()
-    with patch.object(dispatcher, "_registry", lambda: [_NoopAgent(run_decision=True, exec_status="succeeded")]), \
-         patch("db.executor_runs.record_executor_run_started", started), \
-         patch("db.executor_runs.record_executor_run_completed", completed):
+    enqueue = AsyncMock(return_value="run-2")
+    find_idem = AsyncMock(return_value=None)
+    agent = _NoopAgent(run_decision=True, exec_status="succeeded")
+    with patch.object(dispatcher, "_registry", lambda: [agent]), \
+         patch("db.executor_runs.enqueue_executor_run", enqueue), \
+         patch("db.executor_runs.find_in_flight_executor_run_by_idempotency", find_idem):
         result = await dispatcher.dispatch_agents(
             ExecutorContext(merchant_id="m2", parent_audit_run_id="audit-x"),
         )
     assert result["agents_evaluated"] == 1
-    assert result["agents_executed"] == 1
-    assert result["results"][0]["status"] == "succeeded"
-    started.assert_called_once_with(
-        agent_name="noop",
-        merchant_id="m2",
-        parent_audit_run_id="audit-x",
-    )
-    completed.assert_called_once()
-    completed_kwargs = completed.call_args.kwargs
-    assert completed_kwargs["status"] == "succeeded"
-    assert completed_kwargs["evidence_jsonb"] == {"agent": "noop"}
-
-
-@pytest.mark.asyncio
-async def test_dispatcher_records_failure_when_execute_raises():
-    """Uncaught exception in execute() → status='failed' with diagnostic
-    error_message instead of propagating."""
-    from services.executor_agents import dispatcher
-
-    class _BoomAgent(BaseExecutorAgent):
-        name = "boom"
-        async def should_run(self, context): return True
-        async def execute(self, context): raise RuntimeError("kaboom")
-
-    started = AsyncMock(return_value="run-3")
-    completed = AsyncMock()
-    with patch.object(dispatcher, "_registry", lambda: [_BoomAgent()]), \
-         patch("db.executor_runs.record_executor_run_started", started), \
-         patch("db.executor_runs.record_executor_run_completed", completed):
-        result = await dispatcher.dispatch_agents(
-            ExecutorContext(merchant_id="m3"),
-        )
-    assert result["results"][0]["status"] == "failed"
-    assert "kaboom" in (result["results"][0]["error_message"] or "")
-    completed_kwargs = completed.call_args.kwargs
-    assert completed_kwargs["status"] == "failed"
+    assert result["agents_enqueued"] == 1
+    assert result["runs"][0]["state"] == "enqueued"
+    assert result["runs"][0]["agent_name"] == "noop"
+    enqueue.assert_called_once()
+    enq_kwargs = enqueue.call_args.kwargs
+    assert enq_kwargs["agent_name"] == "noop"
+    assert enq_kwargs["merchant_id"] == "m2"
+    assert enq_kwargs["parent_audit_run_id"] == "audit-x"
 
 
 @pytest.mark.asyncio
 async def test_dispatcher_continues_when_should_run_raises():
     """should_run is meant to be cheap; if it raises (e.g. transient
     DB error), skip that agent silently and continue with the next.
-    Lifecycle persistence does NOT run for the skipped agent."""
+    enqueue is NOT called for the raised agent."""
     from services.executor_agents import dispatcher
 
     class _BoomShouldRun(BaseExecutorAgent):
@@ -146,18 +120,29 @@ async def test_dispatcher_continues_when_should_run_raises():
         async def should_run(self, context): raise ValueError("cant-decide")
         async def execute(self, context): return ExecutorResult(status="succeeded")
 
-    started = AsyncMock(return_value="run-4")
-    completed = AsyncMock()
-    with patch.object(dispatcher, "_registry", lambda: [_BoomShouldRun(), _NoopAgent(run_decision=True)]), \
-         patch("db.executor_runs.record_executor_run_started", started), \
-         patch("db.executor_runs.record_executor_run_completed", completed):
+    enqueue = AsyncMock(return_value="run-4")
+    find_idem = AsyncMock(return_value=None)
+    with patch.object(
+        dispatcher, "_registry",
+        lambda: [_BoomShouldRun(), _NoopAgent(run_decision=True)],
+    ), patch("db.executor_runs.enqueue_executor_run", enqueue), \
+         patch("db.executor_runs.find_in_flight_executor_run_by_idempotency", find_idem):
         result = await dispatcher.dispatch_agents(
             ExecutorContext(merchant_id="m4"),
         )
-    # 2 evaluated, 1 actually executed (the noop one)
+    # 2 evaluated, 1 actually enqueued (the noop one — the boom one
+    # raised in should_run and got skipped)
     assert result["agents_evaluated"] == 2
-    assert result["agents_executed"] == 1
-    assert result["results"][0]["agent_name"] == "noop"
+    assert result["agents_enqueued"] == 1
+    assert result["runs"][0]["agent_name"] == "noop"
+    enqueue.assert_called_once()
+
+
+# Note: test_dispatcher_records_failure_when_execute_raises was removed
+# in P3.3. The dispatcher no longer calls execute() — that's the worker's
+# job (services/executor_run_worker.py). The execute-raises behavior is
+# now tested in
+# tests/test_phase3_executor_run_worker.py::test_uncaught_exception_routes_to_retry_with_traceback
 
 
 # ---------------------------------------------------------------------------
