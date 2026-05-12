@@ -327,4 +327,67 @@ class SitemapFreshnessAgent(BaseExecutorAgent):
             "freshness_score": score,
             "severity": severity,
         }
-        return ExecutorResult(status="succeeded", evidence=evidence)
+        # P1.1: when the sitemap has drift, the fix is merchant work
+        # (Pivota can't edit merchant-managed sitemaps directly). Emit
+        # human_task_recommended so the dispatcher materializes a
+        # merchant_task. When the sitemap is clean (no drift), emit
+        # no_op so we don't spam the queue.
+        from services.executor_agents.base import (
+            RESULT_TYPE_HUMAN_TASK_RECOMMENDED,
+            RESULT_TYPE_NO_OP,
+        )
+        has_drift = (
+            len(missing_from_sitemap) > 0 or len(orphan_in_sitemap) > 0
+        )
+        if not has_drift:
+            return ExecutorResult(
+                status="succeeded",
+                evidence=evidence,
+                result_type=RESULT_TYPE_NO_OP,
+            )
+        # Drift detected — frame the human task
+        title_parts = []
+        if len(missing_from_sitemap) > 0:
+            title_parts.append(
+                f"add {len(missing_from_sitemap)} missing PDP"
+                f"{'s' if len(missing_from_sitemap) != 1 else ''}"
+            )
+        if len(orphan_in_sitemap) > 0:
+            title_parts.append(
+                f"remove {len(orphan_in_sitemap)} orphan URL"
+                f"{'s' if len(orphan_in_sitemap) != 1 else ''}"
+            )
+        task_title = (
+            f"Sitemap drift on {merchant_host}: " + " + ".join(title_parts)
+        )
+        body_lines = [
+            f"Sitemap freshness audit found drift between {merchant_host}'s "
+            f"sitemap.xml ({len(sitemap_norm)} URLs) and your live "
+            f"catalog ({len(catalog_norm)} URLs)."
+        ]
+        if missing_sample:
+            body_lines.append(
+                f"\nMissing from sitemap "
+                f"(first {len(missing_sample)} of "
+                f"{len(missing_from_sitemap)}): "
+                + ", ".join(missing_sample[:5])
+                + ("..." if len(missing_sample) > 5 else "")
+            )
+        if orphan_sample:
+            body_lines.append(
+                f"\nOrphan URLs in sitemap "
+                f"(first {len(orphan_sample)} of "
+                f"{len(orphan_in_sitemap)}): "
+                + ", ".join(orphan_sample[:5])
+                + ("..." if len(orphan_sample) > 5 else "")
+            )
+        return ExecutorResult(
+            status="succeeded",
+            evidence=evidence,
+            result_type=RESULT_TYPE_HUMAN_TASK_RECOMMENDED,
+            task_title=task_title,
+            task_body="\n".join(body_lines),
+            task_severity=severity,
+            task_owner="merchant_tech_team",
+            task_lever="sitemap_maintenance",
+        )

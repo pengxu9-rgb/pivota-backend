@@ -179,7 +179,15 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
             str(d.get("parent_audit_run_id"))
             if d.get("parent_audit_run_id") else None
         ),
+        # P1.1 dual-key shim: emit both `requested_at` (legacy
+        # column name) and `started_at` (frontend's expected name).
+        # Same timestamp value for both during the migration window.
+        # Drop `requested_at` from the API response after Phase 2.
         "requested_at": (
+            d["requested_at"].isoformat()
+            if isinstance(d.get("requested_at"), datetime) else None
+        ),
+        "started_at": (
             d["requested_at"].isoformat()
             if isinstance(d.get("requested_at"), datetime) else None
         ),
@@ -188,7 +196,9 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
             if isinstance(d.get("completed_at"), datetime) else None
         ),
         "status": d.get("status"),
+        # P1.1 dual-key shim: see merchant_tasks._row_to_dict.
         "evidence": d.get("evidence_jsonb"),
+        "evidence_jsonb": d.get("evidence_jsonb"),
         "error_message": d.get("error_message"),
     }
 

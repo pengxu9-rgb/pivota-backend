@@ -166,6 +166,14 @@ async def materialize_task_from_executor(
     agent_name: str,
     evidence: Dict[str, Any],
     parent_audit_run_id: Optional[str] = None,
+    # P1.1 — explicit overrides from ExecutorResult.task_*. When the
+    # agent emitted RESULT_TYPE_HUMAN_TASK_RECOMMENDED, it supplies
+    # the task framing directly. Otherwise we fall back to the
+    # per-agent _summarize_executor_work mapping (legacy behavior).
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    severity: Optional[str] = None,
+    lever: Optional[str] = None,
 ) -> Optional[str]:
     """Some executor agents produce work for humans (sitemap diff,
     content brief). Caller invokes this to surface that work as a
@@ -179,15 +187,21 @@ async def materialize_task_from_executor(
     if not merchant_id or not executor_run_id or not agent_name:
         return None
 
-    title, body, severity, lever = _summarize_executor_work(agent_name, evidence)
+    # Prefer explicit values from the agent's ExecutorResult; fall
+    # back to the per-agent summarizer for agents that haven't been
+    # updated yet.
+    if title is None:
+        title, body, severity, lever = _summarize_executor_work(
+            agent_name, evidence,
+        )
     if not title:
         return None  # this agent's run produced no human-actionable work
 
     return await record_task_created(
         merchant_id=merchant_id,
         title=title,
-        body=body,
-        severity=severity,
+        body=body or "",
+        severity=severity or "medium",
         lever=lever,
         parent_audit_run_id=parent_audit_run_id,
         source_executor_run_id=executor_run_id,
