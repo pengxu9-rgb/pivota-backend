@@ -31,6 +31,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
+from db._jsonb_safe import _json_safe
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -173,7 +174,8 @@ async def record_funnel_event(
                 source_channel=source_channel,
                 stage=stage,
                 occurred_at=_now_utc(),
-                attribution_jsonb=attribution,
+                # JSONB write boundary — coerce UUID/datetime/Decimal.
+                attribution_jsonb=_json_safe(attribution) if attribution else attribution,
             )
         )
         return event_id

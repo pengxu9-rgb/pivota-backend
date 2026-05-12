@@ -39,6 +39,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from db._jsonb_safe import coerce_jsonb_to_dict
+
 logger = logging.getLogger(__name__)
 
 
@@ -165,12 +167,16 @@ def build_merchant_projection(
         # ("This brand was named by Forbes Vetted as ..."). Only
         # high-confidence grounding chunks.
         "evidence_quotes": [
+            # coerce_jsonb_to_dict defends against the `databases`
+            # library returning the JSONB column as a raw JSON
+            # string instead of a parsed dict (same race PR #482
+            # fixed at the executor hydration boundary).
             {
-                "host": (e.get("payload_jsonb") or {}).get("host"),
-                "excerpt": (e.get("payload_jsonb") or {}).get(
+                "host": (coerce_jsonb_to_dict(e.get("payload_jsonb")) or {}).get("host"),
+                "excerpt": (coerce_jsonb_to_dict(e.get("payload_jsonb")) or {}).get(
                     "excerpt_text",
                 ),
-                "query": (e.get("payload_jsonb") or {}).get("query"),
+                "query": (coerce_jsonb_to_dict(e.get("payload_jsonb")) or {}).get("query"),
             }
             for e in evidence
             if e.get("evidence_type") == "grounding_chunk"
@@ -248,9 +254,11 @@ def build_pivota_pdp_feed_projection(
         # canonical PDP. Only competitor_mention + grounding_chunk
         # rows with a host.
         "citations": [
+            # coerce_jsonb_to_dict — see comment in
+            # build_merchant_projection's evidence_quotes block.
             {
-                "host": (e.get("payload_jsonb") or {}).get("host"),
-                "times_cited": (e.get("payload_jsonb") or {}).get(
+                "host": (coerce_jsonb_to_dict(e.get("payload_jsonb")) or {}).get("host"),
+                "times_cited": (coerce_jsonb_to_dict(e.get("payload_jsonb")) or {}).get(
                     "times_cited",
                 ),
                 "evidence_type": e.get("evidence_type"),
@@ -259,7 +267,7 @@ def build_pivota_pdp_feed_projection(
             if e.get("evidence_type") in (
                 "grounding_chunk", "competitor_mention",
             )
-            and (e.get("payload_jsonb") or {}).get("host")
+            and (coerce_jsonb_to_dict(e.get("payload_jsonb")) or {}).get("host")
         ],
         # Visibility scores for the PDP's "agent commerce readiness"
         # badge.

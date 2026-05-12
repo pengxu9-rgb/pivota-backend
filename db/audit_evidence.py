@@ -798,7 +798,11 @@ async def insert_verification_run(
                 product_key=product_key,
                 verifier_id=verifier_id,
                 status=status,
-                evidence_jsonb=evidence_jsonb,
+                # JSONB write boundary — coerce UUID/datetime/Decimal
+                # to JSON-safe primitives. Matches the defense applied
+                # at insert_evidence_item / insert_finding / upsert_
+                # projection by PR #477 + #479.
+                evidence_jsonb=_json_safe(evidence_jsonb) if evidence_jsonb else evidence_jsonb,
                 error_message=(
                     error_message[:2000] if error_message else None
                 ),
@@ -813,46 +817,9 @@ async def insert_verification_run(
         return None
 
 
-def _json_safe(value: Any) -> Any:
-    """Recursively coerce asyncpg-native Python types into JSON-safe
-    primitives. Without this, projection payloads built from DB rows
-    fail at JSONB serialization with errors like:
-        Object of type UUID is not JSON serializable
-
-    Handles the three types asyncpg returns that stdlib json.dumps
-    rejects:
-      - uuid.UUID         → str (canonical hex form)
-      - datetime/date     → ISO 8601 string
-      - decimal.Decimal   → float (precision loss accepted; projections
-                            are presentational, not source-of-truth)
-
-    Walks dict/list/tuple/set recursively. Pass-through for str/int/
-    float/bool/None. Anything else falls through unchanged — if a
-    builder ever returns a custom dataclass, the serialization error
-    will surface at the JSONB boundary as it does today, but UUIDs
-    (the common case in P4/P5 audit-row pass-through) are now safe.
-    """
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, uuid.UUID):
-        return str(value)
-    if isinstance(value, datetime):
-        return value.isoformat()
-    # Imported lazily — datetime.date is parent of datetime; check
-    # AFTER datetime so isoformat keeps time component for datetimes.
-    from datetime import date as _date
-    if isinstance(value, _date):
-        return value.isoformat()
-    from decimal import Decimal
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, set):
-        return [_json_safe(v) for v in value]
-    return value
+# _json_safe lives in db/_jsonb_safe so other db modules (executor_runs,
+# merchant_audit_runs) can use it at their JSONB write boundaries too.
+from db._jsonb_safe import _json_safe  # noqa: E402, F401 — re-exported
 
 
 async def upsert_projection(

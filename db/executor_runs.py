@@ -24,6 +24,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from db._jsonb_safe import _json_safe
+
 from sqlalchemy import (
     Column,
     DateTime,
@@ -241,7 +243,8 @@ async def record_executor_run_completed(
             "completed_at": _now_utc(),
         }
         if evidence_jsonb is not None:
-            values["evidence_jsonb"] = evidence_jsonb
+            # JSONB write boundary — coerce UUID/datetime/Decimal.
+            values["evidence_jsonb"] = _json_safe(evidence_jsonb)
         if error_message is not None:
             values["error_message"] = error_message[:2000]
         await database.execute(
@@ -393,7 +396,8 @@ async def enqueue_executor_run(
                 status="running",
                 stage=STAGE_QUEUED,
                 stage_updated_at=now,
-                payload_jsonb=payload_jsonb,
+                # JSONB write boundary — coerce UUID/datetime/Decimal.
+                payload_jsonb=_json_safe(payload_jsonb) if payload_jsonb else payload_jsonb,
                 idempotency_key=idempotency_key,
                 max_retries=int(max_retries),
             )
@@ -523,7 +527,9 @@ async def mark_executor_run_succeeded(
         "status": "succeeded",
     }
     if evidence_jsonb is not None:
-        values["evidence_jsonb"] = evidence_jsonb
+        # JSONB write boundary — coerce UUID/datetime/Decimal.
+        from db._jsonb_safe import _json_safe
+        values["evidence_jsonb"] = _json_safe(evidence_jsonb)
     try:
         result = await database.execute(
             executor_runs.update()
@@ -622,9 +628,11 @@ async def mark_executor_run_failed_with_retry(
                 # but the raw-SQL path needs explicit serialization
                 # because we're not going through the SQLAlchemy
                 # Table.update() shape that auto-coerces.
+                # _json_safe coerces UUID/datetime/Decimal first so
+                # _json.dumps doesn't raise on those types.
                 "error_jsonb": (
-                    _json.dumps(error_jsonb) if error_jsonb is not None
-                    else None
+                    _json.dumps(_json_safe(error_jsonb))
+                    if error_jsonb is not None else None
                 ),
             },
         )
