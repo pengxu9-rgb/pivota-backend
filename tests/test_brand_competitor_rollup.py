@@ -279,3 +279,118 @@ def test_winona_shape_surfaces_category_peers():
     assert by_host["verywellfit.com"]["times_cited"] == 4
     assert by_host["shape.com"]["confidence"] == "possible_peer_host"
     assert by_host["shape.com"]["times_cited"] == 2
+
+
+# =========================================================================
+# N5 PR-7: exclude merchant's own brand-derived hosts
+# =========================================================================
+
+
+def test_excludes_merchant_brand_host_from_rollup():
+    """The Beauty of Joseon external_seed case: the audit probed
+    `agent.pivota.cc/products/sig_...` so `merchant_host` was
+    `agent.pivota.cc`. The category probe found `beautyofjoseon.com`
+    (the brand's real D2C site) and surfaced it as a "competitor".
+    Post-PR-7 the brand-derived host gets excluded."""
+    products = [
+        _product(
+            retailer_hosts=[
+                {"host": "beautyofjoseon.com", "times_cited": 1},
+                {"host": "ulta.com", "times_cited": 2},
+            ],
+        ),
+    ]
+    out = _aggregate_brand_competitors(products, merchant_brand="Beauty of Joseon")
+    hosts = [e["host"] for e in out]
+    assert "beautyofjoseon.com" not in hosts, (
+        "Merchant's own brand-derived host must be filtered out"
+    )
+    assert "ulta.com" in hosts
+
+
+def test_excludes_explicit_merchant_domain_from_rollup():
+    """When the brand report request supplies an explicit
+    `merchant_domain`, that host is excluded regardless of what
+    `merchant_brand` derives to. Stronger signal than the
+    brand-name heuristic."""
+    products = [
+        _product(
+            competitor_hosts=[
+                {"host": "winona.com", "times_cited": 5},
+                {"host": "sephora.com", "times_cited": 3},
+            ],
+        ),
+    ]
+    out = _aggregate_brand_competitors(
+        products,
+        merchant_brand="Winona",
+        merchant_domain="winona.com",
+    )
+    hosts = [e["host"] for e in out]
+    assert "winona.com" not in hosts
+    assert "sephora.com" in hosts
+
+
+def test_excludes_www_prefixed_merchant_host():
+    """The brand probe may surface `www.beautyofjoseon.com` instead
+    of `beautyofjoseon.com`. Both forms must be excluded — the
+    rollup normalizes by stripping the www. prefix."""
+    products = [
+        _product(
+            retailer_hosts=[
+                {"host": "www.beautyofjoseon.com", "times_cited": 2},
+                {"host": "ulta.com", "times_cited": 1},
+            ],
+        ),
+    ]
+    out = _aggregate_brand_competitors(products, merchant_brand="Beauty of Joseon")
+    hosts = [e["host"] for e in out]
+    assert "www.beautyofjoseon.com" not in hosts
+    assert "ulta.com" in hosts
+
+
+def test_brand_with_punctuation_normalizes_correctly():
+    """Brand names with apostrophes / spaces / hyphens normalize
+    to their concatenated alnum form. "L'Oreal" → "loreal.com"."""
+    products = [
+        _product(retailer_hosts=[
+            {"host": "loreal.com", "times_cited": 3},
+            {"host": "ulta.com", "times_cited": 1},
+        ]),
+    ]
+    out = _aggregate_brand_competitors(products, merchant_brand="L'Oreal")
+    hosts = [e["host"] for e in out]
+    assert "loreal.com" not in hosts
+    assert "ulta.com" in hosts
+
+
+def test_no_brand_or_domain_no_filtering():
+    """Back-compat — calling without merchant_brand/merchant_domain
+    preserves the old behavior (no filtering). Internal merchants
+    that already work correctly aren't affected by PR-7."""
+    products = [
+        _product(competitor_hosts=[{"host": "anyhost.com", "times_cited": 1}]),
+    ]
+    out = _aggregate_brand_competitors(products)
+    assert [e["host"] for e in out] == ["anyhost.com"]
+
+
+def test_empty_brand_string_no_filtering():
+    """Empty / whitespace-only merchant_brand is treated as None —
+    no candidates derived, no filtering applied."""
+    products = [
+        _product(competitor_hosts=[{"host": "winona.com", "times_cited": 1}]),
+    ]
+    out = _aggregate_brand_competitors(products, merchant_brand="   ")
+    assert [e["host"] for e in out] == ["winona.com"]
+
+
+def test_brand_with_no_alnum_chars_no_filtering():
+    """Pathological case: brand is all punctuation. Yields no
+    candidate hosts, no filtering applied (don't accidentally
+    filter every host by matching an empty string)."""
+    products = [
+        _product(competitor_hosts=[{"host": "real.com", "times_cited": 1}]),
+    ]
+    out = _aggregate_brand_competitors(products, merchant_brand="!!!")
+    assert [e["host"] for e in out] == ["real.com"]
