@@ -38,17 +38,17 @@ def test_woocommerce_platform_capability_summary():
     assert "WooCommerce" in result["platform_capability_summary"]
 
 
-def test_wix_platform_capability_summary_acknowledges_audit_only():
-    """Wix doesn't have automated order writeback yet — disclosure
-    must say so explicitly."""
+def test_wix_platform_capability_summary_acknowledges_writeback_adapter():
+    """Wix now has automated order writeback adapter support."""
     from services.audit_pivota_commitments_builder import build_pivota_commitments
     result = build_pivota_commitments(
         merchant_platform="wix",
         cold_start=False,
     )
     summary = result["platform_capability_summary"].lower()
-    assert "audit" in summary
-    assert "manual" in summary or "roadmap" in summary
+    assert "wix admin" in summary
+    assert "writeback" in summary
+    assert "roadmap" not in summary
 
 
 def test_custom_platform_capability_summary_mentions_engineering_scope():
@@ -78,9 +78,8 @@ def test_shopify_onboarding_deliverables_include_order_forwarding():
     assert "order forwarding" in text or "order forwarding" in text
 
 
-def test_wix_onboarding_deliverables_use_custom_integration_framing():
-    """Wix lacks automated writeback — onboarding deliverables must
-    say so without fudging."""
+def test_wix_onboarding_deliverables_include_order_forwarding():
+    """Wix writeback ships through its own OAuth-backed adapter."""
     from services.audit_pivota_commitments_builder import build_pivota_commitments
     result = build_pivota_commitments(
         merchant_platform="wix",
@@ -88,11 +87,10 @@ def test_wix_onboarding_deliverables_use_custom_integration_framing():
     )
     deliverables = result["delivers_weeks_1_to_4"]
     text = " ".join(deliverables).lower()
-    # Shouldn't claim shopify-style end-to-end wiring
     assert "shopify oauth" not in text
-    assert "end-to-end" not in text or "manual" in text
-    # Should mention the custom-integration scoping
-    assert "manual" in text or "integration" in text
+    assert "wix oauth" in text
+    assert "order forwarding" in text
+    assert "manual" not in text
 
 
 def test_onboarding_always_includes_canonical_pdp_creation():
@@ -137,7 +135,7 @@ def test_continuous_deliverables_always_include_search_console_cadence():
 
 def test_continuous_deliverables_writeback_line_only_for_writeback_platforms():
     """Order-forwarding maintenance line should appear for
-    Shopify/Woo/BC but NOT for Wix/custom (manual-routing line
+    Shopify/Woo/BC/Wix but NOT for custom (manual-routing line
     instead)."""
     from services.audit_pivota_commitments_builder import build_pivota_commitments
     shopify_text = " ".join(
@@ -148,9 +146,13 @@ def test_continuous_deliverables_writeback_line_only_for_writeback_platforms():
         build_pivota_commitments(merchant_platform="wix", cold_start=False)
         ["delivers_continuous"]
     ).lower()
+    custom_text = " ".join(
+        build_pivota_commitments(merchant_platform="custom", cold_start=False)
+        ["delivers_continuous"]
+    ).lower()
     assert "order-forwarding" in shopify_text or "order forwarding" in shopify_text
-    # Wix gets manual-routing language
-    assert "manual" in wix_text
+    assert "order-forwarding" in wix_text or "order forwarding" in wix_text
+    assert "manual" in custom_text
 
 
 # ---------------------------------------------------------------------

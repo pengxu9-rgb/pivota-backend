@@ -39,11 +39,14 @@ _CAPABILITIES: Dict[str, StorePlatformCapabilities] = {
         purchase_requirement="live_quote_and_final_revalidation",
     ),
     "wix": StorePlatformCapabilities(
+        # Adapter-level writeback is shipped. Live production activation still
+        # depends on the merchant completing Wix App OAuth token storage with
+        # WIX_APP_CLIENT_ID / WIX_APP_CLIENT_SECRET configured.
         platform="wix",
         supports_live_quote=False,
         supports_live_inventory_check=False,
         supports_platform_checkout=False,
-        supports_platform_order_writeback=False,
+        supports_platform_order_writeback=True,
         supports_inventory_reservation=False,
         supports_inventory_hold=False,
         supports_authorize_capture=False,

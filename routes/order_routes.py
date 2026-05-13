@@ -88,6 +88,7 @@ from adapters.bigcommerce_adapter import (
     build_bigcommerce_headers,
     normalize_bigcommerce_store_hash,
 )
+from adapters.wix_adapter import create_wix_order as create_wix_order_via_adapter
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
@@ -5416,6 +5417,117 @@ async def create_bigcommerce_order(order_id: str) -> bool:
         return False
 
 
+async def create_wix_order(order_id: str) -> bool:
+    lock_key = _platform_order_create_lock_key("wix", order_id)
+    async with _pg_advisory_lock_best_effort(lock_key=lock_key) as lock_acquired:
+        if not lock_acquired:
+            logger.info("[Wix] Create already in progress; skipping: order_id=%s", order_id)
+            return True
+
+        order = await get_order(order_id)
+        if not order:
+            logger.error("[Wix] Order %s not found", order_id)
+            return False
+        if _get_linked_platform_order(order):
+            return True
+        if not _order_payment_allows_merchant_order_write(order, platform="wix"):
+            logger.warning(
+                "[Wix] Skip create (not paid): order_id=%s payment_status=%s",
+                order_id,
+                order.get("payment_status"),
+            )
+            return False
+
+        candidates = await _candidate_platform_stores(order, platform="wix")
+        if not candidates:
+            await log_order_event(
+                event_type="merchant_order_failed",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={"platform": "wix", "error": "active_wix_store_missing"},
+            )
+            return False
+
+        last_error: Optional[str] = None
+        for store in candidates:
+            adapter_order = dict(order)
+            adapter_order["store"] = store
+            try:
+                result = await create_wix_order_via_adapter(
+                    str(order.get("merchant_id") or ""),
+                    adapter_order,
+                )
+            except Exception as exc:
+                logger.exception("[Wix] Adapter raised unexpectedly")
+                result = {
+                    "order_id": None,
+                    "status": "error",
+                    "error": "wix_order_writeback_failed",
+                    "raw_response": {"message": str(exc)},
+                }
+
+            platform_order_id = str((result or {}).get("order_id") or "").strip()
+            if not platform_order_id:
+                raw_response = (result or {}).get("raw_response")
+                message = None
+                if isinstance(raw_response, dict):
+                    message = raw_response.get("message") or raw_response.get("error")
+                last_error = str((result or {}).get("error") or message or "wix_order_writeback_failed")[:500]
+                continue
+
+            raw_response = (result or {}).get("raw_response")
+            response_dict = raw_response if isinstance(raw_response, dict) else {}
+            platform_order_name = str(
+                response_dict.get("number")
+                or response_dict.get("orderNumber")
+                or platform_order_id
+            )
+            metadata = _merge_linked_platform_order_metadata(
+                order,
+                platform="wix",
+                platform_order_id=platform_order_id,
+                platform_order_name=platform_order_name,
+                platform_order_url=None,
+                store=store,
+            )
+            store_id_used = str((store or {}).get("store_id") or "").strip() or None
+            await update_fulfillment_info(order_id=order_id, fulfillment_status="processing")
+            await update_order_row(
+                order_id,
+                {
+                    "metadata": metadata,
+                    **({"store_id": store_id_used} if store_id_used else {}),
+                },
+            )
+            await log_order_event(
+                event_type="merchant_order_created",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={
+                    "platform": "wix",
+                    "platform_order_id": platform_order_id,
+                    "store_id": store_id_used,
+                    "domain": str((store or {}).get("domain") or "").strip() or None,
+                },
+            )
+            logger.info(
+                "[Wix] Order linked: order_id=%s platform_order_id=%s store_id=%s",
+                order_id,
+                platform_order_id,
+                store_id_used,
+            )
+            return True
+
+        if last_error:
+            await log_order_event(
+                event_type="merchant_order_failed",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={"platform": "wix", "error": last_error},
+            )
+        return False
+
+
 async def sync_order_to_connected_store(order_id: str) -> bool:
     order = await get_order(order_id)
     if not order:
@@ -5436,6 +5548,8 @@ async def sync_order_to_connected_store(order_id: str) -> bool:
         success = await create_woocommerce_order(order_id)
     elif platform == "bigcommerce":
         success = await create_bigcommerce_order(order_id)
+    elif platform == "wix":
+        success = await create_wix_order(order_id)
     else:
         logger.info("[MerchantSync] No supported store connected for order_id=%s platform=%s", order_id, platform or None)
         success = False
