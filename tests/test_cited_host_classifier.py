@@ -102,6 +102,15 @@ def test_unknown_host_returns_unclassified():
     assert out["applies_to_merchant_category"] is None
 
 
+def test_known_cdn_suffix_uses_cdn_fallback():
+    from services.cited_host_classifier import classify_host
+    out = classify_host("assets.ctfassets.net", merchant_category="sleepwear")
+    assert out["type"] == "cdn"
+    assert out["confidence"] == "heuristic"
+    assert out["subtype"] == "asset_cdn"
+    assert out["coverage_note"] is None
+
+
 def test_none_or_empty_host_returns_unclassified():
     from services.cited_host_classifier import classify_host
     for bad in (None, "", "   "):
@@ -222,7 +231,15 @@ def test_checked_in_registry_loads_and_has_expected_hosts():
 def test_every_registry_entry_has_required_fields():
     from services.cited_host_classifier import _load_registry
     reg = _load_registry()
-    valid_types = {"editorial", "retailer", "marketplace", "video", "brand", "unclassified"}
+    valid_types = {
+        "editorial",
+        "retailer",
+        "marketplace",
+        "video",
+        "brand",
+        "cdn",
+        "unclassified",
+    }
     for host, entry in reg.items():
         assert "type" in entry, f"{host} missing type"
         assert entry["type"] in valid_types, f"{host} has unknown type {entry['type']}"

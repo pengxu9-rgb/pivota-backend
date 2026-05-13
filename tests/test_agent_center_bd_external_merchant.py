@@ -1158,6 +1158,31 @@ def test_extract_category_competitors_aggregates_brands_and_retailers() -> None:
     assert retailer_map["oliveyoung.com"] == 1
 
 
+def test_extract_category_competitors_returns_typed_cited_hosts() -> None:
+    from services.agent_center_bd_report_service import extract_category_competitors
+    runs = [
+        _category_run(
+            "q1",
+            grounding_sources=[
+                {"uri": "https://r1/", "title": "sephora.com"},
+                {"uri": "https://r2/", "title": "forbes.com"},
+                {"uri": "https://r3/", "title": "ctfassets.net"},
+            ],
+        ),
+    ]
+    _, cited_hosts = extract_category_competitors(
+        runs,
+        merchant_host="merchant.example",
+        merchant_brand="Merchant",
+    )
+    by_host = {h["host"]: h for h in cited_hosts}
+    assert by_host["sephora.com"]["type"] == "retailer"
+    assert by_host["forbes.com"]["type"] == "editorial"
+    assert by_host["ctfassets.net"]["type"] == "cdn"
+    assert by_host["ctfassets.net"]["confidence"] == "heuristic"
+    assert all("confidence" in h for h in cited_hosts)
+
+
 def test_verdict_visible_via_retailers_triggers_when_category_high_attr_zero() -> None:
     """The BoJ-class verdict: named-product visibility 0, attribution 0,
     BUT category_visibility 67 → VISIBLE VIA RETAILERS, not INVISIBLE."""
@@ -1169,6 +1194,38 @@ def test_verdict_visible_via_retailers_triggers_when_category_high_attr_zero() -
     )
     assert label == VERDICT_VIA_RETAILERS
     assert "retailers" in explanation.lower() or "retailer" in explanation.lower()
+
+
+def test_verdict_category_mention_no_first_party_when_no_retail_hosts() -> None:
+    from services.agent_center_bd_report_service import (
+        VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY,
+        VERDICT_VIA_RETAILERS,
+        verdict_for,
+    )
+    label, _ = verdict_for(
+        visibility_score=0,
+        attribution_score=0,
+        category_visibility_score=67,
+        evidence={
+            "top_cited_hosts": [
+                {"host": "forbes.com", "type": "editorial", "confidence": "registry"},
+                {"host": "unknown.example", "type": "unclassified", "confidence": "fallback"},
+            ],
+        },
+    )
+    assert label == VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY
+
+    retail_label, _ = verdict_for(
+        visibility_score=0,
+        attribution_score=0,
+        category_visibility_score=67,
+        evidence={
+            "top_cited_hosts": [
+                {"host": "sephora.com", "type": "retailer", "confidence": "registry"},
+            ],
+        },
+    )
+    assert retail_label == VERDICT_VIA_RETAILERS
 
 
 def test_verdict_invisible_when_category_also_zero() -> None:
@@ -1301,6 +1358,63 @@ def test_structured_report_boj_full_scenario_via_retailers() -> None:
     assert report["verdict"]["label"] == VERDICT_VIA_RETAILERS
     titles = [a["title"] for a in report["action_items"]]
     assert any("retailer" in t.lower() or "ai-channel funnel" in t.lower() for t in titles)
+
+
+def test_structured_report_gates_retailer_label_and_drops_cdn_hosts() -> None:
+    from services.agent_center_bd_report_service import (
+        VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY,
+        build_structured_report,
+    )
+    report = build_structured_report(
+        merchant_name="Test Brand",
+        merchant_pdp_url="https://testbrand.com/products/x",
+        product_title="X",
+        product_vendor="Test Brand",
+        product_type="supplement",
+        visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [_vis_run("q1", visible=False, grounding=[])],
+        },
+        attribution_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [_attr_run("q1", found=False)],
+        },
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": [
+                _category_run(
+                    "best supplements",
+                    excerpt="Test Brand is named in a category roundup.",
+                    grounding_sources=[
+                        {"uri": "https://r1.example/a", "title": "forbes.com"},
+                        {"uri": "https://r2.example/a", "title": "ctfassets.net"},
+                    ],
+                    brand_appears=True,
+                ),
+            ],
+        },
+        provider="gemini",
+    )
+    assert report["verdict"]["label"] == VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY
+    by_host = {
+        h["host"]: h
+        for h in report["category_visibility"]["retailer_hosts"]
+    }
+    assert by_host["forbes.com"]["type"] == "editorial"
+    assert by_host["ctfassets.net"]["type"] == "cdn"
+    assert all(
+        h["host"] != "ctfassets.net"
+        for h in report["category_visibility"]["top_cited_hosts"]
+    )
+    assert "ctfassets.net" not in report["merchant_view"]["receipts"]["top_cited_hosts"]
+    first_action_text = (
+        report["action_items"][0]["title"] + " " + report["action_items"][0]["body"]
+    ).lower()
+    assert "retailer" not in first_action_text
+    assert "forbes.com" in first_action_text
 
 
 def test_render_markdown_includes_retailer_and_brand_tables_for_category() -> None:
