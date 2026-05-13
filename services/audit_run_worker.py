@@ -551,6 +551,20 @@ async def _process_one_audit_run_inner(
             # reclaims at stage=verifying, re-runs the side effects
             # (cheap dedupe-noops), then transitions cleanly to
             # completed.
+            # P1-4: track post-processing success. Before this fix,
+            # both `build_and_persist_all_projections` and
+            # `enqueue_verifications_for_completed_audit` were
+            # wrapped in `except Exception: pass`-style swallows.
+            # The run still transitioned to STAGE_COMPLETED with an
+            # empty audit_projections row and no verification work
+            # queued. Client GETs with `?audience=merchant` then
+            # 409'd because the projection wasn't built; verifiers
+            # never ran. Codex P1-4: treat required post-processing
+            # as part of the completion contract — if either side
+            # effect fails, FAIL the run with a clear error_jsonb so
+            # the merchant sees the failure and can re-submit.
+            post_processing_errors: List[str] = []
+
             try:
                 from services.audit_projection_builder import (
                     build_and_persist_all_projections,
@@ -566,6 +580,9 @@ async def _process_one_audit_run_inner(
                 logger.warning(
                     "audit_run_worker: projection build raised for "
                     "run_id=%s: %s", run_id, exc,
+                )
+                post_processing_errors.append(
+                    f"build_and_persist_all_projections: {str(exc)[:200]}"
                 )
 
             try:
@@ -590,6 +607,47 @@ async def _process_one_audit_run_inner(
                     "audit_run_worker: verification enqueue raised "
                     "for run_id=%s: %s", run_id, exc,
                 )
+                post_processing_errors.append(
+                    "enqueue_verifications_for_completed_audit: "
+                    f"{str(exc)[:200]}"
+                )
+
+            if post_processing_errors:
+                # Post-processing failure → run fails. The audit's
+                # report_jsonb / per-product fields are already
+                # persisted via _record_final_report_fields above,
+                # so the merchant's GET still surfaces the canonical
+                # shape; what's missing is the audience projections
+                # and the queued verifications. Re-submitting the
+                # audit is the right recovery path; the idempotency
+                # key changes per the 5-minute window so a re-submit
+                # within that window will dedupe to this failed run
+                # (need force=true to bypass).
+                await mar.transition_stage(
+                    run_id=run_id,
+                    from_stage=mar.STAGE_VERIFYING,
+                    to_stage=mar.STAGE_FAILED,
+                    worker_id=WORKER_ID,
+                    cost_summary_jsonb=cost_summary,
+                    error_jsonb={
+                        "stage": "verifying_post_processing",
+                        "message": (
+                            "Audit ran successfully but post-processing "
+                            "(projection build + verification enqueue) "
+                            "raised. The canonical report is in "
+                            "report_jsonb but audience projections are "
+                            "not built. Re-submit with force=true to "
+                            "retry."
+                        ),
+                        "errors": post_processing_errors,
+                    },
+                )
+                logger.warning(
+                    "audit_run_worker: failing run_id=%s due to %d "
+                    "post-processing errors", run_id,
+                    len(post_processing_errors),
+                )
+                return True
 
             # Only NOW transition to completed. If we reach this
             # line, projections are warm + verifications are
