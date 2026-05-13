@@ -129,17 +129,51 @@ def test_via_retailers_quotes_category_score_and_gap_pct():
 
 
 def test_via_retailers_names_top_retailers():
+    """P0-Q1 gate: retailers are named in the buyer-intent prose
+    ONLY when at least one buyer-intent run cited the merchant —
+    that's the only case where claiming "the other runs grounded in
+    third-party sources" is supported. Test fixture has cited > 0."""
     label, explanation = verdict_for(
         visibility_score=20,
         attribution_score=10,
         category_visibility_score=80,
         evidence=_evidence(
             category_score=80, gap_pct=70,
+            attribution_runs_total=9, merchant_cited_runs=2,
             top_retailers=["sephora.com", "amazon.com"],
         ),
     )
     assert label == VERDICT_VIA_RETAILERS
     assert "sephora.com" in explanation
+
+
+def test_via_retailers_does_not_name_retailers_when_zero_buyer_intent_cited():
+    """P0-Q1 regression guard: when cited == 0, the buyer-intent
+    grounding claim ("the other N grounded in third-party sources
+    including X") is unsupported — `top_retailers` is category-scope
+    evidence, not attribution-scope. The Winona prod artifact (run
+    932d8261) hit this exact case. Prose must say no grounded source
+    was returned, NOT name the category retailers."""
+    label, explanation = verdict_for(
+        visibility_score=20,
+        attribution_score=0,
+        category_visibility_score=33,
+        evidence=_evidence(
+            category_score=33, gap_pct=33,
+            attribution_runs_total=3, merchant_cited_runs=0,
+            top_retailers=["lookhealthystore.com", "ctfassets.net"],
+        ),
+    )
+    assert label == VERDICT_VIA_RETAILERS
+    assert "lookhealthystore.com" not in explanation, (
+        f"category-scope hosts must not appear in buyer-intent prose "
+        f"when cited=0; got: {explanation}"
+    )
+    assert "ctfassets.net" not in explanation
+    assert (
+        "no grounded source" in explanation.lower()
+        or "could attribute" in explanation.lower()
+    )
 
 
 # -----------------------------------------------------------------

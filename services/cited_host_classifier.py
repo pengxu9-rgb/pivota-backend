@@ -11,7 +11,7 @@ host?
 This module loads a BD-curated registry (`data/cited_host_registry.json`)
 and annotates each cited host with:
 
-  - `type`         : editorial | retailer | marketplace | video | brand | unclassified
+  - `type`         : editorial | retailer | marketplace | video | brand | cdn | unclassified
   - `subtype`      : finer-grain (review_site, department_store, ...)
   - `categories`   : merchant categories where this host has notable presence
   - `coverage_note`: 1-2 sentences on what this host actually publishes
@@ -37,6 +37,13 @@ from utils.logger import logger
 
 _REGISTRY_PATH = Path(__file__).resolve().parent.parent / "data" / "cited_host_registry.json"
 _REGISTRY_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_CDN_HOST_SUFFIXES = (
+    "ctfassets.net",
+    "cloudfront.net",
+    "cloudinary.com",
+    "imgix.net",
+    "akamaihd.net",
+)
 
 
 def _load_registry() -> Dict[str, Dict[str, Any]]:
@@ -90,6 +97,7 @@ def _unclassified(host: Optional[str]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "host": h,
         "type": "unclassified",
+        "confidence": "fallback",
         "subtype": None,
         "categories": [],
         "coverage_note": None,
@@ -112,6 +120,22 @@ def _unclassified(host: Optional[str]) -> Dict[str, Any]:
         out["editorial_cadence"] = None
         out["ai_grounding_weight"] = None
         out["expected_outreach_cycle_weeks"] = None
+    return out
+
+
+def _matches_cdn_suffix(host: str) -> bool:
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in _CDN_HOST_SUFFIXES)
+
+
+def _cdn_fallback(host: str) -> Dict[str, Any]:
+    out = _unclassified(host)
+    out["type"] = "cdn"
+    out["confidence"] = "heuristic"
+    out["subtype"] = "asset_cdn"
+    out["tier"] = None
+    out["editorial_cadence"] = None
+    out["ai_grounding_weight"] = None
+    out["expected_outreach_cycle_weeks"] = None
     return out
 
 
@@ -284,6 +308,8 @@ def classify_host(
     registry = _load_registry()
     entry = registry.get(h)
     if not entry:
+        if _matches_cdn_suffix(h):
+            return _cdn_fallback(h)
         return _unclassified(h)
 
     categories = list(entry.get("categories") or [])
@@ -298,6 +324,7 @@ def classify_host(
     out: Dict[str, Any] = {
         "host": h,
         "type": host_type,
+        "confidence": entry.get("confidence") or "registry",
         "subtype": entry.get("subtype"),
         "categories": categories,
         "coverage_note": entry.get("coverage_note"),

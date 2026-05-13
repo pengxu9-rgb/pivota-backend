@@ -272,6 +272,7 @@ def extract_cited_hosts(
 VERDICT_INVISIBLE = "INVISIBLE"
 VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
 VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
+VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY = "CATEGORY MENTION, NO FIRST-PARTY"
 VERDICT_STRONG = "STRONG"
 VERDICT_PARTIAL = "PARTIAL"
 
@@ -286,6 +287,9 @@ _VERDICT_DISPLAY_LABELS = {
     VERDICT_INVISIBLE: "Invisible in grounded LLM citations",
     VERDICT_MISATTRIBUTED: "Visible but misattributed",
     VERDICT_VIA_RETAILERS: "Visible via retailers + editorial",
+    VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY: (
+        "Category-visible, no first-party attribution"
+    ),
     VERDICT_STRONG: "Strong AI-channel attribution",
     VERDICT_PARTIAL: "Partial AI-channel attribution",
 }
@@ -293,6 +297,62 @@ _VERDICT_DISPLAY_LABELS = {
 
 def _verdict_display_label(label: str) -> str:
     return _VERDICT_DISPLAY_LABELS.get(label, label)
+
+
+_RETAIL_CITED_HOST_TYPES = {"retailer", "marketplace"}
+
+
+def _cited_host_type(entry: Dict[str, Any]) -> str:
+    host_type = entry.get("type")
+    if not host_type and entry.get("host"):
+        host_type = classify_host(entry.get("host")).get("type")
+    return (host_type or "unclassified").strip().lower()
+
+
+def _is_retail_cited_host(entry: Dict[str, Any]) -> bool:
+    return _cited_host_type(entry) in _RETAIL_CITED_HOST_TYPES
+
+
+def _is_cdn_cited_host(entry: Dict[str, Any]) -> bool:
+    return _cited_host_type(entry) == "cdn"
+
+
+def _copyworthy_cited_hosts(
+    hosts: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    return [h for h in (hosts or []) if h.get("host") and not _is_cdn_cited_host(h)]
+
+
+def _retail_cited_hosts(
+    hosts: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    return [h for h in _copyworthy_cited_hosts(hosts) if _is_retail_cited_host(h)]
+
+
+def _cited_host_type_label(host_type: Optional[str]) -> str:
+    t = (host_type or "unclassified").strip().lower()
+    if t == "editorial":
+        return "publisher"
+    if t == "cdn":
+        return "cdn"
+    if t == "brand":
+        return "brand site"
+    if t in _RETAIL_CITED_HOST_TYPES:
+        return t
+    return "cited host"
+
+
+def _cited_host_group_label(hosts: Optional[List[Dict[str, Any]]]) -> str:
+    typed = _copyworthy_cited_hosts(hosts)
+    if typed and all(_is_retail_cited_host(h) for h in typed):
+        return "third-party retailers"
+    if typed and all(_cited_host_type(h) == "editorial" for h in typed):
+        return "publishers"
+    if typed and all(_cited_host_type(h) == "brand" for h in typed):
+        return "brand sites"
+    if typed and all(_cited_host_type(h) == "unclassified" for h in typed):
+        return "cited hosts"
+    return "third-party sources"
 
 
 def score_category_visibility(
@@ -484,11 +544,12 @@ def extract_category_competitors(
       - `competitor_brands`: Counter of brand names from Gemini's
         `competitors_appearing` field (e.g. "Patchology", "Wander
         Beauty"). Direct competitors the merchant should know about.
-      - `retailer_hosts`: Counter of grounding source titles that
-        aren't the merchant's own brand/host (e.g. "sephora.com",
-        "oliveyoung.com"). Where AI traffic gets routed instead of
-        the merchant's site — the strongest pitch evidence for the
-        "retailers are eating your AI search funnel" framing.
+      - `retailer_hosts`: Legacy alias for non-merchant cited hosts.
+        Entries are typed (`type`, `confidence`) so callers can decide
+        whether the right label is retailer, publisher, brand site, or
+        neutral cited host. Keeping the alias avoids breaking older
+        renderers while preventing new copy from treating every host as
+        a retailer.
 
     Within-run dedup: cite Sephora 3× in one answer = 1 for Sephora.
     """
@@ -532,10 +593,15 @@ def extract_category_competitors(
         {"name": n, "times_cited": c}
         for n, c in brand_counter.most_common(15)
     ]
-    retailer_hosts = [
-        {"host": h, "times_cited": c}
-        for h, c in retailer_counter.most_common(15)
-    ]
+    retailer_hosts = []
+    for h, c in retailer_counter.most_common(15):
+        classification = classify_host(h)
+        retailer_hosts.append({
+            "host": h,
+            "times_cited": c,
+            "type": classification.get("type") or "unclassified",
+            "confidence": classification.get("confidence") or "fallback",
+        })
     return (competitor_brands, retailer_hosts)
 
 
@@ -589,7 +655,7 @@ def _build_competitive_pressure(
           first owns the AI-channel surface"
     """
     peers_named = list(category_competitor_brands or [])
-    retailer_hosts = list(category_retailer_hosts or [])
+    retailer_hosts = _copyworthy_cited_hosts(category_retailer_hosts)
 
     peers_with_fp: List[Dict[str, Any]] = []
     for peer in peers_named:
@@ -672,7 +738,7 @@ def _build_competitive_pressure(
     return {
         "title": "Competitive pressure — your peers in the AI channel",
         "intro": (
-            "Your products may still sell well through retailers today, "
+            "Your products may still sell well through third-party channels today, "
             "so a 0/3 attribution score might feel low-urgency. The real "
             "BD signal is comparative: which of your direct competitors "
             "have their own .com cited in Gemini grounding for the same "
@@ -897,6 +963,14 @@ def _explain_verdict(
                     f"grounded source titles, though {your_url_label.lower()} "
                     f"itself did not appear"
                 )
+            elif cat_match_details:
+                # P0-Q1 tier-3: match_details exist but neither
+                # url_grounding nor title_match — excerpt-only.
+                signal_phrase = (
+                    f"your brand was mentioned in category-level "
+                    f"answer prose (score {cs}/100), but no grounded "
+                    f"source named your brand or your URL"
+                )
             else:
                 signal_phrase = (
                     f"the category-visibility score is {cs}/100 (we don't "
@@ -909,16 +983,27 @@ def _explain_verdict(
                 signal_phrase[0].upper() + signal_phrase[1:] +
                 ", but in few buyer-intent queries"
             )
-            if retailers_phrase:
+            # P0-Q1: retailers_phrase is category-scope evidence; gate
+            # it from buyer-intent prose when cited == 0 (no buyer-
+            # intent run returned a grounded source we could verify).
+            if retailers_phrase and cited and cited > 0:
                 base += (
                     f". For buyer-intent queries where your URL did not "
                     f"appear, Gemini grounded answers in third-party "
                     f"sources including {retailers_phrase}"
                 )
-            base += (
-                ". We did not verify whether those sources mention your "
-                "brand or products."
-            )
+                base += (
+                    ". We did not verify whether those sources mention "
+                    "your brand or products."
+                )
+            elif (cited == 0) and (runs_total or 0) > 0:
+                base += (
+                    f". None of the {runs_total} buyer-intent runs "
+                    f"returned a grounded source we could attribute "
+                    f"to either you or a third-party retailer."
+                )
+            else:
+                base += "."
             if cp_framing:
                 base += " " + cp_framing
             return base
@@ -989,7 +1074,7 @@ def verdict_for(
     category_visibility_score: Optional[int] = None,
     evidence: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
-    """Categorize the (visibility, attribution) pair into one of five
+    """Categorize the (visibility, attribution) pair into a verdict
     verdicts and emit an evidence-bound diagnostic paragraph. Returns
     (label, explanation).
 
@@ -998,6 +1083,9 @@ def verdict_for(
       - attribution_runs_total: int
       - merchant_cited_runs: int
       - top_retailers: List[str]               (top hosts, len ≤ 3 used)
+      - top_cited_hosts: List[Dict]            (typed host shape; when
+                                                present, gates retailer
+                                                vs publisher wording)
       - competitive_pressure_framing: str|None (from `_build_competitive_pressure`)
       - category_score: int|None
       - gap_pct: int|None                       (category - attribution)
@@ -1034,16 +1122,40 @@ def verdict_for(
             f"Your visibility {visibility_score}/100, attribution {attribution_score}/100.)_  \n\n"
         )
 
-    label = _classify_verdict(
-        visibility_score,
-        attribution_score,
-        category_visibility_score,
-        invisible_max,
-        strong_min,
-        misattr_attr_max,
+    evidence_dict = evidence or {}
+    typed_cited_hosts = evidence_dict.get("top_cited_hosts")
+    has_typed_cited_hosts = isinstance(typed_cited_hosts, list)
+    typed_retail_hosts = (
+        _retail_cited_hosts(typed_cited_hosts) if has_typed_cited_hosts else []
     )
+    if (
+        has_typed_cited_hosts
+        and category_visibility_score is not None
+        and category_visibility_score > 0
+        and attribution_score == 0
+    ):
+        label = (
+            VERDICT_VIA_RETAILERS
+            if typed_retail_hosts
+            else VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY
+        )
+    else:
+        label = _classify_verdict(
+            visibility_score,
+            attribution_score,
+            category_visibility_score,
+            invisible_max,
+            strong_min,
+            misattr_attr_max,
+        )
+        if (
+            has_typed_cited_hosts
+            and label == VERDICT_VIA_RETAILERS
+            and not typed_retail_hosts
+        ):
+            label = VERDICT_PARTIAL
     explanation = _explain_verdict(
-        label, visibility_score, attribution_score, evidence or {}
+        label, visibility_score, attribution_score, evidence_dict
     )
     return label, peer_prefix + explanation
 
@@ -1327,10 +1439,32 @@ def _aggregate_brand_verdict_evidence(
     total_runs = 0
     total_cited = 0
     retailer_count: Counter = Counter()
+    cited_host_meta: Dict[str, Dict[str, Any]] = {}
     failed_query_sample: List[str] = []
     category_scores: List[int] = []
     framing: Optional[str] = None
     framing_score = -1
+
+    def _record_cited_host(entry: Dict[str, Any]) -> None:
+        host = entry.get("host")
+        count = int(entry.get("times_cited") or 0)
+        if host and count:
+            retailer_count[host] += count
+            classification = classify_host(host)
+            cited_host_meta[host] = {
+                "host": host,
+                "type": (
+                    entry.get("type")
+                    or classification.get("type")
+                    or "unclassified"
+                ),
+                "confidence": (
+                    entry.get("confidence")
+                    or classification.get("confidence")
+                    or "fallback"
+                ),
+            }
+
     for p in per_product:
         attr = p.get("attribution") or {}
         total_runs += int(attr.get("runs") or 0)
@@ -1340,20 +1474,14 @@ def _aggregate_brand_verdict_evidence(
         # and category_visibility.retailer_hosts (category probe). The
         # union surfaces hosts that win across either probe type.
         for entry in attr.get("competitor_hosts") or []:
-            host = entry.get("host")
-            count = int(entry.get("times_cited") or 0)
-            if host and count:
-                retailer_count[host] += count
+            _record_cited_host(entry)
         cat = p.get("category_visibility") or {}
         if cat:
             cs = cat.get("score")
             if isinstance(cs, (int, float)):
                 category_scores.append(int(cs))
             for entry in cat.get("retailer_hosts") or []:
-                host = entry.get("host")
-                count = int(entry.get("times_cited") or 0)
-                if host and count:
-                    retailer_count[host] += count
+                _record_cited_host(entry)
 
         # Failed-query sample: pull `query` from attribution.queries
         # entries where merchant URL was missing (self_report_yes False).
@@ -1387,10 +1515,18 @@ def _aggregate_brand_verdict_evidence(
         )
         gap_pct = max(0, int(avg_category) - avg_attribution_pct)
 
+    top_cited_hosts: List[Dict[str, Any]] = []
+    for host, count in retailer_count.most_common(5):
+        entry = dict(cited_host_meta.get(host) or {"host": host})
+        entry["times_cited"] = count
+        if not _is_cdn_cited_host(entry):
+            top_cited_hosts.append(entry)
+
     return {
         "attribution_runs_total": total_runs,
         "merchant_cited_runs": total_cited,
-        "top_retailers": [h for h, _ in retailer_count.most_common(5)],
+        "top_retailers": [h["host"] for h in _retail_cited_hosts(top_cited_hosts)],
+        "top_cited_hosts": top_cited_hosts,
         "competitive_pressure_framing": framing,
         "category_score": int(avg_category) if avg_category is not None else None,
         "gap_pct": gap_pct,
@@ -2080,10 +2216,17 @@ def _generate_action_items(
     failed_attribution_queries = _failed_attribution_queries(attribution_runs)
     failed_visibility_queries = _failed_visibility_queries(visibility_runs)
     top_competitor = competitor_hosts[0] if competitor_hosts else None
+    top_retailer_hosts = _retail_cited_hosts(category_retailer_hosts)
     top_retailer_names = [
-        r["host"] for r in (category_retailer_hosts or [])[:3] if r.get("host")
+        r["host"] for r in top_retailer_hosts[:3] if r.get("host")
+    ]
+    top_cited_hosts = _copyworthy_cited_hosts(category_retailer_hosts)
+    top_cited_names = [
+        r["host"] for r in top_cited_hosts[:3] if r.get("host")
     ]
     retailers_phrase = ", ".join(top_retailer_names)
+    cited_hosts_phrase = ", ".join(top_cited_names)
+    cited_group_label = _cited_host_group_label(top_cited_hosts)
     attribution_runs_total = len(attribution_runs)
 
     # Action 1: severity-stratified headline tied to this merchant's
@@ -2095,8 +2238,11 @@ def _generate_action_items(
             f"tested, AI agents returned zero grounded references to "
             f"your store"
         )
-        if retailers_phrase:
-            body += f". {retailers_phrase} captured the citation slots that should have been yours"
+        if cited_hosts_phrase:
+            body += (
+                f". {cited_hosts_phrase} captured the citation slots "
+                "that should have been yours"
+            )
         body += (
             ". Grounded LLM citations are downstream of Google's index, "
             "so the typical root cause is that Google hasn't indexed "
@@ -2111,27 +2257,31 @@ def _generate_action_items(
             "evidence": {
                 "queries_tested": attribution_runs_total,
                 "top_retailers": top_retailer_names[:5],
-            } if top_retailer_names else {"queries_tested": attribution_runs_total},
+                "top_cited_hosts": top_cited_names[:5],
+            } if top_cited_names else {"queries_tested": attribution_runs_total},
         })
     elif verdict_label == VERDICT_MISATTRIBUTED:
         if top_retailer_names:
             title = f"Reclaim attribution from {top_retailer_names[0]} and other resellers"
+        elif top_cited_names:
+            title = f"Reclaim attribution from {top_cited_names[0]} and other cited hosts"
         else:
-            title = "Reclaim direct attribution from third-party retailers"
+            title = "Reclaim direct attribution from third-party sources"
         body = (
             f"AI agents recognize your product (visibility "
             f"{visibility_score}/100) but your URL appears in "
             f"{merchant_cited_runs} of {attribution_runs_total} buyer-"
             f"intent queries"
         )
-        if retailers_phrase:
-            body += f". The remaining {attribution_runs_total - merchant_cited_runs} route through {retailers_phrase}"
-        body += (
-            ". Every cited URL that's not yours is lost organic "
-            "traffic — and a margin hit if the cited path is a "
-            "reseller. The demand exists; it's just being captured by "
-            "competitors."
-        )
+        if cited_hosts_phrase:
+            body += (
+                f". The remaining {attribution_runs_total - merchant_cited_runs} "
+                f"route through {cited_group_label} including {cited_hosts_phrase}"
+            )
+        body += ". Every cited URL that's not yours is lost organic traffic"
+        if top_retailer_names:
+            body += " — and a margin hit if the cited path is a reseller"
+        body += ". The demand exists; it's just being captured by competitors."
         items.append({
             "severity": "critical",
             "title": title,
@@ -2140,6 +2290,32 @@ def _generate_action_items(
                 "merchant_cited_runs": merchant_cited_runs,
                 "queries_tested": attribution_runs_total,
                 "top_retailers": top_retailer_names[:5],
+                "top_cited_hosts": top_cited_names[:5],
+            },
+        })
+    elif verdict_label == VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY:
+        body = (
+            "Your brand surfaces in category-level AI answers, "
+            f"but your own URL appears in {merchant_cited_runs} of "
+            f"{attribution_runs_total} buyer-intent queries."
+        )
+        if cited_hosts_phrase:
+            body += (
+                f" The cited category sources are {cited_group_label} "
+                f"including {cited_hosts_phrase}."
+            )
+        body += (
+            " Convert those category mentions into first-party citation "
+            "coverage before optimizing downstream conversion."
+        )
+        items.append({
+            "severity": "critical",
+            "title": "Convert category mentions into first-party attribution",
+            "body": body,
+            "evidence": {
+                "merchant_cited_runs": merchant_cited_runs,
+                "queries_tested": attribution_runs_total,
+                "top_cited_hosts": top_cited_names[:5],
             },
         })
     elif verdict_label == VERDICT_VIA_RETAILERS:
@@ -2170,8 +2346,8 @@ def _generate_action_items(
             "title": "Capture the AI-channel funnel that retailers are taking today",
             "body": opener,
             "evidence": (
-                {"top_retailer_hosts": [r["host"] for r in category_retailer_hosts[:5] if r.get("host")]}
-                if category_retailer_hosts
+                {"top_retailer_hosts": [r["host"] for r in top_retailer_hosts[:5] if r.get("host")]}
+                if top_retailer_hosts
                 else None
             ),
         })
@@ -2202,14 +2378,14 @@ def _generate_action_items(
             f"buyer-intent queries, {merchant_cited_runs} cited your "
             f"URL"
         )
-        if losing > 0 and retailers_phrase:
+        if losing > 0 and cited_hosts_phrase:
             body += (
                 f"; the other {losing} grounded their answers in "
-                f"third-party sources including {retailers_phrase}"
+                f"{cited_group_label} including {cited_hosts_phrase}"
             )
         elif losing > 0:
             body += f"; the other {losing} did not cite a merchant URL"
-        if losing > 0 and retailers_phrase:
+        if losing > 0 and cited_hosts_phrase:
             body += (
                 ". We did not verify whether those sources mention "
                 "your brand or products."
@@ -2226,6 +2402,7 @@ def _generate_action_items(
                 "merchant_cited_runs": merchant_cited_runs,
                 "queries_tested": attribution_runs_total,
                 "top_retailers": top_retailer_names[:5],
+                "top_cited_hosts": top_cited_names[:5],
             },
         })
 
@@ -2573,10 +2750,28 @@ def _build_what_pivota_changes(
     for Woo/BC/Wix merchants."""
     gap_pct = max(0, 100 - int(attribution_score))
     top_retailers = [
-        r["host"] for r in (category_retailer_hosts or [])[:3] if r.get("host")
+        r["host"] for r in _retail_cited_hosts(category_retailer_hosts)[:3]
+        if r.get("host")
     ]
-    retailer_phrase = (
-        ", ".join(top_retailers) if top_retailers else "third-party retailers"
+    top_cited_hosts = [
+        r["host"] for r in _copyworthy_cited_hosts(category_retailer_hosts)[:3]
+        if r.get("host")
+    ]
+    retailer_phrase = ", ".join(top_retailers)
+    cited_host_phrase = (
+        ", ".join(top_cited_hosts)
+        if top_cited_hosts
+        else "third-party sources"
+    )
+    captured_by_phrase = retailer_phrase or cited_host_phrase
+    capture_subject = (
+        f"Retailer pages ({captured_by_phrase})"
+        if retailer_phrase
+        else (
+            f"Third-party sources ({captured_by_phrase})"
+            if top_cited_hosts
+            else "Third-party sources"
+        )
     )
     cat_phrase = (
         f"category visibility {category_visibility_score}/100"
@@ -2587,7 +2782,7 @@ def _build_what_pivota_changes(
         f"{cat_phrase}; {merchant_cited_runs}/{attribution_runs} "
         f"buyer-intent queries reach the merchant URL today; the "
         f"remaining ~{gap_pct}% of the AI-channel funnel is captured by "
-        f"{retailer_phrase}."
+        f"{captured_by_phrase}."
     )
 
     discovery_lift = {
@@ -2595,8 +2790,8 @@ def _build_what_pivota_changes(
         "current_state": (
             f"{cat_phrase}; {merchant_cited_runs}/{attribution_runs} "
             f"buyer-intent queries reach your URL today (this audit "
-            f"measures Layer 1: grounded LLM citation). Retailer pages "
-            f"({retailer_phrase}) currently capture the rest of the "
+            f"measures Layer 1: grounded LLM citation). {capture_subject} "
+            f"currently capture the rest of the "
             f"grounded surface."
         ),
         # The 3-layer agentic discovery surface. The merchant is buying
@@ -3276,36 +3471,61 @@ def _category_recognition_phrase(
     score: Optional[int],
     *,
     has_title_match: bool,
+    has_url_grounding: bool = False,
 ) -> str:
     """Score- and signal-conditional phrase for what category visibility
-    actually means. Never overstates: if the score came purely from
-    `in_grounding` (URL was a grounding chunk) without any
-    `title_match` (a grounded source title named the brand), we DO NOT
-    claim "your brand is recognized" — only that the URL was used as
-    a grounding source. Title matches are stronger signal because
-    they confirm Gemini ground-truthed the brand by name.
+    actually means. Never overstates the evidence.
+
+    Three category-evidence tiers, in descending strength:
+      1. `has_url_grounding=True` — the merchant's URL was an actual
+         grounding chunk. Strongest signal: AI grounded its category
+         answer in the merchant's own site.
+      2. `has_title_match=True` (URL did not appear) — Gemini named
+         the brand in a grounded source title, but the source was
+         someone else's URL. Still a real signal, but the merchant's
+         URL was not the citation.
+      3. NEITHER — score came purely from excerpt-only brand mention
+         in answer prose, with no grounded source. Weakest signal:
+         the brand was named, but no editorial source backs it up.
+
+    Pre-fix bug (P0-Q1): this helper accepted only `has_title_match`.
+    When `has_title_match=False` it ALWAYS said "your URL was used as
+    a grounding source" — true for tier 1, FALSE for tier 3. The
+    Winona audit (run 932d8261) hit tier 3 (excerpt match on a
+    different product variant) but the merchant was told their URL
+    was cited. Calling `has_url_grounding` explicitly closes that
+    misclaim.
+
+    Default `has_url_grounding=False` for back-compat with the
+    handful of test fixtures that haven't migrated; the bare
+    title-match call still gets the safer tier-3 narrative.
     """
     if score is None:
         return "we didn't measure category-level presence in this run"
-    if not has_title_match:
+    if has_url_grounding:
+        # Tier 1: URL was an actual grounding chunk.
+        if score >= 70:
+            return (
+                f"your URL was used as a grounding source on most "
+                f"category-level queries (score {score}/100)"
+            )
         return (
             f"your URL was used as a grounding source on some "
-            f"category-level queries (score {score}/100), though no "
-            f"grounded source named your brand"
+            f"category-level queries (score {score}/100)"
         )
-    if score >= 70:
+    if has_title_match:
+        # Tier 2: a grounded source titled the brand, but the URL
+        # was not the cited URL.
         return (
-            f"your brand surfaces consistently in category-level "
-            f"queries (score {score}/100)"
+            f"your brand was named in some category-level grounded "
+            f"source titles (score {score}/100), but your URL itself "
+            f"was not the cited source"
         )
-    if score >= 50:
-        return (
-            f"your brand surfaces in some category-level queries "
-            f"(score {score}/100)"
-        )
+    # Tier 3: excerpt-only brand mention, no grounded source.
     return (
-        f"your brand surfaces only intermittently in category-level "
-        f"queries (score {score}/100)"
+        f"your brand was mentioned in category-level answer prose "
+        f"(score {score}/100), but no grounded source named your "
+        f"brand and your URL was not cited"
     )
 
 
@@ -3334,10 +3554,27 @@ def _build_visibility_plain_summary(
       - Never speculate about root causes (Google indexing, etc.) —
         describe what we observed; let the action items propose fixes.
     """
+    # P0-Q1: category-evidence flags drive the recognition tier. Pre-fix
+    # the helper only checked `has_title_match`, which conflated tier-1
+    # (URL grounded) with tier-3 (excerpt-only mention) — the Winona
+    # audit (run 932d8261) was told its URL was cited when in fact no
+    # grounded source named the brand. Compute BOTH flags now.
     has_title_match = bool(
         category_match_details
         and any(d.get("title_match") for d in category_match_details)
     )
+    has_url_grounding = bool(
+        category_match_details
+        and any(d.get("in_grounding") for d in category_match_details)
+    )
+    # `top_retailers` is the *category*-scope cited hosts; it does NOT
+    # describe what grounded the buyer-intent (attribution) answers,
+    # despite being used in buyer-intent prose pre-fix. We gate the
+    # retailers_phrase to ONLY render when attribution actually had
+    # cited hosts (merchant_cited_runs < attribution_runs_total AND
+    # at least one cited host appeared in attribution scope). For now
+    # we keep the parameter name as-is for back-compat; a follow-up
+    # will plumb attribution-scope hosts through as a distinct kwarg.
     retailers_phrase = ", ".join(top_retailers[:3]) if top_retailers else ""
     not_cited = max(0, attribution_runs_total - merchant_cited_runs)
 
@@ -3347,7 +3584,24 @@ def _build_visibility_plain_summary(
                 f"Across {attribution_runs_total} buyer-intent queries we "
                 f"tested, your URL did not appear in any grounded source"
             )
-            if retailers_phrase:
+            # P0-Q1: pre-fix this always said "Gemini grounded its
+            # answers in third-party sources including <category
+            # retailer hosts>". When attribution had 0 citations on
+            # every run, the buyer-intent answers were NOT actually
+            # grounded in those hosts — those hosts came from the
+            # CATEGORY probe. Only mention third-party grounding when
+            # there's at least ONE buyer-intent run that produced a
+            # cited host (i.e., merchant_cited_runs > 0 OR we have
+            # explicit evidence of buyer-intent third-party citations,
+            # which we don't have at this call boundary today).
+            # Conservative: when 0 of N attribution runs cited
+            # anything, say so.
+            if merchant_cited_runs == 0 and attribution_runs_total > 0:
+                base += (
+                    " and no grounded sources were returned for those "
+                    "queries"
+                )
+            elif retailers_phrase:
                 base += (
                     f". Gemini grounded its answers in third-party sources "
                     f"including {retailers_phrase} — we did not verify "
@@ -3363,18 +3617,30 @@ def _build_visibility_plain_summary(
 
     if verdict_label == VERDICT_VIA_RETAILERS:
         recognition = _category_recognition_phrase(
-            category_visibility_score, has_title_match=has_title_match
+            category_visibility_score,
+            has_title_match=has_title_match,
+            has_url_grounding=has_url_grounding,
         )
         base = (
             f"Mixed. {recognition[0].upper() + recognition[1:]}, but for "
             f"buyer-intent queries your URL appeared in only "
             f"{merchant_cited_runs} of {attribution_runs_total} runs"
         )
-        if not_cited > 0 and retailers_phrase:
+        # P0-Q1: only attribute buyer-intent grounding to third-party
+        # sources when there was at least one buyer-intent run that
+        # actually produced a citation. If 0/N, the answers were
+        # ungrounded — saying "the other N grounded in third-party
+        # sources" overstates the evidence.
+        if not_cited > 0 and merchant_cited_runs > 0 and retailers_phrase:
             base += (
                 f". The other {not_cited} grounded answers in third-party "
                 f"sources including {retailers_phrase} — we did not verify "
                 f"whether those sources mention your brand"
+            )
+        elif not_cited > 0 and merchant_cited_runs == 0:
+            base += (
+                f". None of the {attribution_runs_total} buyer-intent runs "
+                f"returned a grounded source we could attribute"
             )
         base += "."
         return base
@@ -3727,10 +3993,13 @@ def _build_merchant_view(
         merchant_host=merchant_host,
         merchant_category=merchant_category,
     )
-    cited_hosts_detailed_full = classify_cited_hosts(
-        category_retailer_hosts or [],
-        merchant_category=merchant_category,
-    )
+    cited_hosts_detailed_full = [
+        h for h in classify_cited_hosts(
+            category_retailer_hosts or [],
+            merchant_category=merchant_category,
+        )
+        if not _is_cdn_cited_host(h)
+    ]
 
     # Phase C-4 PR-G: per-cited-host playbook actions. Strategic
     # actions from `_generate_action_items` (verdict-tier-based) lead;
@@ -3876,7 +4145,7 @@ def _build_merchant_view(
         merchant_cited_runs=merchant_cited_runs,
         top_retailers=[
             h.get("host")
-            for h in (category_retailer_hosts or [])[:3]
+            for h in _retail_cited_hosts(category_retailer_hosts)[:3]
             if h.get("host")
         ],
     )
@@ -3956,7 +4225,7 @@ def _build_merchant_view(
             # (businessinsider.com, forbes.com).
             "top_cited_hosts": [
                 h.get("host")
-                for h in (category_retailer_hosts or [])[:5]
+                for h in _copyworthy_cited_hosts(category_retailer_hosts)[:5]
                 if h.get("host")
             ],
             # Phase C-4 PR-E: each cited host annotated with type +
@@ -4117,10 +4386,12 @@ def build_structured_report(
     # numbers (top retailers, failed query sample, gap pct, peer
     # framing) so the explanation paragraph names real things instead
     # of falling back to generic prose.
+    top_cited_hosts = _copyworthy_cited_hosts(category_retailer_hosts)[:5]
+    # `top_retailers` stays as a string-list alias for older evidence
+    # consumers. It is now deliberately retail/marketplace-only; typed
+    # `top_cited_hosts` is the source of truth for neutral host labels.
     top_retailer_hosts = [
-        r["host"]
-        for r in (category_retailer_hosts or [])[:5]
-        if r.get("host")
+        r["host"] for r in _retail_cited_hosts(top_cited_hosts) if r.get("host")
     ]
     gap_pct = (
         max(0, category_score - attribution_score)
@@ -4131,6 +4402,7 @@ def build_structured_report(
         "attribution_runs_total": len(attribution_runs),
         "merchant_cited_runs": merchant_cited_runs,
         "top_retailers": top_retailer_hosts,
+        "top_cited_hosts": top_cited_hosts,
         "competitive_pressure_framing": (competitive_pressure or {}).get("framing"),
         "category_score": category_score,
         "gap_pct": gap_pct,
@@ -4291,9 +4563,9 @@ def build_structured_report(
     # for renderers that want the narrative opening.
     from services.audit_narrative_builder import build_executive_summary
     top_cited_publishers_for_narrative = [
-        h.get("host") for h in (competitor_hosts_list or [])[:3]
-        if h.get("host")
-    ]
+        h.get("host") for h in _copyworthy_cited_hosts(category_retailer_hosts)
+        if _cited_host_type(h) == "editorial" and h.get("host")
+    ][:3]
     executive_summary = build_executive_summary(
         merchant_name=merchant_name,
         visibility_score=visibility_score,
@@ -4418,6 +4690,7 @@ def build_structured_report(
                 "queries": _per_query_rows(category_runs, "brand_appears"),
                 "match_details": category_match_details,
                 "competitor_brands": category_competitor_brands,
+                "top_cited_hosts": top_cited_hosts,
                 "retailer_hosts": category_retailer_hosts,
             }
             if category_visibility_result is not None
@@ -4781,10 +5054,10 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                 "BD signal: consumers asking for products in this category "
                 "without naming the brand never see the merchant._\n"
             )
-        retailers = cat.get("retailer_hosts") or []
+        retailers = _copyworthy_cited_hosts(cat.get("retailer_hosts") or [])
         if retailers:
             sections.append(
-                "**Where category traffic is being routed (retailers cited "
+                "**Where category traffic is being routed (cited hosts "
                 "instead of merchant):**\n"
             )
             sections.append(_md_retailer_table(retailers) + "\n")
@@ -4899,9 +5172,10 @@ def _md_competitor_table(competitors: List[Dict[str, Any]], top_n: int = 8) -> s
 def _md_retailer_table(retailers: List[Dict[str, Any]], top_n: int = 8) -> str:
     if not retailers:
         return "_(none cited)_"
-    out = ["| Retailer / host | Category queries citing |", "|---|---|"]
+    out = ["| Cited host | Type | Category queries citing |", "|---|---|---|"]
     for entry in retailers[:top_n]:
-        out.append(f"| `{entry['host']}` | {entry['times_cited']} |")
+        host_type = _cited_host_type_label(entry.get("type"))
+        out.append(f"| `{entry['host']}` | {host_type} | {entry['times_cited']} |")
     return "\n".join(out)
 
 
