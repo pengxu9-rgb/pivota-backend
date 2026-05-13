@@ -1329,18 +1329,32 @@ async def sync_shopify_products(
     
     try:
         # 1. Check if store is actually connected
-        store_check_row = await database.fetch_one(
-            """
-            SELECT store_id, platform, domain, status, product_count 
-            FROM merchant_stores 
-            WHERE merchant_id = :merchant_id
-              AND platform = 'shopify'
-              AND status IN ('active', 'connected')
-            ORDER BY connected_at DESC NULLS LAST
-            LIMIT 1
-            """,
-            {"merchant_id": merchant_id}
-        )
+        try:
+            store_check_row = await database.fetch_one(
+                """
+                SELECT store_id, platform, domain, status, product_count
+                FROM merchant_stores
+                WHERE merchant_id = :merchant_id
+                  AND platform = 'shopify'
+                  AND status IN ('active', 'connected')
+                ORDER BY is_primary DESC, connected_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                {"merchant_id": merchant_id}
+            )
+        except Exception:
+            store_check_row = await database.fetch_one(
+                """
+                SELECT store_id, platform, domain, status, product_count
+                FROM merchant_stores
+                WHERE merchant_id = :merchant_id
+                  AND platform = 'shopify'
+                  AND status IN ('active', 'connected')
+                ORDER BY connected_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                {"merchant_id": merchant_id}
+            )
         
         if not store_check_row:
             raise HTTPException(
@@ -1738,13 +1752,34 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
                 status,
                 product_count,
                 last_sync,
-                connected_at
+                connected_at,
+                is_primary
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
-            ORDER BY connected_at DESC NULLS LAST
+              AND lower(COALESCE(status, '')) IN ('active', 'connected')
+            ORDER BY is_primary DESC, connected_at DESC NULLS LAST
         """
 
-        stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
+        try:
+            stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
+        except Exception:
+            stores_query = """
+                SELECT
+                    store_id,
+                    platform,
+                    name,
+                    domain,
+                    status,
+                    product_count,
+                    last_sync,
+                    connected_at,
+                    false as is_primary
+                FROM merchant_stores
+                WHERE merchant_id = :merchant_id
+                  AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                ORDER BY connected_at DESC NULLS LAST
+            """
+            stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
 
         store_list = [dict(store) for store in stores]
         total_stores = len(store_list)
@@ -1832,6 +1867,7 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
                 if ((cache_counts_by_platform.get((store.get("platform") or "").strip().lower(), {}) or {}).get("active") or 0) > 0
                 else "merchant_stores",
                 "domain": store.get("domain"),
+                "is_primary": bool(store.get("is_primary")),
                 "last_sync": sync_dt.isoformat() if sync_dt else None
             })
 
@@ -2076,6 +2112,29 @@ async def connect_store(
                 "status": 'connected',
                 "connected_at": datetime.now()
             })
+            try:
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET is_primary = TRUE
+                    WHERE store_id = :store_id
+                      AND merchant_id = :merchant_id
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM merchant_stores
+                        WHERE merchant_id = :merchant_id
+                          AND store_id != :store_id
+                          AND is_primary = TRUE
+                          AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                      )
+                    """,
+                    {
+                        "store_id": store_id,
+                        "merchant_id": merchant_id,
+                    },
+                )
+            except Exception:
+                pass
             print(f"✅ Store saved to DB: {store_id} for merchant {merchant_id}")
             
             # Verify the save within transaction

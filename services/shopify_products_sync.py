@@ -63,18 +63,32 @@ def _inject_description_text_fields(product_payload: Dict[str, Any]) -> Dict[str
 
 
 async def _get_shopify_store_credentials(merchant_id: str) -> Dict[str, str]:
-    row = await database.fetch_one(
-        """
-        SELECT store_id, domain, api_key, status
-        FROM merchant_stores
-        WHERE merchant_id = :merchant_id
-          AND platform = 'shopify'
-          AND status IN ('active', 'connected')
-        ORDER BY connected_at DESC NULLS LAST
-        LIMIT 1
-        """,
-        {"merchant_id": merchant_id},
-    )
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT store_id, domain, api_key, status
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+              AND platform = 'shopify'
+              AND status IN ('active', 'connected')
+            ORDER BY is_primary DESC, connected_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id},
+        )
+    except Exception:
+        row = await database.fetch_one(
+            """
+            SELECT store_id, domain, api_key, status
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+              AND platform = 'shopify'
+              AND status IN ('active', 'connected')
+            ORDER BY connected_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id},
+        )
 
     if not row:
         raise ShopifyProductsSyncConfigError("No Shopify store connected for this merchant")

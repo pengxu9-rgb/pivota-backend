@@ -1155,6 +1155,27 @@ async def merchant_connect_shopify(
                 }
             )
 
+        try:
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET is_primary = TRUE
+                WHERE store_id = :store_id
+                  AND merchant_id = :merchant_id
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM merchant_stores
+                    WHERE merchant_id = :merchant_id
+                      AND store_id != :store_id
+                      AND is_primary = TRUE
+                      AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                  )
+                """,
+                {"store_id": store_id, "merchant_id": request.merchant_id},
+            )
+        except Exception:
+            pass
+
         # Prevent stale recommendations/checkout attempts after reconnecting a Shopify store:
         # cached product IDs from a previous shop can linger until TTL, which breaks pricing/checkout.
         try:

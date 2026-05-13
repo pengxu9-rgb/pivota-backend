@@ -11,6 +11,32 @@ import httpx
 
 router = APIRouter()
 
+
+async def sync_legacy_primary_store_fields(merchant_id: str, store: Dict[str, Any]) -> None:
+    """Keep legacy merchant_onboarding MCP fields aligned with the selected primary store."""
+    try:
+        await database.execute(
+            """
+            UPDATE merchant_onboarding
+            SET mcp_connected = TRUE,
+                mcp_platform = :platform,
+                mcp_shop_domain = :domain,
+                mcp_access_token = :api_key,
+                mcp_connected_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = :merchant_id
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": store.get("platform"),
+                "domain": store.get("domain"),
+                "api_key": store.get("api_key"),
+            },
+        )
+    except Exception:
+        # Primary selection should still succeed even if legacy compatibility fields
+        # are unavailable in a given environment.
+        pass
+
 async def get_merchant_id_from_user(current_user: dict) -> str:
     """Get merchant ID from JWT token"""
     merchant_id = current_user.get("merchant_id")
@@ -44,15 +70,63 @@ async def delete_store(
     
     try:
         # Verify ownership before deleting
-        check_query = "SELECT store_id FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id"
-        store = await database.fetch_one(check_query, {"store_id": store_id, "merchant_id": merchant_id})
+        check_query = "SELECT store_id, is_primary FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id"
+        try:
+            store = await database.fetch_one(check_query, {"store_id": store_id, "merchant_id": merchant_id})
+        except Exception:
+            store = await database.fetch_one(
+                "SELECT store_id, false as is_primary FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id",
+                {"store_id": store_id, "merchant_id": merchant_id},
+            )
         
         if not store:
             raise HTTPException(status_code=404, detail="Store not found or not owned by this merchant")
         
-        # Delete the store
-        delete_query = "DELETE FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id"
-        await database.execute(delete_query, {"store_id": store_id, "merchant_id": merchant_id})
+        async with database.transaction():
+            delete_query = "DELETE FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id"
+            await database.execute(delete_query, {"store_id": store_id, "merchant_id": merchant_id})
+
+            if store.get("is_primary"):
+                await database.execute(
+                    """
+                    WITH next_store AS (
+                        SELECT store_id
+                        FROM merchant_stores
+                        WHERE merchant_id = :merchant_id
+                          AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                        ORDER BY connected_at DESC NULLS LAST, store_id DESC
+                        LIMIT 1
+                    )
+                    UPDATE merchant_stores
+                    SET is_primary = TRUE
+                    WHERE store_id = (SELECT store_id FROM next_store)
+                    """,
+                    {"merchant_id": merchant_id},
+                )
+                next_store = await database.fetch_one(
+                    """
+                    SELECT store_id, platform, domain, api_key
+                    FROM merchant_stores
+                    WHERE merchant_id = :merchant_id
+                      AND is_primary = TRUE
+                    LIMIT 1
+                    """,
+                    {"merchant_id": merchant_id},
+                )
+                if next_store:
+                    await sync_legacy_primary_store_fields(merchant_id, dict(next_store))
+                else:
+                    await database.execute(
+                        """
+                        UPDATE merchant_onboarding
+                        SET mcp_connected = FALSE,
+                            mcp_platform = NULL,
+                            mcp_shop_domain = NULL,
+                            mcp_access_token = NULL
+                        WHERE merchant_id = :merchant_id
+                        """,
+                        {"merchant_id": merchant_id},
+                    )
         
         return {
             "status": "success",
@@ -234,9 +308,8 @@ async def set_primary_store(
     """
     Mark a store as the merchant's primary store.
 
-    Current system derives "primary" from recency (ORDER BY connected_at DESC).
-    We implement "set primary" by bumping the target store's connected_at to CURRENT_TIMESTAMP,
-    so it becomes the top candidate for get_primary_store and /merchant/{merchant_id}/integrations.
+    Primary is persisted explicitly so the portal, product sync, and legacy MCP
+    compatibility fields agree on the same selected store.
     """
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -245,7 +318,7 @@ async def set_primary_store(
 
     store = await database.fetch_one(
         """
-        SELECT store_id, status, api_key
+        SELECT store_id, platform, domain, status, api_key
         FROM merchant_stores
         WHERE store_id = :store_id AND merchant_id = :merchant_id
         """,
@@ -262,16 +335,52 @@ async def set_primary_store(
         raise HTTPException(status_code=400, detail="Store credentials missing. Please reconnect the store first.")
 
     try:
-        await database.execute(
-            """
-            UPDATE merchant_stores
-            SET connected_at = CURRENT_TIMESTAMP
-            WHERE store_id = :store_id AND merchant_id = :merchant_id
-            """,
-            {"store_id": store_id, "merchant_id": merchant_id},
-        )
-        return {"status": "success", "message": "Primary store updated", "store_id": store_id}
+        async with database.transaction():
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET is_primary = FALSE
+                WHERE merchant_id = :merchant_id
+                  AND is_primary = TRUE
+                """,
+                {"merchant_id": merchant_id},
+            )
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET is_primary = TRUE
+                WHERE store_id = :store_id AND merchant_id = :merchant_id
+                """,
+                {"store_id": store_id, "merchant_id": merchant_id},
+            )
+            await sync_legacy_primary_store_fields(merchant_id, dict(store))
+
+        return {
+            "status": "success",
+            "message": "Primary store updated",
+            "store_id": store_id,
+            "primary_store_id": store_id,
+        }
     except Exception as e:
+        if "is_primary" in str(e).lower():
+            try:
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET connected_at = CURRENT_TIMESTAMP
+                    WHERE store_id = :store_id AND merchant_id = :merchant_id
+                    """,
+                    {"store_id": store_id, "merchant_id": merchant_id},
+                )
+                await sync_legacy_primary_store_fields(merchant_id, dict(store))
+                return {
+                    "status": "success",
+                    "message": "Primary store updated",
+                    "store_id": store_id,
+                    "primary_store_id": store_id,
+                }
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"Failed to set primary store: {str(e)}")
 
 # ============================================================================

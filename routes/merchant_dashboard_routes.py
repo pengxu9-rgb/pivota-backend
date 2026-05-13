@@ -580,13 +580,36 @@ async def get_merchant_stores(
                 connected_at, 
                 last_sync, 
                 product_count,
+                is_primary,
                 CASE WHEN api_key IS NOT NULL AND api_key != '' THEN true ELSE false END as api_key_present
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
-            ORDER BY connected_at DESC
+              AND lower(COALESCE(status, '')) IN ('active', 'connected')
+            ORDER BY is_primary DESC, connected_at DESC NULLS LAST
         """
         
-        rows = await database.fetch_all(query, {"merchant_id": merchant_id})
+        try:
+            rows = await database.fetch_all(query, {"merchant_id": merchant_id})
+        except Exception as e:
+            logger.warning("merchant_store_primary_query_failed", extra={"merchant_id": merchant_id, "error": str(e)})
+            query = """
+                SELECT
+                    store_id,
+                    platform,
+                    name,
+                    domain,
+                    status,
+                    connected_at,
+                    last_sync,
+                    product_count,
+                    false as is_primary,
+                    CASE WHEN api_key IS NOT NULL AND api_key != '' THEN true ELSE false END as api_key_present
+                FROM merchant_stores
+                WHERE merchant_id = :merchant_id
+                  AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                ORDER BY connected_at DESC NULLS LAST
+            """
+            rows = await database.fetch_all(query, {"merchant_id": merchant_id})
 
         # Derive product counts from products_cache so the UI isn't blocked on
         # merchant_stores.product_count being updated by background import workers.
@@ -610,8 +633,9 @@ async def get_merchant_stores(
             cache_counts_by_platform = {}
 
         print(f"DEBUG get_merchant_stores: Found {len(rows)} stores")
+        active_statuses = {"active", "connected"}
         for row in rows:
-            is_active = row["status"] == "active"
+            is_active = (row["status"] or "").lower() in active_statuses
             has_api_key = row["api_key_present"]
             is_connected = is_active and has_api_key
             platform = (row["platform"] or "").strip().lower()
@@ -625,6 +649,7 @@ async def get_merchant_stores(
                 "domain": row["domain"],
                 "status": row["status"],
                 "is_active": is_active,
+                "is_primary": bool(row["is_primary"]),
                 "is_connected": is_connected,
                 "api_key_present": has_api_key,
                 "shop_domain": row["domain"],  # Alias for compatibility

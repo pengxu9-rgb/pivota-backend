@@ -100,18 +100,19 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                 support_email,
                 status,
                 connected_at,
+                is_primary,
                 'merchant_stores' as source
             FROM merchant_stores
             WHERE merchant_id = :merchant_id 
             AND status IN ('active', 'connected')
-            ORDER BY connected_at DESC
+            ORDER BY is_primary DESC, connected_at DESC
         """
         
         try:
             new_stores = await database.fetch_all(store_query, {"merchant_id": merchant_id})
         except Exception as e:
-            # Backward compatibility: support_email column might not exist yet.
-            logger.error(f"Error fetching from merchant_stores (support_email): {e}")
+            # Backward compatibility: support_email/is_primary columns might not exist yet.
+            logger.error(f"Error fetching from merchant_stores (support_email/is_primary): {e}")
             store_query = """
                 SELECT 
                     store_id,
@@ -122,6 +123,7 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                     api_key,
                     status,
                     connected_at,
+                    false as is_primary,
                     'merchant_stores' as source
                 FROM merchant_stores
                 WHERE merchant_id = :merchant_id 
@@ -162,6 +164,7 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                     "api_key": parsed_token,
                     "status": "active" if merchant.get("mcp_connected", False) else "disconnected",
                     "connected_at": merchant.get("mcp_connected_at"),
+                    "is_primary": True,
                     "source": "legacy_mcp"
                 }
                 stores.append(legacy_store)
@@ -209,6 +212,22 @@ async def ensure_data_consistency(merchant_id: str, platform: str, credentials: 
         
         # 3. If first store, update merchant_onboarding for backward compatibility
         if store_count["count"] == 1:
+            try:
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET is_primary = TRUE
+                    WHERE store_id = :store_id
+                      AND merchant_id = :merchant_id
+                    """,
+                    {
+                        "store_id": store_id,
+                        "merchant_id": merchant_id,
+                    },
+                )
+            except Exception as e:
+                logger.warning(f"Unable to mark first merchant store primary: {e}")
+
             await database.execute("""
                 UPDATE merchant_onboarding SET
                     mcp_platform = :platform,

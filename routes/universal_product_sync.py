@@ -273,13 +273,28 @@ async def find_connected_store(
             WHERE merchant_id = :merchant_id
               AND platform = :platform
               AND status IN ('active', 'connected')
-            ORDER BY connected_at DESC
+            ORDER BY is_primary DESC, connected_at DESC
             LIMIT 1
         """
-        store = await database.fetch_one(
-            store_query_hint,
-            {"merchant_id": merchant_id, "platform": platform_hint_normalized},
-        )
+        try:
+            store = await database.fetch_one(
+                store_query_hint,
+                {"merchant_id": merchant_id, "platform": platform_hint_normalized},
+            )
+        except Exception:
+            store_query_hint = """
+                SELECT store_id, platform, name, domain, api_key, status
+                FROM merchant_stores
+                WHERE merchant_id = :merchant_id
+                  AND platform = :platform
+                  AND status IN ('active', 'connected')
+                ORDER BY connected_at DESC
+                LIMIT 1
+            """
+            store = await database.fetch_one(
+                store_query_hint,
+                {"merchant_id": merchant_id, "platform": platform_hint_normalized},
+            )
         if store:
             return dict(store)
 
@@ -289,10 +304,21 @@ async def find_connected_store(
         FROM merchant_stores 
         WHERE merchant_id = :merchant_id 
         AND status IN ('active', 'connected')
-        ORDER BY connected_at DESC
+        ORDER BY is_primary DESC, connected_at DESC
         LIMIT 1
     """
-    store = await database.fetch_one(store_query, {"merchant_id": merchant_id})
+    try:
+        store = await database.fetch_one(store_query, {"merchant_id": merchant_id})
+    except Exception:
+        store_query = """
+            SELECT store_id, platform, name, domain, api_key, status
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+            AND status IN ('active', 'connected')
+            ORDER BY connected_at DESC
+            LIMIT 1
+        """
+        store = await database.fetch_one(store_query, {"merchant_id": merchant_id})
 
     if store:
         store_dict = dict(store)
