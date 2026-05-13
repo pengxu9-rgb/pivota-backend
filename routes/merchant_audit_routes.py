@@ -43,6 +43,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from db.catalog import catalog_products
+from db.apm_config import (
+    ApmConfigValidationError,
+    get_apm_config,
+    upsert_apm_config,
+)
 from db.database import database
 from db.merchant_audit_runs import (
     count_runs_in_window,
@@ -224,6 +229,12 @@ class MerchantSelfAuditRequest(BaseModel):
 
     products: List[ProductRef] = Field(..., min_length=1, max_length=5)
     max_runs: int = Field(3, ge=1, le=5)
+
+
+class ApmConfigureRequest(BaseModel):
+    enabled: bool
+    cadence_days: int
+    scope: Dict[str, Any] = Field(default_factory=dict)
 
 
 # P2.4: poll budget for the opt-in async-pipeline compat path.
@@ -854,6 +865,47 @@ async def run_merchant_self_audit(
         # callers fetch this audit's history entry later.
         "audit_run_id": run_id,
     }
+
+
+@router.post("/configure-apm")
+async def configure_merchant_apm(
+    body: ApmConfigureRequest,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Persist the merchant's self-service APM opt-in settings."""
+    try:
+        config = await upsert_apm_config(
+            merchant_id=merchant_id,
+            enabled=body.enabled,
+            cadence_days=body.cadence_days,
+            scope=body.scope,
+        )
+    except ApmConfigValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors,
+        ) from exc
+
+    if config is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="merchant not found",
+        )
+    return config
+
+
+@router.get("/apm-config")
+async def read_merchant_apm_config(
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Return the merchant's current APM settings."""
+    config = await get_apm_config(merchant_id)
+    if config is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="APM config not found",
+        )
+    return config
 
 
 @router.get("/history")

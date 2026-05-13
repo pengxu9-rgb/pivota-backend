@@ -14,9 +14,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from jobs.scheduled_audit_job import (
     _extract_products_from_prior_report,
+    _list_due_merchants,
+    _re_audit_merchant,
     is_audit_due,
+    is_apm_audit_due,
 )
 
 
@@ -77,6 +82,212 @@ def test_is_audit_due_unknown_schedule_returns_false():
     assert is_audit_due(None, "daily") is False
     assert is_audit_due(None, "yearly") is False
     assert is_audit_due(None, "") is False
+
+
+# ---------------------------------------------------------------------------
+# PR-13 APM due logic
+# ---------------------------------------------------------------------------
+
+
+def test_cron_picker_excludes_apm_enabled_false_merchants():
+    assert (
+        is_apm_audit_due(
+            apm_enabled=False,
+            cadence_days=7,
+            apm_last_run_at=None,
+        )
+        is False
+    )
+
+
+def test_cron_picker_excludes_recently_audited_merchants():
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    assert (
+        is_apm_audit_due(
+            apm_enabled=True,
+            cadence_days=14,
+            apm_last_run_at=now - timedelta(days=3),
+            now=now,
+        )
+        is False
+    )
+
+
+def test_cron_picker_includes_never_run_enabled_merchants():
+    assert (
+        is_apm_audit_due(
+            apm_enabled=True,
+            cadence_days=30,
+            apm_last_run_at=None,
+        )
+        is True
+    )
+
+
+class _FakeScheduledAuditDatabase:
+    def __init__(self, apm_rows, audit_rows):
+        self.apm_rows = apm_rows
+        self.audit_rows = audit_rows
+
+    async def fetch_all(self, query):
+        sql = str(query.compile(compile_kwargs={"literal_binds": True})).lower()
+        if "from merchant_onboarding" not in sql:
+            return []
+        return [
+            row for row in self.apm_rows
+            if row.get("apm_configured_at") is not None
+            and row.get("apm_enabled") is True
+            and row.get("status") != "deleted"
+        ]
+
+    async def fetch_one(self, query):
+        sql = str(query.compile(compile_kwargs={"literal_binds": True}))
+        import re
+
+        match = re.search(r"merchant_id\s*=\s*'([^']+)'", sql)
+        merchant_id = match.group(1) if match else None
+        if merchant_id is None:
+            return None
+        return self.audit_rows.get(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_list_due_merchants_filters_disabled_and_recent(monkeypatch):
+    import db.database as database_module
+
+    now = datetime.now(timezone.utc)
+    fake_db = _FakeScheduledAuditDatabase(
+        apm_rows=[
+            {
+                "merchant_id": "merch_disabled",
+                "apm_enabled": False,
+                "apm_cadence_days": 7,
+                "apm_last_run_at": None,
+                "apm_configured_at": now,
+                "status": "approved",
+            },
+            {
+                "merchant_id": "merch_recent",
+                "apm_enabled": True,
+                "apm_cadence_days": 7,
+                "apm_last_run_at": now - timedelta(days=1),
+                "apm_configured_at": now,
+                "status": "approved",
+            },
+            {
+                "merchant_id": "merch_due",
+                "apm_enabled": True,
+                "apm_cadence_days": 7,
+                "apm_last_run_at": now - timedelta(days=8),
+                "apm_configured_at": now,
+                "status": "approved",
+            },
+        ],
+        audit_rows={
+            "merch_due": {
+                "run_id": "prior-run",
+                "requested_at": now - timedelta(days=8),
+            },
+        },
+    )
+    monkeypatch.setattr(database_module, "database", fake_db)
+
+    due = await _list_due_merchants()
+
+    assert [row["merchant_id"] for row in due] == ["merch_due"]
+    assert due[0]["cadence_days"] == 7
+    assert due[0]["last_audit_run_id"] == "prior-run"
+
+
+@pytest.mark.asyncio
+async def test_re_audit_merchant_updates_apm_last_run_at_on_success(monkeypatch):
+    import db.apm_config as apm_config_module
+    import db.database as database_module
+    import db.merchant_audit_runs as audit_runs_module
+    import services.agent_center_bd_report_service as report_service
+
+    prior_report = {
+        "per_product": [
+            {
+                "product": {
+                    "title": "Serum",
+                    "vendor": "Acme",
+                    "product_type": "skincare",
+                },
+                "merchant_pdp_url": "https://acme.example/products/serum",
+            }
+        ]
+    }
+
+    class _FakeDatabase:
+        async def fetch_one(self, _query):
+            return {"run_id": "prior-run", "report_jsonb": prior_report}
+
+    monkeypatch.setattr(database_module, "database", _FakeDatabase())
+
+    started = []
+    completed = []
+    marked = []
+
+    async def _record_started(*, merchant_id, product_keys):
+        started.append({"merchant_id": merchant_id, "product_keys": product_keys})
+        return "new-run"
+
+    async def _record_completed(**kwargs):
+        completed.append(kwargs)
+
+    async def _recent_runs_for_merchant(*, merchant_id, limit=5):
+        return [{"run_id": "prior-run", "merchant_id": merchant_id}]
+
+    async def _run_brand_report(**kwargs):
+        return {
+            "aggregate": {
+                "avg_visibility": 100,
+                "avg_attribution": 100,
+                "avg_category_visibility": 100,
+            },
+            "per_product": [
+                {"verdict": {"label": "VISIBLE"}},
+            ],
+        }
+
+    async def _mark_completed(merchant_id: str):
+        marked.append(merchant_id)
+
+    monkeypatch.setattr(
+        audit_runs_module,
+        "record_audit_run_started",
+        _record_started,
+    )
+    monkeypatch.setattr(
+        audit_runs_module,
+        "record_audit_run_completed",
+        _record_completed,
+    )
+    monkeypatch.setattr(
+        audit_runs_module,
+        "recent_runs_for_merchant",
+        _recent_runs_for_merchant,
+    )
+    monkeypatch.setattr(report_service, "run_brand_report", _run_brand_report)
+    monkeypatch.setattr(
+        apm_config_module,
+        "mark_apm_audit_run_completed",
+        _mark_completed,
+    )
+
+    summary = await _re_audit_merchant(
+        {
+            "merchant_id": "merch_due",
+            "cadence_days": 7,
+            "last_audit_run_id": "prior-run",
+        }
+    )
+
+    assert summary["status"] == "succeeded"
+    assert started[0]["merchant_id"] == "merch_due"
+    assert completed[0]["status"] == "succeeded"
+    assert marked == ["merch_due"]
 
 
 # ---------------------------------------------------------------------------

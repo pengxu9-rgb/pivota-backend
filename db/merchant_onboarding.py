@@ -5,7 +5,7 @@ Handles merchant registration, KYC verification, PSP setup, and API key issuance
 
 from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Text, JSON, Float
 from sqlalchemy.sql import func
-from db.database import metadata, database
+from db.database import JSONB_TYPE, metadata, database
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 import secrets
@@ -43,6 +43,11 @@ merchant_onboarding = Table(
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
     Column("verified_at", DateTime, nullable=True),
     Column("psp_connected_at", DateTime, nullable=True),
+    Column("apm_enabled", Boolean, nullable=False, server_default="false", default=False),
+    Column("apm_cadence_days", Integer, nullable=True),
+    Column("apm_scope_jsonb", JSONB_TYPE, nullable=True),
+    Column("apm_configured_at", DateTime(timezone=True), nullable=True),
+    Column("apm_last_run_at", DateTime(timezone=True), nullable=True),
 )
 
 # ============================================================================
