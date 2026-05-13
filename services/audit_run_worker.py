@@ -135,6 +135,97 @@ async def _process_one_audit_run_inner(
     """
     from db import merchant_audit_runs as mar
 
+    # ----- P0-2 resume rehydrate -----
+    # claim_next_pending_run will hand the worker a row at ANY active
+    # stage, not just queued (so the stale-lease reaper can recover a
+    # crashed worker). But local-memory state (brand_report, products,
+    # merchant_name, etc.) starts fresh at default — so before the
+    # original fix, resuming at probing meant re-running probes with
+    # products=[] (empty audit), and resuming at scoring / materializing
+    # / verifying meant the `brand_report is not None` guards skipped
+    # every block and the run sat at stage=verifying forever.
+    #
+    # Strategy:
+    #   - Resume at PROBING: re-run discovery (cheap, no LLM) to
+    #     rehydrate products + merchant state, then continue. The
+    #     probing work itself was either incomplete (lease expired
+    #     before run_brand_report finished) or completed but not yet
+    #     persisted, so it MUST be re-run; we can't dedupe at the
+    #     probe layer today.
+    #   - Resume at SCORING / MATERIALIZING / VERIFYING: brand_report
+    #     was never persisted before the lease expired (today, it
+    #     only lands on the row at _record_final_report_fields, which
+    #     runs late inside the verifying block). Without brand_report
+    #     we can't continue safely — silent skips of the guarded
+    #     blocks would leave the run terminal-empty. Fail the run
+    #     with a clear error so the merchant sees the issue and can
+    #     retry, instead of staying stuck or completing with no work.
+    if current_stage in (
+        mar.STAGE_PROBING,
+        mar.STAGE_SCORING,
+        mar.STAGE_MATERIALIZING,
+        mar.STAGE_VERIFYING,
+    ):
+        logger.info(
+            "audit_run_worker: resume claim at stage=%s run_id=%s "
+            "(stale-lease replay)", current_stage, run_id,
+        )
+        if current_stage == mar.STAGE_PROBING:
+            try:
+                (
+                    merchant_name,
+                    merchant_domain,
+                    products,
+                    pivota_url_used,
+                    integration_state,
+                ) = await _resolve_merchant_and_products(
+                    merchant_id=merchant_id, product_keys=product_keys,
+                )
+                logger.info(
+                    "audit_run_worker: rehydrated discovery for "
+                    "run_id=%s products=%d", run_id, len(products),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "audit_run_worker: discovery rehydrate failed "
+                    "for run_id=%s — failing run", run_id,
+                )
+                await mar.transition_stage(
+                    run_id=run_id,
+                    from_stage=mar.STAGE_PROBING,
+                    to_stage=mar.STAGE_FAILED,
+                    worker_id=WORKER_ID,
+                    error_jsonb={
+                        "stage": "probing_resume_rehydrate",
+                        "message": (
+                            f"discovery rehydrate failed on stale-lease "
+                            f"replay: {str(exc)[:200]}"
+                        ),
+                    },
+                )
+                return True
+        else:
+            # Cannot reconstruct brand_report; fail cleanly.
+            await mar.transition_stage(
+                run_id=run_id,
+                from_stage=current_stage,
+                to_stage=mar.STAGE_FAILED,
+                worker_id=WORKER_ID,
+                error_jsonb={
+                    "stage": f"{current_stage}_resume_unsupported",
+                    "message": (
+                        f"Worker crashed mid-pipeline at stage="
+                        f"{current_stage}. brand_report is not "
+                        "persisted before record_final_report_fields, "
+                        "so the run cannot be safely resumed without "
+                        "re-running probing (which would double LLM "
+                        "cost on an audit that was already past that "
+                        "stage). Please re-submit the audit."
+                    ),
+                },
+            )
+            return True
+
     async def _check_cancellation_and_finalize(*, at_stage: str) -> bool:
         """If the run has been cancelled (cancel_audit_run set
         cancelled_at on this row), finalize it to STAGE_CANCELLED and
