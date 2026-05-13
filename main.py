@@ -157,6 +157,7 @@ from routes.gsc_oauth_routes import (
 from routes.pivota_canonical_routes import (
     router as pivota_canonical_router,
 )
+from routes.agent_pdp_v1 import router as agent_pdp_v1_router
 from routes.agent_payment_sdk import router as agent_payment_router
 from routes.agent_products import router as agent_products_router
 from routes.psp_overview_routes import router as psp_overview_router
@@ -772,6 +773,7 @@ from routes.scheduler_health import router as scheduler_health_router
 app.include_router(scheduler_health_router)
 app.include_router(gsc_oauth_router)  # Phase D: Google Search Console OAuth start + callback
 app.include_router(pivota_canonical_router)  # Public canonical PDP resolver (sig_* → product) + sitemap list
+app.include_router(agent_pdp_v1_router)  # Agent PDP v1 denormalized read path (/api/agent/pdp/*)
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints
