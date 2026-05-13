@@ -156,10 +156,23 @@ def compute_action_severity(
     if gap is not None and gap >= _GAP_BIG and has_failed_query_example:
         return ("critical", "score_gap_big+failed_query_example")
 
+    # Q-P1-6 PR-6 — guard: Rules 3, 4, 7 are UPGRADE rules to "high".
+    # They must not fire when `base` is already higher than "high"
+    # (i.e. base="critical"), or they would silently downgrade a
+    # critical-tier authored action. This surfaced when PR-6 migrated
+    # the verdict-tier hardcoded severities through the scorer — a
+    # base=critical action with gap=60 + supporting evidence was
+    # being knocked down to high by Rule 3. The scorer's intent for
+    # Rules 3/4/7 is "lift conservative bases TO high"; respect a
+    # higher authored base when no explicit downgrade rule applies.
+    _base_already_above_high = (
+        base is not None and _SEVERITY_RANK[base] > _SEVERITY_RANK["high"]
+    )
+
     # Rule 3 — high for medium score gap with concrete supporting
     # evidence. The audit identified a real problem and a real
     # corrective action.
-    if gap is not None and gap >= _GAP_MEDIUM and (
+    if not _base_already_above_high and gap is not None and gap >= _GAP_MEDIUM and (
         has_failed_query_example or host in _RETAIL_HOST_TYPES
     ):
         return ("high", "score_gap_medium+supporting_evidence")
@@ -168,8 +181,8 @@ def compute_action_severity(
     # without a failed-query example, when the host is editorial
     # (publisher / editorial site). The site captured grounded
     # citations; the pitch has a real basis.
-    if gap is not None and gap >= _GAP_MEDIUM and host in _EDITORIAL_HOST_TYPES \
-            and tier in _STRONG_EVIDENCE_TIERS:
+    if not _base_already_above_high and gap is not None and gap >= _GAP_MEDIUM \
+            and host in _EDITORIAL_HOST_TYPES and tier in _STRONG_EVIDENCE_TIERS:
         return ("high", "score_gap_medium+editorial_host+strong_tier")
 
     # Rule 5 — DOWNGRADE: host-targeted pitch with NO failed-query
@@ -181,7 +194,8 @@ def compute_action_severity(
     # pass through to the playbook author's call).
     is_pitch_action = host is not None
     rule_4_already_applied = (
-        gap is not None and gap >= _GAP_MEDIUM
+        not _base_already_above_high
+        and gap is not None and gap >= _GAP_MEDIUM
         and host in _EDITORIAL_HOST_TYPES
         and tier in _STRONG_EVIDENCE_TIERS
     )
