@@ -49,7 +49,7 @@ from db.database import database
 from services.agent_pdp_view_assembler import (
     UPSERT_SQL as AGENT_PDP_VIEW_UPSERT_SQL,
     assemble_row as assemble_agent_pdp_view_row,
-    fetch_external_seed_for_keys,
+    fetch_external_seed_by_id,
     fetch_offers_for_keys,
     fetch_products_for_key,
     fetch_skus_for_keys,
@@ -168,7 +168,11 @@ async def refresh_agent_pdp_view_for_seed(
     product_keys = [p["product_key"] for p in products if p.get("product_key")]
     skus = await fetch_skus_for_keys(product_keys, db=database)
     offers = await fetch_offers_for_keys(product_keys, db=database)
-    external_seed = await fetch_external_seed_for_keys(product_keys, db=database)
+    # Use the triggering seed directly — the writer hook knows which
+    # seed's seed_data just changed. Going through
+    # fetch_external_seed_for_keys (newest active in the group) can
+    # pull description text from a stale, unrelated seed.
+    external_seed = await fetch_external_seed_by_id(seed_id, db=database)
 
     row = assemble_agent_pdp_view_row(
         content_key=content_key,

@@ -129,8 +129,13 @@ async def fetch_external_seed_for_keys(
     db: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """First active external_product_seed attached to any product in a
-    content_key cluster. We only need it as a content fallback, so any
-    one row is fine.
+    content_key cluster. The backfill uses this — it has no specific
+    seed in hand, just a group of product_keys, and any one row works
+    as a content fallback.
+
+    The writer hook should NOT use this; it has a specific seed in
+    hand (the one whose seed_data just changed). See
+    fetch_external_seed_by_id.
     """
     if not product_keys:
         return None
@@ -146,6 +151,30 @@ async def fetch_external_seed_for_keys(
         LIMIT 1
         """,
         {"keys": product_keys},
+    )
+    return dict(row) if row else None
+
+
+async def fetch_external_seed_by_id(
+    seed_id: str,
+    *,
+    db: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the external seed by its specific id. Used by the writer
+    hook — the triggering seed_id is in scope, and we want the
+    description fallback to come from the seed whose seed_data just
+    changed, not "newest active in the group" (which can be a
+    different, stale row).
+    """
+    read_db = db or database
+    row = await read_db.fetch_one(
+        """
+        SELECT id, attached_product_key, title, image_url, seed_data,
+               canonical_url, destination_url
+        FROM external_product_seeds
+        WHERE id = :seed_id
+        """,
+        {"seed_id": seed_id},
     )
     return dict(row) if row else None
 

@@ -69,7 +69,7 @@ class _RecordingDB:
             return self.seed_row
         if "SELECT content_key" in sql:
             return self.catalog_row
-        if "WHERE attached_product_key = ANY(:keys)" in sql:
+        if "FROM external_product_seeds" in sql and "WHERE id = :seed_id" in sql:
             return self.external_seed
         return None
 
