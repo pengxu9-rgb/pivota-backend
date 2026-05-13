@@ -238,6 +238,60 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # PR-13 APM config columns on merchant_onboarding
+            # (migration 089_merchant_onboarding_apm_config.sql).
+            # That PR shipped the SQL migration + the SQLAlchemy model
+            # update + the routes, but no admin-run-migration apply
+            # lever, and production deploys do NOT auto-run
+            # db/migrations/. As a result, after PR #494 deployed,
+            # every audit run failed in `discovering` with
+            # "column merchant_onboarding.apm_enabled does not exist"
+            # because merchant_onboarding.select() materializes
+            # apm_enabled + friends. This block self-heals on startup
+            # so the outage cannot recur on any environment.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_onboarding
+                      ADD COLUMN IF NOT EXISTS apm_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                      ADD COLUMN IF NOT EXISTS apm_cadence_days INTEGER NULL,
+                      ADD COLUMN IF NOT EXISTS apm_scope_jsonb JSONB NULL,
+                      ADD COLUMN IF NOT EXISTS apm_configured_at TIMESTAMPTZ NULL,
+                      ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL;
+                    """
+                )
+            )
+            # Cadence check constraint (idempotent via DO block —
+            # mirrors migration 089's pg_constraint guard).
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'merchant_onboarding_apm_cadence_days_chk'
+                        ) THEN
+                            ALTER TABLE merchant_onboarding
+                                ADD CONSTRAINT merchant_onboarding_apm_cadence_days_chk
+                                CHECK (
+                                    apm_cadence_days IS NULL
+                                    OR apm_cadence_days IN (7, 14, 30)
+                                );
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_merchant_onboarding_apm_due
+                      ON merchant_onboarding (apm_last_run_at, apm_cadence_days)
+                      WHERE apm_enabled = TRUE;
+                    """
+                )
+            )
             # Pivota canonical PDP columns (migration 071). Fast-mode
             # startup skips db/migrations/, so the schema guard owns
             # these in production. Mirrors what's already in db.catalog
