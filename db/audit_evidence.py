@@ -216,6 +216,25 @@ VALID_AUDIENCES = frozenset({
     AUDIENCE_FRONTEND_AGENT_FEED,
 })
 
+# P0-4: role-gated audience access. Merchant JWTs may only read the
+# projections they're documented to be the consumer of. The four
+# internal projections carry data merchants should not see:
+#   - employee_bd: full evidence + cost detail (BD-operator view)
+#   - internal_ops: cost + latency dashboard ("not expected to ship
+#     to merchants" per the builder docstring)
+#   - pivota_pdp_feed: rendering hints for Pivota's own PDP service
+#   - frontend_agent_feed: agent-discoverable shape, currently
+#     conservatively gated; expand the allow list if product
+#     intentionally exposes it to merchant clients
+#
+# Non-merchant audiences require an employee/admin auth path that
+# the public `/api/audits/{run_id}` route does NOT currently expose
+# — the route's only auth dependency is get_current_merchant. A
+# follow-up PR can introduce role-aware dependencies; until then
+# the route returns 403 for any audience outside this allow list
+# and the projections stay merchant-invisible.
+MERCHANT_ALLOWED_AUDIENCES = frozenset({AUDIENCE_MERCHANT})
+
 
 # =====================================================================
 # SQLAlchemy Tables

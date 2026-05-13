@@ -268,6 +268,82 @@ def test_get_404_for_cross_tenant_run(client, stub):
 
 
 # =====================================================================
+# P0-4: audience auth restrictions on /api/audits/{run_id}?audience=
+# =====================================================================
+
+
+def test_get_merchant_audience_allowed(client, stub, monkeypatch):
+    """Merchant JWT + ?audience=merchant — the one allowed projection."""
+    stub.fetch_returns = _detail_row()
+    from routes import audit_runs_routes  # noqa: F401
+
+    async def fake_fetch_projection(*, audit_run_id, audience):
+        return {"payload_jsonb": {"audience": "merchant",
+                                  "action_queue": []}}
+
+    from db import audit_evidence
+    monkeypatch.setattr(
+        audit_evidence, "fetch_projection", fake_fetch_projection,
+    )
+    res = client.get("/api/audits/r-1?audience=merchant")
+    assert res.status_code == 200
+    body = res.json()
+    assert body.get("audience") == "merchant"
+
+
+def test_get_rejects_internal_ops_audience_for_merchant_jwt(client, stub):
+    """The bug: merchant JWT could fetch internal_ops projection of
+    their own audit. Must now return 403 — not 200, not 404."""
+    stub.fetch_returns = _detail_row()
+    res = client.get("/api/audits/r-1?audience=internal_ops")
+    assert res.status_code == 403
+    detail = (res.json() or {}).get("detail") or ""
+    assert "employee or admin" in detail.lower() or \
+        "merchant jwts may only read" in detail.lower(), (
+            f"403 detail should explain the auth requirement; got {detail}"
+        )
+
+
+def test_get_rejects_employee_bd_audience_for_merchant_jwt(client, stub):
+    """employee_bd projection includes full evidence + cost detail.
+    Must not be reachable via a merchant JWT."""
+    stub.fetch_returns = _detail_row()
+    res = client.get("/api/audits/r-1?audience=employee_bd")
+    assert res.status_code == 403
+
+
+def test_get_rejects_pivota_pdp_feed_audience_for_merchant_jwt(client, stub):
+    stub.fetch_returns = _detail_row()
+    res = client.get("/api/audits/r-1?audience=pivota_pdp_feed")
+    assert res.status_code == 403
+
+
+def test_get_rejects_frontend_agent_feed_audience_for_merchant_jwt(client, stub):
+    stub.fetch_returns = _detail_row()
+    res = client.get("/api/audits/r-1?audience=frontend_agent_feed")
+    assert res.status_code == 403
+
+
+def test_get_unknown_audience_returns_422_not_403(client, stub):
+    """Schema validation runs BEFORE the role check — an unknown
+    audience is a client error (422), not a permission error (403).
+    Ordering matters so callers see a clear "fix your audience param"
+    signal instead of a misleading 'employee auth required'."""
+    stub.fetch_returns = _detail_row()
+    res = client.get("/api/audits/r-1?audience=nonsense_audience")
+    assert res.status_code == 422
+
+
+def test_get_cross_tenant_with_internal_audience_still_returns_404(client, stub):
+    """Cross-tenant + internal audience: the cross-tenant 404 must
+    still win (don't leak existence). The audience-based 403 only
+    fires for runs the merchant DOES own."""
+    stub.fetch_returns = _detail_row(merchant_id="merch-OTHER")
+    res = client.get("/api/audits/r-1?audience=internal_ops")
+    assert res.status_code == 404
+
+
+# =====================================================================
 # POST /api/audits/{run_id}/cancel
 # =====================================================================
 

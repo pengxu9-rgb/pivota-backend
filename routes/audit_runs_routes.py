@@ -259,7 +259,9 @@ async def get_audit_run(
     # return the cached shape (or 409 if not yet built).
     if audience is not None:
         from db.audit_evidence import (
-            VALID_AUDIENCES, fetch_projection,
+            MERCHANT_ALLOWED_AUDIENCES,
+            VALID_AUDIENCES,
+            fetch_projection,
         )
         if audience not in VALID_AUDIENCES:
             raise HTTPException(
@@ -267,6 +269,27 @@ async def get_audit_run(
                 detail=(
                     f"Unknown audience {audience!r}. Valid values: "
                     f"{sorted(VALID_AUDIENCES)}"
+                ),
+            )
+        # P0-4: merchant JWTs may only read the merchant projection.
+        # employee_bd / internal_ops / pivota_pdp_feed /
+        # frontend_agent_feed carry internal data (cost detail, full
+        # raw evidence, ops dashboards, etc.) and require an
+        # employee/admin auth path that this route does not yet
+        # expose. Codex review surfaced this as P0-4 — before the
+        # fix, a merchant could fetch their own audit's internal_ops
+        # projection by adding `?audience=internal_ops`.
+        if audience not in MERCHANT_ALLOWED_AUDIENCES:
+            # 403, not 404. The merchant DOES own this run, so
+            # hiding existence is misleading — they just don't
+            # have role permission for this audience shape.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Audience {audience!r} requires employee or "
+                    "admin authentication. Merchant JWTs may only "
+                    "read 'merchant' (or omit ?audience for the "
+                    "canonical shape)."
                 ),
             )
         proj = await fetch_projection(
