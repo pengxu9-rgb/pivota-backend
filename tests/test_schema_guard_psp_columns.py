@@ -64,3 +64,58 @@ async def test_ensure_required_schema_light_adds_merchant_psp_columns_in_fast_mo
     assert any(
         "idx_catalog_products_lifecycle_live" in stmt for stmt in executed
     ), "partial index for pdp_lifecycle_stage live stages not created"
+    # PR-13 APM cols (mig 089). Self-heal block was added after the
+    # production outage where PR #494 deployed without applying the
+    # migration → every audit failed with "column merchant_onboarding
+    # .apm_enabled does not exist". Re-introducing the same gap by
+    # editing schema_guard should be caught by these assertions.
+    apm_stmt = next(
+        (s for s in executed
+         if "ALTER TABLE IF EXISTS merchant_onboarding" in s
+            and "apm_enabled" in s),
+        None,
+    )
+    assert apm_stmt is not None, (
+        "merchant_onboarding APM columns not self-healed in schema_guard"
+    )
+    assert "ADD COLUMN IF NOT EXISTS apm_enabled" in apm_stmt
+    assert "ADD COLUMN IF NOT EXISTS apm_cadence_days" in apm_stmt
+    assert "ADD COLUMN IF NOT EXISTS apm_scope_jsonb" in apm_stmt
+    assert "ADD COLUMN IF NOT EXISTS apm_configured_at" in apm_stmt
+    assert "ADD COLUMN IF NOT EXISTS apm_last_run_at" in apm_stmt
+    assert any(
+        "merchant_onboarding_apm_cadence_days_chk" in s for s in executed
+    ), "apm cadence check constraint not ensured"
+    assert any(
+        "idx_merchant_onboarding_apm_due" in s for s in executed
+    ), "apm due partial index not ensured"
+
+
+@pytest.mark.asyncio
+async def test_schema_guard_apm_block_matches_migration_089():
+    """Sentinel: schema_guard's APM self-heal must stay in lockstep
+    with the canonical migration 089. If a future edit drifts one
+    side, this test fails and reminds the author to update both."""
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    migration_text = (
+        repo_root / "db" / "migrations"
+        / "089_merchant_onboarding_apm_config.sql"
+    ).read_text()
+    guard_text = (repo_root / "db" / "schema_guard.py").read_text()
+    for token in (
+        "apm_enabled",
+        "apm_cadence_days",
+        "apm_scope_jsonb",
+        "apm_configured_at",
+        "apm_last_run_at",
+        "merchant_onboarding_apm_cadence_days_chk",
+        "idx_merchant_onboarding_apm_due",
+    ):
+        assert token in migration_text, f"{token} missing from migration 089"
+        assert token in guard_text, (
+            f"{token} present in migration 089 but missing from "
+            "schema_guard.ensure_required_schema_light — would "
+            "re-introduce the PR-13 outage gap"
+        )
