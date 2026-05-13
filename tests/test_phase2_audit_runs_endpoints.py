@@ -41,7 +41,13 @@ class _AccessorStub:
 
     async def enqueue(self, **kwargs):
         self.enqueued.append(kwargs)
-        return self.enqueue_returns
+        # P0-3: enqueue_audit_run_with_replay returns
+        # (run_id, was_existing). Keep the legacy single-string
+        # configuration for back-compat; tests that exercise the
+        # race-replay path can set enqueue_returns to a tuple.
+        if isinstance(self.enqueue_returns, tuple):
+            return self.enqueue_returns
+        return (self.enqueue_returns, False)
 
     async def find_idem(self, *, idempotency_key):
         self.idem_lookups.append(idempotency_key)
@@ -71,7 +77,7 @@ def client(stub, monkeypatch):
     from utils import auth as auth_module
 
     monkeypatch.setattr(
-        audit_runs_routes, "enqueue_audit_run", stub.enqueue,
+        audit_runs_routes, "enqueue_audit_run_with_replay", stub.enqueue,
     )
     monkeypatch.setattr(
         audit_runs_routes, "find_in_flight_by_idempotency_key",

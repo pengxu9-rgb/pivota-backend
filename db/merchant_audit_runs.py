@@ -37,7 +37,7 @@ import uuid
 from datetime import datetime, timezone
 
 from db._jsonb_safe import _json_safe
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
     ARRAY,
@@ -454,38 +454,166 @@ async def enqueue_audit_run(
 ) -> Optional[str]:
     """Insert a row in `stage='queued'` for the worker to pick up.
 
-    Returns the new run_id, or None on persistence failure (caller
-    decides whether to fall back to the legacy synchronous path or
-    surface a 5xx).
+    Returns the new run_id, or None on persistence failure. Callers
+    that need to know whether the returned id is a fresh insert or a
+    race-deduped existing row should use `enqueue_audit_run_with_replay`
+    below — this wrapper preserves the historical single-return
+    signature for back-compat (idempotency_key=None callers, the
+    legacy `/ai-commerce-readiness` fallback, tests, etc.).
+    """
+    run_id, _was_existing = await enqueue_audit_run_with_replay(
+        merchant_id=merchant_id,
+        product_keys=product_keys,
+        subject_type=subject_type,
+        idempotency_key=idempotency_key,
+        requested_by_user_id=requested_by_user_id,
+    )
+    return run_id
+
+
+async def enqueue_audit_run_with_replay(
+    *,
+    merchant_id: str,
+    product_keys: List[str],
+    subject_type: str = "merchant",
+    idempotency_key: Optional[str] = None,
+    requested_by_user_id: Optional[str] = None,
+) -> Tuple[Optional[str], bool]:
+    """Insert + DB-enforced idempotency dedupe (P0-3).
+
+    Returns `(run_id, was_existing)`:
+      - On a fresh insert: (new_run_id, False)
+      - On a unique-key conflict (concurrent POST raced past
+        find_in_flight_by_idempotency_key, OR the caller didn't
+        pre-check): (existing_run_id, True). Caller should treat
+        was_existing=True as "this is effectively an idempotent
+        replay" and surface it to the client.
+      - On persistence failure: (None, False).
+
+    Backed by `uniq_merchant_audit_runs_active_idempotency_key`
+    (partial UNIQUE index on `idempotency_key` where the row is in
+    an active stage). The DB-level uniqueness closes the check-then-
+    insert race that the route-layer find_in_flight could not.
     """
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
     now = _now_utc()
-    try:
-        await database.execute(
-            merchant_audit_runs.insert().values(
-                run_id=run_id,
-                merchant_id=merchant_id,
-                requested_at=now,
-                # Legacy `status` kept aligned with `stage` during
-                # the dual-key window — old readers see 'running'
-                # and new readers see 'queued'.
-                status="running",
-                stage=STAGE_QUEUED,
-                stage_updated_at=now,
-                product_keys=list(product_keys or []),
-                subject_type=subject_type,
-                idempotency_key=idempotency_key,
-                requested_by_user_id=requested_by_user_id,
+
+    # If no idempotency_key, fall through to the original behavior —
+    # no dedupe possible.
+    if not idempotency_key:
+        try:
+            await database.execute(
+                merchant_audit_runs.insert().values(
+                    run_id=run_id,
+                    merchant_id=merchant_id,
+                    requested_at=now,
+                    status="running",
+                    stage=STAGE_QUEUED,
+                    stage_updated_at=now,
+                    product_keys=list(product_keys or []),
+                    subject_type=subject_type,
+                    idempotency_key=None,
+                    requested_by_user_id=requested_by_user_id,
+                )
             )
+            return run_id, False
+        except Exception as exc:
+            logger.warning(
+                "enqueue_audit_run failed for merchant_id=%s: %s",
+                merchant_id, str(exc)[:200],
+            )
+            return None, False
+
+    # idempotency_key present — use INSERT ... ON CONFLICT DO NOTHING
+    # against the partial unique index. ON CONFLICT requires raw SQL
+    # since SQLAlchemy core's `insert().on_conflict_do_nothing()` is a
+    # postgres dialect call that's awkward in our databases-wrapped
+    # path; raw SQL is also faster + more explicit at this hot path.
+    try:
+        inserted = await database.fetch_one(
+            """
+            INSERT INTO merchant_audit_runs (
+                run_id, merchant_id, requested_at, status,
+                stage, stage_updated_at, product_keys,
+                subject_type, idempotency_key, requested_by_user_id
+            ) VALUES (
+                :run_id, :merchant_id, :now, 'running',
+                :stage_queued, :now, CAST(:product_keys AS TEXT[]),
+                :subject_type, :idempotency_key, :requested_by_user_id
+            )
+            ON CONFLICT ON CONSTRAINT uniq_merchant_audit_runs_active_idempotency_key
+            DO NOTHING
+            RETURNING run_id
+            """,
+            {
+                "run_id": run_id,
+                "merchant_id": merchant_id,
+                "now": now,
+                "stage_queued": STAGE_QUEUED,
+                "product_keys": list(product_keys or []),
+                "subject_type": subject_type,
+                "idempotency_key": idempotency_key,
+                "requested_by_user_id": requested_by_user_id,
+            },
         )
-        return run_id
     except Exception as exc:
+        # Fallback for environments where the unique constraint
+        # hasn't been applied yet (mid-deploy window between this
+        # PR and its migration). Behavior matches the old code:
+        # plain insert, no DB-enforced dedupe. Logged so ops sees
+        # the gap.
         logger.warning(
-            "enqueue_audit_run failed for merchant_id=%s: %s",
+            "enqueue_audit_run on-conflict path raised "
+            "(constraint maybe not applied yet?) — falling back to "
+            "plain insert. merchant_id=%s: %s",
             merchant_id, str(exc)[:200],
         )
-        return None
+        try:
+            await database.execute(
+                merchant_audit_runs.insert().values(
+                    run_id=run_id,
+                    merchant_id=merchant_id,
+                    requested_at=now,
+                    status="running",
+                    stage=STAGE_QUEUED,
+                    stage_updated_at=now,
+                    product_keys=list(product_keys or []),
+                    subject_type=subject_type,
+                    idempotency_key=idempotency_key,
+                    requested_by_user_id=requested_by_user_id,
+                )
+            )
+            return run_id, False
+        except Exception as inner_exc:
+            logger.warning(
+                "enqueue_audit_run fallback insert failed for "
+                "merchant_id=%s: %s",
+                merchant_id, str(inner_exc)[:200],
+            )
+            return None, False
+
+    if inserted is not None:
+        return str(inserted["run_id"]), False
+
+    # ON CONFLICT fired — the row with this idempotency_key already
+    # exists in an active stage. Fetch its run_id and signal replay.
+    existing = await find_in_flight_by_idempotency_key(
+        idempotency_key=idempotency_key,
+    )
+    if existing:
+        return existing, True
+
+    # Pathological case: conflict fired but the existing row was
+    # cancelled / completed between conflict and the find. Surface as
+    # a failure so the caller can decide (retry, fail, etc.) rather
+    # than silently lose the request.
+    logger.warning(
+        "enqueue_audit_run ON CONFLICT fired but no in-flight row "
+        "found for idempotency_key — race with terminal transition. "
+        "merchant_id=%s", merchant_id,
+    )
+    return None, False
 
 
 async def find_in_flight_by_idempotency_key(

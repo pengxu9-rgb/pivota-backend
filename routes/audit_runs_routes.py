@@ -40,7 +40,7 @@ from db.merchant_audit_runs import (
     ACTIVE_STAGES,
     STAGE_QUEUED,
     cancel_audit_run,
-    enqueue_audit_run,
+    enqueue_audit_run_with_replay,
     fetch_audit_run_by_id,
     find_in_flight_by_idempotency_key,
     recent_runs_for_merchant,
@@ -189,7 +189,12 @@ async def create_audit_run(
     else:
         idempotency_key = None
 
-    run_id = await enqueue_audit_run(
+    # enqueue_audit_run_with_replay returns (run_id, was_existing).
+    # was_existing=True means INSERT ... ON CONFLICT DO NOTHING fired
+    # against the partial unique idempotency index — a concurrent
+    # POST won the race; we hand back the winning run_id and signal
+    # idempotent_replay so the client knows it wasn't a fresh enqueue.
+    run_id, was_existing = await enqueue_audit_run_with_replay(
         merchant_id=body.merchant_id,
         product_keys=body.product_keys,
         subject_type=body.subject_type,
@@ -209,11 +214,13 @@ async def create_audit_run(
 
     logger.info(
         "audit_runs: enqueued merchant=%s run_id=%s products=%d "
-        "force=%s",
+        "force=%s race_replay=%s",
         body.merchant_id, run_id, len(body.product_keys), body.force,
+        was_existing,
     )
     return AuditRunCreated(
-        run_id=run_id, stage=STAGE_QUEUED, idempotent_replay=False,
+        run_id=run_id, stage=STAGE_QUEUED,
+        idempotent_replay=was_existing,
     )
 
 
