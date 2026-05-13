@@ -38,6 +38,10 @@ class _AccessorStub:
         self.fetch_returns: Optional[Dict[str, Any]] = None
         self.list_returns: List[Dict[str, Any]] = []
         self.cancel_returns: bool = True
+        # P1-2: by default the product-key ownership check passes
+        # (no keys are missing). Tests that exercise the validation
+        # path set missing_keys_returns explicitly.
+        self.missing_keys_returns: List[str] = []
 
     async def enqueue(self, **kwargs):
         self.enqueued.append(kwargs)
@@ -62,6 +66,9 @@ class _AccessorStub:
 
     async def recent(self, *, merchant_id, limit):
         return self.list_returns
+
+    async def missing_keys(self, *, merchant_id, product_keys):
+        return list(self.missing_keys_returns)
 
 
 @pytest.fixture
@@ -91,6 +98,10 @@ def client(stub, monkeypatch):
     )
     monkeypatch.setattr(
         audit_runs_routes, "recent_runs_for_merchant", stub.recent,
+    )
+    monkeypatch.setattr(
+        audit_runs_routes,
+        "_missing_product_keys_for_merchant", stub.missing_keys,
     )
 
     app = FastAPI()
@@ -211,6 +222,60 @@ def test_post_returns_503_on_persistence_failure(client, stub):
         },
     )
     assert res.status_code == 503
+
+
+def test_post_422_when_any_product_key_missing(client, stub):
+    """P1-2 regression: when one or more product_keys are not owned by
+    the authenticated merchant (or don't exist), POST returns 422
+    with the missing keys listed — does NOT enqueue a doomed run."""
+    stub.missing_keys_returns = ["pk-foreign", "pk-typo"]
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1", "pk-foreign", "pk-typo"],
+        },
+    )
+    assert res.status_code == 422
+    detail = res.json().get("detail") or {}
+    assert "missing_product_keys" in detail
+    assert set(detail["missing_product_keys"]) == {"pk-foreign", "pk-typo"}
+    # The route must NOT have enqueued anything.
+    assert stub.enqueued == [], (
+        "422 path must short-circuit before enqueue"
+    )
+
+
+def test_post_validation_runs_before_idempotency_lookup(client, stub):
+    """Ordering guard: cross-tenant guard already runs first, but the
+    product-key ownership check must also fire BEFORE the idempotency
+    lookup. Otherwise a typo would still bump the daily-cap counter
+    or hit the idempotency table on every retry."""
+    stub.missing_keys_returns = ["pk-not-owned"]
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-not-owned"],
+        },
+    )
+    assert res.status_code == 422
+    assert stub.idem_lookups == [], (
+        "Ownership-422 must short-circuit before find_in_flight is "
+        "called — otherwise typos pollute the idempotency lookups"
+    )
+
+
+def test_post_happy_path_with_valid_keys_passes_ownership_check(client, stub):
+    """Sanity: when missing_keys returns empty, the route proceeds
+    to enqueue as before."""
+    stub.missing_keys_returns = []
+    res = client.post(
+        "/api/audits",
+        json={"merchant_id": "merch-A", "product_keys": ["pk-1"]},
+    )
+    assert res.status_code == 202
+    assert len(stub.enqueued) == 1
 
 
 # =====================================================================
