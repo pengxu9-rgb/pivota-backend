@@ -86,15 +86,33 @@ def _extract_failed_category_queries(
     for product in (audit_report.get("per_product") or []):
         if not isinstance(product, dict):
             continue
-        cv = product.get("category_visibility") or {}
-        match_details = cv.get("match_details") or []
+        # Q-P1-7: defensive shape handling. `category_visibility` is a
+        # dict in the canonical probe output, but production has
+        # surfaced both shapes:
+        #   - dict: {"queries": [...], "match_details": [...], ...}
+        #   - list: [{"query": "...", "matched": False}, ...]  (legacy
+        #     / partial-probe shape; behaves like a flat queries list
+        #     with match_details inlined)
+        # Pre-fix this crashed with AttributeError on the list shape.
+        cv_raw = product.get("category_visibility")
+        if isinstance(cv_raw, list):
+            # List shape: each entry is already a query+match record.
+            # Treat the list itself as both `queries` and inline
+            # `match_details`.
+            queries_iter = cv_raw
+            match_details = cv_raw
+        elif isinstance(cv_raw, dict):
+            queries_iter = cv_raw.get("queries") or []
+            match_details = cv_raw.get("match_details") or []
+        else:
+            continue
         # Index match_details by query for joining.
         md_by_query = {
             (md.get("query") or ""): md
             for md in match_details
             if isinstance(md, dict)
         }
-        for q in (cv.get("queries") or []):
+        for q in queries_iter:
             if not isinstance(q, dict):
                 continue
             qtext = q.get("query") or ""
@@ -103,6 +121,8 @@ def _extract_failed_category_queries(
             md = md_by_query.get(qtext)
             if md is not None:
                 # Use strict signal when match_details available.
+                # In the list-shape case `md` and `q` are the same dict;
+                # the `matched` field still drives the decision.
                 is_failure = not bool(md.get("matched", False))
             else:
                 # Fallback: query returned zero grounded sources.
