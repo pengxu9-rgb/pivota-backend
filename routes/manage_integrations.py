@@ -81,12 +81,14 @@ async def delete_store(
         
         if not store:
             raise HTTPException(status_code=404, detail="Store not found or not owned by this merchant")
+
+        store_data = dict(store)
         
         async with database.transaction():
             delete_query = "DELETE FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id"
             await database.execute(delete_query, {"store_id": store_id, "merchant_id": merchant_id})
 
-            if store.get("is_primary"):
+            if store_data.get("is_primary"):
                 await database.execute(
                     """
                     WITH next_store AS (
@@ -160,6 +162,8 @@ async def update_store(
         
         if not store:
             raise HTTPException(status_code=404, detail="Store not found or not owned by this merchant")
+
+        store_row = dict(store)
         
         # Build update query dynamically based on provided fields
         update_fields = []
@@ -173,7 +177,7 @@ async def update_store(
             # Merge credentials when api_key is provided as a JSON/dict patch, e.g.
             # {"storefront_access_token":"..."} so we don't wipe the existing Admin token.
             patch = store_data["api_key"]
-            current_raw = store.get("api_key") or ""
+            current_raw = store_row.get("api_key") or ""
 
             current: Dict[str, Any] = {}
             if isinstance(current_raw, str) and current_raw.strip().startswith("{"):
@@ -203,7 +207,7 @@ async def update_store(
 
             # Detect whether the caller is attempting to update Shopify Admin token.
             updates_shopify_admin_token = False
-            if store.get("platform") == "shopify":
+            if store_row.get("platform") == "shopify":
                 if isinstance(patch_dict, dict) and any(k in patch_dict for k in ("access_token", "token")):
                     updates_shopify_admin_token = True
 
@@ -221,8 +225,8 @@ async def update_store(
                     merged[k] = v
 
             # Verify Shopify Admin token when it is being updated to prevent storing invalid credentials.
-            if store.get("platform") == "shopify" and updates_shopify_admin_token:
-                domain = str(store.get("domain") or "").strip().lower()
+            if store_row.get("platform") == "shopify" and updates_shopify_admin_token:
+                domain = str(store_row.get("domain") or "").strip().lower()
                 admin_token = merged.get("access_token") or merged.get("token")
                 admin_token = admin_token.strip() if isinstance(admin_token, str) else ""
                 if not domain or not admin_token:
@@ -250,12 +254,12 @@ async def update_store(
 
             # Optional verify: if storefront token present for Shopify, ping Storefront API.
             if (
-                (store.get("platform") == "shopify")
-                and isinstance(store.get("domain"), str)
+                (store_row.get("platform") == "shopify")
+                and isinstance(store_row.get("domain"), str)
                 and isinstance(merged.get("storefront_access_token"), str)
                 and merged.get("storefront_access_token")
             ):
-                domain = store.get("domain")
+                domain = store_row.get("domain")
                 token = merged.get("storefront_access_token")
                 try:
                     url = f"https://{domain}/api/2024-07/graphql.json"
@@ -327,8 +331,9 @@ async def set_primary_store(
     if not store:
         raise HTTPException(status_code=404, detail="Store not found or not owned by this merchant")
 
-    status = (store.get("status") or "").lower()
-    api_key = store.get("api_key") or ""
+    store_data = dict(store)
+    status = (store_data.get("status") or "").lower()
+    api_key = store_data.get("api_key") or ""
     if status not in ("active", "connected"):
         raise HTTPException(status_code=400, detail=f"Store status is '{status}'. Please reconnect the store first.")
     if not api_key.strip():
@@ -353,7 +358,7 @@ async def set_primary_store(
                 """,
                 {"store_id": store_id, "merchant_id": merchant_id},
             )
-            await sync_legacy_primary_store_fields(merchant_id, dict(store))
+            await sync_legacy_primary_store_fields(merchant_id, store_data)
 
         return {
             "status": "success",
@@ -372,7 +377,7 @@ async def set_primary_store(
                     """,
                     {"store_id": store_id, "merchant_id": merchant_id},
                 )
-                await sync_legacy_primary_store_fields(merchant_id, dict(store))
+                await sync_legacy_primary_store_fields(merchant_id, store_data)
                 return {
                     "status": "success",
                     "message": "Primary store updated",
