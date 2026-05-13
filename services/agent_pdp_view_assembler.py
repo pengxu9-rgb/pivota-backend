@@ -215,14 +215,31 @@ def aggregate_variants(skus: List[Dict[str, Any]], canonical_source_product_id: 
 
 
 def pick_gtin13(skus: List[Dict[str, Any]]) -> Optional[str]:
+    """Pick the canonical 14-char GTIN for the content_key group.
+
+    Two failure modes to avoid:
+      1. agent_pdp_view.gtin13 is VARCHAR(14); normalize_gtin passes
+         15+ digit malformed inputs through unchanged. Skip those —
+         they aren't valid GTIN-14.
+      2. SKUs in the same content_key group can carry different
+         barcodes (data noise, or genuine cross-merchant disagreement).
+         Pick the modal value so we deterministically converge on the
+         GTIN that appears most often; tiebreak by lex order so re-runs
+         are byte-identical.
+    """
+    counts: Dict[str, int] = {}
     for s in skus:
         bar = s.get("barcode")
         if not bar:
             continue
         canon = normalize_gtin(str(bar))
-        if canon:
-            return canon
-    return None
+        if not canon or len(canon) != 14:
+            continue
+        counts[canon] = counts.get(canon, 0) + 1
+    if not counts:
+        return None
+    # Sort by count DESC, then GTIN ASC for stable tiebreak.
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
 def build_taxonomy_tags(canonical: Dict[str, Any]) -> Optional[Dict[str, Any]]:

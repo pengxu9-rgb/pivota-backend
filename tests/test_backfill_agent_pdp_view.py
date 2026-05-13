@@ -254,6 +254,40 @@ def test_pick_gtin13_returns_none_when_no_skus_have_barcode() -> None:
     assert backfill.pick_gtin13([{"barcode": ""}, {"barcode": None}]) is None
 
 
+def test_pick_gtin13_rejects_malformed_15_plus_digit_inputs() -> None:
+    """normalize_gtin passes 15+ digit inputs through unchanged (its
+    "malformed, leave as-is" path). agent_pdp_view.gtin13 is
+    VARCHAR(14), so writing a 15+ char value would either fail or
+    silently truncate. Skip those rather than emit a bad value.
+    """
+    skus = [{"barcode": "1234567890123456"}]  # 16 digits → malformed
+    assert backfill.pick_gtin13(skus) is None
+
+
+def test_pick_gtin13_picks_modal_when_skus_disagree() -> None:
+    """When SKUs in the same content_key group carry different
+    barcodes (data noise / cross-merchant disagreement), pick the
+    modal value deterministically — not whichever row asyncpg
+    happened to return first.
+    """
+    skus = [
+        {"barcode": "773602443796"},      # GTIN-A: 00773602443796
+        {"barcode": "773602443796"},      # GTIN-A
+        {"barcode": "999999999999"},      # GTIN-B: 00999999999999
+    ]
+    assert backfill.pick_gtin13(skus) == "00773602443796"
+
+
+def test_pick_gtin13_lex_smallest_wins_on_count_tie() -> None:
+    """Two distinct GTINs each appearing once — sort tiebreak picks
+    lex-smallest so re-runs are byte-identical."""
+    skus = [
+        {"barcode": "999999999999"},
+        {"barcode": "111111111111"},
+    ]
+    assert backfill.pick_gtin13(skus) == "00111111111111"
+
+
 # ---------------------------------------------------------------------------
 # upsert SQL shape
 # ---------------------------------------------------------------------------
