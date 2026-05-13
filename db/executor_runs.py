@@ -525,6 +525,13 @@ async def mark_executor_run_succeeded(
         "completed_at": now,
         # Keep legacy `status` aligned during the dual-key window.
         "status": "succeeded",
+        # Q-P1-7: clear stale failure text. A run that bounced from
+        # STAGE_FAILED → retry → STAGE_SUCCEEDED previously kept the
+        # error_message from the failed attempt, leaving operators
+        # looking at "succeeded" rows that still carry a failure
+        # message. The transient failure is no longer the truth once
+        # the retry succeeded.
+        "error_message": None,
     }
     if evidence_jsonb is not None:
         # JSONB write boundary — coerce UUID/datetime/Decimal.
