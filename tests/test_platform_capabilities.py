@@ -19,7 +19,7 @@ def test_non_shopify_platforms_are_not_live_quote_purchase_ready() -> None:
     assert get_store_platform_capabilities("bigcommerce").purchase_status == "requires_external_platform_checkout_validation"
     assert get_store_platform_capabilities("woocommerce").supports_platform_order_writeback is True
     assert get_store_platform_capabilities("bigcommerce").supports_platform_order_writeback is True
-    assert get_store_platform_capabilities("wix").supports_platform_order_writeback is False
+    assert get_store_platform_capabilities("wix").supports_platform_order_writeback is True
 
 
 def test_custom_and_headless_tiers_audit_only_no_writeback() -> None:

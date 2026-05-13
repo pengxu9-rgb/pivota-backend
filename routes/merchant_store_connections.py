@@ -827,6 +827,52 @@ class ConnectWixRequest(BaseModel):
     store_name: Optional[str] = None
 
 
+@router.get("/wix/oauth/start")
+async def wix_oauth_start_stub(
+    merchant_id: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Stub for Wix App OAuth onboarding.
+
+    TODO(PR-10b follow-up): register the Wix app, request Manage Orders
+    permission, exchange the app instance for an access token using
+    WIX_APP_CLIENT_ID / WIX_APP_CLIENT_SECRET, and persist:
+      {"access_token": "<bearer token>", "site_id": "<wix site id>"}
+    in merchant_stores.api_key.
+    """
+    if current_user["role"] == "merchant" and current_user.get("merchant_id") != merchant_id:
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "error": "wix_oauth_not_configured",
+            "message": "Wix App OAuth requires registered Wix app credentials before live onboarding can run.",
+            "required_env": ["WIX_APP_CLIENT_ID", "WIX_APP_CLIENT_SECRET"],
+            "expected_store_credentials": {
+                "access_token": "stored Wix OAuth bearer token",
+                "site_id": "Wix site id",
+            },
+            "env_configured": {
+                "WIX_APP_CLIENT_ID": bool(os.getenv("WIX_APP_CLIENT_ID")),
+                "WIX_APP_CLIENT_SECRET": bool(os.getenv("WIX_APP_CLIENT_SECRET")),
+            },
+        },
+    )
+
+
+@router.get("/wix/oauth/callback")
+async def wix_oauth_callback_stub():
+    """Stub callback for the future Wix App OAuth handshake."""
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "error": "wix_oauth_not_configured",
+            "message": "Wix OAuth callback is stubbed until Wix developer app credentials are available.",
+            "required_env": ["WIX_APP_CLIENT_ID", "WIX_APP_CLIENT_SECRET"],
+        },
+    )
+
+
 class ConnectWooCommerceRequest(BaseModel):
     merchant_id: str
     store_url: str

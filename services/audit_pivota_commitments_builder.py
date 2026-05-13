@@ -74,8 +74,8 @@ _PLATFORM_CAPABILITY_SUMMARY: Dict[str, str] = {
         "End-to-end automated order writeback into BigCommerce admin"
     ),
     "wix": (
-        "Audit + AI-channel discovery shipped today; automated order "
-        "writeback on Q3 roadmap (manual order routing in the interim)"
+        "End-to-end automated order writeback adapter into Wix admin "
+        "(live activation requires Wix App OAuth credentials)"
     ),
     "custom": (
         "Audit + AI-channel discovery shipped today; order writeback "
@@ -246,9 +246,8 @@ def build_pivota_commitments(
         return {
             "merchant_platform": None,
             "platform_capability_summary": (
-                "Multi-platform: Shopify, WooCommerce, and BigCommerce "
-                "supported end-to-end for automated order writeback. "
-                "Wix supported for audit + manual order routing today. "
+                "Multi-platform: Shopify, WooCommerce, BigCommerce, and "
+                "Wix supported for automated order writeback. "
                 "Custom and headless storefronts supported via "
                 "lightweight engineering integration."
             ),
