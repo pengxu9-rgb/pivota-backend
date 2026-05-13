@@ -1,7 +1,7 @@
 """PR-1b: scheduled re-audit job.
 
 Fires once a day (03:00 UTC, see services/audit_scheduler.py). Picks
-up merchants opted into weekly/monthly auto-re-audit and runs the full
+up merchants opted into Agent Presence Monitoring and runs the full
 audit pipeline for any that are due, persisting results via the
 existing merchant_audit_runs lifecycle.
 
@@ -48,11 +48,19 @@ _MAX_CONCURRENT_AUDITS = 3
 _MIN_HOURS_BETWEEN_AUDITS = 23
 
 
-# Schedule → minimum days between auto-re-audits.
+# Legacy schedule → minimum days between auto-re-audits.
 _INTERVAL_DAYS = {
     "weekly": 7,
     "monthly": 30,
 }
+
+_APM_CADENCE_DAYS = {7, 14, 30}
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def is_audit_due(
@@ -72,51 +80,78 @@ def is_audit_due(
         # Opted in but never audited — kick off the first run on the
         # next cron tick.
         return True
-    now_utc = now if now is not None else datetime.now(timezone.utc)
+    now_utc = _as_utc(now if now is not None else datetime.now(timezone.utc))
     interval = timedelta(days=_INTERVAL_DAYS[schedule])
-    return (now_utc - last_audit_at) >= interval
+    return (now_utc - _as_utc(last_audit_at)) >= interval
+
+
+def is_apm_audit_due(
+    *,
+    apm_enabled: bool,
+    cadence_days: Optional[int],
+    apm_last_run_at: Optional[datetime],
+    now: Optional[datetime] = None,
+) -> bool:
+    """Return whether a merchant's APM config is due for cron pickup."""
+    if not apm_enabled:
+        return False
+    if cadence_days not in _APM_CADENCE_DAYS:
+        return False
+    if apm_last_run_at is None:
+        return True
+    now_utc = now if now is not None else datetime.now(timezone.utc)
+    return (_as_utc(now_utc) - _as_utc(apm_last_run_at)) >= timedelta(
+        days=cadence_days,
+    )
 
 
 async def _list_due_merchants() -> List[Dict[str, Any]]:
-    """Query catalog_merchants for opted-in merchants whose most recent
-    audit run is past their schedule's interval.
+    """Query merchant_onboarding for APM-enabled merchants due for audit.
 
-    Returns list of `{merchant_id, schedule, last_audit_at}`.
+    Returns list of `{merchant_id, cadence_days, last_audit_at}`.
     """
     from db.database import database
-    from db.catalog import catalog_merchants
     from db.merchant_audit_runs import merchant_audit_runs
+    from db.merchant_onboarding import merchant_onboarding
 
     try:
-        # Subquery: most recent succeeded audit per merchant.
-        # We use requested_at (not completed_at) so a merchant whose
-        # audit is currently running but started ≤ interval ago is
-        # NOT picked up again.
-        opted_in_rows = await database.fetch_all(
+        apm_rows = await database.fetch_all(
             select(
-                catalog_merchants.c.merchant_id,
-                catalog_merchants.c.audit_schedule,
+                merchant_onboarding.c.merchant_id,
+                merchant_onboarding.c.apm_enabled,
+                merchant_onboarding.c.apm_cadence_days,
+                merchant_onboarding.c.apm_last_run_at,
             ).where(
-                catalog_merchants.c.audit_schedule.in_(["weekly", "monthly"]),
-                catalog_merchants.c.status == "active",
+                merchant_onboarding.c.apm_configured_at.isnot(None),
+                merchant_onboarding.c.apm_enabled.is_(True),
+                merchant_onboarding.c.status != "deleted",
             )
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "scheduled_audit_job: opted-in query failed: %s", exc,
+            "scheduled_audit_job: APM config query failed: %s", exc,
         )
         return []
 
-    if not opted_in_rows:
+    if not apm_rows:
         return []
 
     out: List[Dict[str, Any]] = []
     now_utc = datetime.now(timezone.utc)
     min_gap = timedelta(hours=_MIN_HOURS_BETWEEN_AUDITS)
 
-    for row in opted_in_rows:
+    for raw_row in apm_rows:
+        row = dict(raw_row)
         merchant_id = row["merchant_id"]
-        schedule = row["audit_schedule"]
+        cadence_days = row.get("apm_cadence_days")
+        apm_last_run_at = row.get("apm_last_run_at")
+        if not is_apm_audit_due(
+            apm_enabled=bool(row.get("apm_enabled")),
+            cadence_days=cadence_days,
+            apm_last_run_at=apm_last_run_at,
+            now=now_utc,
+        ):
+            continue
         try:
             most_recent = await database.fetch_one(
                 merchant_audit_runs.select()
@@ -131,24 +166,23 @@ async def _list_due_merchants() -> List[Dict[str, Any]]:
             )
             continue
 
+        most_recent_data = dict(most_recent) if most_recent else None
         last_at = (
-            most_recent["requested_at"]
-            if most_recent and most_recent.get("requested_at")
+            most_recent_data["requested_at"]
+            if most_recent_data and most_recent_data.get("requested_at")
             else None
         )
         # Idempotency belt: even if schedule says due, skip if audit
         # happened within the last 23h. Avoids stacked misfire double-
         # runs.
-        if last_at is not None and (now_utc - last_at) < min_gap:
-            continue
-        if not is_audit_due(last_at, schedule, now=now_utc):
+        if last_at is not None and (now_utc - _as_utc(last_at)) < min_gap:
             continue
         out.append({
             "merchant_id": merchant_id,
-            "schedule": schedule,
-            "last_audit_at": last_at,
+            "cadence_days": cadence_days,
+            "last_audit_at": apm_last_run_at,
             "last_audit_run_id": (
-                str(most_recent["run_id"]) if most_recent else None
+                str(most_recent_data["run_id"]) if most_recent_data else None
             ),
         })
     return out
@@ -170,7 +204,7 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
     merchant_id = due["merchant_id"]
     summary: Dict[str, Any] = {
         "merchant_id": merchant_id,
-        "schedule": due["schedule"],
+        "cadence_days": due.get("cadence_days"),
         "status": "skipped",
         "reason": None,
     }
@@ -192,11 +226,12 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
         summary["reason"] = f"prior fetch failed: {exc!r}"
         return summary
 
-    if not prior or not prior.get("report_jsonb"):
+    prior_data = dict(prior) if prior else None
+    if not prior_data or not prior_data.get("report_jsonb"):
         summary["reason"] = "prior report_jsonb missing"
         return summary
 
-    products = _extract_products_from_prior_report(prior["report_jsonb"])
+    products = _extract_products_from_prior_report(prior_data["report_jsonb"])
     if not products:
         summary["reason"] = "no products extracted from prior report"
         return summary
@@ -246,6 +281,16 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
         category_visibility_score_avg=agg.get("avg_category_visibility"),
         report_jsonb=out,
     )
+    try:
+        from db.apm_config import mark_apm_audit_run_completed
+
+        await mark_apm_audit_run_completed(merchant_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "scheduled_audit_job: apm_last_run_at update failed for %s: %s",
+            merchant_id,
+            exc,
+        )
     summary["status"] = "succeeded"
     summary["run_id"] = run_id
     summary["visibility"] = agg.get("avg_visibility")
