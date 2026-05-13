@@ -433,6 +433,153 @@ async def _link_task_to_canonical_action(
         return False
 
 
+def _norm_fingerprint(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).lower()
+
+
+def _first_fingerprint(evidence: Dict[str, Any], keys: tuple) -> str:
+    if not isinstance(evidence, dict):
+        return ""
+    for key in keys:
+        value = _norm_fingerprint(evidence.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _executor_topics(evidence: Dict[str, Any]) -> List[str]:
+    topics: List[str] = []
+
+    def add(value: Any) -> None:
+        norm = _norm_fingerprint(value)
+        if norm and norm not in topics:
+            topics.append(norm)
+
+    if not isinstance(evidence, dict):
+        return topics
+    for key in ("topic", "target_topic", "query", "target_query"):
+        add(evidence.get(key))
+    for key in ("briefs", "failures"):
+        for item in evidence.get(key) or []:
+            if isinstance(item, dict):
+                add(item.get("target_query"))
+                add(item.get("query"))
+    return topics
+
+
+def _executor_parent_match_score(
+    *,
+    title: str,
+    evidence: Dict[str, Any],
+    candidate: Dict[str, Any],
+) -> int:
+    candidate_evidence = (
+        candidate.get("evidence_jsonb") or candidate.get("evidence") or {}
+    )
+    score = 0
+
+    executor_host = _first_fingerprint(evidence, ("target_host", "host"))
+    candidate_host = _first_fingerprint(candidate_evidence, ("target_host", "host"))
+    if executor_host and candidate_host:
+        if executor_host != candidate_host:
+            return 0
+        score += 100
+
+    executor_product = _first_fingerprint(evidence, ("product_key",))
+    candidate_product = _first_fingerprint(candidate_evidence, ("product_key",))
+    if executor_product and candidate_product:
+        if executor_product != candidate_product:
+            return 0
+        score += 80
+
+    blob_values = [candidate.get("title"), candidate.get("body")]
+    if isinstance(candidate_evidence, dict):
+        blob_values.extend([
+            candidate_evidence.get("topic"),
+            candidate_evidence.get("target_topic"),
+            candidate_evidence.get("query"),
+            candidate_evidence.get("target_query"),
+        ])
+    candidate_blob = _norm_fingerprint(
+        " ".join(str(v) for v in blob_values if v)
+    )
+    if any(topic in candidate_blob for topic in _executor_topics(evidence)):
+        score += 60
+
+    if _normalize_title_for_identity(title) == _normalize_title_for_identity(
+        candidate.get("title") or ""
+    ):
+        score += 20
+
+    return score
+
+
+async def _resolve_executor_parent_audit_run_id(
+    *,
+    executor_run_id: str,
+    parent_audit_run_id: Optional[str],
+) -> Optional[str]:
+    if parent_audit_run_id:
+        return parent_audit_run_id
+    try:
+        from db.executor_runs import fetch_executor_run_by_id
+
+        run = await fetch_executor_run_by_id(run_id=executor_run_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "executor parent audit lookup raised run_id=%s: %s",
+            executor_run_id, str(exc)[:200],
+        )
+        return None
+    return (run or {}).get("parent_audit_run_id")
+
+
+async def _find_executor_parent_task_id(
+    *,
+    merchant_id: str,
+    parent_audit_run_id: Optional[str],
+    lever: Optional[str],
+    title: str,
+    evidence: Dict[str, Any],
+) -> Optional[str]:
+    if not parent_audit_run_id:
+        return None
+    try:
+        from db.merchant_tasks import find_executor_parent_task_candidates
+
+        candidates = await find_executor_parent_task_candidates(
+            merchant_id=merchant_id,
+            parent_audit_run_id=parent_audit_run_id,
+            lever=lever,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "executor parent task lookup raised merchant=%s audit=%s: %s",
+            merchant_id, parent_audit_run_id, str(exc)[:200],
+        )
+        return None
+
+    best_score = 0
+    best: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        score = _executor_parent_match_score(
+            title=title,
+            evidence=evidence,
+            candidate=candidate,
+        )
+        if score > best_score:
+            best_score = score
+            best = [candidate]
+        elif score == best_score and score > 0:
+            best.append(candidate)
+
+    if best_score <= 0 or len(best) != 1:
+        return None
+    return best[0].get("task_id")
+
+
 async def materialize_task_from_executor(
     *,
     merchant_id: str,
@@ -471,14 +618,27 @@ async def materialize_task_from_executor(
     if not title:
         return None  # this agent's run produced no human-actionable work
 
+    resolved_parent_audit_run_id = await _resolve_executor_parent_audit_run_id(
+        executor_run_id=executor_run_id,
+        parent_audit_run_id=parent_audit_run_id,
+    )
+    parent_task_id = await _find_executor_parent_task_id(
+        merchant_id=merchant_id,
+        parent_audit_run_id=resolved_parent_audit_run_id,
+        lever=lever,
+        title=title,
+        evidence=evidence,
+    )
+
     return await record_task_created(
         merchant_id=merchant_id,
         title=title,
         body=body or "",
         severity=severity or "medium",
         lever=lever,
-        parent_audit_run_id=parent_audit_run_id,
+        parent_audit_run_id=resolved_parent_audit_run_id,
         source_executor_run_id=executor_run_id,
+        parent_task_id=parent_task_id,
         assigned_to_agent=agent_name,
         evidence=evidence,
     )

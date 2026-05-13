@@ -59,6 +59,7 @@ merchant_tasks = Table(
     Column("merchant_id", Text, nullable=False),
     Column("parent_audit_run_id", UUID(as_uuid=False), nullable=True),
     Column("source_executor_run_id", UUID(as_uuid=False), nullable=True),
+    Column("parent_task_id", UUID(as_uuid=False), nullable=True),
     Column("lever", Text, nullable=True),
     Column("severity", Text, nullable=False),
     Column("title", Text, nullable=False),
@@ -93,6 +94,7 @@ _DDL_STATEMENTS = [
       merchant_id              TEXT NOT NULL,
       parent_audit_run_id      UUID NULL,
       source_executor_run_id   UUID NULL,
+      parent_task_id           UUID NULL,
       lever                    TEXT NULL,
       severity                 TEXT NOT NULL DEFAULT 'medium',
       title                    TEXT NOT NULL,
@@ -112,6 +114,8 @@ _DDL_STATEMENTS = [
     # existing-deploy tables get it via the ALTER below (idempotent).
     "ALTER TABLE merchant_tasks ADD COLUMN IF NOT EXISTS "
     "superseded_by_task_id UUID NULL;",
+    "ALTER TABLE merchant_tasks ADD COLUMN IF NOT EXISTS "
+    "parent_task_id UUID NULL;",
     "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_open "
     "ON merchant_tasks (merchant_id, status, severity, created_at DESC) "
     "WHERE status IN ('pending', 'in_progress');",
@@ -121,6 +125,9 @@ _DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_executor_source "
     "ON merchant_tasks (source_executor_run_id) "
     "WHERE source_executor_run_id IS NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_parent_task "
+    "ON merchant_tasks (parent_task_id) "
+    "WHERE parent_task_id IS NOT NULL;",
     "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_identity_pending "
     "ON merchant_tasks (merchant_id, lever, title) "
     "WHERE status = 'pending';",
@@ -162,6 +169,7 @@ async def record_task_created(
     lever: Optional[str] = None,
     parent_audit_run_id: Optional[str] = None,
     source_executor_run_id: Optional[str] = None,
+    parent_task_id: Optional[str] = None,
     assigned_to_agent: Optional[str] = None,
     assigned_to_human: Optional[str] = None,
     evidence: Optional[Dict[str, Any]] = None,
@@ -186,6 +194,7 @@ async def record_task_created(
                 merchant_id=merchant_id,
                 parent_audit_run_id=parent_audit_run_id,
                 source_executor_run_id=source_executor_run_id,
+                parent_task_id=parent_task_id,
                 lever=lever,
                 severity=severity,
                 title=title[:500],
@@ -293,6 +302,10 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
             str(d.get("source_executor_run_id"))
             if d.get("source_executor_run_id") else None
         ),
+        "parent_task_id": (
+            str(d.get("parent_task_id"))
+            if d.get("parent_task_id") else None
+        ),
         "lever": d.get("lever"),
         "severity": d.get("severity"),
         "title": d.get("title"),
@@ -363,6 +376,42 @@ async def list_tasks_for_merchant(
         logger.warning(
             "list_tasks_for_merchant failed for %s: %s",
             merchant_id, str(exc)[:200],
+        )
+        return []
+    return [_row_to_dict(r) for r in (rows or [])]
+
+
+async def find_executor_parent_task_candidates(
+    *,
+    merchant_id: str,
+    parent_audit_run_id: str,
+    lever: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Audit-emitted task candidates that an executor task may refine.
+
+    Executor-produced rows have source_executor_run_id set; parent
+    audit action rows do not. The service layer applies the
+    host/topic/title fingerprint after this scoped lookup.
+    """
+    await ensure_merchant_tasks_table()
+    try:
+        q = merchant_tasks.select().where(
+            merchant_tasks.c.merchant_id == merchant_id,
+            merchant_tasks.c.parent_audit_run_id == parent_audit_run_id,
+            merchant_tasks.c.source_executor_run_id.is_(None),
+        )
+        if lever is None:
+            q = q.where(merchant_tasks.c.lever.is_(None))
+        else:
+            q = q.where(merchant_tasks.c.lever == lever)
+        rows = await database.fetch_all(
+            q.order_by(merchant_tasks.c.created_at.desc())
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "find_executor_parent_task_candidates failed merchant=%s "
+            "audit=%s lever=%s: %s",
+            merchant_id, parent_audit_run_id, lever, str(exc)[:200],
         )
         return []
     return [_row_to_dict(r) for r in (rows or [])]

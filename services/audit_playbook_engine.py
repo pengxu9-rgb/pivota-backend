@@ -272,6 +272,8 @@ def select_playbooks(
     failed_queries_detailed: List[Dict[str, Any]],
     merchant_name: Optional[str] = None,
     merchant_category: Optional[str] = None,
+    attribution_score: Optional[int] = None,
+    category_score: Optional[int] = None,
     cap: int = 5,
 ) -> List[Dict[str, Any]]:
     """Produce per-host playbook actions for the merchant audit's
@@ -372,8 +374,46 @@ def select_playbooks(
             ctx=ctx,
         )
 
+        # Q-P1-6: route the playbook's authored severity through the
+        # central scorer so it can be calibrated against the actual
+        # audit evidence. Pre-fix the playbook's severity flowed
+        # directly into the action (e.g. "Pitch whowhatwear.com" was
+        # `high` even when competitors_named=[] and example=null —
+        # the playbook authors picked "high" as the default, the
+        # audit had nothing to back it up, but the merchant saw
+        # "high" anyway).
+        from services.audit_severity import compute_action_severity
+
+        # score_gap_pct: the discovery → attribution gap. When both
+        # scores are present we use category - attribution (the
+        # "category visible but attribution missing" pattern).
+        # Falls back to "100 - attribution" when only attribution is
+        # known (closer to goal-state framing).
+        score_gap_pct: Optional[int] = None
+        if isinstance(attribution_score, int):
+            if isinstance(category_score, int):
+                score_gap_pct = max(0, category_score - attribution_score)
+            else:
+                score_gap_pct = max(0, 100 - attribution_score)
+
+        host_type = (entry.get("type") or "").strip().lower() or None
+        example_query_str = (example or {}).get("query")
+        has_failed_query_example = bool(
+            example_query_str and str(example_query_str).strip()
+        )
+        has_competitors_named = bool(competitors_named)
+
+        scored_severity, severity_reason = compute_action_severity(
+            score_gap_pct=score_gap_pct,
+            host_type=host_type,
+            has_failed_query_example=has_failed_query_example,
+            has_competitors_named=has_competitors_named,
+            base_severity=pb.get("severity") or "medium",
+        )
+
         actions.append({
-            "severity": pb.get("severity") or "medium",
+            "severity": scored_severity,
+            "severity_reason": severity_reason,
             "title": title,
             "body": body,
             "concrete_next_step": concrete_next_step,
@@ -381,7 +421,7 @@ def select_playbooks(
                 "host": host,
                 "times_cited": entry.get("times_cited") or 0,
                 "competitors_named": list(competitors_named),
-                "example_failed_query": (example or {}).get("query"),
+                "example_failed_query": example_query_str,
             },
             "playbook_step_id": pid,
             "target_host": host,

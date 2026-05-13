@@ -4009,11 +4009,20 @@ def _build_merchant_view(
     # Phase A: also passes merchant_name + merchant_category so the
     # playbook engine can render `pitch_draft` (pre-filled email)
     # per editorial action.
+    # Q-P1-6: thread the actual audit scores into the playbook engine
+    # so the severity scorer can calibrate the playbook's authored
+    # severity against this audit's evidence (score gap, named
+    # competitors, failed-query examples). Pre-fix the playbook's
+    # severity was a fixed value from data/playbooks.json; the
+    # merchant saw "high" on pitch actions whose audit-evidence
+    # didn't support a high tier (the Winona whowhatwear case).
     playbook_actions = select_playbooks(
         cited_hosts_detailed=cited_hosts_detailed_full,
         failed_queries_detailed=failed_queries_detailed,
         merchant_name=merchant_brand,  # use the friendly brand name
         merchant_category=merchant_category,
+        attribution_score=attribution_score,
+        category_score=category_visibility_score,
     )
     merged_actions = list(action_items or []) + list(playbook_actions or [])
 
