@@ -256,6 +256,7 @@ async def _run_async_pipeline_compat(
     body: "MerchantSelfAuditRequest",
     merchant_id: str,
     response: Response,
+    rate_limit_remaining: Optional[int] = None,
 ) -> Dict[str, Any]:
     """P2.4 compat shim: route the legacy synchronous endpoint through
     the new async pipeline. Enqueue + poll for up to 30s. If the run
@@ -365,7 +366,7 @@ async def _run_async_pipeline_compat(
         response.status_code = status.HTTP_202_ACCEPTED
         return {
             "brand_report": None,
-            "rate_limit_remaining": None,
+            "rate_limit_remaining": rate_limit_remaining,
             "executors": None,
             "tasks": None,
             "audited_via_pivota_canonical": [],
@@ -398,9 +399,10 @@ async def _run_async_pipeline_compat(
     # COMPLETED — reshape into the legacy response.
     return {
         "brand_report": row.get("report_jsonb"),
-        # Rate-limit headroom isn't tracked through the new pipeline;
-        # callers using ?via=async_pipeline don't get this field.
-        "rate_limit_remaining": None,
+        # P1-1: rate-limit check now runs before the via branch, so
+        # async-compat callers get the same quota visibility the
+        # sync arm has always emitted.
+        "rate_limit_remaining": rate_limit_remaining,
         # Executors + tasks summaries live in partial_result_jsonb.
         "executors": (
             (row.get("partial_result_jsonb") or {})
@@ -453,12 +455,19 @@ async def run_merchant_self_audit(
         'title="Async audit lifecycle (POST + GET poll)"'
     )
 
+    # P1-1: enforce the daily-cap rate limit BEFORE branching to the
+    # async-compat path. Originally _check_audit_rate_limit only ran
+    # in the sync arm below; adding `?via=async_pipeline` was enough
+    # to bypass the cap entirely. Both paths must share the same
+    # quota window so a noisy client can't burn provider tokens by
+    # opting into the compat shim.
+    remaining = await _check_audit_rate_limit(merchant_id)
+
     if via == "async_pipeline":
         return await _run_async_pipeline_compat(
             body=body, merchant_id=merchant_id, response=response,
+            rate_limit_remaining=remaining,
         )
-
-    remaining = await _check_audit_rate_limit(merchant_id)
 
     # 1. Build the set of (platform, source_product_id) tuples the
     #    merchant asked for. WHERE merchant_id=current is the cross-
