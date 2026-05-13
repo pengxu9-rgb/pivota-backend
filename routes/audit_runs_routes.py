@@ -128,6 +128,38 @@ class AuditRunDetail(BaseModel):
 
 
 # =====================================================================
+# Helpers
+# =====================================================================
+
+
+async def _missing_product_keys_for_merchant(
+    *, merchant_id: str, product_keys: List[str],
+) -> List[str]:
+    """Return the subset of `product_keys` that do NOT exist for this
+    merchant in catalog_products. Empty list ⇒ every key is valid +
+    owned and the audit can be enqueued.
+
+    Filters on `merchant_id == :merchant_id` so a product_key that
+    exists for a DIFFERENT merchant still reports as missing — the
+    function is a cross-tenant guard, not just an existence check.
+    """
+    if not product_keys:
+        return []
+    from db.catalog import catalog_products
+    from db.database import database
+    from sqlalchemy.sql import select as _select
+
+    rows = await database.fetch_all(
+        _select(catalog_products.c.product_key).where(
+            catalog_products.c.merchant_id == merchant_id,
+            catalog_products.c.product_key.in_(list(product_keys)),
+        )
+    )
+    found = {str(r[0]) for r in rows}
+    return [k for k in product_keys if k not in found]
+
+
+# =====================================================================
 # Endpoints
 # =====================================================================
 
@@ -164,6 +196,33 @@ async def create_audit_run(
                 "merchant — cross-tenant audit submission is not "
                 "permitted."
             ),
+        )
+
+    # P1-2: validate that every product_key is owned by the
+    # authenticated merchant BEFORE enqueueing. The legacy
+    # `/ai-commerce-readiness` route did the equivalent check inline
+    # for (platform, source_product_id) refs; the async POST took
+    # opaque product_key strings and never validated ownership, so
+    # a merchant could enqueue a run referencing another merchant's
+    # product_keys and the worker would silently audit on the empty
+    # subset (or fewer products than requested) 30s later. Worse,
+    # the daily-cap counter (P1-1) would still tick on the invalid
+    # enqueue. Validate at the route so the merchant sees a 422
+    # immediately, not a no-op audit much later.
+    missing = await _missing_product_keys_for_merchant(
+        merchant_id=auth_merchant_id,
+        product_keys=body.product_keys,
+    )
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    "One or more product_keys are not owned by this "
+                    "merchant (or do not exist in catalog_products)."
+                ),
+                "missing_product_keys": sorted(missing),
+            },
         )
 
     # Idempotency dedupe (unless force=true).
