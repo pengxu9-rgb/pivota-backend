@@ -342,6 +342,7 @@ async def set_primary_store(
 
     store_data = dict(store)
     status = (store_data.get("status") or "").lower()
+    platform = str(store_data.get("platform") or "").strip().lower()
     api_key = str(store_data.get("api_key") or "")
     if status not in ("active", "connected"):
         raise HTTPException(status_code=400, detail=f"Store status is '{status}'. Please reconnect the store first.")
@@ -359,6 +360,23 @@ async def set_primary_store(
                 """,
                 {"merchant_id": merchant_id},
             )
+            if platform:
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET status = 'inactive',
+                        is_primary = FALSE
+                    WHERE merchant_id = :merchant_id
+                      AND store_id != :store_id
+                      AND lower(COALESCE(platform, '')) = :platform
+                      AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                    """,
+                    {
+                        "merchant_id": merchant_id,
+                        "store_id": store_id,
+                        "platform": platform,
+                    },
+                )
             await database.execute(
                 """
                 UPDATE merchant_stores
