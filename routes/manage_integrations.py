@@ -21,8 +21,7 @@ async def sync_legacy_primary_store_fields(merchant_id: str, store: Dict[str, An
             SET mcp_connected = TRUE,
                 mcp_platform = :platform,
                 mcp_shop_domain = :domain,
-                mcp_access_token = :api_key,
-                mcp_connected_at = CURRENT_TIMESTAMP
+                mcp_access_token = :api_key
             WHERE merchant_id = :merchant_id
             """,
             {
@@ -83,6 +82,8 @@ async def delete_store(
             raise HTTPException(status_code=404, detail="Store not found or not owned by this merchant")
 
         store_data = dict(store)
+        next_primary_store = None
+        clear_legacy_primary = False
         
         async with database.transaction():
             delete_query = "DELETE FROM merchant_stores WHERE store_id = :store_id AND merchant_id = :merchant_id"
@@ -116,19 +117,27 @@ async def delete_store(
                     {"merchant_id": merchant_id},
                 )
                 if next_store:
-                    await sync_legacy_primary_store_fields(merchant_id, dict(next_store))
+                    next_primary_store = dict(next_store)
                 else:
-                    await database.execute(
-                        """
-                        UPDATE merchant_onboarding
-                        SET mcp_connected = FALSE,
-                            mcp_platform = NULL,
-                            mcp_shop_domain = NULL,
-                            mcp_access_token = NULL
-                        WHERE merchant_id = :merchant_id
-                        """,
-                        {"merchant_id": merchant_id},
-                    )
+                    clear_legacy_primary = True
+
+        if next_primary_store:
+            await sync_legacy_primary_store_fields(merchant_id, next_primary_store)
+        elif clear_legacy_primary:
+            try:
+                await database.execute(
+                    """
+                    UPDATE merchant_onboarding
+                    SET mcp_connected = FALSE,
+                        mcp_platform = NULL,
+                        mcp_shop_domain = NULL,
+                        mcp_access_token = NULL
+                    WHERE merchant_id = :merchant_id
+                    """,
+                    {"merchant_id": merchant_id},
+                )
+            except Exception:
+                pass
         
         return {
             "status": "success",
@@ -333,7 +342,7 @@ async def set_primary_store(
 
     store_data = dict(store)
     status = (store_data.get("status") or "").lower()
-    api_key = store_data.get("api_key") or ""
+    api_key = str(store_data.get("api_key") or "")
     if status not in ("active", "connected"):
         raise HTTPException(status_code=400, detail=f"Store status is '{status}'. Please reconnect the store first.")
     if not api_key.strip():
@@ -358,7 +367,19 @@ async def set_primary_store(
                 """,
                 {"store_id": store_id, "merchant_id": merchant_id},
             )
-            await sync_legacy_primary_store_fields(merchant_id, store_data)
+
+        verify_store = await database.fetch_one(
+            """
+            SELECT is_primary
+            FROM merchant_stores
+            WHERE store_id = :store_id AND merchant_id = :merchant_id
+            """,
+            {"store_id": store_id, "merchant_id": merchant_id},
+        )
+        if not verify_store or not dict(verify_store).get("is_primary"):
+            raise HTTPException(status_code=500, detail="Primary store update did not persist")
+
+        await sync_legacy_primary_store_fields(merchant_id, store_data)
 
         return {
             "status": "success",
