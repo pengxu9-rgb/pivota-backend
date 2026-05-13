@@ -642,15 +642,28 @@ async def transition_stage(
                 values["error_message"] = msg[:2000]
     if cost_summary_jsonb is not None:
         values["cost_summary_jsonb"] = _json_safe(cost_summary_jsonb)
+    # Cancellation contract:
+    #   - For non-cancellation transitions, `cancelled_at IS NULL` is
+    #     enforced so a cancel that landed mid-stage blocks further
+    #     forward progress.
+    #   - For the finalize-to-cancelled transition, we MUST allow
+    #     `cancelled_at IS NOT NULL` — otherwise the worker can never
+    #     transition the run to STAGE_CANCELLED after cancel_audit_run
+    #     has set the flag, and the run sits forever in its active
+    #     stage. This was the deadlock that motivated the fix.
+    where_clauses = [
+        merchant_audit_runs.c.run_id == run_id,
+        merchant_audit_runs.c.stage == from_stage,
+        merchant_audit_runs.c.claimed_by_worker == worker_id,
+    ]
+    if to_stage != STAGE_CANCELLED:
+        where_clauses.append(
+            merchant_audit_runs.c.cancelled_at.is_(None),
+        )
     try:
         result = await database.execute(
             merchant_audit_runs.update()
-            .where(
-                merchant_audit_runs.c.run_id == run_id,
-                merchant_audit_runs.c.stage == from_stage,
-                merchant_audit_runs.c.claimed_by_worker == worker_id,
-                merchant_audit_runs.c.cancelled_at.is_(None),
-            )
+            .where(*where_clauses)
             .values(**values)
         )
         # databases lib returns rowcount as the result for UPDATE;
@@ -769,27 +782,58 @@ async def extend_lease(
 
 
 async def cancel_audit_run(*, run_id: str) -> bool:
-    """Mark a run cancelled. Worker checks cancelled_at before each
-    stage transition; in-flight stages run to completion of their
-    current step then bail.
+    """Mark a run cancelled.
+
+    Two paths:
+      1. **Queued run, no worker has done any stage work yet** —
+         atomically finalize to STAGE_CANCELLED. claim_next_pending_run
+         excludes cancelled rows, so otherwise a queued run that gets
+         cancelled would never be claimed and would sit at stage=queued
+         forever.
+      2. **Active run (stage in {discovering…verifying}, worker has the
+         lease)** — set `cancelled_at` so the worker sees the flag at
+         its next stage boundary and calls transition_stage(...
+         to_stage=STAGE_CANCELLED) to finalize. transition_stage
+         specifically allows the cancelled→cancelled transition; see
+         the cancellation contract above.
+
+    Returning True does NOT guarantee the row is already at
+    STAGE_CANCELLED — for path 2 it's still active until the worker
+    bails. Callers should poll if they need certainty.
     """
     await ensure_merchant_audit_runs_table()
     now = _now_utc()
     try:
+        # Path 1: queued runs finalize directly. Race-safe because the
+        # UPDATE filters on stage=queued; a worker that just claimed
+        # the row but hasn't transitioned yet will see stage=cancelled
+        # on its next transition_stage call and bail.
+        queued_result = await database.execute(
+            merchant_audit_runs.update()
+            .where(
+                merchant_audit_runs.c.run_id == run_id,
+                merchant_audit_runs.c.stage == STAGE_QUEUED,
+                merchant_audit_runs.c.cancelled_at.is_(None),
+            )
+            .values(
+                stage=STAGE_CANCELLED,
+                stage_updated_at=now,
+                cancelled_at=now,
+                completed_at=now,
+            )
+        )
+        if isinstance(queued_result, int) and queued_result > 0:
+            return True
+
+        # Path 2: active run — flag cancelled_at; worker finalizes.
         await database.execute(
             merchant_audit_runs.update()
             .where(
                 merchant_audit_runs.c.run_id == run_id,
                 merchant_audit_runs.c.stage.in_(list(ACTIVE_STAGES)),
+                merchant_audit_runs.c.cancelled_at.is_(None),
             )
-            .values(
-                cancelled_at=now,
-                # Don't transition to STAGE_CANCELLED here — let the
-                # worker's next transition_stage call finalize. That
-                # keeps the state-machine validation consistent
-                # (only the worker that holds the lease writes the
-                # terminal stage).
-            )
+            .values(cancelled_at=now)
         )
         return True
     except Exception as exc:

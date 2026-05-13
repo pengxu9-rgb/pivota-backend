@@ -134,9 +134,48 @@ async def _process_one_audit_run_inner(
     audit_run_id + merchant_id via contextvars.
     """
     from db import merchant_audit_runs as mar
+
+    async def _check_cancellation_and_finalize(*, at_stage: str) -> bool:
+        """If the run has been cancelled (cancel_audit_run set
+        cancelled_at on this row), finalize it to STAGE_CANCELLED and
+        return True so the caller can bail. Returns False when no
+        cancellation has been requested.
+
+        Race-safe: a sibling worker that stole the lease can also race
+        the transition_stage; one will win, the other will see
+        ok=False and bail. Either outcome leaves the row at the
+        terminal cancelled stage (the only goal here)."""
+        try:
+            row = await mar.fetch_audit_run_by_id(run_id=run_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "audit_run_worker: cancellation poll fetch failed "
+                "run_id=%s: %s", run_id, str(exc)[:200],
+            )
+            return False
+        if row is None or row.get("cancelled_at") is None:
+            return False
+        # Use a finalize transition (no completed_at side-effects from
+        # outside; transition_stage sets completed_at for terminal
+        # stages itself).
+        ok = await mar.transition_stage(
+            run_id=run_id,
+            from_stage=at_stage,
+            to_stage=mar.STAGE_CANCELLED,
+            worker_id=WORKER_ID,
+        )
+        logger.info(
+            "audit_run_worker: cancellation detected at stage=%s "
+            "run_id=%s finalized=%s",
+            at_stage, run_id, ok,
+        )
+        return True
+
     try:
         # ----- queued → discovering -----
         if current_stage == mar.STAGE_QUEUED:
+            if await _check_cancellation_and_finalize(at_stage=mar.STAGE_QUEUED):
+                return True
             ok = await mar.transition_stage(
                 run_id=run_id,
                 from_stage=mar.STAGE_QUEUED,
@@ -153,6 +192,10 @@ async def _process_one_audit_run_inner(
 
         # ----- discovering: resolve merchant + product catalog rows -----
         if current_stage == mar.STAGE_DISCOVERING:
+            if await _check_cancellation_and_finalize(
+                at_stage=mar.STAGE_DISCOVERING,
+            ):
+                return True
             await mar.extend_lease(run_id=run_id, worker_id=WORKER_ID)
             (
                 merchant_name,
@@ -186,6 +229,10 @@ async def _process_one_audit_run_inner(
 
         # ----- probing: run_brand_report (LLM-heavy) -----
         if current_stage == mar.STAGE_PROBING:
+            if await _check_cancellation_and_finalize(
+                at_stage=mar.STAGE_PROBING,
+            ):
+                return True
             await mar.extend_lease(
                 run_id=run_id, worker_id=WORKER_ID,
                 lease_seconds=LONG_STAGE_LEASE_SECONDS,
@@ -253,6 +300,10 @@ async def _process_one_audit_run_inner(
         # discrete transition so the GET /api/audits/{id} timeline
         # has a clear marker between probing + materializing. -----
         if current_stage == mar.STAGE_SCORING:
+            if await _check_cancellation_and_finalize(
+                at_stage=mar.STAGE_SCORING,
+            ):
+                return True
             # Surface the scoring stage in partial_result_jsonb so
             # GET /api/audits/{id} has a marker between probing and
             # materializing — without this, the per-stage progress
@@ -296,6 +347,10 @@ async def _process_one_audit_run_inner(
 
         # ----- materializing: tasks + executor dispatch -----
         if current_stage == mar.STAGE_MATERIALIZING and brand_report is not None:
+            if await _check_cancellation_and_finalize(
+                at_stage=mar.STAGE_MATERIALIZING,
+            ):
+                return True
             await mar.extend_lease(
                 run_id=run_id, worker_id=WORKER_ID,
                 lease_seconds=LONG_STAGE_LEASE_SECONDS,
@@ -323,6 +378,10 @@ async def _process_one_audit_run_inner(
         # ----- verifying: co-occurrence + GSC URL submission +
         # P4.3 shadow-write evidence_items + readiness_findings -----
         if current_stage == mar.STAGE_VERIFYING and brand_report is not None:
+            if await _check_cancellation_and_finalize(
+                at_stage=mar.STAGE_VERIFYING,
+            ):
+                return True
             # P4.3: derive canonical evidence + findings from the
             # brand_report and persist into the new tables. Best-
             # effort — failures inside the builder don't poison the
