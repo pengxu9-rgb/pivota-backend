@@ -12,12 +12,18 @@ the HTTP endpoints exercised on staging.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict
 
+import pytest
+
+from db.merchant_tasks import _row_to_dict
 from services.task_queue_service import (
     _extract_action_items,
     _is_cold_start_audit,
     _summarize_executor_work,
+    materialize_task_from_executor,
 )
 
 
@@ -344,3 +350,119 @@ def test_summarize_handles_garbage_evidence():
     assert title is None
     title, _, _, _ = _summarize_executor_work("sitemap_freshness_monitor", "not a dict")
     assert title is None
+
+
+# ---------------------------------------------------------------------------
+# Q-P1-5 executor tasks are children of their audit action
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_executor_materialize_sets_parent_task_id_when_parent_exists(monkeypatch):
+    import db.merchant_tasks as merchant_tasks_db
+
+    parent_task_id = "11111111-1111-4111-8111-111111111111"
+    child_task_id = "22222222-2222-4222-8222-222222222222"
+    audit_run_id = "33333333-3333-4333-8333-333333333333"
+    captured: Dict[str, Any] = {}
+
+    async def fake_candidates(**kwargs):
+        assert kwargs == {
+            "merchant_id": "merchant-1",
+            "parent_audit_run_id": audit_run_id,
+            "lever": "content_creation",
+        }
+        return [{
+            "task_id": parent_task_id,
+            "title": "Write 1 content brief for failed category visibility queries",
+            "body": "Draft a brief for best Serums under $50.",
+            "evidence": {"topic": "best Serums under $50"},
+        }]
+
+    async def fake_record(**kwargs):
+        captured.update(kwargs)
+        return child_task_id
+
+    monkeypatch.setattr(
+        merchant_tasks_db, "find_executor_parent_task_candidates", fake_candidates,
+    )
+    monkeypatch.setattr(merchant_tasks_db, "record_task_created", fake_record)
+
+    task_id = await materialize_task_from_executor(
+        merchant_id="merchant-1",
+        executor_run_id="44444444-4444-4444-8444-444444444444",
+        agent_name="content_brief_generator",
+        parent_audit_run_id=audit_run_id,
+        title="Write 1 content brief for failed category visibility queries",
+        body="Generated draft.",
+        severity="medium",
+        lever="content_creation",
+        evidence={
+            "briefs": [{"target_query": "best Serums under $50"}],
+        },
+    )
+
+    assert task_id == child_task_id
+    assert captured["parent_task_id"] == parent_task_id
+    assert captured["parent_audit_run_id"] == audit_run_id
+    assert captured["source_executor_run_id"] == "44444444-4444-4444-8444-444444444444"
+
+
+@pytest.mark.asyncio
+async def test_executor_materialize_leaves_parent_task_id_null_without_match(monkeypatch):
+    import db.merchant_tasks as merchant_tasks_db
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_candidates(**kwargs):
+        return []
+
+    async def fake_record(**kwargs):
+        captured.update(kwargs)
+        return "55555555-5555-4555-8555-555555555555"
+
+    monkeypatch.setattr(
+        merchant_tasks_db, "find_executor_parent_task_candidates", fake_candidates,
+    )
+    monkeypatch.setattr(merchant_tasks_db, "record_task_created", fake_record)
+
+    await materialize_task_from_executor(
+        merchant_id="merchant-1",
+        executor_run_id="66666666-6666-4666-8666-666666666666",
+        agent_name="content_brief_generator",
+        parent_audit_run_id="77777777-7777-4777-8777-777777777777",
+        title="Standalone executor task",
+        body="Generated draft.",
+        severity="medium",
+        lever="content_creation",
+        evidence={"briefs": [{"target_query": "best Serums under $50"}]},
+    )
+
+    assert captured["parent_task_id"] is None
+
+
+def test_row_to_dict_includes_parent_task_id():
+    parent_task_id = "88888888-8888-4888-8888-888888888888"
+    out = _row_to_dict({
+        "task_id": "99999999-9999-4999-8999-999999999999",
+        "merchant_id": "merchant-1",
+        "parent_task_id": parent_task_id,
+        "created_at": datetime(2026, 5, 13, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 5, 13, tzinfo=timezone.utc),
+    })
+
+    assert out["parent_task_id"] == parent_task_id
+
+
+def test_parent_task_migration_and_schema_guard_self_heal_exist():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration = (
+        repo_root / "db" / "migrations" / "093_merchant_tasks_parent_task.sql"
+    )
+    migration_text = migration.read_text()
+    guard_text = (repo_root / "db" / "schema_guard.py").read_text()
+
+    assert "ADD COLUMN IF NOT EXISTS parent_task_id UUID NULL" in migration_text
+    assert "idx_merchant_tasks_parent_task" in migration_text
+    assert "ADD COLUMN IF NOT EXISTS parent_task_id UUID NULL" in guard_text
+    assert "idx_merchant_tasks_parent_task" in guard_text

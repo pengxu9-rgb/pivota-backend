@@ -326,6 +326,10 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Q-P1-5: executor-produced task child pointer
+            # (migration 093). Lets the queue renderer group concrete
+            # executor artifacts under the audit action that spawned
+            # them while keeping the child rows actionable.
             await database.execute(
                 text(
                     """

@@ -80,6 +80,7 @@ merchant_tasks = Table(
     Index("idx_merchant_tasks_open", "merchant_id", "status", "severity", "created_at"),
     Index("idx_merchant_tasks_audit", "parent_audit_run_id"),
     Index("idx_merchant_tasks_executor_source", "source_executor_run_id"),
+    Index("idx_merchant_tasks_parent_task", "parent_task_id"),
     extend_existing=True,
 )
 
@@ -110,8 +111,8 @@ _DDL_STATEMENTS = [
       superseded_by_task_id    UUID NULL
     );
     """,
-    # Migration 092: fresh-deploy tables get the column inline above;
-    # existing-deploy tables get it via the ALTER below (idempotent).
+    # Migrations 092/093: fresh-deploy tables get the columns inline
+    # above; existing-deploy tables get them via idempotent ALTERs.
     "ALTER TABLE merchant_tasks ADD COLUMN IF NOT EXISTS "
     "superseded_by_task_id UUID NULL;",
     "ALTER TABLE merchant_tasks ADD COLUMN IF NOT EXISTS "
