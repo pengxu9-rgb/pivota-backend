@@ -85,6 +85,19 @@ def _is_product_group_id(value: str) -> bool:
     return value.startswith(("pg_", "pg:", "grp_"))
 
 
+def _is_external_product_id(value: str) -> bool:
+    return value.startswith("ext_")
+
+
+def _strip_group_wrapper(value: str) -> str:
+    """The legacy gateway emits canonical refs as ``pg:<product_group_id>``
+    where the inner id is itself a ``pg_*`` / ``grp_*`` string. Strip the
+    leading ``pg:`` so the SQL matches the stored product_group_id."""
+    if value.startswith("pg:"):
+        return value[len("pg:"):]
+    return value
+
+
 def _query_for_id(value: str) -> Optional[str]:
     if is_content_key(value):
         return SELECT_BY_CONTENT_KEY_SQL
@@ -93,6 +106,22 @@ def _query_for_id(value: str) -> Optional[str]:
     if _is_product_group_id(value):
         return SELECT_BY_PRODUCT_GROUP_SQL
     return None
+
+
+# External-product (ext_*) IDs are not stored on agent_pdp_view directly.
+# They live on external_product_seeds.external_product_id; resolution
+# chases attached_product_key → catalog_products.content_key → the
+# agent_pdp_view PK. One extra indexed SELECT, still well inside the
+# <10ms p99 budget.
+EXT_RESOLVE_SQL = """
+    SELECT cp.content_key
+    FROM external_product_seeds eps
+    JOIN catalog_products cp ON cp.product_key = eps.attached_product_key
+    WHERE eps.external_product_id = :ext_id
+      AND eps.status = 'active'
+      AND cp.content_key IS NOT NULL
+    LIMIT 1
+"""
 
 
 def _coerce_json(value: Any) -> Any:
@@ -201,7 +230,29 @@ def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.get("/{id}")
 async def get_agent_pdp(id: str) -> Dict[str, Any]:
-    lookup_id = str(id or "")
+    raw_id = str(id or "")
+
+    # ext_*: resolve to a content_key via external_product_seeds + catalog_products,
+    # then fall through to the standard content_key SELECT.
+    if _is_external_product_id(raw_id):
+        resolved = await database.fetch_one(EXT_RESOLVE_SQL, {"ext_id": raw_id})
+        if not resolved:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="PDP not found",
+            )
+        row = await database.fetch_one(
+            SELECT_BY_CONTENT_KEY_SQL,
+            {"id": dict(resolved).get("content_key")},
+        )
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="PDP not found",
+            )
+        return _build_response(_row_to_dict(row))
+
+    lookup_id = _strip_group_wrapper(raw_id)
     query = _query_for_id(lookup_id)
     if query is None:
         raise HTTPException(

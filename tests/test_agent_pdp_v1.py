@@ -85,13 +85,26 @@ def _row(
 
 
 class FakeAgentPdpDatabase:
-    def __init__(self, rows: List[Dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        rows: List[Dict[str, Any]],
+        ext_id_to_content_key: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.rows = rows
+        self.ext_id_to_content_key = ext_id_to_content_key or {}
         self.calls: List[Dict[str, Any]] = []
 
     async def fetch_one(self, query: str, values: Optional[Dict[str, Any]] = None):
         self.calls.append({"query": str(query), "values": dict(values or {})})
-        lookup_id = str((values or {}).get("id") or "")
+        params = values or {}
+
+        # ext_* resolution path (different bind name + JOIN shape)
+        if "FROM external_product_seeds eps" in str(query):
+            ext_id = str(params.get("ext_id") or "")
+            ck = self.ext_id_to_content_key.get(ext_id)
+            return {"content_key": ck} if ck else None
+
+        lookup_id = str(params.get("id") or "")
 
         if "WHERE content_key = :id" in str(query):
             return next((row for row in self.rows if row["content_key"] == lookup_id), None)
@@ -117,8 +130,13 @@ class FakeAgentPdpDatabase:
         raise AssertionError(f"unexpected query: {query}")
 
 
-def _client(monkeypatch, rows: List[Dict[str, Any]]):
-    db = FakeAgentPdpDatabase(rows)
+def _client(
+    monkeypatch,
+    rows: List[Dict[str, Any]],
+    *,
+    ext_id_to_content_key: Optional[Dict[str, str]] = None,
+):
+    db = FakeAgentPdpDatabase(rows, ext_id_to_content_key=ext_id_to_content_key)
     monkeypatch.setattr(agent_pdp_v1, "database", db)
     app = FastAPI()
     app.include_router(agent_pdp_v1.router)
@@ -229,6 +247,51 @@ def test_get_agent_pdp_malformed_id_returns_404_without_query(monkeypatch) -> No
     assert response.status_code == 404
     assert malformed_ck_response.status_code == 404
     assert db.calls == []
+
+
+def test_get_agent_pdp_strips_pg_colon_prefix_before_group_lookup(monkeypatch) -> None:
+    """Gateway emits canonical refs as `pg:<actual_group_id>`. The route
+    must strip the `pg:` so the SQL queries product_group_id correctly."""
+    row = _row()  # has product_group_id = GROUP_ID
+    client, db = _client(monkeypatch, [row])
+
+    response = client.get(f"/api/agent/pdp/pg:{GROUP_ID}")
+
+    assert response.status_code == 200
+    # The SQL bind must be the bare GROUP_ID, not "pg:GROUP_ID"
+    assert db.calls[0]["values"] == {"id": GROUP_ID}
+
+
+def test_get_agent_pdp_resolves_ext_id_via_external_product_seeds(monkeypatch) -> None:
+    """ext_* ids resolve through external_product_seeds.external_product_id
+    → catalog_products.content_key → agent_pdp_view."""
+    row = _row()
+    client, db = _client(
+        monkeypatch,
+        [row],
+        ext_id_to_content_key={"ext_xyz123": CK_A},
+    )
+
+    response = client.get("/api/agent/pdp/ext_xyz123")
+
+    assert response.status_code == 200
+    # Two queries: resolve ext → content_key, then SELECT by content_key
+    assert len(db.calls) == 2
+    assert "external_product_seeds eps" in db.calls[0]["query"]
+    assert db.calls[0]["values"] == {"ext_id": "ext_xyz123"}
+    assert "WHERE content_key = :id" in db.calls[1]["query"]
+    assert db.calls[1]["values"] == {"id": CK_A}
+
+
+def test_get_agent_pdp_unresolvable_ext_id_returns_404(monkeypatch) -> None:
+    """ext_* that doesn't resolve to any content_key returns 404 without
+    falling back to other dispatch paths."""
+    client, db = _client(monkeypatch, [_row()], ext_id_to_content_key={})
+
+    response = client.get("/api/agent/pdp/ext_missing")
+
+    assert response.status_code == 404
+    assert len(db.calls) == 1  # only the resolve attempt
 
 
 def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
