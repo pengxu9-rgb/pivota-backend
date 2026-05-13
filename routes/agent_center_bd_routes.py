@@ -37,9 +37,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, validator
 
+from db.merchant_audit_runs import recent_runs_for_merchant
 from services.agent_center_bd_report_service import (
     build_structured_report,
     run_bd_probes,
@@ -52,6 +53,21 @@ logger = logging.getLogger(__name__)
 
 
 _HARD_MAX_RUNS = 8
+_TASK_SCOPE_RECENT_RUN_LIMIT = 20
+
+
+async def _latest_completed_audit_run_id_for_tasks(
+    merchant_id: str,
+) -> Optional[str]:
+    """Return newest succeeded audit run id for task scoping."""
+    runs = await recent_runs_for_merchant(
+        merchant_id=merchant_id,
+        limit=_TASK_SCOPE_RECENT_RUN_LIMIT,
+    )
+    for run in runs or []:
+        if run.get("status") == "succeeded" and run.get("run_id"):
+            return str(run["run_id"])
+    return None
 
 
 def _prospect_merchant_id(domain_or_url: str) -> str:
@@ -1097,6 +1113,8 @@ async def bd_list_tasks(
     merchant_id: str,
     status_filter: Optional[str] = None,
     limit: int = 50,
+    parent_audit_run_id: Optional[str] = None,
+    include_history: bool = False,
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     """List tasks for any merchant (BD-side; no merchant auth needed).
@@ -1105,6 +1123,8 @@ async def bd_list_tasks(
 
     Default filter: open work (pending + in_progress). Pass
     `status_filter=all` for everything, or comma-list specific statuses.
+    By default tasks are scoped to the latest completed audit; pass
+    `include_history=true` for the previous flat all-runs list.
     """
     if limit <= 0 or limit > 200:
         raise HTTPException(
@@ -1125,14 +1145,43 @@ async def bd_list_tasks(
     else:
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
 
+    explicit_run_id = (
+        parent_audit_run_id.strip() if parent_audit_run_id else None
+    )
+    latest_audit_run_id: Optional[str] = None
+    if explicit_run_id:
+        tasks_scope = "explicit_run"
+        scoped_parent_audit_run_id = explicit_run_id
+        latest_audit_run_id = explicit_run_id
+    elif include_history:
+        tasks_scope = "history"
+        scoped_parent_audit_run_id = None
+    else:
+        tasks_scope = "latest_completed"
+        latest_audit_run_id = await _latest_completed_audit_run_id_for_tasks(
+            merchant_id
+        )
+        if latest_audit_run_id is None:
+            return {
+                "merchant_id": merchant_id,
+                "count": 0,
+                "latest_audit_run_id": None,
+                "tasks_scope": tasks_scope,
+                "tasks": [],
+            }
+        scoped_parent_audit_run_id = latest_audit_run_id
+
     tasks = await list_tasks_for_merchant(
         merchant_id=merchant_id,
         status_filter=statuses,
         limit=limit,
+        parent_audit_run_id=scoped_parent_audit_run_id,
     )
     return {
         "merchant_id": merchant_id,
         "count": len(tasks),
+        "latest_audit_run_id": latest_audit_run_id,
+        "tasks_scope": tasks_scope,
         "tasks": tasks,
     }
 

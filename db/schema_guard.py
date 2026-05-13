@@ -326,6 +326,18 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Q-P1-5: executor-produced task child pointer
+            # (migration 093). Lets the queue renderer group concrete
+            # executor artifacts under the audit action that spawned
+            # them while keeping the child rows actionable.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_tasks
+                      ADD COLUMN IF NOT EXISTS parent_task_id UUID NULL;
+                    """
+                )
+            )
             await database.execute(
                 text(
                     """
@@ -343,6 +355,16 @@ async def ensure_required_schema_light() -> None:
                       idx_merchant_tasks_superseded_by
                       ON merchant_tasks (superseded_by_task_id)
                       WHERE superseded_by_task_id IS NOT NULL;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                      idx_merchant_tasks_parent_task
+                      ON merchant_tasks (parent_task_id)
+                      WHERE parent_task_id IS NOT NULL;
                     """
                 )
             )
