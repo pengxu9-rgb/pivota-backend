@@ -188,6 +188,73 @@ async def _list_due_merchants() -> List[Dict[str, Any]]:
     return out
 
 
+def _advisory_lock_id_for_merchant(merchant_id: str) -> int:
+    """Stable signed-64-bit advisory lock id derived from merchant_id.
+
+    Postgres advisory locks take a single int8 (or two int4s). Hash
+    the merchant_id with SHA-256, take the first 8 bytes as a
+    signed int — collisions are practically impossible at our
+    merchant count.
+    """
+    import hashlib
+    digest = hashlib.sha256(merchant_id.encode("utf-8")).digest()
+    raw = int.from_bytes(digest[:8], byteorder="big", signed=True)
+    return raw
+
+
+async def _try_acquire_scheduler_lock(merchant_id: str) -> bool:
+    """P1-5: leader-election for per-merchant scheduled audits.
+
+    pg_try_advisory_lock is non-blocking: returns true if THIS
+    session acquired the lock, false if another session holds it.
+    Two pods racing at 03:00 UTC on the same due merchant: one wins,
+    the other returns False and skips.
+
+    Returns False on non-Postgres backends (SQLite tests) — those
+    are single-pod by definition, no leader-election needed.
+    """
+    from db.database import database
+    db_url = str(getattr(database, "url", "") or "")
+    if not db_url.startswith(("postgres://", "postgresql://")):
+        # Non-Postgres backend — no advisory-lock semantics.
+        # Assume single-pod (test / sqlite) and proceed.
+        return True
+    try:
+        row = await database.fetch_one(
+            "SELECT pg_try_advisory_lock(:lock_id) AS got",
+            {"lock_id": _advisory_lock_id_for_merchant(merchant_id)},
+        )
+        return bool(row and row["got"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "scheduled_audit_job: advisory-lock attempt failed for "
+            "merchant_id=%s (treating as unlocked to fail open): %s",
+            merchant_id, str(exc)[:200],
+        )
+        # Fail open — we'd rather double-audit than block all
+        # scheduled audits on a transient lock-system failure.
+        return True
+
+
+async def _release_scheduler_lock(merchant_id: str) -> None:
+    """Release the per-merchant advisory lock. Idempotent — Postgres
+    silently ignores releases for locks not held."""
+    from db.database import database
+    db_url = str(getattr(database, "url", "") or "")
+    if not db_url.startswith(("postgres://", "postgresql://")):
+        return
+    try:
+        await database.execute(
+            "SELECT pg_advisory_unlock(:lock_id)",
+            {"lock_id": _advisory_lock_id_for_merchant(merchant_id)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "scheduled_audit_job: advisory-unlock failed for "
+            "merchant_id=%s: %s", merchant_id, str(exc)[:200],
+        )
+
+
 async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
     """Run a re-audit for one due merchant. Returns a summary dict
     for logging. Catches all exceptions internally — never re-raises
@@ -209,6 +276,48 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
         "reason": None,
     }
 
+    # P1-5: per-merchant advisory lock keeps two pods from running
+    # the same scheduled audit at the same time. Codex P1 #6
+    # ("Multiple API pods can all pick the same due merchant at
+    # 03:00 UTC and run duplicate audits"). Lock is released in the
+    # finally below regardless of audit outcome.
+    locked = await _try_acquire_scheduler_lock(merchant_id)
+    if not locked:
+        summary["reason"] = (
+            "another pod holds the scheduler advisory lock; skipped"
+        )
+        return summary
+
+    try:
+        return await _re_audit_merchant_locked(
+            due=due, summary=summary,
+            database=database,
+            merchant_audit_runs=merchant_audit_runs,
+            record_audit_run_started=record_audit_run_started,
+            record_audit_run_completed=record_audit_run_completed,
+            recent_runs_for_merchant=recent_runs_for_merchant,
+            run_brand_report=run_brand_report,
+        )
+    finally:
+        await _release_scheduler_lock(merchant_id)
+
+
+async def _re_audit_merchant_locked(
+    *,
+    due: Dict[str, Any],
+    summary: Dict[str, Any],
+    database,
+    merchant_audit_runs,
+    record_audit_run_started,
+    record_audit_run_completed,
+    recent_runs_for_merchant,
+    run_brand_report,
+) -> Dict[str, Any]:
+    """Body of _re_audit_merchant, called inside the advisory-lock
+    guard. Extracted so the lock/unlock pair sits in a single
+    try/finally regardless of which early-return path the body
+    takes (no-prior-audit, prior-fetch-failed, no-products, etc.)."""
+    merchant_id = due["merchant_id"]
     # Extract the product set from the most-recent succeeded audit's
     # report_jsonb. Re-audit the same set so trend deltas are
     # apples-to-apples.
