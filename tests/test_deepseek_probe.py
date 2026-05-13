@@ -390,6 +390,346 @@ def test_build_findings_high_severity_for_low_score():
 
 
 # ---------------------------------------------------------------------
+# _call_deepseek_chat request body shape
+#
+# The probe_one_scan_mode E2E tests below monkeypatch
+# _call_deepseek_chat itself, so they never exercise the actual HTTP
+# request body. These tests intercept at the transport layer to pin
+# the canonical request shape (URL, headers, model, messages,
+# response_format, temperature, max_tokens, tools=web_search,
+# enable_search) — regressions there would silently break grounded
+# audits without surfacing in any other test.
+# ---------------------------------------------------------------------
+
+
+def _capturing_transport(
+    *,
+    response_payload: Any = None,
+    status_code: int = 200,
+) -> tuple[httpx.MockTransport, Dict[str, Any]]:
+    captured: Dict[str, Any] = {}
+    payload = (
+        response_payload
+        if response_payload is not None
+        else {"choices": [{"message": {"content": "{}"}}]}
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["headers"] = dict(request.headers)
+        try:
+            captured["body"] = json.loads(request.content.decode("utf-8"))
+        except Exception:
+            captured["body"] = None
+        return httpx.Response(status_code, json=payload)
+
+    return httpx.MockTransport(_handler), captured
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_sends_canonical_request_body(monkeypatch):
+    """Pin the URL, auth header, model, messages, response_format,
+    temperature, and max_tokens that hit Deepseek."""
+    from services.llm_providers import deepseek_probe
+
+    transport, captured = _capturing_transport()
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    await deepseek_probe._call_deepseek_chat(
+        api_key="sk-test-123",
+        base_url="https://api.deepseek.com",
+        model="deepseek-chat",
+        system_prompt="SYS",
+        user_message="USR",
+        timeout_s=5.0,
+    )
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert captured["headers"]["authorization"] == "Bearer sk-test-123"
+    assert captured["headers"]["content-type"] == "application/json"
+    body = captured["body"]
+    assert body["model"] == "deepseek-chat"
+    assert body["messages"] == [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "USR"},
+    ]
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 800
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_includes_web_search_when_enabled(monkeypatch):
+    """enable_web_search=True (default) → body carries both the
+    OpenAI-compatible `tools` array AND the older `enable_search`
+    flag. Deepseek ignores unknown fields rather than 4xx-ing, so
+    sending both is the documented defensive shape."""
+    from services.llm_providers import deepseek_probe
+
+    transport, captured = _capturing_transport()
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    await deepseek_probe._call_deepseek_chat(
+        api_key="sk-test",
+        base_url="https://api.deepseek.com",
+        model="deepseek-chat",
+        system_prompt="SYS",
+        user_message="USR",
+        timeout_s=5.0,
+        enable_web_search=True,
+    )
+    body = captured["body"]
+    assert body["tools"] == [{"type": "web_search"}]
+    assert body["enable_search"] is True
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_omits_web_search_when_disabled(monkeypatch):
+    """enable_web_search=False → no `tools`, no `enable_search` in the
+    body. Audits that opt out of grounding shouldn't pay for tool calls."""
+    from services.llm_providers import deepseek_probe
+
+    transport, captured = _capturing_transport()
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    await deepseek_probe._call_deepseek_chat(
+        api_key="sk-test",
+        base_url="https://api.deepseek.com",
+        model="deepseek-chat",
+        system_prompt="SYS",
+        user_message="USR",
+        timeout_s=5.0,
+        enable_web_search=False,
+    )
+    body = captured["body"]
+    assert "tools" not in body
+    assert "enable_search" not in body
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_strips_trailing_slash_from_base_url(monkeypatch):
+    """`base_url` configured with or without a trailing slash should
+    both resolve to the same `/v1/chat/completions` endpoint."""
+    from services.llm_providers import deepseek_probe
+
+    transport, captured = _capturing_transport()
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    await deepseek_probe._call_deepseek_chat(
+        api_key="sk-test",
+        base_url="https://api.deepseek.com/",
+        model="deepseek-chat",
+        system_prompt="SYS",
+        user_message="USR",
+        timeout_s=5.0,
+    )
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_raises_probe_error_on_401(monkeypatch):
+    from services.llm_providers import deepseek_probe
+
+    transport, _ = _capturing_transport(
+        response_payload={"error": "unauthorized"}, status_code=401,
+    )
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    with pytest.raises(deepseek_probe.DeepseekProbeError) as exc:
+        await deepseek_probe._call_deepseek_chat(
+            api_key="sk-bogus",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            system_prompt="SYS",
+            user_message="USR",
+            timeout_s=5.0,
+        )
+    assert "401" in str(exc.value) or "auth" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_raises_probe_error_on_4xx(monkeypatch):
+    """Non-401 4xx (e.g. 400 bad request) — the probe still treats it
+    as a non-transient client error and raises."""
+    from services.llm_providers import deepseek_probe
+
+    transport, _ = _capturing_transport(
+        response_payload={"error": "bad request"}, status_code=400,
+    )
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    with pytest.raises(deepseek_probe.DeepseekProbeError) as exc:
+        await deepseek_probe._call_deepseek_chat(
+            api_key="sk-test",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            system_prompt="SYS",
+            user_message="USR",
+            timeout_s=5.0,
+        )
+    assert "400" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_raises_probe_error_on_5xx(monkeypatch):
+    from services.llm_providers import deepseek_probe
+
+    transport, _ = _capturing_transport(
+        response_payload={"error": "boom"}, status_code=503,
+    )
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    with pytest.raises(deepseek_probe.DeepseekProbeError) as exc:
+        await deepseek_probe._call_deepseek_chat(
+            api_key="sk-test",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            system_prompt="SYS",
+            user_message="USR",
+            timeout_s=5.0,
+        )
+    assert "503" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_call_deepseek_chat_raises_probe_error_on_network_failure(monkeypatch):
+    """httpx.TimeoutException / NetworkError → DeepseekProbeError so
+    the caller can mark the run upstream-failed."""
+    from services.llm_providers import deepseek_probe
+
+    def _boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns failure")
+
+    transport = httpx.MockTransport(_boom)
+
+    real_async_client = httpx.AsyncClient
+
+    class _ClientFactory:
+        def __init__(self, *a, **kw):
+            kw["transport"] = transport
+            self._client = real_async_client(*a, **kw)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self._client.__aexit__(*exc)
+
+    monkeypatch.setattr(deepseek_probe.httpx, "AsyncClient", _ClientFactory)
+
+    with pytest.raises(deepseek_probe.DeepseekProbeError) as exc:
+        await deepseek_probe._call_deepseek_chat(
+            api_key="sk-test",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            system_prompt="SYS",
+            user_message="USR",
+            timeout_s=5.0,
+        )
+    assert "transport" in str(exc.value).lower() or "dns" in str(exc.value).lower()
+
+
+# ---------------------------------------------------------------------
 # End-to-end probe_one_scan_mode (mocked HTTP)
 # ---------------------------------------------------------------------
 
