@@ -575,6 +575,33 @@ def test_429_when_audit_quota_exhausted(env):
     assert "next_reset_in_seconds" in detail
 
 
+def test_429_when_audit_quota_exhausted_via_async_pipeline_compat(env):
+    """P1-1 regression: before the fix, `?via=async_pipeline` returned
+    before _check_audit_rate_limit, so a quota-exhausted merchant
+    could keep enqueueing audits by switching to the compat path.
+    Now both arms share the same daily-cap check."""
+    client, _, _ = env
+    # Burn the cap via the sync path first.
+    for _ in range(2):
+        res = client.post(
+            "/api/merchant-center/audit/ai-commerce-readiness",
+            json={"products": [_ref("p1")]},
+        )
+        assert res.status_code == 200, res.text
+    # ?via=async_pipeline MUST also be rate-limited.
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness"
+        "?via=async_pipeline",
+        json={"products": [_ref("p1")]},
+    )
+    assert res.status_code == 429, (
+        f"async-compat path bypassed the rate limit: got "
+        f"{res.status_code} {res.text}"
+    )
+    detail = res.json()["detail"]
+    assert detail["limit"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
