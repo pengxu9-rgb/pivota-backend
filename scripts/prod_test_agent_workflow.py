@@ -15,7 +15,7 @@ Hits live HTTPS endpoints with a structured test matrix:
   - Stage transition timestamp monotonicity
 
 Usage:
-  BASE_URL=https://web-production-fedb.up.railway.app \\
+  BASE_URL=https://api.pivota.cc \\
   MERCHANT_JWT=<token> \\
   MERCHANT_ID=merch_efbc46b4619cfbdf \\
   python3 scripts/prod_test_agent_workflow.py [--max-poll-seconds 180]
@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 
-DEFAULT_BASE = "https://web-production-fedb.up.railway.app"
+DEFAULT_BASE = "https://api.pivota.cc"
 
 
 @dataclass
