@@ -249,16 +249,27 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
     if run_id:
         prior_runs = [r for r in prior_runs if r.get("run_id") != run_id]
 
+    # P1-3: scope every probe call inside this scheduled audit with
+    # audit_run_id + merchant_id so probe telemetry rows attribute
+    # to the right run / merchant. Pre-fix, scheduled audits ran
+    # outside any audit_telemetry context — daily cron traffic was
+    # invisible to per-merchant cost accounting and per-run cost
+    # rollups. The async worker already wraps via audit_run_worker;
+    # this brings the cron path up to parity.
+    from services.audit_telemetry_context import audit_telemetry
     try:
-        out = await run_brand_report(
-            merchant_name=str(merchant_id),  # actual name lookup is caller-side; merchant_id is fine for cron
-            merchant_domain=None,
-            products=products,
-            provider="gemini",
-            max_runs=3,
-            prior_runs=prior_runs,
-            integration_state=None,  # cron has no integration context; engine handles None
-        )
+        async with audit_telemetry(
+            run_id=run_id, merchant_id=merchant_id,
+        ):
+            out = await run_brand_report(
+                merchant_name=str(merchant_id),  # actual name lookup is caller-side; merchant_id is fine for cron
+                merchant_domain=None,
+                products=products,
+                provider="gemini",
+                max_runs=3,
+                prior_runs=prior_runs,
+                integration_state=None,  # cron has no integration context; engine handles None
+            )
     except Exception as exc:  # noqa: BLE001
         await record_audit_run_completed(
             run_id=run_id, status="failed", error_message=str(exc)[:2000],

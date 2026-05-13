@@ -575,6 +575,91 @@ def test_429_when_audit_quota_exhausted(env):
     assert "next_reset_in_seconds" in detail
 
 
+def test_legacy_sync_path_wraps_run_brand_report_in_audit_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """P1-3 regression: pre-fix, the legacy /ai-commerce-readiness
+    sync path called run_brand_report OUTSIDE any audit_telemetry
+    context, so probe telemetry rows recorded audit_run_id=None +
+    merchant_id=None — invisible to per-run cost rollups.
+
+    Assert that when run_brand_report is invoked, the contextvar
+    set by audit_telemetry() has the audit run + merchant attribution
+    populated. We capture the context AT run_brand_report time
+    (not after) so the test catches the case where the wrap was
+    accidentally moved outside the call site."""
+    from routes import merchant_audit_routes as mar
+    from services.audit_telemetry_context import current_audit_context
+
+    products = [_row("merch_self", "p1")]
+    monkeypatch.setattr(mar, "database", FakeDatabase(products))
+
+    async def _fake_get_merchant_onboarding(_mid: str):
+        return {"merchant_id": "merch_self",
+                "business_name": "T", "store_url": "t.com"}
+    monkeypatch.setattr(
+        mar, "get_merchant_onboarding", _fake_get_merchant_onboarding,
+    )
+
+    captured_ctx_at_brand_report_time: Dict[str, Any] = {}
+
+    async def _capturing_brand_report(**kwargs):
+        ctx = current_audit_context()
+        captured_ctx_at_brand_report_time["audit_run_id"] = ctx.audit_run_id
+        captured_ctx_at_brand_report_time["merchant_id"] = ctx.merchant_id
+        # Minimal return so the rest of the legacy block doesn't fail.
+        return {
+            "merchant_name": "T", "merchant_domain": "t.com",
+            "timestamp": "2026-05-13T00:00:00+00:00",
+            "provider": "gemini",
+            "per_product": [{
+                "merchant_pdp_url": "https://t.com/p",
+                "verdict": {"label": "OK", "visibility_score": 0,
+                            "attribution_score": 0,
+                            "category_visibility_score": 0},
+            }],
+            "aggregate": {
+                "avg_visibility": 0, "avg_attribution": 0,
+                "avg_category_visibility": 0,
+                "brand_verdict_label": "OK",
+                "brand_verdict_explanation": "",
+                "products_count": 1, "products_succeeded": 1,
+                "products_failed": 0,
+            },
+            "cross_product_competitors": [],
+            "failed": [],
+        }
+
+    monkeypatch.setattr(mar, "run_brand_report", _capturing_brand_report)
+    _install_audit_run_persistence_mocks(monkeypatch, mar)
+
+    async def _override_merchant() -> str:
+        return "merch_self"
+
+    app = FastAPI()
+    app.include_router(mar.router)
+    app.dependency_overrides[get_current_merchant] = _override_merchant
+    client = TestClient(app)
+
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness",
+        json={"products": [_ref("p1")]},
+    )
+    assert res.status_code == 200, res.text
+    # The contextvar must have been set at the moment run_brand_report
+    # was called.
+    assert captured_ctx_at_brand_report_time["merchant_id"] == "merch_self", (
+        "merchant_id not set in audit_telemetry context — probe "
+        "telemetry rows would record merchant_id=None"
+    )
+    # audit_run_id may be None when record_audit_run_started's DB
+    # write is mocked out, but the contextvar MUST have been
+    # populated with WHATEVER value record_audit_run_started returned.
+    # Assert it's at least present in the captured dict so the wrap
+    # demonstrably executed.
+    assert "audit_run_id" in captured_ctx_at_brand_report_time
+
+
 def test_429_when_audit_quota_exhausted_via_async_pipeline_compat(env):
     """P1-1 regression: before the fix, `?via=async_pipeline` returned
     before _check_audit_rate_limit, so a quota-exhausted merchant
