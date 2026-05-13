@@ -311,6 +311,41 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Q-P0-2 / Q-P1-4: cross-audit task supersession
+            # (migration 092). The task_queue_service marks prior
+            # pending tasks as `status='superseded'` and points
+            # `superseded_by_task_id` at the newer task when a fresh
+            # audit emits the same canonical action identity. Without
+            # this column, supersession can't write back the pointer
+            # and the merchant queue stays cluttered with stale rows.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_tasks
+                      ADD COLUMN IF NOT EXISTS superseded_by_task_id UUID NULL;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                      idx_merchant_tasks_identity_pending
+                      ON merchant_tasks (merchant_id, lever, title)
+                      WHERE status = 'pending';
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                      idx_merchant_tasks_superseded_by
+                      ON merchant_tasks (superseded_by_task_id)
+                      WHERE superseded_by_task_id IS NOT NULL;
+                    """
+                )
+            )
             # Pivota canonical PDP columns (migration 071). Fast-mode
             # startup skips db/migrations/, so the schema guard owns
             # these in production. Mirrors what's already in db.catalog
