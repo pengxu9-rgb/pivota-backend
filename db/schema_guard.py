@@ -292,6 +292,25 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # P0-3: DB-enforced audit idempotency (migration 091).
+            # Partial UNIQUE index scoped to active stages closes the
+            # check-then-insert race in POST /api/audits. The index
+            # name doubles as a CONSTRAINT reference for the enqueue
+            # path's `ON CONFLICT ON CONSTRAINT ...` syntax.
+            await database.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                      uniq_merchant_audit_runs_active_idempotency_key
+                      ON merchant_audit_runs (idempotency_key)
+                      WHERE idempotency_key IS NOT NULL
+                        AND stage IN (
+                          'queued', 'discovering', 'probing', 'scoring',
+                          'materializing', 'verifying'
+                        );
+                    """
+                )
+            )
             # Pivota canonical PDP columns (migration 071). Fast-mode
             # startup skips db/migrations/, so the schema guard owns
             # these in production. Mirrors what's already in db.catalog
