@@ -40,6 +40,7 @@ async def _record_probe_telemetry(
     started_at_perf: float,
     result: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> None:
     """P2.5b: best-effort telemetry record after every probe call.
     Pulls audit_run_id + merchant_id from the audit_telemetry context
@@ -47,10 +48,13 @@ async def _record_probe_telemetry(
 
     Token + cost extraction: result['usage'] from upstream PIVOTA-Agent
     contains input_tokens + output_tokens when available. Cost is
-    computed via provider_registry rates. When result/usage is missing
-    (mock fallback, error path, partial response), the row is still
-    inserted with None for the cost fields — telemetry coverage beats
-    perfect cost data.
+    computed via provider_registry rates — when `model` is supplied
+    and the provider has per-model rates, those are preferred over
+    the provider-level fallback so non-headline SKUs (e.g.
+    deepseek-reasoner vs deepseek-chat) aren't silently undercounted.
+    When result/usage is missing (mock fallback, error path, partial
+    response), the row is still inserted with None for the cost
+    fields — telemetry coverage beats perfect cost data.
     """
     try:
         from db.llm_probe_runs import (
@@ -76,15 +80,12 @@ async def _record_probe_telemetry(
                 )
                 p = get_provider(provider)
                 if p is not None:
+                    rates = p.rate_for_model(model)
                     cost_usd = compute_cost_usd(
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        cost_per_1k_input_tokens_usd=(
-                            p.cost_per_1k_input_tokens_usd
-                        ),
-                        cost_per_1k_output_tokens_usd=(
-                            p.cost_per_1k_output_tokens_usd
-                        ),
+                        cost_per_1k_input_tokens_usd=rates["input_per_1k"],
+                        cost_per_1k_output_tokens_usd=rates["output_per_1k"],
                     )
             except Exception:  # noqa: BLE001
                 pass  # cost is nice-to-have; row still records
