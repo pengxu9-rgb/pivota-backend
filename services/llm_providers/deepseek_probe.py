@@ -510,27 +510,37 @@ def _compute_scores_from_runs(
     Conservative: visibility_score is the % of runs where the LLM
     self-reported positively; attribution_echo_rate is unused by
     Deepseek (Gemini-specific concept).
+
+    Upstream-failed runs (parsed=None — HTTP/parse errors caught in
+    `_run_single_query`) are EXCLUDED from the denominator. Same
+    convention as the canonical scorer in
+    services.agent_center_bd_report_service.score_category_visibility
+    (see PR-433). Counting a transient probe failure as a negative
+    would drag the score down for what is not a visibility miss.
     """
     if not runs:
         return {"visibility_score": 0, "attribution_echo_rate": 0}
+    scoreable = [r for r in runs if r.get("parsed") is not None]
+    if not scoreable:
+        return {"visibility_score": 0, "attribution_echo_rate": 0}
     if scan_mode == "open_product_visibility_test":
         positive = sum(
-            1 for r in runs
+            1 for r in scoreable
             if (r.get("parsed") or {}).get("product_visible")
         )
     elif scan_mode == "merchant_store_attribution_test":
         positive = sum(
-            1 for r in runs
+            1 for r in scoreable
             if (r.get("parsed") or {}).get("merchant_url_found")
         )
     elif scan_mode == "category_visibility_test":
         positive = sum(
-            1 for r in runs
+            1 for r in scoreable
             if (r.get("parsed") or {}).get("brand_appears")
         )
     else:
         positive = 0
-    score = round((positive / max(1, len(runs))) * 100)
+    score = round((positive / len(scoreable)) * 100)
     return {"visibility_score": score, "attribution_echo_rate": 0}
 
 

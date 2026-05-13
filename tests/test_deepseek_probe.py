@@ -317,13 +317,38 @@ def test_compute_scores_category_visibility():
     runs = [
         {"parsed": {"brand_appears": True}},
         {"parsed": {"brand_appears": True}},
-        {"parsed": None},  # upstream-failed run
+        {"parsed": None},  # upstream-failed run — excluded from denominator
     ]
     scores = _compute_scores_from_runs(
         scan_mode="category_visibility_test", runs=runs,
     )
-    # 2 positive / 3 total = 67%
-    assert scores["visibility_score"] == 67
+    # 2 positive / 2 scoreable = 100% (upstream-failed run excluded
+    # from denominator — matches the canonical scorer in
+    # services.agent_center_bd_report_service.score_category_visibility).
+    assert scores["visibility_score"] == 100
+
+
+def test_compute_scores_excludes_upstream_failed_from_denominator():
+    """One positive + two upstream-failed runs scores as 100%, not 33%."""
+    from services.llm_providers.deepseek_probe import _compute_scores_from_runs
+    runs = [
+        {"parsed": {"product_visible": True}},
+        {"parsed": None},
+        {"parsed": None},
+    ]
+    scores = _compute_scores_from_runs(
+        scan_mode="open_product_visibility_test", runs=runs,
+    )
+    assert scores["visibility_score"] == 100
+
+
+def test_compute_scores_all_upstream_failed_returns_zero():
+    from services.llm_providers.deepseek_probe import _compute_scores_from_runs
+    runs = [{"parsed": None}, {"parsed": None}]
+    scores = _compute_scores_from_runs(
+        scan_mode="open_product_visibility_test", runs=runs,
+    )
+    assert scores["visibility_score"] == 0
 
 
 def test_compute_scores_handles_empty_runs():
