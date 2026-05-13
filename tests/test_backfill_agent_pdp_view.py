@@ -294,9 +294,8 @@ def test_pick_gtin13_lex_smallest_wins_on_count_tie() -> None:
 
 
 def test_upsert_sql_targets_all_schema_columns() -> None:
-    """Every schema column owned by the backfill (everything except
-    refreshed_by_proposal_id, which belongs to Stage 3a-iii) must be in
-    the INSERT column list AND in the ON CONFLICT DO UPDATE SET clause.
+    """Every schema column owned by the shared upsert must be in the
+    INSERT column list AND in the ON CONFLICT DO UPDATE SET clause.
     Catches drift if mig 085's schema gets extended without updating
     the backfill."""
     sql = backfill.UPSERT_SQL
@@ -307,7 +306,7 @@ def test_upsert_sql_targets_all_schema_columns() -> None:
         "variants", "variants_count", "gtin13",
         "category_path", "taxonomy_tags", "breadcrumb",
         "pdp_lifecycle_stage", "sync_status", "primary_merchant_id",
-        "refresh_source",
+        "refresh_source", "refreshed_by_proposal_id",
     ]
     for col in columns_owned_by_backfill:
         assert col in sql, f"column {col!r} missing from UPSERT_SQL"
@@ -315,6 +314,9 @@ def test_upsert_sql_targets_all_schema_columns() -> None:
     # refreshed_at is owned by the backfill (NOW()) but not via a bind
     # parameter — it's hard-coded NOW() in both branches.
     assert "refreshed_at = NOW()" in sql
+    params = backfill.row_to_upsert_params({"content_key": "ck_x"})
+    assert "refreshed_by_proposal_id" in params
+    assert params["refreshed_by_proposal_id"] is None
 
 
 # ---------------------------------------------------------------------------
