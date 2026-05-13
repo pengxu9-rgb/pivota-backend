@@ -829,7 +829,10 @@ def test_aggregate_brand_scores_skips_missing_category_when_only_some_have_it() 
 def test_aggregate_brand_competitors_sums_across_products() -> None:
     """Cross-product competitor frequency: Sephora cited 3× on product
     A + 2× on product B = 5 total. Better signal than per-product
-    competitor table because BD wants brand-wide narrative."""
+    competitor table because BD wants brand-wide narrative.
+
+    Q-P1-3: hosts now carry confidence tier + per-probe breakdown.
+    Buyer-intent-only hosts → grounded_competitor."""
     from services.agent_center_bd_report_service import _aggregate_brand_competitors
     per_product = [
         {"attribution": {"competitor_hosts": [
@@ -842,9 +845,17 @@ def test_aggregate_brand_competitors_sums_across_products() -> None:
         ]}},
     ]
     out = _aggregate_brand_competitors(per_product)
-    assert out[0] == {"host": "Sephora", "times_cited": 5}
-    # Top-15 ordering: Sephora (5), Ulta (1), YesStyle (1)
+    # Host normalization → lowercase. Buyer-intent only → grounded_competitor.
+    top = out[0]
+    assert top["host"] == "sephora"
+    assert top["times_cited"] == 5
+    assert top["confidence"] == "grounded_competitor"
+    assert top["source"] == "buyer_intent"
+    assert top["buyer_intent_cited"] == 5
+    assert top["category_cited"] == 0
+    # Top-15 ordering: Sephora (5), Ulta (1), YesStyle (1).
     assert len(out) == 3
+    assert [e["host"] for e in out] == ["sephora", "ulta", "yesstyle"]
 
 
 @pytest.mark.asyncio
@@ -957,8 +968,13 @@ async def test_run_brand_report_aggregate_competitor_view(
         include_category_visibility=False,
     )
     # Sephora is cited 1× on each of 2 products = 2 total brand-wide.
+    # Q-P1-3: rollup entry now carries confidence + source breakdown.
+    # Buyer-intent only → grounded_competitor; hosts are lowercased.
     competitors = out["cross_product_competitors"]
-    assert competitors[0] == {"host": "Sephora", "times_cited": 2}
+    assert competitors[0]["host"] == "sephora"
+    assert competitors[0]["times_cited"] == 2
+    assert competitors[0]["confidence"] == "grounded_competitor"
+    assert competitors[0]["source"] == "buyer_intent"
 
 
 def test_render_markdown_includes_industry_context_and_actions() -> None:
