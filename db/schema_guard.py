@@ -37,6 +37,12 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
         },
     ),
     RequiredTableColumns(
+        table="merchant_stores",
+        columns={
+            "is_primary",
+        },
+    ),
+    RequiredTableColumns(
         table="catalog_products",
         columns={
             # Pivota canonical PDP — see migration 071. The canonical
@@ -157,6 +163,78 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown',
                       ADD COLUMN IF NOT EXISTS validation_error TEXT,
                       ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE;
+                    """
+                )
+            )
+            # Merchant portal primary-store selection (migration 089).
+            # Production fast mode skips db/migrations/, so keep the
+            # critical column and invariant available at startup.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_stores
+                      ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT FALSE;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    UPDATE merchant_stores ms
+                    SET is_primary = TRUE
+                    FROM (
+                      SELECT store_id, merchant_id,
+                             ROW_NUMBER() OVER (
+                               PARTITION BY merchant_id
+                               ORDER BY connected_at DESC NULLS LAST, store_id
+                             ) AS primary_rank
+                      FROM merchant_stores
+                      WHERE LOWER(COALESCE(status, 'connected')) IN ('active', 'connected')
+                    ) candidate
+                    WHERE ms.store_id = candidate.store_id
+                      AND candidate.primary_rank = 1
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM merchant_stores existing
+                        WHERE existing.merchant_id = candidate.merchant_id
+                          AND existing.is_primary = TRUE
+                      );
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    UPDATE merchant_stores ms
+                    SET is_primary = FALSE
+                    FROM (
+                      SELECT store_id,
+                             ROW_NUMBER() OVER (
+                               PARTITION BY merchant_id
+                               ORDER BY connected_at DESC NULLS LAST, store_id
+                             ) AS primary_rank
+                      FROM merchant_stores
+                      WHERE is_primary = TRUE
+                    ) ranked
+                    WHERE ms.store_id = ranked.store_id
+                      AND ranked.primary_rank > 1;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uniq_merchant_stores_primary_per_merchant
+                      ON merchant_stores (merchant_id)
+                      WHERE is_primary = TRUE;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_primary
+                      ON merchant_stores (merchant_id, is_primary, connected_at DESC);
                     """
                 )
             )
