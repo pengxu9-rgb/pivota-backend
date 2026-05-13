@@ -117,21 +117,39 @@ def extract_evidence_items(
             })
 
     # Cross-product competitor mentions → competitor_mention evidence.
+    # Q-P1-3: rollup entries now carry a `confidence` tier
+    # (verified_competitor / grounded_competitor / possible_peer_host).
+    # Map those to evidence confidence so possible_peer_host doesn't
+    # drive HIGH-confidence "X is a competitor" calls in downstream
+    # report prose. Back-compat: entries without a confidence field
+    # fall through to MEDIUM (the prior behavior).
     competitors = brand_report.get("cross_product_competitors") or []
+    _competitor_confidence_map = {
+        "verified_competitor": CONFIDENCE_EVIDENCE_HIGH,
+        "grounded_competitor": CONFIDENCE_EVIDENCE_MEDIUM,
+        "possible_peer_host": CONFIDENCE_EVIDENCE_LOW,
+    }
     for c in competitors:
         if not isinstance(c, dict):
             continue
         host = (c.get("host") or "").strip()
         if not host:
             continue
+        rollup_confidence = c.get("confidence")
         out.append({
             "evidence_type": "competitor_mention",
             "payload": {
                 "host": host,
                 "times_cited": c.get("times_cited"),
+                "source": c.get("source"),
+                "rollup_confidence": rollup_confidence,
+                "buyer_intent_cited": c.get("buyer_intent_cited"),
+                "category_cited": c.get("category_cited"),
             },
             "product_key": None,  # brand-level
-            "confidence": CONFIDENCE_EVIDENCE_MEDIUM,
+            "confidence": _competitor_confidence_map.get(
+                rollup_confidence, CONFIDENCE_EVIDENCE_MEDIUM,
+            ),
         })
 
     # Per-product merchant URL matches → url_match evidence.

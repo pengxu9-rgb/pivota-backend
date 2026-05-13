@@ -1610,22 +1610,78 @@ def _aggregate_brand_scores(per_product: List[Dict[str, Any]]) -> Dict[str, Any]
 
 
 def _aggregate_brand_competitors(per_product: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Walk per-product attribution.competitor_hosts, sum across
-    products, return ranked top 15. The aggregate "who's stealing
-    your AI traffic across the whole brand" view — typically more
-    pitch-relevant than per-product because BD wants to call out
-    "Sephora captures 12 / 15 of your queries across these 5 SKUs"."""
-    counter: Counter = Counter()
+    """Walk per-product attribution.competitor_hosts AND
+    category_visibility.retailer_hosts, sum cross-probe + cross-product,
+    return ranked top 15. The aggregate "who's stealing your AI traffic
+    across the whole brand" view — pitch-relevant because BD wants to
+    call out "Sephora captures 12 / 15 of your queries across these 5 SKUs".
+
+    Q-P1-3: pre-fix this only walked attribution.competitor_hosts, which
+    drops category-probe peer brands entirely. The Winona prod artifact
+    surfaced "verywellfit.com" and "shape.com" as category-probe peers
+    that never made it into the brand rollup because the buyer-intent
+    probe (attribution.competitor_hosts) didn't separately capture them.
+
+    Output shape per host:
+      {
+        host, times_cited,                     # back-compat
+        buyer_intent_cited, category_cited,    # per-probe breakdown
+        source,                                # "buyer_intent" | "category_only" | "both"
+        confidence,                            # see below
+      }
+
+    Confidence tiering:
+      - "verified_competitor": appears in BOTH probes. Strongest signal —
+        named by a buyer-intent query AND captured category visibility.
+      - "grounded_competitor": appears only in attribution.competitor_hosts.
+        Direct buyer-intent capture, no category context.
+      - "possible_peer_host": appears only in category_visibility.retailer_hosts.
+        Category peer, but no direct buyer-intent capture — call out as
+        peer/context, not verified competitor.
+
+    Total `times_cited` sums across both probes for ranking.
+    """
+    buyer_intent_count: Counter = Counter()
+    category_count: Counter = Counter()
     for product in per_product:
-        for entry in (product.get("attribution") or {}).get("competitor_hosts") or []:
-            host = entry.get("host")
+        attr = product.get("attribution") or {}
+        for entry in attr.get("competitor_hosts") or []:
+            host = (entry.get("host") or "").strip().lower()
             count = entry.get("times_cited") or 0
             if host and count:
-                counter[host] += int(count)
-    return [
-        {"host": h, "times_cited": c}
-        for h, c in counter.most_common(15)
-    ]
+                buyer_intent_count[host] += int(count)
+        cat = product.get("category_visibility") or {}
+        for entry in cat.get("retailer_hosts") or []:
+            host = (entry.get("host") or "").strip().lower()
+            count = entry.get("times_cited") or 0
+            if host and count:
+                category_count[host] += int(count)
+
+    out: List[Dict[str, Any]] = []
+    for host in set(buyer_intent_count) | set(category_count):
+        bi = buyer_intent_count.get(host, 0)
+        cv = category_count.get(host, 0)
+        if bi and cv:
+            confidence = "verified_competitor"
+            source = "both"
+        elif bi:
+            confidence = "grounded_competitor"
+            source = "buyer_intent"
+        else:
+            confidence = "possible_peer_host"
+            source = "category_only"
+        out.append({
+            "host": host,
+            "times_cited": bi + cv,
+            "buyer_intent_cited": bi,
+            "category_cited": cv,
+            "source": source,
+            "confidence": confidence,
+        })
+
+    # Rank by combined times_cited desc, then by host to stabilize ties.
+    out.sort(key=lambda e: (-e["times_cited"], e["host"]))
+    return out[:15]
 
 
 # ---------------------------------------------------------------------------
@@ -5260,12 +5316,38 @@ def render_brand_markdown(
     cross = brand_report.get("cross_product_competitors") or []
     if cross:
         sections.append("\n## Hosts capturing this brand's AI traffic\n")
-        rows = ["| Host | Times cited across products |", "|---|---|"]
-        for entry in cross[:15]:
-            rows.append(
-                f"| `{entry.get('host', '?')}` | {entry.get('times_cited', 0)} |"
+        # Q-P1-3: split rendering into verified competitors vs possible
+        # peer hosts so BD doesn't lead a pitch with "Sephora's stealing
+        # your traffic" when the evidence is category-context only.
+        verified = [e for e in cross if e.get("confidence") in {
+            "verified_competitor", "grounded_competitor",
+        }]
+        peers = [e for e in cross if e.get("confidence") == "possible_peer_host"]
+        if verified:
+            rows = [
+                "| Host | Times cited | Source | Confidence |",
+                "|---|---|---|---|",
+            ]
+            for entry in verified[:15]:
+                rows.append(
+                    f"| `{entry.get('host', '?')}` "
+                    f"| {entry.get('times_cited', 0)} "
+                    f"| {entry.get('source', 'unknown')} "
+                    f"| {entry.get('confidence', 'unknown')} |"
+                )
+            sections.append("\n".join(rows) + "\n")
+        if peers:
+            sections.append(
+                "\n_Possible peer hosts (category context, no direct "
+                "buyer-intent capture):_\n"
             )
-        sections.append("\n".join(rows) + "\n")
+            rows = ["| Host | Category cites |", "|---|---|"]
+            for entry in peers[:15]:
+                rows.append(
+                    f"| `{entry.get('host', '?')}` "
+                    f"| {entry.get('category_cited', entry.get('times_cited', 0))} |"
+                )
+            sections.append("\n".join(rows) + "\n")
 
     failed = brand_report.get("failed") or []
     if failed:
