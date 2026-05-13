@@ -1403,7 +1403,15 @@ async def run_brand_report(
     aggregate["products_succeeded"] = len(per_product)
     aggregate["products_failed"] = len(failed)
 
-    cross_competitors = _aggregate_brand_competitors(per_product)
+    cross_competitors = _aggregate_brand_competitors(
+        per_product,
+        # N5 PR-7: exclude merchant's own brand-derived domain from
+        # the rollup. Required for external_seed audits where
+        # merchant_host is the Pivota canonical URL, not the brand's
+        # real D2C domain.
+        merchant_brand=merchant_name,
+        merchant_domain=merchant_domain,
+    )
 
     return {
         "merchant_name": merchant_name,
@@ -1609,7 +1617,69 @@ def _aggregate_brand_scores(per_product: List[Dict[str, Any]]) -> Dict[str, Any]
     }
 
 
-def _aggregate_brand_competitors(per_product: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _brand_to_candidate_hosts(brand: Optional[str]) -> List[str]:
+    """Best-effort brand → likely-D2C-host mapping. "Beauty of Joseon"
+    → ["beautyofjoseon.com", "beautyofjoseon.co"]. Used as a filter
+    against the competitor rollup so the merchant's own D2C site
+    doesn't show up as a "competitor" when the audit probed a
+    different host shape (e.g. external_seed uses agent.pivota.cc
+    as merchant_host, leaving the brand's real .com unprotected).
+
+    Conservative — covers the most common shape (concatenated brand
+    words + .com / .co / .co.uk). Doesn't try to enumerate every
+    possible D2C domain shape (e.g. hyphens, prefixes like "get-",
+    .net, .store). The cost of a false-positive exclude is small
+    (one ranked entry dropped); the cost of a false-positive include
+    is BD prose calling the merchant their own competitor.
+    """
+    if not brand:
+        return []
+    normalized = "".join(
+        ch for ch in brand.strip().lower()
+        if ch.isalnum()
+    )
+    if not normalized:
+        return []
+    return [
+        f"{normalized}.com",
+        f"{normalized}.co",
+        f"{normalized}.co.uk",
+        f"www.{normalized}.com",
+    ]
+
+
+def _own_host_set(
+    merchant_brand: Optional[str],
+    merchant_domain: Optional[str],
+) -> set:
+    """Build the set of hosts that are the merchant's own — to be
+    excluded from the competitor rollup. Combines:
+      - Explicit `merchant_domain` (when set by the brand-report
+        caller; the strongest signal).
+      - Brand-name-derived candidate hosts (see `_brand_to_candidate_hosts`).
+    Both normalized lowercase, stripping leading 'www.'.
+    """
+    own: set = set()
+    if merchant_domain:
+        d = merchant_domain.strip().lower().lstrip(".")
+        if d.startswith("www."):
+            d = d[4:]
+        if d:
+            own.add(d)
+    for candidate in _brand_to_candidate_hosts(merchant_brand):
+        c = candidate.lstrip(".")
+        if c.startswith("www."):
+            c = c[4:]
+        own.add(c)
+    return own
+
+
+def _aggregate_brand_competitors(
+    per_product: List[Dict[str, Any]],
+    *,
+    merchant_brand: Optional[str] = None,
+    merchant_domain: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Walk per-product attribution.competitor_hosts AND
     category_visibility.retailer_hosts, sum cross-probe + cross-product,
     return ranked top 15. The aggregate "who's stealing your AI traffic
@@ -1621,6 +1691,15 @@ def _aggregate_brand_competitors(per_product: List[Dict[str, Any]]) -> List[Dict
     surfaced "verywellfit.com" and "shape.com" as category-probe peers
     that never made it into the brand rollup because the buyer-intent
     probe (attribution.competitor_hosts) didn't separately capture them.
+
+    N5 PR-7: external_seed audits use `agent.pivota.cc` as
+    `merchant_host` (Pivota canonical PDP), which leaves the brand's
+    actual D2C domain (e.g. `beautyofjoseon.com`) unprotected — it
+    surfaced in the rollup as a "possible_peer_host" competitor. Fix:
+    accept `merchant_brand` + `merchant_domain` and exclude any host
+    matching the merchant's own brand-derived candidates or explicit
+    domain. Internal merchants where `merchant_host` already matched
+    the brand were never affected by this bug.
 
     Output shape per host:
       {
@@ -1641,6 +1720,16 @@ def _aggregate_brand_competitors(per_product: List[Dict[str, Any]]) -> List[Dict
 
     Total `times_cited` sums across both probes for ranking.
     """
+    own_hosts = _own_host_set(merchant_brand, merchant_domain)
+
+    def _is_own_host(h: str) -> bool:
+        if not h:
+            return False
+        normalized = h.strip().lower().lstrip(".")
+        if normalized.startswith("www."):
+            normalized = normalized[4:]
+        return normalized in own_hosts
+
     buyer_intent_count: Counter = Counter()
     category_count: Counter = Counter()
     for product in per_product:
@@ -1648,13 +1737,13 @@ def _aggregate_brand_competitors(per_product: List[Dict[str, Any]]) -> List[Dict
         for entry in attr.get("competitor_hosts") or []:
             host = (entry.get("host") or "").strip().lower()
             count = entry.get("times_cited") or 0
-            if host and count:
+            if host and count and not _is_own_host(host):
                 buyer_intent_count[host] += int(count)
         cat = product.get("category_visibility") or {}
         for entry in cat.get("retailer_hosts") or []:
             host = (entry.get("host") or "").strip().lower()
             count = entry.get("times_cited") or 0
-            if host and count:
+            if host and count and not _is_own_host(host):
                 category_count[host] += int(count)
 
     out: List[Dict[str, Any]] = []
