@@ -1,4 +1,4 @@
-"""Pure-Python assembler for agent_pdp_view rows (Stage 3a).
+"""Shared assembler and source-row readers for agent_pdp_view rows (Stage 3a).
 
 The agent_pdp_view denormalized table (mig 085, Stage 3a-i) is fed from
 two surfaces:
@@ -7,14 +7,12 @@ two surfaces:
   * The writer hook (Stage 3a-iii — services/seed_data_writer.py), which
     refreshes affected rows on every seed_data commit.
 
-Both call the same pure-Python assembler defined here. Keeping it
-side-effect-free (no DB writes inside _assemble_row) means the writer
+Both call the same pure-Python assembler defined here. Keeping assembly
+side-effect-free (no DB writes inside assemble_row) means the writer
 hook can dry-run / preview the next row state without touching prod,
-and the backfill stays trivially testable.
-
-The DB SELECTs live with the callers (script vs writer hook) because
-their batching shapes differ — the backfill pulls a content_key window;
-the writer hook chases a single content_key per commit.
+and the backfill stays trivially testable. The read helpers here share
+the per-content_key SELECT shape across the backfill and writer hook;
+callers still own batching and persistence.
 """
 
 from __future__ import annotations
@@ -23,6 +21,7 @@ import json
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
+from db.database import database
 from services.catalog_identity import normalize_gtin
 
 # Top-N offers stored per row. Schema docstring (mig 085) says <=5;
@@ -40,6 +39,144 @@ PDP_URL_PREFIX = "https://agent.pivota.cc/products/"
 # or similar) so the audit trail distinguishes one-shot fills from
 # incremental refreshes.
 BACKFILL_REFRESH_SOURCE = "backfill_3a_ii"
+
+
+# ---------------------------------------------------------------------
+# DB fetch helpers
+# ---------------------------------------------------------------------
+
+async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Dict[str, Any]]:
+    read_db = db or database
+    rows = await read_db.fetch_all(
+        """
+        SELECT
+          cp.product_key,
+          cp.merchant_id,
+          cp.platform,
+          cp.source_product_id,
+          cp.title,
+          cp.description,
+          cp.brand,
+          cp.product_type,
+          cp.category,
+          cp.image_url,
+          cp.product_payload,
+          cp.tags,
+          cp.price_tier,
+          cp.use_case_tags,
+          cp.lifestyle_tags,
+          cp.demographic,
+          cp.pdp_lifecycle_stage,
+          cp.pivota_signature_id,
+          cp.canonical_url,
+          cp.sync_status,
+          cp.created_at,
+          pgm.product_group_id,
+          pgm.is_primary AS group_is_primary
+        FROM catalog_products cp
+        LEFT JOIN product_group_members pgm
+          ON pgm.merchant_id = cp.merchant_id
+         AND pgm.platform = cp.platform
+         AND pgm.platform_product_id = cp.source_product_id
+        WHERE cp.content_key = :ck
+        """,
+        {"ck": content_key},
+    )
+    return [dict(r) for r in rows or []]
+
+
+async def fetch_skus_for_keys(product_keys: List[str], *, db: Any = None) -> List[Dict[str, Any]]:
+    if not product_keys:
+        return []
+    read_db = db or database
+    rows = await read_db.fetch_all(
+        """
+        SELECT
+          sku_key, product_key, merchant_id, source_variant_id, source_product_id,
+          sku, barcode, title, currency, image_url, visible_attributes,
+          visible_option_labels
+        FROM catalog_skus
+        WHERE product_key = ANY(:keys)
+        """,
+        {"keys": product_keys},
+    )
+    return [dict(r) for r in rows or []]
+
+
+async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> List[Dict[str, Any]]:
+    if not product_keys:
+        return []
+    read_db = db or database
+    rows = await read_db.fetch_all(
+        """
+        SELECT
+          o.offer_id, o.sku_key, o.product_key, o.merchant_id,
+          o.availability, o.currency, o.list_price,
+          o.merchant_effective_price, o.estimated_best_price,
+          m.merchant_name
+        FROM catalog_offers o
+        LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
+        WHERE o.product_key = ANY(:keys)
+        """,
+        {"keys": product_keys},
+    )
+    return [dict(r) for r in rows or []]
+
+
+async def fetch_external_seed_for_keys(
+    product_keys: List[str],
+    *,
+    db: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """First active external_product_seed attached to any product in a
+    content_key cluster. The backfill uses this — it has no specific
+    seed in hand, just a group of product_keys, and any one row works
+    as a content fallback.
+
+    The writer hook should NOT use this; it has a specific seed in
+    hand (the one whose seed_data just changed). See
+    fetch_external_seed_by_id.
+    """
+    if not product_keys:
+        return None
+    read_db = db or database
+    row = await read_db.fetch_one(
+        """
+        SELECT id, attached_product_key, title, image_url, seed_data,
+               canonical_url, destination_url
+        FROM external_product_seeds
+        WHERE attached_product_key = ANY(:keys)
+          AND status = 'active'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        {"keys": product_keys},
+    )
+    return dict(row) if row else None
+
+
+async def fetch_external_seed_by_id(
+    seed_id: str,
+    *,
+    db: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the external seed by its specific id. Used by the writer
+    hook — the triggering seed_id is in scope, and we want the
+    description fallback to come from the seed whose seed_data just
+    changed, not "newest active in the group" (which can be a
+    different, stale row).
+    """
+    read_db = db or database
+    row = await read_db.fetch_one(
+        """
+        SELECT id, attached_product_key, title, image_url, seed_data,
+               canonical_url, destination_url
+        FROM external_product_seeds
+        WHERE id = :seed_id
+        """,
+        {"seed_id": seed_id},
+    )
+    return dict(row) if row else None
 
 
 def coalesce_first(*values: Any) -> Any:
@@ -388,7 +525,7 @@ UPSERT_SQL = """
       variants, variants_count, gtin13,
       category_path, taxonomy_tags, breadcrumb,
       pdp_lifecycle_stage, sync_status, primary_merchant_id,
-      refreshed_at, refresh_source
+      refreshed_at, refresh_source, refreshed_by_proposal_id
     ) VALUES (
       :content_key, :pivota_signature_id, :product_group_id,
       :brand, :title, :description, :image_url, CAST(:image_urls AS jsonb),
@@ -396,7 +533,7 @@ UPSERT_SQL = """
       CAST(:variants AS jsonb), :variants_count, :gtin13,
       :category_path, CAST(:taxonomy_tags AS jsonb), CAST(:breadcrumb AS jsonb),
       :pdp_lifecycle_stage, :sync_status, :primary_merchant_id,
-      NOW(), :refresh_source
+      NOW(), :refresh_source, :refreshed_by_proposal_id
     )
     ON CONFLICT (content_key) DO UPDATE SET
       pivota_signature_id = EXCLUDED.pivota_signature_id,
@@ -421,7 +558,8 @@ UPSERT_SQL = """
       sync_status = EXCLUDED.sync_status,
       primary_merchant_id = EXCLUDED.primary_merchant_id,
       refreshed_at = NOW(),
-      refresh_source = EXCLUDED.refresh_source
+      refresh_source = EXCLUDED.refresh_source,
+      refreshed_by_proposal_id = EXCLUDED.refreshed_by_proposal_id
 """
 
 
@@ -440,4 +578,5 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     params["variants"] = to_jsonb(row.get("variants"))
     params["taxonomy_tags"] = to_jsonb(row.get("taxonomy_tags"))
     params["breadcrumb"] = to_jsonb(row.get("breadcrumb"))
+    params["refreshed_by_proposal_id"] = row.get("refreshed_by_proposal_id")
     return params

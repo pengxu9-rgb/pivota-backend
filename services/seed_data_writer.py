@@ -46,6 +46,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from db.database import database
+from services.agent_pdp_view_assembler import (
+    UPSERT_SQL as AGENT_PDP_VIEW_UPSERT_SQL,
+    assemble_row as assemble_agent_pdp_view_row,
+    fetch_external_seed_by_id,
+    fetch_offers_for_keys,
+    fetch_products_for_key,
+    fetch_skus_for_keys,
+    row_to_upsert_params as agent_pdp_view_row_to_upsert_params,
+)
 from services.seed_content_audit import (
     AUDITOR_VERSION,
     audit_seed_data,
@@ -99,6 +108,93 @@ class WriteResult:
 
     def merged_field_count(self) -> int:
         return sum(1 for d in self.field_decisions if d.decision == "merge")
+
+
+async def refresh_agent_pdp_view_for_seed(
+    *,
+    seed_id: str,
+    proposal_id: Optional[int],
+    refresh_source: str,
+) -> None:
+    """Refresh the denormalized agent_pdp_view row touched by a seed write.
+
+    agent_pdp_view is a cache; callers intentionally isolate failures so
+    a stale PDP row never rolls back the external_product_seeds source of
+    truth commit.
+    """
+    seed_row = await database.fetch_one(
+        """
+        SELECT attached_product_key
+        FROM external_product_seeds
+        WHERE id = :seed_id
+        """,
+        {"seed_id": seed_id},
+    )
+    attached_product_key = (dict(seed_row) if seed_row else {}).get("attached_product_key")
+    if not attached_product_key:
+        logger.info(
+            "agent_pdp_view refresh skipped for seed_id=%s: no attached_product_key",
+            seed_id,
+        )
+        return
+
+    catalog_row = await database.fetch_one(
+        """
+        SELECT content_key
+        FROM catalog_products
+        WHERE product_key = :product_key
+        LIMIT 1
+        """,
+        {"product_key": attached_product_key},
+    )
+    content_key = (dict(catalog_row) if catalog_row else {}).get("content_key")
+    if not content_key:
+        logger.info(
+            "agent_pdp_view refresh skipped for seed_id=%s product_key=%s: no content_key",
+            seed_id,
+            attached_product_key,
+        )
+        return
+
+    products = await fetch_products_for_key(content_key, db=database)
+    if not products:
+        logger.info(
+            "agent_pdp_view refresh skipped for seed_id=%s content_key=%s: no catalog rows",
+            seed_id,
+            content_key,
+        )
+        return
+
+    product_keys = [p["product_key"] for p in products if p.get("product_key")]
+    skus = await fetch_skus_for_keys(product_keys, db=database)
+    offers = await fetch_offers_for_keys(product_keys, db=database)
+    # Use the triggering seed directly — the writer hook knows which
+    # seed's seed_data just changed. Going through
+    # fetch_external_seed_for_keys (newest active in the group) can
+    # pull description text from a stale, unrelated seed.
+    external_seed = await fetch_external_seed_by_id(seed_id, db=database)
+
+    row = assemble_agent_pdp_view_row(
+        content_key=content_key,
+        products=products,
+        skus=skus,
+        offers=offers,
+        external_seed=external_seed,
+        refresh_source=refresh_source,
+    )
+    if row is None:
+        logger.info(
+            "agent_pdp_view refresh skipped for seed_id=%s content_key=%s: no title",
+            seed_id,
+            content_key,
+        )
+        return
+
+    row["refreshed_by_proposal_id"] = proposal_id
+    await database.execute(
+        AGENT_PDP_VIEW_UPSERT_SQL,
+        agent_pdp_view_row_to_upsert_params(row),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +636,18 @@ async def _apply_merge(
                 {"proposal_id": proposal_id},
             )
 
+    try:
+        await refresh_agent_pdp_view_for_seed(
+            seed_id=seed_id,
+            proposal_id=proposal_id,
+            refresh_source=f"writer_commit:{proposal_id}",
+        )
+    except Exception:
+        logger.exception(
+            "agent_pdp_view refresh failed for seed_id=%s; continuing",
+            seed_id,
+        )
+
 
 async def _insert_new_row(
     *,
@@ -618,6 +726,18 @@ async def _insert_new_row(
             WHERE id = :proposal_id
             """,
             {"proposal_id": proposal_id},
+        )
+
+    try:
+        await refresh_agent_pdp_view_for_seed(
+            seed_id=seed_id,
+            proposal_id=proposal_id,
+            refresh_source=f"writer_commit:{proposal_id}",
+        )
+    except Exception:
+        logger.exception(
+            "agent_pdp_view refresh failed for seed_id=%s; continuing",
+            seed_id,
         )
 
     return WriteResult(
