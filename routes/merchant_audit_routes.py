@@ -683,16 +683,27 @@ async def run_merchant_self_audit(
             merchant_id, exc,
         )
         integration_state = None
+    # P1-3: scope every probe call inside this legacy-sync audit with
+    # audit_run_id + merchant_id so the probe telemetry rows
+    # (db/llm_probe_runs) carry attribution. Pre-fix, run_brand_report
+    # ran outside any audit_telemetry context — probe rows had
+    # audit_run_id=None / merchant_id=None and per-run cost rollups
+    # missed all live legacy traffic. The new pipeline already wraps
+    # via audit_run_worker; this brings the sync arm up to parity.
+    from services.audit_telemetry_context import audit_telemetry
     try:
-        brand_report = await run_brand_report(
-            merchant_name=str(merchant_name),
-            merchant_domain=merchant_domain,
-            products=products,
-            provider="gemini",
-            max_runs=body.max_runs,
-            prior_runs=prior_runs,
-            integration_state=integration_state,
-        )
+        async with audit_telemetry(
+            run_id=run_id, merchant_id=merchant_id,
+        ):
+            brand_report = await run_brand_report(
+                merchant_name=str(merchant_name),
+                merchant_domain=merchant_domain,
+                products=products,
+                provider="gemini",
+                max_runs=body.max_runs,
+                prior_runs=prior_runs,
+                integration_state=integration_state,
+            )
     except ValueError as exc:
         await record_audit_run_completed(
             run_id=run_id, status="failed", error_message=str(exc),
