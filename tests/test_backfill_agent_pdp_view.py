@@ -1,8 +1,8 @@
-"""Tests for scripts/backfill_agent_pdp_view.py — Stage 3a-ii.
+"""Tests for the agent_pdp_view assembler — Stage 3a.
 
-The backfill is the one-shot script that seeds agent_pdp_view (mig 085)
-from catalog_products × catalog_skus × catalog_offers ×
-product_group_members × external_product_seeds. Tests pin:
+Covers services/agent_pdp_view_assembler.py (the pure-Python assembly
+logic shared between the Stage 3a-ii one-shot backfill and the
+Stage 3a-iii writer hook). Tests pin:
 
   - canonical-row pick respects the (is_primary, has_signature,
     product_key) tiebreak ladder
@@ -27,7 +27,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts import backfill_agent_pdp_view as backfill  # noqa: E402
+from services import agent_pdp_view_assembler as backfill  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ def test_pick_canonical_prefers_group_primary_first() -> None:
         {"product_key": "pk_a", "group_is_primary": False, "pivota_signature_id": "sig_a"},
         {"product_key": "pk_b", "group_is_primary": True, "pivota_signature_id": None},
     ]
-    assert backfill._pick_canonical(rows)["product_key"] == "pk_b"
+    assert backfill.pick_canonical(rows)["product_key"] == "pk_b"
 
 
 def test_pick_canonical_then_pivota_signature() -> None:
@@ -48,7 +48,7 @@ def test_pick_canonical_then_pivota_signature() -> None:
         {"product_key": "pk_a", "group_is_primary": False, "pivota_signature_id": None},
         {"product_key": "pk_b", "group_is_primary": False, "pivota_signature_id": "sig_b"},
     ]
-    assert backfill._pick_canonical(rows)["product_key"] == "pk_b"
+    assert backfill.pick_canonical(rows)["product_key"] == "pk_b"
 
 
 def test_pick_canonical_falls_back_to_lowest_product_key() -> None:
@@ -56,7 +56,7 @@ def test_pick_canonical_falls_back_to_lowest_product_key() -> None:
         {"product_key": "pk_b", "group_is_primary": False, "pivota_signature_id": None},
         {"product_key": "pk_a", "group_is_primary": False, "pivota_signature_id": None},
     ]
-    assert backfill._pick_canonical(rows)["product_key"] == "pk_a"
+    assert backfill.pick_canonical(rows)["product_key"] == "pk_a"
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ def _assemble(**overrides) -> Dict[str, Any]:
         "external_seed": None,
     }
     base.update(overrides)
-    return backfill._assemble_row(**base)
+    return backfill.assemble_row(**base)
 
 
 def test_description_falls_back_to_external_seed_seed_data() -> None:
@@ -157,7 +157,7 @@ def test_aggregate_offers_picks_dominant_currency_and_bounds_price() -> None:
          "currency": "CAD", "list_price": Decimal("28.00"),
          "merchant_effective_price": None, "estimated_best_price": None},
     ]
-    currency, price_min, price_max, count, top = backfill._aggregate_offers(
+    currency, price_min, price_max, count, top = backfill.aggregate_offers(
         offers, primary_merchant_id="m1", merchant_url_by_id={"m1": "https://m1"},
     )
     assert currency == "USD"
@@ -177,7 +177,7 @@ def test_aggregate_offers_caps_at_top_n() -> None:
          "merchant_effective_price": None, "estimated_best_price": None}
         for i in range(10)
     ]
-    _, _, _, count, top = backfill._aggregate_offers(
+    _, _, _, count, top = backfill.aggregate_offers(
         offers, primary_merchant_id=None, merchant_url_by_id={},
     )
     assert count == 10
@@ -190,7 +190,7 @@ def test_aggregate_offers_skips_offers_with_no_price() -> None:
          "currency": "USD", "list_price": None,
          "merchant_effective_price": None, "estimated_best_price": None},
     ]
-    _, price_min, price_max, count, top = backfill._aggregate_offers(
+    _, price_min, price_max, count, top = backfill.aggregate_offers(
         offers, primary_merchant_id=None, merchant_url_by_id={},
     )
     assert price_min is None and price_max is None
@@ -217,7 +217,7 @@ def test_aggregate_variants_drops_singleton_placeholder_skus() -> None:
          "visible_option_labels": None, "visible_attributes": None,
          "merchant_id": "m1"},
     ]
-    variants, count = backfill._aggregate_variants(skus, canonical_source_product_id="p1")
+    variants, count = backfill.aggregate_variants(skus, canonical_source_product_id="p1")
     assert count == 1
     assert variants[0]["sku"] == "sku-real"
     assert variants[0]["options"] == {"color": "red"}
@@ -231,7 +231,7 @@ def test_aggregate_variants_caps_at_variant_cap_but_count_is_unbounded() -> None
          "merchant_id": "m1"}
         for i in range(75)
     ]
-    variants, count = backfill._aggregate_variants(skus, canonical_source_product_id="p1")
+    variants, count = backfill.aggregate_variants(skus, canonical_source_product_id="p1")
     assert count == 75
     assert len(variants) == backfill.VARIANT_CAP
 
@@ -247,11 +247,11 @@ def test_pick_gtin13_normalizes_through_canonical_form() -> None:
         {"barcode": None},
         {"barcode": "773602443796"},  # UPC-A (12 digits)
     ]
-    assert backfill._pick_gtin13(skus) == "00773602443796"
+    assert backfill.pick_gtin13(skus) == "00773602443796"
 
 
 def test_pick_gtin13_returns_none_when_no_skus_have_barcode() -> None:
-    assert backfill._pick_gtin13([{"barcode": ""}, {"barcode": None}]) is None
+    assert backfill.pick_gtin13([{"barcode": ""}, {"barcode": None}]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +354,7 @@ def test_assemble_row_full_shape() -> None:
          "merchant_effective_price": None, "estimated_best_price": None},
     ]
 
-    row = backfill._assemble_row(
+    row = backfill.assemble_row(
         content_key="ck_acme_fdn",
         products=products,
         skus=skus,
@@ -392,6 +392,6 @@ def test_assemble_row_returns_none_when_canonical_has_no_title() -> None:
         "pivota_signature_id": None, "canonical_url": None, "sync_status": "live",
         "product_group_id": None, "group_is_primary": False,
     }]
-    assert backfill._assemble_row(
+    assert backfill.assemble_row(
         content_key="ck_x", products=products, skus=[], offers=[], external_seed=None,
     ) is None
