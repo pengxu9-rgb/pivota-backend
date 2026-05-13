@@ -226,6 +226,7 @@ from routes.admin_run_migration_081 import router as admin_run_migration_081_rou
 from routes.admin_run_migration_082 import router as admin_run_migration_082_router
 from routes.admin_run_migration_083 import router as admin_run_migration_083_router
 from routes.admin_run_migration_084 import router as admin_run_migration_084_router
+from routes.admin_run_migration_085 import router as admin_run_migration_085_router
 from routes.admin_sync_refresh_presence import router as admin_sync_refresh_presence_router
 from routes.admin_fix_agents import router as admin_fix_agents_router
 from routes.admin_fix_agent_metrics import router as admin_fix_agent_metrics_router
@@ -857,6 +858,7 @@ app.include_router(admin_run_migration_081_router)  # Run migration 081 - Seed c
 app.include_router(admin_run_migration_082_router)  # Run migration 082 - seed_data_proposals.status += 'no_change'
 app.include_router(admin_run_migration_083_router)  # Run migration 083 - catalog_products.content_key
 app.include_router(admin_run_migration_084_router)  # Run migration 084 - catalog_products sync hygiene
+app.include_router(admin_run_migration_085_router)  # Run migration 085 - agent_pdp_view denormalized table
 app.include_router(admin_sync_refresh_presence_router)  # Stage 2a — lightweight Shopify presence refresh
 app.include_router(merchant_router)  # Merchant management endpoints
 app.include_router(merchant_onboarding_router)  # Merchant onboarding (Phase 2)
