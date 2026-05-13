@@ -360,3 +360,138 @@ def test_extract_products_handles_optional_vendor_and_type():
     out = _extract_products_from_prior_report(report)
     assert out[0]["vendor"] is None
     assert out[0]["product_type"] is None
+
+
+# =====================================================================
+# P1-5: scheduler advisory-lock (per-merchant leader-election)
+# =====================================================================
+
+
+def test_advisory_lock_id_is_stable_per_merchant():
+    """The hash must be deterministic — same merchant_id always
+    yields the same lock id, two different merchant_ids almost
+    certainly different."""
+    from jobs.scheduled_audit_job import _advisory_lock_id_for_merchant
+
+    a1 = _advisory_lock_id_for_merchant("merch_alpha")
+    a2 = _advisory_lock_id_for_merchant("merch_alpha")
+    b = _advisory_lock_id_for_merchant("merch_beta")
+    assert a1 == a2
+    assert a1 != b
+    # Fits in a signed int8 (Postgres's pg_try_advisory_lock arg).
+    assert -(2 ** 63) <= a1 <= (2 ** 63) - 1
+
+
+@pytest.mark.asyncio
+async def test_re_audit_merchant_skips_when_lock_not_acquired(monkeypatch):
+    """When _try_acquire_scheduler_lock returns False (another pod
+    holds the lock), _re_audit_merchant must return status=skipped
+    + a reason explaining the lock contention and must NOT proceed
+    to fetch prior, run_brand_report, etc."""
+    from jobs import scheduled_audit_job as job
+
+    async def fake_try_acquire(_merchant_id):
+        return False
+
+    body_calls = {"count": 0}
+
+    async def fake_locked_body(**kwargs):
+        body_calls["count"] += 1
+        return {"status": "called"}
+
+    monkeypatch.setattr(
+        job, "_try_acquire_scheduler_lock", fake_try_acquire,
+    )
+    monkeypatch.setattr(
+        job, "_re_audit_merchant_locked", fake_locked_body,
+    )
+
+    result = await job._re_audit_merchant({
+        "merchant_id": "merch_alpha",
+        "cadence_days": 7,
+        "last_audit_run_id": "run-old",
+    })
+    assert result["status"] == "skipped"
+    assert "advisory lock" in (result.get("reason") or ""), (
+        f"Reason must explain the lock contention; got {result}"
+    )
+    assert body_calls["count"] == 0, (
+        "When the lock isn't acquired, _re_audit_merchant must NOT "
+        "invoke the locked body — that's the whole point of the guard"
+    )
+
+
+@pytest.mark.asyncio
+async def test_re_audit_merchant_releases_lock_when_body_returns_early(
+    monkeypatch,
+):
+    """When the body short-circuits (no prior succeeded audit), the
+    lock must still be released via the finally block — otherwise a
+    single bad merchant would hold its lock indefinitely within the
+    session, blocking its own future scheduled audits."""
+    from jobs import scheduled_audit_job as job
+
+    async def fake_try_acquire(_merchant_id):
+        return True
+
+    releases: list = []
+
+    async def fake_release(merchant_id):
+        releases.append(merchant_id)
+
+    monkeypatch.setattr(
+        job, "_try_acquire_scheduler_lock", fake_try_acquire,
+    )
+    monkeypatch.setattr(
+        job, "_release_scheduler_lock", fake_release,
+    )
+
+    result = await job._re_audit_merchant({
+        "merchant_id": "merch_alpha",
+        "cadence_days": 7,
+        # No prior run → body returns early with "no prior succeeded"
+        "last_audit_run_id": None,
+    })
+    assert result.get("reason") == "no prior succeeded audit; skipped"
+    assert releases == ["merch_alpha"], (
+        "Lock release must fire even when the body returns early"
+    )
+
+
+@pytest.mark.asyncio
+async def test_re_audit_merchant_releases_lock_when_body_raises(monkeypatch):
+    """Defense-in-depth: even if the locked body raises an unexpected
+    exception, the finally still releases the lock. Stops a buggy
+    audit step from locking out the merchant's future cron ticks."""
+    from jobs import scheduled_audit_job as job
+
+    async def fake_try_acquire(_merchant_id):
+        return True
+
+    async def fake_locked_body(**kwargs):
+        raise RuntimeError("synthetic body failure")
+
+    releases: list = []
+
+    async def fake_release(merchant_id):
+        releases.append(merchant_id)
+
+    monkeypatch.setattr(
+        job, "_try_acquire_scheduler_lock", fake_try_acquire,
+    )
+    monkeypatch.setattr(
+        job, "_re_audit_merchant_locked", fake_locked_body,
+    )
+    monkeypatch.setattr(
+        job, "_release_scheduler_lock", fake_release,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic body failure"):
+        await job._re_audit_merchant({
+            "merchant_id": "merch_alpha",
+            "cadence_days": 7,
+            "last_audit_run_id": "run-old",
+        })
+    assert releases == ["merch_alpha"], (
+        "Lock release must fire even when the locked body raises"
+    )
