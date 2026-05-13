@@ -2253,6 +2253,7 @@ def _generate_action_items(
     runs_with_any_citation: int,
     visibility_score: int = 0,
     attribution_score: int = 0,
+    category_visibility_score: int = 0,
     category_retailer_hosts: Optional[List[Dict[str, Any]]] = None,
     category_competitor_brands: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
@@ -2261,10 +2262,21 @@ def _generate_action_items(
     facing diagnostic prose, evidence-bound), and optional `evidence`
     (the failed query / cited competitor host that drives this action).
 
+    Q-P1-6 PR-6: every emitted action's `severity` now routes through
+    `compute_action_severity` from `services.audit_severity` and
+    carries a `severity_reason` token. PR-3 wired the scorer into the
+    playbook engine; this function is the brand-level / verdict-tier
+    counterpart and was left out of that migration with a TODO. The
+    canonical Winona regression case ("Specific queries where your
+    URL was missing", base=medium with attribution=0/category=67) now
+    upgrades to critical via Rule 2 instead of shipping at medium.
+
     Pitch-free: no "Pivota's agentic-commerce protocol", no "12% →
     25-30%" macros, no "complementary to existing retail distribution".
     Those live in `_build_what_pivota_changes` exclusively.
     """
+    from services.audit_severity import compute_action_severity
+
     items: List[Dict[str, Any]] = []
 
     # Failures named in evidence text — shared with verdict_for via
@@ -2284,6 +2296,51 @@ def _generate_action_items(
     cited_hosts_phrase = ", ".join(top_cited_names)
     cited_group_label = _cited_host_group_label(top_cited_hosts)
     attribution_runs_total = len(attribution_runs)
+
+    # Q-P1-6 — shared inputs for compute_action_severity. Computed
+    # once per call; each item below routes its hardcoded base
+    # severity through the scorer with the per-site refinements
+    # (has_failed_query_example flips True only inside the failed-
+    # query branch, has_competitors_named varies by site, etc.).
+    #
+    # `score_gap_pct` is None when category_visibility_score wasn't
+    # measured (Phase 2a probe disabled). The scorer treats None as
+    # "no gap signal" and falls back to base-severity passthrough.
+    _score_gap_pct: Optional[int]
+    if category_visibility_score:
+        _score_gap_pct = max(0, int(category_visibility_score) - int(attribution_score or 0))
+    else:
+        _score_gap_pct = None
+    _has_failed_attribution_query = bool(failed_attribution_queries)
+    # Brand-level actions don't target a specific host, so host_type
+    # stays None — the scorer's Rules 1/4/5 (host-gated) won't fire.
+    # That's correct: Rules 2/3/7 (gap × failed-query) are the relevant
+    # lifters for brand-level remediations.
+    _named_competitor_count = (
+        (1 if top_competitor and top_competitor.get("host") else 0)
+        + len(category_competitor_brands or [])
+    )
+    _has_named_competitors_any = _named_competitor_count > 0
+
+    def _score(
+        *,
+        base: str,
+        has_failed_query: bool = False,
+        has_named_competitors: bool = False,
+    ) -> Dict[str, str]:
+        """Route a site's authored base severity through the central
+        scorer. Returns a dict ready to **spread into items.append:
+            {**_score(base="critical", has_failed_query=True), ...}
+        Centralizes the boilerplate so each migration site stays one
+        line of intent."""
+        sev, reason = compute_action_severity(
+            score_gap_pct=_score_gap_pct,
+            host_type=None,  # brand-level, no specific target host
+            has_failed_query_example=has_failed_query,
+            has_competitors_named=has_named_competitors,
+            base_severity=base,
+        )
+        return {"severity": sev, "severity_reason": reason}
 
     # Action 1: severity-stratified headline tied to this merchant's
     # specific failure pattern. All five tiers data-bind off the same
@@ -2307,7 +2364,11 @@ def _generate_action_items(
             "top SKUs, and re-test in 72 hours."
         )
         items.append({
-            "severity": "critical",
+            **_score(
+                base="critical",
+                has_failed_query=_has_failed_attribution_query,
+                has_named_competitors=_has_named_competitors_any,
+            ),
             "title": "Index your canonical PDPs with Google Search Console",
             "body": body,
             "evidence": {
@@ -2339,7 +2400,11 @@ def _generate_action_items(
             body += " — and a margin hit if the cited path is a reseller"
         body += ". The demand exists; it's just being captured by competitors."
         items.append({
-            "severity": "critical",
+            **_score(
+                base="critical",
+                has_failed_query=_has_failed_attribution_query,
+                has_named_competitors=_has_named_competitors_any,
+            ),
             "title": title,
             "body": body,
             "evidence": {
@@ -2365,7 +2430,11 @@ def _generate_action_items(
             "coverage before optimizing downstream conversion."
         )
         items.append({
-            "severity": "critical",
+            **_score(
+                base="critical",
+                has_failed_query=_has_failed_attribution_query,
+                has_named_competitors=_has_named_competitors_any,
+            ),
             "title": "Convert category mentions into first-party attribution",
             "body": body,
             "evidence": {
@@ -2398,7 +2467,15 @@ def _generate_action_items(
                 f"{retailers_phrase}."
             )
         items.append({
-            "severity": "critical",
+            **_score(
+                base="critical",
+                has_failed_query=_has_failed_attribution_query,
+                # VIA_RETAILERS by definition has top_retailer_hosts populated;
+                # those ARE the named competitors capturing the funnel.
+                has_named_competitors=(
+                    _has_named_competitors_any or bool(top_retailer_hosts)
+                ),
+            ),
             "title": "Capture the AI-channel funnel that retailers are taking today",
             "body": opener,
             "evidence": (
@@ -2409,7 +2486,7 @@ def _generate_action_items(
         })
     elif verdict_label == VERDICT_STRONG:
         items.append({
-            "severity": "low",
+            **_score(base="low"),
             "title": "Maintain attribution with monitoring + drift detection",
             "body": (
                 f"AI agents cite your URL in {merchant_cited_runs} of "
@@ -2451,7 +2528,11 @@ def _generate_action_items(
             "are — close those first."
         )
         items.append({
-            "severity": "high",
+            **_score(
+                base="high",
+                has_failed_query=_has_failed_attribution_query,
+                has_named_competitors=_has_named_competitors_any,
+            ),
             "title": "Close the gap on inconsistent queries",
             "body": body,
             "evidence": {
@@ -2465,7 +2546,13 @@ def _generate_action_items(
     # Action 2: top competitor capture, named with frequency.
     if top_competitor and top_competitor.get("times_cited", 0) >= 2:
         items.append({
-            "severity": "high",
+            # This site is guarded by `top_competitor` — we have a
+            # named competitor by definition.
+            **_score(
+                base="high",
+                has_failed_query=_has_failed_attribution_query,
+                has_named_competitors=True,
+            ),
             "title": f"Top citation drain: {top_competitor['host']}",
             "body": (
                 f"`{top_competitor['host']}` was cited by Gemini in "
@@ -2485,7 +2572,14 @@ def _generate_action_items(
     # source).
     if runs_with_any_citation > 0 and merchant_cited_runs == 0:
         items.append({
-            "severity": "critical",
+            # Zero-citation is critical evidence on its own; scorer
+            # may pass it through, may upgrade if has_failed_query
+            # adds the buyer-intent signal.
+            **_score(
+                base="critical",
+                has_failed_query=_has_failed_attribution_query,
+                has_named_competitors=_has_named_competitors_any,
+            ),
             "title": "Zero direct AI-channel attribution today",
             "body": (
                 f"Across {runs_with_any_citation} queries that returned "
@@ -2503,7 +2597,14 @@ def _generate_action_items(
             for q in failed_attribution_queries[:2]
         )
         items.append({
-            "severity": "medium",
+            # THE canonical Winona regression case: base=medium with
+            # gap=67 + has_failed_query → Rule 2/3/7 fires and upgrades.
+            # Pre-PR-6 this shipped at medium regardless of evidence.
+            **_score(
+                base="medium",
+                has_failed_query=True,
+                has_named_competitors=_has_named_competitors_any,
+            ),
             "title": "Specific queries where your URL was missing",
             "body": (
                 f"Gemini's grounded answer to {sample} did not include "
@@ -2525,7 +2626,13 @@ def _generate_action_items(
         and verdict_label != VERDICT_VIA_RETAILERS
     ):
         items.append({
-            "severity": "medium",
+            # Visibility (not attribution) failures — we don't pass
+            # has_failed_query here because the scorer's semantics
+            # for that flag are buyer-intent failed-attribution
+            # queries specifically (Rule 7's "exact buyer-intent
+            # zero-attribution" case). Visibility failures are a
+            # different evidence class, so pass through base=medium.
+            **_score(base="medium"),
             "title": "Strengthen schema + sitemap inclusion for visibility",
             "body": (
                 f"The product wasn't surfaced with grounded sources on "
@@ -4542,6 +4649,11 @@ def build_structured_report(
         runs_with_any_citation=runs_with_any_citation,
         visibility_score=visibility_score,
         attribution_score=attribution_score,
+        # Q-P1-6 PR-6: scorer needs this to compute score_gap_pct.
+        # `category_score` is Optional[int]; coerce to 0 when None
+        # (probe didn't run) — the scorer treats 0 as "no measured
+        # category visibility" and falls back to base passthrough.
+        category_visibility_score=(category_score or 0),
         category_retailer_hosts=category_retailer_hosts,
         category_competitor_brands=category_competitor_brands,
     )
