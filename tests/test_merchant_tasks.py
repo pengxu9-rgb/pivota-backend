@@ -146,6 +146,98 @@ def test_extract_action_items_returns_empty_for_garbage_input():
 
 
 # ---------------------------------------------------------------------------
+# Q-P1-5 canonical identity: per-host actions DO NOT collapse
+# ---------------------------------------------------------------------------
+
+
+def test_extract_action_items_keeps_per_host_editorial_actions_distinct():
+    """Q-P1-5 regression guard: pre-fix dedup used
+    `(lever or title).lower()` so 3 editorial actions targeting 3
+    different hosts collapsed into one row (the Winona prod artifact
+    shape). The new canonical identity includes target_host, so
+    distinct hosts remain distinct."""
+    audit = _make_audit_with_actions([[
+        {"title": "Pitch forbes.com editorial team",
+         "lever": "editorial",
+         "severity": "high",
+         "target_host": "forbes.com"},
+        {"title": "Pitch whowhatwear.com fashion team",
+         "lever": "editorial",
+         "severity": "high",
+         "target_host": "whowhatwear.com"},
+        {"title": "Pitch reallyree.com",
+         "lever": "editorial",
+         "severity": "high",
+         "target_host": "reallyree.com"},
+    ]])
+    out = _extract_action_items(audit)
+    assert len(out) == 3, (
+        f"three editorial actions on different hosts must NOT collapse — "
+        f"got {len(out)}: {[a['title'] for a in out]}"
+    )
+    hosts = {a["evidence"]["target_host"] for a in out}
+    assert hosts == {"forbes.com", "whowhatwear.com", "reallyree.com"}
+
+
+def test_extract_action_items_collapses_same_host_per_product():
+    """Q-P1-5: two actions with the SAME (lever, title, host) on two
+    products should still collapse to one — the audit author intends
+    one task, not two copies."""
+    audit = _make_audit_with_actions([
+        [{"title": "Pitch forbes.com",
+          "lever": "editorial",
+          "target_host": "forbes.com"}],
+        [{"title": "Pitch forbes.com",
+          "lever": "editorial",
+          "target_host": "forbes.com"}],
+    ])
+    out = _extract_action_items(audit)
+    assert len(out) == 1
+
+
+def test_extract_action_items_keeps_merchant_scoped_levers_as_one():
+    """Sanity: merchant-scoped levers (pivota_integration,
+    gsc_integration) should still collapse cross-product even when
+    titles vary slightly — there's only ONE such action per audit."""
+    audit = _make_audit_with_actions([
+        [{"title": "Connect Google Search Console",
+          "lever": "gsc_integration",
+          "severity": "high"}],
+        [{"title": "Set up GSC integration",
+          "lever": "gsc_integration",
+          "severity": "high"}],
+    ])
+    out = _extract_action_items(audit)
+    assert len(out) == 1
+
+
+def test_extract_action_items_per_host_with_no_lever_keeps_distinct_titles():
+    """When lever is absent (None), the per-host bucket still
+    keys off title — different titles remain distinct."""
+    audit = _make_audit_with_actions([
+        [{"title": "Investigate lookhealthystore.com"}],
+        [{"title": "Investigate credihealth.com"}],
+    ])
+    out = _extract_action_items(audit)
+    assert len(out) == 2
+
+
+def test_extract_action_items_per_host_collapses_case_only_diffs():
+    """Identity uses normalized (whitespace-collapsed lowercased)
+    title, so case-only diffs still dedupe on per-host bucket."""
+    audit = _make_audit_with_actions([
+        [{"title": "Pitch forbes.com EDITORIAL TEAM",
+          "lever": "editorial",
+          "target_host": "forbes.com"}],
+        [{"title": "Pitch forbes.com editorial team",
+          "lever": "editorial",
+          "target_host": "forbes.com"}],
+    ])
+    out = _extract_action_items(audit)
+    assert len(out) == 1
+
+
+# ---------------------------------------------------------------------------
 # _summarize_executor_work — per-agent task-summary mapping
 # ---------------------------------------------------------------------------
 

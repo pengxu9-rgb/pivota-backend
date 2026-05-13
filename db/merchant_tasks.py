@@ -40,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 VALID_STATUSES = frozenset({
     "pending", "in_progress", "done", "dismissed", "failed",
+    # Q-P0-2 / Q-P1-4: when a fresh audit run emits the same
+    # canonical action identity (merchant + lever + normalized
+    # title + target_host), the older pending task is moved to
+    # `superseded` and `superseded_by_task_id` points at the new
+    # task. Preserved in the table for audit-trail visibility;
+    # default list views exclude them like 'dismissed'.
+    "superseded",
 })
 
 VALID_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
@@ -64,6 +71,11 @@ merchant_tasks = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("dismissed_reason", Text, nullable=True),
+    # Q-P0-2 / Q-P1-4: cross-audit supersession pointer (mig 092).
+    # When a fresh audit emits the same canonical action identity,
+    # the older pending row's status flips to 'superseded' and this
+    # column points at the new task.
+    Column("superseded_by_task_id", UUID(as_uuid=False), nullable=True),
     Index("idx_merchant_tasks_open", "merchant_id", "status", "severity", "created_at"),
     Index("idx_merchant_tasks_audit", "parent_audit_run_id"),
     Index("idx_merchant_tasks_executor_source", "source_executor_run_id"),
@@ -92,9 +104,14 @@ _DDL_STATEMENTS = [
       created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       completed_at             TIMESTAMPTZ NULL,
-      dismissed_reason         TEXT NULL
+      dismissed_reason         TEXT NULL,
+      superseded_by_task_id    UUID NULL
     );
     """,
+    # Migration 092: fresh-deploy tables get the column inline above;
+    # existing-deploy tables get it via the ALTER below (idempotent).
+    "ALTER TABLE merchant_tasks ADD COLUMN IF NOT EXISTS "
+    "superseded_by_task_id UUID NULL;",
     "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_open "
     "ON merchant_tasks (merchant_id, status, severity, created_at DESC) "
     "WHERE status IN ('pending', 'in_progress');",
@@ -104,6 +121,12 @@ _DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_executor_source "
     "ON merchant_tasks (source_executor_run_id) "
     "WHERE source_executor_run_id IS NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_identity_pending "
+    "ON merchant_tasks (merchant_id, lever, title) "
+    "WHERE status = 'pending';",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_superseded_by "
+    "ON merchant_tasks (superseded_by_task_id) "
+    "WHERE superseded_by_task_id IS NOT NULL;",
 ]
 
 
@@ -296,6 +319,10 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
             if isinstance(d.get("completed_at"), datetime) else None
         ),
         "dismissed_reason": d.get("dismissed_reason"),
+        "superseded_by_task_id": (
+            str(d.get("superseded_by_task_id"))
+            if d.get("superseded_by_task_id") else None
+        ),
     }
 
 
@@ -304,12 +331,18 @@ async def list_tasks_for_merchant(
     merchant_id: str,
     status_filter: Optional[List[str]] = None,
     limit: int = 50,
+    parent_audit_run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """List tasks for a merchant, newest first. Default filters to
-    open work (pending + in_progress); pass empty list or
-    ['done','dismissed'] for archive view."""
+    open work (`pending` + `in_progress`); pass empty list for all
+    statuses, or pass `['superseded']` to view the audit trail of
+    tasks displaced by newer audit runs (Q-P0-2)."""
     await ensure_merchant_tasks_table()
     if status_filter is None:
+        # Default queue: open work only. `superseded` is excluded
+        # (Q-P0-2 — stale tasks from prior audits should not clutter
+        # the live queue). `dismissed`, `done`, `failed` remain
+        # excluded by default too.
         status_filter = ["pending", "in_progress"]
     # Validate each entry; silently drop unknowns.
     status_filter = [s for s in status_filter if s in VALID_STATUSES]
@@ -318,6 +351,10 @@ async def list_tasks_for_merchant(
         q = merchant_tasks.select().where(
             merchant_tasks.c.merchant_id == merchant_id
         )
+        if parent_audit_run_id is not None:
+            q = q.where(
+                merchant_tasks.c.parent_audit_run_id == parent_audit_run_id
+            )
         if status_filter:
             q = q.where(merchant_tasks.c.status.in_(status_filter))
         q = q.order_by(merchant_tasks.c.created_at.desc()).limit(limit)
@@ -366,3 +403,92 @@ async def tasks_for_audit(
         )
         return []
     return [_row_to_dict(r) for r in (rows or [])]
+
+
+async def find_pending_supersede_candidates(
+    *,
+    merchant_id: str,
+    lever: Optional[str],
+    title: str,
+    exclude_audit_run_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Q-P0-2 / Q-P1-4: find prior `pending` tasks that share the
+    canonical action identity with a newly-materialized task and
+    should be marked `superseded`.
+
+    Identity for this query: (merchant_id, lever, title) — the
+    backing partial index `idx_merchant_tasks_identity_pending`
+    covers exactly this lookup. Finer-grained identity components
+    (target_host, product_key) live in `evidence_jsonb` and are
+    compared by the service layer after fetching; doing that inside
+    SQL would need a functional index on JSONB which is heavier and
+    less portable.
+
+    `exclude_audit_run_id` lets the caller exclude the run that
+    JUST inserted this task (so a freshly-materialized task doesn't
+    supersede itself when materialize_tasks_from_audit walks the
+    action list).
+
+    Returns the candidate rows (caller decides which to supersede
+    based on full identity match including evidence fields)."""
+    await ensure_merchant_tasks_table()
+    try:
+        q = merchant_tasks.select().where(
+            merchant_tasks.c.merchant_id == merchant_id,
+            merchant_tasks.c.status == "pending",
+            merchant_tasks.c.title == title,
+        )
+        if lever is None:
+            q = q.where(merchant_tasks.c.lever.is_(None))
+        else:
+            q = q.where(merchant_tasks.c.lever == lever)
+        if exclude_audit_run_id is not None:
+            q = q.where(
+                merchant_tasks.c.parent_audit_run_id != exclude_audit_run_id
+            )
+        rows = await database.fetch_all(q)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "find_pending_supersede_candidates failed merchant=%s "
+            "lever=%s title=%s: %s",
+            merchant_id, lever, title[:60], str(exc)[:200],
+        )
+        return []
+    return [_row_to_dict(r) for r in (rows or [])]
+
+
+async def mark_task_superseded(
+    *,
+    task_id: str,
+    superseded_by_task_id: str,
+) -> bool:
+    """Q-P0-2: flip a pending task to `status='superseded'` and
+    point `superseded_by_task_id` at the newer task. Idempotent;
+    a no-op when the task is already terminal (done / dismissed /
+    failed / superseded). Returns True when the UPDATE matched a
+    row, False otherwise."""
+    await ensure_merchant_tasks_table()
+    try:
+        now = datetime.now(timezone.utc)
+        result = await database.execute(
+            merchant_tasks.update()
+            .where(
+                merchant_tasks.c.task_id == task_id,
+                merchant_tasks.c.status == "pending",
+            )
+            .values(
+                status="superseded",
+                superseded_by_task_id=superseded_by_task_id,
+                updated_at=now,
+                completed_at=now,
+            )
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_task_superseded failed task_id=%s by=%s: %s",
+            task_id, superseded_by_task_id, str(exc)[:200],
+        )
+        return False

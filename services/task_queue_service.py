@@ -5,11 +5,21 @@ Called from the merchant audit completion hook (alongside the
 executor agent dispatch from PR-4a).
 
 Honest scope:
-  - One-shot materialization per audit run. Re-running an audit
-    creates new tasks (doesn't update existing). Operators dismiss
-    stale tasks via the dismiss endpoint.
-  - Dedup via title+lever per audit_run_id (don't double-create
-    when the same audit is somehow processed twice).
+  - One-shot materialization per audit run (idempotent — re-running
+    the same audit_run_id is a no-op via `tasks_for_audit` check).
+  - Q-P0-2 / Q-P1-4: cross-audit SUPERSESSION. When a fresh audit
+    emits the same canonical action identity as a prior pending task,
+    the prior task flips to `status='superseded'` and points at the
+    newer task via `superseded_by_task_id`. Operators no longer see
+    stale tasks from previous audits in their default queue, and
+    the audit-trail link is preserved (queryable via
+    `?status_filter=superseded`).
+  - Canonical action identity: (merchant_id, lever, normalized_title,
+    target_host, product_keys). Pre-fix dedup used only
+    `(lever or title).lower()`, which collapsed different editorial
+    actions on different target_hosts into a single row. The new
+    identity preserves per-host distinctness; see
+    `_canonical_action_identity` below.
   - Skips Phase 0 / pivota_integration tasks for cold-start audits
     (mirrors the merchant_view.actions demote — these are pitch
     material in cold-start, not work).
@@ -28,6 +38,20 @@ _PITCH_ONLY_LEVERS = frozenset({
     "pivota_integration",  # Phase 0 — onboarding pitch
 })
 
+# Levers that represent merchant-scoped (not per-host) actions. For
+# these, dedup by lever alone — only ONE such action ever applies per
+# audit regardless of how it's titled across products.
+#
+# Per-host levers (`editorial`, `research`, `partnership`, etc.) use
+# the full (lever, normalized_title, target_host, product_key)
+# identity so distinct hosts/products materialize as distinct tasks.
+_MERCHANT_SCOPED_LEVERS = frozenset({
+    "pivota_integration",
+    "gsc_integration",
+    "schema_indexing",
+    "site_audit",
+})
+
 
 def _is_cold_start_audit(integration_state: Optional[Dict[str, Any]]) -> bool:
     """Mirrors services.agent_center_bd_report_service._is_cold_start_audit
@@ -41,13 +65,67 @@ def _is_cold_start_audit(integration_state: Optional[Dict[str, Any]]) -> bool:
     return "store_platform" in missing and "psp" in missing
 
 
+def _normalize_title_for_identity(title: str) -> str:
+    """Whitespace-collapsed lowercased title for the identity key.
+    Punctuation kept because action titles do encode meaningful
+    distinctions like "Pitch whowhatwear.com fashion team" vs
+    "Pitch forbes.com editorial team" — the host is the differentiator.
+    """
+    return " ".join(title.split()).lower()
+
+
+def _canonical_action_identity(
+    *,
+    title: str,
+    lever: Optional[str],
+    target_host: Optional[str],
+    product_key: Optional[str],
+) -> tuple:
+    """Q-P1-5 canonical action identity. Same identity → same task;
+    different identity → distinct task even if title/lever match.
+
+    Pre-fix `_extract_action_items` used `(lever or title).lower()`
+    as the dedup key. That collapsed different editorial actions
+    targeting different hosts into one row, because lever='editorial'
+    matched across all of them. The Winona prod artifact showed 4
+    "Write 1 content brief for failed category visibility queries"
+    rows because the OUTER materializer dedup tolerated duplicates
+    while the SCOPED-by-key dedup inside extract dropped
+    target-host distinctions.
+
+    Two identity regimes:
+      1. **Merchant-scoped levers** (gsc_integration, etc.) — ONE
+         such action ever applies per audit. Identity = (lever,)
+         alone so cross-product duplicates collapse correctly even
+         when titles vary slightly ("GSC" vs "GSC again").
+      2. **Everything else** — identity = (lever, normalized_title,
+         target_host, product_key). Preserves per-host/per-product
+         distinctions for editorial / research / partnership / etc.
+
+    Two tasks share identity ↔ they're the same action.
+    """
+    lever_norm = (lever or "").lower()
+    if lever_norm in _MERCHANT_SCOPED_LEVERS:
+        # Merchant-scoped: lever alone is the identity.
+        return ("merchant_scoped", lever_norm)
+    return (
+        "per_host",
+        lever_norm,
+        _normalize_title_for_identity(title),
+        (target_host or "").lower(),
+        (product_key or "").lower(),
+    )
+
+
 def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Walk per_product → merchant_view.actions (the PR-A redesign
     surface) and return the union of action items across all products.
 
     Falls back to per_product → action_items (the legacy field) when
-    merchant_view is missing. Dedups by (lever or title) so the same
-    action across multiple products only materializes one task.
+    merchant_view is missing. Within-audit dedup uses the canonical
+    action identity (see _canonical_action_identity), preserving
+    distinct actions that share lever/title but target different
+    hosts — pre-fix those collapsed into one row.
     """
     if not isinstance(audit_report, dict):
         return []
@@ -57,6 +135,7 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
     for product in per_product:
         if not isinstance(product, dict):
             continue
+        product_key = product.get("product_key") or product.get("merchant_pdp_url")
         # Prefer merchant_view.actions (PR-A: data-bound, ranked)
         actions = ((product.get("merchant_view") or {}).get("actions") or [])
         if not actions:
@@ -83,9 +162,18 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
                     _derive_lever_from_title,
                 )
                 lever = _derive_lever_from_title(title.strip())
-            # Dedup key: lever when present (stable cross-product ID),
-            # else title.
-            key = (lever or title).lower()
+            target_host = a.get("target_host")
+            # Q-P1-5: canonical identity preserves target_host +
+            # product_key distinctions. Pre-fix this dedup key was
+            # `(lever or title).lower()`, which collapsed every
+            # editorial action with lever='editorial' into one row
+            # regardless of which host it targeted.
+            key = _canonical_action_identity(
+                title=title.strip(),
+                lever=lever,
+                target_host=target_host,
+                product_key=product_key,
+            )
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -98,7 +186,8 @@ def _extract_action_items(audit_report: Optional[Dict[str, Any]]) -> List[Dict[s
                     "priority_order": a.get("priority_order"),
                     "cta_url": a.get("cta_url"),
                     "cta_label": a.get("cta_label"),
-                    "target_host": a.get("target_host"),
+                    "target_host": target_host,
+                    "product_key": product_key,
                 },
             })
     return out
@@ -119,6 +208,8 @@ async def materialize_tasks_from_audit(
     abort the batch.
     """
     from db.merchant_tasks import (
+        find_pending_supersede_candidates,
+        mark_task_superseded,
         record_task_created,
         tasks_for_audit,
     )
@@ -143,6 +234,7 @@ async def materialize_tasks_from_audit(
     materialized = 0
     skipped_pitch = 0
     failures = 0
+    superseded_total = 0
     # P5.8.3: track which canonical action_plan_items each
     # materialized task corresponds to, so the worker can call
     # link_action_to_task and populate action_plan_items.
@@ -165,6 +257,20 @@ async def materialize_tasks_from_audit(
         )
         if task_id:
             materialized += 1
+            # Q-P0-2 / Q-P1-4: cross-audit supersession. Find prior
+            # pending tasks from OTHER audits with the same canonical
+            # identity and mark them superseded. The DB query
+            # filters on (merchant_id, lever, title); we narrow to
+            # full identity match (incl. target_host + product_key)
+            # in Python because those fields live in evidence_jsonb
+            # and would require a functional index to query directly.
+            superseded_count = await _supersede_prior_pending(
+                merchant_id=merchant_id,
+                new_task_id=task_id,
+                action=action,
+                audit_run_id=audit_run_id,
+            )
+            superseded_total += superseded_count
             # Find the canonical action_plan_items row for this
             # (audit_run, lever, title) and link the task back.
             # Match is best-effort: if extract_actions didn't emit
@@ -190,18 +296,91 @@ async def materialize_tasks_from_audit(
 
     logger.info(
         "task_queue: audit=%s merchant=%s materialized=%d "
-        "links=%d skipped_pitch=%d failures=%d",
-        audit_run_id, merchant_id, materialized, links_established,
-        skipped_pitch, failures,
+        "superseded=%d links=%d skipped_pitch=%d failures=%d",
+        audit_run_id, merchant_id, materialized, superseded_total,
+        links_established, skipped_pitch, failures,
     )
     return {
         "audit_run_id": audit_run_id,
         "materialized": materialized,
+        "superseded_prior_pending": superseded_total,
         "links_established": links_established,
         "skipped_pitch_only": skipped_pitch,
         "failures": failures,
         "action_items_total": len(actions),
     }
+
+
+async def _supersede_prior_pending(
+    *,
+    merchant_id: str,
+    new_task_id: str,
+    action: Dict[str, Any],
+    audit_run_id: str,
+) -> int:
+    """Q-P0-2 / Q-P1-4: mark prior pending tasks with the same
+    canonical action identity as `superseded` and point them at the
+    newly-materialized task.
+
+    Returns the number of rows superseded. Best-effort — accessor
+    failures are logged and counted as zero supersessions; the new
+    task remains valid regardless.
+
+    Identity match has TWO layers:
+      1. SQL prefilter on (merchant_id, lever, title) via
+         `find_pending_supersede_candidates`. Cheap, index-backed.
+      2. Python full-identity filter on target_host + product_key
+         pulled from `evidence_jsonb`. Heavier but precise.
+
+    Tasks in stages other than `pending` are NOT touched:
+      - `in_progress`: operator is actively working it; don't
+        steal the work mid-flight.
+      - `done` / `dismissed` / `failed`: terminal; supersession
+        would muddy the audit trail.
+      - `superseded`: already pointing at a newer task; would
+        create a chain that obscures the latest live task.
+    """
+    from db.merchant_tasks import (
+        find_pending_supersede_candidates,
+        mark_task_superseded,
+    )
+
+    title = action.get("title") or ""
+    lever = action.get("lever")
+    new_evidence = action.get("evidence") or {}
+    new_target_host = (new_evidence.get("target_host") or "").lower()
+    new_product_key = (new_evidence.get("product_key") or "").lower()
+
+    candidates = await find_pending_supersede_candidates(
+        merchant_id=merchant_id,
+        lever=lever,
+        title=title,
+        exclude_audit_run_id=audit_run_id,
+    )
+    if not candidates:
+        return 0
+
+    superseded = 0
+    for cand in candidates:
+        cand_evidence = cand.get("evidence") or {}
+        cand_target_host = (cand_evidence.get("target_host") or "").lower()
+        cand_product_key = (cand_evidence.get("product_key") or "").lower()
+        # Strict equality on the differentiator fields. Pre-fix dedup
+        # used `(lever or title).lower()` only — that collapsed every
+        # editorial action targeting different hosts. Don't reintroduce
+        # that collapse here; only supersede when target_host AND
+        # product_key match too.
+        if cand_target_host != new_target_host:
+            continue
+        if cand_product_key != new_product_key:
+            continue
+        ok = await mark_task_superseded(
+            task_id=cand["task_id"],
+            superseded_by_task_id=new_task_id,
+        )
+        if ok:
+            superseded += 1
+    return superseded
 
 
 async def _link_task_to_canonical_action(
