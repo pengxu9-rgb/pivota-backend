@@ -338,16 +338,36 @@ async def create_wix_order(
     order = dict(order_dict or {})
     credentials = extract_wix_order_credentials(order)
     access_token = credentials.get("access_token") or ""
-    if not access_token:
+    site_id = credentials.get("site_id") or ""
+    # Require BOTH access_token AND site_id. Wix's API needs the
+    # site_id in the request URL/header — sending a probe with just
+    # an access_token would 4xx upstream and waste a paid attempt.
+    # Also: per the codex code review of PR #491, accepting any
+    # non-empty access_token (without checking site_id) lets legacy
+    # raw api_key blobs sneak through to upstream as bogus OAuth
+    # bearer tokens. Strict-pair validation closes that gap.
+    if not access_token or not site_id:
+        missing = []
+        if not access_token:
+            missing.append("access_token")
+        if not site_id:
+            missing.append("site_id")
         logger.warning(
-            "[Wix] Order writeback skipped; credentials not configured: merchant_id=%s order_id=%s",
+            "[Wix] Order writeback skipped; credentials not configured "
+            "(missing=%s): merchant_id=%s order_id=%s",
+            ",".join(missing),
             merchant_id,
             order.get("order_id"),
         )
         return _error_result(
             "wix_credentials_not_configured",
             raw_response={
-                "message": "Wix access token is missing for merchant store",
+                "message": (
+                    f"Wix credentials incomplete; missing: "
+                    f"{', '.join(missing)}. Both access_token AND "
+                    f"site_id must be present to call the Wix API."
+                ),
+                "missing_fields": missing,
                 "expected_store_credentials": {
                     "access_token": "stored Wix OAuth bearer token",
                     "site_id": "Wix site id",

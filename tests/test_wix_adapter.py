@@ -180,6 +180,67 @@ async def test_create_wix_order_missing_credentials_returns_not_configured(monke
     assert result["retryable"] is False
 
 
+@pytest.mark.asyncio
+async def test_create_wix_order_partial_credentials_token_only_returns_not_configured(monkeypatch):
+    """Per the codex code review of PR #491: a Wix call with an
+    access_token but NO site_id was previously accepted and would
+    fail upstream with a 4xx (wasting a paid attempt). Strict-pair
+    validation rejects this BEFORE the network call."""
+    from adapters import wix_adapter
+
+    class FailingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("network should not be called without site_id")
+
+    order = _wix_order()
+    order["store"] = {
+        "store_id": "store_wix_1",
+        "platform": "wix",
+        # access_token present but site_id MISSING — should be rejected.
+        "api_credentials": {"access_token": "tok_partial_only"},
+    }
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", FailingAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", order)
+
+    assert result["status"] == "error"
+    assert result["error"] == "wix_credentials_not_configured"
+    assert result["retryable"] is False
+    raw = result.get("raw_response") or {}
+    assert "site_id" in (raw.get("missing_fields") or []), (
+        "Adapter must enumerate which credential fields are missing "
+        "so the operator can fix the right one — token-only must "
+        "surface 'site_id' in the missing_fields list."
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_wix_order_partial_credentials_site_only_returns_not_configured(monkeypatch):
+    """Mirror of the token-only case: a Wix call with site_id but
+    NO access_token must also reject before network call."""
+    from adapters import wix_adapter
+
+    class FailingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("network should not be called without access_token")
+
+    order = _wix_order()
+    order["store"] = {
+        "store_id": "store_wix_1",
+        "platform": "wix",
+        "api_credentials": {"site_id": "site_partial_only"},
+    }
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", FailingAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", order)
+
+    assert result["status"] == "error"
+    assert result["error"] == "wix_credentials_not_configured"
+    assert result["retryable"] is False
+    raw = result.get("raw_response") or {}
+    assert "access_token" in (raw.get("missing_fields") or [])
+
+
 def test_build_wix_order_payload_populates_required_wix_fields_from_order():
     from adapters.wix_adapter import build_wix_order_payload
 
