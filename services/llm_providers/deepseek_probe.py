@@ -610,6 +610,7 @@ async def probe_one_scan_mode(
             scan_mode=scan_mode, status="succeeded",
             started_at_perf=_telemetry_started_at,
             input_tokens=0, output_tokens=0,
+            model=model,
         )
         return {
             "scan_mode": scan_mode,
@@ -668,6 +669,7 @@ async def probe_one_scan_mode(
             None if succeeded_runs > 0
             else "all_runs_returned_upstream_failed_shape"
         ),
+        model=model,
     )
     return {
         "scan_mode": scan_mode,
@@ -691,10 +693,14 @@ async def _record_deepseek_telemetry(
     input_tokens: Optional[int],
     output_tokens: Optional[int],
     error_message: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> None:
     """P2.5b: best-effort telemetry record for one Deepseek probe
     call. Pulls audit_run_id + merchant_id from the audit_telemetry
-    context; computes cost via provider_registry rates."""
+    context; computes cost via provider_registry rates. When `model`
+    is supplied, per-model rates (set on the provider's `model_rates`)
+    are used so overriding DEEPSEEK_MODEL to a non-Flash SKU does not
+    silently undercount cost."""
     try:
         import time as _time
         from db.llm_probe_runs import (
@@ -714,15 +720,12 @@ async def _record_deepseek_telemetry(
         try:
             p = get_provider("deepseek")
             if p is not None:
+                rates = p.rate_for_model(model)
                 cost_usd = compute_cost_usd(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
-                    cost_per_1k_input_tokens_usd=(
-                        p.cost_per_1k_input_tokens_usd
-                    ),
-                    cost_per_1k_output_tokens_usd=(
-                        p.cost_per_1k_output_tokens_usd
-                    ),
+                    cost_per_1k_input_tokens_usd=rates["input_per_1k"],
+                    cost_per_1k_output_tokens_usd=rates["output_per_1k"],
                 )
         except Exception:  # noqa: BLE001
             pass

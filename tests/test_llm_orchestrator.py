@@ -142,6 +142,79 @@ def test_provider_estimated_cost_per_probe():
     assert abs(cost - expected) < 1e-9
 
 
+def test_rate_for_model_returns_provider_rate_when_model_unknown():
+    """Unknown model id → falls back to provider-level rates."""
+    from services.llm_providers.provider_registry import get_provider
+    deepseek = get_provider("deepseek")
+    rates = deepseek.rate_for_model("deepseek-some-future-sku")
+    assert rates["input_per_1k"] == deepseek.cost_per_1k_input_tokens_usd
+    assert rates["output_per_1k"] == deepseek.cost_per_1k_output_tokens_usd
+
+
+def test_rate_for_model_returns_provider_rate_when_model_none():
+    from services.llm_providers.provider_registry import get_provider
+    deepseek = get_provider("deepseek")
+    rates = deepseek.rate_for_model(None)
+    assert rates["input_per_1k"] == deepseek.cost_per_1k_input_tokens_usd
+
+
+def test_rate_for_model_deepseek_chat_uses_flash_rate():
+    from services.llm_providers.provider_registry import get_provider
+    deepseek = get_provider("deepseek")
+    rates = deepseek.rate_for_model("deepseek-chat")
+    assert rates["input_per_1k"] == 0.00014
+    assert rates["output_per_1k"] == 0.00028
+
+
+def test_rate_for_model_deepseek_reasoner_uses_pro_rate():
+    """The key regression: pointing DEEPSEEK_MODEL at the reasoner
+    SKU must NOT silently use V4 Flash rates."""
+    from services.llm_providers.provider_registry import get_provider
+    deepseek = get_provider("deepseek")
+    rates = deepseek.rate_for_model("deepseek-reasoner")
+    assert rates["input_per_1k"] == 0.00055
+    assert rates["output_per_1k"] == 0.00219
+    # And it's distinct from the flash rate
+    assert rates["input_per_1k"] != deepseek.cost_per_1k_input_tokens_usd
+
+
+def test_estimated_cost_per_probe_uses_per_model_rate():
+    """`model_id` kwarg routes through `rate_for_model`."""
+    from services.llm_providers.provider_registry import get_provider
+    deepseek = get_provider("deepseek")
+    flash_cost = deepseek.estimated_cost_per_probe_usd(
+        expected_input_tokens=1000,
+        expected_output_tokens=1000,
+        model_id="deepseek-chat",
+    )
+    reasoner_cost = deepseek.estimated_cost_per_probe_usd(
+        expected_input_tokens=1000,
+        expected_output_tokens=1000,
+        model_id="deepseek-reasoner",
+    )
+    # Reasoner is materially more expensive than flash.
+    assert reasoner_cost > flash_cost * 5
+
+
+def test_rate_for_model_partial_entry_falls_back_to_provider_default():
+    """If a model_rates entry only specifies input_per_1k, the
+    output_per_1k falls back to provider default rather than 0."""
+    from services.llm_providers.provider_registry import LLMProvider
+    p = LLMProvider(
+        id="partial",
+        display_name="Partial Rates",
+        backend="local_mock",
+        cost_per_1k_input_tokens_usd=0.001,
+        cost_per_1k_output_tokens_usd=0.002,
+        avg_latency_ms_per_probe=100,
+        rate_limit_per_minute=10,
+        model_rates={"only-input": {"input_per_1k": 0.005}},
+    )
+    rates = p.rate_for_model("only-input")
+    assert rates["input_per_1k"] == 0.005
+    assert rates["output_per_1k"] == 0.002
+
+
 # ---------------------------------------------------------------------
 # Orchestration strategies
 # ---------------------------------------------------------------------

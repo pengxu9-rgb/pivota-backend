@@ -88,6 +88,10 @@ class LLMProvider:
     id: str
     display_name: str
     backend: str
+    # Provider-level fallback rates. Used when the active model has no
+    # entry in `model_rates`, or for orchestrator ranking that doesn't
+    # know the runtime model. Should be the headline SKU's rate so
+    # ranking decisions stay representative.
     cost_per_1k_input_tokens_usd: float
     cost_per_1k_output_tokens_usd: float
     avg_latency_ms_per_probe: int
@@ -95,6 +99,14 @@ class LLMProvider:
     health_status: str = HEALTH_HEALTHY
     capabilities: Dict[str, Any] = field(default_factory=dict)
     suitable_for_scan_modes: Dict[str, str] = field(default_factory=dict)
+    # Per-model overrides. Keys are concrete model ids (e.g.
+    # "deepseek-chat", "deepseek-reasoner"); values are
+    # {"input_per_1k": float, "output_per_1k": float}. Telemetry
+    # callers that know the runtime model should pass it to
+    # `rate_for_model` so cost isn't silently undercounted when an
+    # operator overrides DEEPSEEK_MODEL / GEMINI_MODEL / etc to a
+    # different SKU than the provider's headline rate.
+    model_rates: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
     def suitability_for(self, scan_mode: str) -> str:
         """Return suitability rating for a scan_mode. Defaults to
@@ -106,18 +118,46 @@ class LLMProvider:
         """Numerical weight for ranking. 0 = unsuitable; higher = better."""
         return _SUITABILITY_WEIGHTS.get(self.suitability_for(scan_mode), 0)
 
+    def rate_for_model(
+        self, model_id: Optional[str],
+    ) -> Dict[str, float]:
+        """Return per-1k-token rates for a specific model id, falling
+        back to provider-level rates when the model has no entry. Use
+        this in telemetry/cost computation so DEEPSEEK_MODEL (etc)
+        overrides don't silently undercount."""
+        if model_id:
+            rates = self.model_rates.get(model_id)
+            if rates:
+                return {
+                    "input_per_1k": float(
+                        rates.get("input_per_1k",
+                                  self.cost_per_1k_input_tokens_usd),
+                    ),
+                    "output_per_1k": float(
+                        rates.get("output_per_1k",
+                                  self.cost_per_1k_output_tokens_usd),
+                    ),
+                }
+        return {
+            "input_per_1k": self.cost_per_1k_input_tokens_usd,
+            "output_per_1k": self.cost_per_1k_output_tokens_usd,
+        }
+
     def estimated_cost_per_probe_usd(
         self, *, expected_input_tokens: int = 500,
         expected_output_tokens: int = 300,
+        model_id: Optional[str] = None,
     ) -> float:
-        """Rough cost estimate for one probe call. Uses the
-        provider's per-1k-token rates against expected token counts.
+        """Rough cost estimate for one probe call. Uses per-model
+        rates when `model_id` is known (and that model has a rate
+        entry), otherwise falls back to the provider-level rates.
         Default expected tokens are sized for an audit probe (system
         prompt + query + structured JSON response).
         """
+        rates = self.rate_for_model(model_id)
         return (
-            (expected_input_tokens / 1000.0) * self.cost_per_1k_input_tokens_usd
-            + (expected_output_tokens / 1000.0) * self.cost_per_1k_output_tokens_usd
+            (expected_input_tokens / 1000.0) * rates["input_per_1k"]
+            + (expected_output_tokens / 1000.0) * rates["output_per_1k"]
         )
 
 
@@ -213,7 +253,12 @@ def _seed_default_providers() -> None:
         id="deepseek",
         display_name="Deepseek V4",
         backend=BACKEND_DEEPSEEK_LOCAL,
-        cost_per_1k_input_tokens_usd=0.00014,    # Deepseek-Chat current rate
+        # Provider-level rate = headline SKU (deepseek-chat, V4 Flash).
+        # Per-model rates below cover the published lineup; if an
+        # operator points DEEPSEEK_MODEL at one of them, telemetry
+        # uses the right rate. Unknown model ids fall back to these
+        # provider-level numbers.
+        cost_per_1k_input_tokens_usd=0.00014,    # deepseek-chat (V4 Flash)
         cost_per_1k_output_tokens_usd=0.00028,
         avg_latency_ms_per_probe=1800,
         rate_limit_per_minute=120,
@@ -234,6 +279,19 @@ def _seed_default_providers() -> None:
             # structured output for non-grounded classification.
             "form_factor_classification": SUITABILITY_EXCELLENT,
             "corporate_intel_lookup": SUITABILITY_GOOD,
+        },
+        # Per-model rates (cache-miss list price; update as Deepseek's
+        # pricing page changes). Cache-hit pricing is a separate axis
+        # not modeled here.
+        model_rates={
+            "deepseek-chat": {       # V4 Flash
+                "input_per_1k": 0.00014,
+                "output_per_1k": 0.00028,
+            },
+            "deepseek-reasoner": {   # V4 Pro / reasoner SKU
+                "input_per_1k": 0.00055,
+                "output_per_1k": 0.00219,
+            },
         },
     ))
 
