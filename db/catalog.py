@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -507,4 +508,61 @@ beauty_content_assets = Table(
     Column("metadata_json", JSONB_TYPE, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+)
+
+
+# Stage 3a (mig 085) — denormalized one-row-per-canonical-product view
+# that powers /api/agent/pdp/{id}. Read path target: <10ms p99 SELECT.
+# Backfilled by Stage 3a-ii script; refreshed by Stage 3a-iii hook in
+# seed_data_writer; read by Stage 3a-iv endpoint.
+# See plans/rosy-mixing-bengio.md.
+agent_pdp_view = Table(
+    "agent_pdp_view",
+    metadata,
+    Column("content_key", String(40), primary_key=True),
+    Column("pivota_signature_id", String(40), nullable=True),
+    Column("product_group_id", String(64), nullable=True),
+    Column("brand", Text, nullable=True),
+    Column("title", Text, nullable=False),
+    Column("description", Text, nullable=True),
+    Column("image_url", Text, nullable=True),
+    Column("image_urls", JSONB_TYPE, nullable=True),
+    Column("currency", String(3), nullable=True),
+    Column("price_min", Numeric(12, 2), nullable=True),
+    Column("price_max", Numeric(12, 2), nullable=True),
+    Column("offer_count", Integer, nullable=True),
+    Column("offers", JSONB_TYPE, nullable=True),
+    Column("variants", JSONB_TYPE, nullable=True),
+    Column("variants_count", Integer, nullable=True),
+    Column("gtin13", String(14), nullable=True),
+    Column("category_path", Text, nullable=True),
+    Column("taxonomy_tags", JSONB_TYPE, nullable=True),
+    Column("breadcrumb", JSONB_TYPE, nullable=True),
+    Column("pdp_lifecycle_stage", String(16), nullable=True),
+    Column("sync_status", String(16), nullable=True),
+    Column("primary_merchant_id", String(64), nullable=True),
+    Column("refreshed_at", DateTime, server_default=func.now(), nullable=False),
+    Column("refreshed_by_proposal_id", BigInteger, nullable=True),
+    Column("refresh_source", Text, nullable=True),
+    Index(
+        "idx_agent_pdp_view_pivota_signature_id",
+        "pivota_signature_id",
+        unique=True,
+        postgresql_where=Column("pivota_signature_id").isnot(None),
+    ),
+    Index(
+        "idx_agent_pdp_view_product_group_id",
+        "product_group_id",
+        postgresql_where=Column("product_group_id").isnot(None),
+    ),
+    Index(
+        "idx_agent_pdp_view_gtin13",
+        "gtin13",
+        postgresql_where=Column("gtin13").isnot(None),
+    ),
+    Index(
+        "idx_agent_pdp_view_brand",
+        "brand",
+        postgresql_where=Column("brand").isnot(None),
+    ),
 )
