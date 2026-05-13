@@ -182,36 +182,132 @@ def test_plain_summary_no_recognition_claim_without_title_match():
         )
 
 
-def test_plain_summary_recognition_phrase_score_calibrated():
-    """When title_match exists, the recognition phrase should still
-    be calibrated to the score — never overstate."""
+def test_plain_summary_recognition_phrase_tiered_evidence():
+    """P0-Q1 regression: the recognition phrase must reflect the
+    actual evidence tier (URL-grounded vs title-only vs excerpt-only),
+    not just the score. Pre-fix, tier-2 (title-match without URL
+    grounding) at score 85 was rendered as "your brand surfaces
+    consistently" — overstating the evidence. Now tier-2 says "named
+    in source titles, but your URL itself was not the cited source"
+    regardless of score, because score gradation can't promote
+    title-match into URL-grounding."""
+    # Tier 1: URL was an actual grounding chunk. High score earns
+    # the "most" qualifier; low score keeps "some".
+    url_grounding_details = [
+        {"title_match": True, "in_grounding": True, "matched": True},
+    ]
+    summary_t1_high = _build_visibility_plain_summary(
+        verdict_label=VERDICT_VIA_RETAILERS,
+        visibility_score=30, attribution_score=10,
+        category_visibility_score=85,
+        category_match_details=url_grounding_details,
+        attribution_runs_total=9, merchant_cited_runs=1,
+        top_retailers=["cosmopolitan.com"],
+    )
+    assert "url was used as a grounding source on most" in summary_t1_high.lower()
+
+    summary_t1_low = _build_visibility_plain_summary(
+        verdict_label=VERDICT_VIA_RETAILERS,
+        visibility_score=30, attribution_score=10,
+        category_visibility_score=35,
+        category_match_details=url_grounding_details,
+        attribution_runs_total=9, merchant_cited_runs=1,
+        top_retailers=["cosmopolitan.com"],
+    )
+    assert "url was used as a grounding source on some" in summary_t1_low.lower()
+
+    # Tier 2: title-match only — URL did NOT appear. Score is
+    # mentioned but does NOT escalate the qualifier.
     title_match_details = [
         {"title_match": True, "in_grounding": False, "matched": True},
     ]
-    # Low category score (35) — should not say "consistently surfaces"
-    summary_low = _build_visibility_plain_summary(
+    summary_t2_high = _build_visibility_plain_summary(
         verdict_label=VERDICT_VIA_RETAILERS,
-        visibility_score=30,
-        attribution_score=10,
-        category_visibility_score=35,
-        category_match_details=title_match_details,
-        attribution_runs_total=9,
-        merchant_cited_runs=1,
-        top_retailers=["cosmopolitan.com"],
-    )
-    assert "consistently" not in summary_low.lower()
-    # High category score (85) — "consistently" is appropriate
-    summary_high = _build_visibility_plain_summary(
-        verdict_label=VERDICT_VIA_RETAILERS,
-        visibility_score=30,
-        attribution_score=10,
+        visibility_score=30, attribution_score=10,
         category_visibility_score=85,
         category_match_details=title_match_details,
-        attribution_runs_total=9,
-        merchant_cited_runs=1,
+        attribution_runs_total=9, merchant_cited_runs=1,
         top_retailers=["cosmopolitan.com"],
     )
-    assert "consistently" in summary_high.lower()
+    # The pre-fix overclaim was "consistently" at score 85 — gone.
+    assert "consistently" not in summary_t2_high.lower()
+    # Tier-2 must say title-match-only, NOT URL grounding.
+    assert "named in some category-level grounded source titles" in (
+        summary_t2_high.lower()
+    )
+    assert "your url itself was not the cited source" in summary_t2_high.lower()
+
+    # Tier 3: NEITHER title-match nor URL-grounding — score came
+    # purely from excerpt-only brand mention (the Winona artifact
+    # from run 932d8261).
+    excerpt_only_details = [
+        {"title_match": False, "in_grounding": False, "matched": True},
+    ]
+    summary_t3 = _build_visibility_plain_summary(
+        verdict_label=VERDICT_VIA_RETAILERS,
+        visibility_score=0, attribution_score=0,
+        category_visibility_score=33,
+        category_match_details=excerpt_only_details,
+        attribution_runs_total=3, merchant_cited_runs=0,
+        top_retailers=["ctfassets.net"],
+    )
+    # MUST NOT say URL was used / grounded — that's the P0-Q1 bug.
+    assert "url was used" not in summary_t3.lower()
+    assert "url was cited" not in summary_t3.lower()
+    # MUST say excerpt/prose mention with explicit "no grounded source".
+    assert "answer prose" in summary_t3.lower()
+    assert "no grounded source named your brand" in summary_t3.lower()
+
+
+def test_plain_summary_does_not_attribute_buyer_intent_grounding_when_zero_citations():
+    """P0-Q1 regression: when 0 of N attribution runs cited anything,
+    pre-fix prose still said "the other N grounded their answers in
+    third-party sources including <category retailer hosts>". That
+    used category-scope hosts to describe buyer-intent grounding —
+    wrong scope. Now: when merchant_cited_runs=0, prose says the
+    runs didn't return grounded sources rather than blaming
+    third-party retailers."""
+    excerpt_only_details = [
+        {"title_match": False, "in_grounding": False, "matched": True},
+    ]
+    summary = _build_visibility_plain_summary(
+        verdict_label=VERDICT_VIA_RETAILERS,
+        visibility_score=0, attribution_score=0,
+        category_visibility_score=33,
+        category_match_details=excerpt_only_details,
+        attribution_runs_total=3, merchant_cited_runs=0,
+        top_retailers=["ctfassets.net", "lookhealthystore.com"],
+    )
+    # Pre-fix overclaim — third-party-grounding for buyer-intent runs
+    # that had ZERO citations. Must be absent now.
+    assert (
+        "grounded answers in third-party sources" not in summary.lower()
+    ), f"buyer-intent grounding claim must not fire when 0/N cited: {summary}"
+    # Must say something about no grounded source returning.
+    assert (
+        "no grounded source" in summary.lower()
+        or "did not return" in summary.lower()
+        or "could not attribute" in summary.lower()
+    ), f"summary should signal no attribution: {summary}"
+
+
+def test_plain_summary_invisible_does_not_blame_category_hosts_when_zero_buyer_intent_citations():
+    """Same scope-conflation as above but for the VERDICT_INVISIBLE
+    branch. Pre-fix the INVISIBLE branch ALSO used `top_retailers`
+    (a category-scope arg) in buyer-intent prose. Gate it to fire
+    only when there's actual buyer-intent grounding evidence."""
+    summary = _build_visibility_plain_summary(
+        verdict_label=VERDICT_INVISIBLE,
+        visibility_score=0, attribution_score=0,
+        category_visibility_score=0,
+        category_match_details=[],
+        attribution_runs_total=3,
+        merchant_cited_runs=0,
+        top_retailers=["ctfassets.net", "lookhealthystore.com"],
+    )
+    assert (
+        "grounded its answers in third-party sources" not in summary.lower()
+    ), f"INVISIBLE branch must not blame category hosts for buyer-intent: {summary}"
 
 
 def test_plain_summary_handles_null_category_score():
