@@ -5609,6 +5609,29 @@ def render_brand_markdown(
         tt = own.get("tiktok") or {}
         ig = own.get("instagram") or {}
 
+        # Failure-reason surfacing: map a sub-call's failure token to a
+        # merchant-readable one-liner. When a sub-section is empty AND
+        # a reason exists, the renderer shows this instead of silently
+        # omitting — so the operator knows the lookup ran and WHY it
+        # came back empty (vs. "was this even checked?").
+        _failure_reasons = social.get("failure_reasons") or {}
+        _FAILURE_TEXT = {
+            "ungrounded": (
+                "the lookup couldn't ground its answer in a live source "
+                "(suppressed to avoid unverified numbers)"
+            ),
+            "parse_error": "the lookup returned an unparseable response",
+            "rate_limited": "the lookup was rate-limited — retry later",
+            "transport_error": "the lookup failed to reach the data source",
+            "no_data": "the lookup ran but found nothing for this brand",
+        }
+
+        def _failure_note(label: str, reason: Optional[str]) -> Optional[str]:
+            if not reason:
+                return None
+            text = _FAILURE_TEXT.get(reason, f"unavailable ({reason})")
+            return f"_{label} unavailable — {text}._\n"
+
         def _own_presence_line(platform_label: str, p: Dict[str, Any]) -> str:
             # PR-9: when the sub-call was ungrounded, every metric is
             # nulled — render the handle + an explicit "not verified"
@@ -5628,16 +5651,31 @@ def render_brand_markdown(
                 f"focus: {focus}.\n"
             )
 
-        if tt or ig:
+        # Own-presence block. Renders a line per platform that has
+        # data; for a platform that came back empty WITH a failure
+        # reason, render the explanation note instead.
+        tt_note = _failure_note("TikTok presence", _failure_reasons.get("own_presence_tiktok"))
+        ig_note = _failure_note("Instagram presence", _failure_reasons.get("own_presence_instagram"))
+        if tt or ig or tt_note or ig_note:
             sections.append("**Your brand's own social presence:**\n")
             if tt:
                 sections.append(_own_presence_line("TikTok", tt))
+            elif tt_note:
+                sections.append(f"- {tt_note}")
             if ig:
                 sections.append(_own_presence_line("Instagram", ig))
+            elif ig_note:
+                sections.append(f"- {ig_note}")
         kol = social.get("kol_endorsements") or {}
         tt_kols = kol.get("tiktok") or []
         ig_kols = kol.get("instagram") or []
-        if tt_kols or ig_kols:
+        kol_tt_note = _failure_note(
+            "TikTok creator endorsements", _failure_reasons.get("kol_tiktok"),
+        )
+        kol_ig_note = _failure_note(
+            "Instagram creator endorsements", _failure_reasons.get("kol_instagram"),
+        )
+        if tt_kols or ig_kols or kol_tt_note or kol_ig_note:
             sections.append(
                 "\n**Creators who posted about your brand (last 12 months):**\n"
             )
@@ -5647,12 +5685,16 @@ def render_brand_markdown(
                     f"({k.get('follower_band', '?')}) — "
                     f"{k.get('post_summary', 'post summary not available')}\n"
                 )
+            if not tt_kols and kol_tt_note:
+                sections.append(f"- {kol_tt_note}")
             for k in (ig_kols or [])[:5]:
                 sections.append(
                     f"- Instagram: {k.get('creator_name', '?')} "
                     f"({k.get('follower_band', '?')}) — "
                     f"{k.get('post_summary', 'post summary not available')}\n"
                 )
+            if not ig_kols and kol_ig_note:
+                sections.append(f"- {kol_ig_note}")
         # PR-10: brand-vs-competitor benchmark table. This is the
         # PRIMARY benchmark — apples-to-apples follower counts because
         # the merchant AND each competitor were measured by the same
@@ -5699,6 +5741,10 @@ def render_brand_markdown(
         # table because it's the less-reliable signal (one call
         # covering N brands; came back null in the PR-8 prod run).
         competitive = social.get("competitive_comparison") or []
+        competitive_note = _failure_note(
+            "Competitive social comparison",
+            _failure_reasons.get("competitive_comparison"),
+        )
         if competitive:
             sections.append("\n**Competitive social comparison:**\n")
             rows = ["| Brand | TikTok | Instagram | Notes |", "|---|---|---|---|"]
@@ -5710,6 +5756,12 @@ def render_brand_markdown(
                     f"| {c.get('notes') or ''} |"
                 )
             sections.append("\n".join(rows) + "\n")
+        elif competitive_note:
+            # competitive_comparison came back null — explain why
+            # rather than silently dropping the sub-section. (The
+            # PR-10 per-competitor benchmark table above is the
+            # primary signal; this note covers the secondary layer.)
+            sections.append("\n" + competitive_note)
 
     failed = brand_report.get("failed") or []
     if failed:

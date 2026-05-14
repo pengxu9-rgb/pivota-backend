@@ -1420,13 +1420,31 @@ def _coerce_str(v: Any) -> Optional[str]:
     return v.strip() if isinstance(v, str) and v.strip() else None
 
 
-async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], api_key: str) -> Optional[Dict[str, Any]]:
+# Failure-reason tokens shared by the three social sub-calls. Surfaced
+# in infer_social_intelligence's `failure_reasons` dict so the renderer
+# can explain WHY a sub-section is empty instead of silently omitting
+# it. None = the sub-call succeeded with data.
+_FR_TRANSPORT = "transport_error"   # _gemini_grounded_call returned None (HTTP/timeout/429)
+_FR_PARSE = "parse_error"           # response body didn't parse to the expected shape
+_FR_UNGROUNDED = "ungrounded"       # PR-9 grounding gate: 0 grounding chunks
+_FR_NO_DATA = "no_data"             # grounded + parsed but yielded nothing usable
+
+
+async def _infer_own_presence(
+    brand: str, platform: str, handle: Optional[str], api_key: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Returns (presence_dict, failure_reason). On success the dict is
+    populated and reason is None. On failure the dict is None and
+    reason names why (see _FR_* tokens). An ungrounded-but-handle-
+    present result still SURFACES (dict non-None, reason None) — it's
+    marked grounding="ungrounded" internally; the PR-9 gate only nulls
+    the metric fields, it doesn't suppress the whole result."""
     payload = await _gemini_grounded_call(
         _build_own_presence_prompt(brand, platform, handle),
         api_key=api_key, scan_mode="bd_own_presence",
     )
     if not payload:
-        return None
+        return (None, _FR_TRANSPORT)
     raw_text = _parse_gemini_text(payload)
     parsed = _unwrap_json(raw_text)
     # If Gemini wrapped the object in a single-field container, peek inside.
@@ -1439,7 +1457,7 @@ async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], 
             "own_presence(%s): could not parse object; raw=%r",
             platform, (raw_text or "")[:300],
         )
-        return None
+        return (None, _FR_PARSE)
     metric_key = "view_per_post_estimate" if platform == "tiktok" else "engagement_rate_estimate"
     # PR-9 honesty gate. Follower counts, view/engagement estimates,
     # and content-focus claims are only trustworthy when Gemini
@@ -1487,30 +1505,39 @@ async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], 
     # every metric nulled, so the renderer shows the handle + "not
     # verified" rather than fabricated counts.
     if not any(out[k] for k in ("handle", "follower_estimate", "follower_band", "content_focus", "post_frequency")):
-        return None
-    return out
+        # Nothing to surface. Distinguish WHY: if the response wasn't
+        # grounded the PR-9 gate nulled everything → "ungrounded";
+        # if it WAS grounded but the model still returned an all-empty
+        # object → "no_data".
+        return (None, _FR_UNGROUNDED if not grounded else _FR_NO_DATA)
+    return (out, None)
 
 
-async def _infer_kol_endorsements(brand: str, platform: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
+async def _infer_kol_endorsements(
+    brand: str, platform: str, api_key: str,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Returns (kol_list, failure_reason). Success → non-empty list +
+    None. An ungrounded response → (None, "ungrounded") — a creator
+    list is the highest-fabrication-risk output, suppressed wholesale
+    by the PR-9 gate. Grounded-but-empty → (None, "no_data")."""
     payload = await _gemini_grounded_call(
         _build_kol_prompt(brand, platform),
         api_key=api_key, scan_mode="bd_kol_endorsements",
     )
     if not payload:
-        return None
+        return (None, _FR_TRANSPORT)
     # PR-9 honesty gate. A list of named creators who "posted about
     # the brand in the last 12 months" is the highest-fabrication-risk
     # output of the three social sub-calls — an ungrounded response
     # invents plausible-looking creator handles wholesale. Zero
-    # grounding chunks → treat as "no data" (None), never surface
-    # fabricated creators in a merchant-facing report.
+    # grounding chunks → suppress, never surface fabricated creators.
     if _grounding_chunk_count(payload) == 0:
         logger.info(
             "kol_endorsements(%s): ungrounded response (0 grounding chunks) "
             "for %s — suppressing to avoid fabricated creator list",
             platform, brand,
         )
-        return None
+        return (None, _FR_UNGROUNDED)
     raw_text = _parse_gemini_text(payload)
     parsed = _coerce_to_array(_unwrap_json(raw_text))
     if parsed is None:
@@ -1518,7 +1545,7 @@ async def _infer_kol_endorsements(brand: str, platform: str, api_key: str) -> Op
             "kol_endorsements(%s): could not coerce response to array; raw=%r",
             platform, (raw_text or "")[:300],
         )
-        return None
+        return (None, _FR_PARSE)
     out: List[Dict[str, Any]] = []
     for item in parsed:
         if not isinstance(item, dict):
@@ -1536,18 +1563,28 @@ async def _infer_kol_endorsements(brand: str, platform: str, api_key: str) -> Op
             "post_date": _coerce_str(item.get("post_date")),
             "content_summary": _coerce_str(item.get("content_summary")),
         })
-    return out
+    # Grounded + parsed but no usable creators — a legitimate "we
+    # checked, found nothing" outcome. Surface it as no_data so the
+    # renderer can say "no endorsements found" rather than omitting.
+    if not out:
+        return (None, _FR_NO_DATA)
+    return (out, None)
 
 
-async def _infer_competitive_social(brand: str, competitors: List[str], api_key: str) -> Optional[List[Dict[str, Any]]]:
+async def _infer_competitive_social(
+    brand: str, competitors: List[str], api_key: str,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Returns (comparison_list, failure_reason). No competitors to
+    compare → (None, None) — not a failure, nothing was attempted.
+    Otherwise the standard failure tokens apply."""
     if not competitors:
-        return None
+        return (None, None)
     payload = await _gemini_grounded_call(
         _build_competitive_prompt(brand, competitors),
         api_key=api_key, scan_mode="bd_competitive_social",
     )
     if not payload:
-        return None
+        return (None, _FR_TRANSPORT)
     # PR-9 honesty gate. Competitor follower counts + KOL-count
     # estimates are fabrication risk when ungrounded — the model will
     # happily emit plausible numbers for every competitor brand from
@@ -1558,7 +1595,7 @@ async def _infer_competitive_social(brand: str, competitors: List[str], api_key:
             "for %s — suppressing to avoid fabricated competitor figures",
             brand,
         )
-        return None
+        return (None, _FR_UNGROUNDED)
     raw_text = _parse_gemini_text(payload)
     parsed = _coerce_to_array(_unwrap_json(raw_text))
     if parsed is None:
@@ -1566,7 +1603,7 @@ async def _infer_competitive_social(brand: str, competitors: List[str], api_key:
             "competitive_social: could not coerce response to array; raw=%r",
             (raw_text or "")[:300],
         )
-        return None
+        return (None, _FR_PARSE)
     out: List[Dict[str, Any]] = []
     for item in parsed:
         if not isinstance(item, dict):
@@ -1581,7 +1618,9 @@ async def _infer_competitive_social(brand: str, competitors: List[str], api_key:
             "kol_endorsements_count_estimate": _coerce_int(item.get("kol_endorsements_count_estimate")),
             "gap_summary": _coerce_str(item.get("gap_summary")),
         })
-    return out
+    if not out:
+        return (None, _FR_NO_DATA)
+    return (out, None)
 
 
 # PR-10: per-competitor benchmark — number of named competitors we
@@ -1652,6 +1691,16 @@ async def infer_social_intelligence(
         "kol_endorsements": {"tiktok": None, "instagram": None},
         "competitive_comparison": None,
         "competitor_presence": None,
+        # No sub-call ran — failure_reasons keys all None so downstream
+        # consumers can rely on the key existing without special-casing.
+        "failure_reasons": {
+            "own_presence_tiktok": None,
+            "own_presence_instagram": None,
+            "kol_tiktok": None,
+            "kol_instagram": None,
+            "competitive_comparison": None,
+            "competitor_presence": None,
+        },
         "available": False,
     }
     if not api_key:
@@ -1706,32 +1755,67 @@ async def infer_social_intelligence(
 
     results = await asyncio.gather(*coros, return_exceptions=True)
 
-    def _safe(r: Any) -> Any:
-        return r if not isinstance(r, Exception) else None
+    def _safe(r: Any) -> Tuple[Any, Optional[str]]:
+        """Every sub-call now returns a (data, failure_reason) tuple.
+        An exception escaping the coro → (None, transport_error) so
+        the failure still gets a reason instead of vanishing."""
+        if isinstance(r, BaseException):
+            return (None, _FR_TRANSPORT)
+        if isinstance(r, tuple) and len(r) == 2:
+            return r
+        # Defensive: a sub-call that somehow returned a bare value.
+        return (r, None if r else _FR_NO_DATA)
 
     # Re-assemble per-competitor presence. A competitor surfaces only
     # if at least one of its platform probes returned data — same
     # "surface partial, suppress fully-empty" rule as own_presence.
+    # Per-platform failure reasons are tracked so the renderer can
+    # explain a missing competitor benchmark.
     competitor_presence: Dict[str, Any] = {}
+    competitor_failure_reasons: Dict[str, Dict[str, Optional[str]]] = {}
     for comp, (tt_idx, ig_idx) in competitor_idx_map.items():
-        comp_tt = _safe(results[tt_idx])
-        comp_ig = _safe(results[ig_idx])
+        comp_tt, comp_tt_reason = _safe(results[tt_idx])
+        comp_ig, comp_ig_reason = _safe(results[ig_idx])
         if comp_tt or comp_ig:
             competitor_presence[comp] = {"tiktok": comp_tt, "instagram": comp_ig}
+        if comp_tt_reason or comp_ig_reason:
+            competitor_failure_reasons[comp] = {
+                "tiktok": comp_tt_reason,
+                "instagram": comp_ig_reason,
+            }
+
+    own_tt, own_tt_reason = _safe(results[0])
+    own_ig, own_ig_reason = _safe(results[1])
+    kol_tt, kol_tt_reason = _safe(results[2])
+    kol_ig, kol_ig_reason = _safe(results[3])
+    if competitive_idx is not None:
+        competitive, competitive_reason = _safe(results[competitive_idx])
+    else:
+        competitive, competitive_reason = None, None
 
     out = {
         "own_presence": {
-            "tiktok": _safe(results[0]),
-            "instagram": _safe(results[1]),
+            "tiktok": own_tt,
+            "instagram": own_ig,
         },
         "kol_endorsements": {
-            "tiktok": _safe(results[2]),
-            "instagram": _safe(results[3]),
+            "tiktok": kol_tt,
+            "instagram": kol_ig,
         },
-        "competitive_comparison": (
-            _safe(results[competitive_idx]) if competitive_idx is not None else None
-        ),
+        "competitive_comparison": competitive,
         "competitor_presence": competitor_presence or None,
+        # PR: failure-reason surfacing. Why each sub-call came back
+        # empty — None when the sub-call succeeded with data. The
+        # renderer maps these tokens to merchant-readable one-liners
+        # so an empty sub-section is explained, not silently omitted.
+        "failure_reasons": {
+            "own_presence_tiktok": own_tt_reason,
+            "own_presence_instagram": own_ig_reason,
+            "kol_tiktok": kol_tt_reason,
+            "kol_instagram": kol_ig_reason,
+            "competitive_comparison": competitive_reason,
+            "competitor_presence": competitor_failure_reasons or None,
+        },
     }
     out["available"] = any(
         v for v in (
