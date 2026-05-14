@@ -133,21 +133,23 @@ _COMPETITIVE_JSON = (
 
 # =========================================================================
 # _infer_own_presence — ungrounded nulls metrics, keeps handle
+# All three sub-calls now return a (result, failure_reason) tuple.
 # =========================================================================
 
 
 @pytest.mark.asyncio
 async def test_own_presence_grounded_keeps_metrics():
     """Grounded response (2 chunks) → follower numbers survive,
-    grounding marker = grounded."""
+    grounding marker = grounded, failure_reason None."""
     with patch(
         "services.bd_brand_signals._gemini_grounded_call",
         new_callable=AsyncMock,
         return_value=_payload(_OWN_PRESENCE_JSON, grounded=True),
     ):
-        result = await _infer_own_presence(
+        result, reason = await _infer_own_presence(
             "Beauty of Joseon", "tiktok", "beautyofjoseon", "fake-key",
         )
+    assert reason is None
     assert result is not None
     assert result["follower_estimate"] == 662000
     assert result["follower_band"] == "100k-1M"
@@ -160,17 +162,19 @@ async def test_own_presence_grounded_keeps_metrics():
 @pytest.mark.asyncio
 async def test_own_presence_ungrounded_nulls_metrics_keeps_handle():
     """Ungrounded response (0 chunks) → every metric nulled, handle
-    survives, grounding marker = ungrounded. The follower count the
-    LLM emitted is NOT trusted."""
+    survives, grounding marker = ungrounded. The result still
+    SURFACES (handle present) so failure_reason is None — the
+    ungrounded state is carried by the `grounding` field."""
     with patch(
         "services.bd_brand_signals._gemini_grounded_call",
         new_callable=AsyncMock,
         return_value=_payload(_OWN_PRESENCE_JSON, grounded=False),
     ):
-        result = await _infer_own_presence(
+        result, reason = await _infer_own_presence(
             "Beauty of Joseon", "tiktok", "beautyofjoseon", "fake-key",
         )
     assert result is not None  # handle was supplied → still surfaces
+    assert reason is None      # surfaced (with grounding=ungrounded), not a failure
     assert result["handle"] == "beautyofjoseon"
     assert result["follower_estimate"] is None
     assert result["follower_band"] is None
@@ -184,16 +188,48 @@ async def test_own_presence_ungrounded_nulls_metrics_keeps_handle():
 @pytest.mark.asyncio
 async def test_own_presence_ungrounded_no_handle_suppressed():
     """Ungrounded AND no caller-supplied handle → every field nulled
-    → existing emptiness check returns None (nothing to surface)."""
+    → emptiness check returns (None, "ungrounded")."""
     with patch(
         "services.bd_brand_signals._gemini_grounded_call",
         new_callable=AsyncMock,
         return_value=_payload(_OWN_PRESENCE_JSON, grounded=False),
     ):
-        result = await _infer_own_presence(
+        result, reason = await _infer_own_presence(
             "Beauty of Joseon", "instagram", None, "fake-key",
         )
     assert result is None
+    assert reason == "ungrounded"
+
+
+@pytest.mark.asyncio
+async def test_own_presence_transport_error_when_payload_none():
+    """_gemini_grounded_call returns None (HTTP/timeout/429) →
+    (None, "transport_error")."""
+    with patch(
+        "services.bd_brand_signals._gemini_grounded_call",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        result, reason = await _infer_own_presence(
+            "Beauty of Joseon", "tiktok", "boj", "fake-key",
+        )
+    assert result is None
+    assert reason == "transport_error"
+
+
+@pytest.mark.asyncio
+async def test_own_presence_parse_error_when_not_json():
+    """Response body that doesn't parse to a dict → (None, "parse_error")."""
+    with patch(
+        "services.bd_brand_signals._gemini_grounded_call",
+        new_callable=AsyncMock,
+        return_value=_payload("this is not json at all", grounded=True),
+    ):
+        result, reason = await _infer_own_presence(
+            "Beauty of Joseon", "tiktok", "boj", "fake-key",
+        )
+    assert result is None
+    assert reason == "parse_error"
 
 
 @pytest.mark.asyncio
@@ -208,16 +244,17 @@ async def test_own_presence_instagram_grounded():
         new_callable=AsyncMock,
         return_value=_payload(ig_json, grounded=True),
     ):
-        result = await _infer_own_presence(
+        result, reason = await _infer_own_presence(
             "Beauty of Joseon", "instagram", "boj", "fake-key",
         )
+    assert reason is None
     assert result["follower_estimate"] == 1213393
     assert result["engagement_rate_estimate"] == "2.1%"
     assert result["grounding"] == "grounded"
 
 
 # =========================================================================
-# _infer_kol_endorsements — ungrounded returns None
+# _infer_kol_endorsements — (result, failure_reason)
 # =========================================================================
 
 
@@ -228,9 +265,10 @@ async def test_kol_grounded_returns_list():
         new_callable=AsyncMock,
         return_value=_payload(_KOL_JSON, grounded=True),
     ):
-        result = await _infer_kol_endorsements(
+        result, reason = await _infer_kol_endorsements(
             "Beauty of Joseon", "tiktok", "fake-key",
         )
+    assert reason is None
     assert result is not None
     assert len(result) == 1
     assert result[0]["creator_handle"] == "skinrocks"
@@ -240,20 +278,52 @@ async def test_kol_grounded_returns_list():
 async def test_kol_ungrounded_returns_none():
     """Ungrounded creator list is fabrication — suppress entirely.
     Even though the JSON parses fine, 0 grounding chunks means the
-    model invented these creators."""
+    model invented these creators → (None, "ungrounded")."""
     with patch(
         "services.bd_brand_signals._gemini_grounded_call",
         new_callable=AsyncMock,
         return_value=_payload(_KOL_JSON, grounded=False),
     ):
-        result = await _infer_kol_endorsements(
+        result, reason = await _infer_kol_endorsements(
             "Beauty of Joseon", "tiktok", "fake-key",
         )
     assert result is None
+    assert reason == "ungrounded"
+
+
+@pytest.mark.asyncio
+async def test_kol_no_data_when_grounded_but_empty():
+    """Grounded + parsed but the model found no creators → the list
+    is empty → (None, "no_data"). A legitimate "we checked, found
+    nothing" outcome — distinct from a failure."""
+    with patch(
+        "services.bd_brand_signals._gemini_grounded_call",
+        new_callable=AsyncMock,
+        return_value=_payload("[]", grounded=True),
+    ):
+        result, reason = await _infer_kol_endorsements(
+            "Beauty of Joseon", "tiktok", "fake-key",
+        )
+    assert result is None
+    assert reason == "no_data"
+
+
+@pytest.mark.asyncio
+async def test_kol_transport_error_when_payload_none():
+    with patch(
+        "services.bd_brand_signals._gemini_grounded_call",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        result, reason = await _infer_kol_endorsements(
+            "Beauty of Joseon", "tiktok", "fake-key",
+        )
+    assert result is None
+    assert reason == "transport_error"
 
 
 # =========================================================================
-# _infer_competitive_social — ungrounded returns None
+# _infer_competitive_social — (result, failure_reason)
 # =========================================================================
 
 
@@ -264,9 +334,10 @@ async def test_competitive_grounded_returns_list():
         new_callable=AsyncMock,
         return_value=_payload(_COMPETITIVE_JSON, grounded=True),
     ):
-        result = await _infer_competitive_social(
+        result, reason = await _infer_competitive_social(
             "Beauty of Joseon", ["Drunk Elephant"], "fake-key",
         )
+    assert reason is None
     assert result is not None
     assert len(result) == 1
     assert result[0]["brand"] == "Drunk Elephant"
@@ -275,27 +346,44 @@ async def test_competitive_grounded_returns_list():
 
 @pytest.mark.asyncio
 async def test_competitive_ungrounded_returns_none():
-    """Ungrounded competitor figures — suppress entirely."""
+    """Ungrounded competitor figures — suppress → (None, "ungrounded")."""
     with patch(
         "services.bd_brand_signals._gemini_grounded_call",
         new_callable=AsyncMock,
         return_value=_payload(_COMPETITIVE_JSON, grounded=False),
     ):
-        result = await _infer_competitive_social(
+        result, reason = await _infer_competitive_social(
             "Beauty of Joseon", ["Drunk Elephant"], "fake-key",
         )
     assert result is None
+    assert reason == "ungrounded"
+
+
+@pytest.mark.asyncio
+async def test_competitive_parse_error_when_not_array():
+    with patch(
+        "services.bd_brand_signals._gemini_grounded_call",
+        new_callable=AsyncMock,
+        return_value=_payload("not an array", grounded=True),
+    ):
+        result, reason = await _infer_competitive_social(
+            "Beauty of Joseon", ["Drunk Elephant"], "fake-key",
+        )
+    assert result is None
+    assert reason == "parse_error"
 
 
 @pytest.mark.asyncio
 async def test_competitive_empty_competitors_returns_none():
-    """Pre-existing guard still holds — no competitors → no call."""
+    """Pre-existing guard still holds — no competitors → no call.
+    Not a failure (nothing was attempted) → reason is None."""
     with patch(
         "services.bd_brand_signals._gemini_grounded_call",
         new_callable=AsyncMock,
     ) as mock_call:
-        result = await _infer_competitive_social(
+        result, reason = await _infer_competitive_social(
             "Beauty of Joseon", [], "fake-key",
         )
         mock_call.assert_not_called()
     assert result is None
+    assert reason is None

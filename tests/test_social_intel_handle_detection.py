@@ -123,13 +123,17 @@ async def test_fetch_homepage_html_non_200_returns_none():
 def _patch_infer(own_presence_side_effect):
     """Context-manager bundle: patch api-key, the three sub-calls.
     `_fetch_homepage_html` is intentionally NOT patched here — each
-    test patches it to control the fallback-scrape path."""
+    test patches it to control the fallback-scrape path.
+
+    Sub-calls return (result, failure_reason) tuples — the kol +
+    competitive mocks return the no-op tuple shape; the
+    own-presence side_effect is supplied per-test."""
     return patch.multiple(
         "services.bd_brand_signals",
         _resolve_gemini_api_key=lambda: "fake-key",
         _infer_own_presence=AsyncMock(side_effect=own_presence_side_effect),
-        _infer_kol_endorsements=AsyncMock(return_value=[]),
-        _infer_competitive_social=AsyncMock(return_value=None),
+        _infer_kol_endorsements=AsyncMock(return_value=(None, "no_data")),
+        _infer_competitive_social=AsyncMock(return_value=(None, None)),
     )
 
 
@@ -141,7 +145,7 @@ async def test_handle_from_caller_param_used_directly():
 
     async def capture_own(brand, platform, handle, api_key):
         seen_handles[platform] = handle
-        return _presence(handle, 662000)
+        return (_presence(handle, 662000), None)
 
     with patch(
         "services.bd_brand_signals._fetch_homepage_html",
@@ -168,7 +172,7 @@ async def test_handle_from_homepage_scrape_fallback():
 
     async def capture_own(brand, platform, handle, api_key):
         seen_handles[platform] = handle
-        return _presence(handle, 662000)
+        return (_presence(handle, 662000), None)
 
     with patch(
         "services.bd_brand_signals._fetch_homepage_html",
@@ -193,7 +197,7 @@ async def test_handle_none_when_homepage_has_no_links():
 
     async def capture_own(brand, platform, handle, api_key):
         seen_handles[platform] = handle
-        return _presence(handle, 662000)
+        return (_presence(handle, 662000), None)
 
     with patch(
         "services.bd_brand_signals._fetch_homepage_html",
@@ -215,7 +219,7 @@ async def test_handle_none_when_homepage_fetch_fails():
 
     async def capture_own(brand, platform, handle, api_key):
         seen_handles[platform] = handle
-        return _presence(handle, 662000)
+        return (_presence(handle, 662000), None)
 
     with patch(
         "services.bd_brand_signals._fetch_homepage_html",
@@ -240,7 +244,7 @@ async def test_rich_response_kept_even_when_handle_null():
     async def own_with_data_no_handle(brand, platform, handle, api_key):
         # LLM didn't return a handle, caller/scrape didn't supply one,
         # but the probe still produced grounded follower data.
-        return _presence(None, 662000)
+        return (_presence(None, 662000), None)
 
     with patch(
         "services.bd_brand_signals._fetch_homepage_html",

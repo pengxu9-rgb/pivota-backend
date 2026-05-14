@@ -53,6 +53,8 @@ def patched_subcalls():
     returns a presence dict keyed off the brand arg so each
     competitor probe is distinguishable."""
 
+    # Sub-calls return (result, failure_reason) tuples — the mocks
+    # match that contract.
     async def fake_own_presence(brand, platform, handle, api_key):
         # Each brand gets a distinct follower count so tests can
         # assert which probe produced which result.
@@ -62,13 +64,13 @@ def patched_subcalls():
             "Glow Recipe": 430000,
             "COSRX": 380000,
         }.get(brand, 100000)
-        return _presence(brand.lower().replace(" ", ""), followers)
+        return (_presence(brand.lower().replace(" ", ""), followers), None)
 
     async def fake_kol(brand, platform, api_key):
-        return []  # empty list = grounded-but-no-endorsements
+        return (None, "no_data")  # grounded-but-no-endorsements
 
     async def fake_competitive(brand, competitors, api_key):
-        return None  # the fragile single call — null is its common outcome
+        return (None, "parse_error")  # the fragile single call's common outcome
 
     with patch(
         "services.bd_brand_signals._resolve_gemini_api_key",
@@ -190,17 +192,20 @@ async def test_ungrounded_competitor_probe_still_surfaces_with_nulled_metrics():
     (the renderer shows "not verified"); it's not silently dropped."""
 
     async def mixed_own_presence(brand, platform, handle, api_key):
-        # Merchant grounded; competitor ungrounded.
+        # Merchant grounded; competitor ungrounded. Both still
+        # SURFACE (handle present) → reason None; the ungrounded
+        # state rides on the presence dict's `grounding` field.
         grounded = brand == "Beauty of Joseon"
-        return _presence(
-            brand.lower().replace(" ", ""), 662000, grounded=grounded,
+        return (
+            _presence(brand.lower().replace(" ", ""), 662000, grounded=grounded),
+            None,
         )
 
     async def fake_kol(brand, platform, api_key):
-        return []
+        return (None, "no_data")
 
     async def fake_competitive(brand, competitors, api_key):
-        return None
+        return (None, "parse_error")
 
     with patch(
         "services.bd_brand_signals._resolve_gemini_api_key",
@@ -243,16 +248,16 @@ async def test_competitor_dropped_when_both_platforms_return_none():
     own_presence."""
 
     async def own_presence_brand_only(brand, platform, handle, api_key):
-        # Merchant returns data; competitor returns None entirely.
+        # Merchant returns data; competitor probe fully fails.
         if brand == "Beauty of Joseon":
-            return _presence("beautyofjoseon", 662000)
-        return None
+            return (_presence("beautyofjoseon", 662000), None)
+        return (None, "transport_error")
 
     async def fake_kol(brand, platform, api_key):
-        return []
+        return (None, "no_data")
 
     async def fake_competitive(brand, competitors, api_key):
-        return None
+        return (None, "parse_error")
 
     with patch(
         "services.bd_brand_signals._resolve_gemini_api_key",
@@ -319,14 +324,14 @@ async def test_available_true_when_only_competitor_presence_succeeds():
 
     async def own_presence_competitor_only(brand, platform, handle, api_key):
         if brand == "Beauty of Joseon":
-            return None  # merchant's own probes all fail
-        return _presence("drunkelephant", 510000)
+            return (None, "transport_error")  # merchant's own probes all fail
+        return (_presence("drunkelephant", 510000), None)
 
     async def fake_kol(brand, platform, api_key):
-        return None  # KOL also fails
+        return (None, "transport_error")  # KOL also fails
 
     async def fake_competitive(brand, competitors, api_key):
-        return None
+        return (None, "transport_error")
 
     with patch(
         "services.bd_brand_signals._resolve_gemini_api_key",
