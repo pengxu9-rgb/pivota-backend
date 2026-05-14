@@ -1543,18 +1543,35 @@ async def _infer_competitive_social(brand: str, competitors: List[str], api_key:
     return out
 
 
+# PR-10: per-competitor benchmark — number of named competitors we
+# run a full own-presence probe against. The brand's own follower
+# numbers are meaningless without a peer benchmark ("662k TikTok" —
+# is that good?). The single-call `_infer_competitive_social` asks
+# Gemini to estimate followers for ~5 brands at once and came back
+# null in the PR-8 prod run. Running `_infer_own_presence` per
+# competitor gives apples-to-apples comparison (identical method +
+# PR-9 honesty gate per-competitor) at a bounded cost. Capped at 2
+# so the added grounded-call count stays 4 (2 competitors × 2
+# platforms) on top of the existing 4-5.
+_COMPETITOR_BENCHMARK_CAP = 2
+
+
 async def infer_social_intelligence(
     brand: str,
     domain: str,
     detected_handles: Optional[List[Dict[str, str]]] = None,
     competitor_brands: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """4-5 Gemini grounded queries in parallel:
+    """Gemini grounded queries in parallel:
     - own TikTok presence
     - own Instagram presence
     - TikTok KOL endorsements (last 12 months)
     - Instagram KOL endorsements (last 12 months)
     - Competitive social comparison (only when competitor_brands non-empty)
+    - PR-10: per-competitor own-presence probes for the top
+      `_COMPETITOR_BENCHMARK_CAP` named competitors — same
+      `_infer_own_presence` method used for the merchant, so the
+      brand's numbers have an apples-to-apples benchmark.
 
     Returns:
       {
@@ -1566,25 +1583,34 @@ async def infer_social_intelligence(
           "tiktok": [...] | null,
           "instagram": [...] | null,
         },
-        "competitive_comparison": [...] | null,
+        "competitive_comparison": [...] | null,   # secondary gap_summary narrative
+        "competitor_presence": {                   # PR-10 primary benchmark
+          "<competitor name>": {"tiktok": {...} | null, "instagram": {...} | null},
+          ...
+        } | null,
         "available": bool,  # at least one signal succeeded
       }
 
     Honesty: returns None / empty for any sub-call that failed parse;
     {available: false} when no GEMINI_API_KEY or when brand+domain
     inputs are empty. UI renders "data not available — manual research
-    recommended" instead of fabricating.
+    recommended" instead of fabricating. PR-9's grounding gate applies
+    per sub-call, INCLUDING each per-competitor probe.
 
-    LLM-multiplier safety: 4-5 single-shot grounded calls per audit.
-    asyncio.gather parallelism keeps wall-time bounded at ~20s. Per-
-    merchant semaphore (cap=5) in agent_center_llm_client bounds
-    concurrent load across this + the audit probe pipeline.
+    LLM-multiplier safety: 4-5 base single-shot grounded calls + up to
+    4 per-competitor probes (2 competitors × 2 platforms) = max 9.
+    asyncio.gather parallelism keeps wall-time bounded at ~20-25s.
+    Per-merchant semaphore (cap=5) in agent_center_llm_client bounds
+    concurrent load. The whole function is opt-in behind
+    `include_social_intelligence` so the bump only lands when the
+    operator asked for it.
     """
     api_key = _resolve_gemini_api_key()
     empty = {
         "own_presence": {"tiktok": None, "instagram": None},
         "kol_endorsements": {"tiktok": None, "instagram": None},
         "competitive_comparison": None,
+        "competitor_presence": None,
         "available": False,
     }
     if not api_key:
@@ -1597,19 +1623,47 @@ async def infer_social_intelligence(
     ig_handle = _detected_handle(detected_handles or [], "instagram")
     competitors = [c for c in (competitor_brands or []) if isinstance(c, str) and c.strip()]
 
-    coros = [
+    # Base coros — own presence + KOL endorsements. Fixed indices 0-3.
+    coros: List[Any] = [
         _infer_own_presence(brand, "tiktok", tt_handle, api_key),
         _infer_own_presence(brand, "instagram", ig_handle, api_key),
         _infer_kol_endorsements(brand, "tiktok", api_key),
         _infer_kol_endorsements(brand, "instagram", api_key),
     ]
+
+    # Competitive comparison narrative — index tracked dynamically.
+    competitive_idx: Optional[int] = None
     if competitors:
+        competitive_idx = len(coros)
         coros.append(_infer_competitive_social(brand, competitors, api_key))
+
+    # PR-10: per-competitor benchmark probes. Top N competitors get
+    # the same own-presence probe the merchant gets. Track each
+    # competitor's (tiktok_idx, instagram_idx) so we can re-assemble
+    # after the gather.
+    benchmark_competitors = competitors[:_COMPETITOR_BENCHMARK_CAP]
+    competitor_idx_map: Dict[str, Tuple[int, int]] = {}
+    for comp in benchmark_competitors:
+        tt_idx = len(coros)
+        coros.append(_infer_own_presence(comp, "tiktok", None, api_key))
+        ig_idx = len(coros)
+        coros.append(_infer_own_presence(comp, "instagram", None, api_key))
+        competitor_idx_map[comp] = (tt_idx, ig_idx)
 
     results = await asyncio.gather(*coros, return_exceptions=True)
 
     def _safe(r: Any) -> Any:
         return r if not isinstance(r, Exception) else None
+
+    # Re-assemble per-competitor presence. A competitor surfaces only
+    # if at least one of its platform probes returned data — same
+    # "surface partial, suppress fully-empty" rule as own_presence.
+    competitor_presence: Dict[str, Any] = {}
+    for comp, (tt_idx, ig_idx) in competitor_idx_map.items():
+        comp_tt = _safe(results[tt_idx])
+        comp_ig = _safe(results[ig_idx])
+        if comp_tt or comp_ig:
+            competitor_presence[comp] = {"tiktok": comp_tt, "instagram": comp_ig}
 
     out = {
         "own_presence": {
@@ -1620,13 +1674,17 @@ async def infer_social_intelligence(
             "tiktok": _safe(results[2]),
             "instagram": _safe(results[3]),
         },
-        "competitive_comparison": _safe(results[4]) if competitors else None,
+        "competitive_comparison": (
+            _safe(results[competitive_idx]) if competitive_idx is not None else None
+        ),
+        "competitor_presence": competitor_presence or None,
     }
     out["available"] = any(
-        v is not None for v in (
+        v for v in (
             out["own_presence"]["tiktok"], out["own_presence"]["instagram"],
             out["kol_endorsements"]["tiktok"], out["kol_endorsements"]["instagram"],
             out["competitive_comparison"],
+            out["competitor_presence"],
         )
     )
     return out
