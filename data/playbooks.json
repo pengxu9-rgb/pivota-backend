@@ -160,12 +160,12 @@
     },
     "creator_partnership_social": {
       "applies_when": {"type": "video", "subtype": "social"},
-      "title_template": "Influencer partnerships: {host}",
-      "body_template": "{coverage_note} {outreach_hint} Social-first creators drive social pickup but lower AI-channel grounding weight than YouTube long-form.",
-      "concrete_next_step": "Lower priority for AI-channel attribution. Spend first on YouTube long-form creators (higher grounded-retrieval pickup). Use {host} for category awareness + paid ads, not for editorial-style endorsement.",
-      "severity": "low",
+      "title_template": "Creator partnerships: {host}",
+      "body_template": "{coverage_note} {outreach_hint} Short-form creators on {host} drive top-of-funnel discovery + product reviews that increasingly surface in grounded LLM answers (especially TikTok product haul / dupe / review formats). Complement long-form YouTube coverage with native-format social.",
+      "concrete_next_step": "This month: identify 3-5 creators on {host} (10k-500k followers) who already post category content covering competitor brands. Send a partnership pitch — typical rate is $200-2000/post at this tier. Track via custom discount codes + UTM-tagged links. Pair with a YouTube long-form review for compounding AI-channel pickup.",
+      "severity": "medium",
       "lever": "creator_partnership",
-      "expected_timeline_weeks": [2, 8]
+      "expected_timeline_weeks": [3, 8]
     },
     "generic_editorial": {
       "applies_when": {"type": "editorial"},

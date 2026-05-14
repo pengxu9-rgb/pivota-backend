@@ -1308,6 +1308,7 @@ async def run_brand_report(
     include_category_visibility: bool = True,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     integration_state: Optional[Dict[str, Any]] = None,
+    include_social_intelligence: bool = False,
 ) -> Dict[str, Any]:
     """Run BD probes against up to 5 products of one merchant and
     aggregate into a brand-level report.
@@ -1413,6 +1414,51 @@ async def run_brand_report(
         merchant_domain=merchant_domain,
     )
 
+    # PR-8 (Option A step 3): wire bd_brand_signals.infer_social_intelligence
+    # into the main audit so brand TikTok/Instagram presence + KOL
+    # endorsements + competitive social comparison surface in every
+    # merchant report — not just BD cold-start prospects.
+    #
+    # OPT-IN gate: the function adds 4-5 grounded Gemini calls per
+    # audit (parallel via asyncio.gather, ~20s wall). Per the
+    # LLM-multiplier-safety standing rule (PR #278 incident), default
+    # is OFF until staging load-test confirms the per-tenant semaphore
+    # bounds the additional load. Callers opt-in via
+    # `include_social_intelligence=True`. The function ALSO short-
+    # circuits to {available:false} when GEMINI_API_KEY is absent or
+    # merchant_domain is empty, so a stray True flag in a misconfigured
+    # env doesn't fire calls.
+    #
+    # Competitor brand input: the audit's `competitive_pressure.peers_named`
+    # list across all products (deduped) is the natural feed for the
+    # competitive comparison sub-call.
+    social_intelligence: Optional[Dict[str, Any]] = None
+    if include_social_intelligence and merchant_domain:
+        peer_brand_names: List[str] = []
+        seen_brand_names: set = set()
+        for p in per_product:
+            for peer in (p.get("competitive_pressure") or {}).get("peers_named") or []:
+                name = (peer.get("name") or "").strip()
+                if name and name.lower() not in seen_brand_names:
+                    seen_brand_names.add(name.lower())
+                    peer_brand_names.append(name)
+        peer_brand_names = peer_brand_names[:10]
+        try:
+            from services.bd_brand_signals import infer_social_intelligence
+            social_intelligence = await infer_social_intelligence(
+                brand=merchant_name,
+                domain=merchant_domain,
+                detected_handles=None,
+                competitor_brands=peer_brand_names or None,
+            )
+        except Exception:  # noqa: BLE001
+            # Same pattern as bd_cold_start_service — never let social
+            # inference failures block the audit return. Surface as
+            # null; the merchant report renders the section only when
+            # available=True, so a null here cleanly omits the
+            # section without crashing the audit.
+            social_intelligence = None
+
     return {
         "merchant_name": merchant_name,
         "merchant_domain": (merchant_domain or "").strip() or None,
@@ -1421,6 +1467,7 @@ async def run_brand_report(
         "per_product": per_product,
         "aggregate": aggregate,
         "cross_product_competitors": cross_competitors,
+        "social_intelligence": social_intelligence,
         "failed": failed,
     }
 
@@ -5547,6 +5594,63 @@ def render_brand_markdown(
                 rows.append(
                     f"| `{entry.get('host', '?')}` "
                     f"| {entry.get('category_cited', entry.get('times_cited', 0))} |"
+                )
+            sections.append("\n".join(rows) + "\n")
+
+    # PR-8 social intelligence section. Render only when available
+    # (the bd_brand_signals function returns {available: false} when
+    # GEMINI_API_KEY is unset or the caller passed include_social_
+    # intelligence=False; in either case we skip the section so the
+    # report doesn't carry empty "data not available" stubs).
+    social = brand_report.get("social_intelligence") or {}
+    if social.get("available"):
+        sections.append("\n## Social channel intelligence\n")
+        own = social.get("own_presence") or {}
+        tt = own.get("tiktok") or {}
+        ig = own.get("instagram") or {}
+        if tt or ig:
+            sections.append("**Your brand's own social presence:**\n")
+            if tt:
+                sections.append(
+                    f"- TikTok: `@{tt.get('handle', '?')}` — "
+                    f"{tt.get('follower_estimate') or tt.get('follower_band') or '?'} followers; "
+                    f"focus: {tt.get('content_focus') or 'mixed'}.\n"
+                )
+            if ig:
+                sections.append(
+                    f"- Instagram: `@{ig.get('handle', '?')}` — "
+                    f"{ig.get('follower_estimate') or ig.get('follower_band') or '?'} followers; "
+                    f"focus: {ig.get('content_focus') or 'mixed'}.\n"
+                )
+        kol = social.get("kol_endorsements") or {}
+        tt_kols = kol.get("tiktok") or []
+        ig_kols = kol.get("instagram") or []
+        if tt_kols or ig_kols:
+            sections.append(
+                "\n**Creators who posted about your brand (last 12 months):**\n"
+            )
+            for k in (tt_kols or [])[:5]:
+                sections.append(
+                    f"- TikTok: {k.get('creator_name', '?')} "
+                    f"({k.get('follower_band', '?')}) — "
+                    f"{k.get('post_summary', 'post summary not available')}\n"
+                )
+            for k in (ig_kols or [])[:5]:
+                sections.append(
+                    f"- Instagram: {k.get('creator_name', '?')} "
+                    f"({k.get('follower_band', '?')}) — "
+                    f"{k.get('post_summary', 'post summary not available')}\n"
+                )
+        competitive = social.get("competitive_comparison") or []
+        if competitive:
+            sections.append("\n**Competitive social comparison:**\n")
+            rows = ["| Brand | TikTok | Instagram | Notes |", "|---|---|---|---|"]
+            for c in competitive[:8]:
+                rows.append(
+                    f"| {c.get('brand', '?')} "
+                    f"| {c.get('tiktok_followers') or '—'} "
+                    f"| {c.get('instagram_followers') or '—'} "
+                    f"| {c.get('notes') or ''} |"
                 )
             sections.append("\n".join(rows) + "\n")
 
