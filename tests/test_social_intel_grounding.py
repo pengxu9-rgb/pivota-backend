@@ -15,9 +15,11 @@ Measured 2026-05-14: it recovered 0 of 13 ungrounded attempts. Prompt
 escalation does not move a model that decided not to search. Two changes
 replaced it (see ~/tmp/social-grounding-check/verdict.md):
 
-1. **Model tier** — social probes use `_GEMINI_SOCIAL_MODEL` (Pro),
-   which grounds the social/KOL queries the flash tier won't. Non-social
-   bd_ probes (retail / founder / press) stay on flash.
+1. **Model lever** — social probes use `_GEMINI_SOCIAL_MODEL`, a model
+   chosen to ground social/KOL queries better than the stable 2.5-flash.
+   (gemini-2.5-pro was tried first, PR #531, and reverted — it didn't
+   move the rate; the current pick is a newer flash generation.)
+   Non-social bd_ probes (retail / founder / press) stay on 2.5-flash.
 2. **Transport retry** — `_gemini_grounded_call` retries a
    transport/timeout failure once. The bd_ social path uses its own
    httpx client and never got #528's transport retry; this is the same
@@ -80,14 +82,14 @@ def test_prompts_carry_the_search_directive():
 
 
 # =========================================================================
-# Part 2a — model tier: social probes run on the Pro model
+# Part 2a — model lever: social probes run on `_GEMINI_SOCIAL_MODEL`
 # =========================================================================
 
 
 @pytest.mark.asyncio
-async def test_own_presence_uses_the_social_pro_model():
-    """`_infer_own_presence` calls `_gemini_grounded_call` with the Pro
-    tier — flash does not ground social queries."""
+async def test_own_presence_uses_the_social_model():
+    """`_infer_own_presence` calls `_gemini_grounded_call` with the
+    social model — the stable flash tier grounds social queries poorly."""
     mock = AsyncMock(return_value=_payload(
         '{"follower_estimate": 5, "follower_band": "<10k"}', grounded=True,
     ))
@@ -100,7 +102,7 @@ async def test_own_presence_uses_the_social_pro_model():
 
 
 @pytest.mark.asyncio
-async def test_kol_endorsements_uses_the_social_pro_model():
+async def test_kol_endorsements_uses_the_social_model():
     mock = AsyncMock(return_value=_payload(
         '[{"creator_handle": "@x", "follower_band": "10k-100k"}]',
         grounded=True,
@@ -114,7 +116,7 @@ async def test_kol_endorsements_uses_the_social_pro_model():
 
 
 @pytest.mark.asyncio
-async def test_competitive_social_uses_the_social_pro_model():
+async def test_competitive_social_uses_the_social_model():
     mock = AsyncMock(return_value=_payload(
         '[{"brand": "Drunk Elephant", "gap_summary": "ahead"}]',
         grounded=True,
