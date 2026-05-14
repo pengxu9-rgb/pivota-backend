@@ -48,13 +48,16 @@ _HOMEPAGE_MAX_BYTES = 2_000_000  # 2 MB — only the <head> + nav links matter
 # Gemini grounded API — same shape used by gemini_url_validator.py +
 # bd_brand_category_inferrer.py. No new SDK dep.
 _GEMINI_MODEL = "gemini-2.5-flash"
-# Social probes (own presence / KOL / competitive) ran near-zero
-# grounded on flash — ~/tmp/social-grounding-check/verdict.md (2026-05-14:
-# 5/49 bd_ calls grounded, the ungrounded-retry recovered 0/13). The fix
-# is the model lever, not more prompt/retry tuning: social probes use the
-# Pro tier, which grounds the social/KOL queries flash won't. Non-social
-# bd_ probes (retail / founder / press) stay on flash.
-_GEMINI_SOCIAL_MODEL = "gemini-2.5-pro"
+# Social probes (own presence / KOL / competitive) ground poorly on
+# gemini-2.5-flash — it answers social/KOL queries from memory instead of
+# searching (~/tmp/social-grounding-check/verdict.md, 2026-05-14). The
+# gemini-2.5-pro tier was tried (PR #531) and verified ineffective: it did
+# NOT move the grounded rate (~14% → ~15%, flat) at ~3x cost + latency.
+# The next lever is a newer flash generation — gemini-3-flash-preview —
+# which grounds social queries better than 2.5-flash without Pro's tax.
+# Scoped to the social probes only (a preview model): non-social bd_
+# probes (retail / founder / press) stay on the stable 2.5-flash.
+_GEMINI_SOCIAL_MODEL = "gemini-3-flash-preview"
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # A grounded call that actually runs a web search legitimately takes
 # longer than a from-memory answer — and the Pro tier longer still. The
@@ -895,9 +898,10 @@ async def _gemini_grounded_call(
 ) -> Optional[Dict[str, Any]]:
     """One grounded call. Returns parsed payload or None on any failure.
 
-    `model` selects the Gemini tier — social probes pass
-    `_GEMINI_SOCIAL_MODEL` (Pro), which grounds the social/KOL queries
-    the flash tier won't; everything else defaults to flash.
+    `model` selects the Gemini model — social probes pass
+    `_GEMINI_SOCIAL_MODEL` (a newer flash generation that grounds
+    social/KOL queries better than 2.5-flash); everything else defaults
+    to the stable `_GEMINI_MODEL` flash.
 
     A transport/timeout failure is retried once (bounded, post-failure
     only — never a happy-path call multiplier) before giving up: a
@@ -1039,8 +1043,9 @@ async def _record_bd_telemetry(
 # NOTE — the ungrounded-retry (`_grounded_call_with_retry`, PR #530) was
 # removed 2026-05-14. Measured: the retry recovered 0 of 13 ungrounded
 # attempts — prompt escalation does not move a model that decided not to
-# search. The lever that works is the model tier (see _GEMINI_SOCIAL_MODEL).
-# The ungrounded telemetry it added is kept (it's in `_gemini_grounded_call`).
+# search. The model lever is the next thing being tried (see
+# `_GEMINI_SOCIAL_MODEL`); the ungrounded telemetry this PR added is kept
+# (it's in `_gemini_grounded_call`) as the feedback loop for measuring it.
 # Full write-up: ~/tmp/social-grounding-check/verdict.md.
 
 
@@ -1397,10 +1402,10 @@ def _detected_handle(detected: List[Dict[str, str]], platform: str) -> Optional[
 # nulls every figure — the merchant sees an empty section.
 #
 # This directive compels a search; it keeps the honesty contract intact
-# (no search result → return nulls, never a guessed number). An
-# escalated retry variant existed (PR #530) but was removed — prompt
-# escalation did not move an ungrounded model (0/13 recovery); the model
-# tier does (see `_GEMINI_SOCIAL_MODEL`).
+# (no search result → return nulls, never a guessed number). An escalated
+# retry variant existed (PR #530) but was removed — prompt escalation did
+# not move an ungrounded model (0/13 recovery). The model lever is the
+# remaining approach (see `_GEMINI_SOCIAL_MODEL`).
 _GROUNDING_DIRECTIVE = (
     "Before answering, you MUST use web search to look this up. Base "
     "every figure ONLY on what the search results actually show. Do "
