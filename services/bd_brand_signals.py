@@ -917,9 +917,22 @@ async def _gemini_grounded_call(
             error_message="non_json_response",
         )
         return None
+    # Grounding-stability telemetry. A 200 response can still be
+    # un-grounded — Gemini answered from internal knowledge without
+    # invoking the google_search tool, so the response carries zero
+    # grounding chunks and PR-9's honesty gate will null every figure.
+    # Record that distinctly so the ungrounded RATE is measurable:
+    #   status stays "succeeded" (the HTTP call + cost accounting +
+    #   provider-fallback logic are unaffected — `status` can't take a
+    #   new value anyway, record_probe_run coerces unknowns to failed),
+    #   and error_message="ungrounded" annotates the degraded outcome.
+    # Query:  count(*) FILTER (WHERE error_message='ungrounded')
+    #         / count(*)  ... WHERE scan_mode LIKE 'bd_%'
+    _grounded = _grounding_chunk_count(result) > 0
     await _record_bd_telemetry(
         scan_mode=scan_mode, status="succeeded",
         started_at_perf=_telemetry_started_at,
+        error_message=None if _grounded else "ungrounded",
     )
     return result
 
@@ -962,6 +975,55 @@ async def _record_bd_telemetry(
             "_record_bd_telemetry suppressed error: %s",
             str(exc)[:200],
         )
+
+
+async def _grounded_call_with_retry(
+    *,
+    base_prompt: str,
+    escalated_prompt: str,
+    api_key: str,
+    scan_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Grounding-stability wrapper around `_gemini_grounded_call`.
+
+    Attempt 1 uses `base_prompt`. If the response comes back
+    un-grounded (zero grounding chunks — Gemini answered from internal
+    knowledge instead of searching), attempt 2 retries with
+    `escalated_prompt`, which more forcefully demands a live web
+    search. Returns:
+      - the grounded payload if EITHER attempt grounds
+      - otherwise the last payload we got (so the caller's PR-9
+        honesty gate still nulls it consistently)
+      - None if attempt 1 had a transport/HTTP failure (no point
+        retrying a dead endpoint; `_gemini_grounded_call` already
+        logged + recorded it)
+
+    The retry only fires on the ungrounded path — never on a clean
+    grounded response and never on a happy-path call — so this is not
+    the per-query call multiplier the LLM-cost-safety rule guards
+    against. The retry's telemetry row carries a `_retry` scan_mode
+    suffix so the retry rate (and whether it helps) is measurable.
+    """
+    payload = await _gemini_grounded_call(
+        base_prompt, api_key=api_key, scan_mode=scan_mode,
+    )
+    if payload is None:
+        return None  # transport/HTTP failure — don't retry a dead call
+    if _grounding_chunk_count(payload) > 0:
+        return payload  # grounded on attempt 1 — done
+
+    # Ungrounded. Retry once with the escalated prompt. The `_retry`
+    # scan_mode suffix keeps the retry distinguishable in telemetry.
+    retry_payload = await _gemini_grounded_call(
+        escalated_prompt, api_key=api_key, scan_mode=f"{scan_mode}_retry",
+    )
+    if retry_payload is not None and _grounding_chunk_count(retry_payload) > 0:
+        return retry_payload  # retry grounded — use it
+    # Still ungrounded (or the retry transport-failed). Hand back the
+    # best payload we have; the sub-call's honesty gate takes it from
+    # here. Prefer the retry payload when present so the caller sees
+    # the most recent attempt.
+    return retry_payload if retry_payload is not None else payload
 
 
 def _build_retail_prompt(brand: str, domain: str) -> str:
@@ -1309,7 +1371,42 @@ def _detected_handle(detected: List[Dict[str, str]], platform: str) -> Optional[
     return None
 
 
-def _build_own_presence_prompt(brand: str, platform: str, handle: Optional[str]) -> str:
+# Search-grounding directives. The social sub-calls all run through
+# `_gemini_grounded_call` with the `google_search` tool enabled — but
+# the tool is model-discretionary: Gemini decides whether to actually
+# search. When a prompt says "estimate X's reach", Gemini often
+# answers from internal knowledge WITHOUT searching, the response
+# carries zero grounding chunks, and PR-9's honesty gate (correctly)
+# nulls every figure — the merchant sees an empty section.
+#
+# These directives compel a search. `_GROUNDING_DIRECTIVE` is the
+# default; `_GROUNDING_DIRECTIVE_ESCALATED` is the harder retry
+# variant used by `_grounded_call_with_retry` when attempt 1 came
+# back un-grounded. Both keep the honesty contract intact: no search
+# result → return nulls, never a guessed number.
+_GROUNDING_DIRECTIVE = (
+    "Before answering, you MUST use web search to look this up. Base "
+    "every figure ONLY on what the search results actually show. Do "
+    "not answer from prior knowledge or memory. If a search returns "
+    "nothing usable for a field, set that field to null — never guess."
+)
+_GROUNDING_DIRECTIVE_ESCALATED = (
+    "CRITICAL: a previous attempt answered without searching the web "
+    "and was rejected. You MUST perform a live web search now before "
+    "writing anything. An answer not backed by a search result you "
+    "actually retrieved is unacceptable — if you cannot search, or "
+    "the search yields nothing, return every field as null. Do NOT "
+    "fall back to prior knowledge under any circumstances."
+)
+
+
+def _grounding_directive(escalated: bool) -> str:
+    return _GROUNDING_DIRECTIVE_ESCALATED if escalated else _GROUNDING_DIRECTIVE
+
+
+def _build_own_presence_prompt(
+    brand: str, platform: str, handle: Optional[str], *, escalated: bool = False,
+) -> str:
     handle_clause = (
         f"Their {platform} handle is @{handle}." if handle
         else f"Search for {brand}'s official {platform} account."
@@ -1319,7 +1416,9 @@ def _build_own_presence_prompt(brand: str, platform: str, handle: Optional[str])
         '"view_per_post_estimate"' if platform == "tiktok"
         else '"engagement_rate_estimate"'
     )
-    return f"""You are a social-media analyst. Estimate {brand}'s own {label} reach.
+    return f"""You are a social-media analyst. Report {brand}'s own {label} reach.
+
+{_grounding_directive(escalated)}
 
 {handle_clause}
 
@@ -1328,7 +1427,7 @@ OUTPUT FORMAT — strict:
 - Do NOT wrap in markdown fences (```)
 - Do NOT add prose before or after
 - Do NOT wrap in an outer object like {{"data": {{...}}}}
-- Use null for any field you can't verify (don't guess)
+- Use null for any field you can't verify from search results (don't guess)
 
 Schema:
 {{
@@ -1343,9 +1442,11 @@ Schema:
 Allowed values for follower_band: "<10k", "10k-100k", "100k-1M", "1M-10M", ">10M", or null."""
 
 
-def _build_kol_prompt(brand: str, platform: str) -> str:
+def _build_kol_prompt(brand: str, platform: str, *, escalated: bool = False) -> str:
     label = "TikTok" if platform == "tiktok" else "Instagram"
     return f"""You are a creator-marketing analyst. List up to 8 {label} creators (10k-1M follower band) who have posted about {brand} in the last 12 months.
+
+{_grounding_directive(escalated)}
 
 For each creator give:
 - creator_handle: the @ handle
@@ -1360,15 +1461,19 @@ OUTPUT FORMAT — strict:
 - Do NOT wrap in markdown fences (```)
 - Do NOT wrap in an outer object like {{"creators": [...]}}
 - Do NOT add prose before or after
-- If no endorsements found, reply with the literal: []
+- If a search finds no endorsements, reply with the literal: []
 
 Schema per element:
 {{"creator_handle": "...", "follower_band": "10k-100k", "post_url": null, "view_count_estimate": 12000, "post_date": "2025-01-15", "content_summary": "..."}}"""
 
 
-def _build_competitive_prompt(brand: str, competitors: List[str]) -> str:
+def _build_competitive_prompt(
+    brand: str, competitors: List[str], *, escalated: bool = False,
+) -> str:
     competitor_list = ", ".join(competitors[:6])
     return f"""You are a competitive social-media analyst. Compare {brand}'s TikTok + Instagram presence to these competitors: {competitor_list}.
+
+{_grounding_directive(escalated)}
 
 For each competitor brand give:
 - brand: the competitor brand name
@@ -1384,7 +1489,7 @@ Reply with ONLY a JSON array. No prose:
   ...
 ]
 
-If no comparable data, reply with: []"""
+If a search finds no comparable data, reply with: []"""
 
 
 _SUFFIX_MULT = {"k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000, "b": 1_000_000_000, "B": 1_000_000_000}
@@ -1439,8 +1544,11 @@ async def _infer_own_presence(
     present result still SURFACES (dict non-None, reason None) — it's
     marked grounding="ungrounded" internally; the PR-9 gate only nulls
     the metric fields, it doesn't suppress the whole result."""
-    payload = await _gemini_grounded_call(
-        _build_own_presence_prompt(brand, platform, handle),
+    payload = await _grounded_call_with_retry(
+        base_prompt=_build_own_presence_prompt(brand, platform, handle),
+        escalated_prompt=_build_own_presence_prompt(
+            brand, platform, handle, escalated=True,
+        ),
         api_key=api_key, scan_mode="bd_own_presence",
     )
     if not payload:
@@ -1520,8 +1628,9 @@ async def _infer_kol_endorsements(
     None. An ungrounded response → (None, "ungrounded") — a creator
     list is the highest-fabrication-risk output, suppressed wholesale
     by the PR-9 gate. Grounded-but-empty → (None, "no_data")."""
-    payload = await _gemini_grounded_call(
-        _build_kol_prompt(brand, platform),
+    payload = await _grounded_call_with_retry(
+        base_prompt=_build_kol_prompt(brand, platform),
+        escalated_prompt=_build_kol_prompt(brand, platform, escalated=True),
         api_key=api_key, scan_mode="bd_kol_endorsements",
     )
     if not payload:
@@ -1579,8 +1688,11 @@ async def _infer_competitive_social(
     Otherwise the standard failure tokens apply."""
     if not competitors:
         return (None, None)
-    payload = await _gemini_grounded_call(
-        _build_competitive_prompt(brand, competitors),
+    payload = await _grounded_call_with_retry(
+        base_prompt=_build_competitive_prompt(brand, competitors),
+        escalated_prompt=_build_competitive_prompt(
+            brand, competitors, escalated=True,
+        ),
         api_key=api_key, scan_mode="bd_competitive_social",
     )
     if not payload:

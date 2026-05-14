@@ -651,7 +651,8 @@ async def test_infer_social_intelligence_skips_competitive_when_no_competitors(m
 
     with patch("services.bd_brand_signals._infer_own_presence", new=AsyncMock(side_effect=fake_own)), \
          patch("services.bd_brand_signals._infer_kol_endorsements", new=AsyncMock(side_effect=fake_kol)), \
-         patch("services.bd_brand_signals._infer_competitive_social", new=AsyncMock(side_effect=fake_comp)):
+         patch("services.bd_brand_signals._infer_competitive_social", new=AsyncMock(side_effect=fake_comp)), \
+         patch("services.bd_brand_signals._fetch_homepage_html", new=AsyncMock(return_value=None)):
         result = await infer_social_intelligence("Grüns", "gruns.co", [], None)
     assert result["available"] is True
     assert own_call_count == 2  # tiktok + instagram
@@ -679,7 +680,8 @@ async def test_infer_social_intelligence_runs_competitive_when_competitors_provi
 
     with patch("services.bd_brand_signals._infer_own_presence", new=AsyncMock(side_effect=fake_own)), \
          patch("services.bd_brand_signals._infer_kol_endorsements", new=AsyncMock(side_effect=fake_kol)), \
-         patch("services.bd_brand_signals._infer_competitive_social", new=AsyncMock(side_effect=fake_comp)):
+         patch("services.bd_brand_signals._infer_competitive_social", new=AsyncMock(side_effect=fake_comp)), \
+         patch("services.bd_brand_signals._fetch_homepage_html", new=AsyncMock(return_value=None)):
         result = await infer_social_intelligence("Grüns", "gruns.co", [], ["Hiya"])
     assert result["available"] is True
     assert result["competitive_comparison"][0]["brand"] == "Hiya"
@@ -702,7 +704,8 @@ async def test_infer_social_intelligence_partial_failure_surfaces_what_succeeded
         return None
 
     with patch("services.bd_brand_signals._infer_own_presence", new=AsyncMock(side_effect=fake_own)), \
-         patch("services.bd_brand_signals._infer_kol_endorsements", new=AsyncMock(side_effect=fake_kol)):
+         patch("services.bd_brand_signals._infer_kol_endorsements", new=AsyncMock(side_effect=fake_kol)), \
+         patch("services.bd_brand_signals._fetch_homepage_html", new=AsyncMock(return_value=None)):
         result = await infer_social_intelligence("Grüns", "gruns.co", [], None)
     assert result["available"] is True
     assert result["own_presence"]["tiktok"] is not None
