@@ -1,30 +1,31 @@
-"""Social-intel grounding stability — model tier, transport retry, and
-ungrounded telemetry.
+"""Social-intel grounding stability — transport retry and ungrounded
+telemetry.
 
 ## The problem
 
 The social sub-calls (own presence / KOL / competitive) run through
 `_gemini_grounded_call` with the `google_search` tool enabled — but the
-tool is model-discretionary. On `gemini-2.5-flash` the model routinely
-answered social/KOL queries from internal knowledge WITHOUT searching:
-the response carried zero grounding chunks, PR-9's honesty gate
-(correctly) nulled every figure, and the merchant saw an empty section.
+tool is model-discretionary. The model routinely answered social/KOL
+queries from internal knowledge WITHOUT searching: the response carried
+zero grounding chunks, PR-9's honesty gate (correctly) nulled every
+figure, and the merchant saw an empty section.
 
-PR #530 tried to fix this with prompt escalation + an ungrounded retry.
-Measured 2026-05-14: it recovered 0 of 13 ungrounded attempts. Prompt
-escalation does not move a model that decided not to search. Two changes
-replaced it (see ~/tmp/social-grounding-check/verdict.md):
+Two grounding levers were tried and reverted (see
+~/tmp/social-grounding-check/verdict.md): PR #530's prompt escalation +
+ungrounded retry (0/13 recovery) and PR #531's flash → gemini-2.5-pro
+model tier (~14% → ~15% grounded, flat). Neither moved the rate — the
+ceiling is `google_search` tool-discretion, not a prompt or model gap.
 
-1. **Model tier** — social probes use `_GEMINI_SOCIAL_MODEL` (Pro),
-   which grounds the social/KOL queries the flash tier won't. Non-social
-   bd_ probes (retail / founder / press) stay on flash.
-2. **Transport retry** — `_gemini_grounded_call` retries a
-   transport/timeout failure once. The bd_ social path uses its own
-   httpx client and never got #528's transport retry; this is the same
-   fix, here. `transport: ReadTimeout` was 43% of bd_ calls on 2026-05-14.
+What stays — and what this file covers:
 
-The ungrounded telemetry (`error_message="ungrounded"` on a
-200-but-zero-grounding-chunks response) is kept — it's the feedback loop.
+1. **Transport retry** — `_gemini_grounded_call` retries a
+   transport/timeout failure once, with a 75s read budget. The bd_
+   social path uses its own httpx client and never got #528's transport
+   retry; this is the same fix, here. `transport: ReadTimeout` was 50%
+   of bd_ calls before this; ~4% after (verified in prod, 2026-05-14).
+2. **Ungrounded telemetry** — `error_message="ungrounded"` on a
+   200-but-zero-grounding-chunks response. The feedback loop for when a
+   grounding lever that actually works is found.
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ import pytest
 
 from services.bd_brand_signals import (
     _GEMINI_MODEL,
-    _GEMINI_SOCIAL_MODEL,
     _GROUNDING_DIRECTIVE,
     _build_competitive_prompt,
     _build_kol_prompt,
@@ -80,14 +80,16 @@ def test_prompts_carry_the_search_directive():
 
 
 # =========================================================================
-# Part 2a — model tier: social probes run on the Pro model
+# Part 2a — social probes: one call each, correct scan_mode, no `model`
+# override (the Pro model tier, PR #531, was reverted — flash for all)
 # =========================================================================
 
 
 @pytest.mark.asyncio
-async def test_own_presence_uses_the_social_pro_model():
-    """`_infer_own_presence` calls `_gemini_grounded_call` with the Pro
-    tier — flash does not ground social queries."""
+async def test_own_presence_calls_once_with_its_scan_mode():
+    """`_infer_own_presence` makes exactly one `_gemini_grounded_call`
+    tagged `bd_own_presence`, and does not pass a `model` override —
+    every bd_ probe runs on the default tier."""
     mock = AsyncMock(return_value=_payload(
         '{"follower_estimate": 5, "follower_band": "<10k"}', grounded=True,
     ))
@@ -95,12 +97,12 @@ async def test_own_presence_uses_the_social_pro_model():
         await _infer_own_presence("Beauty of Joseon", "tiktok", "boj", "k")
     assert mock.await_count == 1
     _, kwargs = mock.await_args
-    assert kwargs["model"] == _GEMINI_SOCIAL_MODEL
     assert kwargs["scan_mode"] == "bd_own_presence"
+    assert "model" not in kwargs
 
 
 @pytest.mark.asyncio
-async def test_kol_endorsements_uses_the_social_pro_model():
+async def test_kol_endorsements_calls_once_with_its_scan_mode():
     mock = AsyncMock(return_value=_payload(
         '[{"creator_handle": "@x", "follower_band": "10k-100k"}]',
         grounded=True,
@@ -109,12 +111,12 @@ async def test_kol_endorsements_uses_the_social_pro_model():
         await _infer_kol_endorsements("Beauty of Joseon", "instagram", "k")
     assert mock.await_count == 1
     _, kwargs = mock.await_args
-    assert kwargs["model"] == _GEMINI_SOCIAL_MODEL
     assert kwargs["scan_mode"] == "bd_kol_endorsements"
+    assert "model" not in kwargs
 
 
 @pytest.mark.asyncio
-async def test_competitive_social_uses_the_social_pro_model():
+async def test_competitive_social_calls_once_with_its_scan_mode():
     mock = AsyncMock(return_value=_payload(
         '[{"brand": "Drunk Elephant", "gap_summary": "ahead"}]',
         grounded=True,
@@ -125,8 +127,8 @@ async def test_competitive_social_uses_the_social_pro_model():
         )
     assert mock.await_count == 1
     _, kwargs = mock.await_args
-    assert kwargs["model"] == _GEMINI_SOCIAL_MODEL
     assert kwargs["scan_mode"] == "bd_competitive_social"
+    assert "model" not in kwargs
 
 
 @pytest.mark.asyncio
@@ -260,9 +262,10 @@ async def test_non_retryable_request_error_not_retried():
 
 
 @pytest.mark.asyncio
-async def test_default_model_is_flash():
-    """Callers that don't pass `model` (retail / founder / press) stay on
-    flash — only the social probes opt into Pro."""
+async def test_calls_hit_the_flash_model_endpoint():
+    """Every bd_ probe runs on `_GEMINI_MODEL` (flash) — the request URL
+    targets that model. The Pro tier (PR #531) was reverted; there is no
+    longer a per-call model override."""
     captured_url: Dict[str, str] = {}
 
     class _UrlSpyClient(_RaisingClient):
@@ -277,10 +280,9 @@ async def test_default_model_is_flash():
     with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
          patch("services.bd_brand_signals._record_bd_telemetry", AsyncMock()):
         await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_retail_presence",
+            "prompt", api_key="k", scan_mode="bd_own_presence",
         )
     assert _GEMINI_MODEL in captured_url["url"]
-    assert _GEMINI_SOCIAL_MODEL not in captured_url["url"]
 
 
 # =========================================================================

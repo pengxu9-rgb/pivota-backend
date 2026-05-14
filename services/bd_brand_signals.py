@@ -48,13 +48,13 @@ _HOMEPAGE_MAX_BYTES = 2_000_000  # 2 MB — only the <head> + nav links matter
 # Gemini grounded API — same shape used by gemini_url_validator.py +
 # bd_brand_category_inferrer.py. No new SDK dep.
 _GEMINI_MODEL = "gemini-2.5-flash"
-# Social probes (own presence / KOL / competitive) ran near-zero
-# grounded on flash — ~/tmp/social-grounding-check/verdict.md (2026-05-14:
-# 5/49 bd_ calls grounded, the ungrounded-retry recovered 0/13). The fix
-# is the model lever, not more prompt/retry tuning: social probes use the
-# Pro tier, which grounds the social/KOL queries flash won't. Non-social
-# bd_ probes (retail / founder / press) stay on flash.
-_GEMINI_SOCIAL_MODEL = "gemini-2.5-pro"
+# The flash → gemini-2.5-pro model lever (PR #531) was reverted 2026-05-14:
+# verified in prod, Pro did NOT move the grounded rate (~14% → ~15%, flat)
+# — it still never grounds TikTok and grounds 0/6 KOL probes, at ~3× the
+# cost + latency. The grounding ceiling is a `google_search` tool-discretion
+# limit, not a model-tier gap. The transport retry + 75s timeout from #531
+# stay — that fix (ReadTimeout 50% → 4%) is what actually worked.
+# Full write-up: ~/tmp/social-grounding-check/verdict.md.
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # A grounded call that actually runs a web search legitimately takes
 # longer than a from-memory answer — and the Pro tier longer still. The
@@ -891,13 +891,8 @@ async def _gemini_grounded_call(
     *,
     api_key: str,
     scan_mode: str = "bd_grounded_lookup",
-    model: str = _GEMINI_MODEL,
 ) -> Optional[Dict[str, Any]]:
     """One grounded call. Returns parsed payload or None on any failure.
-
-    `model` selects the Gemini tier — social probes pass
-    `_GEMINI_SOCIAL_MODEL` (Pro), which grounds the social/KOL queries
-    the flash tier won't; everything else defaults to flash.
 
     A transport/timeout failure is retried once (bounded, post-failure
     only — never a happy-path call multiplier) before giving up: a
@@ -920,7 +915,7 @@ async def _gemini_grounded_call(
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
         "tools": [{"google_search": {}}],
     }
-    url = f"{_GEMINI_BASE_URL}/models/{model}:generateContent"
+    url = f"{_GEMINI_BASE_URL}/models/{_GEMINI_MODEL}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     r = None
     last_exc: Optional[BaseException] = None
@@ -1039,8 +1034,10 @@ async def _record_bd_telemetry(
 # NOTE — the ungrounded-retry (`_grounded_call_with_retry`, PR #530) was
 # removed 2026-05-14. Measured: the retry recovered 0 of 13 ungrounded
 # attempts — prompt escalation does not move a model that decided not to
-# search. The lever that works is the model tier (see _GEMINI_SOCIAL_MODEL).
-# The ungrounded telemetry it added is kept (it's in `_gemini_grounded_call`).
+# search. The flash → Pro model tier was also tried (PR #531) and reverted
+# — it did not move the grounded rate either. No known lever shifts
+# `google_search` tool-discretion for these social/KOL queries today; the
+# ungrounded telemetry below is the feedback loop for when one is found.
 # Full write-up: ~/tmp/social-grounding-check/verdict.md.
 
 
@@ -1397,10 +1394,10 @@ def _detected_handle(detected: List[Dict[str, str]], platform: str) -> Optional[
 # nulls every figure — the merchant sees an empty section.
 #
 # This directive compels a search; it keeps the honesty contract intact
-# (no search result → return nulls, never a guessed number). An
-# escalated retry variant existed (PR #530) but was removed — prompt
-# escalation did not move an ungrounded model (0/13 recovery); the model
-# tier does (see `_GEMINI_SOCIAL_MODEL`).
+# (no search result → return nulls, never a guessed number). An escalated
+# retry variant (PR #530) and a Pro model tier (PR #531) were both tried
+# and reverted — neither moved the grounded rate. The directive is the
+# only lever that stays; the rest is honest nulls + telemetry.
 _GROUNDING_DIRECTIVE = (
     "Before answering, you MUST use web search to look this up. Base "
     "every figure ONLY on what the search results actually show. Do "
@@ -1552,7 +1549,6 @@ async def _infer_own_presence(
     payload = await _gemini_grounded_call(
         _build_own_presence_prompt(brand, platform, handle),
         api_key=api_key, scan_mode="bd_own_presence",
-        model=_GEMINI_SOCIAL_MODEL,
     )
     if not payload:
         return (None, _FR_TRANSPORT)
@@ -1634,7 +1630,6 @@ async def _infer_kol_endorsements(
     payload = await _gemini_grounded_call(
         _build_kol_prompt(brand, platform),
         api_key=api_key, scan_mode="bd_kol_endorsements",
-        model=_GEMINI_SOCIAL_MODEL,
     )
     if not payload:
         return (None, _FR_TRANSPORT)
@@ -1694,7 +1689,6 @@ async def _infer_competitive_social(
     payload = await _gemini_grounded_call(
         _build_competitive_prompt(brand, competitors),
         api_key=api_key, scan_mode="bd_competitive_social",
-        model=_GEMINI_SOCIAL_MODEL,
     )
     if not payload:
         return (None, _FR_TRANSPORT)
