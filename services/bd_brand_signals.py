@@ -48,8 +48,34 @@ _HOMEPAGE_MAX_BYTES = 2_000_000  # 2 MB — only the <head> + nav links matter
 # Gemini grounded API — same shape used by gemini_url_validator.py +
 # bd_brand_category_inferrer.py. No new SDK dep.
 _GEMINI_MODEL = "gemini-2.5-flash"
+# Social probes (own presence / KOL / competitive) ran near-zero
+# grounded on flash — ~/tmp/social-grounding-check/verdict.md (2026-05-14:
+# 5/49 bd_ calls grounded, the ungrounded-retry recovered 0/13). The fix
+# is the model lever, not more prompt/retry tuning: social probes use the
+# Pro tier, which grounds the social/KOL queries flash won't. Non-social
+# bd_ probes (retail / founder / press) stay on flash.
+_GEMINI_SOCIAL_MODEL = "gemini-2.5-pro"
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-_GEMINI_TIMEOUT_S = 20.0
+# A grounded call that actually runs a web search legitimately takes
+# longer than a from-memory answer — and the Pro tier longer still. The
+# old flat 20s timeout was the dominant social-probe failure mode (43%
+# of bd_ calls died on `transport: ReadTimeout`, 2026-05-14). Give the
+# read leg a generous budget; keep connect tight.
+_GEMINI_TIMEOUT = httpx.Timeout(connect=10.0, read=75.0, write=10.0, pool=10.0)
+# One retry on a transport/timeout failure. #528 added this for the main
+# probe client (agent_center_llm_client) — but the bd_ social path uses
+# its own client and never got it. Same fix, here. Bounded at one extra
+# attempt; fires only after a failure, never on the happy path, so it is
+# not the per-query call multiplier the LLM-cost-safety rule guards against.
+_GEMINI_TRANSPORT_RETRY_EXCS = (
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.ConnectError,
+    httpx.NetworkError,
+)
+_GEMINI_RETRY_BACKOFF_S = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -865,8 +891,18 @@ async def _gemini_grounded_call(
     *,
     api_key: str,
     scan_mode: str = "bd_grounded_lookup",
+    model: str = _GEMINI_MODEL,
 ) -> Optional[Dict[str, Any]]:
     """One grounded call. Returns parsed payload or None on any failure.
+
+    `model` selects the Gemini tier — social probes pass
+    `_GEMINI_SOCIAL_MODEL` (Pro), which grounds the social/KOL queries
+    the flash tier won't; everything else defaults to flash.
+
+    A transport/timeout failure is retried once (bounded, post-failure
+    only — never a happy-path call multiplier) before giving up: a
+    grounded web-search call is slow enough that a lone ReadTimeout is
+    often transient, and a lost social probe is worse than a slow audit.
 
     P2.5b: scan_mode is recorded into llm_probe_runs for cost
     attribution. Callers in this module pass the inference name
@@ -884,17 +920,40 @@ async def _gemini_grounded_call(
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
         "tools": [{"google_search": {}}],
     }
-    url = f"{_GEMINI_BASE_URL}/models/{_GEMINI_MODEL}:generateContent"
+    url = f"{_GEMINI_BASE_URL}/models/{model}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-    try:
-        async with httpx.AsyncClient(timeout=_GEMINI_TIMEOUT_S) as client:
-            r = await client.post(url, headers=headers, json=body)
-    except (httpx.TimeoutException, httpx.RequestError) as exc:
-        logger.warning("brand_context: HTTP error: %s", exc)
+    r = None
+    last_exc: Optional[BaseException] = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=_GEMINI_TIMEOUT) as client:
+                r = await client.post(url, headers=headers, json=body)
+            break
+        except _GEMINI_TRANSPORT_RETRY_EXCS as exc:
+            last_exc = exc
+            logger.warning(
+                "brand_context: transport error (attempt %s/2) scan_mode=%s: %s",
+                attempt, scan_mode, exc,
+            )
+            if attempt == 2:
+                break
+            await asyncio.sleep(_GEMINI_RETRY_BACKOFF_S)
+        except httpx.RequestError as exc:
+            # Non-retryable httpx error — e.g. DecodingError,
+            # TooManyRedirects, UnsupportedProtocol. Transient transport
+            # + timeout errors are handled by the retry branch above;
+            # only what falls through here is unrecoverable.
+            last_exc = exc
+            logger.warning("brand_context: HTTP error: %s", exc)
+            break
+    if r is None:
         await _record_bd_telemetry(
             scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
-            error_message=f"transport: {type(exc).__name__}",
+            error_message=(
+                f"transport: {type(last_exc).__name__}"
+                if last_exc is not None else "transport: unknown"
+            ),
         )
         return None
     if r.status_code != 200:
@@ -977,53 +1036,12 @@ async def _record_bd_telemetry(
         )
 
 
-async def _grounded_call_with_retry(
-    *,
-    base_prompt: str,
-    escalated_prompt: str,
-    api_key: str,
-    scan_mode: str,
-) -> Optional[Dict[str, Any]]:
-    """Grounding-stability wrapper around `_gemini_grounded_call`.
-
-    Attempt 1 uses `base_prompt`. If the response comes back
-    un-grounded (zero grounding chunks — Gemini answered from internal
-    knowledge instead of searching), attempt 2 retries with
-    `escalated_prompt`, which more forcefully demands a live web
-    search. Returns:
-      - the grounded payload if EITHER attempt grounds
-      - otherwise the last payload we got (so the caller's PR-9
-        honesty gate still nulls it consistently)
-      - None if attempt 1 had a transport/HTTP failure (no point
-        retrying a dead endpoint; `_gemini_grounded_call` already
-        logged + recorded it)
-
-    The retry only fires on the ungrounded path — never on a clean
-    grounded response and never on a happy-path call — so this is not
-    the per-query call multiplier the LLM-cost-safety rule guards
-    against. The retry's telemetry row carries a `_retry` scan_mode
-    suffix so the retry rate (and whether it helps) is measurable.
-    """
-    payload = await _gemini_grounded_call(
-        base_prompt, api_key=api_key, scan_mode=scan_mode,
-    )
-    if payload is None:
-        return None  # transport/HTTP failure — don't retry a dead call
-    if _grounding_chunk_count(payload) > 0:
-        return payload  # grounded on attempt 1 — done
-
-    # Ungrounded. Retry once with the escalated prompt. The `_retry`
-    # scan_mode suffix keeps the retry distinguishable in telemetry.
-    retry_payload = await _gemini_grounded_call(
-        escalated_prompt, api_key=api_key, scan_mode=f"{scan_mode}_retry",
-    )
-    if retry_payload is not None and _grounding_chunk_count(retry_payload) > 0:
-        return retry_payload  # retry grounded — use it
-    # Still ungrounded (or the retry transport-failed). Hand back the
-    # best payload we have; the sub-call's honesty gate takes it from
-    # here. Prefer the retry payload when present so the caller sees
-    # the most recent attempt.
-    return retry_payload if retry_payload is not None else payload
+# NOTE — the ungrounded-retry (`_grounded_call_with_retry`, PR #530) was
+# removed 2026-05-14. Measured: the retry recovered 0 of 13 ungrounded
+# attempts — prompt escalation does not move a model that decided not to
+# search. The lever that works is the model tier (see _GEMINI_SOCIAL_MODEL).
+# The ungrounded telemetry it added is kept (it's in `_gemini_grounded_call`).
+# Full write-up: ~/tmp/social-grounding-check/verdict.md.
 
 
 def _build_retail_prompt(brand: str, domain: str) -> str:
@@ -1371,41 +1389,28 @@ def _detected_handle(detected: List[Dict[str, str]], platform: str) -> Optional[
     return None
 
 
-# Search-grounding directives. The social sub-calls all run through
+# Search-grounding directive. The social sub-calls all run through
 # `_gemini_grounded_call` with the `google_search` tool enabled — but
-# the tool is model-discretionary: Gemini decides whether to actually
-# search. When a prompt says "estimate X's reach", Gemini often
-# answers from internal knowledge WITHOUT searching, the response
+# the tool is model-discretionary: the model decides whether to actually
+# search. When a prompt says "estimate X's reach", a from-memory answer
 # carries zero grounding chunks, and PR-9's honesty gate (correctly)
 # nulls every figure — the merchant sees an empty section.
 #
-# These directives compel a search. `_GROUNDING_DIRECTIVE` is the
-# default; `_GROUNDING_DIRECTIVE_ESCALATED` is the harder retry
-# variant used by `_grounded_call_with_retry` when attempt 1 came
-# back un-grounded. Both keep the honesty contract intact: no search
-# result → return nulls, never a guessed number.
+# This directive compels a search; it keeps the honesty contract intact
+# (no search result → return nulls, never a guessed number). An
+# escalated retry variant existed (PR #530) but was removed — prompt
+# escalation did not move an ungrounded model (0/13 recovery); the model
+# tier does (see `_GEMINI_SOCIAL_MODEL`).
 _GROUNDING_DIRECTIVE = (
     "Before answering, you MUST use web search to look this up. Base "
     "every figure ONLY on what the search results actually show. Do "
     "not answer from prior knowledge or memory. If a search returns "
     "nothing usable for a field, set that field to null — never guess."
 )
-_GROUNDING_DIRECTIVE_ESCALATED = (
-    "CRITICAL: a previous attempt answered without searching the web "
-    "and was rejected. You MUST perform a live web search now before "
-    "writing anything. An answer not backed by a search result you "
-    "actually retrieved is unacceptable — if you cannot search, or "
-    "the search yields nothing, return every field as null. Do NOT "
-    "fall back to prior knowledge under any circumstances."
-)
-
-
-def _grounding_directive(escalated: bool) -> str:
-    return _GROUNDING_DIRECTIVE_ESCALATED if escalated else _GROUNDING_DIRECTIVE
 
 
 def _build_own_presence_prompt(
-    brand: str, platform: str, handle: Optional[str], *, escalated: bool = False,
+    brand: str, platform: str, handle: Optional[str],
 ) -> str:
     handle_clause = (
         f"Their {platform} handle is @{handle}." if handle
@@ -1418,7 +1423,7 @@ def _build_own_presence_prompt(
     )
     return f"""You are a social-media analyst. Report {brand}'s own {label} reach.
 
-{_grounding_directive(escalated)}
+{_GROUNDING_DIRECTIVE}
 
 {handle_clause}
 
@@ -1442,11 +1447,11 @@ Schema:
 Allowed values for follower_band: "<10k", "10k-100k", "100k-1M", "1M-10M", ">10M", or null."""
 
 
-def _build_kol_prompt(brand: str, platform: str, *, escalated: bool = False) -> str:
+def _build_kol_prompt(brand: str, platform: str) -> str:
     label = "TikTok" if platform == "tiktok" else "Instagram"
     return f"""You are a creator-marketing analyst. List up to 8 {label} creators (10k-1M follower band) who have posted about {brand} in the last 12 months.
 
-{_grounding_directive(escalated)}
+{_GROUNDING_DIRECTIVE}
 
 For each creator give:
 - creator_handle: the @ handle
@@ -1468,12 +1473,12 @@ Schema per element:
 
 
 def _build_competitive_prompt(
-    brand: str, competitors: List[str], *, escalated: bool = False,
+    brand: str, competitors: List[str],
 ) -> str:
     competitor_list = ", ".join(competitors[:6])
     return f"""You are a competitive social-media analyst. Compare {brand}'s TikTok + Instagram presence to these competitors: {competitor_list}.
 
-{_grounding_directive(escalated)}
+{_GROUNDING_DIRECTIVE}
 
 For each competitor brand give:
 - brand: the competitor brand name
@@ -1544,12 +1549,10 @@ async def _infer_own_presence(
     present result still SURFACES (dict non-None, reason None) — it's
     marked grounding="ungrounded" internally; the PR-9 gate only nulls
     the metric fields, it doesn't suppress the whole result."""
-    payload = await _grounded_call_with_retry(
-        base_prompt=_build_own_presence_prompt(brand, platform, handle),
-        escalated_prompt=_build_own_presence_prompt(
-            brand, platform, handle, escalated=True,
-        ),
+    payload = await _gemini_grounded_call(
+        _build_own_presence_prompt(brand, platform, handle),
         api_key=api_key, scan_mode="bd_own_presence",
+        model=_GEMINI_SOCIAL_MODEL,
     )
     if not payload:
         return (None, _FR_TRANSPORT)
@@ -1628,10 +1631,10 @@ async def _infer_kol_endorsements(
     None. An ungrounded response → (None, "ungrounded") — a creator
     list is the highest-fabrication-risk output, suppressed wholesale
     by the PR-9 gate. Grounded-but-empty → (None, "no_data")."""
-    payload = await _grounded_call_with_retry(
-        base_prompt=_build_kol_prompt(brand, platform),
-        escalated_prompt=_build_kol_prompt(brand, platform, escalated=True),
+    payload = await _gemini_grounded_call(
+        _build_kol_prompt(brand, platform),
         api_key=api_key, scan_mode="bd_kol_endorsements",
+        model=_GEMINI_SOCIAL_MODEL,
     )
     if not payload:
         return (None, _FR_TRANSPORT)
@@ -1688,12 +1691,10 @@ async def _infer_competitive_social(
     Otherwise the standard failure tokens apply."""
     if not competitors:
         return (None, None)
-    payload = await _grounded_call_with_retry(
-        base_prompt=_build_competitive_prompt(brand, competitors),
-        escalated_prompt=_build_competitive_prompt(
-            brand, competitors, escalated=True,
-        ),
+    payload = await _gemini_grounded_call(
+        _build_competitive_prompt(brand, competitors),
         api_key=api_key, scan_mode="bd_competitive_social",
+        model=_GEMINI_SOCIAL_MODEL,
     )
     if not payload:
         return (None, _FR_TRANSPORT)
