@@ -207,30 +207,43 @@ def test_no_competitors_phrase_when_failed_query_has_none():
 
 def test_actions_sorted_by_severity_then_times_cited():
     """high severity beats medium beats low; within same severity,
-    higher times_cited comes first."""
+    higher times_cited comes first. Uses non-editorial host types so
+    each host stays a distinct action — editorial hosts now collapse
+    into one consolidated action (see test_editorial_dedup_* below)."""
     from services.audit_playbook_engine import select_playbooks
     actions = select_playbooks(
         cited_hosts_detailed=[
             _cited("low-host.example", type_="retailer", subtype="mass_market", times_cited=10),  # low
-            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=2),         # high
-            _cited("forbes.com", type_="editorial", subtype="review_site", times_cited=5),        # high
+            _cited("amazon.com", type_="retailer", subtype="marketplace", times_cited=2),         # varies
+            _cited("walmart.com", type_="retailer", subtype="mass_market", times_cited=5),        # low
             _cited("nordstrom.com", type_="retailer", subtype="department_store", times_cited=3), # medium
         ],
         failed_queries_detailed=[],
     )
     severities = [a["severity"] for a in actions]
-    # All highs first, then medium, then low
-    assert severities == sorted(severities, key=lambda s: {"critical": 0, "high": 1, "medium": 2, "low": 3}[s])
-    # Within high tier, forbes (5) before nymag (2)
-    high_targets = [a["target_host"] for a in actions if a["severity"] == "high"]
-    assert high_targets[0] == "forbes.com"
-    assert high_targets[1] == "nymag.com"
+    # Sorted: critical < high < medium < low (ascending rank).
+    assert severities == sorted(
+        severities, key=lambda s: {"critical": 0, "high": 1, "medium": 2, "low": 3}[s]
+    )
+    # Within any same-severity tier, higher times_cited comes first.
+    by_sev: Dict[str, List[int]] = {}
+    for a in actions:
+        by_sev.setdefault(a["severity"], []).append(
+            (a.get("evidence", {}) or {}).get("times_cited", 0)
+        )
+    for sev, counts in by_sev.items():
+        assert counts == sorted(counts, reverse=True), (
+            f"{sev} tier not sorted by times_cited desc: {counts}"
+        )
 
 
 def test_cap_limits_output():
+    """`cap` limits the action count. Uses non-editorial hosts so each
+    stays a distinct action — 10 editorial hosts would consolidate to
+    1 and never exercise the cap."""
     from services.audit_playbook_engine import select_playbooks
     cited = [
-        _cited(f"host{i}.example", type_="editorial", subtype="review_site")
+        _cited(f"host{i}.example", type_="retailer", subtype="mass_market")
         for i in range(10)
     ]
     actions = select_playbooks(
@@ -509,3 +522,141 @@ def test_merchant_view_legacy_action_items_unchanged_by_playbooks():
         assert "playbook_step_id" not in a, (
             f"legacy action_items should not include playbook actions: {a!r}"
         )
+
+
+# ---------------------------------------------------------------------
+# 4c. Editorial pitch consolidation (PR: editorial-pitch-dedup)
+# ---------------------------------------------------------------------
+
+
+def test_editorial_dedup_collapses_multiple_hosts_to_one_action():
+    """3 editorial hosts → 1 consolidated "Pitch N editorial sites"
+    action instead of 3 separate "Pitch {host}" actions."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=5),
+            _cited("forbes.com", type_="editorial", subtype="review_site", times_cited=3),
+            _cited("marieclaire.com", type_="editorial", subtype="review_site", times_cited=2),
+        ],
+        failed_queries_detailed=[],
+        merchant_category="beauty",
+    )
+    editorial = [a for a in actions if a.get("lever") == "editorial_outreach"]
+    assert len(editorial) == 1, "3 editorial hosts must collapse to 1 action"
+    consolidated = editorial[0]
+    assert consolidated["playbook_step_id"] == "editorial_pitch_consolidated"
+    assert "3 editorial sites" in consolidated["title"]
+    assert "beauty" in consolidated["title"]
+    assert consolidated["severity_reason"] == "editorial_pitches_consolidated"
+    # target_host is None — it's multi-host.
+    assert consolidated["target_host"] is None
+
+
+def test_editorial_dedup_preserves_per_host_pitch_draft():
+    """The per-host pitch_draft + target_host survive inside
+    evidence.editorial_hosts so the merchant can still act per-host."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=5),
+            _cited("forbes.com", type_="editorial", subtype="review_site", times_cited=3),
+        ],
+        failed_queries_detailed=[],
+        merchant_category="beauty",
+    )
+    consolidated = next(a for a in actions if a.get("lever") == "editorial_outreach")
+    hosts = consolidated["evidence"]["editorial_hosts"]
+    assert len(hosts) == 2
+    host_names = {h["host"] for h in hosts}
+    assert host_names == {"nymag.com", "forbes.com"}
+    # Each per-host entry carries the keys a per-host renderer needs.
+    for h in hosts:
+        assert "pitch_draft" in h
+        assert "playbook_step_id" in h
+        assert "title" in h
+    assert consolidated["evidence"]["host_count"] == 2
+    # times_cited on the consolidated action sums the group (5 + 3).
+    assert consolidated["evidence"]["times_cited"] == 8
+
+
+def test_editorial_dedup_leaves_non_editorial_actions_untouched():
+    """Retailer / creator / research actions pass through unchanged —
+    only editorial-outreach actions consolidate."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=4),
+            _cited("forbes.com", type_="editorial", subtype="review_site", times_cited=2),
+            _cited("nordstrom.com", type_="retailer", subtype="department_store", times_cited=3),
+            _cited("made-up.example", type_="unclassified", subtype=None, times_cited=2),
+        ],
+        failed_queries_detailed=[],
+        merchant_category="beauty",
+    )
+    levers = [a.get("lever") for a in actions]
+    # 1 consolidated editorial + 1 retailer + 1 research = 3 total.
+    assert levers.count("editorial_outreach") == 1
+    # The non-editorial actions still have their own target_host.
+    non_editorial = [a for a in actions if a.get("lever") != "editorial_outreach"]
+    assert len(non_editorial) == 2
+    for a in non_editorial:
+        assert a.get("target_host") is not None
+
+
+def test_editorial_dedup_single_host_passes_through():
+    """A lone editorial host is NOT consolidated — a 1-host wrapper
+    adds indirection for no benefit. The single "Pitch {host}"
+    action passes through unchanged."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=4),
+        ],
+        failed_queries_detailed=[],
+        merchant_category="beauty",
+    )
+    assert len(actions) == 1
+    # Original per-host action, not the consolidated wrapper.
+    assert actions[0]["playbook_step_id"] != "editorial_pitch_consolidated"
+    assert actions[0]["target_host"] == "nymag.com"
+
+
+def test_editorial_dedup_severity_is_max_of_group():
+    """The consolidated action's severity = the strongest among the
+    grouped editorial actions. Build a group where the scorer would
+    produce differing severities, assert the consolidated takes the
+    max."""
+    from services.audit_playbook_engine import select_playbooks
+    # Provide failed-query evidence for one host so its scored
+    # severity differs from a bare-cited host.
+    failed = [
+        _failed_query(
+            "best beauty serum", host="nymag.com",
+            competitors=["Competitor A", "Competitor B"],
+        ),
+    ]
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=5),
+            _cited("forbes.com", type_="editorial", subtype="review_site", times_cited=2),
+        ],
+        failed_queries_detailed=failed,
+        merchant_category="beauty",
+        attribution_score=10,
+        category_score=80,
+    )
+    consolidated = next(a for a in actions if a.get("lever") == "editorial_outreach")
+    # Per-host severities are preserved in evidence. The consolidated
+    # severity must equal the STRONGEST (lowest rank value) of them.
+    rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    per_host_severities = [
+        h["severity"] for h in consolidated["evidence"]["editorial_hosts"]
+    ]
+    assert all(s is not None for s in per_host_severities)
+    strongest = min(per_host_severities, key=lambda s: rank[s])
+    assert consolidated["severity"] == strongest, (
+        f"consolidated severity {consolidated['severity']!r} must be the "
+        f"strongest of the group {per_host_severities!r}"
+    )
+    assert consolidated["evidence"]["host_count"] == 2
