@@ -5608,20 +5608,32 @@ def render_brand_markdown(
         own = social.get("own_presence") or {}
         tt = own.get("tiktok") or {}
         ig = own.get("instagram") or {}
+
+        def _own_presence_line(platform_label: str, p: Dict[str, Any]) -> str:
+            # PR-9: when the sub-call was ungrounded, every metric is
+            # nulled — render the handle + an explicit "not verified"
+            # note rather than a fabricated count. A grounded entry
+            # renders the real numbers.
+            handle = p.get("handle") or "?"
+            if p.get("grounding") == "ungrounded":
+                return (
+                    f"- {platform_label}: `@{handle}` — follower / engagement "
+                    f"data not verified (the lookup couldn't ground its "
+                    f"answer in a live source). Operator to confirm manually.\n"
+                )
+            followers = p.get("follower_estimate") or p.get("follower_band") or "?"
+            focus = p.get("content_focus") or "mixed"
+            return (
+                f"- {platform_label}: `@{handle}` — {followers} followers; "
+                f"focus: {focus}.\n"
+            )
+
         if tt or ig:
             sections.append("**Your brand's own social presence:**\n")
             if tt:
-                sections.append(
-                    f"- TikTok: `@{tt.get('handle', '?')}` — "
-                    f"{tt.get('follower_estimate') or tt.get('follower_band') or '?'} followers; "
-                    f"focus: {tt.get('content_focus') or 'mixed'}.\n"
-                )
+                sections.append(_own_presence_line("TikTok", tt))
             if ig:
-                sections.append(
-                    f"- Instagram: `@{ig.get('handle', '?')}` — "
-                    f"{ig.get('follower_estimate') or ig.get('follower_band') or '?'} followers; "
-                    f"focus: {ig.get('content_focus') or 'mixed'}.\n"
-                )
+                sections.append(_own_presence_line("Instagram", ig))
         kol = social.get("kol_endorsements") or {}
         tt_kols = kol.get("tiktok") or []
         ig_kols = kol.get("instagram") or []

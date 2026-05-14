@@ -709,6 +709,48 @@ def _parse_gemini_text(payload: Dict[str, Any]) -> Optional[str]:
     return "\n".join(chunks).strip() or None
 
 
+def _grounding_chunk_count(payload: Optional[Dict[str, Any]]) -> int:
+    """Count the grounding chunks Gemini returned for a response.
+
+    PR-9 honesty gate. When the `google_search` tool is enabled
+    (every `_gemini_grounded_call`), a response that actually
+    consulted the web carries `candidates[0].groundingMetadata.
+    groundingChunks` — one entry per source the model retrieved. A
+    response answered purely from the model's internal knowledge
+    carries zero chunks.
+
+    Social-intelligence sub-calls (`_infer_own_presence`,
+    `_infer_kol_endorsements`, `_infer_competitive_social`) ask the
+    model for follower counts, KOL lists, and competitive figures.
+    Those are exactly the fields that, ungrounded, become confident
+    fabrication in a merchant-facing report. The count returned here
+    is the gate: zero chunks → the numeric/factual fields must be
+    nulled, not surfaced.
+
+    Handles both camelCase (`groundingMetadata` / `groundingChunks`)
+    and snake_case (`grounding_metadata` / `grounding_chunks`) since
+    the REST API has shipped both shapes across versions.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    candidates = payload.get("candidates") or []
+    if not candidates or not isinstance(candidates[0], dict):
+        return 0
+    meta = (
+        candidates[0].get("groundingMetadata")
+        or candidates[0].get("grounding_metadata")
+        or {}
+    )
+    if not isinstance(meta, dict):
+        return 0
+    chunks = (
+        meta.get("groundingChunks")
+        or meta.get("grounding_chunks")
+        or []
+    )
+    return len(chunks) if isinstance(chunks, list) else 0
+
+
 def _unwrap_json(text: Optional[str]) -> Optional[Any]:
     """Try to parse JSON from a Gemini response. Strips ``` fences and
     falls back to extracting the first balanced { or [ block."""
@@ -1358,21 +1400,51 @@ async def _infer_own_presence(brand: str, platform: str, handle: Optional[str], 
         )
         return None
     metric_key = "view_per_post_estimate" if platform == "tiktok" else "engagement_rate_estimate"
+    # PR-9 honesty gate. Follower counts, view/engagement estimates,
+    # and content-focus claims are only trustworthy when Gemini
+    # actually consulted the web. A zero-chunk response means the
+    # model answered from internal knowledge — those numbers are
+    # plausible-sounding fabrication, NOT data. Null the factual
+    # fields and mark grounding="ungrounded" so the renderer shows
+    # "not verified" instead of a confident wrong number.
+    grounded = _grounding_chunk_count(payload) > 0
     out: Dict[str, Any] = {
         "platform": platform,
+        # handle is safe to keep even ungrounded — it's either the
+        # caller-supplied param or a name the operator can click
+        # through to verify; it's not a fabricated metric.
         "handle": handle or _coerce_str(parsed.get("handle")),
-        "follower_estimate": _coerce_int(parsed.get("follower_estimate")),
-        "follower_band": _coerce_str(parsed.get("follower_band")),
-        metric_key: _coerce_int(parsed.get(metric_key)) if platform == "tiktok"
-            else (parsed.get(metric_key) if isinstance(parsed.get(metric_key), (int, float, str)) else None),
-        "content_focus": _coerce_str(parsed.get("content_focus")),
-        "post_frequency": _coerce_str(parsed.get("post_frequency")),
-        "verified_account": parsed.get("verified_account") if isinstance(parsed.get("verified_account"), bool) else None,
+        "follower_estimate": (
+            _coerce_int(parsed.get("follower_estimate")) if grounded else None
+        ),
+        "follower_band": (
+            _coerce_str(parsed.get("follower_band")) if grounded else None
+        ),
+        metric_key: (
+            (_coerce_int(parsed.get(metric_key)) if platform == "tiktok"
+             else (parsed.get(metric_key) if isinstance(parsed.get(metric_key), (int, float, str)) else None))
+            if grounded else None
+        ),
+        "content_focus": (
+            _coerce_str(parsed.get("content_focus")) if grounded else None
+        ),
+        "post_frequency": (
+            _coerce_str(parsed.get("post_frequency")) if grounded else None
+        ),
+        "verified_account": (
+            parsed.get("verified_account")
+            if grounded and isinstance(parsed.get("verified_account"), bool)
+            else None
+        ),
+        "grounding": "grounded" if grounded else "ungrounded",
     }
     # Surface even partial data — handle alone is meaningful (operator
     # can click through to verify) and content_focus tells the BD what
     # the brand actually posts. Only fully-empty (no handle AND no
-    # other field) is suppressed.
+    # other field) is suppressed. An ungrounded response with a
+    # caller-supplied handle still surfaces (handle=truthy) — but with
+    # every metric nulled, so the renderer shows the handle + "not
+    # verified" rather than fabricated counts.
     if not any(out[k] for k in ("handle", "follower_estimate", "follower_band", "content_focus", "post_frequency")):
         return None
     return out
@@ -1384,6 +1456,19 @@ async def _infer_kol_endorsements(brand: str, platform: str, api_key: str) -> Op
         api_key=api_key, scan_mode="bd_kol_endorsements",
     )
     if not payload:
+        return None
+    # PR-9 honesty gate. A list of named creators who "posted about
+    # the brand in the last 12 months" is the highest-fabrication-risk
+    # output of the three social sub-calls — an ungrounded response
+    # invents plausible-looking creator handles wholesale. Zero
+    # grounding chunks → treat as "no data" (None), never surface
+    # fabricated creators in a merchant-facing report.
+    if _grounding_chunk_count(payload) == 0:
+        logger.info(
+            "kol_endorsements(%s): ungrounded response (0 grounding chunks) "
+            "for %s — suppressing to avoid fabricated creator list",
+            platform, brand,
+        )
         return None
     raw_text = _parse_gemini_text(payload)
     parsed = _coerce_to_array(_unwrap_json(raw_text))
@@ -1421,6 +1506,17 @@ async def _infer_competitive_social(brand: str, competitors: List[str], api_key:
         api_key=api_key, scan_mode="bd_competitive_social",
     )
     if not payload:
+        return None
+    # PR-9 honesty gate. Competitor follower counts + KOL-count
+    # estimates are fabrication risk when ungrounded — the model will
+    # happily emit plausible numbers for every competitor brand from
+    # internal knowledge. Zero grounding chunks → suppress entirely.
+    if _grounding_chunk_count(payload) == 0:
+        logger.info(
+            "competitive_social: ungrounded response (0 grounding chunks) "
+            "for %s — suppressing to avoid fabricated competitor figures",
+            brand,
+        )
         return None
     raw_text = _parse_gemini_text(payload)
     parsed = _coerce_to_array(_unwrap_json(raw_text))
