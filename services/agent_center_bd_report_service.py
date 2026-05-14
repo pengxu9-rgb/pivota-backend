@@ -1505,6 +1505,18 @@ async def run_brand_report(
             # section without crashing the audit.
             social_intelligence = None
 
+    # P2 (post-#525 codex review): reconcile the three competitor
+    # surfaces (host rollup / category peers / social benchmark) into
+    # one brand-keyed `competitor_entities` view. Additive — the raw
+    # surfaces above are untouched; this is the coherent "what do we
+    # know about competitor X" rollup a BD operator actually wants.
+    competitor_entities = _reconcile_competitor_entities(
+        cross_product_competitors=cross_competitors,
+        per_product=per_product,
+        social_intelligence=social_intelligence,
+        merchant_brand=merchant_name,
+    )
+
     return {
         "merchant_name": merchant_name,
         "merchant_domain": (merchant_domain or "").strip() or None,
@@ -1513,6 +1525,7 @@ async def run_brand_report(
         "per_product": per_product,
         "aggregate": aggregate,
         "cross_product_competitors": cross_competitors,
+        "competitor_entities": competitor_entities,
         "social_intelligence": social_intelligence,
         "failed": failed,
     }
@@ -1864,6 +1877,133 @@ def _aggregate_brand_competitors(
     # Rank by combined times_cited desc, then by host to stabilize ties.
     out.sort(key=lambda e: (-e["times_cited"], e["host"]))
     return out[:15]
+
+
+def _normalize_competitor_name(name: str) -> str:
+    """Canonical key for a competitor brand name — lowercased,
+    alphanumeric-only. "Drunk Elephant" → "drunkelephant",
+    "PEACH & LILY" → "peachlily". Used to join the three competitor
+    surfaces (host rollup / category peers / social benchmark) which
+    all key competitors differently."""
+    return "".join(ch for ch in (name or "").strip().lower() if ch.isalnum())
+
+
+def _reconcile_competitor_entities(
+    *,
+    cross_product_competitors: List[Dict[str, Any]],
+    per_product: List[Dict[str, Any]],
+    social_intelligence: Optional[Dict[str, Any]],
+    merchant_brand: Optional[str],
+) -> List[Dict[str, Any]]:
+    """P2 (post-#525 codex review): the audit surfaces competitors in
+    THREE places with no shared identity —
+
+      1. `cross_product_competitors` — host-keyed (`sephora.com`),
+         from `_aggregate_brand_competitors`.
+      2. per-product `competitive_pressure.peers_named` — brand-name-
+         keyed (`Sephora`), plus `peers_with_first_party_visibility`.
+      3. `social_intelligence.competitor_presence` /
+         `competitive_comparison` — brand-name-keyed social metrics.
+
+    A BD operator reading the report gets the same competitor three
+    times with no reconciliation. This builds an ADDITIVE derived
+    view — `competitor_entities` — that joins all three by normalized
+    brand name. It does NOT replace the raw surfaces (consumers that
+    read them still work); it's the one coherent "what do we know
+    about competitor X" rollup.
+
+    Brand-centric: each entity is a named competitor brand (that's how
+    BD thinks). Host-rollup entries that match no named brand stay in
+    `cross_product_competitors` untouched — not duplicated here. The
+    host↔brand join reuses `_brand_matches_host_segment` (the PR-7/N6
+    matcher), so it inherits the tightened all-words + coverage rule
+    and the merchant's-own-domain exclusion.
+    """
+    # 1. Seed entities from category peers (the canonical brand list),
+    #    summing category mention counts across products.
+    entities: Dict[str, Dict[str, Any]] = {}
+    for product in per_product or []:
+        cp = product.get("competitive_pressure") or {}
+        for peer in cp.get("peers_named") or []:
+            name = (peer.get("name") or "").strip()
+            key = _normalize_competitor_name(name)
+            if not key:
+                continue
+            ent = entities.setdefault(key, {
+                "canonical_name": key,
+                "display_name": name,
+                "category_mentions": 0,
+                "known_hosts": [],
+                "first_party_visible": False,
+                "social": None,
+                "social_comparison": None,
+                "seen_in": [],
+            })
+            ent["category_mentions"] += int(peer.get("times_cited") or 0)
+            if "category_peers" not in ent["seen_in"]:
+                ent["seen_in"].append("category_peers")
+        # first-party visibility flag from the same block.
+        for fp in cp.get("peers_with_first_party_visibility") or []:
+            key = _normalize_competitor_name(fp.get("brand") or "")
+            if key in entities:
+                entities[key]["first_party_visible"] = True
+
+    # 2. Join host-rollup entries: a host belongs to an entity when the
+    #    entity's brand name matches the host's first segment.
+    for host_entry in cross_product_competitors or []:
+        host = (host_entry.get("host") or "").strip().lower()
+        if not host:
+            continue
+        first_segment = host.split(".")[0]
+        for key, ent in entities.items():
+            if _brand_matches_host_segment(ent["display_name"], first_segment):
+                ent["known_hosts"].append({
+                    "host": host,
+                    "confidence": host_entry.get("confidence"),
+                    "times_cited": host_entry.get("times_cited"),
+                    "source": host_entry.get("source"),
+                })
+                if "host_rollup" not in ent["seen_in"]:
+                    ent["seen_in"].append("host_rollup")
+                break  # one host → at most one entity
+
+    # 3. Join social benchmark — competitor_presence + competitive_comparison.
+    si = social_intelligence or {}
+    comp_presence = si.get("competitor_presence") or {}
+    for comp_name, presence in comp_presence.items():
+        key = _normalize_competitor_name(comp_name)
+        ent = entities.get(key)
+        if ent is None:
+            # Social named a competitor the category-peer list didn't —
+            # surface it rather than drop it.
+            ent = entities.setdefault(key or comp_name, {
+                "canonical_name": key or comp_name,
+                "display_name": comp_name,
+                "category_mentions": 0,
+                "known_hosts": [],
+                "first_party_visible": False,
+                "social": None,
+                "social_comparison": None,
+                "seen_in": [],
+            })
+        ent["social"] = presence
+        if "social_benchmark" not in ent["seen_in"]:
+            ent["seen_in"].append("social_benchmark")
+    for comp in si.get("competitive_comparison") or []:
+        if not isinstance(comp, dict):
+            continue
+        key = _normalize_competitor_name(comp.get("brand") or "")
+        ent = entities.get(key)
+        if ent is not None:
+            ent["social_comparison"] = comp
+            if "social_benchmark" not in ent["seen_in"]:
+                ent["seen_in"].append("social_benchmark")
+
+    # Rank: most-corroborated first (seen in the most surfaces), then
+    # by category mention count.
+    out = list(entities.values())
+    out.sort(key=lambda e: (-len(e["seen_in"]), -e["category_mentions"], e["canonical_name"]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -5607,6 +5747,48 @@ def render_brand_markdown(
             f"- Products audited: {aggregate.get('products_count', len(per_product))}\n"
         )
 
+    # P2 (post-#525 codex review): the reconciled competitor view —
+    # one row per competitor brand joining what the host rollup,
+    # category-peer list, and social benchmark each said. Rendered
+    # ABOVE the raw per-surface sections below so the operator gets
+    # the coherent picture first; the raw sections stay for detail.
+    entities = brand_report.get("competitor_entities") or []
+    if entities:
+        sections.append("\n## Competitors — reconciled view\n")
+        sections.append(
+            "_One row per competitor brand, joining every surface the "
+            "audit saw them in. `Seen in` shows which signals "
+            "corroborate — a competitor in all three is the most "
+            "certain._\n"
+        )
+        rows = [
+            "| Competitor | Category mentions | Known host(s) | First-party visible | Social | Seen in |",
+            "|---|---|---|---|---|---|",
+        ]
+        for ent in entities[:15]:
+            hosts = ", ".join(
+                f"`{h.get('host')}`" for h in (ent.get("known_hosts") or [])
+                if h.get("host")
+            ) or "—"
+            social = ent.get("social") or {}
+            social_bits = []
+            for platform in ("tiktok", "instagram"):
+                p = social.get(platform) or {}
+                fv = p.get("follower_estimate") or p.get("follower_band")
+                if fv:
+                    social_bits.append(f"{platform[:2].upper()} {fv}")
+            social_str = ", ".join(social_bits) or "—"
+            seen = ", ".join(ent.get("seen_in") or []) or "—"
+            rows.append(
+                f"| {ent.get('display_name', '?')} "
+                f"| {ent.get('category_mentions', 0)} "
+                f"| {hosts} "
+                f"| {'yes' if ent.get('first_party_visible') else 'no'} "
+                f"| {social_str} "
+                f"| {seen} |"
+            )
+        sections.append("\n".join(rows) + "\n")
+
     cross = brand_report.get("cross_product_competitors") or []
     if cross:
         sections.append("\n## Hosts capturing this brand's AI traffic\n")
@@ -5793,13 +5975,18 @@ def render_brand_markdown(
         )
         if competitive:
             sections.append("\n**Competitive social comparison:**\n")
-            rows = ["| Brand | TikTok | Instagram | Notes |", "|---|---|---|---|"]
+            rows = ["| Brand | TikTok | Instagram | Gap |", "|---|---|---|---|"]
             for c in competitive[:8]:
+                # P2 fix (codex review): _infer_competitive_social emits
+                # `*_followers_estimate` + `gap_summary`; the renderer
+                # was reading `tiktok_followers` / `instagram_followers`
+                # / `notes` — fields that never exist — so every row
+                # rendered blank. Read the actual field names.
                 rows.append(
                     f"| {c.get('brand', '?')} "
-                    f"| {c.get('tiktok_followers') or '—'} "
-                    f"| {c.get('instagram_followers') or '—'} "
-                    f"| {c.get('notes') or ''} |"
+                    f"| {c.get('tiktok_followers_estimate') or '—'} "
+                    f"| {c.get('instagram_followers_estimate') or '—'} "
+                    f"| {c.get('gap_summary') or ''} |"
                 )
             sections.append("\n".join(rows) + "\n")
         elif competitive_note:
