@@ -28,8 +28,11 @@ def reset_caches():
     reset_registry_cache()
 
 
+# Default times_cited=2 so the helper produces a host that clears the
+# `select_playbooks` min-citation threshold (default 2). Tests that
+# specifically exercise the threshold pass times_cited=1 explicitly.
 def _cited(host: str, *, type_: str, subtype: str, applies: bool = True,
-           times_cited: int = 1, coverage_note: str = "Coverage note.",
+           times_cited: int = 2, coverage_note: str = "Coverage note.",
            outreach_hint: str = "Outreach hint.") -> Dict[str, Any]:
     return {
         "host": host,
@@ -84,7 +87,7 @@ def test_unclassified_host_matches_generic_unclassified_playbook():
     from services.audit_playbook_engine import select_playbooks
     unclassified_host = {
         "host": "made-up.example",
-        "times_cited": 1,
+        "times_cited": 2,  # clears the min-citation threshold
         "type": "unclassified",
         "subtype": None,
         "categories": [],
@@ -239,6 +242,102 @@ def test_cap_limits_output():
 
 
 # ---------------------------------------------------------------------
+# 4b. Min-citation threshold (PR-11)
+# ---------------------------------------------------------------------
+
+
+def test_single_cite_host_is_skipped_by_default():
+    """A host cited only once is too weak to anchor a host-targeted
+    action — skipped under the default threshold (2)."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=1),
+        ],
+        failed_queries_detailed=[],
+    )
+    assert actions == []
+
+
+def test_two_cite_host_clears_default_threshold():
+    """Two citations is the default minimum — the host fires."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=2),
+        ],
+        failed_queries_detailed=[],
+    )
+    assert len(actions) == 1
+    assert actions[0]["target_host"] == "nymag.com"
+
+
+def test_min_times_cited_1_restores_all_hosts_behavior():
+    """Callers can pass min_times_cited=1 to restore the prior
+    all-cited-hosts behavior — a 1-cite host fires again."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("nymag.com", type_="editorial", subtype="review_site", times_cited=1),
+        ],
+        failed_queries_detailed=[],
+        min_times_cited=1,
+    )
+    assert len(actions) == 1
+
+
+def test_min_times_cited_can_be_raised():
+    """A stricter threshold (3) skips a 2-cite host."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("two-cites.example", type_="editorial", subtype="review_site", times_cited=2),
+            _cited("three-cites.example", type_="editorial", subtype="review_site", times_cited=3),
+        ],
+        failed_queries_detailed=[],
+        min_times_cited=3,
+    )
+    assert [a["target_host"] for a in actions] == ["three-cites.example"]
+
+
+def test_missing_or_non_int_times_cited_is_skipped():
+    """A host whose times_cited is missing / non-int is treated as 0
+    and skipped — we don't emit actions for hosts whose citation
+    count we can't establish."""
+    from services.audit_playbook_engine import select_playbooks
+    no_count = {
+        "host": "no-count.example",
+        # times_cited intentionally absent
+        "type": "editorial",
+        "subtype": "review_site",
+        "categories": ["sleepwear"],
+        "coverage_note": "x",
+        "outreach_hint": "y",
+        "applies_to_merchant_category": True,
+    }
+    bad_count = dict(no_count, host="bad-count.example", times_cited="lots")
+    actions = select_playbooks(
+        cited_hosts_detailed=[no_count, bad_count],
+        failed_queries_detailed=[],
+    )
+    assert actions == []
+
+
+def test_min_times_cited_below_1_treated_as_no_threshold():
+    """A caller passing 0 / negative shouldn't accidentally skip
+    every host — clamped to 1 (no effective threshold)."""
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[
+            _cited("one-cite.example", type_="editorial", subtype="review_site", times_cited=1),
+        ],
+        failed_queries_detailed=[],
+        min_times_cited=0,
+    )
+    assert len(actions) == 1
+
+
+# ---------------------------------------------------------------------
 # 5. Required fields on every action
 # ---------------------------------------------------------------------
 
@@ -344,9 +443,17 @@ def test_merchant_view_actions_include_playbook_actions_after_strategic():
         category_visibility_result={
             "provider": "gemini", "scores": {"visibility_score": 0},
             "raw_runs": [
+                # Two category runs both citing nymag.com so the host
+                # clears the select_playbooks min-citation threshold
+                # (default 2) — a single citation no longer fires a
+                # host-targeted playbook action.
                 _category_run(
                     "best pajamas",
                     grounding_sources=[{"uri": "https://nymag.com/", "title": "nymag.com"}],
+                ),
+                _category_run(
+                    "best pajamas under 100",
+                    grounding_sources=[{"uri": "https://nymag.com/strategist", "title": "nymag.com"}],
                 ),
             ],
         },

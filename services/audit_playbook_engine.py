@@ -266,6 +266,17 @@ def _build_pitch_draft(
     }
 
 
+# A host cited only once in the audit's grounding sources is weak
+# evidence for any host-targeted action — a single citation could be
+# noise (one tangential mention) rather than a real capture pattern.
+# The PR-8 quality review flagged a `creator_partnerships: youtube.com`
+# action that fired off 2 cites (defensible) but noted that at 1 cite
+# the same action reads as flimsy. The threshold gates host-targeted
+# playbook actions on at least this many citations. Callers can lower
+# it to 1 to restore the prior all-hosts behavior.
+_DEFAULT_MIN_TIMES_CITED = 2
+
+
 def select_playbooks(
     *,
     cited_hosts_detailed: List[Dict[str, Any]],
@@ -275,12 +286,19 @@ def select_playbooks(
     attribution_score: Optional[int] = None,
     category_score: Optional[int] = None,
     cap: int = 5,
+    min_times_cited: int = _DEFAULT_MIN_TIMES_CITED,
 ) -> List[Dict[str, Any]]:
     """Produce per-host playbook actions for the merchant audit's
     `merchant_view.actions` extension. Skips hosts where
     `applies_to_merchant_category` is False — they're cited but
     irrelevant to this merchant (e.g. a beauty-only host appearing
     in a sleepwear audit).
+
+    `min_times_cited` (default 2): hosts with fewer citations than
+    this in the audit's grounding sources are skipped — a single
+    citation is too weak to justify a host-targeted action on the
+    merchant queue. Pass `min_times_cited=1` to restore the prior
+    all-cited-hosts behavior.
 
     Each output entry mirrors `_generate_action_items` shape and adds:
       playbook_step_id          : the matched playbook key
@@ -294,6 +312,9 @@ def select_playbooks(
                                   (`email` or `submission_url`).
     """
     actions: List[Dict[str, Any]] = []
+    # Guard against a caller passing 0 / negative — treat anything
+    # below 1 as "no threshold" rather than skipping every host.
+    effective_min_cited = max(1, int(min_times_cited))
 
     for entry in cited_hosts_detailed or []:
         host = (entry.get("host") or "").strip()
@@ -304,6 +325,15 @@ def select_playbooks(
         # cover the merchant's category. None (registry didn't know
         # merchant_category) and True both pass through.
         if applies is False:
+            continue
+
+        # Min-citation gate. A host cited fewer than `effective_min_cited`
+        # times is too thin to anchor a host-targeted action. `times_cited`
+        # missing / non-int is treated as 0 → skipped (we don't emit
+        # actions for hosts whose citation count we can't establish).
+        raw_cited = entry.get("times_cited")
+        times_cited = raw_cited if isinstance(raw_cited, int) else 0
+        if times_cited < effective_min_cited:
             continue
 
         selection = _select_playbook_for_host(entry)
