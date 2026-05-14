@@ -74,6 +74,13 @@ def patched_subcalls():
         "services.bd_brand_signals._resolve_gemini_api_key",
         return_value="fake-key",
     ), patch(
+        # Handle-detection fallback fetches the homepage when no
+        # detected_handles were threaded in — mock it so the suite
+        # never touches the network.
+        "services.bd_brand_signals._fetch_homepage_html",
+        new_callable=AsyncMock,
+        return_value=None,
+    ), patch(
         "services.bd_brand_signals._infer_own_presence",
         new_callable=AsyncMock,
         side_effect=fake_own_presence,
@@ -199,6 +206,10 @@ async def test_ungrounded_competitor_probe_still_surfaces_with_nulled_metrics():
         "services.bd_brand_signals._resolve_gemini_api_key",
         return_value="fake-key",
     ), patch(
+        "services.bd_brand_signals._fetch_homepage_html",
+        new_callable=AsyncMock,
+        return_value=None,
+    ), patch(
         "services.bd_brand_signals._infer_own_presence",
         new_callable=AsyncMock,
         side_effect=mixed_own_presence,
@@ -246,6 +257,10 @@ async def test_competitor_dropped_when_both_platforms_return_none():
     with patch(
         "services.bd_brand_signals._resolve_gemini_api_key",
         return_value="fake-key",
+    ), patch(
+        "services.bd_brand_signals._fetch_homepage_html",
+        new_callable=AsyncMock,
+        return_value=None,
     ), patch(
         "services.bd_brand_signals._infer_own_presence",
         new_callable=AsyncMock,
@@ -316,6 +331,10 @@ async def test_available_true_when_only_competitor_presence_succeeds():
     with patch(
         "services.bd_brand_signals._resolve_gemini_api_key",
         return_value="fake-key",
+    ), patch(
+        "services.bd_brand_signals._fetch_homepage_html",
+        new_callable=AsyncMock,
+        return_value=None,
     ), patch(
         "services.bd_brand_signals._infer_own_presence",
         new_callable=AsyncMock,
