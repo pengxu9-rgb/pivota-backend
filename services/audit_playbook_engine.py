@@ -460,6 +460,9 @@ def select_playbooks(
             "pitch_draft": pitch_draft,
         })
 
+    # Consolidate editorial pitches into one action before sort + cap.
+    actions = _consolidate_editorial_actions(actions, merchant_category)
+
     # Sort: severity ascending (critical first) then times_cited descending.
     actions.sort(
         key=lambda a: (
@@ -468,3 +471,114 @@ def select_playbooks(
         )
     )
     return actions[:cap]
+
+
+# Editorial-pitch playbooks all carry lever="editorial_outreach". A
+# D2C beauty audit routinely cites forbes.com + whowhatwear.com +
+# marieclaire.com + ... — pre-consolidation that's one "Pitch X"
+# action PER host, which reads as repetitive noise on the merchant
+# queue (the PR-8 quality review's N7 finding). One consolidated
+# "Pitch N editorial sites" action is the right granularity; the
+# per-host pitch_draft + target_host are preserved inside
+# `evidence.editorial_hosts` so the merchant can still act per-host.
+_EDITORIAL_LEVER = "editorial_outreach"
+
+
+def _consolidate_editorial_actions(
+    actions: List[Dict[str, Any]],
+    merchant_category: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Collapse 2+ editorial-outreach playbook actions into a single
+    consolidated action. 0 or 1 editorial actions pass through
+    unchanged — a lone editorial pitch doesn't need the consolidation
+    wrapper (it'd just add a layer of indirection for one host).
+
+    Non-editorial actions (retailer / creator / research / wholesale)
+    are never touched. Order within `actions` is otherwise preserved;
+    the caller re-sorts by severity afterward.
+    """
+    editorial = [a for a in actions if a.get("lever") == _EDITORIAL_LEVER]
+    if len(editorial) < 2:
+        return actions
+
+    non_editorial = [a for a in actions if a.get("lever") != _EDITORIAL_LEVER]
+
+    # Per-host detail preserved so the merchant can still act per-host
+    # — the pitch_draft (pre-filled email) is the load-bearing part.
+    editorial_hosts: List[Dict[str, Any]] = []
+    for a in editorial:
+        editorial_hosts.append({
+            "host": a.get("target_host"),
+            "pitch_draft": a.get("pitch_draft"),
+            "playbook_step_id": a.get("playbook_step_id"),
+            "title": a.get("title"),
+            "concrete_next_step": a.get("concrete_next_step"),
+            "expected_timeline_weeks": a.get("expected_timeline_weeks"),
+            "times_cited": (a.get("evidence", {}) or {}).get("times_cited", 0),
+            # Per-host severity preserved so a per-host renderer can
+            # show each site's individual tier — and so the
+            # consolidated severity (max of the group) is auditable.
+            "severity": a.get("severity"),
+        })
+
+    # Consolidated severity = the strongest (lowest rank value) among
+    # the grouped actions — if any single editorial pitch was `high`,
+    # the consolidated action is `high`.
+    consolidated_severity = min(
+        (a.get("severity") or "low" for a in editorial),
+        key=lambda s: _SEVERITY_RANK.get(s, 99),
+    )
+
+    # Widest timeline span across the group.
+    lows = [
+        a.get("expected_timeline_weeks", [0, 0])[0]
+        for a in editorial
+        if isinstance(a.get("expected_timeline_weeks"), list)
+        and len(a.get("expected_timeline_weeks") or []) == 2
+    ]
+    highs = [
+        a.get("expected_timeline_weeks", [0, 0])[1]
+        for a in editorial
+        if isinstance(a.get("expected_timeline_weeks"), list)
+        and len(a.get("expected_timeline_weeks") or []) == 2
+    ]
+    timeline = [min(lows), max(highs)] if lows and highs else [0, 0]
+
+    hosts = [h["host"] for h in editorial_hosts if h.get("host")]
+    host_list = ", ".join(hosts)
+    category_label = (merchant_category or "").strip() or "your category"
+    n = len(editorial_hosts)
+
+    consolidated = {
+        "severity": consolidated_severity,
+        "severity_reason": "editorial_pitches_consolidated",
+        "title": f"Pitch {n} editorial sites for {category_label} visibility",
+        "body": (
+            f"{n} editorial sites surfaced in your audit's grounding "
+            f"sources are worth a pitch: {host_list}. Each is a place "
+            f"AI assistants already look for {category_label} "
+            f"recommendations — a placement there feeds back into "
+            f"grounded answers. Per-site pitch drafts are attached "
+            f"below; the sites are ordered by how often they were "
+            f"cited in your audit."
+        ),
+        "concrete_next_step": (
+            f"This week: start with the most-cited site ({hosts[0]}) — "
+            f"send its pitch draft, then work down the list. Editorial "
+            f"pitches need a story angle, not just a product spec."
+        ),
+        "evidence": {
+            "editorial_hosts": editorial_hosts,
+            "host_count": n,
+            # Sum of citations across the grouped hosts — keeps the
+            # severity-sort tiebreaker meaningful for the merged action.
+            "times_cited": sum(h.get("times_cited", 0) for h in editorial_hosts),
+        },
+        "playbook_step_id": "editorial_pitch_consolidated",
+        "target_host": None,  # multi-host — see evidence.editorial_hosts
+        "lever": _EDITORIAL_LEVER,
+        "expected_timeline_weeks": timeline,
+        "pitch_draft": None,  # per-host drafts live in evidence.editorial_hosts
+    }
+
+    return non_editorial + [consolidated]
