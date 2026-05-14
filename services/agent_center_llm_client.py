@@ -115,14 +115,29 @@ async def _record_probe_telemetry(
 # RemoteProtocolError. One retry buys us through a single rolling
 # restart without making the user re-run a 30-second BD report.
 #
-# Timeouts are NOT retried — a slow Gemini call shouldn't double the
-# wall-clock cost. Only retry the cheap network-layer failures.
+# httpx.TimeoutException IS retried (ReadTimeout / ConnectTimeout /
+# WriteTimeout / PoolTimeout all subclass it). The prior code
+# excluded timeouts on the reasoning "a slow Gemini call shouldn't
+# double the wall-clock cost" — but that conflates two things:
+#   - a slow-but-SUCCESSFUL call: correct not to retry (we got a result)
+#   - a ReadTimeout: the call FAILED — the window was spent for zero
+#     result. Not retrying just drops the product from the audit.
+# When a timeout fires we've already lost the time; a single retry
+# has a real chance of producing an actual result, and a lost
+# product is worse than a slow audit. The retry stays inside the
+# already-held per-merchant + global semaphores (no concurrency
+# blow-out) and is bounded at one extra attempt — this is NOT the
+# per-query call multiplier the LLM-cost-safety rule guards against;
+# the retry only fires when a call has already failed, never on the
+# happy path. (Prod incident 2026-05-14: audit f33b6069 had many
+# products fail mid-audit on `ReadTimeout('')`.)
 _TRANSPORT_RETRY_EXCS = (
     httpx.RemoteProtocolError,
     httpx.ReadError,
     httpx.WriteError,
     httpx.ConnectError,
     httpx.NetworkError,
+    httpx.TimeoutException,
 )
 _RETRY_BACKOFF_S = 0.5
 
@@ -481,8 +496,12 @@ async def probe(
                         break
                     await asyncio.sleep(_RETRY_BACKOFF_S)
                 except httpx.HTTPError as exc:
-                    # Non-retryable httpx error (e.g. timeout, decoding) — surface
-                    # immediately with the exception class named so logs aren't blank.
+                    # Genuinely non-retryable httpx error — e.g. DecodingError,
+                    # TooManyRedirects. Timeouts + transport errors are caught
+                    # by the _TRANSPORT_RETRY_EXCS branch above; only what
+                    # falls through to here is unrecoverable. Surface
+                    # immediately with the exception class named so logs
+                    # aren't blank.
                     raise AgentCenterLlmClientError(
                         f"llm probe transport failed ({type(exc).__name__}): {exc!r}"
                     ) from exc
