@@ -581,32 +581,46 @@ def test_coerce_int_handles_thousands_suffix():
     assert _coerce_int(None) is None
 
 
+# The 3 prompt builders are now EXTRACTION prompts — they take a
+# `search_results` list (from SerpAPI) and embed it. A small fake stands
+# in for that list.
+_FAKE_RESULTS = [
+    {"title": "Grüns TikTok", "url": "https://tiktok.com/@grunsdaily",
+     "snippet": "120k followers"},
+]
+
+
 def test_own_presence_prompt_includes_handle_when_known():
-    p = _build_own_presence_prompt("Grüns", "tiktok", "grunsdaily")
+    p = _build_own_presence_prompt("Grüns", "tiktok", "grunsdaily", _FAKE_RESULTS)
     assert "Grüns" in p
     assert "@grunsdaily" in p
     assert "TikTok" in p
     assert "view_per_post_estimate" in p
+    assert "SEARCH RESULTS:" in p and "120k followers" in p  # results embedded
 
 
-def test_own_presence_prompt_falls_back_to_search_when_no_handle():
-    p = _build_own_presence_prompt("Grüns", "instagram", None)
-    assert "@" not in p.split("Their Instagram handle")[0]  # no handle clause
-    assert "Search for Grüns's official instagram account" in p
+def test_own_presence_prompt_falls_back_when_no_handle():
+    p = _build_own_presence_prompt("Grüns", "instagram", None, _FAKE_RESULTS)
+    assert "@" not in p.split("Identify Grüns")[0]  # no handle clause before it
+    assert "Identify Grüns's official instagram account" in p
     assert "engagement_rate_estimate" in p
 
 
 def test_kol_prompt_specifies_platform_and_band():
-    p = _build_kol_prompt("Grüns", "tiktok")
+    p = _build_kol_prompt("Grüns", "tiktok", _FAKE_RESULTS)
     assert "TikTok" in p
     assert "10k-1M follower band" in p
     assert "12 months" in p
+    assert "SEARCH RESULTS:" in p
 
 
 def test_competitive_prompt_lists_competitors():
-    p = _build_competitive_prompt("Grüns", ["Hiya", "First Day", "Olly"])
+    p = _build_competitive_prompt(
+        "Grüns", ["Hiya", "First Day", "Olly"], _FAKE_RESULTS,
+    )
     assert "Hiya, First Day, Olly" in p
     assert "Grüns" in p
+    assert "SEARCH RESULTS:" in p
 
 
 @pytest.mark.asyncio

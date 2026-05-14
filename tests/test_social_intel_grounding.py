@@ -1,35 +1,27 @@
-"""Social-intel grounding stability — transport retry and ungrounded
-telemetry.
+"""Social-intel grounding — search-then-extract pipeline.
 
 ## The problem
 
-The social sub-calls (own presence / KOL / competitive) run through
-`_gemini_grounded_call` with the `google_search` tool enabled — but the
-tool is model-discretionary. The model routinely answers social/KOL
-queries from internal knowledge WITHOUT searching: the response carries
-zero grounding chunks, PR-9's honesty gate (correctly) nulls every
-figure, and the merchant sees an empty section.
+The 3 social sub-calls (own presence / KOL / competitive) used to call
+Gemini with the `google_search` grounding tool. A 2026-05-14 prod
+diagnostic proved the model issues good search queries every call, but
+Gemini's grounding *retrieval* returns 0 chunks for 12/15 social calls.
+Three prior attempts (#530 prompt escalation, #531 gemini-2.5-pro, #533
+gemini-3-flash-preview) all failed — the model was never the bottleneck.
 
-Three levers were tried against this and ALL failed to move the grounded
-rate (see ~/tmp/social-grounding-check/verdict.md): PR #530's prompt
-escalation + ungrounded retry (0/13 recovery), PR #531's gemini-2.5-pro
-(~15%, flat), and PR #533's gemini-3-flash-preview (7%, worst). The
-bottleneck is `google_search` tool-discretion, not model tier or prompt
-wording — a structural fix is still open.
+## The fix this file covers
 
-What stays — and what this file covers:
+The social probes now run **search-then-extract**: deterministic SerpAPI
+search (`services.social_search_client`) → Gemini *extraction* call
+(`_gemini_extract_call`, no `google_search` tool). Grounding is now
+deterministic: "did the search return results?" `_search_then_extract`
+returns `(payload, search_status)` where status ∈ {ok, empty,
+transport_error} — so the honesty gate distinguishes "search found
+nothing" (`_FR_UNGROUNDED`) from "the call failed" (`_FR_TRANSPORT`).
 
-1. **`_GEMINI_SOCIAL_MODEL`** — the per-case model seam for the social
-   probes. Currently == `_GEMINI_MODEL` (flash); kept as the hook for the
-   planned model-orchestration layer (routing + outage fallback).
-2. **Transport retry** — `_gemini_grounded_call` retries a
-   transport/timeout failure once, with a 75s read budget. The bd_ social
-   path uses its own httpx client and never got #528's transport retry;
-   this is the same fix, here. `transport: ReadTimeout` was ~50% of bd_
-   calls before this; ~5% after (verified in prod, 2026-05-14).
-3. **Ungrounded telemetry** — `error_message="ungrounded"` on a
-   200-but-zero-grounding-chunks response. The feedback loop for whatever
-   structural grounding fix comes next.
+`_gemini_grounded_call` + `_grounding_chunk_count` are UNCHANGED — the 4
+non-social grounded callers still use them, and their transport-retry +
+ungrounded-telemetry tests stay valid (Part 2b / Part 3 below).
 """
 
 from __future__ import annotations
@@ -41,22 +33,33 @@ import httpx
 import pytest
 
 from services.bd_brand_signals import (
+    _EXTRACTION_DIRECTIVE,
+    _FR_TRANSPORT,
+    _FR_UNGROUNDED,
     _GEMINI_MODEL,
-    _GEMINI_SOCIAL_MODEL,
     _GROUNDING_DIRECTIVE,
+    _SEARCH_EMPTY,
+    _SEARCH_OK,
+    _SEARCH_TRANSPORT,
     _build_competitive_prompt,
     _build_kol_prompt,
     _build_own_presence_prompt,
+    _competitive_queries,
+    _gemini_extract_call,
     _gemini_grounded_call,
     _infer_competitive_social,
     _infer_kol_endorsements,
     _infer_own_presence,
+    _kol_queries,
+    _own_presence_queries,
+    _search_then_extract,
 )
 
 
-def _payload(text: str, *, grounded: bool) -> Dict[str, Any]:
-    """Gemini-shaped payload. `grounded` controls whether
-    groundingMetadata.groundingChunks is populated."""
+def _payload(text: str, *, grounded: bool = False) -> Dict[str, Any]:
+    """Gemini-shaped payload. `grounded` adds groundingMetadata — only
+    relevant to the legacy `_gemini_grounded_call` tests; the extraction
+    path ignores it."""
     candidate: Dict[str, Any] = {"content": {"parts": [{"text": text}]}}
     if grounded:
         candidate["groundingMetadata"] = {
@@ -67,92 +70,206 @@ def _payload(text: str, *, grounded: bool) -> Dict[str, Any]:
     return {"candidates": [candidate]}
 
 
+_RESULTS = [
+    {"title": "Beauty of Joseon (@beautyofjoseon_official) TikTok",
+     "url": "https://www.tiktok.com/@beautyofjoseon_official",
+     "snippet": "1.2M followers · skincare brand"},
+]
+
+
 # =========================================================================
-# Part 1 — prompt directives
+# Part 1 — extraction prompts + query builders
 # =========================================================================
 
 
-def test_prompts_carry_the_search_directive():
-    """Every social prompt carries the grounding directive that tells
-    the model it MUST search first. (The escalated retry variant was
-    removed with PR #530's retry — prompt escalation didn't ground.)"""
-    own = _build_own_presence_prompt("Beauty of Joseon", "tiktok", "boj")
-    kol = _build_kol_prompt("Beauty of Joseon", "instagram")
-    comp = _build_competitive_prompt("Beauty of Joseon", ["Drunk Elephant"])
+def test_extraction_prompts_embed_search_results():
+    """Every social prompt now embeds the real search-result snippets and
+    carries the EXTRACTION directive — not the legacy grounding one."""
+    own = _build_own_presence_prompt("Beauty of Joseon", "tiktok", "boj", _RESULTS)
+    kol = _build_kol_prompt("Beauty of Joseon", "instagram", _RESULTS)
+    comp = _build_competitive_prompt("Beauty of Joseon", ["Drunk Elephant"], _RESULTS)
     for prompt in (own, kol, comp):
-        assert _GROUNDING_DIRECTIVE in prompt
-        assert "MUST use web search" in prompt
+        assert _EXTRACTION_DIRECTIVE in prompt
+        assert _GROUNDING_DIRECTIVE not in prompt        # legacy directive gone
+        assert "SEARCH RESULTS:" in prompt
+        assert "beautyofjoseon_official" in prompt       # the snippet is embedded
+
+
+def test_query_builders_are_bounded_and_templated():
+    """The query builders are deterministic + bounded — no LLM call for
+    query generation, and the per-probe fan-out is capped."""
+    own = _own_presence_queries("Beauty of Joseon", "tiktok", "boj")
+    kol = _kol_queries("Beauty of Joseon", "instagram")
+    comp = _competitive_queries("Beauty of Joseon", ["A", "B", "C", "D", "E", "F"])
+    assert 1 <= len(own) <= 3 and "Beauty of Joseon" in own[0]
+    assert 1 <= len(kol) <= 3 and all("Beauty of Joseon" in q for q in kol)
+    assert len(comp) == 4                                # capped at 4 competitors
+    # own_presence drops the handle query when no handle is known
+    assert len(_own_presence_queries("X", "tiktok", None)) == 2
 
 
 # =========================================================================
-# Part 2a — model lever: social probes run on `_GEMINI_SOCIAL_MODEL`
+# Part 2a — the 3 social probes route through `_search_then_extract`
 # =========================================================================
 
 
 @pytest.mark.asyncio
-async def test_own_presence_uses_the_social_model():
-    """`_infer_own_presence` calls `_gemini_grounded_call` with the
-    social model — the stable flash tier grounds social queries poorly."""
-    mock = AsyncMock(return_value=_payload(
-        '{"follower_estimate": 5, "follower_band": "<10k"}', grounded=True,
+async def test_own_presence_routes_through_search_then_extract():
+    """`_infer_own_presence` calls `_search_then_extract` once with its
+    scan_mode + a non-empty query list + a callable extract_prompt_fn."""
+    mock = AsyncMock(return_value=(
+        _payload('{"follower_estimate": 5, "follower_band": "<10k"}'), _SEARCH_OK,
     ))
-    with patch("services.bd_brand_signals._gemini_grounded_call", mock):
-        await _infer_own_presence("Beauty of Joseon", "tiktok", "boj", "k")
+    with patch("services.bd_brand_signals._search_then_extract", mock):
+        out, reason = await _infer_own_presence("Beauty of Joseon", "tiktok", "boj", "k")
     assert mock.await_count == 1
     _, kwargs = mock.await_args
-    assert kwargs["model"] == _GEMINI_SOCIAL_MODEL
+    assert kwargs["scan_mode"] == "bd_own_presence"
+    assert kwargs["queries"] and isinstance(kwargs["queries"], list)
+    assert callable(kwargs["extract_prompt_fn"])
+    assert reason is None and out is not None
+
+
+@pytest.mark.asyncio
+async def test_kol_endorsements_routes_through_search_then_extract():
+    mock = AsyncMock(return_value=(
+        _payload('[{"creator_handle": "@x", "follower_band": "10k-100k"}]'),
+        _SEARCH_OK,
+    ))
+    with patch("services.bd_brand_signals._search_then_extract", mock):
+        await _infer_kol_endorsements("Beauty of Joseon", "instagram", "k")
+    assert mock.await_count == 1
+    _, kwargs = mock.await_args
+    assert kwargs["scan_mode"] == "bd_kol_endorsements"
+    assert kwargs["queries"]
+
+
+@pytest.mark.asyncio
+async def test_competitive_social_routes_through_search_then_extract():
+    mock = AsyncMock(return_value=(
+        _payload('[{"brand": "Drunk Elephant", "gap_summary": "ahead"}]'),
+        _SEARCH_OK,
+    ))
+    with patch("services.bd_brand_signals._search_then_extract", mock):
+        await _infer_competitive_social("Beauty of Joseon", ["Drunk Elephant"], "k")
+    assert mock.await_count == 1
+    _, kwargs = mock.await_args
+    assert kwargs["scan_mode"] == "bd_competitive_social"
+    assert kwargs["queries"]
+
+
+@pytest.mark.asyncio
+async def test_infer_transport_vs_empty_are_distinct():
+    """The 3-state search status maps correctly: transport_error →
+    `_FR_TRANSPORT` (retry-worthy), empty → `_FR_UNGROUNDED` (kol/comp
+    suppress wholesale). Guards against a search outage silently
+    degrading to 'nothing found'."""
+    # kol — transport vs empty
+    with patch("services.bd_brand_signals._search_then_extract",
+               AsyncMock(return_value=(None, _SEARCH_TRANSPORT))):
+        assert (await _infer_kol_endorsements("B", "tiktok", "k")) == (None, _FR_TRANSPORT)
+    with patch("services.bd_brand_signals._search_then_extract",
+               AsyncMock(return_value=(None, _SEARCH_EMPTY))):
+        assert (await _infer_kol_endorsements("B", "tiktok", "k")) == (None, _FR_UNGROUNDED)
+    # competitive — same mapping
+    with patch("services.bd_brand_signals._search_then_extract",
+               AsyncMock(return_value=(None, _SEARCH_TRANSPORT))):
+        assert (await _infer_competitive_social("B", ["C"], "k")) == (None, _FR_TRANSPORT)
+    with patch("services.bd_brand_signals._search_then_extract",
+               AsyncMock(return_value=(None, _SEARCH_EMPTY))):
+        assert (await _infer_competitive_social("B", ["C"], "k")) == (None, _FR_UNGROUNDED)
+
+
+@pytest.mark.asyncio
+async def test_own_presence_empty_search_nulls_metrics_but_surfaces_handle():
+    """own_presence on empty search: no extraction runs, every metric is
+    nulled, but a caller-supplied handle still surfaces — identical
+    outward behavior to the old '0 grounding chunks' path."""
+    with patch("services.bd_brand_signals._search_then_extract",
+               AsyncMock(return_value=(None, _SEARCH_EMPTY))):
+        out, reason = await _infer_own_presence("Beauty of Joseon", "tiktok", "boj", "k")
+    assert reason is None and out is not None            # surfaced, not suppressed
+    assert out["handle"] == "boj"
+    assert out["grounding"] == "ungrounded"
+    assert out["follower_estimate"] is None and out["follower_band"] is None
+
+
+# =========================================================================
+# Part 2b — `_search_then_extract` helper
+# =========================================================================
+
+
+@pytest.mark.asyncio
+async def test_search_then_extract_transport_short_circuits():
+    """search transport failure → (None, transport_error), extraction NOT called."""
+    extract = AsyncMock()
+    with patch("services.social_search_client.search_web_many",
+               AsyncMock(return_value=([], "transport_error"))), \
+         patch("services.bd_brand_signals._gemini_extract_call", extract):
+        result = await _search_then_extract(
+            queries=["q"], extract_prompt_fn=lambda r: "p",
+            scan_mode="bd_own_presence", api_key="k",
+        )
+    assert result == (None, _SEARCH_TRANSPORT)
+    extract.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_then_extract_empty_and_no_key_both_map_to_empty():
+    """search empty OR no_key → (None, empty); extraction NOT called."""
+    for status in ("empty", "no_key"):
+        extract = AsyncMock()
+        with patch("services.social_search_client.search_web_many",
+                   AsyncMock(return_value=([], status))), \
+             patch("services.bd_brand_signals._gemini_extract_call", extract):
+            result = await _search_then_extract(
+                queries=["q"], extract_prompt_fn=lambda r: "p",
+                scan_mode="bd_own_presence", api_key="k",
+            )
+        assert result == (None, _SEARCH_EMPTY)
+        extract.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_then_extract_ok_runs_extraction():
+    """search ok → extraction runs, prompt fn gets the results, payload returned."""
+    seen: Dict[str, Any] = {}
+    payload = _payload("{}")
+
+    def _prompt_fn(results):
+        seen["results"] = results
+        return "extract this"
+
+    with patch("services.social_search_client.search_web_many",
+               AsyncMock(return_value=(_RESULTS, "ok"))), \
+         patch("services.bd_brand_signals._gemini_extract_call",
+               AsyncMock(return_value=payload)) as extract:
+        result = await _search_then_extract(
+            queries=["q"], extract_prompt_fn=_prompt_fn,
+            scan_mode="bd_own_presence", api_key="k",
+        )
+    assert result == (payload, _SEARCH_OK)
+    assert seen["results"] == _RESULTS
+    _, kwargs = extract.await_args
     assert kwargs["scan_mode"] == "bd_own_presence"
 
 
 @pytest.mark.asyncio
-async def test_kol_endorsements_uses_the_social_model():
-    mock = AsyncMock(return_value=_payload(
-        '[{"creator_handle": "@x", "follower_band": "10k-100k"}]',
-        grounded=True,
-    ))
-    with patch("services.bd_brand_signals._gemini_grounded_call", mock):
-        await _infer_kol_endorsements("Beauty of Joseon", "instagram", "k")
-    assert mock.await_count == 1
-    _, kwargs = mock.await_args
-    assert kwargs["model"] == _GEMINI_SOCIAL_MODEL
-    assert kwargs["scan_mode"] == "bd_kol_endorsements"
-
-
-@pytest.mark.asyncio
-async def test_competitive_social_uses_the_social_model():
-    mock = AsyncMock(return_value=_payload(
-        '[{"brand": "Drunk Elephant", "gap_summary": "ahead"}]',
-        grounded=True,
-    ))
-    with patch("services.bd_brand_signals._gemini_grounded_call", mock):
-        await _infer_competitive_social(
-            "Beauty of Joseon", ["Drunk Elephant"], "k",
+async def test_search_then_extract_extraction_failure_is_transport():
+    """search ok but the extraction call returns None → (None, transport_error)."""
+    with patch("services.social_search_client.search_web_many",
+               AsyncMock(return_value=(_RESULTS, "ok"))), \
+         patch("services.bd_brand_signals._gemini_extract_call",
+               AsyncMock(return_value=None)):
+        result = await _search_then_extract(
+            queries=["q"], extract_prompt_fn=lambda r: "p",
+            scan_mode="bd_own_presence", api_key="k",
         )
-    assert mock.await_count == 1
-    _, kwargs = mock.await_args
-    assert kwargs["model"] == _GEMINI_SOCIAL_MODEL
-    assert kwargs["scan_mode"] == "bd_competitive_social"
-
-
-@pytest.mark.asyncio
-async def test_no_ungrounded_retry_fires():
-    """An ungrounded response is NOT retried — the ungrounded-retry
-    (PR #530) was removed: 0/13 recovery. Exactly one call; the honesty
-    gate takes it from there."""
-    mock = AsyncMock(return_value=_payload("{}", grounded=False))
-    with patch("services.bd_brand_signals._gemini_grounded_call", mock):
-        _result, reason = await _infer_own_presence(
-            "Beauty of Joseon", "tiktok", "boj", "k",
-        )
-    # exactly one call — no `_retry` follow-up
-    assert mock.await_count == 1
-    # ungrounded → honesty gate marks it (handle alone may still
-    # surface; the point asserted here is no retry, not the gate token)
-    assert reason in ("ungrounded", None)
+    assert result == (None, _SEARCH_TRANSPORT)
 
 
 # =========================================================================
-# Part 2b — transport retry inside `_gemini_grounded_call`
+# Part 2c — `_gemini_extract_call` (the extraction step)
 # =========================================================================
 
 
@@ -169,14 +286,14 @@ def _http_response(payload: Dict[str, Any]):
 
 class _RaisingClient:
     """httpx.AsyncClient stand-in. `.post()` raises `exc` for the first
-    `fail_times` calls, then returns `ok_response`. Counts post calls so
-    a test can assert how many attempts were made."""
+    `fail_times` calls, then returns `ok_response`."""
 
     def __init__(self, exc, fail_times, ok_response=None):
         self._exc = exc
         self._fail_times = fail_times
         self._ok = ok_response
         self.post_calls = 0
+        self.last_json = None
 
     def __call__(self, *a, **kw):
         return self
@@ -189,15 +306,75 @@ class _RaisingClient:
 
     async def post(self, url, **kwargs):
         self.post_calls += 1
+        self.last_json = kwargs.get("json")
         if self.post_calls <= self._fail_times:
             raise self._exc
         return self._ok
 
 
 @pytest.mark.asyncio
-async def test_transport_failure_retried_once_then_succeeds():
-    """A lone ReadTimeout is retried — attempt 2 succeeds → payload
-    returned, telemetry NOT marked failed."""
+async def test_extract_call_omits_google_search_tool_and_lifts_token_budget():
+    """`_gemini_extract_call` sends NO `tools` key (no google_search) and
+    a 4096 output-token budget (the MAX_TOKENS-bug fix)."""
+    client = _RaisingClient(
+        None, fail_times=0, ok_response=_http_response(_payload("{}")),
+    )
+    with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
+         patch("services.bd_brand_signals._record_bd_telemetry", AsyncMock()):
+        await _gemini_extract_call("prompt", api_key="k", scan_mode="bd_own_presence")
+    assert "tools" not in client.last_json
+    assert client.last_json["generationConfig"]["maxOutputTokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_extract_call_retries_transport_then_succeeds():
+    captured: Dict[str, Any] = {}
+
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+
+    client = _RaisingClient(
+        httpx.ReadTimeout("slow"), fail_times=1,
+        ok_response=_http_response(_payload("{}")),
+    )
+    with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
+         patch("services.bd_brand_signals._record_bd_telemetry", _capture), \
+         patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
+        result = await _gemini_extract_call("p", api_key="k", scan_mode="bd_own_presence")
+    assert result is not None
+    assert client.post_calls == 2
+    assert captured["status"] == "succeeded"
+    # the extraction call NEVER records "ungrounded" — groundedness is
+    # decided upstream by the search step.
+    assert captured["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_extract_call_transport_both_attempts_gives_up():
+    captured: Dict[str, Any] = {}
+
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+
+    client = _RaisingClient(httpx.ReadTimeout("slow"), fail_times=2)
+    with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
+         patch("services.bd_brand_signals._record_bd_telemetry", _capture), \
+         patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
+        result = await _gemini_extract_call("p", api_key="k", scan_mode="bd_own_presence")
+    assert result is None
+    assert client.post_calls == 2
+    assert captured["status"] == "failed"
+    assert captured["error_message"].startswith("transport:")
+
+
+# =========================================================================
+# Part 2d — `_gemini_grounded_call` transport retry (UNCHANGED — still
+# used by the 4 non-social grounded callers: retail/founder/corp/press)
+# =========================================================================
+
+
+@pytest.mark.asyncio
+async def test_grounded_call_transport_retried_once_then_succeeds():
     captured: Dict[str, Any] = {}
 
     async def _capture(**kwargs):
@@ -211,17 +388,15 @@ async def test_transport_failure_retried_once_then_succeeds():
          patch("services.bd_brand_signals._record_bd_telemetry", _capture), \
          patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
         result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_own_presence",
+            "prompt", api_key="k", scan_mode="bd_retail_presence",
         )
     assert result is not None
-    assert client.post_calls == 2  # retried once
+    assert client.post_calls == 2
     assert captured["status"] == "succeeded"
 
 
 @pytest.mark.asyncio
-async def test_transport_failure_both_attempts_gives_up():
-    """ReadTimeout on both attempts → None, telemetry status=failed with
-    a `transport:` error_message naming the exception class."""
+async def test_grounded_call_transport_both_attempts_gives_up():
     captured: Dict[str, Any] = {}
 
     async def _capture(**kwargs):
@@ -232,44 +407,29 @@ async def test_transport_failure_both_attempts_gives_up():
          patch("services.bd_brand_signals._record_bd_telemetry", _capture), \
          patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
         result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_own_presence",
+            "prompt", api_key="k", scan_mode="bd_retail_presence",
         )
     assert result is None
-    assert client.post_calls == 2  # one retry, then gave up
+    assert client.post_calls == 2
     assert captured["status"] == "failed"
-    assert captured["error_message"].startswith("transport:")
     assert "ReadTimeout" in captured["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_non_retryable_request_error_not_retried():
-    """A non-transient httpx.RequestError (e.g. UnsupportedProtocol) is
-    NOT retried — only transport/timeout errors are."""
-    captured: Dict[str, Any] = {}
-
-    async def _capture(**kwargs):
-        captured.update(kwargs)
-
-    client = _RaisingClient(
-        httpx.UnsupportedProtocol("bad scheme"), fail_times=2,
-    )
+async def test_grounded_call_non_retryable_request_error_not_retried():
+    client = _RaisingClient(httpx.UnsupportedProtocol("bad scheme"), fail_times=2)
     with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
-         patch("services.bd_brand_signals._record_bd_telemetry", _capture), \
+         patch("services.bd_brand_signals._record_bd_telemetry", AsyncMock()), \
          patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
         result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_own_presence",
+            "prompt", api_key="k", scan_mode="bd_retail_presence",
         )
     assert result is None
-    assert client.post_calls == 1  # no retry
-    assert captured["status"] == "failed"
+    assert client.post_calls == 1                        # no retry
 
 
 @pytest.mark.asyncio
-async def test_default_call_targets_the_default_model():
-    """A call that doesn't pass `model` hits the `_GEMINI_MODEL` endpoint.
-    (`_GEMINI_SOCIAL_MODEL` currently == `_GEMINI_MODEL`; once the
-    orchestration layer gives them distinct values, this guards that the
-    default path isn't accidentally routed onto the social model.)"""
+async def test_grounded_call_targets_the_default_model():
     captured_url: Dict[str, str] = {}
 
     class _UrlSpyClient(_RaisingClient):
@@ -290,7 +450,8 @@ async def test_default_call_targets_the_default_model():
 
 
 # =========================================================================
-# Part 3 — ungrounded telemetry (kept — the feedback loop)
+# Part 3 — `_gemini_grounded_call` ungrounded telemetry (UNCHANGED — still
+# the feedback loop for the non-social grounded callers)
 # =========================================================================
 
 
@@ -314,39 +475,37 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_telemetry_marks_ungrounded_response():
-    """A 200 response with zero grounding chunks → telemetry records
+async def test_grounded_call_marks_ungrounded_response():
+    """`_gemini_grounded_call`: a 200 with zero grounding chunks → telemetry
     error_message='ungrounded' (status stays 'succeeded')."""
     captured: Dict[str, Any] = {}
 
-    async def _capture_telemetry(**kwargs):
+    async def _capture(**kwargs):
         captured.update(kwargs)
 
-    fake_client = _FakeClient(_http_response(_payload("{}", grounded=False)))
-    with patch("services.bd_brand_signals.httpx.AsyncClient", fake_client), \
-         patch("services.bd_brand_signals._record_bd_telemetry", _capture_telemetry):
+    fake = _FakeClient(_http_response(_payload("{}", grounded=False)))
+    with patch("services.bd_brand_signals.httpx.AsyncClient", fake), \
+         patch("services.bd_brand_signals._record_bd_telemetry", _capture):
         result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_own_presence",
+            "prompt", api_key="k", scan_mode="bd_retail_presence",
         )
-    assert result is not None  # the payload is still returned
+    assert result is not None
     assert captured["status"] == "succeeded"
     assert captured["error_message"] == "ungrounded"
 
 
 @pytest.mark.asyncio
-async def test_telemetry_clean_on_grounded_response():
-    """A 200 response WITH grounding chunks → telemetry records
-    error_message=None (clean grounded success)."""
+async def test_grounded_call_clean_on_grounded_response():
     captured: Dict[str, Any] = {}
 
-    async def _capture_telemetry(**kwargs):
+    async def _capture(**kwargs):
         captured.update(kwargs)
 
-    fake_client = _FakeClient(_http_response(_payload("{}", grounded=True)))
-    with patch("services.bd_brand_signals.httpx.AsyncClient", fake_client), \
-         patch("services.bd_brand_signals._record_bd_telemetry", _capture_telemetry):
+    fake = _FakeClient(_http_response(_payload("{}", grounded=True)))
+    with patch("services.bd_brand_signals.httpx.AsyncClient", fake), \
+         patch("services.bd_brand_signals._record_bd_telemetry", _capture):
         result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_own_presence",
+            "prompt", api_key="k", scan_mode="bd_retail_presence",
         )
     assert result is not None
     assert captured["status"] == "succeeded"
