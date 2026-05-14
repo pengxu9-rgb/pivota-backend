@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 _SITEMAP_FETCH_TIMEOUT_S = 8.0
 _SITEMAP_MAX_BYTES = 5_000_000  # 5 MB — most sitemaps are <1 MB
+_HOMEPAGE_FETCH_TIMEOUT_S = 6.0
+_HOMEPAGE_MAX_BYTES = 2_000_000  # 2 MB — only the <head> + nav links matter
 
 # Gemini grounded API — same shape used by gemini_url_validator.py +
 # bd_brand_category_inferrer.py. No new SDK dep.
@@ -510,6 +512,45 @@ async def _fetch_robots_txt(base_url: str) -> Optional[str]:
             if r.status_code != 200:
                 return None
             return r.text
+    except (httpx.TimeoutException, httpx.RequestError):
+        return None
+
+
+async def _fetch_homepage_html(domain: str) -> Optional[str]:
+    """Best-effort fetch of a merchant's homepage HTML, used as the
+    handle-detection fallback for social intelligence.
+
+    The cold-start flow already has homepage HTML in hand (it fetches
+    it for the whole brand-signals extraction). But `run_brand_report`
+    — the main audit path — doesn't, so it passed `detected_handles=None`
+    into `infer_social_intelligence` and the social probes never had a
+    handle to anchor on. The PR-8 prod run showed both TikTok +
+    Instagram own_presence entries with handle:null as a result.
+
+    This helper lets `infer_social_intelligence` self-serve a homepage
+    fetch when no handles were threaded in. One cheap HTTP GET (not a
+    Gemini call); failure returns None and the social probes fall back
+    to "search for the brand's account" prompting as before.
+    """
+    if not domain or not domain.strip():
+        return None
+    d = domain.strip()
+    if not d.startswith(("http://", "https://")):
+        d = "https://" + d
+    try:
+        async with httpx.AsyncClient(
+            timeout=_HOMEPAGE_FETCH_TIMEOUT_S,
+            follow_redirects=True,
+        ) as client:
+            r = await client.get(
+                d, headers={"User-Agent": "Pivota-BD-Audit/1.0"},
+            )
+            if r.status_code != 200:
+                return None
+            # Cap the body — only the <head> meta + nav/footer social
+            # links matter for handle extraction; no need to hold a
+            # multi-MB product-grid homepage in memory.
+            return r.text[:_HOMEPAGE_MAX_BYTES]
     except (httpx.TimeoutException, httpx.RequestError):
         return None
 
@@ -1619,8 +1660,21 @@ async def infer_social_intelligence(
     if not brand or not brand.strip() or not domain or not domain.strip():
         return empty
 
-    tt_handle = _detected_handle(detected_handles or [], "tiktok")
-    ig_handle = _detected_handle(detected_handles or [], "instagram")
+    # Handle-detection fallback. The cold-start flow threads
+    # `detected_handles` (scraped from homepage HTML it already
+    # fetched). The main audit path (run_brand_report) passes None —
+    # so when no handles were threaded in, self-serve a homepage
+    # fetch + scrape here. Without this, the social probes get
+    # handle=None and the PR-8 prod run's "handle:null everywhere"
+    # is the result. One cheap HTTP GET; failure → handles stay None
+    # and the probes fall back to "search for the account" prompting.
+    handles = list(detected_handles or [])
+    if not handles:
+        homepage_html = await _fetch_homepage_html(domain)
+        if homepage_html:
+            handles = _extract_social_handles(homepage_html)
+    tt_handle = _detected_handle(handles, "tiktok")
+    ig_handle = _detected_handle(handles, "instagram")
     competitors = [c for c in (competitor_brands or []) if isinstance(c, str) and c.strip()]
 
     # Base coros — own presence + KOL endorsements. Fixed indices 0-3.
