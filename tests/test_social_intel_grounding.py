@@ -1,32 +1,35 @@
-"""Social-intel grounding stability — model tier, transport retry, and
-ungrounded telemetry.
+"""Social-intel grounding stability — transport retry and ungrounded
+telemetry.
 
 ## The problem
 
 The social sub-calls (own presence / KOL / competitive) run through
 `_gemini_grounded_call` with the `google_search` tool enabled — but the
-tool is model-discretionary. On `gemini-2.5-flash` the model routinely
-answered social/KOL queries from internal knowledge WITHOUT searching:
-the response carried zero grounding chunks, PR-9's honesty gate
-(correctly) nulled every figure, and the merchant saw an empty section.
+tool is model-discretionary. The model routinely answers social/KOL
+queries from internal knowledge WITHOUT searching: the response carries
+zero grounding chunks, PR-9's honesty gate (correctly) nulls every
+figure, and the merchant sees an empty section.
 
-PR #530 tried to fix this with prompt escalation + an ungrounded retry.
-Measured 2026-05-14: it recovered 0 of 13 ungrounded attempts. Prompt
-escalation does not move a model that decided not to search. Two changes
-replaced it (see ~/tmp/social-grounding-check/verdict.md):
+Three levers were tried against this and ALL failed to move the grounded
+rate (see ~/tmp/social-grounding-check/verdict.md): PR #530's prompt
+escalation + ungrounded retry (0/13 recovery), PR #531's gemini-2.5-pro
+(~15%, flat), and PR #533's gemini-3-flash-preview (7%, worst). The
+bottleneck is `google_search` tool-discretion, not model tier or prompt
+wording — a structural fix is still open.
 
-1. **Model lever** — social probes use `_GEMINI_SOCIAL_MODEL`, a model
-   chosen to ground social/KOL queries better than the stable 2.5-flash.
-   (gemini-2.5-pro was tried first, PR #531, and reverted — it didn't
-   move the rate; the current pick is a newer flash generation.)
-   Non-social bd_ probes (retail / founder / press) stay on 2.5-flash.
+What stays — and what this file covers:
+
+1. **`_GEMINI_SOCIAL_MODEL`** — the per-case model seam for the social
+   probes. Currently == `_GEMINI_MODEL` (flash); kept as the hook for the
+   planned model-orchestration layer (routing + outage fallback).
 2. **Transport retry** — `_gemini_grounded_call` retries a
-   transport/timeout failure once. The bd_ social path uses its own
-   httpx client and never got #528's transport retry; this is the same
-   fix, here. `transport: ReadTimeout` was 43% of bd_ calls on 2026-05-14.
-
-The ungrounded telemetry (`error_message="ungrounded"` on a
-200-but-zero-grounding-chunks response) is kept — it's the feedback loop.
+   transport/timeout failure once, with a 75s read budget. The bd_ social
+   path uses its own httpx client and never got #528's transport retry;
+   this is the same fix, here. `transport: ReadTimeout` was ~50% of bd_
+   calls before this; ~5% after (verified in prod, 2026-05-14).
+3. **Ungrounded telemetry** — `error_message="ungrounded"` on a
+   200-but-zero-grounding-chunks response. The feedback loop for whatever
+   structural grounding fix comes next.
 """
 
 from __future__ import annotations
@@ -262,9 +265,11 @@ async def test_non_retryable_request_error_not_retried():
 
 
 @pytest.mark.asyncio
-async def test_default_model_is_flash():
-    """Callers that don't pass `model` (retail / founder / press) stay on
-    flash — only the social probes opt into Pro."""
+async def test_default_call_targets_the_default_model():
+    """A call that doesn't pass `model` hits the `_GEMINI_MODEL` endpoint.
+    (`_GEMINI_SOCIAL_MODEL` currently == `_GEMINI_MODEL`; once the
+    orchestration layer gives them distinct values, this guards that the
+    default path isn't accidentally routed onto the social model.)"""
     captured_url: Dict[str, str] = {}
 
     class _UrlSpyClient(_RaisingClient):
@@ -281,8 +286,7 @@ async def test_default_model_is_flash():
         await _gemini_grounded_call(
             "prompt", api_key="k", scan_mode="bd_retail_presence",
         )
-    assert _GEMINI_MODEL in captured_url["url"]
-    assert _GEMINI_SOCIAL_MODEL not in captured_url["url"]
+    assert f"/models/{_GEMINI_MODEL}:" in captured_url["url"]
 
 
 # =========================================================================
