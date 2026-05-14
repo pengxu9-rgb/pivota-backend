@@ -2253,9 +2253,12 @@ def test_competitive_pressure_framing_when_no_peers_first_party_visible() -> Non
     assert "third-party hosts" in framing
 
 
-def test_competitive_pressure_brand_discriminator_handles_multiword_brands() -> None:
-    """Heuristic must match multi-word brands like 'Beauty of Joseon' →
-    'beautyofjoseon.com' via longest-word discriminator (joseon)."""
+def test_competitive_pressure_peer_host_match_handles_multiword_brands() -> None:
+    """The peer-host matcher (post-#525 N6 fix) must still match
+    multi-word brands to their D2C domain: 'Beauty of Joseon' →
+    'beautyofjoseon.com', 'PEACH & LILY' → 'peachandlily.com'. Every
+    significant brand word must appear in the host segment AND cover
+    >=60% of it — both these brands clear that bar."""
     runs = [
         _category_run_with_competitors_and_hosts(
             "best face masks 2026",
@@ -2266,9 +2269,75 @@ def test_competitive_pressure_brand_discriminator_handles_multiword_brands() -> 
     cp = _report_with_competitive_data(runs)["competitive_pressure"]
     fp = cp["peers_with_first_party_visibility"]
     fp_brands = {p["brand"] for p in fp}
-    # Both should be detected
     assert "Beauty of Joseon" in fp_brands
     assert "PEACH & LILY" in fp_brands
+
+
+def test_competitive_pressure_rejects_fabricated_peer_host_pairing() -> None:
+    """N6 regression (post-#525 codex review P1). Pre-fix the matcher
+    took the single longest brand word and loose-substring-matched it:
+    competitor 'YSE Beauty' → discriminator 'beauty' → matched the
+    MERCHANT's own 'beautyofjoseon.com'. The report then claimed
+    "YSE Beauty (beautyofjoseon.com)" as a peer-with-first-party-
+    visibility — a fabricated pairing.
+
+    Post-fix: 'yse' is not a substring of 'beautyofjoseon', so the
+    all-words rule rejects it. And even if it did partially match,
+    beautyofjoseon.com is the merchant's own domain (merchant brand
+    'Beauty of Joseon') so it's excluded from peer matching outright."""
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best face masks 2026",
+            competitors=["YSE Beauty", "Origins"],
+            hosts=["beautyofjoseon.com", "origins.com"],
+        ),
+    ]
+    # Merchant in _report_with_competitive_data is "TestBrand" — use a
+    # dedicated builder so the merchant brand is "Beauty of Joseon",
+    # making beautyofjoseon.com the merchant's OWN domain.
+    from services.agent_center_bd_report_service import build_structured_report
+    report = build_structured_report(
+        merchant_name="Beauty of Joseon",
+        merchant_pdp_url="https://agent.pivota.cc/products/sig_x",
+        product_title="Test Product",
+        product_vendor="Beauty of Joseon",
+        product_type="face mask",
+        visibility_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        attribution_result={"provider": "gemini", "scores": {"visibility_score": 0}, "raw_runs": []},
+        category_visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 0},
+            "raw_runs": runs,
+        },
+        provider="gemini",
+    )
+    cp = report["competitive_pressure"]
+    fp_brands = {p["brand"] for p in cp["peers_with_first_party_visibility"]}
+    fp_hosts = {p["first_party_host"] for p in cp["peers_with_first_party_visibility"]}
+    # YSE Beauty must NOT be paired with beautyofjoseon.com.
+    assert "YSE Beauty" not in fp_brands, (
+        "YSE Beauty falsely matched a host — N6 fabricated pairing regressed"
+    )
+    # The merchant's own domain must never appear as a peer host.
+    assert "beautyofjoseon.com" not in fp_hosts
+    # Origins → origins.com is a legitimate match and should survive.
+    assert "Origins" in fp_brands
+
+
+def test_competitive_pressure_generic_word_brand_does_not_overmatch() -> None:
+    """A brand whose only significant word is a generic category term
+    must not claim a much longer unrelated host. 'Glow Co' → 'glow'
+    is in 'glowrecipe' but covers only 4/9 chars (<60%) → rejected."""
+    runs = [
+        _category_run_with_competitors_and_hosts(
+            "best serums 2026",
+            competitors=["Glow Co"],
+            hosts=["glowrecipe.com"],
+        ),
+    ]
+    cp = _report_with_competitive_data(runs)["competitive_pressure"]
+    fp_brands = {p["brand"] for p in cp["peers_with_first_party_visibility"]}
+    assert "Glow Co" not in fp_brands
 
 
 def test_render_markdown_includes_competitive_pressure_section() -> None:

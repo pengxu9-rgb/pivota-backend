@@ -466,3 +466,39 @@ def test_parent_task_migration_and_schema_guard_self_heal_exist():
     assert "idx_merchant_tasks_parent_task" in migration_text
     assert "ADD COLUMN IF NOT EXISTS parent_task_id UUID NULL" in guard_text
     assert "idx_merchant_tasks_parent_task" in guard_text
+
+
+@pytest.mark.asyncio
+async def test_find_executor_parent_candidates_excludes_superseded(monkeypatch):
+    """P1 (post-#525 codex review): find_executor_parent_task_candidates
+    must exclude status='superseded' rows. If a newer audit run
+    superseded the parent action between executor dispatch and
+    materialization, linking the child to the stale parent orphans it
+    under a task the merchant no longer sees.
+
+    Captures the compiled query and asserts the superseded exclusion
+    is in the WHERE clause."""
+    import db.merchant_tasks as mt
+
+    captured = {}
+
+    async def _fake_fetch_all(query):
+        captured["sql"] = str(query)
+        return []
+
+    async def _noop_ensure():
+        return None
+
+    monkeypatch.setattr(mt.database, "fetch_all", _fake_fetch_all)
+    monkeypatch.setattr(mt, "ensure_merchant_tasks_table", _noop_ensure)
+
+    await mt.find_executor_parent_task_candidates(
+        merchant_id="merchant-1",
+        parent_audit_run_id="audit-1",
+        lever="content_creation",
+    )
+    sql = captured["sql"].lower()
+    # The status filter must be present in the compiled query.
+    assert "status" in sql and "superseded" in sql, (
+        f"superseded exclusion missing from query: {captured['sql']}"
+    )

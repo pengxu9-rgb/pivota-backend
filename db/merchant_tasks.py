@@ -393,6 +393,14 @@ async def find_executor_parent_task_candidates(
     Executor-produced rows have source_executor_run_id set; parent
     audit action rows do not. The service layer applies the
     host/topic/title fingerprint after this scoped lookup.
+
+    Excludes `superseded` rows: if a newer audit run replaced the
+    parent action between executor dispatch and materialization
+    (PR-2 supersession), linking the executor's child task to the
+    stale parent would orphan it under a task the merchant no longer
+    sees. Better to leave the child standalone (parent_task_id=None,
+    the existing no-match back-compat path) than to link a dead
+    parent. Surfaced by the post-#525 codex review (P1).
     """
     await ensure_merchant_tasks_table()
     try:
@@ -400,6 +408,7 @@ async def find_executor_parent_task_candidates(
             merchant_tasks.c.merchant_id == merchant_id,
             merchant_tasks.c.parent_audit_run_id == parent_audit_run_id,
             merchant_tasks.c.source_executor_run_id.is_(None),
+            merchant_tasks.c.status != "superseded",
         )
         if lever is None:
             q = q.where(merchant_tasks.c.lever.is_(None))

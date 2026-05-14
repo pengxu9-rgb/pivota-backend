@@ -614,19 +614,48 @@ def extract_category_competitors(
 # ---------------------------------------------------------------------------
 
 
-def _brand_discriminator(brand_name: str) -> Optional[str]:
-    """Pick the longest >=4-char alphanumeric word from the brand name to
-    use as a discriminator when matching against retailer hostnames.
-    e.g. "Beauty of Joseon" → "joseon"; "The Ordinary" → "ordinary";
-    "PEACH & LILY" → "peach" (passes through 'peachandlily' first segment)."""
+def _brand_significant_words(brand_name: str) -> List[str]:
+    """Lowercased alphanumeric words >=3 chars from a brand name.
+    "Beauty of Joseon" → ["beauty", "joseon"] ("of" dropped);
+    "YSE Beauty" → ["yse", "beauty"]; "PEACH & LILY" → ["peach", "lily"]."""
     if not brand_name:
-        return None
+        return []
     import re as _re
     words = _re.findall(r"\w+", brand_name.lower())
-    long_words = [w for w in words if len(w) >= 4]
-    if not long_words:
-        return None
-    return max(long_words, key=len)
+    return [w for w in words if len(w) >= 3]
+
+
+def _brand_matches_host_segment(brand_name: str, host_first_segment: str) -> bool:
+    """N6 fix (post-#525 codex review P1). Decide whether a competitor
+    brand name plausibly OWNS a hostname's first segment.
+
+    The pre-fix heuristic took the single longest brand word and did a
+    loose substring check (`"beauty" in "beautyofjoseon"`), so a
+    competitor "YSE Beauty" got falsely matched to the merchant's own
+    "beautyofjoseon.com" — fabricated peer-host pairing in BD prose.
+
+    Tightened rule — BOTH must hold:
+      1. EVERY significant brand word (>=3 chars) is a substring of the
+         host's first segment. ("YSE Beauty" → "yse" is not in
+         "beautyofjoseon" → reject.)
+      2. The brand words cover >=60% of the host segment's length, so a
+         brand whose only real word is a generic category term
+         ("Beauty Co" → "beauty" = 6/14 of "beautyofjoseon") can't
+         claim a much longer unrelated host.
+
+    Still a heuristic (a canonical brand→domain entity map is the P2
+    follow-up), but it kills the false-positive class the review flagged
+    while keeping true positives: "Beauty of Joseon"→beautyofjoseon.com,
+    "PEACH & LILY"→peachandlily.com, "Origins"→origins.com.
+    """
+    words = _brand_significant_words(brand_name)
+    seg = (host_first_segment or "").lower()
+    if not words or not seg:
+        return False
+    if not all(w in seg for w in words):
+        return False
+    covered = sum(len(w) for w in words)
+    return covered / len(seg) >= 0.6
 
 
 def _build_competitive_pressure(
@@ -643,9 +672,10 @@ def _build_competitive_pressure(
       - peers_named: every competitor brand AI agents name when consumers
         ask about this category. Sorted by mention count.
       - peers_with_first_party_visibility: subset whose .com is cited in
-        Gemini grounding for those same category queries. Heuristic match
-        — see _brand_discriminator. The presence of even ONE such peer
-        is the BD pressure point.
+        Gemini grounding for those same category queries. Match via
+        _brand_matches_host_segment (all-words + 60%-coverage; the
+        merchant's own domains are excluded). The presence of even ONE
+        such peer is the BD pressure point.
 
     The framing string below tells the right story for both cases:
       (a) some peers are first-party visible — urgent: "every retailer-
@@ -657,16 +687,31 @@ def _build_competitive_pressure(
     peers_named = list(category_competitor_brands or [])
     retailer_hosts = _copyworthy_cited_hosts(category_retailer_hosts)
 
+    # N6 fix: a peer can't be "first-party visible" via the MERCHANT's
+    # own domain. The merchant's host set is derived from merchant_brand
+    # + merchant_host (the latter is `agent.pivota.cc` for external_seed
+    # audits, so the brand-derived candidates are what actually protect
+    # the real D2C domain — same shape as the PR-7 rollup exclusion).
+    _merchant_own_hosts = _own_host_set(merchant_brand, merchant_host)
+
+    def _normalize_host(h: str) -> str:
+        n = (h or "").strip().lower().lstrip(".")
+        return n[4:] if n.startswith("www.") else n
+
     peers_with_fp: List[Dict[str, Any]] = []
     for peer in peers_named:
         brand = peer.get("name") or ""
-        disc = _brand_discriminator(brand)
-        if not disc:
+        if not _brand_significant_words(brand):
             continue
         for host_entry in retailer_hosts:
             host = (host_entry.get("host") or "").lower()
-            first_segment = host.split(".")[0] if host else ""
-            if disc in first_segment:
+            if not host:
+                continue
+            # Never let a peer claim the merchant's own domain.
+            if _normalize_host(host) in _merchant_own_hosts:
+                continue
+            first_segment = host.split(".")[0]
+            if _brand_matches_host_segment(brand, first_segment):
                 peers_with_fp.append({
                     "brand": brand,
                     "first_party_host": host_entry.get("host"),
@@ -696,9 +741,10 @@ def _build_competitive_pressure(
                 for p in peers_with_fp[:3]
             )
             + (
-                f". The peer-host match is heuristic (longest brand "
-                f"word vs hostname first segment), so a few of these "
-                f"may be coincidental. Your URL appears in "
+                f". The peer-host match requires every brand word to "
+                f"appear in the hostname (the merchant's own domains "
+                f"are excluded), so a coincidental pairing is unlikely "
+                f"but not impossible. Your URL appears in "
                 f"{merchant_attribution_score}% of buyer-intent queries."
                 if not merchant_first_party_visible
                 else f". Your own URL also appeared in grounding "
