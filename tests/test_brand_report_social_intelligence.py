@@ -323,3 +323,87 @@ def test_does_not_render_social_section_when_field_null():
     report = _brand_report_with_social(None)
     md = render_brand_markdown(report)
     assert "## Social channel intelligence" not in md
+
+
+def test_renders_competitor_benchmark_table():
+    """PR-10: competitor_presence renders a brand-vs-competitor
+    benchmark table — the merchant's own row plus a row per
+    benchmarked competitor, follower counts from the same probe."""
+    report = _brand_report_with_social({
+        "own_presence": {
+            "tiktok": {"handle": "beautyofjoseon", "follower_estimate": 662000},
+            "instagram": {"handle": "boj", "follower_estimate": 1210000},
+        },
+        "kol_endorsements": {"tiktok": None, "instagram": None},
+        "competitive_comparison": None,
+        "competitor_presence": {
+            "Drunk Elephant": {
+                "tiktok": {"handle": "drunkelephant", "follower_estimate": 510000},
+                "instagram": {"handle": "drunkelephant", "follower_estimate": 1800000},
+            },
+            "Glow Recipe": {
+                "tiktok": {"handle": "glowrecipe", "follower_band": "100k-1M"},
+                "instagram": None,
+            },
+        },
+        "available": True,
+    })
+    md = render_brand_markdown(report)
+    assert "Brand vs. competitor social benchmark" in md
+    # Merchant's own row, marked "(you)".
+    assert "(you)" in md
+    assert "662000" in md
+    # Competitor rows.
+    assert "Drunk Elephant" in md
+    assert "510000" in md
+    assert "Glow Recipe" in md
+    # Glow Recipe instagram is None → renders as "—".
+    # Glow Recipe tiktok has only a band → renders the band.
+    assert "100k-1M" in md
+
+
+def test_competitor_benchmark_shows_not_verified_for_ungrounded():
+    """PR-9 + PR-10 interaction: an ungrounded competitor probe has
+    nulled metrics — the benchmark table shows "not verified" rather
+    than a fabricated number."""
+    report = _brand_report_with_social({
+        "own_presence": {
+            "tiktok": {"handle": "beautyofjoseon", "follower_estimate": 662000},
+            "instagram": None,
+        },
+        "kol_endorsements": {"tiktok": None, "instagram": None},
+        "competitive_comparison": None,
+        "competitor_presence": {
+            "Drunk Elephant": {
+                "tiktok": {
+                    "handle": "drunkelephant",
+                    "follower_estimate": None,
+                    "follower_band": None,
+                    "grounding": "ungrounded",
+                },
+                "instagram": None,
+            },
+        },
+        "available": True,
+    })
+    md = render_brand_markdown(report)
+    assert "Brand vs. competitor social benchmark" in md
+    assert "not verified" in md
+
+
+def test_does_not_render_competitor_benchmark_when_absent():
+    """No competitor_presence → no benchmark table, but the rest of
+    the social section still renders."""
+    report = _brand_report_with_social({
+        "own_presence": {
+            "tiktok": {"handle": "beautyofjoseon", "follower_estimate": 662000},
+            "instagram": None,
+        },
+        "kol_endorsements": {"tiktok": None, "instagram": None},
+        "competitive_comparison": None,
+        "competitor_presence": None,
+        "available": True,
+    })
+    md = render_brand_markdown(report)
+    assert "## Social channel intelligence" in md
+    assert "Brand vs. competitor social benchmark" not in md

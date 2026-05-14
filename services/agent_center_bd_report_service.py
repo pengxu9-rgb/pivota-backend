@@ -5653,6 +5653,51 @@ def render_brand_markdown(
                     f"({k.get('follower_band', '?')}) — "
                     f"{k.get('post_summary', 'post summary not available')}\n"
                 )
+        # PR-10: brand-vs-competitor benchmark table. This is the
+        # PRIMARY benchmark — apples-to-apples follower counts because
+        # the merchant AND each competitor were measured by the same
+        # `_infer_own_presence` probe (PR-9's grounding gate applied
+        # to each). A merchant's "662k TikTok" only means something
+        # next to a peer's number.
+        competitor_presence = social.get("competitor_presence") or {}
+        if competitor_presence:
+            sections.append(
+                "\n**Brand vs. competitor social benchmark:** "
+                "_(follower counts measured by the same grounded lookup "
+                "for every brand — blank = the lookup couldn't ground a "
+                "verified number)_\n"
+            )
+
+            def _followers(p: Optional[Dict[str, Any]]) -> str:
+                if not p:
+                    return "—"
+                # PR-9: an ungrounded probe has all metrics nulled.
+                return str(
+                    p.get("follower_estimate")
+                    or p.get("follower_band")
+                    or "not verified"
+                )
+
+            rows = ["| Brand | TikTok | Instagram |", "|---|---|---|"]
+            # Merchant's own row first — the baseline being benchmarked.
+            merchant_label = brand_report.get("merchant_name") or "Your brand"
+            rows.append(
+                f"| **{merchant_label}** (you) "
+                f"| {_followers(tt)} | {_followers(ig)} |"
+            )
+            for comp_name, comp in competitor_presence.items():
+                comp = comp or {}
+                rows.append(
+                    f"| {comp_name} "
+                    f"| {_followers(comp.get('tiktok'))} "
+                    f"| {_followers(comp.get('instagram'))} |"
+                )
+            sections.append("\n".join(rows) + "\n")
+
+        # Secondary narrative layer — the single-call competitive
+        # comparison's gap_summary prose. Kept below the benchmark
+        # table because it's the less-reliable signal (one call
+        # covering N brands; came back null in the PR-8 prod run).
         competitive = social.get("competitive_comparison") or []
         if competitive:
             sections.append("\n**Competitive social comparison:**\n")
