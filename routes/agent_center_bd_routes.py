@@ -277,6 +277,13 @@ class BdBrandReportRequest(BaseModel):
     provider: str = Field("gemini")
     max_runs: int = Field(3, ge=1, le=_HARD_MAX_RUNS)
     include_category_visibility: bool = Field(True)
+    # PR-8 (Option A step 3): opt-in to bd_brand_signals social
+    # intelligence — 4-5 additional grounded Gemini calls per audit
+    # to surface brand TikTok/Instagram presence + KOL endorsements
+    # + competitive social comparison. Off by default until staging
+    # load-test confirms the per-tenant semaphore handles the bump
+    # (LLM-multiplier-safety rule, PR #278 incident).
+    include_social_intelligence: bool = Field(False)
 
     @validator("provider")
     def _provider_allowed(cls, v: str) -> str:
@@ -311,6 +318,7 @@ async def brand_report(
             provider=body.provider,
             max_runs=body.max_runs,
             include_category_visibility=body.include_category_visibility,
+            include_social_intelligence=body.include_social_intelligence,
         )
     except Exception as exc:
         raise _map_error(exc) from exc
