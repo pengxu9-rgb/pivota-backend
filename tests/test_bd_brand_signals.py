@@ -480,25 +480,37 @@ def test_parse_gemini_text_handles_empty_response():
     assert _parse_gemini_text({}) is None
 
 
+# Non-social prompts are now EXTRACTION prompts — they take a
+# `search_results` list (from SerpAPI) and embed it.
+_FAKE_BC_RESULTS = [
+    {"title": "Grüns at Target",
+     "url": "https://target.com/grüns",
+     "snippet": "Available at Target stores nationwide"},
+]
+
+
 def test_retail_prompt_mentions_brand_and_domain():
-    p = _build_retail_prompt("Grüns", "gruns.co")
+    p = _build_retail_prompt("Grüns", "gruns.co", _FAKE_BC_RESULTS)
     assert "Grüns" in p
     assert "gruns.co" in p
     assert "JSON array" in p
+    assert "SEARCH RESULTS:" in p and "target.com" in p
 
 
 def test_founder_prompt_requests_origin_story():
-    p = _build_founder_prompt("Acme", "acme.co")
+    p = _build_founder_prompt("Acme", "acme.co", _FAKE_BC_RESULTS)
     assert "Acme" in p
     assert "founders" in p
     assert "founding_year" in p
     assert "origin_story" in p
+    assert "SEARCH RESULTS:" in p
 
 
 def test_press_prompt_requests_12_month_window():
-    p = _build_press_prompt("Acme", "acme.co")
+    p = _build_press_prompt("Acme", "acme.co", _FAKE_BC_RESULTS)
     assert "12 months" in p
     assert "publication" in p
+    assert "SEARCH RESULTS:" in p
 
 
 @pytest.mark.asyncio
