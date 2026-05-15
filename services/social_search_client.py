@@ -30,10 +30,12 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 # Telemetry identifiers — provider/scan_mode values are lowercase
-# snake_case per the llm_probe_runs convention. The `bd_social_search`
-# empty-rate is the replacement KPI for the retired `ungrounded` rate.
+# snake_case per the llm_probe_runs convention. The `bd_search` empty-rate
+# is the replacement KPI for the retired `ungrounded` rate. Originally
+# named `bd_social_search` when only the 3 social probes used it (#535);
+# renamed when the 4 non-social probes joined (#536 follow-up).
 _SEARCH_PROVIDER = "serpapi"
-_SEARCH_SCAN_MODE = "bd_social_search"
+_SEARCH_SCAN_MODE = "bd_search"
 
 _SEARCH_TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
 # Mirror bd_brand_signals._GEMINI_TRANSPORT_RETRY_EXCS — transient
@@ -90,7 +92,7 @@ async def _record_search_telemetry(
 ) -> None:
     """Best-effort telemetry for one SerpAPI call. SerpAPI cost is not
     metered here (cost_usd=None); the row captures latency + status + the
-    empty/transport signal. The `bd_social_search` empty-rate
+    empty/transport signal. The `bd_search` empty-rate
     (error_message='empty_search') is the replacement health KPI for the
     retired `ungrounded` rate."""
     try:

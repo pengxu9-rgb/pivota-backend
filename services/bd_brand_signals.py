@@ -780,48 +780,6 @@ def _parse_gemini_text(payload: Dict[str, Any]) -> Optional[str]:
     return "\n".join(chunks).strip() or None
 
 
-def _grounding_chunk_count(payload: Optional[Dict[str, Any]]) -> int:
-    """Count the grounding chunks Gemini returned for a response.
-
-    PR-9 honesty gate. When the `google_search` tool is enabled
-    (every `_gemini_grounded_call`), a response that actually
-    consulted the web carries `candidates[0].groundingMetadata.
-    groundingChunks` — one entry per source the model retrieved. A
-    response answered purely from the model's internal knowledge
-    carries zero chunks.
-
-    Social-intelligence sub-calls (`_infer_own_presence`,
-    `_infer_kol_endorsements`, `_infer_competitive_social`) ask the
-    model for follower counts, KOL lists, and competitive figures.
-    Those are exactly the fields that, ungrounded, become confident
-    fabrication in a merchant-facing report. The count returned here
-    is the gate: zero chunks → the numeric/factual fields must be
-    nulled, not surfaced.
-
-    Handles both camelCase (`groundingMetadata` / `groundingChunks`)
-    and snake_case (`grounding_metadata` / `grounding_chunks`) since
-    the REST API has shipped both shapes across versions.
-    """
-    if not isinstance(payload, dict):
-        return 0
-    candidates = payload.get("candidates") or []
-    if not candidates or not isinstance(candidates[0], dict):
-        return 0
-    meta = (
-        candidates[0].get("groundingMetadata")
-        or candidates[0].get("grounding_metadata")
-        or {}
-    )
-    if not isinstance(meta, dict):
-        return 0
-    chunks = (
-        meta.get("groundingChunks")
-        or meta.get("grounding_chunks")
-        or []
-    )
-    return len(chunks) if isinstance(chunks, list) else 0
-
-
 def _unwrap_json(text: Optional[str]) -> Optional[Any]:
     """Try to parse JSON from a Gemini response. Strips ``` fences and
     falls back to extracting the first balanced { or [ block."""
@@ -890,126 +848,6 @@ def _coerce_to_array(parsed: Any) -> Optional[List[Any]]:
     return None
 
 
-async def _gemini_grounded_call(
-    prompt: str,
-    *,
-    api_key: str,
-    scan_mode: str = "bd_grounded_lookup",
-    model: str = _GEMINI_MODEL,
-) -> Optional[Dict[str, Any]]:
-    """One grounded call (Gemini `google_search` tool). Returns parsed
-    payload or None on any failure.
-
-    DEPRECATED — no callers in this module as of the non-social migration.
-    Both the 3 social probes (own presence / KOL / competitive — migrated
-    in PR #535) and the 4 non-social ones (retail / founder / corporate /
-    press — migrated here) now use `_search_then_extract` (real SerpAPI
-    search + `_gemini_extract_call`), because Gemini's `google_search`
-    grounding retrieval returned 0 chunks for 12/15 social and 9/12
-    non-social calls in the 2026-05-14 diagnostics. This function +
-    `_grounding_chunk_count` + `_GROUNDING_DIRECTIVE` are kept transitionally
-    so a follow-up cleanup PR can remove them with its own minimal-blast
-    diff; new callers should NOT be added.
-
-    `model` selects the Gemini model — defaults to `_GEMINI_MODEL`.
-
-    A transport/timeout failure is retried once (bounded, post-failure
-    only — never a happy-path call multiplier) before giving up: a
-    grounded web-search call is slow enough that a lone ReadTimeout is
-    often transient, and a lost social probe is worse than a slow audit.
-
-    P2.5b: scan_mode is recorded into llm_probe_runs for cost
-    attribution. Callers in this module pass the inference name
-    (e.g., "bd_retail_presence", "bd_corporate_intel") so the
-    cost rollup distinguishes which inferences ran.
-
-    Note: Gemini's REST API doesn't return token usage in the
-    response body, so input_tokens + output_tokens + cost_usd are
-    recorded as None. Latency + status are still captured.
-    """
-    import time as _time
-    _telemetry_started_at = _time.perf_counter()
-    body = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
-        "tools": [{"google_search": {}}],
-    }
-    url = f"{_GEMINI_BASE_URL}/models/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-    r = None
-    last_exc: Optional[BaseException] = None
-    for attempt in (1, 2):
-        try:
-            async with httpx.AsyncClient(timeout=_GEMINI_TIMEOUT) as client:
-                r = await client.post(url, headers=headers, json=body)
-            break
-        except _GEMINI_TRANSPORT_RETRY_EXCS as exc:
-            last_exc = exc
-            logger.warning(
-                "brand_context: transport error (attempt %s/2) scan_mode=%s: %s",
-                attempt, scan_mode, exc,
-            )
-            if attempt == 2:
-                break
-            await asyncio.sleep(_GEMINI_RETRY_BACKOFF_S)
-        except httpx.RequestError as exc:
-            # Non-retryable httpx error — e.g. DecodingError,
-            # TooManyRedirects, UnsupportedProtocol. Transient transport
-            # + timeout errors are handled by the retry branch above;
-            # only what falls through here is unrecoverable.
-            last_exc = exc
-            logger.warning("brand_context: HTTP error: %s", exc)
-            break
-    if r is None:
-        await _record_bd_telemetry(
-            scan_mode=scan_mode, status="failed",
-            started_at_perf=_telemetry_started_at,
-            error_message=(
-                f"transport: {type(last_exc).__name__}"
-                if last_exc is not None else "transport: unknown"
-            ),
-        )
-        return None
-    if r.status_code != 200:
-        logger.warning("brand_context: non-200 %s body=%s", r.status_code, r.text[:300])
-        await _record_bd_telemetry(
-            scan_mode=scan_mode,
-            status=(
-                "rate_limited" if r.status_code == 429 else "failed"
-            ),
-            started_at_perf=_telemetry_started_at,
-            error_message=f"http_{r.status_code}",
-        )
-        return None
-    try:
-        result = r.json()
-    except json.JSONDecodeError:
-        await _record_bd_telemetry(
-            scan_mode=scan_mode, status="failed",
-            started_at_perf=_telemetry_started_at,
-            error_message="non_json_response",
-        )
-        return None
-    # Grounding-stability telemetry. A 200 response can still be
-    # un-grounded — Gemini answered from internal knowledge without
-    # invoking the google_search tool, so the response carries zero
-    # grounding chunks and PR-9's honesty gate will null every figure.
-    # Record that distinctly so the ungrounded RATE is measurable:
-    #   status stays "succeeded" (the HTTP call + cost accounting +
-    #   provider-fallback logic are unaffected — `status` can't take a
-    #   new value anyway, record_probe_run coerces unknowns to failed),
-    #   and error_message="ungrounded" annotates the degraded outcome.
-    # Query:  count(*) FILTER (WHERE error_message='ungrounded')
-    #         / count(*)  ... WHERE scan_mode LIKE 'bd_%'
-    _grounded = _grounding_chunk_count(result) > 0
-    await _record_bd_telemetry(
-        scan_mode=scan_mode, status="succeeded",
-        started_at_perf=_telemetry_started_at,
-        error_message=None if _grounded else "ungrounded",
-    )
-    return result
-
-
 async def _gemini_extract_call(
     prompt: str,
     *,
@@ -1018,11 +856,11 @@ async def _gemini_extract_call(
     model: str = _GEMINI_SOCIAL_MODEL,
 ) -> Optional[Dict[str, Any]]:
     """Plain (non-grounded) Gemini completion — the EXTRACTION step of the
-    social search-then-extract pipeline.
+    search-then-extract pipeline. Used by all 7 bd_ probes.
 
-    Identical transport handling to `_gemini_grounded_call` (one bounded
-    retry on `_GEMINI_TRANSPORT_RETRY_EXCS`, `_GEMINI_TIMEOUT`, telemetry
-    via `_record_bd_telemetry`) but with two deliberate differences:
+    Transport handling: one bounded retry on `_GEMINI_TRANSPORT_RETRY_EXCS`
+    + `_GEMINI_TIMEOUT`; telemetry via `_record_bd_telemetry`. Two
+    deliberate things to know:
 
       - NO `google_search` tool — retrieval already happened (SerpAPI);
         this call only extracts structured JSON from snippets the caller
@@ -1139,14 +977,17 @@ async def _record_bd_telemetry(
         )
 
 
-# NOTE — the ungrounded-retry (`_grounded_call_with_retry`, PR #530) was
-# removed 2026-05-14. Measured: the retry recovered 0 of 13 ungrounded
-# attempts — prompt escalation does not move a model that decided not to
-# search. The model lever was also exhausted (see `_GEMINI_SOCIAL_MODEL`):
-# neither pro nor a newer flash moved the rate. The ungrounded telemetry
-# this PR added is kept (it's in `_gemini_grounded_call`) as the feedback
-# loop for whatever structural fix comes next.
-# Full write-up: ~/tmp/social-grounding-check/verdict.md.
+# HISTORY — Gemini `google_search` grounding (`_gemini_grounded_call` +
+# `_grounding_chunk_count`) was the original retrieval path for all 7 bd_
+# probes. Two attempts to make it work in-place (PR #530's prompt
+# escalation + ungrounded retry, 0/13 recovery; PR #531/#533's model-tier
+# swaps, ~7-15% grounded flat) both failed. A 2026-05-14 diagnostic proved
+# the model searches every call but Gemini's `google_search` *retrieval*
+# returns 0 chunks ~75% of the time. PRs #535 (social) + #536 (non-social)
+# replaced it with deterministic SerpAPI retrieval + `_gemini_extract_call`.
+# `_gemini_grounded_call`/`_grounding_chunk_count`/`_GROUNDING_DIRECTIVE`
+# were deleted in the follow-up cleanup. Full write-up:
+# ~/tmp/social-grounding-check/verdict.md.
 
 
 def _build_retail_prompt(
@@ -1540,20 +1381,6 @@ def _detected_handle(detected: List[Dict[str, str]], platform: str) -> Optional[
     return None
 
 
-# Grounding directive (legacy / dead code). Used to be embedded in the 3
-# social prompts when they called Gemini's `google_search` tool directly.
-# The social probes migrated to search-then-extract (real SerpAPI search +
-# `_gemini_extract_call`, see `_search_then_extract`) because Gemini's
-# `google_search` grounding retrieval returned 0 chunks for 12/15 social
-# calls (2026-05-14 diagnostic). No caller references this any more —
-# kept one cycle; delete with the non-social-caller follow-up.
-_GROUNDING_DIRECTIVE = (
-    "Before answering, you MUST use web search to look this up. Base "
-    "every figure ONLY on what the search results actually show. Do "
-    "not answer from prior knowledge or memory. If a search returns "
-    "nothing usable for a field, set that field to null — never guess."
-)
-
 # Extraction directive — the social prompts now embed REAL search-result
 # snippets (SerpAPI) and ask the model only to EXTRACT structured data
 # from them. With search-then-extract the fabrication surface moves from
@@ -1616,9 +1443,9 @@ def _competitive_queries(brand: str, competitors: List[str]) -> List[str]:
 
 # Query builders for the 4 non-social bd_ probes (retail / founder / corporate /
 # press). Mirror what Gemini's google_search actually issued in the 2026-05-14
-# non-social diagnostic — these are the search-then-extract replacements for
-# the discretionary `_gemini_grounded_call` path (which returned 0 chunks
-# 9/12 times).
+# non-social diagnostic — the search-then-extract replacements for the
+# discretionary grounding path that returned 0 chunks 9/12 times (see HISTORY
+# block above `_gemini_extract_call`).
 def _retail_queries(brand: str, domain: str) -> List[str]:
     return [
         f"where to buy {brand}",
@@ -1811,9 +1638,8 @@ async def _search_then_extract(
     api_key: str,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """Run `queries` via the SerpAPI client, then (if there were results)
-    run the Gemini extraction call. The deterministic replacement for the
-    old `_gemini_grounded_call` + `_grounding_chunk_count` front half of
-    the 3 social probes.
+    run the Gemini extraction call. The single deterministic front half
+    for all 7 bd_ probes.
 
     Returns `(payload, search_status)`:
       - `(extract_payload, _SEARCH_OK)`  search had results, extraction ran

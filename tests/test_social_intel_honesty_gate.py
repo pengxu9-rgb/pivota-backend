@@ -8,15 +8,13 @@ verification that the response was actually grounded in a web source.
 An ungrounded response answers from internal knowledge: plausible-
 sounding numbers that are fabrication, not data.
 
-The honesty gate's *trigger* changed with the search-then-extract
-rework (2026-05-14). It used to be `_grounding_chunk_count(payload) > 0`
-("did Gemini's google_search tool retrieve anything"). It's now the
-deterministic `search_status` from `_search_then_extract`:
+The honesty gate's *trigger* is the deterministic `search_status` from
+`_search_then_extract`:
   - `_SEARCH_OK`        — SerpAPI returned usable results → grounded
   - `_SEARCH_EMPTY`     — SerpAPI returned nothing → ungrounded
   - `_SEARCH_TRANSPORT` — the search/extraction call failed → transport_error
 
-Gate behavior per sub-call is UNCHANGED:
+Gate behavior per sub-call:
   - _infer_own_presence: ungrounded → null all metric fields, keep
     handle, mark grounding="ungrounded"
   - _infer_kol_endorsements: ungrounded → return None (a fabricated
@@ -24,8 +22,6 @@ Gate behavior per sub-call is UNCHANGED:
   - _infer_competitive_social: ungrounded → return None
 
 These tests mock `_search_then_extract` so no network is touched.
-`_grounding_chunk_count` is unchanged + still used by the 4 non-social
-grounded callers — its primitive tests stay below.
 """
 
 from __future__ import annotations
@@ -39,65 +35,10 @@ from services.bd_brand_signals import (
     _SEARCH_EMPTY,
     _SEARCH_OK,
     _SEARCH_TRANSPORT,
-    _grounding_chunk_count,
     _infer_competitive_social,
     _infer_kol_endorsements,
     _infer_own_presence,
 )
-
-
-# =========================================================================
-# _grounding_chunk_count — still used by the 4 non-social grounded callers
-# =========================================================================
-
-
-def test_grounding_chunk_count_camelcase():
-    payload = {
-        "candidates": [{
-            "groundingMetadata": {
-                "groundingChunks": [
-                    {"web": {"uri": "https://a.com", "title": "A"}},
-                    {"web": {"uri": "https://b.com", "title": "B"}},
-                ],
-            },
-        }],
-    }
-    assert _grounding_chunk_count(payload) == 2
-
-
-def test_grounding_chunk_count_snakecase():
-    """REST API has shipped both camelCase + snake_case shapes."""
-    payload = {
-        "candidates": [{
-            "grounding_metadata": {
-                "grounding_chunks": [{"web": {"uri": "https://a.com"}}],
-            },
-        }],
-    }
-    assert _grounding_chunk_count(payload) == 1
-
-
-def test_grounding_chunk_count_zero_when_no_metadata():
-    payload = {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
-    assert _grounding_chunk_count(payload) == 0
-
-
-def test_grounding_chunk_count_zero_when_empty_chunks():
-    payload = {"candidates": [{"groundingMetadata": {"groundingChunks": []}}]}
-    assert _grounding_chunk_count(payload) == 0
-
-
-def test_grounding_chunk_count_handles_garbage_input():
-    assert _grounding_chunk_count(None) == 0
-    assert _grounding_chunk_count({}) == 0
-    assert _grounding_chunk_count({"candidates": []}) == 0
-    assert _grounding_chunk_count({"candidates": ["not a dict"]}) == 0
-    assert _grounding_chunk_count(
-        {"candidates": [{"groundingMetadata": "not a dict"}]}
-    ) == 0
-    assert _grounding_chunk_count(
-        {"candidates": [{"groundingMetadata": {"groundingChunks": "not a list"}}]}
-    ) == 0
 
 
 # =========================================================================

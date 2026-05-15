@@ -18,10 +18,6 @@ deterministic: "did the search return results?" `_search_then_extract`
 returns `(payload, search_status)` where status ∈ {ok, empty,
 transport_error} — so the honesty gate distinguishes "search found
 nothing" (`_FR_UNGROUNDED`) from "the call failed" (`_FR_TRANSPORT`).
-
-`_gemini_grounded_call` + `_grounding_chunk_count` are UNCHANGED — the 4
-non-social grounded callers still use them, and their transport-retry +
-ungrounded-telemetry tests stay valid (Part 2b / Part 3 below).
 """
 
 from __future__ import annotations
@@ -36,8 +32,6 @@ from services.bd_brand_signals import (
     _EXTRACTION_DIRECTIVE,
     _FR_TRANSPORT,
     _FR_UNGROUNDED,
-    _GEMINI_MODEL,
-    _GROUNDING_DIRECTIVE,
     _SEARCH_EMPTY,
     _SEARCH_OK,
     _SEARCH_TRANSPORT,
@@ -46,7 +40,6 @@ from services.bd_brand_signals import (
     _build_own_presence_prompt,
     _competitive_queries,
     _gemini_extract_call,
-    _gemini_grounded_call,
     _infer_competitive_social,
     _infer_kol_endorsements,
     _infer_own_presence,
@@ -56,18 +49,9 @@ from services.bd_brand_signals import (
 )
 
 
-def _payload(text: str, *, grounded: bool = False) -> Dict[str, Any]:
-    """Gemini-shaped payload. `grounded` adds groundingMetadata — only
-    relevant to the legacy `_gemini_grounded_call` tests; the extraction
-    path ignores it."""
-    candidate: Dict[str, Any] = {"content": {"parts": [{"text": text}]}}
-    if grounded:
-        candidate["groundingMetadata"] = {
-            "groundingChunks": [
-                {"web": {"uri": "https://socialblade.com/x", "title": "SB"}},
-            ],
-        }
-    return {"candidates": [candidate]}
+def _payload(text: str) -> Dict[str, Any]:
+    """Gemini-shaped extraction-call response with `text` as the body."""
+    return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
 
 
 _RESULTS = [
@@ -83,14 +67,13 @@ _RESULTS = [
 
 
 def test_extraction_prompts_embed_search_results():
-    """Every social prompt now embeds the real search-result snippets and
-    carries the EXTRACTION directive — not the legacy grounding one."""
+    """Every social prompt embeds the real search-result snippets and
+    carries the EXTRACTION directive."""
     own = _build_own_presence_prompt("Beauty of Joseon", "tiktok", "boj", _RESULTS)
     kol = _build_kol_prompt("Beauty of Joseon", "instagram", _RESULTS)
     comp = _build_competitive_prompt("Beauty of Joseon", ["Drunk Elephant"], _RESULTS)
     for prompt in (own, kol, comp):
         assert _EXTRACTION_DIRECTIVE in prompt
-        assert _GROUNDING_DIRECTIVE not in prompt        # legacy directive gone
         assert "SEARCH RESULTS:" in prompt
         assert "beautyofjoseon_official" in prompt       # the snippet is embedded
 
@@ -367,146 +350,3 @@ async def test_extract_call_transport_both_attempts_gives_up():
     assert captured["error_message"].startswith("transport:")
 
 
-# =========================================================================
-# Part 2d — `_gemini_grounded_call` transport retry (UNCHANGED — still
-# used by the 4 non-social grounded callers: retail/founder/corp/press)
-# =========================================================================
-
-
-@pytest.mark.asyncio
-async def test_grounded_call_transport_retried_once_then_succeeds():
-    captured: Dict[str, Any] = {}
-
-    async def _capture(**kwargs):
-        captured.update(kwargs)
-
-    client = _RaisingClient(
-        httpx.ReadTimeout("slow"), fail_times=1,
-        ok_response=_http_response(_payload("{}", grounded=True)),
-    )
-    with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
-         patch("services.bd_brand_signals._record_bd_telemetry", _capture), \
-         patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
-        result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_retail_presence",
-        )
-    assert result is not None
-    assert client.post_calls == 2
-    assert captured["status"] == "succeeded"
-
-
-@pytest.mark.asyncio
-async def test_grounded_call_transport_both_attempts_gives_up():
-    captured: Dict[str, Any] = {}
-
-    async def _capture(**kwargs):
-        captured.update(kwargs)
-
-    client = _RaisingClient(httpx.ReadTimeout("slow"), fail_times=2)
-    with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
-         patch("services.bd_brand_signals._record_bd_telemetry", _capture), \
-         patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
-        result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_retail_presence",
-        )
-    assert result is None
-    assert client.post_calls == 2
-    assert captured["status"] == "failed"
-    assert "ReadTimeout" in captured["error_message"]
-
-
-@pytest.mark.asyncio
-async def test_grounded_call_non_retryable_request_error_not_retried():
-    client = _RaisingClient(httpx.UnsupportedProtocol("bad scheme"), fail_times=2)
-    with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
-         patch("services.bd_brand_signals._record_bd_telemetry", AsyncMock()), \
-         patch("services.bd_brand_signals.asyncio.sleep", AsyncMock()):
-        result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_retail_presence",
-        )
-    assert result is None
-    assert client.post_calls == 1                        # no retry
-
-
-@pytest.mark.asyncio
-async def test_grounded_call_targets_the_default_model():
-    captured_url: Dict[str, str] = {}
-
-    class _UrlSpyClient(_RaisingClient):
-        async def post(self, url, **kwargs):
-            captured_url["url"] = url
-            return await super().post(url, **kwargs)
-
-    client = _UrlSpyClient(
-        None, fail_times=0,
-        ok_response=_http_response(_payload("{}", grounded=True)),
-    )
-    with patch("services.bd_brand_signals.httpx.AsyncClient", client), \
-         patch("services.bd_brand_signals._record_bd_telemetry", AsyncMock()):
-        await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_retail_presence",
-        )
-    assert f"/models/{_GEMINI_MODEL}:" in captured_url["url"]
-
-
-# =========================================================================
-# Part 3 — `_gemini_grounded_call` ungrounded telemetry (UNCHANGED — still
-# the feedback loop for the non-social grounded callers)
-# =========================================================================
-
-
-class _FakeClient:
-    """httpx.AsyncClient stand-in returning a fixed response."""
-
-    def __init__(self, response):
-        self._response = response
-
-    def __call__(self, *a, **kw):
-        return self
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def post(self, url, **kwargs):
-        return self._response
-
-
-@pytest.mark.asyncio
-async def test_grounded_call_marks_ungrounded_response():
-    """`_gemini_grounded_call`: a 200 with zero grounding chunks → telemetry
-    error_message='ungrounded' (status stays 'succeeded')."""
-    captured: Dict[str, Any] = {}
-
-    async def _capture(**kwargs):
-        captured.update(kwargs)
-
-    fake = _FakeClient(_http_response(_payload("{}", grounded=False)))
-    with patch("services.bd_brand_signals.httpx.AsyncClient", fake), \
-         patch("services.bd_brand_signals._record_bd_telemetry", _capture):
-        result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_retail_presence",
-        )
-    assert result is not None
-    assert captured["status"] == "succeeded"
-    assert captured["error_message"] == "ungrounded"
-
-
-@pytest.mark.asyncio
-async def test_grounded_call_clean_on_grounded_response():
-    captured: Dict[str, Any] = {}
-
-    async def _capture(**kwargs):
-        captured.update(kwargs)
-
-    fake = _FakeClient(_http_response(_payload("{}", grounded=True)))
-    with patch("services.bd_brand_signals.httpx.AsyncClient", fake), \
-         patch("services.bd_brand_signals._record_bd_telemetry", _capture):
-        result = await _gemini_grounded_call(
-            "prompt", api_key="k", scan_mode="bd_retail_presence",
-        )
-    assert result is not None
-    assert captured["status"] == "succeeded"
-    assert captured["error_message"] is None
