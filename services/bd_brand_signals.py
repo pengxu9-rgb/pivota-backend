@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
@@ -897,12 +897,18 @@ async def _gemini_grounded_call(
     scan_mode: str = "bd_grounded_lookup",
     model: str = _GEMINI_MODEL,
 ) -> Optional[Dict[str, Any]]:
-    """One grounded call. Returns parsed payload or None on any failure.
+    """One grounded call (Gemini `google_search` tool). Returns parsed
+    payload or None on any failure.
 
-    `model` selects the Gemini model — social probes pass
-    `_GEMINI_SOCIAL_MODEL` (the per-case model seam; currently flash,
-    pending the model-orchestration layer); everything else defaults to
-    `_GEMINI_MODEL`.
+    NOTE: the 3 social probes (own presence / KOL / competitive) migrated
+    OFF this — they use `_search_then_extract` (real SerpAPI search +
+    `_gemini_extract_call`), because Gemini's `google_search` grounding
+    retrieval returned 0 chunks for 12/15 social calls (2026-05-14
+    diagnostic). This function + `_grounding_chunk_count` stay for the 4
+    non-social grounded callers (retail / founder / corporate / press);
+    migrating those to search-then-extract is a follow-up.
+
+    `model` selects the Gemini model — defaults to `_GEMINI_MODEL`.
 
     A transport/timeout failure is retried once (bounded, post-failure
     only — never a happy-path call multiplier) before giving up: a
@@ -997,6 +1003,95 @@ async def _gemini_grounded_call(
         scan_mode=scan_mode, status="succeeded",
         started_at_perf=_telemetry_started_at,
         error_message=None if _grounded else "ungrounded",
+    )
+    return result
+
+
+async def _gemini_extract_call(
+    prompt: str,
+    *,
+    api_key: str,
+    scan_mode: str = "bd_extract",
+    model: str = _GEMINI_SOCIAL_MODEL,
+) -> Optional[Dict[str, Any]]:
+    """Plain (non-grounded) Gemini completion — the EXTRACTION step of the
+    social search-then-extract pipeline.
+
+    Identical transport handling to `_gemini_grounded_call` (one bounded
+    retry on `_GEMINI_TRANSPORT_RETRY_EXCS`, `_GEMINI_TIMEOUT`, telemetry
+    via `_record_bd_telemetry`) but with two deliberate differences:
+
+      - NO `google_search` tool — retrieval already happened (SerpAPI);
+        this call only extracts structured JSON from snippets the caller
+        embedded in `prompt`.
+      - `maxOutputTokens` raised to 4096 — without google_search query
+        spam eating the budget, this is generous, and it fixes the
+        `_infer_competitive_social` `finish=MAX_TOKENS` bug.
+
+    Crucially this NEVER records `error_message="ungrounded"` —
+    groundedness is decided upstream by whether the SerpAPI search
+    returned results, not by `groundingMetadata`.
+    """
+    import time as _time
+    _telemetry_started_at = _time.perf_counter()
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
+    }
+    url = f"{_GEMINI_BASE_URL}/models/{model}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    r = None
+    last_exc: Optional[BaseException] = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=_GEMINI_TIMEOUT) as client:
+                r = await client.post(url, headers=headers, json=body)
+            break
+        except _GEMINI_TRANSPORT_RETRY_EXCS as exc:
+            last_exc = exc
+            logger.warning(
+                "bd_extract: transport error (attempt %s/2) scan_mode=%s: %s",
+                attempt, scan_mode, exc,
+            )
+            if attempt == 2:
+                break
+            await asyncio.sleep(_GEMINI_RETRY_BACKOFF_S)
+        except httpx.RequestError as exc:
+            last_exc = exc
+            logger.warning("bd_extract: HTTP error: %s", exc)
+            break
+    if r is None:
+        await _record_bd_telemetry(
+            scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message=(
+                f"transport: {type(last_exc).__name__}"
+                if last_exc is not None else "transport: unknown"
+            ),
+        )
+        return None
+    if r.status_code != 200:
+        logger.warning("bd_extract: non-200 %s body=%s", r.status_code, r.text[:300])
+        await _record_bd_telemetry(
+            scan_mode=scan_mode,
+            status="rate_limited" if r.status_code == 429 else "failed",
+            started_at_perf=_telemetry_started_at,
+            error_message=f"http_{r.status_code}",
+        )
+        return None
+    try:
+        result = r.json()
+    except json.JSONDecodeError:
+        await _record_bd_telemetry(
+            scan_mode=scan_mode, status="failed",
+            started_at_perf=_telemetry_started_at,
+            error_message="non_json_response",
+        )
+        return None
+    await _record_bd_telemetry(
+        scan_mode=scan_mode, status="succeeded",
+        started_at_perf=_telemetry_started_at,
+        error_message=None,
     )
     return result
 
@@ -1396,19 +1491,13 @@ def _detected_handle(detected: List[Dict[str, str]], platform: str) -> Optional[
     return None
 
 
-# Search-grounding directive. The social sub-calls all run through
-# `_gemini_grounded_call` with the `google_search` tool enabled — but
-# the tool is model-discretionary: the model decides whether to actually
-# search. When a prompt says "estimate X's reach", a from-memory answer
-# carries zero grounding chunks, and PR-9's honesty gate (correctly)
-# nulls every figure — the merchant sees an empty section.
-#
-# This directive compels a search; it keeps the honesty contract intact
-# (no search result → return nulls, never a guessed number). An escalated
-# retry variant existed (PR #530) but was removed — prompt escalation did
-# not move an ungrounded model (0/13 recovery), and neither did the model
-# lever (see `_GEMINI_SOCIAL_MODEL`). The directive is the only grounding
-# lever that stays; a structural fix is still open.
+# Grounding directive (legacy / dead code). Used to be embedded in the 3
+# social prompts when they called Gemini's `google_search` tool directly.
+# The social probes migrated to search-then-extract (real SerpAPI search +
+# `_gemini_extract_call`, see `_search_then_extract`) because Gemini's
+# `google_search` grounding retrieval returned 0 chunks for 12/15 social
+# calls (2026-05-14 diagnostic). No caller references this any more —
+# kept one cycle; delete with the non-social-caller follow-up.
 _GROUNDING_DIRECTIVE = (
     "Before answering, you MUST use web search to look this up. Base "
     "every figure ONLY on what the search results actually show. Do "
@@ -1416,13 +1505,73 @@ _GROUNDING_DIRECTIVE = (
     "nothing usable for a field, set that field to null — never guess."
 )
 
+# Extraction directive — the social prompts now embed REAL search-result
+# snippets (SerpAPI) and ask the model only to EXTRACT structured data
+# from them. With search-then-extract the fabrication surface moves from
+# "did the model consult the web" to "did the model invent beyond the
+# snippets we gave it" — this directive is the guard for that.
+_EXTRACTION_DIRECTIVE = (
+    "Below are real web search results. Base every figure ONLY on what "
+    "these search results actually state. Do NOT use prior knowledge or "
+    "memory. If a field is not supported by the search results, set it "
+    "to null — never guess or estimate."
+)
+
+
+def _format_search_results(results: List[Dict[str, str]]) -> str:
+    """Render normalized SerpAPI results as a numbered context block for
+    an extraction prompt."""
+    lines: List[str] = []
+    for i, r in enumerate(results, 1):
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        snippet = (r.get("snippet") or "").strip()
+        lines.append(f"[{i}] {title}\n    {url}\n    {snippet}")
+    return "\n".join(lines) if lines else "(no search results)"
+
+
+# ---------------------------------------------------------------------------
+# Search query builders — deterministic + bounded. The 2026-05-14 diagnostic
+# showed Gemini's own search queries were essentially these templates with
+# the brand/handle/platform slotted in, so we template them directly: no
+# extra LLM call for query generation, fully testable.
+# ---------------------------------------------------------------------------
+
+def _own_presence_queries(
+    brand: str, platform: str, handle: Optional[str],
+) -> List[str]:
+    label = "TikTok" if platform == "tiktok" else "Instagram"
+    queries = [
+        f"{brand} {label} followers",
+        f"{brand} official {label} account",
+    ]
+    if handle:
+        queries.append(f"@{handle} {label} follower count")
+    return queries[:3]
+
+
+def _kol_queries(brand: str, platform: str) -> List[str]:
+    label = "TikTok" if platform == "tiktok" else "Instagram"
+    return [
+        f"{label} creators who posted about {brand}",
+        f"{brand} {label} influencer review",
+        f"{brand} {label} sponsored creator post",
+    ][:3]
+
+
+def _competitive_queries(brand: str, competitors: List[str]) -> List[str]:
+    return [
+        f"{comp} TikTok Instagram followers" for comp in competitors[:4]
+    ]
+
 
 def _build_own_presence_prompt(
     brand: str, platform: str, handle: Optional[str],
+    search_results: List[Dict[str, str]],
 ) -> str:
     handle_clause = (
         f"Their {platform} handle is @{handle}." if handle
-        else f"Search for {brand}'s official {platform} account."
+        else f"Identify {brand}'s official {platform} account from the results."
     )
     label = "TikTok" if platform == "tiktok" else "Instagram"
     metric_hint = (
@@ -1431,16 +1580,19 @@ def _build_own_presence_prompt(
     )
     return f"""You are a social-media analyst. Report {brand}'s own {label} reach.
 
-{_GROUNDING_DIRECTIVE}
+{_EXTRACTION_DIRECTIVE}
 
 {handle_clause}
+
+SEARCH RESULTS:
+{_format_search_results(search_results)}
 
 OUTPUT FORMAT — strict:
 - Reply with a bare JSON object starting with {{ and ending with }}
 - Do NOT wrap in markdown fences (```)
 - Do NOT add prose before or after
 - Do NOT wrap in an outer object like {{"data": {{...}}}}
-- Use null for any field you can't verify from search results (don't guess)
+- Use null for any field not supported by the search results above (don't guess)
 
 Schema:
 {{
@@ -1455,16 +1607,21 @@ Schema:
 Allowed values for follower_band: "<10k", "10k-100k", "100k-1M", "1M-10M", ">10M", or null."""
 
 
-def _build_kol_prompt(brand: str, platform: str) -> str:
+def _build_kol_prompt(
+    brand: str, platform: str, search_results: List[Dict[str, str]],
+) -> str:
     label = "TikTok" if platform == "tiktok" else "Instagram"
-    return f"""You are a creator-marketing analyst. List up to 8 {label} creators (10k-1M follower band) who have posted about {brand} in the last 12 months.
+    return f"""You are a creator-marketing analyst. From the search results below, list up to 8 {label} creators (10k-1M follower band) who have posted about {brand} in the last 12 months.
 
-{_GROUNDING_DIRECTIVE}
+{_EXTRACTION_DIRECTIVE}
+
+SEARCH RESULTS:
+{_format_search_results(search_results)}
 
 For each creator give:
 - creator_handle: the @ handle
 - follower_band: one of "10k-100k", "100k-1M", "<10k", ">1M"
-- post_url: link to the specific post if findable, else null
+- post_url: link to the specific post if present in the results, else null
 - view_count_estimate: rough view count, integer or null
 - post_date: ISO date YYYY-MM-DD if known, else year, else null
 - content_summary: one short sentence about the post
@@ -1474,7 +1631,7 @@ OUTPUT FORMAT — strict:
 - Do NOT wrap in markdown fences (```)
 - Do NOT wrap in an outer object like {{"creators": [...]}}
 - Do NOT add prose before or after
-- If a search finds no endorsements, reply with the literal: []
+- If the search results name no creators, reply with the literal: []
 
 Schema per element:
 {{"creator_handle": "...", "follower_band": "10k-100k", "post_url": null, "view_count_estimate": 12000, "post_date": "2025-01-15", "content_summary": "..."}}"""
@@ -1482,16 +1639,20 @@ Schema per element:
 
 def _build_competitive_prompt(
     brand: str, competitors: List[str],
+    search_results: List[Dict[str, str]],
 ) -> str:
     competitor_list = ", ".join(competitors[:6])
-    return f"""You are a competitive social-media analyst. Compare {brand}'s TikTok + Instagram presence to these competitors: {competitor_list}.
+    return f"""You are a competitive social-media analyst. From the search results below, compare {brand}'s TikTok + Instagram presence to these competitors: {competitor_list}.
 
-{_GROUNDING_DIRECTIVE}
+{_EXTRACTION_DIRECTIVE}
+
+SEARCH RESULTS:
+{_format_search_results(search_results)}
 
 For each competitor brand give:
 - brand: the competitor brand name
-- tiktok_followers_estimate: integer estimate or null
-- instagram_followers_estimate: integer estimate or null
+- tiktok_followers_estimate: integer or null
+- instagram_followers_estimate: integer or null
 - kol_endorsements_count_estimate: rough count of KOL posts (10k-1M followers) about that competitor in the last 12 months, integer or null
 - gap_summary: one sentence comparing this competitor's social position to {brand}'s
 
@@ -1502,7 +1663,7 @@ Reply with ONLY a JSON array. No prose:
   ...
 ]
 
-If a search finds no comparable data, reply with: []"""
+If the search results contain no comparable data, reply with: []"""
 
 
 _SUFFIX_MULT = {"k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000, "b": 1_000_000_000, "B": 1_000_000_000}
@@ -1542,10 +1703,59 @@ def _coerce_str(v: Any) -> Optional[str]:
 # in infer_social_intelligence's `failure_reasons` dict so the renderer
 # can explain WHY a sub-section is empty instead of silently omitting
 # it. None = the sub-call succeeded with data.
-_FR_TRANSPORT = "transport_error"   # _gemini_grounded_call returned None (HTTP/timeout/429)
-_FR_PARSE = "parse_error"           # response body didn't parse to the expected shape
-_FR_UNGROUNDED = "ungrounded"       # PR-9 grounding gate: 0 grounding chunks
-_FR_NO_DATA = "no_data"             # grounded + parsed but yielded nothing usable
+_FR_TRANSPORT = "transport_error"   # search API OR extraction call failed (HTTP/timeout)
+_FR_PARSE = "parse_error"           # extraction response didn't parse to the expected shape
+_FR_UNGROUNDED = "ungrounded"       # search returned nothing usable (was: 0 grounding chunks)
+_FR_NO_DATA = "no_data"             # search had results + parsed but yielded nothing usable
+
+
+# search-then-extract status — `_search_then_extract` returns one of these
+# alongside the payload, so callers distinguish "search found nothing"
+# (_FR_UNGROUNDED) from "the search/extraction call failed" (_FR_TRANSPORT).
+_SEARCH_OK = "ok"
+_SEARCH_EMPTY = "empty"
+_SEARCH_TRANSPORT = "transport_error"
+
+
+async def _search_then_extract(
+    *,
+    queries: List[str],
+    extract_prompt_fn: Callable[[List[Dict[str, str]]], str],
+    scan_mode: str,
+    api_key: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Run `queries` via the SerpAPI client, then (if there were results)
+    run the Gemini extraction call. The deterministic replacement for the
+    old `_gemini_grounded_call` + `_grounding_chunk_count` front half of
+    the 3 social probes.
+
+    Returns `(payload, search_status)`:
+      - `(extract_payload, _SEARCH_OK)`  search had results, extraction ran
+      - `(None, _SEARCH_EMPTY)`          search returned 0 results — ungrounded
+      - `(None, _SEARCH_TRANSPORT)`      search OR extraction failed at transport
+
+    The caller maps `search_status` onto its `_FR_*` token + honesty-gate
+    branch. `extract_prompt_fn` takes the normalized search results and
+    returns the extraction prompt (each probe closes over its own
+    brand/platform/competitor context).
+    """
+    from services.social_search_client import search_web_many
+
+    results, search_status = await search_web_many(queries)
+    if search_status == "transport_error":
+        return (None, _SEARCH_TRANSPORT)
+    # "no_key" and "empty" both mean: no usable results, never fabricate —
+    # the honesty gate treats them identically (ungrounded).
+    if search_status in ("empty", "no_key") or not results:
+        return (None, _SEARCH_EMPTY)
+
+    payload = await _gemini_extract_call(
+        extract_prompt_fn(results), api_key=api_key, scan_mode=scan_mode,
+    )
+    if payload is None:
+        # Extraction call transport-failed — distinct from "search empty".
+        return (None, _SEARCH_TRANSPORT)
+    return (payload, _SEARCH_OK)
 
 
 async def _infer_own_presence(
@@ -1557,35 +1767,41 @@ async def _infer_own_presence(
     present result still SURFACES (dict non-None, reason None) — it's
     marked grounding="ungrounded" internally; the PR-9 gate only nulls
     the metric fields, it doesn't suppress the whole result."""
-    payload = await _gemini_grounded_call(
-        _build_own_presence_prompt(brand, platform, handle),
-        api_key=api_key, scan_mode="bd_own_presence",
-        model=_GEMINI_SOCIAL_MODEL,
+    payload, search_status = await _search_then_extract(
+        queries=_own_presence_queries(brand, platform, handle),
+        extract_prompt_fn=lambda results: _build_own_presence_prompt(
+            brand, platform, handle, results,
+        ),
+        scan_mode="bd_own_presence",
+        api_key=api_key,
     )
-    if not payload:
+    if search_status == _SEARCH_TRANSPORT:
         return (None, _FR_TRANSPORT)
-    raw_text = _parse_gemini_text(payload)
-    parsed = _unwrap_json(raw_text)
-    # If Gemini wrapped the object in a single-field container, peek inside.
-    if isinstance(parsed, dict) and len(parsed) == 1:
-        only_value = next(iter(parsed.values()))
-        if isinstance(only_value, dict):
-            parsed = only_value
-    if not isinstance(parsed, dict):
-        logger.info(
-            "own_presence(%s): could not parse object; raw=%r",
-            platform, (raw_text or "")[:300],
-        )
-        return (None, _FR_PARSE)
     metric_key = "view_per_post_estimate" if platform == "tiktok" else "engagement_rate_estimate"
-    # PR-9 honesty gate. Follower counts, view/engagement estimates,
-    # and content-focus claims are only trustworthy when Gemini
-    # actually consulted the web. A zero-chunk response means the
-    # model answered from internal knowledge — those numbers are
-    # plausible-sounding fabrication, NOT data. Null the factual
-    # fields and mark grounding="ungrounded" so the renderer shows
-    # "not verified" instead of a confident wrong number.
-    grounded = _grounding_chunk_count(payload) > 0
+    # PR-9 honesty gate. Follower counts, view/engagement estimates, and
+    # content-focus claims are only trustworthy when they came out of real
+    # search results. `grounded` is now deterministic: the SerpAPI search
+    # returned usable results (vs. returned nothing). When NOT grounded,
+    # no extraction ran — `parsed` stays {} so every metric field nulls
+    # out, but the caller-supplied handle still surfaces. Identical
+    # outward behavior to the old "0 grounding chunks" path.
+    grounded = search_status == _SEARCH_OK
+    if not grounded:
+        parsed: Dict[str, Any] = {}
+    else:
+        raw_text = _parse_gemini_text(payload)
+        parsed = _unwrap_json(raw_text)
+        # If Gemini wrapped the object in a single-field container, peek inside.
+        if isinstance(parsed, dict) and len(parsed) == 1:
+            only_value = next(iter(parsed.values()))
+            if isinstance(only_value, dict):
+                parsed = only_value
+        if not isinstance(parsed, dict):
+            logger.info(
+                "own_presence(%s): could not parse object; raw=%r",
+                platform, (raw_text or "")[:300],
+            )
+            return (None, _FR_PARSE)
     out: Dict[str, Any] = {
         "platform": platform,
         # handle is safe to keep even ungrounded — it's either the
@@ -1639,22 +1855,25 @@ async def _infer_kol_endorsements(
     None. An ungrounded response → (None, "ungrounded") — a creator
     list is the highest-fabrication-risk output, suppressed wholesale
     by the PR-9 gate. Grounded-but-empty → (None, "no_data")."""
-    payload = await _gemini_grounded_call(
-        _build_kol_prompt(brand, platform),
-        api_key=api_key, scan_mode="bd_kol_endorsements",
-        model=_GEMINI_SOCIAL_MODEL,
+    payload, search_status = await _search_then_extract(
+        queries=_kol_queries(brand, platform),
+        extract_prompt_fn=lambda results: _build_kol_prompt(
+            brand, platform, results,
+        ),
+        scan_mode="bd_kol_endorsements",
+        api_key=api_key,
     )
-    if not payload:
+    if search_status == _SEARCH_TRANSPORT:
         return (None, _FR_TRANSPORT)
-    # PR-9 honesty gate. A list of named creators who "posted about
-    # the brand in the last 12 months" is the highest-fabrication-risk
-    # output of the three social sub-calls — an ungrounded response
-    # invents plausible-looking creator handles wholesale. Zero
-    # grounding chunks → suppress, never surface fabricated creators.
-    if _grounding_chunk_count(payload) == 0:
+    # PR-9 honesty gate. A list of named creators who "posted about the
+    # brand in the last 12 months" is the highest-fabrication-risk output
+    # of the three social sub-calls. When the search returns nothing
+    # there is nothing to extract from — suppress wholesale rather than
+    # let the extractor invent plausible-looking creator handles.
+    if search_status == _SEARCH_EMPTY:
         logger.info(
-            "kol_endorsements(%s): ungrounded response (0 grounding chunks) "
-            "for %s — suppressing to avoid fabricated creator list",
+            "kol_endorsements(%s): search returned nothing for %s — "
+            "suppressing to avoid a fabricated creator list",
             platform, brand,
         )
         return (None, _FR_UNGROUNDED)
@@ -1699,21 +1918,24 @@ async def _infer_competitive_social(
     Otherwise the standard failure tokens apply."""
     if not competitors:
         return (None, None)
-    payload = await _gemini_grounded_call(
-        _build_competitive_prompt(brand, competitors),
-        api_key=api_key, scan_mode="bd_competitive_social",
-        model=_GEMINI_SOCIAL_MODEL,
+    payload, search_status = await _search_then_extract(
+        queries=_competitive_queries(brand, competitors),
+        extract_prompt_fn=lambda results: _build_competitive_prompt(
+            brand, competitors, results,
+        ),
+        scan_mode="bd_competitive_social",
+        api_key=api_key,
     )
-    if not payload:
+    if search_status == _SEARCH_TRANSPORT:
         return (None, _FR_TRANSPORT)
-    # PR-9 honesty gate. Competitor follower counts + KOL-count
-    # estimates are fabrication risk when ungrounded — the model will
-    # happily emit plausible numbers for every competitor brand from
-    # internal knowledge. Zero grounding chunks → suppress entirely.
-    if _grounding_chunk_count(payload) == 0:
+    # PR-9 honesty gate. Competitor follower counts + KOL-count estimates
+    # are fabrication risk — when the search returns nothing there is
+    # nothing to extract from, so suppress entirely rather than let the
+    # extractor emit plausible numbers for every competitor brand.
+    if search_status == _SEARCH_EMPTY:
         logger.info(
-            "competitive_social: ungrounded response (0 grounding chunks) "
-            "for %s — suppressing to avoid fabricated competitor figures",
+            "competitive_social: search returned nothing for %s — "
+            "suppressing to avoid fabricated competitor figures",
             brand,
         )
         return (None, _FR_UNGROUNDED)
@@ -1829,6 +2051,15 @@ async def infer_social_intelligence(
         return empty
     if not brand or not brand.strip() or not domain or not domain.strip():
         return empty
+    # Search-then-extract needs SerpAPI for retrieval. Without it every
+    # social probe degrades to "ungrounded" (honest empty, never fabricated)
+    # — surface it so the operator knows the section will come back empty.
+    from services.social_search_client import _resolve_search_api_key
+    if not _resolve_search_api_key():
+        logger.info(
+            "social_intelligence: no SERPAPI_API_KEY — social probes will "
+            "return ungrounded (empty) for %s", brand,
+        )
 
     # Handle-detection fallback. The cold-start flow threads
     # `detected_handles` (scraped from homepage HTML it already

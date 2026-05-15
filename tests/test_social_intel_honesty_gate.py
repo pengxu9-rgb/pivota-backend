@@ -4,33 +4,41 @@ The post-PR-8 quality review found that `_infer_own_presence`,
 `_infer_kol_endorsements`, and `_infer_competitive_social` in
 `services/bd_brand_signals.py` accepted whatever follower counts /
 creator lists / competitive figures the LLM returned — with no
-verification that the response was actually grounded in a web
-source. An ungrounded Gemini response answers from internal
-knowledge: plausible-sounding numbers that are fabrication, not data.
+verification that the response was actually grounded in a web source.
+An ungrounded response answers from internal knowledge: plausible-
+sounding numbers that are fabrication, not data.
 
-PR-9 adds `_grounding_chunk_count(payload)`: every `_gemini_grounded_call`
-uses the `google_search` tool, so a grounded response carries
-`candidates[0].groundingMetadata.groundingChunks`. Zero chunks means
-the model didn't consult the web.
+The honesty gate's *trigger* changed with the search-then-extract
+rework (2026-05-14). It used to be `_grounding_chunk_count(payload) > 0`
+("did Gemini's google_search tool retrieve anything"). It's now the
+deterministic `search_status` from `_search_then_extract`:
+  - `_SEARCH_OK`        — SerpAPI returned usable results → grounded
+  - `_SEARCH_EMPTY`     — SerpAPI returned nothing → ungrounded
+  - `_SEARCH_TRANSPORT` — the search/extraction call failed → transport_error
 
-Gate behavior per sub-call:
+Gate behavior per sub-call is UNCHANGED:
   - _infer_own_presence: ungrounded → null all metric fields, keep
     handle, mark grounding="ungrounded"
   - _infer_kol_endorsements: ungrounded → return None (a fabricated
     creator list is the highest-risk output; suppress entirely)
   - _infer_competitive_social: ungrounded → return None
 
-These tests mock `_gemini_grounded_call` so no network is touched.
+These tests mock `_search_then_extract` so no network is touched.
+`_grounding_chunk_count` is unchanged + still used by the 4 non-social
+grounded callers — its primitive tests stay below.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from services.bd_brand_signals import (
+    _SEARCH_EMPTY,
+    _SEARCH_OK,
+    _SEARCH_TRANSPORT,
     _grounding_chunk_count,
     _infer_competitive_social,
     _infer_kol_endorsements,
@@ -39,7 +47,7 @@ from services.bd_brand_signals import (
 
 
 # =========================================================================
-# _grounding_chunk_count — the gate primitive
+# _grounding_chunk_count — still used by the 4 non-social grounded callers
 # =========================================================================
 
 
@@ -70,7 +78,6 @@ def test_grounding_chunk_count_snakecase():
 
 
 def test_grounding_chunk_count_zero_when_no_metadata():
-    """Ungrounded response: candidate has content but no groundingMetadata."""
     payload = {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
     assert _grounding_chunk_count(payload) == 0
 
@@ -94,24 +101,15 @@ def test_grounding_chunk_count_handles_garbage_input():
 
 
 # =========================================================================
-# Test payload builders
+# Test payload builder — an extraction-call response (Gemini-shaped).
 # =========================================================================
 
 
-def _payload(text: str, *, grounded: bool) -> Dict[str, Any]:
-    """Build a Gemini-shaped payload with `text` as the response and
-    either 2 grounding chunks (grounded) or none (ungrounded)."""
-    candidate: Dict[str, Any] = {
-        "content": {"parts": [{"text": text}]},
-    }
-    if grounded:
-        candidate["groundingMetadata"] = {
-            "groundingChunks": [
-                {"web": {"uri": "https://socialblade.com/x", "title": "SB"}},
-                {"web": {"uri": "https://tiktok.com/@brand", "title": "TT"}},
-            ],
-        }
-    return {"candidates": [candidate]}
+def _payload(text: str) -> Dict[str, Any]:
+    """Build a Gemini-shaped extraction-call response with `text` as the
+    body. (groundingMetadata is irrelevant post-rework — the search step
+    decides groundedness, not the extraction response.)"""
+    return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
 
 
 _OWN_PRESENCE_JSON = (
@@ -131,20 +129,23 @@ _COMPETITIVE_JSON = (
 )
 
 
+def _ste(payload, status):
+    """An AsyncMock standing in for `_search_then_extract`."""
+    return AsyncMock(return_value=(payload, status))
+
+
 # =========================================================================
 # _infer_own_presence — ungrounded nulls metrics, keeps handle
-# All three sub-calls now return a (result, failure_reason) tuple.
 # =========================================================================
 
 
 @pytest.mark.asyncio
 async def test_own_presence_grounded_keeps_metrics():
-    """Grounded response (2 chunks) → follower numbers survive,
+    """search ok → extraction parsed → follower numbers survive,
     grounding marker = grounded, failure_reason None."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(_OWN_PRESENCE_JSON, grounded=True),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(_payload(_OWN_PRESENCE_JSON), _SEARCH_OK),
     ):
         result, reason = await _infer_own_presence(
             "Beauty of Joseon", "tiktok", "beautyofjoseon", "fake-key",
@@ -161,14 +162,12 @@ async def test_own_presence_grounded_keeps_metrics():
 
 @pytest.mark.asyncio
 async def test_own_presence_ungrounded_nulls_metrics_keeps_handle():
-    """Ungrounded response (0 chunks) → every metric nulled, handle
-    survives, grounding marker = ungrounded. The result still
-    SURFACES (handle present) so failure_reason is None — the
-    ungrounded state is carried by the `grounding` field."""
+    """search empty → no extraction runs → every metric nulled, handle
+    survives, grounding marker = ungrounded. The result still SURFACES
+    (handle present) so failure_reason is None."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(_OWN_PRESENCE_JSON, grounded=False),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(None, _SEARCH_EMPTY),
     ):
         result, reason = await _infer_own_presence(
             "Beauty of Joseon", "tiktok", "beautyofjoseon", "fake-key",
@@ -187,12 +186,11 @@ async def test_own_presence_ungrounded_nulls_metrics_keeps_handle():
 
 @pytest.mark.asyncio
 async def test_own_presence_ungrounded_no_handle_suppressed():
-    """Ungrounded AND no caller-supplied handle → every field nulled
+    """search empty AND no caller-supplied handle → every field nulled
     → emptiness check returns (None, "ungrounded")."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(_OWN_PRESENCE_JSON, grounded=False),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(None, _SEARCH_EMPTY),
     ):
         result, reason = await _infer_own_presence(
             "Beauty of Joseon", "instagram", None, "fake-key",
@@ -202,13 +200,11 @@ async def test_own_presence_ungrounded_no_handle_suppressed():
 
 
 @pytest.mark.asyncio
-async def test_own_presence_transport_error_when_payload_none():
-    """_gemini_grounded_call returns None (HTTP/timeout/429) →
-    (None, "transport_error")."""
+async def test_own_presence_transport_error():
+    """search OR extraction call failed → (None, "transport_error")."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=None,
+        "services.bd_brand_signals._search_then_extract",
+        _ste(None, _SEARCH_TRANSPORT),
     ):
         result, reason = await _infer_own_presence(
             "Beauty of Joseon", "tiktok", "boj", "fake-key",
@@ -219,11 +215,11 @@ async def test_own_presence_transport_error_when_payload_none():
 
 @pytest.mark.asyncio
 async def test_own_presence_parse_error_when_not_json():
-    """Response body that doesn't parse to a dict → (None, "parse_error")."""
+    """search ok but the extraction body doesn't parse to a dict →
+    (None, "parse_error")."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload("this is not json at all", grounded=True),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(_payload("this is not json at all"), _SEARCH_OK),
     ):
         result, reason = await _infer_own_presence(
             "Beauty of Joseon", "tiktok", "boj", "fake-key",
@@ -240,9 +236,8 @@ async def test_own_presence_instagram_grounded():
         '"engagement_rate_estimate": "2.1%", "content_focus": "K-beauty"}'
     )
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(ig_json, grounded=True),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(_payload(ig_json), _SEARCH_OK),
     ):
         result, reason = await _infer_own_presence(
             "Beauty of Joseon", "instagram", "boj", "fake-key",
@@ -261,9 +256,8 @@ async def test_own_presence_instagram_grounded():
 @pytest.mark.asyncio
 async def test_kol_grounded_returns_list():
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(_KOL_JSON, grounded=True),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(_payload(_KOL_JSON), _SEARCH_OK),
     ):
         result, reason = await _infer_kol_endorsements(
             "Beauty of Joseon", "tiktok", "fake-key",
@@ -276,13 +270,11 @@ async def test_kol_grounded_returns_list():
 
 @pytest.mark.asyncio
 async def test_kol_ungrounded_returns_none():
-    """Ungrounded creator list is fabrication — suppress entirely.
-    Even though the JSON parses fine, 0 grounding chunks means the
-    model invented these creators → (None, "ungrounded")."""
+    """search empty → there is nothing to extract from → suppress the
+    creator list entirely → (None, "ungrounded")."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(_KOL_JSON, grounded=False),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(None, _SEARCH_EMPTY),
     ):
         result, reason = await _infer_kol_endorsements(
             "Beauty of Joseon", "tiktok", "fake-key",
@@ -293,13 +285,12 @@ async def test_kol_ungrounded_returns_none():
 
 @pytest.mark.asyncio
 async def test_kol_no_data_when_grounded_but_empty():
-    """Grounded + parsed but the model found no creators → the list
-    is empty → (None, "no_data"). A legitimate "we checked, found
-    nothing" outcome — distinct from a failure."""
+    """search ok + extraction parsed but the model found no creators →
+    empty list → (None, "no_data"). A legitimate "we checked, found
+    nothing" — distinct from a failure."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload("[]", grounded=True),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(_payload("[]"), _SEARCH_OK),
     ):
         result, reason = await _infer_kol_endorsements(
             "Beauty of Joseon", "tiktok", "fake-key",
@@ -309,11 +300,10 @@ async def test_kol_no_data_when_grounded_but_empty():
 
 
 @pytest.mark.asyncio
-async def test_kol_transport_error_when_payload_none():
+async def test_kol_transport_error():
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=None,
+        "services.bd_brand_signals._search_then_extract",
+        _ste(None, _SEARCH_TRANSPORT),
     ):
         result, reason = await _infer_kol_endorsements(
             "Beauty of Joseon", "tiktok", "fake-key",
@@ -330,9 +320,8 @@ async def test_kol_transport_error_when_payload_none():
 @pytest.mark.asyncio
 async def test_competitive_grounded_returns_list():
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(_COMPETITIVE_JSON, grounded=True),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(_payload(_COMPETITIVE_JSON), _SEARCH_OK),
     ):
         result, reason = await _infer_competitive_social(
             "Beauty of Joseon", ["Drunk Elephant"], "fake-key",
@@ -346,11 +335,10 @@ async def test_competitive_grounded_returns_list():
 
 @pytest.mark.asyncio
 async def test_competitive_ungrounded_returns_none():
-    """Ungrounded competitor figures — suppress → (None, "ungrounded")."""
+    """search empty → suppress competitor figures → (None, "ungrounded")."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload(_COMPETITIVE_JSON, grounded=False),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(None, _SEARCH_EMPTY),
     ):
         result, reason = await _infer_competitive_social(
             "Beauty of Joseon", ["Drunk Elephant"], "fake-key",
@@ -362,9 +350,8 @@ async def test_competitive_ungrounded_returns_none():
 @pytest.mark.asyncio
 async def test_competitive_parse_error_when_not_array():
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new_callable=AsyncMock,
-        return_value=_payload("not an array", grounded=True),
+        "services.bd_brand_signals._search_then_extract",
+        _ste(_payload("not an array"), _SEARCH_OK),
     ):
         result, reason = await _infer_competitive_social(
             "Beauty of Joseon", ["Drunk Elephant"], "fake-key",
@@ -378,7 +365,7 @@ async def test_competitive_empty_competitors_returns_none():
     """Pre-existing guard still holds — no competitors → no call.
     Not a failure (nothing was attempted) → reason is None."""
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
+        "services.bd_brand_signals._search_then_extract",
         new_callable=AsyncMock,
     ) as mock_call:
         result, reason = await _infer_competitive_social(

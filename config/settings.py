@@ -191,6 +191,16 @@ class Settings(BaseSettings):
     # support, which the probe relies on for predictable JSON outputs.
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+    # SerpAPI — deterministic web search for the BD social-intel probes.
+    # The 3 social probes (own presence / KOL / competitive) replaced
+    # Gemini's discretionary `google_search` grounding (which a 2026-05-14
+    # diagnostic proved returns 0 chunks 12/15 calls) with a real search
+    # API + Gemini-as-extractor. When SERPAPI_API_KEY is unset the social
+    # search client returns no results and the probes degrade to
+    # "ungrounded" — they never fabricate. See services/social_search_client.py.
+    serpapi_api_key: Optional[str] = os.getenv("SERPAPI_API_KEY")
+    serpapi_base_url: str = os.getenv("SERPAPI_BASE_URL", "https://serpapi.com")
+
     # Platform Orders ACP Integration
     enable_platform_orders_acp: bool = os.getenv("FEATURE_PLATFORM_ORDERS_ACP", "false").lower() == "true"
     platform_orders_acp_url: str = os.getenv(
