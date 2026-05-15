@@ -900,13 +900,16 @@ async def _gemini_grounded_call(
     """One grounded call (Gemini `google_search` tool). Returns parsed
     payload or None on any failure.
 
-    NOTE: the 3 social probes (own presence / KOL / competitive) migrated
-    OFF this — they use `_search_then_extract` (real SerpAPI search +
-    `_gemini_extract_call`), because Gemini's `google_search` grounding
-    retrieval returned 0 chunks for 12/15 social calls (2026-05-14
-    diagnostic). This function + `_grounding_chunk_count` stay for the 4
-    non-social grounded callers (retail / founder / corporate / press);
-    migrating those to search-then-extract is a follow-up.
+    DEPRECATED — no callers in this module as of the non-social migration.
+    Both the 3 social probes (own presence / KOL / competitive — migrated
+    in PR #535) and the 4 non-social ones (retail / founder / corporate /
+    press — migrated here) now use `_search_then_extract` (real SerpAPI
+    search + `_gemini_extract_call`), because Gemini's `google_search`
+    grounding retrieval returned 0 chunks for 12/15 social and 9/12
+    non-social calls in the 2026-05-14 diagnostics. This function +
+    `_grounding_chunk_count` + `_GROUNDING_DIRECTIVE` are kept transitionally
+    so a follow-up cleanup PR can remove them with its own minimal-blast
+    diff; new callers should NOT be added.
 
     `model` selects the Gemini model — defaults to `_GEMINI_MODEL`.
 
@@ -1146,46 +1149,67 @@ async def _record_bd_telemetry(
 # Full write-up: ~/tmp/social-grounding-check/verdict.md.
 
 
-def _build_retail_prompt(brand: str, domain: str) -> str:
-    return f"""You are a retail-distribution analyst. List the top 8 online retailers (department stores, marketplaces, beauty/category specialists) that currently sell products from {brand} ({domain}).
+def _build_retail_prompt(
+    brand: str, domain: str, search_results: List[Dict[str, str]],
+) -> str:
+    return f"""You are a retail-distribution analyst. From the search results below, extract up to 8 online retailers (department stores, marketplaces, beauty/category specialists) that currently sell products from {brand} ({domain}).
+
+{_EXTRACTION_DIRECTIVE}
+
+SEARCH RESULTS:
+{_format_search_results(search_results)}
 
 For each retailer give:
 - retailer: the retailer name (e.g. "Sephora", "Amazon", "Target")
-- url: the brand's landing or product page on that retailer site, if you can identify it
-- confidence: "high" (you've seen the brand cited there in grounded results), "medium" (you're inferring from category fit), or "low"
+- url: the brand's landing or product page on that retailer site, if present in the results
+- confidence: "high" (named explicitly in the results), "medium" (referenced indirectly), or "low"
 
 OUTPUT FORMAT — strict:
 - Reply with a bare JSON array starting with [ and ending with ]
 - Do NOT wrap in markdown fences (```)
 - Do NOT wrap in an outer object like {{"retailers": [...]}}
 - Do NOT add prose before or after
-- If no retailers found, reply with the literal: []
+- If the search results name no retailers, reply with the literal: []
 
 Schema per element:
 {{"retailer": "...", "url": "...", "confidence": "high"}}"""
 
 
-def _build_founder_prompt(brand: str, domain: str) -> str:
-    return f"""You are a brand-research analyst. Find founder + founding context for {brand} ({domain}).
+def _build_founder_prompt(
+    brand: str, domain: str, search_results: List[Dict[str, str]],
+) -> str:
+    return f"""You are a brand-research analyst. From the search results below, extract founder + founding context for {brand} ({domain}).
+
+{_EXTRACTION_DIRECTIVE}
+
+SEARCH RESULTS:
+{_format_search_results(search_results)}
 
 Reply with ONLY a JSON object. No prose:
 
 {{
-  "founders": ["Name 1", "Name 2"],   // founder names; empty array if unknown
-  "founding_year": 2018,              // integer; null if unknown
-  "origin_story": "One-to-two sentence origin: what gap they saw, who started it, why."
+  "founders": ["Name 1", "Name 2"],   // founder names from the results; empty array if unknown
+  "founding_year": 2018,              // integer from the results; null if unknown
+  "origin_story": "One-to-two sentence origin grounded in the results: what gap they saw, who started it, why."
 }}
 
-If you can't find verified information, return {{"founders": [], "founding_year": null, "origin_story": null}}."""
+If the search results don't establish these, return {{"founders": [], "founding_year": null, "origin_story": null}}."""
 
 
-def _build_press_prompt(brand: str, domain: str) -> str:
-    return f"""You are a media-monitoring analyst. List up to 6 press articles, editorial features, or notable mentions of {brand} ({domain}) from the last 12 months.
+def _build_press_prompt(
+    brand: str, domain: str, search_results: List[Dict[str, str]],
+) -> str:
+    return f"""You are a media-monitoring analyst. From the search results below, extract up to 6 press articles, editorial features, or notable mentions of {brand} ({domain}) from the last 12 months.
+
+{_EXTRACTION_DIRECTIVE}
+
+SEARCH RESULTS:
+{_format_search_results(search_results)}
 
 For each:
 - publication: name (e.g. "NYMag Strategist", "Forbes Vetted")
 - headline: article headline
-- url: article URL
+- url: article URL (from the search results)
 - date: publication date (ISO format YYYY-MM-DD if known, else year)
 
 OUTPUT FORMAT — strict:
@@ -1193,18 +1217,22 @@ OUTPUT FORMAT — strict:
 - Do NOT wrap in markdown fences (```)
 - Do NOT wrap in an outer object like {{"press": [...]}}
 - Do NOT add prose before or after
-- If no recent coverage found, reply with the literal: []
+- If the search results contain no coverage, reply with the literal: []
 
 Schema per element:
 {{"publication": "...", "headline": "...", "url": "...", "date": "YYYY-MM-DD"}}"""
 
 
 async def _infer_retail_presence(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
-    payload = await _gemini_grounded_call(
-        _build_retail_prompt(brand, domain),
-        api_key=api_key, scan_mode="bd_retail_presence",
+    payload, search_status = await _search_then_extract(
+        queries=_retail_queries(brand, domain),
+        extract_prompt_fn=lambda r: _build_retail_prompt(brand, domain, r),
+        scan_mode="bd_retail_presence",
+        api_key=api_key,
     )
-    if not payload:
+    if search_status != _SEARCH_OK or not payload:
+        # search empty OR transport-failed → honest empty, never a fabricated
+        # retailer list. Downstream `(brand_context or {}).get(...)` handles None.
         return None
     raw_text = _parse_gemini_text(payload)
     parsed = _coerce_to_array(_unwrap_json(raw_text))
@@ -1230,11 +1258,13 @@ async def _infer_retail_presence(brand: str, domain: str, api_key: str) -> Optio
 
 
 async def _infer_founder_story(brand: str, domain: str, api_key: str) -> Optional[Dict[str, Any]]:
-    payload = await _gemini_grounded_call(
-        _build_founder_prompt(brand, domain),
-        api_key=api_key, scan_mode="bd_founder_story",
+    payload, search_status = await _search_then_extract(
+        queries=_founder_queries(brand, domain),
+        extract_prompt_fn=lambda r: _build_founder_prompt(brand, domain, r),
+        scan_mode="bd_founder_story",
+        api_key=api_key,
     )
-    if not payload:
+    if search_status != _SEARCH_OK or not payload:
         return None
     parsed = _unwrap_json(_parse_gemini_text(payload))
     if not isinstance(parsed, dict):
@@ -1259,14 +1289,22 @@ async def _infer_founder_story(brand: str, domain: str, api_key: str) -> Optiona
     }
 
 
-def _build_corporate_prompt(brand: str, domain: str) -> str:
-    """PR-7a corporate intel prompt. Asks Gemini for ownership +
-    funding signals only, with strict null defaults to prevent
-    hallucination of corporate facts."""
+def _build_corporate_prompt(
+    brand: str, domain: str, search_results: List[Dict[str, str]],
+) -> str:
+    """PR-7a corporate intel prompt — extraction variant. Reads ownership +
+    funding signals from the SerpAPI search results below, with strict null
+    defaults to prevent fabrication of corporate facts. Acquisition signals
+    must come from explicit text in the results (press release / SEC
+    filing), never from inference; the downstream hallucination-defense
+    layer additionally nulls low-confidence acquired/subsidiary claims."""
     return (
         f"Research the corporate ownership and funding status of "
-        f"the brand '{brand}' (website: {domain}). Respond ONLY with "
-        f"a JSON object of this exact shape:\n"
+        f"the brand '{brand}' (website: {domain}) from the search "
+        f"results below.\n\n"
+        f"{_EXTRACTION_DIRECTIVE}\n\n"
+        f"SEARCH RESULTS:\n{_format_search_results(search_results)}\n\n"
+        f"Respond ONLY with a JSON object of this exact shape:\n"
         f'{{\n'
         f'  "ownership_status": "independent" | "acquired" | '
         f'"public" | "subsidiary" | null,\n'
@@ -1278,11 +1316,11 @@ def _build_corporate_prompt(brand: str, domain: str) -> str:
         f'"100m_to_1b" | "1b_plus" | null,\n'
         f'  "confidence": "high" | "medium" | "low"\n'
         f'}}\n'
-        f"Use null for any field you cannot establish with high "
-        f"confidence from public sources. Acquisition signals MUST "
-        f"come from a confirmed press release or SEC filing — do "
-        f"not infer from tone or rumor. Set confidence='low' if any "
-        f"field required a non-trivial inference."
+        f"Use null for any field not supported by the search results. "
+        f"Acquisition signals MUST be explicitly stated in the results "
+        f"(press release / SEC filing) — do not infer from tone or "
+        f"category. Set confidence='low' if any field required a "
+        f"non-trivial inference from the snippets."
     )
 
 
@@ -1294,11 +1332,17 @@ async def _infer_corporate_intel(
     null defaults; rejects responses with confidence='low' on
     ownership_status to defend against hallucinated acquisitions.
     """
-    payload = await _gemini_grounded_call(
-        _build_corporate_prompt(brand, domain), api_key=api_key,
+    payload, search_status = await _search_then_extract(
+        queries=_corporate_queries(brand, domain),
+        extract_prompt_fn=lambda r: _build_corporate_prompt(brand, domain, r),
         scan_mode="bd_corporate_intel",
+        api_key=api_key,
     )
-    if not payload:
+    if search_status != _SEARCH_OK or not payload:
+        # search empty / transport-failed → honest empty. This is the
+        # ONLY non-social field actively rendered to merchants (executive
+        # summary editorial framing), so the suppress-on-ungrounded
+        # discipline matters most here.
         return None
     parsed = _unwrap_json(_parse_gemini_text(payload))
     if not isinstance(parsed, dict):
@@ -1366,11 +1410,16 @@ async def _infer_corporate_intel(
 
 
 async def _infer_press_coverage(brand: str, domain: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
-    payload = await _gemini_grounded_call(
-        _build_press_prompt(brand, domain),
-        api_key=api_key, scan_mode="bd_press_coverage",
+    payload, search_status = await _search_then_extract(
+        queries=_press_queries(brand, domain),
+        extract_prompt_fn=lambda r: _build_press_prompt(brand, domain, r),
+        scan_mode="bd_press_coverage",
+        api_key=api_key,
     )
-    if not payload:
+    if search_status != _SEARCH_OK or not payload:
+        # search empty / transport-failed → honest empty. (Diagnostic also
+        # showed 3/3 hit MAX_TOKENS pre-rework; the extraction-path 4096
+        # token budget side-fixes that.)
         return None
     raw_text = _parse_gemini_text(payload)
     parsed = _coerce_to_array(_unwrap_json(raw_text))
@@ -1563,6 +1612,43 @@ def _competitive_queries(brand: str, competitors: List[str]) -> List[str]:
     return [
         f"{comp} TikTok Instagram followers" for comp in competitors[:4]
     ]
+
+
+# Query builders for the 4 non-social bd_ probes (retail / founder / corporate /
+# press). Mirror what Gemini's google_search actually issued in the 2026-05-14
+# non-social diagnostic — these are the search-then-extract replacements for
+# the discretionary `_gemini_grounded_call` path (which returned 0 chunks
+# 9/12 times).
+def _retail_queries(brand: str, domain: str) -> List[str]:
+    return [
+        f"where to buy {brand}",
+        f"{brand} retailers",
+        f"{brand} sephora ulta amazon target",
+    ][:3]
+
+
+def _founder_queries(brand: str, domain: str) -> List[str]:
+    return [
+        f"{brand} founder",
+        f"{brand} founding year origin story",
+        f"who started {brand} {domain}",
+    ][:3]
+
+
+def _corporate_queries(brand: str, domain: str) -> List[str]:
+    return [
+        f"{brand} parent company",
+        f"{brand} acquired by",
+        f"{brand} funding round valuation",
+    ][:3]
+
+
+def _press_queries(brand: str, domain: str) -> List[str]:
+    return [
+        f"{brand} press coverage 2025 2026",
+        f"{brand} editorial feature review",
+        f"{brand} forbes nymag bustle vogue",
+    ][:3]
 
 
 def _build_own_presence_prompt(

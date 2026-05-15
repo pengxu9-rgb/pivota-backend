@@ -8,6 +8,13 @@ Coverage:
   - All-null response → returns None (caller treats as "no data")
   - Narrative integration: corporate phrase weaves into executive
     summary opening paragraph
+
+`_infer_corporate_intel` migrated from `_gemini_grounded_call` (Gemini
+`google_search` grounding) to `_search_then_extract` (SerpAPI search +
+`_gemini_extract_call`) in the non-social grounded-callers rework. The
+tests now patch `_search_then_extract` and return a `(payload, status)`
+tuple — the underlying extraction-response shape (Gemini-style payload
+with candidates/content/parts) is unchanged.
 """
 
 from __future__ import annotations
@@ -18,21 +25,25 @@ import pytest
 
 
 # ---------------------------------------------------------------------
-# Corporate intel parsing (mocked Gemini response)
+# Corporate intel parsing (mocked search-then-extract response)
 # ---------------------------------------------------------------------
 
 
-def _mock_gemini_payload(parsed_dict):
-    """Wrap a parsed JSON dict in the Gemini grounded response shape
-    that _gemini_grounded_call returns."""
+def _mock_search_extract(parsed_dict, status="ok"):
+    """Build the (payload, search_status) tuple that
+    `_search_then_extract` returns. `parsed_dict` is wrapped in a
+    Gemini-extraction-call response shape (candidates/content/parts).
+    Default status is "ok"; pass "transport_error" or "empty" to
+    simulate the no-extraction paths."""
     import json
-    return {
+    payload = {
         "candidates": [{
             "content": {
                 "parts": [{"text": json.dumps(parsed_dict)}],
             },
         }],
     }
+    return (payload, status)
 
 
 @pytest.mark.asyncio
@@ -40,8 +51,8 @@ async def test_parses_acquired_brand_high_confidence():
     """Grüns case: acquired by Unilever, confirmed."""
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": "acquired",
             "parent_company": "Unilever",
             "parent_acquisition_year": 2024,
@@ -62,8 +73,8 @@ async def test_parses_acquired_brand_high_confidence():
 async def test_parses_publicly_traded_brand():
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": "public",
             "parent_company": None,
             "parent_acquisition_year": None,
@@ -82,8 +93,8 @@ async def test_parses_publicly_traded_brand():
 async def test_parses_venture_backed_brand():
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": "independent",
             "parent_company": None,
             "parent_acquisition_year": None,
@@ -103,8 +114,8 @@ async def test_rejects_low_confidence_acquisition_claim():
     low confidence, downgrade ownership_status to None."""
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": "acquired",
             "parent_company": "BigCorp",
             "parent_acquisition_year": 2023,
@@ -127,8 +138,8 @@ async def test_drops_parent_company_when_ownership_status_doesnt_warrant():
     relationships that don't exist."""
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": "independent",
             "parent_company": "SomeBrand",  # shouldn't be set
             "parent_acquisition_year": None,
@@ -145,8 +156,8 @@ async def test_drops_parent_company_when_ownership_status_doesnt_warrant():
 async def test_rejects_invalid_acquisition_year():
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": "acquired",
             "parent_company": "Unilever",
             "parent_acquisition_year": 1750,  # out of range
@@ -165,8 +176,8 @@ async def test_returns_none_when_all_fields_null():
     everything is null → return None so caller renders 'no data'."""
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": None,
             "parent_company": None,
             "parent_acquisition_year": None,
@@ -183,8 +194,8 @@ async def test_returns_none_when_all_fields_null():
 async def test_invalid_funding_stage_dropped():
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=_mock_gemini_payload({
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=_mock_search_extract({
             "ownership_status": "independent",
             "parent_company": None,
             "parent_acquisition_year": None,
@@ -201,13 +212,29 @@ async def test_invalid_funding_stage_dropped():
 
 
 @pytest.mark.asyncio
-async def test_returns_none_on_gemini_call_failure():
-    """When the underlying Gemini call returns None (transport
-    failure), corporate intel is None too. Doesn't crash the audit."""
+async def test_returns_none_on_search_transport_failure():
+    """When the search step transport-fails (or the extraction call
+    fails), `_search_then_extract` returns (None, "transport_error") and
+    `_infer_corporate_intel` returns None — never a fabricated value.
+    Doesn't crash the audit."""
     from services.bd_brand_signals import _infer_corporate_intel
     with patch(
-        "services.bd_brand_signals._gemini_grounded_call",
-        new=AsyncMock(return_value=None),
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=(None, "transport_error")),
+    ):
+        result = await _infer_corporate_intel("X", "x.com", "test-key")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_returns_none_on_search_empty():
+    """When the search returns no usable results, `_search_then_extract`
+    returns (None, "empty") and `_infer_corporate_intel` returns None
+    rather than a fabricated value. Honesty gate: search empty ≡ ungrounded."""
+    from services.bd_brand_signals import _infer_corporate_intel
+    with patch(
+        "services.bd_brand_signals._search_then_extract",
+        new=AsyncMock(return_value=(None, "empty")),
     ):
         result = await _infer_corporate_intel("X", "x.com", "test-key")
     assert result is None
