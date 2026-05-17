@@ -75,6 +75,20 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # stage (draft/candidate/validated/published/hold/archived).
             # Recall (Phase O-5) filters on this column.
             "pdp_lifecycle_stage",
+            # Phase O-5b — see migration 094. Structured fashion fields
+            # + per-field provenance; the PIVOTA-Agent gateway's
+            # canonicalCatalogSearch SELECT (PR #1393) materializes
+            # these directly into product.fashion_meta. Missing column
+            # → gateway query errors on any catalog row hit.
+            "material",
+            "material_source",
+            "material_confidence",
+            "care",
+            "care_source",
+            "care_confidence",
+            "size_guide",
+            "size_guide_source",
+            "size_guide_confidence",
         },
     ),
 )
@@ -386,6 +400,28 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
                       ADD COLUMN IF NOT EXISTS demographic VARCHAR(16),
                       ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
+                    """
+                )
+            )
+            # Phase O-5b: structured fashion fields + per-field provenance
+            # (migration 094_catalog_fashion_fields.sql). Production
+            # fast-mode startup skips db/migrations/, so schema_guard owns
+            # the apply. Without this, the PIVOTA-Agent gateway SELECT
+            # (PR #1393) fails with "column does not exist" the moment
+            # any fashion-tagged product is requested.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS material TEXT,
+                      ADD COLUMN IF NOT EXISTS material_source VARCHAR(32),
+                      ADD COLUMN IF NOT EXISTS material_confidence REAL,
+                      ADD COLUMN IF NOT EXISTS care TEXT,
+                      ADD COLUMN IF NOT EXISTS care_source VARCHAR(32),
+                      ADD COLUMN IF NOT EXISTS care_confidence REAL,
+                      ADD COLUMN IF NOT EXISTS size_guide JSONB,
+                      ADD COLUMN IF NOT EXISTS size_guide_source VARCHAR(32),
+                      ADD COLUMN IF NOT EXISTS size_guide_confidence REAL;
                     """
                 )
             )
