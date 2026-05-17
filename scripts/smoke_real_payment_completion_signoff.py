@@ -12,7 +12,6 @@ from typing import Any, Dict, Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MERCHANT_ID = "merch_efbc46b4619cfbdf"
 PAID_TERMINAL_STATUSES = {"paid", "completed"}
 REFUND_TERMINAL_STATUSES = {"refunded", "partially_refunded"}
 
@@ -29,7 +28,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--merchant-id",
-        default=os.getenv("READINESS_ALPHA_MERCHANT_ID") or DEFAULT_MERCHANT_ID,
+        default=os.getenv("READINESS_ALPHA_MERCHANT_ID"),
     )
     parser.add_argument(
         "--mode",
@@ -72,7 +71,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", default=None)
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--output-md", default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.merchant_id:
+        parser.error("--merchant-id is required or set READINESS_ALPHA_MERCHANT_ID")
+    return args
 
 
 def _write_if_requested(path_str: Optional[str], content: str) -> None:

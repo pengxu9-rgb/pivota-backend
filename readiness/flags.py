@@ -3,9 +3,6 @@ from __future__ import annotations
 import os
 
 
-DEFAULT_ALPHA_MERCHANT_ID = "merch_efbc46b4619cfbdf"
-
-
 def _env_flag(name: str) -> bool:
     return (os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on"))
 
@@ -55,4 +52,4 @@ def readiness_return_sync_enabled() -> bool:
 
 
 def readiness_alpha_merchant_id() -> str:
-    return (os.getenv("READINESS_ALPHA_MERCHANT_ID") or DEFAULT_ALPHA_MERCHANT_ID).strip() or DEFAULT_ALPHA_MERCHANT_ID
+    return os.getenv("READINESS_ALPHA_MERCHANT_ID", "").strip()

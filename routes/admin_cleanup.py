@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from db.database import database
 from routes.auth_routes import require_admin
+from utils.runtime_safety import require_runtime_gate
 import logging
 
 router = APIRouter(prefix="/admin/cleanup", tags=["Admin Cleanup"])
@@ -23,9 +24,10 @@ async def remove_other_merchants(
     This cleans up test/mock data and keeps only the real merchant account
     
     Args:
-        keep_merchant_id: The merchant to keep (e.g., merch_208139f7600dbf42)
+        keep_merchant_id: The merchant to keep
         confirm: Must be true to execute
     """
+    require_runtime_gate("ENABLE_DESTRUCTIVE_ADMIN_CLEANUP")
     if not request.confirm:
         return {
             "status": "warning",
@@ -54,47 +56,17 @@ async def remove_other_merchants(
             
             merchant_ids_to_delete = [m["merchant_id"] for m in merchants_to_delete]
             
-            # Delete in order (respecting foreign keys)
-            # PostgreSQL doesn't support = ANY() with list in asyncpg, use IN instead
-            
-            # 1. Delete orders
-            placeholders = ','.join([f"'{mid}'" for mid in merchant_ids_to_delete])
-            orders_result = await database.execute(
-                f"DELETE FROM orders WHERE merchant_id IN ({placeholders})"
-            )
-            
-            # 2. Delete PSP configs
-            psps_result = await database.execute(
-                f"DELETE FROM merchant_psps WHERE merchant_id IN ({placeholders})"
-            )
-            
-            # 3. Delete merchant_stores if exists
-            try:
-                await database.execute(
-                    f"DELETE FROM merchant_stores WHERE merchant_id IN ({placeholders})"
-                )
-            except:
-                pass  # Table may not exist
-            
-            # 4. Delete users for these merchants
-            users_result = await database.execute(
-                f"DELETE FROM users WHERE merchant_id IN ({placeholders})"
-            )
-            
-            # 5. Delete merchant_onboarding records
-            merchants_result = await database.execute(
-                f"DELETE FROM merchant_onboarding WHERE merchant_id IN ({placeholders})"
-            )
-            
-            # 6. Make sure kept merchant has correct contact_email
-            # (In case merge already ran but didn't update this)
-            await database.execute(
-                """
-                UPDATE merchant_onboarding
-                SET contact_email = 'merchant@test.com'
-                WHERE merchant_id = 'merch_208139f7600dbf42'
-                """
-            )
+            # Delete in order (respecting foreign keys), using bound params only.
+            for merchant_id in merchant_ids_to_delete:
+                params = {"merchant_id": merchant_id}
+                await database.execute("DELETE FROM orders WHERE merchant_id = :merchant_id", params)
+                await database.execute("DELETE FROM merchant_psps WHERE merchant_id = :merchant_id", params)
+                try:
+                    await database.execute("DELETE FROM merchant_stores WHERE merchant_id = :merchant_id", params)
+                except Exception:
+                    pass  # Table may not exist
+                await database.execute("DELETE FROM users WHERE merchant_id = :merchant_id", params)
+                await database.execute("DELETE FROM merchant_onboarding WHERE merchant_id = :merchant_id", params)
             
             logger.info(f"✅ Cleanup complete. Kept {request.keep_merchant_id}, deleted {len(merchants_to_delete)} merchants")
             

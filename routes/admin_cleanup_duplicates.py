@@ -1,56 +1,65 @@
 """
 Admin endpoint to cleanup duplicate store connections
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
+from routes.auth_routes import require_admin
+from utils.runtime_safety import require_runtime_gate
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/cleanup", tags=["admin-cleanup"])
 
 @router.post("/duplicate-stores")
-async def cleanup_duplicate_stores():
-    """
-    Clean up duplicate store connections (no auth for emergency)
-    Keeps stores for merch_6b90dc9838d5fd9c (official demo)
-    Removes duplicates for merch_208139f7600dbf42 (test account)
-    """
+async def cleanup_duplicate_stores(current_user: dict = Depends(require_admin)):
+    """Clean up duplicate store connections, gated for production."""
+    require_runtime_gate("ENABLE_DUPLICATE_STORE_CLEANUP")
     try:
-        # Check current state
         check_query = """
-            SELECT 
-                merchant_id,
+            SELECT
+                domain,
+                platform,
                 COUNT(*) as store_count,
-                STRING_AGG(DISTINCT platform, ', ') as platforms
+                STRING_AGG(DISTINCT merchant_id, ', ') as merchant_ids
             FROM merchant_stores
-            WHERE merchant_id IN ('merch_6b90dc9838d5fd9c', 'merch_208139f7600dbf42')
-            GROUP BY merchant_id
+            WHERE COALESCE(NULLIF(trim(domain), ''), '') <> ''
+            GROUP BY domain, platform
+            HAVING COUNT(*) > 1
         """
-        
         before_state = await database.fetch_all(check_query)
         logger.info(f"Before cleanup: {[dict(r) for r in before_state]}")
-        
-        # Delete duplicate stores for test merchant
-        await database.execute(
-            "DELETE FROM merchant_stores WHERE merchant_id = 'merch_208139f7600dbf42'"
+
+        deleted = await database.execute(
+            """
+            DELETE FROM merchant_stores
+            WHERE store_id IN (
+                SELECT store_id
+                FROM (
+                    SELECT
+                        store_id,
+                        row_number() OVER (
+                            PARTITION BY merchant_id, lower(coalesce(platform, '')), lower(coalesce(domain, ''))
+                            ORDER BY
+                                CASE WHEN lower(coalesce(status, '')) IN ('active', 'connected') THEN 0 ELSE 1 END,
+                                connected_at DESC NULLS LAST,
+                                store_id DESC
+                        ) AS rn
+                    FROM merchant_stores
+                ) ranked
+                WHERE rn > 1
+            )
+            """
         )
-        
-        # Delete products cache for test merchant
-        await database.execute(
-            "DELETE FROM products_cache WHERE merchant_id = 'merch_208139f7600dbf42'"
-        )
-        
-        # Check after cleanup
+
         after_state = await database.fetch_all(check_query)
         logger.info(f"After cleanup: {[dict(r) for r in after_state]}")
-        
+
         return {
             "success": True,
             "message": "Duplicate stores cleaned up",
             "before": [dict(r) for r in before_state],
             "after": [dict(r) for r in after_state],
-            "kept_merchant": "merch_6b90dc9838d5fd9c",
-            "removed_from": "merch_208139f7600dbf42"
+            "deleted": deleted,
         }
         
     except Exception as e:
@@ -59,7 +68,7 @@ async def cleanup_duplicate_stores():
 
 
 @router.get("/check-duplicates")
-async def check_duplicate_stores():
+async def check_duplicate_stores(current_user: dict = Depends(require_admin)):
     """Check for duplicate store connections across merchants"""
     try:
         # Find stores with same domain connected to different merchants
@@ -90,7 +99,5 @@ async def check_duplicate_stores():
         }
     except Exception as e:
         return {"error": str(e)}
-
-
 
 

@@ -5,10 +5,10 @@ Plan: plans/rosy-mixing-bengio.md Stage 2b-i
 
 Usage:
   # Dry-run scoped to a single merchant (recommended first pass)
-  python3 scripts/run_product_group_autogrouper.py --merchant-id merch_efbc46b4619cfbdf
+  python3 scripts/run_product_group_autogrouper.py --merchant-id <merchant_id>
 
   # Apply on that merchant
-  python3 scripts/run_product_group_autogrouper.py --merchant-id merch_efbc46b4619cfbdf --apply
+  python3 scripts/run_product_group_autogrouper.py --merchant-id <merchant_id> --apply
 
   # Dry-run scoped to a single content_key (deepest spot-check)
   python3 scripts/run_product_group_autogrouper.py \

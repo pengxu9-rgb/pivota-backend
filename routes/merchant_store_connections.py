@@ -32,7 +32,7 @@ router = APIRouter(prefix="/integrations", tags=["Merchant Integrations"])
 
 _SHOPIFY_OAUTH_STATE_TTL_SECONDS = 30 * 60
 _SHOPIFY_INSTALL_TOKEN_TTL_SECONDS = 15 * 60
-_SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS_DEFAULT = {"merch_efbc46b4619cfbdf"}
+_SHOPIFY_OAUTH_ALLOWED_MERCHANT_IDS_DEFAULT: set[str] = set()
 _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
     "orders/create",
     "orders/updated",

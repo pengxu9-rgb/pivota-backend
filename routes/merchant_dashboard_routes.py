@@ -255,74 +255,9 @@ class MerchantOrderBackedCanaryRequest(BaseModel):
 # Merchant dashboards should treat revenue as "paid/confirmed" only.
 PAID_PAYMENT_STATUSES_SQL = "('paid','completed','succeeded','success','settled','partially_refunded')"
 
-# Demo data for merchant dashboard
-DEMO_MERCHANT_DATA = {
-    "merch_208139f7600dbf42": {
-        "id": "merch_208139f7600dbf42",
-        "business_name": "ChydanTest Store",
-        "email": "merchant@test.com",
-        "status": "active",
-        "created_at": "2025-01-01T00:00:00Z",
-        "profile": {
-            "business_name": "ChydanTest Store",
-            "contact_name": "Test Merchant",
-            "email": "merchant@test.com",
-            "phone": "+1234567890",
-            "address": "123 Test Street",
-            "city": "New York",
-            "country": "US",
-            "postal_code": "10001"
-        },
-        "stores": [
-            {
-                "id": "store_shopify_demo",
-                "platform": "shopify",
-                "name": "chydantest.myshopify.com",
-                "status": "connected",
-                "connected_at": "2025-01-15T10:00:00Z",
-                "domain": "chydantest.myshopify.com",
-                "api_key": "shpat_xxxxxxxxxxxxx",
-                "last_sync": "2025-10-19T10:00:00Z",
-                "product_count": 4
-            },
-            {
-                "id": "store_wix_demo",
-                "platform": "wix",
-                "name": "peng652.wixsite.com/aydan-1",
-                "status": "connected",
-                "connected_at": "2025-10-19T12:00:00Z",
-                "domain": "peng652.wixsite.com/aydan-1",
-                "api_key_last4": "****",
-                "last_sync": "2025-10-19T12:00:00Z",
-                "product_count": 0
-            }
-        ],
-        "psps": [
-            {
-                "id": "psp_stripe_demo",
-                "provider": "stripe",
-                "name": "Stripe Account",
-                "status": "active",
-                "connected_at": "2025-01-15T11:00:00Z",
-                "account_id": "acct_1234567890",
-                "capabilities": ["card", "bank_transfer", "alipay", "wechat_pay"],
-                "fees": {
-                    "card": 2.9,
-                    "bank_transfer": 1.5,
-                    "alipay": 2.5,
-                    "wechat_pay": 2.5
-                }
-            }
-        ],
-        "webhooks": {
-            "endpoint": "https://chydantest.myshopify.com/webhooks/pivota",
-            "secret": "whsec_" + ''.join(random.choices(string.ascii_letters + string.digits, k=32)),
-            "events": ["order.created", "order.updated", "payment.completed", "payment.failed"],
-            "created_at": "2025-01-15T12:00:00Z",
-            "status": "active"
-        }
-    }
-}
+# Production dashboard routes must fail closed when DB reads fail. Demo
+# merchant fixtures belong in tests/dev-only fixtures, not runtime fallback.
+DEMO_MERCHANT_DATA = {}
 
 def generate_demo_orders(merchant_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     """Generate demo orders for merchant"""
@@ -448,8 +383,7 @@ async def get_merchant_profile(current_user: dict = Depends(get_current_user)):
         raise
     except Exception as e:
         print(f"Error fetching merchant profile: {e}")
-        # Fallback to demo data
-        merchant_id = current_user.get("merchant_id", "merch_208139f7600dbf42")
+        merchant_id = current_user.get("merchant_id")
         merchant_data = DEMO_MERCHANT_DATA.get(merchant_id)
         if merchant_data:
             return {"status": "success", "data": merchant_data["profile"]}
@@ -818,26 +752,7 @@ async def get_merchant_orders(
         }
     except Exception as e:
         print(f"Error fetching orders from DB: {e}")
-        # Fallback to demo data if table doesn't exist
-        orders = generate_demo_orders(merchant_id, limit=50)
-        
-        # Filter by status if provided
-        if status:
-            orders = [o for o in orders if o["status"] == status]
-        
-        # Apply pagination
-        total = len(orders)
-        orders = orders[offset:offset + limit]
-        
-        return {
-            "status": "success",
-            "data": {
-                "orders": orders,
-                "total": total,
-                "limit": limit,
-                "offset": offset
-            }
-        }
+        raise HTTPException(status_code=500, detail="Failed to fetch orders")
 
 @router.get("/merchant/dashboard/stats")
 async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):

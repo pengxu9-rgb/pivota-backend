@@ -1,6 +1,8 @@
 """Direct database check endpoint - bypass all business logic"""
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from db.database import database
+from routes.auth_routes import require_admin
+from utils.runtime_safety import require_runtime_gate
 import datetime
 
 router = APIRouter()
@@ -18,8 +20,9 @@ async def version_check():
     }
 
 @router.get("/direct-db-check")
-async def direct_db_check():
+async def direct_db_check(current_user: dict = Depends(require_admin)):
     """Directly query database without any auth or filtering"""
+    require_runtime_gate("ENABLE_DIRECT_DB_CHECK")
     result = {}
     
     try:
@@ -41,19 +44,18 @@ async def direct_db_check():
         result["psps_error"] = str(e)
     
     try:
-        # Check specific merchant
-        merchant_id = "merch_6b90dc9838d5fd9c"
-        stores_query = "SELECT * FROM merchant_stores WHERE merchant_id = :merchant_id"
-        stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
-        result["test_merchant_stores"] = [dict(s) for s in stores]
-        result["test_merchant_stores_count"] = len(stores)
-        
-        psps_query = "SELECT * FROM merchant_psps WHERE merchant_id = :merchant_id"
-        psps = await database.fetch_all(psps_query, {"merchant_id": merchant_id})
-        result["test_merchant_psps"] = [dict(p) for p in psps]
-        result["test_merchant_psps_count"] = len(psps)
+        merchant_id = str(current_user.get("merchant_id") or "").strip()
+        if merchant_id:
+            stores_query = "SELECT * FROM merchant_stores WHERE merchant_id = :merchant_id"
+            stores = await database.fetch_all(stores_query, {"merchant_id": merchant_id})
+            result["current_merchant_stores"] = [dict(s) for s in stores]
+            result["current_merchant_stores_count"] = len(stores)
+
+            psps_query = "SELECT * FROM merchant_psps WHERE merchant_id = :merchant_id"
+            psps = await database.fetch_all(psps_query, {"merchant_id": merchant_id})
+            result["current_merchant_psps"] = [dict(p) for p in psps]
+            result["current_merchant_psps_count"] = len(psps)
     except Exception as e:
-        result["test_merchant_error"] = str(e)
+        result["current_merchant_error"] = str(e)
     
     return result
-

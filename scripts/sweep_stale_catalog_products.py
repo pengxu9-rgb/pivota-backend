@@ -37,7 +37,7 @@ Usage:
   python3 scripts/sweep_stale_catalog_products.py --apply
 
   # Scope to one merchant for spot-checking
-  python3 scripts/sweep_stale_catalog_products.py --merchant-id merch_efbc46b4619cfbdf
+  python3 scripts/sweep_stale_catalog_products.py --merchant-id <merchant_id>
 
   # Tweak thresholds
   python3 scripts/sweep_stale_catalog_products.py \

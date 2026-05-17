@@ -6,6 +6,7 @@ Clean and simple authentication system for Pivota
 import logging
 import asyncio
 import json
+import os
 from datetime import datetime
 from textwrap import dedent
 from typing import Optional
@@ -32,11 +33,9 @@ from utils.transient_errors import is_asyncpg_busy_error
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 logger = logging.getLogger("auth_routes")
 
-# Keep the historical demo merchant usable when a canonical users row exists
-# without a merchant_id binding in older production databases.
 DEMO_MERCHANT_IDS = {
-    "merchant@test.com": "merch_6b90dc9838d5fd9c",
-}
+    "merchant@test.com": os.getenv("DEMO_MERCHANT_ID", "").strip(),
+} if settings.enable_internal_demo_fixtures and os.getenv("DEMO_MERCHANT_ID", "").strip() else {}
 
 # Backward-compat shim for tests and historical imports.
 # Some code/tests patch `routes.auth.require_admin_user`.

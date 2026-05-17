@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -23,7 +24,11 @@ IDENTITY_RECOVERY_SOURCE = "pdp_identity_recovery"
 DEFAULT_PROPOSER = "pdp_identity_graph_repair_20260512"
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 EXTERNAL_SEED_PLATFORM = "external_seed"
-DEFAULT_SUSPECT_MERCHANT_IDS = ("merch_efbc46b4619cfbdf",)
+DEFAULT_SUSPECT_MERCHANT_IDS = tuple(
+    value.strip()
+    for value in os.getenv("PDP_IDENTITY_RECOVERY_SUSPECT_MERCHANT_IDS", "").split(",")
+    if value.strip()
+)
 
 
 def _clean(value: Any) -> str:

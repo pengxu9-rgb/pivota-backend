@@ -1,22 +1,25 @@
 """
 Initialize orders table with real data
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
 from datetime import datetime, timedelta
 import random
 import uuid
+from routes.auth_routes import require_admin
+from utils.runtime_safety import configured_env_value, require_runtime_gate
 
 router = APIRouter()
 
 @router.post("/reinit-orders-table")
-async def reinit_orders_table():
+async def reinit_orders_table(current_user: dict = Depends(require_admin)):
     """Reinitialize orders table with Stripe-only transactions"""
-    return await init_orders_table()
+    return await init_orders_table(current_user=current_user)
 
 @router.post("/init-orders-table")
-async def init_orders_table():
+async def init_orders_table(current_user: dict = Depends(require_admin)):
     """Create and populate orders table with initial data"""
+    require_runtime_gate("ENABLE_INIT_ORDERS_TABLE")
     try:
         # Create orders table if not exists
         async with database.transaction():
@@ -51,8 +54,9 @@ async def init_orders_table():
             await database.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
             await database.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)")
             
-            # Generate initial orders for test merchant
-            merchant_id = "merch_6b90dc9838d5fd9c"
+            merchant_id = configured_env_value("INIT_ORDERS_TABLE_MERCHANT_ID")
+            if not merchant_id:
+                raise HTTPException(status_code=400, detail="INIT_ORDERS_TABLE_MERCHANT_ID is required")
             statuses = ['completed', 'processing', 'pending', 'failed', 'delivered', 'cancelled']
             payment_methods = ['credit_card', 'debit_card', 'paypal', 'apple_pay', 'google_pay', 'bank_transfer', 'alipay', 'wechat_pay']
             
@@ -172,10 +176,13 @@ async def init_orders_table():
         }
 
 @router.get("/orders-stats")
-async def get_orders_stats():
+async def get_orders_stats(current_user: dict = Depends(require_admin)):
     """Get current orders statistics"""
+    require_runtime_gate("ENABLE_INIT_ORDERS_TABLE")
     try:
-        merchant_id = "merch_6b90dc9838d5fd9c"
+        merchant_id = configured_env_value("INIT_ORDERS_TABLE_MERCHANT_ID")
+        if not merchant_id:
+            raise HTTPException(status_code=400, detail="INIT_ORDERS_TABLE_MERCHANT_ID is required")
         
         # Check if orders table exists
         check_query = """

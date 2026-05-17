@@ -224,7 +224,7 @@ class Settings(BaseSettings):
     feature_readiness_real_merchant_alpha: bool = os.getenv("FEATURE_READINESS_REAL_MERCHANT_ALPHA", "false").lower() == "true"
     feature_readiness_source_of_truth_v1: bool = os.getenv("FEATURE_READINESS_SOURCE_OF_TRUTH_V1", "false").lower() == "true"
     feature_readiness_canonical_checkout_alpha: bool = os.getenv("FEATURE_READINESS_CANONICAL_CHECKOUT_ALPHA", "false").lower() == "true"
-    readiness_alpha_merchant_id: str = os.getenv("READINESS_ALPHA_MERCHANT_ID", "merch_efbc46b4619cfbdf")
+    readiness_alpha_merchant_id: Optional[str] = os.getenv("READINESS_ALPHA_MERCHANT_ID")
     readiness_internal_api_key: Optional[str] = os.getenv("READINESS_INTERNAL_API_KEY")
     readiness_allow_unauthenticated_dev: bool = os.getenv("READINESS_ALLOW_UNAUTHED_DEV", "false").lower() == "true"
     

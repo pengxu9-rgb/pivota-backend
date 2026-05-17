@@ -50,7 +50,9 @@ async def get_all_psp_metrics(current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in ["merchant", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    merchant_id = current_user.get("merchant_id", "merch_6b90dc9838d5fd9c")
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required in current user context")
     
     try:
         # Get all PSPs

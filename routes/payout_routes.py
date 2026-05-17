@@ -134,9 +134,10 @@ async def get_payout_details(
     payout_date = datetime.now() - timedelta(days=random.randint(0, 30))
     arrival_date = payout_date + timedelta(days=2)
     
+    merchant_id = str(current_user.get("merchant_id") or "").strip() or None
     payout = {
         "id": payout_id,
-        "merchant_id": "merch_208139f7600dbf42",
+        "merchant_id": merchant_id,
         "amount": round(random.uniform(1000, 5000), 2),
         "currency": "USD",
         "status": random.choice(["completed", "pending", "processing"]),
@@ -182,7 +183,6 @@ async def request_payout(
             "created_at": datetime.now().isoformat() + "Z"
         }
     }
-
 
 
 

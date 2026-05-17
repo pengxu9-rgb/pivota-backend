@@ -1,7 +1,8 @@
 """Fix duplicate stores - keep only unique ones"""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
 from utils.auth import get_current_user
+from utils.runtime_safety import require_runtime_gate
 
 router = APIRouter()
 
@@ -9,14 +10,32 @@ router = APIRouter()
 @router.get("/fix-duplicate-stores")
 async def fix_duplicate_stores(current_user: dict = Depends(get_current_user)):
     """Remove duplicate stores, keep the newest one for each platform/domain"""
-    
-    merchant_id = "merch_6b90dc9838d5fd9c"
+    require_runtime_gate("ENABLE_DUPLICATE_STORE_FIX")
+    merchant_id = str(current_user.get("merchant_id") or "").strip()
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required in current user context")
     
     try:
-        # Delete duplicate Shopify store (keep the one created by main.py)
         await database.execute(
-            "DELETE FROM merchant_stores WHERE store_id = 'store_shopify_real' AND merchant_id = :merchant_id",
-            {"merchant_id": merchant_id}
+            """
+            DELETE FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+              AND store_id IN (
+                SELECT store_id
+                FROM (
+                  SELECT
+                    store_id,
+                    row_number() OVER (
+                      PARTITION BY lower(coalesce(platform, '')), lower(coalesce(domain, ''))
+                      ORDER BY connected_at DESC NULLS LAST, store_id DESC
+                    ) AS rn
+                  FROM merchant_stores
+                  WHERE merchant_id = :merchant_id
+                ) ranked
+                WHERE rn > 1
+              )
+            """,
+            {"merchant_id": merchant_id},
         )
         
         # Verify
@@ -33,8 +52,6 @@ async def fix_duplicate_stores(current_user: dict = Depends(get_current_user)):
             "status": "error",
             "message": str(e)
         }
-
-
 
 
 

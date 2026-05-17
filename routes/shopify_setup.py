@@ -40,9 +40,11 @@ async def configure_shopify(
         raise HTTPException(status_code=404, detail="Not found")
     
     # Get Shopify credentials from environment
-    shopify_store = settings.shopify_store_url or "chydantest.myshopify.com"
+    shopify_store = settings.shopify_store_url
     shopify_token = settings.shopify_access_token
     
+    if not shopify_store:
+        raise HTTPException(status_code=400, detail="SHOPIFY_STORE_URL not set in environment")
     if not shopify_token:
         raise HTTPException(status_code=400, detail="SHOPIFY_ACCESS_TOKEN not set in environment")
 

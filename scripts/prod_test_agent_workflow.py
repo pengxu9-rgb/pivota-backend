@@ -17,7 +17,7 @@ Hits live HTTPS endpoints with a structured test matrix:
 Usage:
   BASE_URL=https://api.pivota.cc \\
   MERCHANT_JWT=<token> \\
-  MERCHANT_ID=merch_efbc46b4619cfbdf \\
+  MERCHANT_ID=<merchant_id> \\
   python3 scripts/prod_test_agent_workflow.py [--max-poll-seconds 180]
 
 Reads zero secrets from any prod env. Outputs a JSON report to stdout and
@@ -461,12 +461,14 @@ def run(base: str, jwt: str, merchant_id: str,
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--base-url", default=os.environ.get("BASE_URL", DEFAULT_BASE))
-    p.add_argument("--merchant-id",
-                   default=os.environ.get("MERCHANT_ID", "merch_efbc46b4619cfbdf"))
+    p.add_argument("--merchant-id", default=os.environ.get("MERCHANT_ID"))
     p.add_argument("--max-poll-seconds", type=int, default=180)
     p.add_argument("--out", default=None,
                    help="Output JSON file path (auto-named if omitted).")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.merchant_id:
+        p.error("--merchant-id is required or set MERCHANT_ID")
+    return args
 
 
 def main() -> int:

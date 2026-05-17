@@ -15,7 +15,6 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 
-DEFAULT_MERCHANT_ID = "merch_efbc46b4619cfbdf"
 DEFAULT_SURFACE = "ucp"
 DEFAULT_MARKET = "US"
 
@@ -35,7 +34,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", required=True, help="API base URL, e.g. https://api.pivota.cc")
     parser.add_argument(
         "--merchant-id",
-        default=os.getenv("READINESS_ALPHA_MERCHANT_ID") or DEFAULT_MERCHANT_ID,
+        default=os.getenv("READINESS_ALPHA_MERCHANT_ID"),
     )
     parser.add_argument("--surface", default=os.getenv("COMMERCE_FUNNEL_SURFACE") or DEFAULT_SURFACE)
     parser.add_argument(
@@ -99,6 +98,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--output-md", default=None)
     args = parser.parse_args()
+    if not args.merchant_id:
+        parser.error("--merchant-id is required or set READINESS_ALPHA_MERCHANT_ID")
     args.run_id = str(args.run_id or _utc_now_compact())
     return args
 

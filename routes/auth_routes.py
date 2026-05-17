@@ -27,11 +27,9 @@ JWT_SECRET = settings.jwt_secret_key
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
-# Keep the historical demo merchant usable when a canonical users row exists
-# without a merchant_id binding in older production databases.
 DEMO_MERCHANT_IDS = {
-    "merchant@test.com": "merch_6b90dc9838d5fd9c",
-}
+    "merchant@test.com": os.getenv("DEMO_MERCHANT_ID", "").strip(),
+} if settings.enable_internal_demo_fixtures and os.getenv("DEMO_MERCHANT_ID", "").strip() else {}
 
 # User Role Types
 from enum import Enum
@@ -211,12 +209,25 @@ async def signin(login_data: UserLogin):
     """
     try:
         normalized_email = normalize_email(login_data.email)
-        demo_accounts = {
-            "merchant@test.com": {"password": "Admin123!", "role": "merchant", "merchant_id": "merch_6b90dc9838d5fd9c"},
-            "employee@pivota.com": {"password": "Admin123!", "role": "admin"},
-            "agent@test.com": {"password": "Admin123!", "role": "agent"},
-            "superadmin@pivota.com": {"password": "admin123", "role": "admin"},
-        }
+        demo_accounts = {}
+        if settings.enable_internal_demo_fixtures:
+            demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
+            demo_accounts = {
+                **(
+                    {
+                        "merchant@test.com": {
+                            "password": "Admin123!",
+                            "role": "merchant",
+                            "merchant_id": demo_merchant_id,
+                        }
+                    }
+                    if demo_merchant_id
+                    else {}
+                ),
+                "employee@pivota.com": {"password": "Admin123!", "role": "admin"},
+                "agent@test.com": {"password": "Admin123!", "role": "agent"},
+                "superadmin@pivota.com": {"password": "admin123", "role": "admin"},
+            }
         # In-memory users
         if normalized_email in users_db:
             stored = users_db[normalized_email]

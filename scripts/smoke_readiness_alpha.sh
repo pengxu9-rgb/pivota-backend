@@ -3,11 +3,10 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-DEFAULT_MERCHANT_ID="merch_efbc46b4619cfbdf"
 SUMMARY_QUERY_SUFFIX="summary_only=true&sample_limit=25"
 
 BASE_URL=""
-MERCHANT_ID="${READINESS_ALPHA_MERCHANT_ID:-$DEFAULT_MERCHANT_ID}"
+MERCHANT_ID="${READINESS_ALPHA_MERCHANT_ID:-}"
 INTERNAL_KEY="${READINESS_INTERNAL_API_KEY:-${READINESS_KEY:-}}"
 RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")}"
 OUT_DIR=""
@@ -50,7 +49,7 @@ Safe default:
 Options:
   --base-url URL               Required. Production or staging base URL.
   --internal-key KEY           Internal readiness API key. Falls back to READINESS_INTERNAL_API_KEY or READINESS_KEY.
-  --merchant-id ID             Merchant ID. Default: $DEFAULT_MERCHANT_ID
+  --merchant-id ID             Merchant ID. Required unless READINESS_ALPHA_MERCHANT_ID is set.
   --out-dir DIR                Output directory. Default: /tmp/pivota-readiness-smoke-\$RUN_ID
   --run-id ID                  Run identifier. Default: current UTC timestamp
   --ready-variant-id ID        Override the ready variant selected from the report.
@@ -385,6 +384,7 @@ main() {
 
   [[ -n "$BASE_URL" ]] || die "--base-url is required"
   [[ -n "$INTERNAL_KEY" ]] || die "--internal-key is required or set READINESS_INTERNAL_API_KEY"
+  [[ -n "$MERCHANT_ID" ]] || die "--merchant-id is required or set READINESS_ALPHA_MERCHANT_ID"
 
   BASE_URL="${BASE_URL%/}"
   OUT_DIR="${OUT_DIR:-/tmp/pivota-readiness-smoke-$RUN_ID}"
