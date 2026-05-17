@@ -36,7 +36,10 @@ if str(ROOT) not in sys.path:
 
 from db.database import database
 from services.catalog_identity import make_content_key
-from services.pdp_category_classifier import resolve_path_from_row
+from services.pdp_category_classifier import (
+    fold_category_from_variants,
+    resolve_path_from_row,
+)
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
@@ -121,26 +124,44 @@ def resolve_mirror_category_metadata(
     category: Optional[str],
     product_type: Optional[str],
     title: Optional[str],
+    variants: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """Classify only newly inserted mirror rows.
 
     Existing catalog_products rows are intentionally not overwritten by the
     mirror; this helper is used only on the INSERT path so future mirrors do not
     recreate NULL category_path rows.
+
+    Phase O-5: when product-level fields don't match a pattern, fall back to
+    variant-level fields via fold_category_from_variants. Hit at variant level
+    sets category_label_source='variant_aggregate' (confidence 0.85) instead
+    of the regex_backfill_at_mirror tag.
     """
-    hit = resolve_path_from_row(category=category, product_type=product_type, title=title)
-    if hit is None:
+    folded = fold_category_from_variants(
+        category=category, product_type=product_type, title=title, variants=variants,
+    )
+    if folded is None:
         return {
             "category_path": None,
             "category_confidence": None,
             "category_label_source": None,
             "category_label": None,
         }
-    label, path = hit
+    (label, path), source, confidence = folded
+    # Preserve the historical mirror-specific source tag when the product-level
+    # fields matched, so existing telemetry (e.g. category_label_source =
+    # 'regex_backfill_at_mirror' dashboards) keeps working. Variant fallbacks
+    # use the new 'variant_aggregate' tag so they can be distinguished.
+    if source == "merchant_payload":
+        label_source = CATEGORY_LABEL_SOURCE_AT_MIRROR
+        label_confidence = CATEGORY_CONFIDENCE_REGEX_AT_MIRROR
+    else:
+        label_source = source
+        label_confidence = confidence
     return {
         "category_path": path,
-        "category_confidence": CATEGORY_CONFIDENCE_REGEX_AT_MIRROR,
-        "category_label_source": CATEGORY_LABEL_SOURCE_AT_MIRROR,
+        "category_confidence": label_confidence,
+        "category_label_source": label_source,
         "category_label": label,
     }
 
@@ -156,6 +177,34 @@ _SEED_DATA_TAG_PATHS: Tuple[Tuple[str, ...], ...] = (
     ("product", "tags"),             # generic scraper "product" wrapper
     ("tags",),                        # top-level
 )
+
+# Phase O-5 — same pattern as _SEED_DATA_TAG_PATHS but for variant arrays.
+# Returns the first non-empty list found. Used to feed
+# fold_category_from_variants on the mirror INSERT path so variant-level
+# category signals reach the canonical row even when product-level fields
+# don't carry them.
+_SEED_DATA_VARIANT_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("snapshot", "variants"),
+    ("product", "variants"),
+    ("variants",),
+)
+
+
+def _extract_variants_from_seed_data(seed_data: Any) -> List[Any]:
+    if not isinstance(seed_data, dict):
+        return []
+    for path in _SEED_DATA_VARIANT_PATHS:
+        node: Any = seed_data
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+            if node is None:
+                break
+        if isinstance(node, list) and node:
+            return node
+    return []
 
 
 def _extract_tags_from_seed_data(seed_data: Any) -> List[str]:
@@ -731,6 +780,7 @@ async def _apply(limit: int) -> int:
             category=row_dict.get("mirrored_category"),
             product_type=row_dict.get("mirrored_product_type"),
             title=row_dict.get("title"),
+            variants=_extract_variants_from_seed_data(row_dict.get("seed_data")),
         )
         # Phase O-1 followup: extract tags from seed_data so external
         # crawl data flows into the canonical tags column. Always writes

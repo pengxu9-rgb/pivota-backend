@@ -39,6 +39,7 @@ from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
 from services.catalog_identity import make_content_key
+from services.pdp_category_classifier import fold_category_from_variants
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
@@ -656,6 +657,23 @@ async def ingest_standard_products(
                 description=_description_for_ingest,
                 tags=_tags_for_ingest,
             )
+            # Phase O-5 (variant-canonical fold-up): classify category_path
+            # inline at sync time using product-level fields first, then
+            # falling back to variant-level fields. Previously this column
+            # was left null at sync and only populated later by
+            # scripts/backfill_pdp_category_path.py, so freshly-synced
+            # products were invisible to category-anchored search until the
+            # next backfill run. See plans/let-s-build-a-full-breezy-taco.md.
+            _category_fold = fold_category_from_variants(
+                category=product.product_type,
+                product_type=product.product_type,
+                title=product.title,
+                variants=product.variants,
+            )
+            if _category_fold is not None:
+                (_cat_label, _cat_path), _cat_source, _cat_confidence = _category_fold
+            else:
+                _cat_label, _cat_path, _cat_source, _cat_confidence = None, None, None, None
             # Phase O-4: compute lifecycle stage from the same shape
             # the row will be UPSERTed with. Path A always sets
             # pdp_scope='merchant_owned' so the row promotes through
@@ -666,7 +684,7 @@ async def ingest_standard_products(
                 "title": product.title,
                 "description": _description_for_ingest,
                 "image_url": product.image_url,
-                "category_path": None,  # Phase A doesn't set this; classifier may, downstream
+                "category_path": _cat_path,
                 "tags": _tags_for_ingest,
                 "demographic": _taxonomy_v1.get("demographic"),
                 "use_case_tags": _taxonomy_v1.get("use_case_tags"),
@@ -693,6 +711,12 @@ async def ingest_standard_products(
                     "brand": brand,
                     "product_type": product.product_type,
                     "category": product.product_type,
+                    # Phase O-5: category_path classified inline at sync time
+                    # via services/pdp_category_classifier.fold_category_from_variants.
+                    # Source enum + confidence let downstream agents trust-gate.
+                    "category_path": _cat_path,
+                    "category_label_source": _cat_source,
+                    "category_confidence": _cat_confidence,
                     # Phase O-1: persist merchant-supplied tags. Always write
                     # a list (possibly empty) on this path so future operators
                     # can tell "ingest saw the feed and it was empty" from

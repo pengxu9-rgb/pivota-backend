@@ -409,3 +409,99 @@ def test_pattern_count_matches_source() -> None:
     # PIVOTA-Agent BEAUTY_CATEGORY_PATTERNS (drift detection if upstream
     # adds/removes a pattern).
     assert len(CATEGORY_PATTERNS) >= 23  # at least the 23 unique categories
+
+
+# ---------- fold_category_from_variants (Phase O-5) ----------
+
+from services.pdp_category_classifier import (  # noqa: E402
+    CATEGORY_CONFIDENCE_MERCHANT,
+    CATEGORY_CONFIDENCE_VARIANT,
+    CATEGORY_SOURCE_MERCHANT,
+    CATEGORY_SOURCE_VARIANT,
+    fold_category_from_variants,
+)
+
+
+def test_fold_uses_product_level_when_it_hits() -> None:
+    result = fold_category_from_variants(
+        category="Lipstick",
+        product_type=None,
+        title="random",
+        variants=[{"title": "Mascara variant"}],  # should be ignored
+    )
+    assert result is not None
+    (label, path), source, confidence = result
+    assert label == "Lipstick"
+    assert path == "beauty/makeup/lip/lipstick"
+    assert source == CATEGORY_SOURCE_MERCHANT
+    assert confidence == CATEGORY_CONFIDENCE_MERCHANT
+
+
+def test_fold_falls_back_to_variant_when_product_level_misses() -> None:
+    # Product level has nothing classifiable; a variant title carries "lipstick".
+    result = fold_category_from_variants(
+        category=None,
+        product_type=None,
+        title="opaque branded item with no category words",
+        variants=[
+            {"title": "Red shade"},  # no signal
+            {"title": "MAC Ruby Woo Matte Lipstick"},  # hits Lipstick
+        ],
+    )
+    assert result is not None
+    (label, path), source, confidence = result
+    assert label == "Lipstick"
+    assert source == CATEGORY_SOURCE_VARIANT
+    assert confidence == CATEGORY_CONFIDENCE_VARIANT
+
+
+def test_fold_reads_variant_platform_metadata_product_type() -> None:
+    # Some Shopify webhook payloads put category info inside platform_metadata
+    # rather than at the variant top level.
+    result = fold_category_from_variants(
+        category=None,
+        product_type=None,
+        title=None,
+        variants=[
+            {"platform_metadata": {"product_type": "Mascara"}},
+        ],
+    )
+    assert result is not None
+    (label, _path), source, _ = result
+    assert label == "Mascara"
+    assert source == CATEGORY_SOURCE_VARIANT
+
+
+def test_fold_returns_none_when_nothing_matches_anywhere() -> None:
+    result = fold_category_from_variants(
+        category=None,
+        product_type=None,
+        title="quirky item with no category signal",
+        variants=[{"title": "also no signal"}],
+    )
+    assert result is None
+
+
+def test_fold_handles_empty_variants_list() -> None:
+    result = fold_category_from_variants(
+        category="Foundation",
+        product_type=None,
+        title=None,
+        variants=[],
+    )
+    assert result is not None
+    (label, _path), source, _ = result
+    assert label == "Foundation"
+    assert source == CATEGORY_SOURCE_MERCHANT
+
+
+def test_fold_handles_none_variants() -> None:
+    result = fold_category_from_variants(
+        category="Foundation",
+        product_type=None,
+        title=None,
+        variants=None,
+    )
+    assert result is not None
+    (label, _path), _, _ = result
+    assert label == "Foundation"
