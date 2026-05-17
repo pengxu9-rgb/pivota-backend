@@ -540,11 +540,13 @@ async def test_ingest_standard_products_writes_o4_lifecycle_stage(
     monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
     monkeypatch.setattr(module.database, "execute", _noop_execute)
 
-    # Candidate-grade row: title + image + long description + taxonomy
-    # signals via derive_taxonomy_v1. Path A intentionally hardcodes
-    # category_path=None at this write (classifier promotes downstream),
-    # so this row stops at "candidate" — the validated gate requires
-    # category_path which Path A doesn't supply on initial sync.
+    # Validated-grade row: title + image + long description + taxonomy
+    # signals via derive_taxonomy_v1. Phase O-5 classifies category_path
+    # inline at sync time (services.pdp_category_classifier.fold_category_from_variants),
+    # so a recognizable title like "Moisturizer" now promotes the row to
+    # 'validated' on the initial Path A write. (Previously, category_path
+    # was hard-coded to None and the row stopped at 'candidate' until the
+    # backfill classifier ran.)
     await module.ingest_standard_products(
         merchant_id="merch_o4",
         platform="shopify",
@@ -572,9 +574,12 @@ async def test_ingest_standard_products_writes_o4_lifecycle_stage(
     assert "pdp_lifecycle_stage" in write, (
         "Path A write must include pdp_lifecycle_stage column (Phase O-4)"
     )
-    # category_path is None on initial Path A write → caps at candidate.
-    # A follow-up classifier run + lifecycle recompute promotes validated.
-    assert write["pdp_lifecycle_stage"] == "candidate"
+    # Phase O-5: classifier hits inline → row promotes to validated.
+    assert write["pdp_lifecycle_stage"] == "validated"
+    # Phase O-5: confirm the new category_path + provenance columns are populated.
+    assert write["category_path"] == "beauty/skincare/moisturize/cream"
+    assert write["category_label_source"] == "merchant_payload"
+    assert write["category_confidence"] == 1.0
 
     # Draft-grade row: missing image + short description → can't even
     # promote to candidate. Must still write the column (so writes don't

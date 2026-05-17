@@ -161,6 +161,78 @@ def resolve_path_from_row(
     return None
 
 
+# Provenance enum values written to catalog_products.category_label_source.
+# Confidence defaults are documented in
+# ~/.claude/plans/let-s-build-a-full-breezy-taco.md.
+CATEGORY_SOURCE_MERCHANT = "merchant_payload"
+CATEGORY_SOURCE_VARIANT = "variant_aggregate"
+
+CATEGORY_CONFIDENCE_MERCHANT = 1.0
+CATEGORY_CONFIDENCE_VARIANT = 0.85
+
+
+def fold_category_from_variants(
+    *,
+    category: Optional[str],
+    product_type: Optional[str],
+    title: Optional[str],
+    variants: Optional[list] = None,
+) -> Optional[Tuple[Tuple[str, str], str, float]]:
+    """Resolve (label, path) plus provenance from product-level fields,
+    falling back to variant-level fields when product-level misses.
+
+    Variants can be StandardProductVariant objects OR plain dicts (raw
+    Shopify payload). For dicts, we look at:
+      - top-level keys: category / product_type / title
+      - platform_metadata: category / product_type
+    For StandardProductVariant objects, we look at title and
+    platform_metadata.get("category") / platform_metadata.get("product_type").
+
+    Returns ((label, path), source, confidence) or None.
+    """
+    hit = resolve_path_from_row(category=category, product_type=product_type, title=title)
+    if hit is not None:
+        return (hit, CATEGORY_SOURCE_MERCHANT, CATEGORY_CONFIDENCE_MERCHANT)
+    for variant in variants or []:
+        v_category = _variant_field(variant, "category")
+        v_product_type = _variant_field(variant, "product_type")
+        v_title = _variant_field(variant, "title")
+        v_hit = resolve_path_from_row(
+            category=v_category, product_type=v_product_type, title=v_title,
+        )
+        if v_hit is not None:
+            return (v_hit, CATEGORY_SOURCE_VARIANT, CATEGORY_CONFIDENCE_VARIANT)
+    return None
+
+
+def _variant_field(variant, key: str) -> Optional[str]:
+    """Read a field from a variant that might be a dict OR a pydantic model."""
+    if variant is None:
+        return None
+    # dict path (raw Shopify payload before model parsing)
+    if isinstance(variant, dict):
+        direct = variant.get(key)
+        if direct:
+            return str(direct)
+        meta = variant.get("platform_metadata") or {}
+        if isinstance(meta, dict):
+            nested = meta.get(key)
+            if nested:
+                return str(nested)
+        return None
+    # pydantic model path (StandardProductVariant). title is always present;
+    # category/product_type live in platform_metadata when Shopify carries them.
+    if key == "title":
+        title = getattr(variant, "title", None)
+        return str(title) if title else None
+    meta = getattr(variant, "platform_metadata", None) or {}
+    if isinstance(meta, dict):
+        nested = meta.get(key)
+        if nested:
+            return str(nested)
+    return None
+
+
 def category_path_prefix_for_query(query: Optional[str]) -> Optional[str]:
     """Used by the recall path: when the user query matches a known category,
     return a 3-segment prefix like 'beauty/makeup/lip/' so the SQL can do
