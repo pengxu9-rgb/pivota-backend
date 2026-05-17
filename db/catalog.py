@@ -73,6 +73,12 @@ catalog_products = Table(
     Column("use_case_tags", JSONB_TYPE, nullable=True),
     Column("lifestyle_tags", JSONB_TYPE, nullable=True),
     Column("demographic", String(16), nullable=True),
+    # Phase 6 — PDP scope dimension (mig 070). Merchant sync writes
+    # these fields during ingest, so the SQLAlchemy table metadata must
+    # stay aligned with the live schema.
+    Column("pdp_scope", String(32), nullable=False, server_default="unverified"),
+    Column("pdp_scope_source", String(32), nullable=True),
+    Column("pdp_scope_set_at", DateTime, nullable=True),
     # Phase O-4 — onboarding lifecycle stage (mig 077). Computed at
     # ingest by every path; recall (Phase O-5) filters on
     # validated|published. See docs/PDP_ONBOARDING_PLAYBOOK.md.
