@@ -7,11 +7,57 @@ import pytest
 import services.catalog_sync_service as module
 
 
+async def _generated_sku_key(**kwargs):
+    return module.make_catalog_sku_key(kwargs["product_key"], kwargs["source_variant_id"])
+
+
+async def _noop_execute(*_args, **_kwargs):
+    return None
+
+
 def test_catalog_sync_service_utcnow_is_naive_utc() -> None:
     value = module._utcnow()
 
     assert isinstance(value, datetime)
     assert value.tzinfo is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_catalog_sku_key_preserves_existing_source_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_fetch_one(_query):
+        return {"sku_key": "prod::merch_1::shopify::prod_1::v::var_1"}
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+
+    sku_key = await module._resolve_catalog_sku_key(
+        merchant_id="merch_1",
+        platform="shopify",
+        product_key="prod::merch_1::shopify::prod_1",
+        source_variant_id="var_1",
+    )
+
+    assert sku_key == "prod::merch_1::shopify::prod_1::v::var_1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_catalog_sku_key_generates_when_source_identity_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_fetch_one(_query):
+        return None
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+
+    sku_key = await module._resolve_catalog_sku_key(
+        merchant_id="merch_1",
+        platform="shopify",
+        product_key="prod::merch_1::shopify::prod_1",
+        source_variant_id="var_1",
+    )
+
+    assert sku_key == "sku::prod::merch_1::shopify::prod_1::var_1"
 
 
 @pytest.mark.asyncio
@@ -218,6 +264,8 @@ async def test_ingest_standard_products_wraps_merchant_and_product_writes_in_tra
     monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
     monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
     monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module.database, "execute", _noop_execute)
 
     stats = await module.ingest_standard_products(
         merchant_id="merch_1",
@@ -284,6 +332,8 @@ async def test_ingest_standard_products_persists_merchant_tags(
     monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
     monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
     monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module.database, "execute", _noop_execute)
 
     # Product WITH tags — merchant has diligently tagged it.
     await module.ingest_standard_products(
@@ -383,6 +433,8 @@ async def test_ingest_standard_products_writes_o2_taxonomy(
     monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
     monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
     monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module.database, "execute", _noop_execute)
 
     # Product with price + lifestyle + demographic + use-case signals.
     await module.ingest_standard_products(
@@ -485,6 +537,8 @@ async def test_ingest_standard_products_writes_o4_lifecycle_stage(
     monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
     monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
     monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module.database, "execute", _noop_execute)
 
     # Candidate-grade row: title + image + long description + taxonomy
     # signals via derive_taxonomy_v1. Path A intentionally hardcodes

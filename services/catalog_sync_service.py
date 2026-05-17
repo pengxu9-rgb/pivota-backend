@@ -434,6 +434,28 @@ async def _fetch_one_by_pk(table: Any, pk_name: str, pk_value: Any) -> Optional[
     return dict(row) if row else None
 
 
+async def _resolve_catalog_sku_key(
+    *,
+    merchant_id: str,
+    platform: str,
+    product_key: str,
+    source_variant_id: str,
+) -> str:
+    """Preserve existing SKU primary keys across key-shape migrations."""
+    row = await database.fetch_one(
+        select(catalog_skus.c.sku_key)
+        .where(catalog_skus.c.merchant_id == merchant_id)
+        .where(catalog_skus.c.platform == platform)
+        .where(catalog_skus.c.source_variant_id == source_variant_id)
+        .limit(1)
+    )
+    if row:
+        existing_key = str(dict(row).get("sku_key") or "").strip()
+        if existing_key:
+            return existing_key
+    return make_catalog_sku_key(product_key, source_variant_id)
+
+
 async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> None:
     pk_value = values[pk_name]
     existing = await _fetch_one_by_pk(table, pk_name, pk_value)
@@ -753,7 +775,12 @@ async def ingest_standard_products(
 
             for variant in variants:
                 source_variant_id = str(variant.variant_id or variant.id or "default")
-                sku_key = make_catalog_sku_key(product_key, source_variant_id)
+                sku_key = await _resolve_catalog_sku_key(
+                    merchant_id=merchant_id,
+                    platform=platform,
+                    product_key=product_key,
+                    source_variant_id=source_variant_id,
+                )
                 variant_price = _safe_decimal(variant.price if variant.price is not None else product.price)
                 compare_at = _safe_decimal(
                     variant.compare_at_price if variant.compare_at_price is not None else product.compare_at_price
