@@ -6126,6 +6126,12 @@ async def agent_search_products(
             logger.debug("Failed to log agent_search_ranking sample", exc_info=True)
 
         # Log impression events for cross-merchant search (best-effort).
+        # Previously awaited inline; that blocked the handler on a 50-row
+        # execute_many INSERT against agent_product_events which dominated
+        # request latency (stage_timings_ms.log_ms regularly 1.9-5.3s while
+        # external_seed_ms was 0.6-1.0s - so logging was the actual hot
+        # path, not search). Schedule via background_tasks so it runs after
+        # the response is sent.
         try:
             events = []
             for idx, p in enumerate(paginated_products[:50]):
@@ -6156,10 +6162,10 @@ async def agent_search_products(
                     }
                 )
             if events:
-                await log_product_events(events)
+                background_tasks.add_task(log_product_events, events)
         except Exception:
             logger.debug(
-                "Failed to log agent product events from agent_search_products",
+                "Failed to schedule agent product events from agent_search_products",
                 exc_info=True,
             )
         search_stage_timings["log_ms"] = max(
