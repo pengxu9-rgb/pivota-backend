@@ -27,6 +27,12 @@ _SUNSCREEN_RE = re.compile(
 # (category_label, taxonomy_path, regex). Order matters — more specific
 # patterns appear earlier; the first match wins.
 CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
+    ("Makeup Sponge", "beauty/tools/sponge", re.compile(
+        r"\b(makeup sponge|beauty sponge|sponge\s*/\s*puff|powder puff|blender sponge)\b",
+        re.IGNORECASE)),
+    ("Brush Pouch", "beauty/tools/brush-accessory", re.compile(
+        r"\b(brush bag|brush pouch|brush case|brush holder|brush roll)\b",
+        re.IGNORECASE)),
     ("Brush", "beauty/tools/brush", re.compile(
         r"\b(brush|makeup brush|foundation brush|powder brush|blush brush|shader brush|kabuki)\b",
         re.IGNORECASE)),
@@ -166,7 +172,13 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(coat|overcoat|trench\s+coat|peacoat|parka)\b",
         re.IGNORECASE)),
     ("Jacket", "fashion/apparel/outerwear/jacket", re.compile(
-        r"\b(jacket|blazer|bomber|denim\s+jacket|windbreaker|puffer)\b",
+        r"\b(jacket|blazer|bomber|denim\s+jacket|windbreaker|puffer\s+jacket)\b",
+        re.IGNORECASE)),
+    ("Vest", "fashion/apparel/outerwear/vest", re.compile(
+        r"\b(vest|gilet|puffer\s+vest|padded\s+vest|down\s+vest)\b",
+        re.IGNORECASE)),
+    ("Base Layer", "fashion/apparel/base-layer", re.compile(
+        r"\b(base\s+layer|baselayer|thermal\s+(?:top|bottom|underwear|set))\b",
         re.IGNORECASE)),
     ("Lingerie", "fashion/apparel/intimates/lingerie", re.compile(
         r"\b(lingerie|bra\b|panty|panties|underwear|brief|boy[-\s]?short|push[-\s]?up)\b",
@@ -200,7 +212,19 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # patterns so a "dog sweater" matches Sweater first (the path tree
     # uses fashion/apparel/* either way, so category_kind=fashion).
     ("Pet Apparel", "fashion/apparel/pet", re.compile(
-        r"\b(pet\s+(?:apparel|wear|clothing|sweater|coat|jacket)|dog\s+(?:sweater|jacket|coat|hoodie)|cat\s+sweater)\b",
+        r"\b(pet\s+(?:apparel|wear|clothing|sweater|coat|jacket|outfit|overalls?|onesies?)|"
+        r"dog\s+(?:sweater|jacket|coat|hoodie|outfit|overalls?|onesies?)|"
+        r"cat\s+(?:sweater|outfit|onesies?)|"
+        r"\d-leg\s+(?:onesies?|base\s+layer))\b",
+        re.IGNORECASE)),
+    # Pet accessories — non-clothing pet gear (harness/leash/collar/etc.).
+    # Distinct fashion/accessories/pet path so the catalog can tell
+    # "pet apparel" from "pet accessory" without one being a parent of
+    # the other.
+    ("Pet Accessory", "fashion/accessories/pet", re.compile(
+        r"\b((?:dog|cat|pet)\s+(?:harness|leash|collar|bandana|bow\s*tie|tag|carrier)|"
+        r"tactical\s+(?:dog|cat|pet)\s+harness|"
+        r"retractable\s+(?:dog|cat|pet)\s+leash)\b",
         re.IGNORECASE)),
     # Generic apparel/clothing fallback — last so specific patterns win.
     ("Apparel", "fashion/apparel/general", re.compile(
