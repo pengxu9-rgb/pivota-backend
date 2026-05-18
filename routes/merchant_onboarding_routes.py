@@ -913,14 +913,20 @@ async def list_all_onboardings(
     """
     try:
         merchants = await get_all_merchant_onboardings(status, include_deleted=include_deleted)
-        
-        # Get product counts and sync info for all merchants
-        merchant_list = []
-        for m in merchants:
-            # Derive PSP status from merchant_psps as fallback (ensures dashboard reflects connections)
-            psp_row = None
+
+        # Previously: for each merchant, three awaits in series (PSP lookup,
+        # products_cache aggregate, build_readiness_summary) — and merchants
+        # were processed one-at-a-time. With N merchants that is 3*N
+        # sequential round-trips and is the load-bearing slow path the
+        # employee portal dashboard times out on. Run the three per-merchant
+        # queries concurrently for each merchant, and run merchants
+        # concurrently with a bounded semaphore so we don't blow out the
+        # connection pool on installs with many merchants.
+        sem = asyncio.Semaphore(8)
+
+        async def _fetch_psp_row(merchant_id: str):
             try:
-                psp_row = await database.fetch_one(
+                return await database.fetch_one(
                     """
                     SELECT provider
                     FROM merchant_psps
@@ -928,29 +934,40 @@ async def list_all_onboardings(
                     ORDER BY connected_at DESC
                     LIMIT 1
                     """,
-                    {"merchant_id": m["merchant_id"]}
+                    {"merchant_id": merchant_id},
                 )
             except Exception:
-                psp_row = None
+                return None
+
+        async def _fetch_product_info(merchant_id: str):
+            try:
+                return await database.fetch_one(
+                    """SELECT
+                           COUNT(*) as count,
+                           MAX(cached_at) as last_synced,
+                           COUNT(CASE WHEN expires_at < NOW() THEN 1 END) as expired_count
+                       FROM products_cache
+                       WHERE merchant_id = :merchant_id""",
+                    {"merchant_id": merchant_id},
+                )
+            except Exception:
+                return None
+
+        async def _enrich(m):
+            async with sem:
+                psp_row, product_info, readiness = await asyncio.gather(
+                    _fetch_psp_row(m["merchant_id"]),
+                    _fetch_product_info(m["merchant_id"]),
+                    build_readiness_summary(m["merchant_id"]),
+                )
 
             psp_connected = m.get("psp_connected", False) or bool(psp_row)
             psp_type = m.get("psp_type") or (psp_row["provider"] if psp_row else None)
-            # Get product count and last sync time from cache
-            product_info = await database.fetch_one(
-                """SELECT 
-                       COUNT(*) as count,
-                       MAX(cached_at) as last_synced,
-                       COUNT(CASE WHEN expires_at < NOW() THEN 1 END) as expired_count
-                   FROM products_cache 
-                   WHERE merchant_id = :merchant_id""",
-                {"merchant_id": m["merchant_id"]}
-            )
             product_count = product_info["count"] if product_info else 0
             last_synced = product_info["last_synced"] if product_info else None
             expired_count = product_info["expired_count"] if product_info else 0
-            has_expired = expired_count > 0
-            
-            merchant_list.append({
+
+            return {
                 "merchant_id": m["merchant_id"],
                 "business_name": m["business_name"],
                 "store_url": m.get("store_url") or "N/A",
@@ -966,12 +983,14 @@ async def list_all_onboardings(
                 "mcp_platform": m.get("mcp_platform"),
                 "product_count": product_count,
                 "last_synced": last_synced.isoformat() if last_synced else None,
-                "products_expired": has_expired,
+                "products_expired": expired_count > 0,
                 "expired_count": expired_count,
                 "created_at": m["created_at"].isoformat() if m["created_at"] else None,
-                "readiness_summary": (await build_readiness_summary(m["merchant_id"])).model_dump(),
-            })
-        
+                "readiness_summary": readiness.model_dump(),
+            }
+
+        merchant_list = await asyncio.gather(*(_enrich(m) for m in merchants))
+
         return {
             "status": "success",
             "count": len(merchant_list),
