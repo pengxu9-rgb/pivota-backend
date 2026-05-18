@@ -80,25 +80,26 @@ def test_haystack_handles_all_null_inputs_gracefully():
 
 # ---------- end-to-end: extractors on a synthetic Shopify-style row ----------
 
-def test_extractors_are_noops_during_deprecation_window():
-    # Phase O-5b: the regex extractor was neutered after a 2026-05-18 dry-run
-    # revealed false positives on beauty catalog descriptions. The script
-    # still loops over every row + calls the extractors, but receives
-    # empty results — so an accidental --apply is harmless. When the LLM
-    # extractor v2 lands, swap this assertion for category-gated mock
-    # extraction tests.
+@pytest.mark.asyncio
+async def test_extractors_are_async_and_default_off(monkeypatch):
+    # Phase O-5b v2: the extractors are async, category-gated, and gated
+    # by FASHION_EXTRACT_ENABLED (default off). The backfill script loops
+    # over every row + invokes them, but they short-circuit cheaply when
+    # the flag is off OR the row isn't fashion-categorized — so a
+    # whole-catalog --apply against the current 99%-beauty catalog
+    # produces zero extractions.
+    monkeypatch.delenv("FASHION_EXTRACT_ENABLED", raising=False)
     row = {
         "title": "Linen Summer Dress",
-        "description": (
-            "A breezy linen dress.\n"
-            "Material: 100% European linen.\n"
-            "Care: Machine wash cold; hang dry.\n"
-        ),
+        "description": "Material: 100% European linen. Care: Machine wash cold.",
     }
     haystack = _description_haystack(row)
-    assert extract_material(description=haystack).value is None
-    assert extract_care(description=haystack).value is None
-    assert extract_size_guide(description=haystack).value is None
+    m = await extract_material(description=haystack, category_path="fashion/dresses")
+    c = await extract_care(description=haystack, category_path="fashion/dresses")
+    s = await extract_size_guide(description=haystack, category_path="fashion/dresses")
+    assert m.value is None
+    assert c.value is None
+    assert s.value is None
 
 
 # ---------- _apply_update behavior (SQL string + params) ----------
