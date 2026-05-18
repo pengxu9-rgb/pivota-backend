@@ -305,6 +305,42 @@ def fold_category_from_variants(
     return None
 
 
+async def fold_category_with_llm_fallback(
+    *,
+    merchant_id: Optional[str] = None,
+    category: Optional[str] = None,
+    product_type: Optional[str] = None,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    variants: Optional[list] = None,
+) -> Optional[Tuple[Tuple[str, str], str, float]]:
+    """Same return shape as fold_category_from_variants, but when the
+    regex+variant fallback returns None AND the LLM_CATEGORY_CLASSIFIER_ENABLED
+    flag is on, fires services.category_classifier_llm.classify_via_llm
+    as a final fallback. Source on hit: 'llm_category_v1'.
+
+    Stays async so caller can `await`. Regex hits still complete
+    synchronously (no LLM call) — the LLM only runs on the long tail.
+    """
+    regex_hit = fold_category_from_variants(
+        category=category, product_type=product_type, title=title, variants=variants,
+    )
+    if regex_hit is not None:
+        return regex_hit
+    # Local import — keeps the heavy httpx+settings deps out of the
+    # sync regex path. Anyone importing fold_category_from_variants
+    # gets no LLM dependency.
+    from services.category_classifier_llm import classify_via_llm, CATEGORY_SOURCE_LLM
+    llm = await classify_via_llm(
+        merchant_id=merchant_id, category=category,
+        product_type=product_type, title=title, description=description,
+    )
+    if llm is None:
+        return None
+    label, path, confidence = llm
+    return ((label, path), CATEGORY_SOURCE_LLM, confidence)
+
+
 def _variant_field(variant, key: str) -> Optional[str]:
     """Read a field from a variant that might be a dict OR a pydantic model."""
     if variant is None:
