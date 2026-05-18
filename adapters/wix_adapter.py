@@ -8,6 +8,7 @@ Legacy OAuth bearer support remains available only when the stored credential
 blob explicitly declares ``auth_mode=oauth``.
 """
 
+import asyncio
 from decimal import Decimal, ROUND_HALF_UP
 import logging
 import time
@@ -551,6 +552,34 @@ def _combined_raw_response(
     return combined
 
 
+async def _fetch_wix_order_after_payment(
+    client: httpx.AsyncClient,
+    *,
+    wix_order_id: str,
+    headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Fetch the approved order, waiting briefly for Wix to assign its display number."""
+    final_payload: Dict[str, Any] = {}
+    for delay_s in (0.0, 0.5, 1.0, 1.5):
+        if delay_s:
+            await asyncio.sleep(delay_s)
+        final_response = await client.get(
+            WIX_ECOM_ORDER_URL_TEMPLATE.format(order_id=wix_order_id),
+            headers=headers,
+        )
+        final_payload = _safe_response_json(final_response)
+        if final_response.status_code >= 400:
+            logger.warning(
+                "[Wix] Order created but final order lookup failed: wix_order_id=%s status=%s",
+                wix_order_id,
+                final_response.status_code,
+            )
+            return final_payload
+        if _extract_wix_order_number(final_payload):
+            return final_payload
+    return final_payload
+
+
 async def create_wix_order(
     merchant_id: str,
     order_dict: Dict[str, Any],
@@ -675,19 +704,11 @@ async def create_wix_order(
                         retryable=payment_response.status_code >= 500,
                     )
 
-                final_response = await client.get(
-                    WIX_ECOM_ORDER_URL_TEMPLATE.format(order_id=wix_order_id),
+                final_payload = await _fetch_wix_order_after_payment(
+                    client,
+                    wix_order_id=wix_order_id,
                     headers=headers,
                 )
-                final_payload = _safe_response_json(final_response)
-                if final_response.status_code >= 400:
-                    logger.warning(
-                        "[Wix] Order created but final order lookup failed: merchant_id=%s order_id=%s wix_order_id=%s status=%s",
-                        merchant_id,
-                        order.get("order_id"),
-                        wix_order_id,
-                        final_response.status_code,
-                    )
     except httpx.RequestError as exc:
         logger.warning(
             "[Wix] Order writeback network error: merchant_id=%s order_id=%s error=%s",

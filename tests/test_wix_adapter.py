@@ -136,6 +136,46 @@ async def test_create_wix_order_posts_payload_and_returns_order_id(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_wix_order_polls_until_wix_display_number_is_assigned(monkeypatch):
+    from adapters import wix_adapter
+
+    captured: Dict[str, Any] = {"get_count": 0}
+
+    async def no_sleep(_delay):
+        return None
+
+    class DummyAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            if url == wix_adapter.WIX_ECOM_CREATE_ORDER_URL:
+                return DummyResponse(201, {"id": "wix_order_delayed"})
+            return DummyResponse(200, {"paymentsIds": ["wix_payment_delayed"]})
+
+        async def get(self, url, headers=None):
+            captured["get_count"] += 1
+            if captured["get_count"] == 1:
+                return DummyResponse(200, {"order": {"id": "wix_order_delayed", "number": "0"}})
+            return DummyResponse(200, {"order": {"id": "wix_order_delayed", "number": "1004"}})
+
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", DummyAsyncClient)
+    monkeypatch.setattr(wix_adapter.asyncio, "sleep", no_sleep)
+
+    result = await wix_adapter.create_wix_order("merch_wix", _wix_order())
+
+    assert result["order_id"] == "wix_order_delayed"
+    assert result["raw_response"]["number"] == "1004"
+    assert captured["get_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_create_wix_order_uses_bearer_only_for_explicit_oauth(monkeypatch):
     from adapters import wix_adapter
 
