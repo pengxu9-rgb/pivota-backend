@@ -30,7 +30,7 @@ from services.platform_order_writeback_readiness import (
 logger = logging.getLogger(__name__)
 
 WIX_ECOM_CREATE_ORDER_URL = "https://www.wixapis.com/ecom/v1/orders"
-WIX_STORES_APP_ID = "1380b703-ce81-ff05-f115-39571d94dfcd"
+WIX_STORES_APP_ID = "215238eb-22a5-4c36-9e7b-e7c08025e04e"
 DEFAULT_WIX_PAYMENT_METHOD = "Pivota External Payment"
 
 
