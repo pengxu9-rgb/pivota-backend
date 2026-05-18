@@ -10,11 +10,27 @@ from services.wix_connection import (
 )
 
 
-def test_normalize_wix_site_id_rejects_public_store_url() -> None:
+def test_normalize_wix_site_id_extracts_dashboard_url() -> None:
+    site_id = normalize_wix_site_id(
+        "https://manage.wix.com/dashboard/c86b93b4-6d54-4e29-9bc3-26783c93ebb4/store/products"
+    )
+
+    assert site_id == "c86b93b4-6d54-4e29-9bc3-26783c93ebb4"
+
+
+def test_normalize_wix_site_id_extracts_url_query_param() -> None:
+    site_id = normalize_wix_site_id(
+        "https://manage.wix.com/account/sites?siteId=c86b93b4-6d54-4e29-9bc3-26783c93ebb4"
+    )
+
+    assert site_id == "c86b93b4-6d54-4e29-9bc3-26783c93ebb4"
+
+
+def test_normalize_wix_site_id_rejects_url_without_site_id() -> None:
     with pytest.raises(WixConnectionValidationError) as exc_info:
         normalize_wix_site_id("https://peng652.wixsite.com/aydan-1")
 
-    assert exc_info.value.code == "WIX_SITE_ID_EXPECTED"
+    assert exc_info.value.code == "WIX_SITE_ID_NOT_FOUND_IN_URL"
 
 
 def test_extract_wix_site_id_prefers_credential_blob() -> None:

@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
 WIX_PRODUCTS_QUERY_URL = "https://www.wixapis.com/stores-reader/v1/products/query"
+_WIX_SITE_ID_QUERY_KEYS = (
+    "siteId",
+    "site_id",
+    "metaSiteId",
+    "meta_site_id",
+    "msid",
+    "siteGuid",
+)
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 class WixConnectionValidationError(Exception):
@@ -33,17 +45,10 @@ def coerce_wix_credential_blob(value: Any) -> Dict[str, Any]:
     return {}
 
 
-def normalize_wix_site_id(value: Any) -> str:
-    site_id = str(value or "").strip()
+def _validate_wix_site_id(site_id: Any) -> str:
+    site_id = str(site_id or "").strip()
     if not site_id:
         raise WixConnectionValidationError("WIX_SITE_ID_REQUIRED", "Wix Site ID is required")
-
-    parsed = urlparse(site_id)
-    if parsed.scheme or parsed.netloc or "wixsite.com" in site_id.lower():
-        raise WixConnectionValidationError(
-            "WIX_SITE_ID_EXPECTED",
-            "Wix Site ID is required; do not use the public wixsite.com store URL.",
-        )
 
     if any(ch.isspace() for ch in site_id):
         raise WixConnectionValidationError(
@@ -52,6 +57,54 @@ def normalize_wix_site_id(value: Any) -> str:
         )
 
     return site_id
+
+
+def _extract_site_id_from_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    query_sources = [parsed.query]
+    if parsed.fragment:
+        fragment = parsed.fragment[1:] if parsed.fragment.startswith("?") else parsed.fragment
+        if "?" in fragment:
+            fragment = fragment.split("?", 1)[1]
+        query_sources.append(fragment)
+
+    for raw_query in query_sources:
+        for key, values in parse_qs(raw_query, keep_blank_values=False).items():
+            if key in _WIX_SITE_ID_QUERY_KEYS and values:
+                return _validate_wix_site_id(values[0])
+
+    segments = [unquote(segment).strip() for segment in parsed.path.split("/") if segment.strip()]
+    lower_segments = [segment.lower() for segment in segments]
+
+    for marker in ("dashboard", "site", "sites"):
+        if marker in lower_segments:
+            marker_index = lower_segments.index(marker)
+            if marker_index + 1 < len(segments):
+                return _validate_wix_site_id(segments[marker_index + 1])
+
+    for segment in segments:
+        if _UUID_RE.match(segment):
+            return _validate_wix_site_id(segment)
+
+    return ""
+
+
+def normalize_wix_site_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise WixConnectionValidationError("WIX_SITE_ID_REQUIRED", "Wix Site ID is required")
+
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        site_id = _extract_site_id_from_url(raw)
+        if site_id:
+            return site_id
+        raise WixConnectionValidationError(
+            "WIX_SITE_ID_NOT_FOUND_IN_URL",
+            "Wix Site ID was not found in that URL. Paste the Wix URL that contains the Site ID, or paste the Site ID directly.",
+        )
+
+    return _validate_wix_site_id(raw)
 
 
 def normalize_wix_api_key(value: Any) -> str:
