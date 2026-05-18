@@ -607,3 +607,138 @@ async def test_ingest_standard_products_writes_o4_lifecycle_stage(
     assert len(catalog_products_writes) == 1
     write = catalog_products_writes[0]
     assert write.get("pdp_lifecycle_stage") == "draft"
+
+
+@pytest.mark.asyncio
+async def test_ingest_standard_products_passes_through_shopify_metafields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase O-5b (#3): when a merchant publishes a Shopify metafield like
+    custom.material, the value flows into catalog_products with
+    source='merchant_payload' confidence=1.0. Authoritative path — wins
+    over the LLM extractor v2 (which is the fallback)."""
+    from services import catalog_sync_service as module
+
+    catalog_products_writes: List[Dict[str, Any]] = []
+
+    async def _capture_upsert(table, primary_key, payload, *, conflict_update=None):
+        # Mirror the recording-stub pattern used by the existing O-4 test:
+        # only capture writes to catalog_products; let other tables no-op.
+        if getattr(table, "name", None) == "catalog_products":
+            catalog_products_writes.append(dict(payload))
+
+    async def _noop_upsert_merchant(**kwargs):
+        return None
+
+    async def _noop_upsert_field_fact(**kwargs):
+        return None
+
+    async def _generated_sku_key(**kwargs):
+        return f"sku::{kwargs.get('product_key')}::{kwargs.get('source_variant_id')}"
+
+    async def _noop_execute(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(module, "_upsert_by_pk", _capture_upsert)
+    monkeypatch.setattr(module, "upsert_catalog_merchant", _noop_upsert_merchant)
+    monkeypatch.setattr(module, "_upsert_field_fact", _noop_upsert_field_fact)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module.database, "execute", _noop_execute)
+
+    await module.ingest_standard_products(
+        merchant_id="merch_fashion",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_fashion_1",
+                "product_id": "prod_fashion_1",
+                "merchant_id": "merch_fashion",
+                "platform": "shopify",
+                "title": "Linen Summer Dress",
+                "description": "A breezy linen dress for warm days.",
+                "image_url": "https://example.com/dress.jpg",
+                "price": 89.0,
+                "currency": "USD",
+                "product_type": "Dress",
+                "tags": [],
+                "variants": [],
+                "platform_metadata": {
+                    # Shopify standard metafield shape.
+                    "metafields": [
+                        {"namespace": "shopify", "key": "material",
+                         "value": "100% organic linen", "type": "single_line_text_field"},
+                        {"namespace": "custom", "key": "care_instructions",
+                         "value": "Hand wash cold; lay flat to dry."},
+                    ],
+                },
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    # Merchant-published values flow through with the highest trust tier.
+    assert write["material"] == "100% organic linen"
+    assert write["material_source"] == "merchant_payload"
+    assert write["material_confidence"] == 1.0
+    assert write["care"] == "Hand wash cold; lay flat to dry."
+    assert write["care_source"] == "merchant_payload"
+    assert write["care_confidence"] == 1.0
+    # size_guide was not provided → column stays out of the upsert dict
+    # (preserves NULL so the fallback LLM extractor can fill in later
+    # without racing the merchant_payload write).
+    assert "size_guide" not in write
+
+
+@pytest.mark.asyncio
+async def test_ingest_standard_products_omits_fashion_keys_when_no_metafields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No metafields = no fashion keys in the upsert dict (don't NULL out
+    a value some other path may have set)."""
+    from services import catalog_sync_service as module
+
+    catalog_products_writes: List[Dict[str, Any]] = []
+
+    async def _capture_upsert(table, primary_key, payload, *, conflict_update=None):
+        if getattr(table, "name", None) == "catalog_products":
+            catalog_products_writes.append(dict(payload))
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    async def _generated_sku_key(**kwargs):
+        return f"sku::{kwargs.get('product_key')}::{kwargs.get('source_variant_id')}"
+
+    monkeypatch.setattr(module, "_upsert_by_pk", _capture_upsert)
+    monkeypatch.setattr(module, "upsert_catalog_merchant", _noop)
+    monkeypatch.setattr(module, "_upsert_field_fact", _noop)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module.database, "execute", _noop)
+
+    await module.ingest_standard_products(
+        merchant_id="merch_no_meta",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_no_meta",
+                "product_id": "prod_no_meta",
+                "merchant_id": "merch_no_meta",
+                "platform": "shopify",
+                "title": "Plain Item",
+                "price": 10.0,
+                "currency": "USD",
+                "variants": [],
+            }
+        ],
+        source_system="test",
+        source_ref="test_ref",
+    )
+    assert len(catalog_products_writes) == 1
+    write = catalog_products_writes[0]
+    for k in ("material", "material_source", "material_confidence",
+              "care", "care_source", "care_confidence",
+              "size_guide", "size_guide_source", "size_guide_confidence"):
+        assert k not in write, f"fashion field {k} unexpectedly in upsert dict"
