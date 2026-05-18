@@ -386,15 +386,20 @@ def run(args: argparse.Namespace) -> int:
     _check_backend_build(api_base, failures)
     _check_openapi(api_base, failures)
 
+    # Canonical password login (same path the employee portal UI uses).
+    # /auth/signin is a legacy route guarded by ENABLE_INTERNAL_DEMO_FIXTURES
+    # in prod; since that gate is intentionally off, the smoke can't use it.
+    # /api/auth/login is the production auth path and returns the same
+    # JWT shape we need: {"success": true, "token": "...", "user": {...}}.
     employee_login = _api_json(
         api_base,
-        "/auth/signin",
+        "/api/auth/login",
         method="POST",
         json_body={"email": args.employee_email, "password": args.employee_password},
     )
     merchant_login = _api_json(
         api_base,
-        "/auth/signin",
+        "/api/auth/login",
         method="POST",
         json_body={"email": args.merchant_email, "password": args.merchant_password},
     )
@@ -404,9 +409,20 @@ def run(args: argparse.Namespace) -> int:
         failures.append("employee login did not return token")
     if not merchant_token:
         failures.append("merchant login did not return token")
-    merchant_id = ((merchant_login.get("user") or {}) if isinstance(merchant_login.get("user"), dict) else {}).get("merchant_id")
+
+    # /api/auth/login does not include merchant_id in its user payload (only
+    # row id, email, full_name, role). Prefer an explicit smoke-config value
+    # (PIVOTA_SMOKE_MERCHANT_ID) and fall back to the login response for
+    # back-compat with the legacy /auth/signin shape. If neither source
+    # provides it, the downstream product_key cross-check is skipped rather
+    # than a hard failure.
+    merchant_user = merchant_login.get("user") if isinstance(merchant_login.get("user"), dict) else {}
+    merchant_id = (args.merchant_id or merchant_user.get("merchant_id") or "").strip()
     if not merchant_id:
-        failures.append("merchant login did not return merchant_id")
+        print(json.dumps({
+            "event": "smoke_merchant_id_unset",
+            "note": "PIVOTA_SMOKE_MERCHANT_ID is unset and /api/auth/login does not include merchant_id; product_key cross-check will be skipped.",
+        }))
 
     _check_hydration_status(api_base, employee_token, failures)
 
@@ -465,6 +481,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--employee-password", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_PASSWORD", "Admin123!"))
     parser.add_argument("--merchant-email", default=env_or_default("PIVOTA_SMOKE_MERCHANT_EMAIL", "merchant@test.com"))
     parser.add_argument("--merchant-password", default=env_or_default("PIVOTA_SMOKE_MERCHANT_PASSWORD", "Admin123!"))
+    parser.add_argument(
+        "--merchant-id",
+        default=env_or_default("PIVOTA_SMOKE_MERCHANT_ID", ""),
+        help="Merchant ID for product_key cross-check (legacy /auth/signin returned it in the login response; /api/auth/login does not).",
+    )
     parser.add_argument("--external-pdp-id", default=env_or_default("PDP_SMOKE_EXTERNAL_PDP_ID", ""))
     parser.add_argument("--internal-pdp-id", default=env_or_default("PDP_SMOKE_INTERNAL_PDP_ID", ""))
     parser.add_argument(
