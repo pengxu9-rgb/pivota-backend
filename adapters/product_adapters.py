@@ -20,6 +20,7 @@ from adapters.bigcommerce_adapter import (
 )
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
+from services.wix_connection import WIX_PRODUCTS_QUERY_URL, build_wix_catalog_headers
 
 logger = logging.getLogger(__name__)
 
@@ -834,12 +835,8 @@ class WixProductAdapter:
         try:
             logger.info(f"🔄 Fetching Wix products: site_id={site_id}")
             
-            url = "https://www.wixapis.com/stores/v1/products/query"
-            headers = {
-                "Authorization": api_key,
-                "wix-site-id": site_id,
-                "Content-Type": "application/json"
-            }
+            url = WIX_PRODUCTS_QUERY_URL
+            headers = build_wix_catalog_headers(api_key, site_id)
             
             # Wix products query does NOT include `variants` by default even when a product has
             # productOptions/manageVariants=true. We must opt in.

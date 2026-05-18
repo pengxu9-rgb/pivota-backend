@@ -55,6 +55,21 @@ def test_prepare_platform_credentials_extracts_bigcommerce_store_hash_from_domai
     }
 
 
+def test_prepare_platform_credentials_extracts_wix_blob_site_id() -> None:
+    credentials = prepare_platform_credentials(
+        "wix",
+        {
+            "domain": "https://example.wixsite.com/store",
+            "api_key": '{"site_id":"site_123","api_key":"token_123"}',
+        },
+    )
+
+    assert credentials == {
+        "site_id": "site_123",
+        "api_key": "token_123",
+    }
+
+
 async def test_woocommerce_fetch_products_parses_variations(monkeypatch):
     import httpx
 

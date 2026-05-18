@@ -156,7 +156,7 @@ async def test_wix_fetch_products_includes_variants(monkeypatch):
     assert next_token is None
     assert len(products) == 1
     assert len(products[0].variants) == 1
-    assert captured["url"].endswith("/stores/v1/products/query")
+    assert captured["url"].endswith("/stores-reader/v1/products/query")
     assert captured["json"]["includeVariants"] is True
 
 

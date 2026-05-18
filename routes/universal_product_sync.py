@@ -17,6 +17,11 @@ from routes.product_routes import upsert_product_cache
 from db.products import delete_missing_products_from_cache
 from services.catalog_sync_service import ingest_standard_products
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.wix_connection import (
+    WixConnectionValidationError,
+    extract_wix_site_id,
+    normalize_wix_api_key,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products", tags=["product-sync-v2"])
@@ -378,10 +383,12 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
             }
     
     elif platform == "wix":
-        # For Wix, domain is the site_id and api_key is the API key
-        site_id = store_info.get("domain")
-        api_key = store_info.get("api_key")
-        
+        api_key = normalize_wix_api_key(store_info.get("api_key"))
+        try:
+            site_id = extract_wix_site_id(store_info.get("domain"), store_info.get("api_key"))
+        except WixConnectionValidationError:
+            site_id = ""
+
         if site_id and api_key:
             return {
                 "site_id": site_id,

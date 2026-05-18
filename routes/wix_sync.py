@@ -4,8 +4,11 @@ from typing import Optional
 from utils.auth import get_current_user
 from db.database import database
 from datetime import datetime
-import httpx
 import uuid
+from services.wix_connection import (
+    WixConnectionValidationError,
+    validate_wix_catalog_access,
+)
 
 router = APIRouter()
 
@@ -34,7 +37,9 @@ async def _sync_connected_platform_products(
     if store_id:
         store_query = """
             SELECT * FROM merchant_stores
-            WHERE store_id = :store_id AND platform = :platform
+            WHERE store_id = :store_id
+              AND platform = :platform
+              AND status IN ('active', 'connected')
         """
         store = await database.fetch_one(
             store_query,
@@ -43,7 +48,9 @@ async def _sync_connected_platform_products(
     elif merchant_id:
         store_query = """
             SELECT * FROM merchant_stores
-            WHERE merchant_id = :merchant_id AND platform = :platform
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND status IN ('active', 'connected')
             LIMIT 1
         """
         store = await database.fetch_one(
@@ -51,12 +58,7 @@ async def _sync_connected_platform_products(
             {"merchant_id": merchant_id, "platform": platform},
         )
     else:
-        store_query = """
-            SELECT * FROM merchant_stores
-            WHERE platform = :platform
-            LIMIT 1
-        """
-        store = await database.fetch_one(store_query, {"platform": platform})
+        raise HTTPException(status_code=400, detail="store_id or merchant context is required")
 
     if not store:
         raise HTTPException(status_code=404, detail=f"{platform_label} store not found")
@@ -176,40 +178,75 @@ async def connect_wix_store_sync(
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
         
-        # Generate store ID
-        store_id = f"store_wix_{uuid.uuid4().hex[:8]}"
-        
-        # Simulate Wix API validation
-        # In production, this would verify the API key and site_id with Wix
-        
-        # Insert store
-        insert_query = """
-            INSERT INTO merchant_stores (
-                store_id, merchant_id, platform, name, domain,
-                api_key, status, connected_at, product_count
-            ) VALUES (
-                :store_id, :merchant_id, :platform, :name, :domain,
-                :api_key, :status, :connected_at, :product_count
+        try:
+            validation = await validate_wix_catalog_access(site_id, api_key)
+        except WixConnectionValidationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
             )
-        """
-        
-        await database.execute(insert_query, {
-            "store_id": store_id,
-            "merchant_id": merchant_id,
-            "platform": "wix",
-            "name": store_name or site_id,
-            "domain": site_id,
-            "api_key": api_key,
-            "status": "active",
-            "connected_at": datetime.now(),
-            "product_count": 0
-        })
+
+        normalized_site_id = validation["site_id"]
+        normalized_api_key = validation["api_key"]
+
+        existing = await database.fetch_one(
+            """
+            SELECT store_id
+            FROM merchant_stores
+            WHERE merchant_id = :merchant_id
+              AND platform = 'wix'
+              AND domain = :domain
+            """,
+            {"merchant_id": merchant_id, "domain": normalized_site_id},
+        )
+
+        if existing:
+            store_id = existing["store_id"]
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET name = :name,
+                    api_key = :api_key,
+                    status = 'active',
+                    connected_at = :connected_at
+                WHERE store_id = :store_id
+                """,
+                {
+                    "store_id": store_id,
+                    "name": store_name or normalized_site_id,
+                    "api_key": normalized_api_key,
+                    "connected_at": datetime.now(),
+                },
+            )
+        else:
+            store_id = f"store_wix_{uuid.uuid4().hex[:8]}"
+            insert_query = """
+                INSERT INTO merchant_stores (
+                    store_id, merchant_id, platform, name, domain,
+                    api_key, status, connected_at, product_count
+                ) VALUES (
+                    :store_id, :merchant_id, :platform, :name, :domain,
+                    :api_key, :status, :connected_at, :product_count
+                )
+            """
+
+            await database.execute(insert_query, {
+                "store_id": store_id,
+                "merchant_id": merchant_id,
+                "platform": "wix",
+                "name": store_name or normalized_site_id,
+                "domain": normalized_site_id,
+                "api_key": normalized_api_key,
+                "status": "active",
+                "connected_at": datetime.now(),
+                "product_count": 0
+            })
         
         return {
             "status": "success",
             "message": "Wix store connected successfully",
             "store_id": store_id,
-            "store_name": store_name or site_id
+            "store_name": store_name or normalized_site_id
         }
     
     except HTTPException:
@@ -232,6 +269,7 @@ async def test_wix_connection(
         store_query = """
             SELECT * FROM merchant_stores
             WHERE merchant_id = :merchant_id AND platform = 'wix'
+              AND status IN ('active', 'connected')
             LIMIT 1
         """
         store = await database.fetch_one(store_query, {"merchant_id": merchant_id})
@@ -239,16 +277,20 @@ async def test_wix_connection(
         if not store:
             raise HTTPException(status_code=404, detail="Wix store not found")
         
-        # Simulate connection test
-        # In production, this would ping Wix API
+        try:
+            validation = await validate_wix_catalog_access(store["domain"], store["api_key"])
+        except WixConnectionValidationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
+            )
         
         return {
             "status": "success",
             "message": "Wix connection successful",
             "store_name": store["name"],
-            "site_id": store["domain"],
+            "site_id": validation["site_id"],
             "api_status": "active",
-            "response_time": 120  # ms
         }
     
     except HTTPException:

@@ -10,6 +10,7 @@ from datetime import datetime
 from utils.auth import get_current_user
 from db.database import database
 from services.merchant_psp_config_service import persist_canonical_merchant_psp
+from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
 import uuid
 import json
 
@@ -98,72 +99,33 @@ async def connect_wix_store_employee(
                 detail=f"Cannot connect store for {merchant_check['status']} merchant. Please approve merchant first."
             )
         
-        # Validate inputs
-        if not request.site_id or not request.site_id.strip():
-            raise HTTPException(status_code=400, detail="Wix Site ID is required")
-        
-        if not request.api_key or not request.api_key.strip():
-            raise HTTPException(status_code=400, detail="Wix API Key is required")
-        
-        # Test Wix API connection
-        import httpx
-        # Wix Stores API endpoint for getting site info
-        # https://dev.wix.com/api/rest/wix-stores/catalog/products/query-products
-        test_url = f"https://www.wixapis.com/stores/v1/products/query"
-        headers = {
-            "Authorization": request.api_key,
-            "wix-site-id": request.site_id
-        }
-        
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # Try to query products with limit 1 just to test connection
-                test_response = await client.post(
-                    test_url, 
-                    headers=headers,
-                    json={"query": {"limit": 1}}
-                )
-            
-            if test_response.status_code == 200:
-                logger.info(f"✅ Wix credentials verified for site {request.site_id}")
-            elif test_response.status_code == 401:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Invalid Wix API Key - authentication failed"
-                )
-            elif test_response.status_code == 403:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Wix API Key does not have permission to access this site"
-                )
-            else:
-                # Non-critical error, log but allow connection
-                logger.warning(f"⚠️ Wix API test returned {test_response.status_code}, but proceeding with connection")
-                
-        except httpx.RequestError as e:
-            # Network error - log but don't block connection
-            logger.warning(f"⚠️ Could not test Wix API (network error), but proceeding: {str(e)}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"⚠️ Wix API test error, but proceeding: {str(e)}")
+            validation = await validate_wix_catalog_access(request.site_id, request.api_key)
+        except WixConnectionValidationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
+            )
+
+        site_id = validation["site_id"]
+        api_key = validation["api_key"]
         
         # Check if store already exists
         existing = await database.fetch_one(
             """SELECT store_id FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'wix' 
                AND domain = :domain""",
-            {"merchant_id": request.merchant_id, "domain": request.site_id}
+            {"merchant_id": request.merchant_id, "domain": site_id}
         )
         
         if existing:
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :api_key, status = 'connected', connected_at = :connected_at
+                   SET api_key = :api_key, status = 'active', connected_at = :connected_at
                    WHERE store_id = :store_id""",
                 {
-                    "api_key": request.api_key,
+                    "api_key": api_key,
                     "connected_at": datetime.now(),
                     "store_id": existing["store_id"]
                 }
@@ -181,11 +143,11 @@ async def connect_wix_store_employee(
                     "store_id": store_id,
                     "merchant_id": request.merchant_id,
                     "platform": "wix",
-                    "name": request.store_name or f"Wix Store {request.site_id[:8]}",
-                    "domain": request.site_id,
-                    "status": "connected",
+                    "name": request.store_name or f"Wix Store {site_id[:8]}",
+                    "domain": site_id,
+                    "status": "active",
                     "product_count": 0,
-                    "api_key": request.api_key,
+                    "api_key": api_key,
                     "connected_at": datetime.now()
                 }
             )

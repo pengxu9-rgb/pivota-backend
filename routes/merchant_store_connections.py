@@ -7,6 +7,7 @@ from services.shopify_access_token_service import (
     exchange_shopify_client_credentials_token,
     resolve_shopify_admin_access_token,
 )
+from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
@@ -1488,49 +1489,33 @@ async def merchant_connect_wix(
             raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
-        # Validate inputs
-        if not request.site_id or not request.site_id.strip():
-            raise HTTPException(status_code=400, detail="Wix Site ID is required")
-        
-        if not request.api_key or not request.api_key.strip():
-            raise HTTPException(status_code=400, detail="Wix API Key is required")
-        
-        # Test Wix API connection (simplified check)
-        test_url = "https://www.wixapis.com/stores/v1/products/query"
-        headers = {
-            "Authorization": request.api_key,
-            "wix-site-id": request.site_id
-        }
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            test_response = await client.post(
-                test_url,
-                json={"query": {"limit": 1}},
-                headers=headers
-            )
-        
-        if test_response.status_code not in [200, 401, 403]:
+        try:
+            validation = await validate_wix_catalog_access(request.site_id, request.api_key)
+        except WixConnectionValidationError as exc:
             raise HTTPException(
-                status_code=400,
-                detail=f"Invalid Wix credentials. API returned: {test_response.status_code}"
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
             )
-        
-        logger.info(f"✅ Wix credentials verified for site {request.site_id}")
+
+        site_id = validation["site_id"]
+        api_key = validation["api_key"]
+
+        logger.info("Wix credentials verified for merchant=%s", request.merchant_id)
         
         # Check if store already exists
         existing_store = await database.fetch_one(
             """SELECT store_id FROM merchant_stores 
                WHERE merchant_id = :merchant_id AND platform = 'wix' AND domain = :site_id""",
-            {"merchant_id": request.merchant_id, "site_id": request.site_id}
+            {"merchant_id": request.merchant_id, "site_id": site_id}
         )
         
         if existing_store:
             # Update existing store
             await database.execute(
                 """UPDATE merchant_stores 
-                   SET api_key = :token, status = 'active', last_sync = CURRENT_TIMESTAMP
+                   SET api_key = :token, status = 'active', connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "token": request.api_key}
+                {"store_id": existing_store["store_id"], "token": api_key}
             )
             store_id = existing_store["store_id"]
         else:
@@ -1543,9 +1528,9 @@ async def merchant_connect_wix(
                 {
                     "store_id": store_id,
                     "merchant_id": request.merchant_id,
-                    "site_id": request.site_id,
-                    "name": request.store_name or f"Wix Store {request.site_id[:8]}",
-                    "token": request.api_key
+                    "site_id": site_id,
+                    "name": request.store_name or f"Wix Store {site_id[:8]}",
+                    "token": api_key
                 }
             )
         

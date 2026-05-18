@@ -322,6 +322,7 @@ from routes.merchant_risk_api import router as merchant_risk_router
 from routes.agent_promotions import router as agent_promotions_router
 from routes.shopify_promotions_sync_api import router as shopify_promotions_sync_router
 from routes.shopify_products_sync_api import router as shopify_products_sync_router
+from routes.platform_products_sync_api import router as platform_products_sync_router
 from routes.outbound_links import router as outbound_links_router
 from routes.external_offers import router as external_offers_router
 from routes.prometheus_metrics import router as prometheus_metrics_router
@@ -973,6 +974,7 @@ app.include_router(agent_promotions_router)  # Agent-facing promotions list (/ag
 app.include_router(merchant_risk_router)  # Internal risk APIs (disputes/returns)
 app.include_router(shopify_promotions_sync_router)  # Sync Shopify promotions into DB-backed promotions
 app.include_router(shopify_products_sync_router)  # Sync Shopify products into products_cache
+app.include_router(platform_products_sync_router)  # Sync non-Shopify platform products into products_cache/catalog
 app.include_router(product_enrichment_router)  # Internal product enrichment trigger
 if DEBUG_MODE:
     app.include_router(create_test_agent_router)  # Create test agent account
