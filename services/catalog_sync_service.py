@@ -39,6 +39,11 @@ from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
 from services.catalog_identity import make_content_key
+from services.fashion_field_payload_extractor import (
+    extract_care_from_payload,
+    extract_material_from_payload,
+    extract_size_guide_from_payload,
+)
 from services.pdp_category_classifier import fold_category_from_variants
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
@@ -674,6 +679,19 @@ async def ingest_standard_products(
                 (_cat_label, _cat_path), _cat_source, _cat_confidence = _category_fold
             else:
                 _cat_label, _cat_path, _cat_source, _cat_confidence = None, None, None, None
+            # Phase O-5b (#3): merchant-published fashion fields read from
+            # Shopify standard metafields (or top-level platform_metadata
+            # for legacy/admin-injected shapes). Authoritative path —
+            # source=merchant_payload confidence=1.0. When absent, the
+            # LLM extractor v2 (services/fashion_field_extractor.py) is
+            # the fallback (gated by FASHION_EXTRACT_ENABLED).
+            # NOTE: shopify_real_adapter doesn't fetch metafields yet, so
+            # this is a no-op for the Shopify fetch path today. Manual
+            # admin injection + future GraphQL adapter upgrade will both
+            # populate these.
+            _payload_material = extract_material_from_payload(product.platform_metadata)
+            _payload_care = extract_care_from_payload(product.platform_metadata)
+            _payload_size_guide = extract_size_guide_from_payload(product.platform_metadata)
             # Phase O-4: compute lifecycle stage from the same shape
             # the row will be UPSERTed with. Path A always sets
             # pdp_scope='merchant_owned' so the row promotes through
@@ -717,6 +735,20 @@ async def ingest_standard_products(
                     "category_path": _cat_path,
                     "category_label_source": _cat_source,
                     "category_confidence": _cat_confidence,
+                    # Phase O-5b (#3): merchant-published fashion fields
+                    # (Shopify metafields / admin-injected). Only set when
+                    # actually populated — NULL stays NULL so the LLM
+                    # extractor v2 (fallback) can fill in later without
+                    # racing the merchant_payload write.
+                    **({"material": _payload_material,
+                        "material_source": "merchant_payload",
+                        "material_confidence": 1.0} if _payload_material else {}),
+                    **({"care": _payload_care,
+                        "care_source": "merchant_payload",
+                        "care_confidence": 1.0} if _payload_care else {}),
+                    **({"size_guide": _payload_size_guide,
+                        "size_guide_source": "merchant_payload",
+                        "size_guide_confidence": 1.0} if _payload_size_guide else {}),
                     # Phase O-1: persist merchant-supplied tags. Always write
                     # a list (possibly empty) on this path so future operators
                     # can tell "ingest saw the feed and it was empty" from
