@@ -71,6 +71,12 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "use_case_tags",
             "lifestyle_tags",
             "demographic",
+            # Phase 2 / O-5 — see migration 069. Catalog sync writes
+            # category_path + provenance inline; without these in both
+            # schema_guard and db.catalog metadata, production sync fails.
+            "category_path",
+            "category_confidence",
+            "category_label_source",
             # Phase O-4 — see migration 077. Onboarding lifecycle
             # stage (draft/candidate/validated/published/hold/archived).
             # Recall (Phase O-5) filters on this column.
@@ -399,6 +405,9 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS use_case_tags JSONB,
                       ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
                       ADD COLUMN IF NOT EXISTS demographic VARCHAR(16),
+                      ADD COLUMN IF NOT EXISTS category_path VARCHAR(255),
+                      ADD COLUMN IF NOT EXISTS category_confidence REAL,
+                      ADD COLUMN IF NOT EXISTS category_label_source VARCHAR(32),
                       ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
                     """
                 )

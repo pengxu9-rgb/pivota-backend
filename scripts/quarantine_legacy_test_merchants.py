@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,12 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# This is a short-lived operator script; keep the production pool tiny.
+os.environ.setdefault("DB_POOL_MIN_SIZE", "1")
+os.environ.setdefault("DB_POOL_MAX_SIZE", "2")
+if os.getenv("DATABASE_PUBLIC_URL"):
+    os.environ["DATABASE_URL"] = os.getenv("DATABASE_PUBLIC_URL", "")
 
 from db.database import database  # noqa: E402
 

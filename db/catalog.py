@@ -5,6 +5,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     Index,
     Integer,
     Numeric,
@@ -58,6 +59,11 @@ catalog_products = Table(
     Column("brand", String(255), nullable=True),
     Column("product_type", String(255), nullable=True),
     Column("category", String(255), nullable=True),
+    # Phase 2 / O-5 — hierarchical PDP taxonomy path. The sync path writes
+    # these inline, so runtime metadata must match migration 069.
+    Column("category_path", String(255), nullable=True),
+    Column("category_confidence", Float, nullable=True),
+    Column("category_label_source", String(32), nullable=True),
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
