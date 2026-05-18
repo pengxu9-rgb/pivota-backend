@@ -132,10 +132,9 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     # ----- Phase O-5b: fashion / apparel patterns -----
     # Order: more specific (sweater, hoodie, dress) above the broad "apparel".
-    # Pet apparel is included intentionally — PawStyle (merch_efbc46b4619cfbdf)
-    # is a real fashion merchant whose entire catalog is dog/cat clothing,
-    # and the LLM extractor's category gate filters on category_path
-    # starting with 'fashion/' or 'apparel/'.
+    # Pet apparel is included intentionally because some active fashion
+    # merchants sell dog/cat clothing, and the LLM extractor's category
+    # gate filters on category_path starting with 'fashion/' or 'apparel/'.
     ("Sweater", "fashion/apparel/tops/sweater", re.compile(
         r"\b(sweater|knit(?:ted)?\s+sweater|knit\s+top|cardigan|pullover|jumper)\b",
         re.IGNORECASE)),

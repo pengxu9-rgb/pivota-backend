@@ -3,9 +3,9 @@ from __future__ import annotations
 """Wix eCommerce order writeback adapter.
 
 Production Wix catalog sync is API-key based. Order writeback follows the same
-credential model and is disabled unless ``ENABLE_WIX_ORDER_WRITEBACK_V2`` is
-explicitly enabled. Legacy OAuth bearer support remains available only when the
-stored credential blob explicitly declares ``auth_mode=oauth``.
+credential model and is gated by per-store readiness on ``merchant_stores``.
+Legacy OAuth bearer support remains available only when the stored credential
+blob explicitly declares ``auth_mode=oauth``.
 """
 
 from decimal import Decimal, ROUND_HALF_UP
@@ -21,62 +21,17 @@ from services.wix_connection import (
     extract_wix_site_id,
     normalize_wix_api_key,
 )
-from utils.runtime_safety import configured_env_value, env_flag
+from services.platform_order_writeback_readiness import (
+    GLOBAL_ORDER_WRITEBACK_DISABLE_FLAG,
+    is_store_order_writeback_allowed,
+    store_order_writeback_context,
+)
 
 logger = logging.getLogger(__name__)
 
 WIX_ECOM_CREATE_ORDER_URL = "https://www.wixapis.com/ecom/v1/orders"
 WIX_STORES_APP_ID = "1380b703-ce81-ff05-f115-39571d94dfcd"
-WIX_ORDER_WRITEBACK_FLAG = "ENABLE_WIX_ORDER_WRITEBACK_V2"
-WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS = "WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS"
-WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS = "WIX_ORDER_WRITEBACK_V2_CANARY_MERCHANT_IDS"
-WIX_ORDER_WRITEBACK_CANARY_STORE_IDS = "WIX_ORDER_WRITEBACK_V2_CANARY_STORE_IDS"
 DEFAULT_WIX_PAYMENT_METHOD = "Pivota External Payment"
-
-
-def _csv_env_set(name: str) -> set[str]:
-    return {
-        item.strip()
-        for item in configured_env_value(name).split(",")
-        if item.strip()
-    }
-
-
-def wix_order_writeback_canary_scope_configured() -> bool:
-    return any(
-        _csv_env_set(name)
-        for name in (
-            WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS,
-            WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS,
-            WIX_ORDER_WRITEBACK_CANARY_STORE_IDS,
-        )
-    )
-
-
-def is_wix_order_writeback_v2_enabled(order_dict: Optional[Dict[str, Any]] = None) -> bool:
-    if not env_flag(WIX_ORDER_WRITEBACK_FLAG):
-        return False
-
-    order_ids = _csv_env_set(WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS)
-    merchant_ids = _csv_env_set(WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS)
-    store_ids = _csv_env_set(WIX_ORDER_WRITEBACK_CANARY_STORE_IDS)
-    if not (order_ids or merchant_ids or store_ids):
-        return True
-    if not isinstance(order_dict, dict):
-        return False
-
-    store = _coerce_dict(order_dict.get("store") or order_dict.get("store_info"))
-    order_id = _clean_str(order_dict.get("order_id"))
-    merchant_id = _clean_str(order_dict.get("merchant_id"))
-    store_id = _clean_str(order_dict.get("store_id") or store.get("store_id"))
-
-    if order_ids and order_id not in order_ids:
-        return False
-    if merchant_ids and merchant_id not in merchant_ids:
-        return False
-    if store_ids and store_id not in store_ids:
-        return False
-    return True
 
 
 def _clean_str(value: Any) -> str:
@@ -91,6 +46,26 @@ def _coerce_dict(value: Any) -> Dict[str, Any]:
         if raw.startswith("{"):
             return coerce_wix_credential_blob(raw)
     return {}
+
+
+def wix_order_writeback_readiness_context(order_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    order = dict(order_dict or {}) if isinstance(order_dict, dict) else {}
+    store = _coerce_dict(order.get("store") or order.get("store_info"))
+    return store_order_writeback_context(
+        store,
+        order_id=_clean_str(order.get("order_id")),
+        platform="wix",
+    )
+
+
+def is_wix_order_writeback_allowed(order_dict: Optional[Dict[str, Any]] = None) -> bool:
+    order = dict(order_dict or {}) if isinstance(order_dict, dict) else {}
+    store = _coerce_dict(order.get("store") or order.get("store_info"))
+    return is_store_order_writeback_allowed(
+        store,
+        order_id=_clean_str(order.get("order_id")),
+        platform="wix",
+    )
 
 
 def _coerce_money(value: Any, default: str = "0.00") -> Decimal:
@@ -463,17 +438,18 @@ async def create_wix_order(
 ) -> Dict[str, Any]:
     """Create an order in Wix eCommerce and return the platform result shape."""
     order = dict(order_dict or {})
-    if not is_wix_order_writeback_v2_enabled(order):
+    readiness = wix_order_writeback_readiness_context(order)
+    if not readiness.get("allowed"):
         return _error_result(
             "wix_order_writeback_not_ready",
             raw_response={
-                "message": "Wix order writeback v2 is disabled or outside canary scope.",
-                "required_flag": WIX_ORDER_WRITEBACK_FLAG,
-                "canary_scope_env": [
-                    WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS,
-                    WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS,
-                    WIX_ORDER_WRITEBACK_CANARY_STORE_IDS,
-                ],
+                "message": "Wix order writeback is not enabled for this active store.",
+                "readiness": readiness,
+                "required_store_fields": {
+                    "order_writeback_status": "enabled or canary",
+                    "order_writeback_canary_order_id": "matching order_id when status is canary",
+                },
+                "global_kill_switch": GLOBAL_ORDER_WRITEBACK_DISABLE_FLAG,
             },
             retryable=False,
         )

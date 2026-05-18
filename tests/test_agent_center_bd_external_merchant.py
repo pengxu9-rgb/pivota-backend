@@ -1660,7 +1660,7 @@ def test_checkout_loop_chain_has_six_steps_each_with_evidence() -> None:
     # End-to-end test merchant cited in the final-step evidence.
     last_step = chain[-1]
     assert "shopify" in last_step["label"].lower()
-    assert "merch_38fa56d5118b9974" in last_step["evidence"]
+    assert "internal_shopify_test_merchant" in last_step["evidence"]
 
 
 def test_checkout_loop_platform_coverage_multi_platform_messaging() -> None:
@@ -1740,7 +1740,7 @@ def test_render_markdown_includes_discovery_lift_and_checkout_loop() -> None:
     # Checkout-loop sub-section with 6-step chain table.
     assert "How in-chat checkout closes the loop" in md
     assert "Shopify admin" in md
-    assert "merch_38fa56d5118b9974" in md
+    assert "internal_shopify_test_merchant" in md
     # Platform coverage line + outcome.
     assert "Platform coverage" in md
     assert "Shopify" in md
@@ -2021,8 +2021,8 @@ def test_render_markdown_contains_onboarding_sequence_section() -> None:
     assert "SKU Match" in md
     assert "Shopify OAuth" in md
     # Test merchant playground line.
-    assert "merch_38fa56d5118b9974" in md
-    assert "shop.myshopify.com" in md
+    assert "internal_shopify_test_merchant" in md
+    assert "internal-shopify-test.example" in md
     # Manual-today steps render with the wrench badge.
     assert "🔧 manual today" in md
     # Roadmap_note explains RESERVED placeholders.

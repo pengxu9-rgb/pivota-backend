@@ -3011,19 +3011,17 @@ PIVOTA_PDP_BASELINE_REFERENCE: Dict[str, Any] = {
 }
 
 
-# Reference to the internal Shopify test merchant used as the live
-# validation playground for the onboarding sequence's order-side steps
-# (Outcome B: order-home). The discovery-side reference (Outcome A:
-# discovery-lift) lives in `pivota-pdp-baseline.md`, produced by
-# scripts/agent_center_pivota_pdp_baseline.py — that's the canonical
-# AI-channel surface, NOT the test merchant's Shopify dev URL.
+# Reference label for the internal Shopify test playground used by the
+# onboarding sequence's order-side steps. Do not hardcode a real merchant
+# ID here; production runtime must not depend on any specific test store.
 TEST_MERCHANT_REFERENCE: Dict[str, str] = {
-    "merchant_id": "merch_38fa56d5118b9974",
-    "shop_domain": "shop.myshopify.com",
+    "merchant_id": "internal_shopify_test_merchant",
+    "shop_domain": "internal-shopify-test.example",
     # Discovery-side artifact: probes Pivota canonical sig_* PDPs,
-    # NOT the test merchant's Shopify URL (which is unindexed by
+    # NOT the test merchant's shop URL (which is unindexed by
     # design — Shopify dev domain has no public retrieval surface).
     "discovery_baseline_path": "reports/pivota-pdp-baseline.md",
+    "audit_artifact_path": "reports/pivota-pdp-baseline.md",
 }
 
 
@@ -3166,20 +3164,22 @@ def _build_platform_specific_chain_tail(
             ),
             "shipped": True,
         },
-        "step_6": {
-            "step": 6,
-            "label": (
-                "Merchant sees the order in their storefront admin "
-                "with first-party customer data (email, address, "
-                "line items, attribution metadata)"
-            ),
-            "evidence": (
-                "Verified end-to-end on Shopify / WooCommerce / "
-                "BigCommerce; equivalent surfaces shipped for Wix + "
-                "custom via integration sprint"
-            ),
-            "shipped": True,
-        },
+            "step_6": {
+                "step": 6,
+                "label": (
+                    "Merchant sees the order in their storefront admin "
+                    "(Shopify / WooCommerce / BigCommerce native adapters) "
+                    "with first-party customer data (email, address, "
+                    "line items, attribution metadata)"
+                ),
+                "evidence": (
+                    "Verified end-to-end on Shopify / WooCommerce / "
+                    "BigCommerce using the internal test playground "
+                    f"{TEST_MERCHANT_REFERENCE['merchant_id']}; equivalent "
+                    "surfaces shipped for Wix + custom via integration sprint"
+                ),
+                "shipped": True,
+            },
         "outcome": (
             "Orders land in the merchant's storefront admin within "
             "seconds of in-chat completion (Shopify, WooCommerce, "
@@ -3493,6 +3493,7 @@ def _build_what_pivota_changes(
             "runner; operations runs them on the merchant's behalf "
             "during onboarding."
         ),
+        "test_merchant": dict(TEST_MERCHANT_REFERENCE),
         "steps": [
             {
                 "step": 1,
@@ -3614,7 +3615,7 @@ def _build_what_pivota_changes(
             },
         ],
         "roadmap_note": (
-            "Three Pivota agents (Offer Execution, Checkout "
+            "RESERVED: Three Pivota agents (Offer Execution, Checkout "
             "Verification, GMV Attribution) are on the Q3 roadmap as "
             "one-click runners — not yet shipped as automated agents. "
             "Steps 4 and 5 above deliver their function manually today; "
@@ -5440,7 +5441,7 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                         f"{pc['custom_integration']}_\n"
                     )
                 if pc.get("note"):
-                    sections.append(f"_{pc['note']}_\n")
+                    sections.append(f"**Roadmap.** {pc['note']}\n")
             if cl.get("outcome"):
                 sections.append(f"**Outcome.** {cl['outcome']}\n")
 
@@ -5479,6 +5480,8 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                         f"| {n} | **{name}** | {status} | {what} | {val} |"
                     )
                 sections.append("\n".join(rows) + "\n")
+            if os.get("roadmap_note"):
+                sections.append(f"**Roadmap.** {os['roadmap_note']}\n")
             if os.get("roadmap_note"):
                 sections.append(f"_{os['roadmap_note']}_\n")
 

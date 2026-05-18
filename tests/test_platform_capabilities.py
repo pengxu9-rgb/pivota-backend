@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 
-def test_non_shopify_platforms_are_not_live_quote_purchase_ready(monkeypatch) -> None:
+def test_non_shopify_platforms_are_not_live_quote_purchase_ready() -> None:
     from services.platform_capabilities import get_store_platform_capabilities
 
-    monkeypatch.delenv("ENABLE_WIX_ORDER_WRITEBACK_V2", raising=False)
     for platform in ("wix", "woocommerce", "bigcommerce"):
         capabilities = get_store_platform_capabilities(platform)
         assert capabilities.supports_live_quote is False
@@ -13,7 +12,7 @@ def test_non_shopify_platforms_are_not_live_quote_purchase_ready(monkeypatch) ->
         assert capabilities.supports_authorize_capture is False
 
     assert get_store_platform_capabilities("wix").supports_platform_checkout is False
-    assert get_store_platform_capabilities("wix").purchase_status == "order_writeback_v2_canary_pending"
+    assert get_store_platform_capabilities("wix").purchase_status == "order_writeback_store_readiness_pending"
     assert get_store_platform_capabilities("woocommerce").supports_platform_checkout is True
     assert get_store_platform_capabilities("woocommerce").purchase_status == "requires_external_platform_checkout_validation"
     assert get_store_platform_capabilities("bigcommerce").supports_platform_checkout is True
@@ -23,29 +22,55 @@ def test_non_shopify_platforms_are_not_live_quote_purchase_ready(monkeypatch) ->
     assert get_store_platform_capabilities("wix").supports_platform_order_writeback is False
 
 
-def test_wix_order_writeback_capability_requires_runtime_flag(monkeypatch) -> None:
+def test_wix_platform_matrix_stays_store_readiness_pending() -> None:
     from services.platform_capabilities import get_store_platform_capabilities, platform_capability_matrix
 
-    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
-    monkeypatch.delenv("WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS", raising=False)
-    monkeypatch.delenv("WIX_ORDER_WRITEBACK_V2_CANARY_MERCHANT_IDS", raising=False)
-    monkeypatch.delenv("WIX_ORDER_WRITEBACK_V2_CANARY_STORE_IDS", raising=False)
-
-    capabilities = get_store_platform_capabilities("wix")
-    assert capabilities.supports_platform_order_writeback is True
-    assert capabilities.purchase_status == "requires_merchant_checkout_validation"
-    assert platform_capability_matrix()["wix"]["supports_platform_order_writeback"] is True
+    generic = get_store_platform_capabilities("wix")
+    assert generic.supports_platform_order_writeback is False
+    assert generic.purchase_status == "order_writeback_store_readiness_pending"
+    assert platform_capability_matrix()["wix"]["supports_platform_order_writeback"] is False
 
 
-def test_wix_order_writeback_capability_stays_pending_for_canary_scope(monkeypatch) -> None:
-    from services.platform_capabilities import get_store_platform_capabilities
+def test_wix_runtime_capability_uses_store_readiness() -> None:
+    from services.platform_capabilities import get_store_runtime_platform_capabilities
 
-    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
-    monkeypatch.setenv("WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS", "ORD_WIX_1")
+    enabled = get_store_runtime_platform_capabilities(
+        "wix",
+        {
+            "store_id": "store_wix_1",
+            "platform": "wix",
+            "status": "active",
+            "order_writeback_status": "enabled",
+        },
+    )
+    assert enabled.supports_platform_order_writeback is True
+    assert enabled.purchase_status == "order_writeback_ready"
 
-    capabilities = get_store_platform_capabilities("wix")
-    assert capabilities.supports_platform_order_writeback is False
-    assert capabilities.purchase_status == "order_writeback_v2_canary_pending"
+    canary = get_store_runtime_platform_capabilities(
+        "wix",
+        {
+            "store_id": "store_wix_1",
+            "platform": "wix",
+            "status": "active",
+            "order_writeback_status": "canary",
+            "order_writeback_canary_order_id": "ORD_WIX_1",
+        },
+        order_id="ORD_WIX_1",
+    )
+    assert canary.supports_platform_order_writeback is True
+    assert canary.purchase_status == "order_writeback_canary_ready"
+
+    disabled = get_store_runtime_platform_capabilities(
+        "wix",
+        {
+            "store_id": "store_wix_1",
+            "platform": "wix",
+            "status": "active",
+            "order_writeback_status": "disabled",
+        },
+    )
+    assert disabled.supports_platform_order_writeback is False
+    assert disabled.purchase_status == "order_writeback_store_readiness_pending"
 
 
 def test_custom_and_headless_tiers_audit_only_no_writeback() -> None:

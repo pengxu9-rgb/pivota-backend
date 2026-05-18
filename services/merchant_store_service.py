@@ -10,6 +10,7 @@ import json
 
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
+from services.platform_order_writeback_readiness import normalize_store_order_writeback_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,12 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                 status,
                 connected_at,
                 is_primary,
+                order_writeback_status,
+                order_writeback_enabled_at,
+                order_writeback_canary_order_id,
+                order_writeback_last_canary_order_id,
+                order_writeback_last_verified_at,
+                order_writeback_last_error,
                 'merchant_stores' as source
             FROM merchant_stores
             WHERE merchant_id = :merchant_id 
@@ -139,6 +146,7 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
             store_dict["api_key_raw"] = original_key
             store_dict["api_credentials"] = parse_api_credentials(original_key)
             store_dict["api_key"] = parse_api_key(original_key)
+            store_dict = normalize_store_order_writeback_readiness(store_dict)
             stores.append(store_dict)
         
     except Exception as e:
@@ -165,9 +173,10 @@ async def get_merchant_active_stores(merchant_id: str) -> List[Dict[str, Any]]:
                     "status": "active" if merchant.get("mcp_connected", False) else "disconnected",
                     "connected_at": merchant.get("mcp_connected_at"),
                     "is_primary": True,
-                    "source": "legacy_mcp"
+                    "source": "legacy_mcp",
+                    "order_writeback_status": "disabled",
                 }
-                stores.append(legacy_store)
+                stores.append(normalize_store_order_writeback_readiness(legacy_store))
 
         except Exception as e:
             logger.error(f"Error fetching from merchant_onboarding: {e}")
@@ -287,10 +296,18 @@ async def get_store_by_id(store_id: str, *, merchant_id: Optional[str] = None) -
             support_email,
             status,
             connected_at,
+            is_primary,
+            order_writeback_status,
+            order_writeback_enabled_at,
+            order_writeback_canary_order_id,
+            order_writeback_last_canary_order_id,
+            order_writeback_last_verified_at,
+            order_writeback_last_error,
             'merchant_stores' as source
         FROM merchant_stores
         WHERE store_id = :store_id
         {merchant_clause}
+        AND status IN ('active', 'connected')
         LIMIT 1
     """
     try:
@@ -306,10 +323,12 @@ async def get_store_by_id(store_id: str, *, merchant_id: Optional[str] = None) -
                 api_key,
                 status,
                 connected_at,
+                false as is_primary,
                 'merchant_stores' as source
             FROM merchant_stores
             WHERE store_id = :store_id
             {merchant_clause}
+            AND status IN ('active', 'connected')
             LIMIT 1
         """
         row = await database.fetch_one(query, params)
@@ -322,7 +341,7 @@ async def get_store_by_id(store_id: str, *, merchant_id: Optional[str] = None) -
     store_dict["api_key_raw"] = original_key
     store_dict["api_credentials"] = parse_api_credentials(original_key)
     store_dict["api_key"] = parse_api_key(original_key)
-    return store_dict
+    return normalize_store_order_writeback_readiness(store_dict)
 
 
 async def has_any_store_connected(merchant_id: str) -> bool:

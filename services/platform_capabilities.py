@@ -3,19 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Dict
 
-from utils.runtime_safety import configured_env_value, env_flag
-
-
-WIX_ORDER_WRITEBACK_FLAG = "ENABLE_WIX_ORDER_WRITEBACK_V2"
-WIX_ORDER_WRITEBACK_CANARY_SCOPE_FLAGS = (
-    "WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS",
-    "WIX_ORDER_WRITEBACK_V2_CANARY_MERCHANT_IDS",
-    "WIX_ORDER_WRITEBACK_V2_CANARY_STORE_IDS",
+from services.platform_order_writeback_readiness import (
+    ORDER_WRITEBACK_STATUS_CANARY,
+    ORDER_WRITEBACK_STATUS_ENABLED,
+    store_order_writeback_context,
 )
-
-
-def _wix_order_writeback_canary_scope_configured() -> bool:
-    return any(configured_env_value(name) for name in WIX_ORDER_WRITEBACK_CANARY_SCOPE_FLAGS)
 
 
 @dataclass(frozen=True)
@@ -63,8 +55,8 @@ _CAPABILITIES: Dict[str, StorePlatformCapabilities] = {
         supports_authorize_capture=False,
         supports_auto_void=False,
         supports_auto_refund=False,
-        purchase_status="order_writeback_v2_canary_pending",
-        purchase_requirement="enable_wix_order_writeback_v2_after_api_key_site_id_canary",
+        purchase_status="order_writeback_store_readiness_pending",
+        purchase_requirement="validated_active_wix_store_with_order_writeback_status_enabled_or_canary",
     ),
     "woocommerce": StorePlatformCapabilities(
         platform="woocommerce",
@@ -135,17 +127,6 @@ _CAPABILITIES: Dict[str, StorePlatformCapabilities] = {
 
 def get_store_platform_capabilities(platform: str | None) -> StorePlatformCapabilities:
     key = str(platform or "").strip().lower()
-    if (
-        key == "wix"
-        and env_flag(WIX_ORDER_WRITEBACK_FLAG)
-        and not _wix_order_writeback_canary_scope_configured()
-    ):
-        return replace(
-            _CAPABILITIES["wix"],
-            supports_platform_order_writeback=True,
-            purchase_status="requires_merchant_checkout_validation",
-            purchase_requirement="wix_api_key_site_id_credentials_and_v2_order_writeback",
-        )
     return _CAPABILITIES.get(
         key,
         StorePlatformCapabilities(
@@ -162,6 +143,40 @@ def get_store_platform_capabilities(platform: str | None) -> StorePlatformCapabi
             purchase_status="unknown_requires_validation",
             purchase_requirement="merchant_specific_validation_required",
         ),
+    )
+
+
+def get_store_runtime_platform_capabilities(
+    platform: str | None,
+    store: Dict[str, Any] | None,
+    *,
+    order_id: str | None = None,
+) -> StorePlatformCapabilities:
+    base = get_store_platform_capabilities(platform)
+    key = str(platform or "").strip().lower()
+    if key != "wix":
+        return base
+
+    context = store_order_writeback_context(store, order_id=order_id, platform="wix")
+    if not context.get("allowed"):
+        return base
+
+    readiness_status = str(context.get("order_writeback_status") or "").strip().lower()
+    if readiness_status == ORDER_WRITEBACK_STATUS_ENABLED:
+        purchase_status = "order_writeback_ready"
+        purchase_requirement = "active_wix_store_with_order_writeback_status_enabled"
+    elif readiness_status == ORDER_WRITEBACK_STATUS_CANARY:
+        purchase_status = "order_writeback_canary_ready"
+        purchase_requirement = "matching_canary_order_id_on_active_wix_store"
+    else:
+        purchase_status = base.purchase_status
+        purchase_requirement = base.purchase_requirement
+
+    return replace(
+        base,
+        supports_platform_order_writeback=True,
+        purchase_status=purchase_status,
+        purchase_requirement=purchase_requirement,
     )
 
 

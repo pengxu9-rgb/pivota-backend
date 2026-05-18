@@ -186,9 +186,9 @@ class ShopifyProductAdapter:
         429 in bursts even for modest catalogs. GraphQL has a separate
         cost-based throttle (1000 cost points/sec) and this query is ~10
         points per product, so 250 products in one call ≈ 2500 points —
-        well within the burst budget. Verified live 2026-05-18 on
-        merch_efbc46b4619cfbdf after the original REST adapter
-        (PR #546) blew up with 429 storms.
+        well within the burst budget. Verified live 2026-05-18 on an
+        active Shopify catalog after the original REST adapter (PR #546)
+        blew up with 429 storms.
 
         Failure mode: on any GraphQL transport/parse failure, returns an
         empty dict and logs the cause. One bad sync page should not

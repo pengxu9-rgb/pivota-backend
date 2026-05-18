@@ -40,6 +40,12 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
         table="merchant_stores",
         columns={
             "is_primary",
+            "order_writeback_status",
+            "order_writeback_enabled_at",
+            "order_writeback_canary_order_id",
+            "order_writeback_last_canary_order_id",
+            "order_writeback_last_verified_at",
+            "order_writeback_last_error",
         },
     ),
     RequiredTableColumns(
@@ -193,7 +199,13 @@ async def ensure_required_schema_light() -> None:
                 text(
                     """
                     ALTER TABLE IF EXISTS merchant_stores
-                      ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT FALSE;
+                      ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                      ADD COLUMN IF NOT EXISTS order_writeback_status TEXT NOT NULL DEFAULT 'disabled',
+                      ADD COLUMN IF NOT EXISTS order_writeback_enabled_at TIMESTAMPTZ NULL,
+                      ADD COLUMN IF NOT EXISTS order_writeback_canary_order_id TEXT NULL,
+                      ADD COLUMN IF NOT EXISTS order_writeback_last_canary_order_id TEXT NULL,
+                      ADD COLUMN IF NOT EXISTS order_writeback_last_verified_at TIMESTAMPTZ NULL,
+                      ADD COLUMN IF NOT EXISTS order_writeback_last_error TEXT NULL;
                     """
                 )
             )
@@ -255,6 +267,23 @@ async def ensure_required_schema_light() -> None:
                     """
                     CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_primary
                       ON merchant_stores (merchant_id, is_primary, connected_at DESC);
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_merchant_stores_order_writeback_status
+                      ON merchant_stores (platform, order_writeback_status, status);
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_merchant_stores_order_writeback_canary
+                      ON merchant_stores (order_writeback_canary_order_id)
+                      WHERE order_writeback_canary_order_id IS NOT NULL;
                     """
                 )
             )
@@ -567,6 +596,21 @@ async def ensure_required_schema_light() -> None:
                         text(
                             f"ALTER TABLE merchant_psps ADD COLUMN {col} "
                             f"{sqlite_type.get(col, 'TEXT')};"
+                        )
+                    )
+                except Exception:
+                    continue
+            store_missing = set(missing.get("merchant_stores") or [])
+            store_sqlite_type = {
+                "is_primary": "BOOLEAN DEFAULT FALSE",
+                "order_writeback_status": "TEXT DEFAULT 'disabled'",
+            }
+            for col in sorted(store_missing):
+                try:
+                    await database.execute(
+                        text(
+                            f"ALTER TABLE merchant_stores ADD COLUMN {col} "
+                            f"{store_sqlite_type.get(col, 'TEXT')};"
                         )
                     )
                 except Exception:
