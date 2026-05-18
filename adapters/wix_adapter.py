@@ -30,6 +30,8 @@ from services.platform_order_writeback_readiness import (
 logger = logging.getLogger(__name__)
 
 WIX_ECOM_CREATE_ORDER_URL = "https://www.wixapis.com/ecom/v1/orders"
+WIX_ECOM_ORDER_URL_TEMPLATE = "https://www.wixapis.com/ecom/v1/orders/{order_id}"
+WIX_ECOM_ADD_PAYMENT_URL_TEMPLATE = "https://www.wixapis.com/ecom/v1/payments/orders/{order_id}/add-payment"
 WIX_STORES_APP_ID = "215238eb-22a5-4c36-9e7b-e7c08025e04e"
 DEFAULT_WIX_PAYMENT_METHOD = "Pivota External Payment"
 
@@ -299,6 +301,39 @@ def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
     return {"order": wix_order}
 
 
+def build_wix_payment_payload(order_dict: Dict[str, Any], wix_order_id: str) -> Dict[str, Any]:
+    """Build the Wix Add Payments payload used to approve paid external orders."""
+    order = dict(order_dict or {})
+    payment_reference = _clean_str(
+        order.get("payment_intent_id")
+        or order.get("payment_reference")
+        or order.get("order_id")
+        or wix_order_id
+    )
+    regular_details: Dict[str, Any] = {
+        "paymentMethod": "Offline",
+        "offlinePayment": True,
+        "status": "APPROVED",
+        "paymentProvider": "Pivota",
+        "paymentMethodName": {
+            "userDefinedName": {"custom": DEFAULT_WIX_PAYMENT_METHOD},
+        },
+    }
+    if payment_reference:
+        regular_details["providerTransactionId"] = payment_reference[:100]
+
+    return {
+        "orderId": wix_order_id,
+        "payments": [
+            {
+                "amount": {"amount": _money_str(order.get("total"))},
+                "regularPaymentDetails": regular_details,
+                "refundDisabled": True,
+            }
+        ],
+    }
+
+
 def _explicit_auth_mode(source: Dict[str, Any]) -> str:
     mode = _clean_str(
         source.get("auth_mode")
@@ -475,6 +510,47 @@ def _extract_wix_order_id(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_wix_order_number(payload: Dict[str, Any]) -> str:
+    for key in ("number", "orderNumber"):
+        value = _clean_str(payload.get(key))
+        if value and value != "0":
+            return value
+    order = payload.get("order")
+    if isinstance(order, dict):
+        for key in ("number", "orderNumber"):
+            value = _clean_str(order.get(key))
+            if value and value != "0":
+                return value
+    return ""
+
+
+def _paid_order_requires_payment_record(order: Dict[str, Any]) -> bool:
+    payment_status = _clean_str(order.get("payment_status")).lower()
+    status = _clean_str(order.get("status")).lower()
+    return payment_status == "paid" or status == "paid"
+
+
+def _combined_raw_response(
+    *,
+    create_payload: Dict[str, Any],
+    payment_payload: Optional[Dict[str, Any]] = None,
+    final_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    source = final_payload if isinstance(final_payload, dict) and final_payload else create_payload
+    order = source.get("order") if isinstance(source.get("order"), dict) else source
+    combined = dict(order if isinstance(order, dict) else create_payload)
+    number = _extract_wix_order_number(source)
+    if number:
+        combined["number"] = number
+        combined["orderNumber"] = number
+    combined["create_order_response"] = create_payload
+    if payment_payload is not None:
+        combined["add_payment_response"] = payment_payload
+    if final_payload is not None:
+        combined["final_order_response"] = final_payload
+    return combined
+
+
 async def create_wix_order(
     merchant_id: str,
     order_dict: Dict[str, Any],
@@ -549,6 +625,69 @@ async def create_wix_order(
                 headers=headers,
                 json=payload,
             )
+
+            response_payload = _safe_response_json(response)
+            if response.status_code in (401, 403):
+                return _error_result(
+                    "wix_auth_failed",
+                    raw_response=response_payload,
+                    status_code=response.status_code,
+                    retryable=False,
+                )
+            if response.status_code not in (200, 201):
+                return _error_result(
+                    "wix_api_error",
+                    raw_response=response_payload,
+                    status_code=response.status_code,
+                    retryable=True,
+                )
+
+            wix_order_id = _extract_wix_order_id(response_payload)
+            if not wix_order_id:
+                return _error_result(
+                    "wix_response_missing_order_id",
+                    raw_response=response_payload,
+                    status_code=response.status_code,
+                    retryable=True,
+                )
+
+            payment_payload: Optional[Dict[str, Any]] = None
+            final_payload: Optional[Dict[str, Any]] = None
+            if _paid_order_requires_payment_record(order):
+                payment_response = await client.post(
+                    WIX_ECOM_ADD_PAYMENT_URL_TEMPLATE.format(order_id=wix_order_id),
+                    headers=headers,
+                    json=build_wix_payment_payload(order, wix_order_id),
+                )
+                payment_payload = _safe_response_json(payment_response)
+                if payment_response.status_code in (401, 403):
+                    return _error_result(
+                        "wix_auth_failed",
+                        raw_response=payment_payload,
+                        status_code=payment_response.status_code,
+                        retryable=False,
+                    )
+                if payment_response.status_code not in (200, 201):
+                    return _error_result(
+                        "wix_payment_record_failed",
+                        raw_response=payment_payload,
+                        status_code=payment_response.status_code,
+                        retryable=payment_response.status_code >= 500,
+                    )
+
+                final_response = await client.get(
+                    WIX_ECOM_ORDER_URL_TEMPLATE.format(order_id=wix_order_id),
+                    headers=headers,
+                )
+                final_payload = _safe_response_json(final_response)
+                if final_response.status_code >= 400:
+                    logger.warning(
+                        "[Wix] Order created but final order lookup failed: merchant_id=%s order_id=%s wix_order_id=%s status=%s",
+                        merchant_id,
+                        order.get("order_id"),
+                        wix_order_id,
+                        final_response.status_code,
+                    )
     except httpx.RequestError as exc:
         logger.warning(
             "[Wix] Order writeback network error: merchant_id=%s order_id=%s error=%s",
@@ -569,31 +708,6 @@ async def create_wix_order(
             retryable=True,
         )
 
-    response_payload = _safe_response_json(response)
-    if response.status_code in (401, 403):
-        return _error_result(
-            "wix_auth_failed",
-            raw_response=response_payload,
-            status_code=response.status_code,
-            retryable=False,
-        )
-    if response.status_code not in (200, 201):
-        return _error_result(
-            "wix_api_error",
-            raw_response=response_payload,
-            status_code=response.status_code,
-            retryable=True,
-        )
-
-    wix_order_id = _extract_wix_order_id(response_payload)
-    if not wix_order_id:
-        return _error_result(
-            "wix_response_missing_order_id",
-            raw_response=response_payload,
-            status_code=response.status_code,
-            retryable=True,
-        )
-
     logger.info(
         "[Wix] Order created: merchant_id=%s order_id=%s wix_order_id=%s",
         merchant_id,
@@ -603,7 +717,11 @@ async def create_wix_order(
     return {
         "order_id": wix_order_id,
         "status": "created",
-        "raw_response": response_payload,
+        "raw_response": _combined_raw_response(
+            create_payload=response_payload,
+            payment_payload=payment_payload,
+            final_payload=final_payload,
+        ),
     }
 
 

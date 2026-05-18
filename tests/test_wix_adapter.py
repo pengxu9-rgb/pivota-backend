@@ -83,18 +83,27 @@ async def test_create_wix_order_posts_payload_and_returns_order_id(monkeypatch):
             return False
 
         async def post(self, url, headers=None, json=None):
-            captured.update({"url": url, "headers": headers, "json": json})
-            return DummyResponse(201, {"id": "wix_order_123", "number": "1001"})
+            if url == wix_adapter.WIX_ECOM_CREATE_ORDER_URL:
+                captured.update({"url": url, "headers": headers, "json": json})
+                return DummyResponse(201, {"id": "wix_order_123"})
+            captured.update({"payment_url": url, "payment_headers": headers, "payment_json": json})
+            return DummyResponse(200, {"paymentsIds": ["wix_payment_123"]})
+
+        async def get(self, url, headers=None):
+            captured.update({"get_url": url, "get_headers": headers})
+            return DummyResponse(
+                200,
+                {"order": {"id": "wix_order_123", "number": "1001", "status": "APPROVED"}},
+            )
 
     monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", DummyAsyncClient)
 
     result = await wix_adapter.create_wix_order("merch_wix", _wix_order())
 
-    assert result == {
-        "order_id": "wix_order_123",
-        "status": "created",
-        "raw_response": {"id": "wix_order_123", "number": "1001"},
-    }
+    assert result["order_id"] == "wix_order_123"
+    assert result["status"] == "created"
+    assert result["raw_response"]["number"] == "1001"
+    assert result["raw_response"]["add_payment_response"] == {"paymentsIds": ["wix_payment_123"]}
     assert captured["url"] == wix_adapter.WIX_ECOM_CREATE_ORDER_URL
     assert "stores/v2/orders" not in captured["url"]
     assert captured["headers"]["Authorization"] == "IST.test_key"
@@ -116,6 +125,14 @@ async def test_create_wix_order_posts_payload_and_returns_order_id(monkeypatch):
     }
     assert order["shippingInfo"]["shipmentDetails"]["address"]["city"] == "Austin"
     assert order["billingInfo"]["paymentMethod"] == "Pivota External Payment"
+    assert captured["payment_url"] == (
+        wix_adapter.WIX_ECOM_ADD_PAYMENT_URL_TEMPLATE.format(order_id="wix_order_123")
+    )
+    assert captured["payment_json"]["orderId"] == "wix_order_123"
+    assert captured["payment_json"]["payments"][0]["amount"]["amount"] == "31.00"
+    assert captured["payment_json"]["payments"][0]["regularPaymentDetails"]["offlinePayment"] is True
+    assert captured["payment_json"]["payments"][0]["regularPaymentDetails"]["status"] == "APPROVED"
+    assert captured["get_url"] == wix_adapter.WIX_ECOM_ORDER_URL_TEMPLATE.format(order_id="wix_order_123")
 
 
 @pytest.mark.asyncio
@@ -135,8 +152,15 @@ async def test_create_wix_order_uses_bearer_only_for_explicit_oauth(monkeypatch)
             return False
 
         async def post(self, url, headers=None, json=None):
-            captured.update({"url": url, "headers": headers, "json": json})
-            return DummyResponse(201, {"order": {"id": "wix_order_oauth"}})
+            if url == wix_adapter.WIX_ECOM_CREATE_ORDER_URL:
+                captured.update({"url": url, "headers": headers, "json": json})
+                return DummyResponse(201, {"order": {"id": "wix_order_oauth"}})
+            captured.update({"payment_url": url, "payment_headers": headers, "payment_json": json})
+            return DummyResponse(200, {"paymentsIds": ["pay_oauth"]})
+
+        async def get(self, url, headers=None):
+            captured.update({"get_url": url, "get_headers": headers})
+            return DummyResponse(200, {"order": {"id": "wix_order_oauth", "number": "1002"}})
 
     order = _wix_order()
     order["store"] = {
@@ -157,6 +181,7 @@ async def test_create_wix_order_uses_bearer_only_for_explicit_oauth(monkeypatch)
 
     assert result["order_id"] == "wix_order_oauth"
     assert captured["headers"]["Authorization"] == "Bearer token_123"
+    assert captured["payment_headers"]["Authorization"] == "Bearer token_123"
 
 
 @pytest.mark.asyncio
@@ -381,8 +406,15 @@ async def test_create_wix_order_allows_matching_canary_order(monkeypatch):
             return False
 
         async def post(self, url, headers=None, json=None):
-            captured.update({"url": url, "headers": headers, "json": json})
-            return DummyResponse(201, {"id": "wix_order_123"})
+            if url == wix_adapter.WIX_ECOM_CREATE_ORDER_URL:
+                captured.update({"url": url, "headers": headers, "json": json})
+                return DummyResponse(201, {"id": "wix_order_123"})
+            captured.update({"payment_url": url, "payment_json": json})
+            return DummyResponse(200, {"paymentsIds": ["pay_canary"]})
+
+        async def get(self, url, headers=None):
+            captured.update({"get_url": url, "get_headers": headers})
+            return DummyResponse(200, {"order": {"id": "wix_order_123", "number": "1003"}})
 
     monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", DummyAsyncClient)
 
@@ -393,6 +425,7 @@ async def test_create_wix_order_allows_matching_canary_order(monkeypatch):
 
     assert result["order_id"] == "wix_order_123"
     assert captured["url"] == wix_adapter.WIX_ECOM_CREATE_ORDER_URL
+    assert captured["payment_url"] == wix_adapter.WIX_ECOM_ADD_PAYMENT_URL_TEMPLATE.format(order_id="wix_order_123")
 
 
 @pytest.mark.asyncio
