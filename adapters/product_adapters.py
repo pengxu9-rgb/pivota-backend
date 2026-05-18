@@ -6,8 +6,8 @@ Pivota 的核心价值层
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-import asyncio
 import httpx
+import json
 import logging
 import os
 import time
@@ -175,43 +175,104 @@ class ShopifyProductAdapter:
         headers: Dict[str, str],
         products: List[Dict[str, Any]],
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Bulk-fetch metafields for a product list using parallel
-        per-product /metafields.json calls. Returns {str(product_id):
-        [metafield_dict, ...]}. Failures per-product log + return [] for
-        that product (one bad product shouldn't kill the whole sync).
+        """Bulk-fetch metafields for a product list via a single Shopify
+        GraphQL Admin API call. Returns {str(product_id): [metafield_dict,
+        ...]}. Each metafield dict is normalized to match the REST shape
+        (namespace, key, value, type) so the downstream consumer in
+        services/fashion_field_payload_extractor.py works unchanged.
 
-        Future-optimization: a single GraphQL bulk query with
-        `metafields(identifiers: [...])` would replace this with one
-        request. Until then, asyncio.gather keeps wall-clock latency
-        bounded by Shopify's per-call response time, not N×serial.
+        Why GraphQL instead of parallel REST: Shopify Admin REST throttles
+        at 2 req/sec per client; per-product /metafields.json calls hit
+        429 in bursts even for modest catalogs. GraphQL has a separate
+        cost-based throttle (1000 cost points/sec) and this query is ~10
+        points per product, so 250 products in one call ≈ 2500 points —
+        well within the burst budget. Verified live 2026-05-18 on
+        merch_efbc46b4619cfbdf after the original REST adapter
+        (PR #546) blew up with 429 storms.
+
+        Failure mode: on any GraphQL transport/parse failure, returns an
+        empty dict and logs the cause. One bad sync page should not
+        break the whole catalog sync.
         """
         product_ids = [str(p.get("id")) for p in products if p.get("id")]
         if not product_ids:
             return {}
 
-        async def _fetch_one(pid: str) -> Tuple[str, List[Dict[str, Any]]]:
-            url = f"https://{shop_domain}/admin/api/2024-07/products/{pid}/metafields.json"
-            try:
-                resp = await client.get(url, headers=headers)
-            except Exception as exc:
-                logger.warning("shopify_metafields.transport_fail pid=%s err=%s", pid, exc)
-                return pid, []
-            if resp.status_code != 200:
+        gids = [f"gid://shopify/Product/{pid}" for pid in product_ids]
+        query = """
+        query getProductMetafields($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on Product {
+              id
+              metafields(first: 50) {
+                edges {
+                  node {
+                    namespace
+                    key
+                    value
+                    type
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        url = f"https://{shop_domain}/admin/api/2024-07/graphql.json"
+        try:
+            resp = await client.post(
+                url,
+                headers={**headers, "Content-Type": "application/json"},
+                json={"query": query, "variables": {"ids": gids}},
+            )
+        except Exception as exc:
+            logger.warning("shopify_metafields_graphql.transport_fail err=%s", exc)
+            return {pid: [] for pid in product_ids}
+        if resp.status_code != 200:
+            logger.warning(
+                "shopify_metafields_graphql.http_%d body=%s",
+                resp.status_code, resp.text[:300],
+            )
+            return {pid: [] for pid in product_ids}
+        try:
+            payload = resp.json() or {}
+            if "errors" in payload:
                 logger.warning(
-                    "shopify_metafields.http_%d pid=%s body=%s",
-                    resp.status_code, pid, resp.text[:200],
+                    "shopify_metafields_graphql.api_errors %s",
+                    json.dumps(payload["errors"])[:300],
                 )
-                return pid, []
-            try:
-                payload = resp.json() or {}
-                mfs = payload.get("metafields", [])
-                return pid, [m for m in mfs if isinstance(m, dict)]
-            except Exception as exc:
-                logger.warning("shopify_metafields.parse_fail pid=%s err=%s", pid, exc)
-                return pid, []
+                return {pid: [] for pid in product_ids}
+            nodes = ((payload.get("data") or {}).get("nodes") or [])
+        except Exception as exc:
+            logger.warning("shopify_metafields_graphql.parse_fail err=%s", exc)
+            return {pid: [] for pid in product_ids}
 
-        results = await asyncio.gather(*[_fetch_one(pid) for pid in product_ids])
-        return dict(results)
+        out: Dict[str, List[Dict[str, Any]]] = {pid: [] for pid in product_ids}
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            gid = node.get("id") or ""
+            # gid shape: "gid://shopify/Product/10064562225449" → tail = pid
+            pid = gid.rsplit("/", 1)[-1] if gid else None
+            if not pid or pid not in out:
+                continue
+            mfs_block = node.get("metafields") or {}
+            edges = mfs_block.get("edges") or []
+            mfs: List[Dict[str, Any]] = []
+            for edge in edges:
+                inner = (edge or {}).get("node")
+                if not isinstance(inner, dict):
+                    continue
+                # Normalize to REST shape so the consumer code doesn't
+                # have to know which adapter produced this.
+                mfs.append({
+                    "namespace": inner.get("namespace"),
+                    "key": inner.get("key"),
+                    "value": inner.get("value"),
+                    "type": inner.get("type"),
+                })
+            out[pid] = mfs
+        return out
 
     @staticmethod
     async def fetch_shop_currency(
