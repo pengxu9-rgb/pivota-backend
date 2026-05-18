@@ -4827,8 +4827,8 @@ async def agent_search_products(
                 )
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 logger.info(
-                    "agent_search_products.summary",
-                    extra={
+                    "agent_search_products.summary %s",
+                    json.dumps({
                         "event": "agent_search_products.summary",
                         "query": query,
                         "merchant_scope": None,
@@ -4840,7 +4840,7 @@ async def agent_search_products(
                         "auth_total_ms": auth_total_ms,
                         "db_pool_wait_ms": db_pool_wait_ms,
                         "fast_path": "cross_merchant_browse_fastpath",
-                    },
+                    }),
                 )
                 _record_search_metric(
                     mode="browse_fastpath",
@@ -5253,8 +5253,8 @@ async def agent_search_products(
                 merchant_id=merchant_id or "cross_merchant_search",
             )
             logger.info(
-                "agent_search_products.summary",
-                extra={
+                "agent_search_products.summary %s",
+                json.dumps({
                     "event": "agent_search_products.summary",
                     "query": query,
                     "merchant_scope": merchant_id,
@@ -5268,7 +5268,7 @@ async def agent_search_products(
                     "auth_total_ms": auth_total_ms,
                     "db_pool_wait_ms": db_pool_wait_ms,
                     "fast_path": "cross_merchant_fast",
-                },
+                }),
             )
             _record_search_metric(
                 mode="fast_mode",
@@ -5651,8 +5651,8 @@ async def agent_search_products(
             )
             latency_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
-                "agent_search_products.summary",
-                extra={
+                "agent_search_products.summary %s",
+                json.dumps({
                     "event": "agent_search_products.summary",
                     "query": query,
                     "merchant_scope": merchant_id,
@@ -5665,7 +5665,7 @@ async def agent_search_products(
                     "auth_total_ms": auth_total_ms,
                     "db_pool_wait_ms": db_pool_wait_ms,
                     "fast_path": "cross_merchant_browse_standard",
-                },
+                }),
             )
             _record_search_metric(
                 mode="browse_standard",
