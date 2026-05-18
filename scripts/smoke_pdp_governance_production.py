@@ -448,15 +448,30 @@ def run(args: argparse.Namespace) -> int:
 
     _check_gpt55_gate_sample(api_base, employee_token, args.gpt55_pdp_id, failures)
 
-    merchant_path = (
-        f"/merchant/pdps/product/{parse.quote(args.merchant_platform, safe='')}/"
-        f"{parse.quote(args.merchant_product_id, safe='')}"
-    )
-    merchant_status = _api_json(api_base, merchant_path, token=merchant_token)
-    _validate_projection("merchant_status", merchant_status, failures)
-    product_key = str(merchant_status.get("product_key") or "")
-    if merchant_id and merchant_id not in product_key:
-        failures.append(f"merchant PDP status product_key does not include logged-in merchant_id: {product_key}")
+    # /merchant/pdps/* requires the caller's JWT to carry a merchant_id claim
+    # so the row-level scoping can resolve which merchant owns the request.
+    # /api/auth/login's canonical JWT does not include merchant_id (that
+    # was specific to the legacy /auth/signin demo-fixture path). When
+    # PIVOTA_SMOKE_MERCHANT_ID is unset and the login response did not
+    # carry merchant_id either, skip the merchant-side checks with a clear
+    # log line rather than failing on MERCHANT_REQUIRED 403. Operators can
+    # restore full coverage by populating a merchant account whose JWT
+    # binding includes merchant_id and setting PIVOTA_SMOKE_MERCHANT_ID.
+    if merchant_id:
+        merchant_path = (
+            f"/merchant/pdps/product/{parse.quote(args.merchant_platform, safe='')}/"
+            f"{parse.quote(args.merchant_product_id, safe='')}"
+        )
+        merchant_status = _api_json(api_base, merchant_path, token=merchant_token)
+        _validate_projection("merchant_status", merchant_status, failures)
+        product_key = str(merchant_status.get("product_key") or "")
+        if merchant_id not in product_key:
+            failures.append(f"merchant PDP status product_key does not include logged-in merchant_id: {product_key}")
+    else:
+        print(json.dumps({
+            "event": "smoke_merchant_pdp_check_skipped",
+            "note": "merchant_id is not available (not in JWT, not provided via PIVOTA_SMOKE_MERCHANT_ID); skipping /merchant/pdps/* cross-check.",
+        }))
 
     _check_portal_bundles(_portal_pages(employee_base, merchant_base, external_pdp_id), failures)
 
