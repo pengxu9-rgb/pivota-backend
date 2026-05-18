@@ -1,13 +1,14 @@
 """
 Admin SQL execution endpoint for quick fixes
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from typing import List
 import logging
 
 from db.database import database
+from routes.auth_routes import require_admin
 from sqlalchemy import text
+from utils.runtime_safety import require_runtime_gate
 
 router = APIRouter(prefix="/admin/sql", tags=["admin-sql"])
 logger = logging.getLogger(__name__)
@@ -19,8 +20,12 @@ class SQLExecuteRequest(BaseModel):
 
 
 @router.post("/execute")
-async def execute_sql(request: SQLExecuteRequest):
-    """Execute SQL statement - NO AUTH for testing"""
+async def execute_sql(
+    request: SQLExecuteRequest,
+    current_user: dict = Depends(require_admin),
+):
+    """Execute SQL statement behind explicit admin/runtime gates."""
+    require_runtime_gate("ENABLE_ADMIN_SQL_EXECUTE")
     if not request.confirm:
         return {"error": "Must confirm execution"}
     
@@ -45,8 +50,12 @@ async def execute_sql(request: SQLExecuteRequest):
 
 
 @router.post("/query")
-async def query_sql(request: SQLExecuteRequest):
-    """Query SQL and return results - NO AUTH for testing"""
+async def query_sql(
+    request: SQLExecuteRequest,
+    current_user: dict = Depends(require_admin),
+):
+    """Query SQL behind explicit admin/runtime gates."""
+    require_runtime_gate("ENABLE_ADMIN_SQL_QUERY")
     try:
         # Execute query
         rows = await database.fetch_all(text(request.sql))
@@ -68,5 +77,3 @@ async def query_sql(request: SQLExecuteRequest):
             "success": False,
             "error": str(e)
         }
-
-

@@ -59,10 +59,7 @@ def _wix_order() -> Dict[str, Any]:
             "store_id": "store_wix_1",
             "platform": "wix",
             "domain": "site_123",
-            "api_credentials": {
-                "access_token": "token_123",
-                "site_id": "site_123",
-            },
+            "api_key": "IST.test_key",
         },
     }
 
@@ -71,6 +68,7 @@ def _wix_order() -> Dict[str, Any]:
 async def test_create_wix_order_posts_payload_and_returns_order_id(monkeypatch):
     from adapters import wix_adapter
 
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
     captured: Dict[str, Any] = {}
 
     class DummyAsyncClient:
@@ -96,19 +94,67 @@ async def test_create_wix_order_posts_payload_and_returns_order_id(monkeypatch):
         "status": "created",
         "raw_response": {"id": "wix_order_123", "number": "1001"},
     }
-    assert captured["url"] == wix_adapter.WIX_STORES_CREATE_ORDER_URL
-    assert captured["headers"]["Authorization"] == "Bearer token_123"
+    assert captured["url"] == wix_adapter.WIX_ECOM_CREATE_ORDER_URL
+    assert "stores/v2/orders" not in captured["url"]
+    assert captured["headers"]["Authorization"] == "IST.test_key"
     assert captured["headers"]["wix-site-id"] == "site_123"
-    assert captured["json"]["lineItems"][0]["name"] == "Wix Test Product"
-    assert captured["json"]["lineItems"][0]["quantity"] == 2
-    assert captured["json"]["shippingInfo"]["shipmentDetails"]["address"]["city"] == "Austin"
-    assert captured["json"]["billingInfo"]["paymentMethod"] == "Pivota External Payment"
+    order = captured["json"]["order"]
+    assert order["lineItems"][0]["name"] == "Wix Test Product"
+    assert order["lineItems"][0]["quantity"] == 2
+    assert order["lineItems"][0]["catalogReference"] == {
+        "appId": wix_adapter.WIX_STORES_APP_ID,
+        "catalogItemId": "prod_wix_1",
+        "options": {"variantId": "var_wix_1"},
+    }
+    assert order["shippingInfo"]["shipmentDetails"]["address"]["city"] == "Austin"
+    assert order["billingInfo"]["paymentMethod"] == "Pivota External Payment"
+
+
+@pytest.mark.asyncio
+async def test_create_wix_order_uses_bearer_only_for_explicit_oauth(monkeypatch):
+    from adapters import wix_adapter
+
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
+    captured: Dict[str, Any] = {}
+
+    class DummyAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured.update({"url": url, "headers": headers, "json": json})
+            return DummyResponse(201, {"order": {"id": "wix_order_oauth"}})
+
+    order = _wix_order()
+    order["store"] = {
+        "store_id": "store_wix_1",
+        "platform": "wix",
+        "domain": "site_123",
+        "api_credentials": {
+            "auth_mode": "oauth",
+            "access_token": "token_123",
+            "site_id": "site_123",
+        },
+    }
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", DummyAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", order)
+
+    assert result["order_id"] == "wix_order_oauth"
+    assert captured["headers"]["Authorization"] == "Bearer token_123"
 
 
 @pytest.mark.asyncio
 async def test_create_wix_order_auth_failure_returns_error_shape(monkeypatch):
     from adapters import wix_adapter
 
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
     class DummyAsyncClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -137,6 +183,7 @@ async def test_create_wix_order_auth_failure_returns_error_shape(monkeypatch):
 async def test_create_wix_order_network_error_returns_error_shape(monkeypatch):
     from adapters import wix_adapter
 
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
     class DummyAsyncClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -164,6 +211,7 @@ async def test_create_wix_order_network_error_returns_error_shape(monkeypatch):
 async def test_create_wix_order_missing_credentials_returns_not_configured(monkeypatch):
     from adapters import wix_adapter
 
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
     class FailingAsyncClient:
         def __init__(self, *args, **kwargs):
             raise AssertionError("network should not be called without credentials")
@@ -176,7 +224,7 @@ async def test_create_wix_order_missing_credentials_returns_not_configured(monke
 
     assert result["order_id"] is None
     assert result["status"] == "error"
-    assert result["error"] == "wix_credentials_not_configured"
+    assert result["error"] == "wix_order_writeback_not_ready"
     assert result["retryable"] is False
 
 
@@ -188,6 +236,7 @@ async def test_create_wix_order_partial_credentials_token_only_returns_not_confi
     validation rejects this BEFORE the network call."""
     from adapters import wix_adapter
 
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
     class FailingAsyncClient:
         def __init__(self, *args, **kwargs):
             raise AssertionError("network should not be called without site_id")
@@ -196,15 +245,15 @@ async def test_create_wix_order_partial_credentials_token_only_returns_not_confi
     order["store"] = {
         "store_id": "store_wix_1",
         "platform": "wix",
-        # access_token present but site_id MISSING — should be rejected.
-        "api_credentials": {"access_token": "tok_partial_only"},
+        # Explicit OAuth token present but site_id MISSING — should be rejected.
+        "api_credentials": {"auth_mode": "oauth", "access_token": "tok_partial_only"},
     }
     monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", FailingAsyncClient)
 
     result = await wix_adapter.create_wix_order("merch_wix", order)
 
     assert result["status"] == "error"
-    assert result["error"] == "wix_credentials_not_configured"
+    assert result["error"] == "wix_order_writeback_not_ready"
     assert result["retryable"] is False
     raw = result.get("raw_response") or {}
     assert "site_id" in (raw.get("missing_fields") or []), (
@@ -220,6 +269,7 @@ async def test_create_wix_order_partial_credentials_site_only_returns_not_config
     NO access_token must also reject before network call."""
     from adapters import wix_adapter
 
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
     class FailingAsyncClient:
         def __init__(self, *args, **kwargs):
             raise AssertionError("network should not be called without access_token")
@@ -235,10 +285,103 @@ async def test_create_wix_order_partial_credentials_site_only_returns_not_config
     result = await wix_adapter.create_wix_order("merch_wix", order)
 
     assert result["status"] == "error"
-    assert result["error"] == "wix_credentials_not_configured"
+    assert result["error"] == "wix_order_writeback_not_ready"
     assert result["retryable"] is False
     raw = result.get("raw_response") or {}
-    assert "access_token" in (raw.get("missing_fields") or [])
+    assert "api_key" in (raw.get("missing_fields") or [])
+
+
+@pytest.mark.asyncio
+async def test_create_wix_order_flag_disabled_fails_closed(monkeypatch):
+    from adapters import wix_adapter
+
+    monkeypatch.delenv("ENABLE_WIX_ORDER_WRITEBACK_V2", raising=False)
+
+    class FailingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("network should not be called when v2 is disabled")
+
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", FailingAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", _wix_order())
+
+    assert result["status"] == "error"
+    assert result["error"] == "wix_order_writeback_not_ready"
+    assert result["retryable"] is False
+    assert result["raw_response"]["required_flag"] == "ENABLE_WIX_ORDER_WRITEBACK_V2"
+
+
+@pytest.mark.asyncio
+async def test_create_wix_order_respects_canary_order_scope(monkeypatch):
+    from adapters import wix_adapter
+
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
+    monkeypatch.setenv("WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS", "ORD_ALLOWED")
+
+    class FailingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("network should not be called outside canary scope")
+
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", FailingAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", _wix_order())
+
+    assert result["status"] == "error"
+    assert result["error"] == "wix_order_writeback_not_ready"
+    assert "WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS" in result["raw_response"]["canary_scope_env"]
+
+
+@pytest.mark.asyncio
+async def test_create_wix_order_allows_matching_canary_order(monkeypatch):
+    from adapters import wix_adapter
+
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
+    monkeypatch.setenv("WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS", "ORD_WIX_1")
+    captured: Dict[str, Any] = {}
+
+    class DummyAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured.update({"url": url, "headers": headers, "json": json})
+            return DummyResponse(201, {"id": "wix_order_123"})
+
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", DummyAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", _wix_order())
+
+    assert result["order_id"] == "wix_order_123"
+    assert captured["url"] == wix_adapter.WIX_ECOM_CREATE_ORDER_URL
+
+
+@pytest.mark.asyncio
+async def test_create_wix_order_missing_catalog_mapping_fails_before_network(monkeypatch):
+    from adapters import wix_adapter
+
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
+    order = _wix_order()
+    order["items"][0].pop("product_id")
+    order["items"][0].pop("platform_product_id", None)
+    order["items"][0].pop("wix_product_id", None)
+
+    class FailingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("network should not be called without a Wix catalog item id")
+
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", FailingAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", order)
+
+    assert result["status"] == "error"
+    assert result["error"] == "wix_order_payload_invalid"
+    assert "lineItems[0].catalogReference.catalogItemId" in result["raw_response"]["blockers"]
 
 
 def test_build_wix_order_payload_populates_required_wix_fields_from_order():
@@ -246,21 +389,24 @@ def test_build_wix_order_payload_populates_required_wix_fields_from_order():
 
     payload = build_wix_order_payload(_wix_order())
 
-    assert payload["lineItems"][0]["productId"] == "prod_wix_1"
-    assert payload["lineItems"][0]["variantId"] == "var_wix_1"
-    assert payload["lineItems"][0]["options"] == [{"option": "Size", "selection": "M"}]
-    assert payload["shippingInfo"]["shipmentDetails"]["address"]["zipCode"] == "78701"
-    assert payload["billingInfo"]["email"] == "buyer@example.com"
-    assert payload["billingInfo"]["paymentProviderTransactionId"] == "pi_wix_1"
-    assert payload["billingInfo"]["paymentMethod"] == "Pivota External Payment"
-    assert payload["paymentMethod"] == "Pivota External Payment"
-    assert payload["paymentStatus"] == "PAID"
+    order = payload["order"]
+    assert order["lineItems"][0]["catalogReference"]["catalogItemId"] == "prod_wix_1"
+    assert order["lineItems"][0]["catalogReference"]["options"]["variantId"] == "var_wix_1"
+    assert order["lineItems"][0]["selectedOptions"] == [{"option": "Size", "selection": "M"}]
+    assert order["shippingInfo"]["shipmentDetails"]["address"]["postalCode"] == "78701"
+    assert order["billingInfo"]["email"] == "buyer@example.com"
+    assert order["billingInfo"]["paymentProviderTransactionId"] == "pi_wix_1"
+    assert order["billingInfo"]["paymentMethod"] == "Pivota External Payment"
+    assert order["paymentMethod"] == "Pivota External Payment"
+    assert order["paymentStatus"] == "PAID"
+    assert order["priceSummary"]["total"]["amount"] == "31.00"
 
 
 @pytest.mark.asyncio
 async def test_sync_order_to_connected_store_routes_to_wix_adapter(monkeypatch):
     from routes import order_routes
 
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
     adapter_calls: list[Dict[str, Any]] = []
     fulfillment_updates: list[Dict[str, Any]] = []
     order_updates: list[Dict[str, Any]] = []
@@ -283,10 +429,7 @@ async def test_sync_order_to_connected_store_routes_to_wix_adapter(monkeypatch):
                 "store_id": "store_wix_1",
                 "platform": "wix",
                 "domain": "site_123",
-                "api_credentials": {
-                    "access_token": "token_123",
-                    "site_id": "site_123",
-                },
+                "api_key": "IST.test_key",
             }
         ]
 
@@ -334,3 +477,99 @@ async def test_sync_order_to_connected_store_routes_to_wix_adapter(monkeypatch):
     assert merchant_order["platform_order_name"] == "1001"
     assert order_events[0]["event_type"] == "merchant_order_created"
     assert order_events[0]["metadata"]["platform"] == "wix"
+    assert order_events[1]["event_type"] == "wix_order_created"
+
+
+@pytest.mark.asyncio
+async def test_sync_order_to_connected_store_wix_flag_disabled_does_not_call_adapter(monkeypatch):
+    from routes import order_routes
+
+    monkeypatch.delenv("ENABLE_WIX_ORDER_WRITEBACK_V2", raising=False)
+    order = _wix_order()
+    order.pop("store")
+    order["store_id"] = "store_wix_1"
+    order_events: list[Dict[str, Any]] = []
+    sync_failures: list[Dict[str, Any]] = []
+
+    async def fake_get_order(order_id: str):
+        return dict(order)
+
+    async def fake_get_store_by_id(store_id: str, *, merchant_id: str):
+        return {"store_id": store_id, "platform": "wix", "domain": "site_123", "api_key": "IST.test_key"}
+
+    async def fail_adapter(*args, **kwargs):
+        raise AssertionError("legacy or v2 adapter should not be called while Wix v2 flag is disabled")
+
+    async def fake_log_order_event(**kwargs):
+        order_events.append(kwargs)
+
+    async def fake_mark_failed(**kwargs):
+        sync_failures.append(kwargs)
+
+    @asynccontextmanager
+    async def fake_lock(*, lock_key: int):
+        yield True
+
+    monkeypatch.setattr(order_routes, "_pg_advisory_lock_best_effort", fake_lock)
+    monkeypatch.setattr(order_routes, "get_order", fake_get_order)
+    monkeypatch.setattr(order_routes, "get_store_by_id", fake_get_store_by_id)
+    monkeypatch.setattr(order_routes, "create_wix_order_via_adapter", fail_adapter)
+    monkeypatch.setattr(order_routes, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(order_routes, "_mark_merchant_order_sync_failed_best_effort", fake_mark_failed)
+
+    ok = await order_routes.sync_order_to_connected_store("ORD_WIX_1")
+
+    assert ok is False
+    assert [event["event_type"] for event in order_events] == [
+        "wix_order_writeback_skipped",
+        "merchant_order_failed",
+    ]
+    assert sync_failures[0]["platform"] == "wix"
+    assert sync_failures[0]["error"] == "wix_order_writeback_not_ready"
+    assert sync_failures[0]["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_sync_order_to_connected_store_wix_canary_scope_does_not_call_adapter(monkeypatch):
+    from routes import order_routes
+
+    monkeypatch.setenv("ENABLE_WIX_ORDER_WRITEBACK_V2", "true")
+    monkeypatch.setenv("WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS", "ORD_ALLOWED")
+    order = _wix_order()
+    order.pop("store")
+    order["store_id"] = "store_wix_1"
+    order_events: list[Dict[str, Any]] = []
+    sync_failures: list[Dict[str, Any]] = []
+
+    async def fake_get_order(order_id: str):
+        return dict(order)
+
+    async def fake_get_store_by_id(store_id: str, *, merchant_id: str):
+        return {"store_id": store_id, "platform": "wix", "domain": "site_123", "api_key": "IST.test_key"}
+
+    async def fail_adapter(*args, **kwargs):
+        raise AssertionError("adapter should not be called outside canary scope")
+
+    async def fake_log_order_event(**kwargs):
+        order_events.append(kwargs)
+
+    async def fake_mark_failed(**kwargs):
+        sync_failures.append(kwargs)
+
+    @asynccontextmanager
+    async def fake_lock(*, lock_key: int):
+        yield True
+
+    monkeypatch.setattr(order_routes, "_pg_advisory_lock_best_effort", fake_lock)
+    monkeypatch.setattr(order_routes, "get_order", fake_get_order)
+    monkeypatch.setattr(order_routes, "get_store_by_id", fake_get_store_by_id)
+    monkeypatch.setattr(order_routes, "create_wix_order_via_adapter", fail_adapter)
+    monkeypatch.setattr(order_routes, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(order_routes, "_mark_merchant_order_sync_failed_best_effort", fake_mark_failed)
+
+    ok = await order_routes.sync_order_to_connected_store("ORD_WIX_1")
+
+    assert ok is False
+    assert order_events[0]["event_type"] == "wix_order_writeback_skipped"
+    assert "WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS" in order_events[0]["metadata"]["canary_scope_env"]
+    assert sync_failures[0]["error"] == "wix_order_writeback_not_ready"

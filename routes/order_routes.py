@@ -88,7 +88,14 @@ from adapters.bigcommerce_adapter import (
     build_bigcommerce_headers,
     normalize_bigcommerce_store_hash,
 )
-from adapters.wix_adapter import create_wix_order as create_wix_order_via_adapter
+from adapters.wix_adapter import (
+    WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS,
+    WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS,
+    WIX_ORDER_WRITEBACK_CANARY_STORE_IDS,
+    WIX_ORDER_WRITEBACK_FLAG,
+    create_wix_order as create_wix_order_via_adapter,
+    is_wix_order_writeback_v2_enabled,
+)
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from routes.reviews_invitation_issuer import (
     SendInvitationEmailFromOrderRequest,
@@ -1336,6 +1343,7 @@ async def _candidate_platform_stores(
             if str((store or {}).get("store_id") or "").strip() == bound_store_id:
                 candidates.append(store)
                 break
+        return candidates
 
     for store in platform_stores:
         if store not in candidates:
@@ -5437,6 +5445,39 @@ async def create_wix_order(order_id: str) -> bool:
                 order.get("payment_status"),
             )
             return False
+        if not is_wix_order_writeback_v2_enabled(order):
+            await log_order_event(
+                event_type="wix_order_writeback_skipped",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={
+                    "platform": "wix",
+                    "error": "wix_order_writeback_not_ready",
+                    "required_flag": WIX_ORDER_WRITEBACK_FLAG,
+                    "canary_scope_env": [
+                        WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS,
+                        WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS,
+                        WIX_ORDER_WRITEBACK_CANARY_STORE_IDS,
+                    ],
+                },
+            )
+            await log_order_event(
+                event_type="merchant_order_failed",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={
+                    "platform": "wix",
+                    "error": "wix_order_writeback_not_ready",
+                    "required_flag": WIX_ORDER_WRITEBACK_FLAG,
+                    "retryable": False,
+                    "canary_scope_env": [
+                        WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS,
+                        WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS,
+                        WIX_ORDER_WRITEBACK_CANARY_STORE_IDS,
+                    ],
+                },
+            )
+            return False
 
         candidates = await _candidate_platform_stores(order, platform="wix")
         if not candidates:
@@ -5449,6 +5490,7 @@ async def create_wix_order(order_id: str) -> bool:
             return False
 
         last_error: Optional[str] = None
+        last_retryable = True
         for store in candidates:
             adapter_order = dict(order)
             adapter_order["store"] = store
@@ -5473,6 +5515,7 @@ async def create_wix_order(order_id: str) -> bool:
                 if isinstance(raw_response, dict):
                     message = raw_response.get("message") or raw_response.get("error")
                 last_error = str((result or {}).get("error") or message or "wix_order_writeback_failed")[:500]
+                last_retryable = bool((result or {}).get("retryable", True))
                 continue
 
             raw_response = (result or {}).get("raw_response")
@@ -5510,6 +5553,16 @@ async def create_wix_order(order_id: str) -> bool:
                     "domain": str((store or {}).get("domain") or "").strip() or None,
                 },
             )
+            await log_order_event(
+                event_type="wix_order_created",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={
+                    "platform": "wix",
+                    "platform_order_id": platform_order_id,
+                    "store_id": store_id_used,
+                },
+            )
             logger.info(
                 "[Wix] Order linked: order_id=%s platform_order_id=%s store_id=%s",
                 order_id,
@@ -5523,7 +5576,17 @@ async def create_wix_order(order_id: str) -> bool:
                 event_type="merchant_order_failed",
                 order_id=order_id,
                 merchant_id=order["merchant_id"],
-                metadata={"platform": "wix", "error": last_error},
+                metadata={"platform": "wix", "error": last_error, "retryable": last_retryable},
+            )
+            await log_order_event(
+                event_type=(
+                    "wix_order_writeback_not_ready"
+                    if last_error == "wix_order_writeback_not_ready"
+                    else "wix_order_writeback_failed"
+                ),
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                metadata={"platform": "wix", "error": last_error, "retryable": last_retryable},
             )
         return False
 
@@ -5539,6 +5602,21 @@ async def sync_order_to_connected_store(order_id: str) -> bool:
     store_info = None
     if bound_store_id:
         store_info = await get_store_by_id(bound_store_id, merchant_id=str(order.get("merchant_id") or "").strip())
+        if not store_info:
+            logger.info(
+                "[MerchantSync] Bound store missing or inactive; refusing primary-store fallback: order_id=%s store_id=%s",
+                order_id,
+                bound_store_id,
+            )
+            await _mark_merchant_order_sync_failed_best_effort(
+                order_id=order_id,
+                order=order,
+                platform=None,
+                reason="bound_store_missing_or_inactive",
+                error="bound merchant store is missing or inactive",
+                retryable=False,
+            )
+            return False
     if not store_info:
         store_info = await get_primary_store(str(order.get("merchant_id") or "").strip())
     platform = str((store_info or {}).get("platform") or "").strip().lower()
@@ -5556,13 +5634,20 @@ async def sync_order_to_connected_store(order_id: str) -> bool:
 
     if success:
         return True
+    failure_error = "merchant order creation failed or no supported store connection was available"
+    failure_reason = "merchant_order_create_returned_false"
+    retryable = True
+    if platform == "wix" and not is_wix_order_writeback_v2_enabled(order):
+        failure_error = "wix_order_writeback_not_ready"
+        failure_reason = "wix_order_writeback_v2_disabled"
+        retryable = False
     await _mark_merchant_order_sync_failed_best_effort(
         order_id=order_id,
         order=order,
         platform=platform or None,
-        reason="merchant_order_create_returned_false",
-        error="merchant order creation failed or no supported store connection was available",
-        retryable=True,
+        reason=failure_reason,
+        error=failure_error,
+        retryable=retryable,
     )
     return False
 

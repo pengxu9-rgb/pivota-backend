@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from db.database import database
 from utils.auth import get_current_user
+from utils.runtime_safety import require_runtime_gate
 from datetime import datetime
-import secrets
 import logging
 
 router = APIRouter(prefix="/admin/bind", tags=["admin-bind"])
@@ -20,9 +20,10 @@ async def admin_bind_wix_store(
     request: BindWixStoreRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Admin can bind a Wix store to any merchant (bypass auth check)"""
-    if current_user["role"] not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Admin access required")
+    """Superadmin-only emergency Wix bind endpoint, production-gated."""
+    require_runtime_gate("ALLOW_PROD_ADMIN_STORE_MUTATION")
+    if current_user["role"] != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin access required")
     
     try:
         # Check if store already exists
@@ -74,5 +75,3 @@ async def admin_bind_wix_store(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-

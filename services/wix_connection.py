@@ -143,6 +143,18 @@ def build_wix_catalog_headers(api_key: str, site_id: str) -> Dict[str, str]:
     }
 
 
+def build_wix_api_key_headers(api_key: str, site_id: str) -> Dict[str, str]:
+    """Headers for Wix REST API-key calls.
+
+    Wix API keys are sent as the raw Authorization value. They are not OAuth
+    bearer tokens, so callers must not prepend "Bearer " to IST/JWS keys.
+    """
+    return {
+        **build_wix_catalog_headers(api_key, site_id),
+        "Accept": "application/json",
+    }
+
+
 def extract_wix_site_id(domain: Any, api_key: Any = None) -> str:
     blob = coerce_wix_credential_blob(api_key)
     site_id = str(blob.get("site_id") or blob.get("wix_site_id") or domain or "").strip()

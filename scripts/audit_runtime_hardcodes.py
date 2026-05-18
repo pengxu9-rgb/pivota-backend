@@ -30,7 +30,10 @@ FORBIDDEN = tuple(re.compile(value, re.IGNORECASE) for value in FORBIDDEN_STRING
 
 def _should_skip(path: Path) -> bool:
     rel = path.relative_to(REPO_ROOT).as_posix()
-    if rel == "scripts/audit_runtime_hardcodes.py":
+    if rel in {
+        "scripts/audit_runtime_hardcodes.py",
+        "scripts/inventory_legacy_test_merchants.py",
+    }:
         return True
     parts = rel.split("/")
     for idx in range(len(parts)):

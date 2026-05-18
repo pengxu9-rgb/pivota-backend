@@ -1,19 +1,28 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional, List
 from db.database import database
 from utils.auth import get_current_user
+from utils.runtime_safety import require_runtime_gate
 import logging
 
 router = APIRouter(prefix="/admin/cleanup", tags=["admin-cleanup"])
 logger = logging.getLogger(__name__)
+
+
+def _require_admin_store_mutation_access(current_user: dict, *, mutation: bool) -> None:
+    require_runtime_gate("ALLOW_PROD_ADMIN_STORE_MUTATION")
+    role = str((current_user or {}).get("role") or "").strip().lower()
+    if mutation:
+        if role != "superadmin":
+            raise HTTPException(status_code=403, detail="Superadmin access required")
+    elif role not in {"admin", "superadmin"}:
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 @router.get("/stores/wix")
 async def list_wix_stores(
     current_user: dict = Depends(get_current_user)
 ):
     """List all Wix store connections (admin only)"""
-    if current_user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    _require_admin_store_mutation_access(current_user, mutation=False)
     
     try:
         query = """
@@ -48,8 +57,7 @@ async def delete_wix_store(
     current_user: dict = Depends(get_current_user)
 ):
     """Delete a specific Wix store connection (admin only)"""
-    if current_user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    _require_admin_store_mutation_access(current_user, mutation=True)
     
     try:
         # Check if store exists
@@ -82,8 +90,7 @@ async def delete_all_wix_stores(
     current_user: dict = Depends(get_current_user)
 ):
     """Delete ALL Wix store connections (admin only, requires confirmation)"""
-    if current_user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    _require_admin_store_mutation_access(current_user, mutation=True)
     
     if not confirm:
         raise HTTPException(
@@ -127,8 +134,7 @@ async def delete_store_by_domain(
     current_user: dict = Depends(get_current_user)
 ):
     """Delete store by platform and domain (admin only)"""
-    if current_user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    _require_admin_store_mutation_access(current_user, mutation=True)
     
     try:
         # Find and delete stores

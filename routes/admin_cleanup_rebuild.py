@@ -3,12 +3,11 @@ Admin cleanup and rebuild endpoints for testing
 """
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from typing import Optional
 import logging
-from datetime import datetime
 
 from db.database import database
 from routes.auth_routes import require_admin
+from utils.runtime_safety import require_runtime_gate
 
 router = APIRouter(prefix="/admin/cleanup", tags=["admin-cleanup"])
 logger = logging.getLogger(__name__)
@@ -25,8 +24,12 @@ class DeletePSPsRequest(BaseModel):
 
 
 @router.post("/delete-all-orders")
-async def delete_all_orders(request: DeleteOrdersRequest):
-    """Delete all orders for a merchant - NO AUTH for testing"""
+async def delete_all_orders(
+    request: DeleteOrdersRequest,
+    current_user: dict = Depends(require_admin),
+):
+    """Delete all orders for a merchant behind explicit admin/runtime gates."""
+    require_runtime_gate("ENABLE_DESTRUCTIVE_ADMIN_CLEANUP")
     if not request.confirm:
         return {"error": "Must confirm deletion"}
     
@@ -68,8 +71,12 @@ async def delete_all_orders(request: DeleteOrdersRequest):
 
 
 @router.post("/delete-all-psps")
-async def delete_all_psps(request: DeletePSPsRequest):
-    """Delete all PSP configurations for a merchant - NO AUTH for testing"""
+async def delete_all_psps(
+    request: DeletePSPsRequest,
+    current_user: dict = Depends(require_admin),
+):
+    """Delete all PSP configurations behind explicit admin/runtime gates."""
+    require_runtime_gate("ENABLE_DESTRUCTIVE_ADMIN_CLEANUP")
     if not request.confirm:
         return {"error": "Must confirm deletion"}
     
@@ -111,8 +118,12 @@ async def delete_all_psps(request: DeletePSPsRequest):
 
 
 @router.get("/verify-clean-state/{merchant_id}")
-async def verify_clean_state(merchant_id: str):
-    """Verify that merchant has clean state - NO AUTH for testing"""
+async def verify_clean_state(
+    merchant_id: str,
+    current_user: dict = Depends(require_admin),
+):
+    """Verify merchant cleanup state behind explicit admin/runtime gates."""
+    require_runtime_gate("ENABLE_ADMIN_CLEANUP_VERIFY")
     try:
         # Check orders
         order_query = """

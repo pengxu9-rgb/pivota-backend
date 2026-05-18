@@ -22,7 +22,7 @@ Usage:
     #    (use Railway dashboard or `railway variables --set`).
     # 2) Pick a real Shopify merchant + product:
     python scripts/validate_fashion_metafield_pipeline.py \\
-        --merchant-id merch_efbc46b4619cfbdf \\
+        --merchant-id merch_xxxxxxxxxxxxxxxx \\
         --product-id 10064562225449 \\
         --material '100% test linen (PIPELINE VALIDATION)' \\
         --gateway-base https://agent.pivota.cc
@@ -378,7 +378,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--merchant-id", required=True, help="Pivota merchant_id (e.g. merch_efbc46b4619cfbdf)")
+    parser.add_argument("--merchant-id", required=True, help="Pivota merchant_id (e.g. merch_xxxxxxxxxxxxxxxx)")
     parser.add_argument("--product-id", required=True, help="Shopify product_id (numeric, e.g. 10064562225449)")
     parser.add_argument("--material", default="100% test linen", help="Material text the script will set in Shopify")
     parser.add_argument("--namespace", default="custom", help="Shopify metafield namespace (default 'custom')")

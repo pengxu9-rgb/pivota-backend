@@ -1,36 +1,82 @@
 from __future__ import annotations
 
-"""Wix Stores order writeback adapter.
+"""Wix eCommerce order writeback adapter.
 
-This adapter intentionally only consumes already-stored merchant tokens. Wix
-App OAuth is not wired in this pass because a real Wix developer app is not
-available in this environment. Future onboarding should exchange the Wix app
-instance for a Bearer access token using:
-
-  * WIX_APP_CLIENT_ID
-  * WIX_APP_CLIENT_SECRET
-
-and persist the merchant store credential blob as:
-
-  {"access_token": "<wix bearer token>", "site_id": "<wix site id>"}
-
-Until then, missing merchant tokens return ``wix_credentials_not_configured``
-instead of raising into the paid-order pipeline.
+Production Wix catalog sync is API-key based. Order writeback follows the same
+credential model and is disabled unless ``ENABLE_WIX_ORDER_WRITEBACK_V2`` is
+explicitly enabled. Legacy OAuth bearer support remains available only when the
+stored credential blob explicitly declares ``auth_mode=oauth``.
 """
 
 from decimal import Decimal, ROUND_HALF_UP
-import json
 import logging
-import os
 import time
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
+from services.wix_connection import (
+    build_wix_api_key_headers,
+    coerce_wix_credential_blob,
+    extract_wix_site_id,
+    normalize_wix_api_key,
+)
+from utils.runtime_safety import configured_env_value, env_flag
+
 logger = logging.getLogger(__name__)
 
-WIX_STORES_CREATE_ORDER_URL = "https://www.wixapis.com/stores/v2/orders"
+WIX_ECOM_CREATE_ORDER_URL = "https://www.wixapis.com/ecom/v1/orders"
+WIX_STORES_APP_ID = "1380b703-ce81-ff05-f115-39571d94dfcd"
+WIX_ORDER_WRITEBACK_FLAG = "ENABLE_WIX_ORDER_WRITEBACK_V2"
+WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS = "WIX_ORDER_WRITEBACK_V2_CANARY_ORDER_IDS"
+WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS = "WIX_ORDER_WRITEBACK_V2_CANARY_MERCHANT_IDS"
+WIX_ORDER_WRITEBACK_CANARY_STORE_IDS = "WIX_ORDER_WRITEBACK_V2_CANARY_STORE_IDS"
 DEFAULT_WIX_PAYMENT_METHOD = "Pivota External Payment"
+
+
+def _csv_env_set(name: str) -> set[str]:
+    return {
+        item.strip()
+        for item in configured_env_value(name).split(",")
+        if item.strip()
+    }
+
+
+def wix_order_writeback_canary_scope_configured() -> bool:
+    return any(
+        _csv_env_set(name)
+        for name in (
+            WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS,
+            WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS,
+            WIX_ORDER_WRITEBACK_CANARY_STORE_IDS,
+        )
+    )
+
+
+def is_wix_order_writeback_v2_enabled(order_dict: Optional[Dict[str, Any]] = None) -> bool:
+    if not env_flag(WIX_ORDER_WRITEBACK_FLAG):
+        return False
+
+    order_ids = _csv_env_set(WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS)
+    merchant_ids = _csv_env_set(WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS)
+    store_ids = _csv_env_set(WIX_ORDER_WRITEBACK_CANARY_STORE_IDS)
+    if not (order_ids or merchant_ids or store_ids):
+        return True
+    if not isinstance(order_dict, dict):
+        return False
+
+    store = _coerce_dict(order_dict.get("store") or order_dict.get("store_info"))
+    order_id = _clean_str(order_dict.get("order_id"))
+    merchant_id = _clean_str(order_dict.get("merchant_id"))
+    store_id = _clean_str(order_dict.get("store_id") or store.get("store_id"))
+
+    if order_ids and order_id not in order_ids:
+        return False
+    if merchant_ids and merchant_id not in merchant_ids:
+        return False
+    if store_ids and store_id not in store_ids:
+        return False
+    return True
 
 
 def _clean_str(value: Any) -> str:
@@ -43,12 +89,7 @@ def _coerce_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, str):
         raw = value.strip()
         if raw.startswith("{"):
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    return dict(parsed)
-            except Exception:
-                return {}
+            return coerce_wix_credential_blob(raw)
     return {}
 
 
@@ -99,7 +140,9 @@ def _build_wix_address(order: Dict[str, Any]) -> Dict[str, Any]:
         "country": country,
         "subdivision": _normalize_subdivision(country, shipping_address.get("state")),
         "city": _clean_str(shipping_address.get("city")),
+        "postalCode": _clean_str(shipping_address.get("postal_code")),
         "zipCode": _clean_str(shipping_address.get("postal_code")),
+        "addressLine1": _clean_str(shipping_address.get("address_line1")),
         "addressLine": _clean_str(shipping_address.get("address_line1")),
         "addressLine2": _clean_str(shipping_address.get("address_line2")),
         "phone": _clean_str(shipping_address.get("phone")),
@@ -141,9 +184,10 @@ def _build_wix_line_item(item: Dict[str, Any]) -> Dict[str, Any]:
     unit_price = _money_str(item.get("unit_price") or item.get("price"))
     line_item: Dict[str, Any] = {
         "name": title,
+        "productName": {"original": title},
         "quantity": quantity,
-        "price": unit_price,
-        "lineItemType": "CUSTOM_AMOUNT_ITEM",
+        "price": {"amount": unit_price},
+        "itemType": {"preset": "PHYSICAL"},
     }
 
     sku = _clean_str(item.get("sku"))
@@ -153,28 +197,34 @@ def _build_wix_line_item(item: Dict[str, Any]) -> Dict[str, Any]:
     product_id = _clean_str(
         item.get("wix_product_id")
         or item.get("platform_product_id")
+        or item.get("source_product_id")
         or item.get("external_product_id")
         or item.get("product_id")
     )
-    if product_id:
-        line_item["productId"] = product_id
-        line_item["lineItemType"] = "PHYSICAL"
-
     variant_id = _clean_str(
         item.get("wix_variant_id")
         or item.get("platform_variant_id")
+        or item.get("source_variant_id")
         or item.get("external_variant_id")
         or item.get("variant_id")
     )
+    if product_id:
+        catalog_options: Dict[str, Any] = {}
+        if variant_id:
+            catalog_options["variantId"] = variant_id
+        line_item["catalogReference"] = {
+            "appId": WIX_STORES_APP_ID,
+            "catalogItemId": product_id,
+            **({"options": catalog_options} if catalog_options else {}),
+        }
     if variant_id:
-        line_item["variantId"] = variant_id
-        line_item["options"] = _line_item_options(item)
+        line_item["selectedOptions"] = _line_item_options(item)
 
     return line_item
 
 
 def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the Wix Stores v2 order payload from a Pivota order row."""
+    """Build the Wix eCommerce Create Order payload from a Pivota order row."""
     order = dict(order_dict or {})
     order_id = _clean_str(order.get("order_id"))
     email = _clean_str(order.get("customer_email"))
@@ -196,7 +246,7 @@ def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
     if payment_reference:
         billing_info["paymentProviderTransactionId"] = payment_reference
 
-    return {
+    wix_order = {
         "lineItems": line_items,
         "shippingInfo": {
             "shipmentDetails": {
@@ -215,11 +265,11 @@ def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
         "paymentStatus": "PAID" if payment_status == "paid" else "NOT_PAID",
         "fulfillmentStatus": "NOT_FULFILLED",
         "currency": currency,
-        "totals": {
-            "subtotal": _money_str(order.get("subtotal")),
-            "shipping": _money_str(order.get("shipping_fee")),
-            "tax": _money_str(order.get("tax")),
-            "total": _money_str(order.get("total")),
+        "priceSummary": {
+            "subtotal": {"amount": _money_str(order.get("subtotal"))},
+            "shipping": {"amount": _money_str(order.get("shipping_fee"))},
+            "tax": {"amount": _money_str(order.get("tax"))},
+            "total": {"amount": _money_str(order.get("total"))},
         },
         "channelInfo": {
             "type": "OTHER_PLATFORM",
@@ -228,40 +278,68 @@ def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
         },
         "buyerNote": f"Pivota Order ID: {order_id}" if order_id else "Pivota order",
     }
+    return {"order": wix_order}
+
+
+def _explicit_auth_mode(source: Dict[str, Any]) -> str:
+    mode = _clean_str(
+        source.get("auth_mode")
+        or source.get("auth_type")
+        or source.get("authentication_mode")
+        or source.get("credential_type")
+    ).lower()
+    if mode in {"oauth", "bearer", "access_token"}:
+        return "oauth"
+    if mode in {"api_key", "apikey", "wix_api_key"}:
+        return "api_key"
+    token_type = _clean_str(source.get("token_type")).lower()
+    if token_type == "bearer":
+        return "oauth"
+    return ""
+
+
+def _safe_extract_site_id(domain: Any, api_key: Any = None) -> str:
+    try:
+        return extract_wix_site_id(domain, api_key)
+    except Exception:
+        return _clean_str(domain)
 
 
 def extract_wix_order_credentials(order_dict: Dict[str, Any]) -> Dict[str, str]:
-    """Extract stored Wix credentials from a dispatcher order payload."""
+    """Extract Wix order credentials without treating raw API keys as OAuth."""
     order = dict(order_dict or {})
     store = _coerce_dict(order.get("store") or order.get("store_info"))
     credential_sources = [
         _coerce_dict(order.get("wix_credentials")),
         _coerce_dict(order.get("api_credentials")),
         _coerce_dict(store.get("api_credentials")),
+        _coerce_dict(order.get("wix_api_key")),
         _coerce_dict(order.get("api_key_raw")),
         _coerce_dict(order.get("api_key")),
+        _coerce_dict(store.get("wix_api_key")),
         _coerce_dict(store.get("api_key_raw")),
         _coerce_dict(store.get("api_key")),
     ]
 
-    access_token = _clean_str(
-        order.get("wix_access_token")
-        or order.get("access_token")
-        or store.get("access_token")
-        or store.get("api_key")
-    )
-    if access_token.startswith("{"):
-        access_token = ""
+    auth_mode = ""
+    api_key = _clean_str(order.get("wix_api_key") or order.get("api_key") or store.get("api_key"))
+    if api_key.startswith("{"):
+        api_key = normalize_wix_api_key(api_key)
+    access_token = ""
     site_id = _clean_str(order.get("wix_site_id") or order.get("site_id") or store.get("site_id"))
     instance_id = _clean_str(order.get("wix_instance_id") or order.get("instance_id") or store.get("instance_id"))
 
     for source in credential_sources:
-        if not access_token:
-            access_token = _clean_str(
-                source.get("access_token")
-                or source.get("wix_access_token")
+        source_mode = _explicit_auth_mode(source)
+        if source_mode and not auth_mode:
+            auth_mode = source_mode
+        if source_mode == "oauth" and not access_token:
+            access_token = _clean_str(source.get("access_token") or source.get("wix_access_token"))
+        if source_mode != "oauth" and not api_key:
+            api_key = _clean_str(
+                source.get("api_key")
+                or source.get("wix_api_key")
                 or source.get("token")
-                or source.get("api_key")
             )
         if not site_id:
             site_id = _clean_str(source.get("site_id") or source.get("wix_site_id"))
@@ -269,9 +347,14 @@ def extract_wix_order_credentials(order_dict: Dict[str, Any]) -> Dict[str, str]:
             instance_id = _clean_str(source.get("instance_id") or source.get("wix_instance_id"))
 
     if not site_id:
-        site_id = _clean_str(store.get("domain") or order.get("domain"))
+        site_id = _safe_extract_site_id(store.get("domain") or order.get("domain"), store.get("api_key"))
+
+    if not auth_mode:
+        auth_mode = "api_key" if api_key else ("oauth" if access_token else "")
 
     return {
+        "auth_mode": auth_mode,
+        "api_key": api_key,
         "access_token": access_token,
         "site_id": site_id,
         "instance_id": instance_id,
@@ -283,6 +366,50 @@ def _authorization_header(access_token: str) -> str:
     if token.lower().startswith("bearer "):
         return token
     return f"Bearer {token}"
+
+
+def _build_order_headers(credentials: Dict[str, str]) -> Dict[str, str]:
+    site_id = credentials.get("site_id") or ""
+    if credentials.get("auth_mode") == "oauth":
+        return {
+            "Authorization": _authorization_header(credentials.get("access_token") or ""),
+            "wix-site-id": site_id,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+    return build_wix_api_key_headers(credentials.get("api_key") or "", site_id)
+
+
+def _credential_missing_fields(credentials: Dict[str, str]) -> List[str]:
+    auth_mode = credentials.get("auth_mode") or "api_key"
+    missing: List[str] = []
+    if auth_mode == "oauth":
+        if not credentials.get("access_token"):
+            missing.append("access_token")
+    else:
+        if not credentials.get("api_key"):
+            missing.append("api_key")
+    if not credentials.get("site_id"):
+        missing.append("site_id")
+    return missing
+
+
+def _payload_blockers(payload: Dict[str, Any]) -> List[str]:
+    order = payload.get("order") if isinstance(payload, dict) else None
+    if not isinstance(order, dict):
+        return ["order"]
+    line_items = order.get("lineItems")
+    if not isinstance(line_items, list) or not line_items:
+        return ["lineItems"]
+    blockers: List[str] = []
+    for index, item in enumerate(line_items):
+        if not isinstance(item, dict):
+            blockers.append(f"lineItems[{index}]")
+            continue
+        catalog_ref = item.get("catalogReference")
+        if not isinstance(catalog_ref, dict) or not _clean_str(catalog_ref.get("catalogItemId")):
+            blockers.append(f"lineItems[{index}].catalogReference.catalogItemId")
+    return blockers
 
 
 def _error_result(
@@ -334,73 +461,70 @@ async def create_wix_order(
     *,
     timeout_s: float = 20.0,
 ) -> Dict[str, Any]:
-    """Create an order in Wix Stores and return the platform result shape."""
+    """Create an order in Wix eCommerce and return the platform result shape."""
     order = dict(order_dict or {})
+    if not is_wix_order_writeback_v2_enabled(order):
+        return _error_result(
+            "wix_order_writeback_not_ready",
+            raw_response={
+                "message": "Wix order writeback v2 is disabled or outside canary scope.",
+                "required_flag": WIX_ORDER_WRITEBACK_FLAG,
+                "canary_scope_env": [
+                    WIX_ORDER_WRITEBACK_CANARY_ORDER_IDS,
+                    WIX_ORDER_WRITEBACK_CANARY_MERCHANT_IDS,
+                    WIX_ORDER_WRITEBACK_CANARY_STORE_IDS,
+                ],
+            },
+            retryable=False,
+        )
+
     credentials = extract_wix_order_credentials(order)
-    access_token = credentials.get("access_token") or ""
-    site_id = credentials.get("site_id") or ""
-    # Require BOTH access_token AND site_id. Wix's API needs the
-    # site_id in the request URL/header — sending a probe with just
-    # an access_token would 4xx upstream and waste a paid attempt.
-    # Also: per the codex code review of PR #491, accepting any
-    # non-empty access_token (without checking site_id) lets legacy
-    # raw api_key blobs sneak through to upstream as bogus OAuth
-    # bearer tokens. Strict-pair validation closes that gap.
-    if not access_token or not site_id:
-        missing = []
-        if not access_token:
-            missing.append("access_token")
-        if not site_id:
-            missing.append("site_id")
+    missing = _credential_missing_fields(credentials)
+    if missing:
+        auth_mode = credentials.get("auth_mode") or "api_key"
         logger.warning(
             "[Wix] Order writeback skipped; credentials not configured "
-            "(missing=%s): merchant_id=%s order_id=%s",
+            "(auth_mode=%s missing=%s): merchant_id=%s order_id=%s",
+            auth_mode,
             ",".join(missing),
             merchant_id,
             order.get("order_id"),
         )
         return _error_result(
-            "wix_credentials_not_configured",
+            "wix_order_writeback_not_ready",
             raw_response={
                 "message": (
-                    f"Wix credentials incomplete; missing: "
-                    f"{', '.join(missing)}. Both access_token AND "
-                    f"site_id must be present to call the Wix API."
+                    "Wix order writeback credentials are incomplete; "
+                    f"missing: {', '.join(missing)}."
                 ),
                 "missing_fields": missing,
+                "auth_mode": auth_mode,
                 "expected_store_credentials": {
-                    "access_token": "stored Wix OAuth bearer token",
+                    "api_key": "stored Wix API key",
                     "site_id": "Wix site id",
-                },
-                "oauth_env": {
-                    "WIX_APP_CLIENT_ID": bool(os.getenv("WIX_APP_CLIENT_ID")),
-                    "WIX_APP_CLIENT_SECRET": bool(os.getenv("WIX_APP_CLIENT_SECRET")),
                 },
             },
             retryable=False,
         )
 
     payload = build_wix_order_payload(order)
-    if not payload.get("lineItems"):
+    blockers = _payload_blockers(payload)
+    if blockers:
         return _error_result(
             "wix_order_payload_invalid",
-            raw_response={"message": "Wix order payload requires at least one line item"},
+            raw_response={
+                "message": "Wix order payload is missing required catalog-backed line item fields",
+                "blockers": blockers,
+            },
             retryable=False,
         )
 
-    headers = {
-        "Authorization": _authorization_header(access_token),
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    site_id = credentials.get("site_id") or ""
-    if site_id:
-        headers["wix-site-id"] = site_id
+    headers = _build_order_headers(credentials)
 
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             response = await client.post(
-                WIX_STORES_CREATE_ORDER_URL,
+                WIX_ECOM_CREATE_ORDER_URL,
                 headers=headers,
                 json=payload,
             )
