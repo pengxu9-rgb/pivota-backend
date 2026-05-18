@@ -405,10 +405,10 @@ def test_handles_none_inputs() -> None:
 
 
 def test_pattern_count_matches_source() -> None:
-    # Lock in pattern count: 23 beauty (original) + 19 fashion/apparel
-    # (Phase O-5b — added so PawStyle and other apparel merchants get
-    # category_path populated, which unblocks the LLM extractor gate).
-    assert len(CATEGORY_PATTERNS) >= 42
+    # Original 23 beauty + 19 fashion/apparel (PR #551) + 6 pet-accessory/
+    # vest/base-layer/sponge/brush-pouch additions (this PR, covers the
+    # long tail of PawStyle product_types not matched by the first cut).
+    assert len(CATEGORY_PATTERNS) >= 48
 
 
 # Phase O-5b drift-detection: lock in fashion category mappings.
@@ -422,6 +422,21 @@ APPAREL_FIXTURES = [
     ("Air Jordan 1 Sneakers", "Shoes", "fashion/shoes"),
     ("Leather Crossbody Handbag", "Bag", "fashion/accessories/bag"),
     ("Pet Sweater for Small Dogs", "Sweater", "fashion/apparel/tops/sweater"),
+    # Pet-accessory + vest + base-layer + beauty-tool extension (this PR).
+    ("Comfy Dog Harness for Small to Medium Dogs",
+     "Pet Accessory", "fashion/accessories/pet"),
+    ("Tactical Dog Harness", "Pet Accessory", "fashion/accessories/pet"),
+    ("Retractable Dog Leash", "Pet Accessory", "fashion/accessories/pet"),
+    ("Cat Harness with Leash", "Pet Accessory", "fashion/accessories/pet"),
+    ("Padded Vest", "Vest", "fashion/apparel/outerwear/vest"),
+    ("Down Puffer Vest", "Vest", "fashion/apparel/outerwear/vest"),
+    ("4-Leg Onesie", "Pet Apparel", "fashion/apparel/pet"),
+    ("Pet Overalls", "Pet Apparel", "fashion/apparel/pet"),
+    ("2-Leg Base Layer", "Base Layer", "fashion/apparel/base-layer"),
+    ("Makeup Sponge/Puff", "Makeup Sponge", "beauty/tools/sponge"),
+    ("Beauty Sponge Blender", "Makeup Sponge", "beauty/tools/sponge"),
+    ("Brush Bag", "Brush Pouch", "beauty/tools/brush-accessory"),
+    ("Makeup Brush Pouch", "Brush Pouch", "beauty/tools/brush-accessory"),
 ]
 
 
