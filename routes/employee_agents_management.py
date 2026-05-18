@@ -8,6 +8,7 @@ Provides comprehensive agent monitoring and control for Employee Portal
 ⚠️ This file is kept for reference or future advanced features
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -138,71 +139,79 @@ async def get_all_agents(
         
         agents = await database.fetch_all(query, params)
         
-        # Enrich with metrics and governance
-        result = []
-        for agent_row in agents:
-            # Convert Record to dict first
+        # Enrich with metrics and governance.
+        #
+        # Previously: for each agent, run the metrics query (which contains
+        # two subqueries against agent_usage_logs — easily the slowest table
+        # in this dataset) and the policy query in series, one agent at a
+        # time. With N agents that is 2*N sequential round-trips and a
+        # leading cause of the employee dashboard freezing for the full
+        # axios 20s timeout. Build the queries once per agent then run them
+        # all concurrently, bounded by a semaphore so we don't exhaust the
+        # connection pool.
+        metrics_interval = {
+            "1d": "24 hours",
+            "7d": "7 days",
+            "30d": "30 days",
+            "90d": "90 days",
+        }.get(date_range, "7 days")
+
+        metrics_query = f"""
+            SELECT
+                COALESCE(
+                    (SELECT COUNT(*) FROM agent_usage_logs
+                     WHERE agent_id = :agent_id
+                     AND timestamp >= NOW() - INTERVAL '{metrics_interval}'),
+                    0
+                ) as requests_24h,
+                COUNT(*) as orders_24h,
+                COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END) as successful_24h,
+                COUNT(CASE WHEN payment_status IN ('failed', 'cancelled', 'error') THEN 1 END) as failed_24h,
+                CASE
+                    WHEN COUNT(*) > 0 THEN
+                        (COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
+                    ELSE 100
+                END as success_rate_24h,
+                COALESCE(AVG(
+                    (SELECT AVG(response_time_ms) FROM agent_usage_logs
+                     WHERE agent_id = :agent_id
+                     AND timestamp >= NOW() - INTERVAL '{metrics_interval}')
+                ), 0) as avg_latency_24h,
+                COALESCE(SUM(total), 0) as gmv_24h
+            FROM orders
+            WHERE agent_id = :agent_id
+                AND created_at >= NOW() - INTERVAL '{metrics_interval}'
+        """
+
+        policy_query = """
+            SELECT max_error_rate, max_requests_per_minute, status
+            FROM agent_policies
+            WHERE agent_id = :agent_id
+        """
+
+        default_metrics = {
+            "requests_24h": 0,
+            "successful_24h": 0,
+            "failed_24h": 0,
+            "success_rate_24h": 0,
+            "avg_latency_24h": 0,
+            "orders_24h": 0,
+            "gmv_24h": 0,
+        }
+
+        sem = asyncio.Semaphore(8)
+
+        async def _enrich(agent_row):
             agent = dict(agent_row)
-            # Determine time interval based on date_range
-            time_interval = {
-                "1d": "24 hours",
-                "7d": "7 days",
-                "30d": "30 days",
-                "90d": "90 days"
-            }.get(date_range, "7 days")
-            
-            # Get metrics: requests from usage_logs, orders/GMV from orders table
-            metrics_query = f"""
-                SELECT 
-                    COALESCE(
-                        (SELECT COUNT(*) FROM agent_usage_logs 
-                         WHERE agent_id = :agent_id 
-                         AND timestamp >= NOW() - INTERVAL '{time_interval}'), 
-                        0
-                    ) as requests_24h,
-                    COUNT(*) as orders_24h,
-                    COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END) as successful_24h,
-                    COUNT(CASE WHEN payment_status IN ('failed', 'cancelled', 'error') THEN 1 END) as failed_24h,
-                    CASE 
-                        WHEN COUNT(*) > 0 THEN 
-                            (COUNT(CASE WHEN payment_status IN ('paid', 'completed', 'succeeded') THEN 1 END)::FLOAT / COUNT(*)::FLOAT * 100)
-                        ELSE 100 
-                    END as success_rate_24h,
-                    COALESCE(AVG(
-                        (SELECT AVG(response_time_ms) FROM agent_usage_logs 
-                         WHERE agent_id = :agent_id 
-                         AND timestamp >= NOW() - INTERVAL '{time_interval}')
-                    ), 0) as avg_latency_24h,
-                    COALESCE(SUM(total), 0) as gmv_24h
-                FROM orders
-                WHERE agent_id = :agent_id
-                    AND created_at >= NOW() - INTERVAL '{time_interval}'
-            """
-            
-            metrics_row = await database.fetch_one(metrics_query, {"agent_id": agent["agent_id"]})
-            
-            # If no metrics, provide default values
+            async with sem:
+                metrics_row, policy_row = await asyncio.gather(
+                    database.fetch_one(metrics_query, {"agent_id": agent["agent_id"]}),
+                    database.fetch_one(policy_query, {"agent_id": agent["agent_id"]}),
+                )
             if not metrics_row:
-                metrics_row = {
-                    "requests_24h": 0,
-                    "successful_24h": 0,
-                    "failed_24h": 0,
-                    "success_rate_24h": 0,
-                    "avg_latency_24h": 0,
-                    "orders_24h": 0,
-                    "gmv_24h": 0
-                }
-            
-            # Get governance policy
-            policy_query = """
-                SELECT max_error_rate, max_requests_per_minute, status
-                FROM agent_policies
-                WHERE agent_id = :agent_id
-            """
-            policy_row = await database.fetch_one(policy_query, {"agent_id": agent["agent_id"]})
-            
-            # Build response with REAL data from orders table
-            result.append({
+                metrics_row = default_metrics
+
+            return {
                 "agent_id": agent["agent_id"],
                 "name": agent["name"],
                 "email": agent["email"],
@@ -214,13 +223,11 @@ async def get_all_agents(
                 "created_at": agent["created_at"].isoformat() if agent["created_at"] else None,
                 "last_active": agent["last_active"].isoformat() if agent["last_active"] else None,
                 "merchant_count": agent["merchant_count"],
-                
-                # Add total stats from orders table
+
                 "total_orders": agent["total_orders"],
                 "total_gmv": float(agent["total_gmv"]),
-                "total_requests": agent["request_count"],  # For compatibility
-                
-                # Reserved: metrics field (always present)
+                "total_requests": agent["request_count"],
+
                 "metrics": {
                     "requests_24h": metrics_row["requests_24h"] if metrics_row else 0,
                     "successful_24h": metrics_row["successful_24h"] if metrics_row else 0,
@@ -228,17 +235,18 @@ async def get_all_agents(
                     "success_rate": float(metrics_row.get("success_rate_24h", 0)) if metrics_row else 0.0,
                     "avg_latency_ms": int(metrics_row.get("avg_latency_24h", 0)) if metrics_row else 0,
                     "total_gmv": float(metrics_row.get("gmv_24h", 0)) if metrics_row else 0.0,
-                    "total_orders": metrics_row.get("orders_24h", 0) if metrics_row else 0
+                    "total_orders": metrics_row.get("orders_24h", 0) if metrics_row else 0,
                 },
-                
-                # Reserved: governance field (always present)
+
                 "governance": {
                     "max_error_rate": float(policy_row["max_error_rate"]) if policy_row else 0.1,
                     "max_requests_per_minute": policy_row["max_requests_per_minute"] if policy_row else 100,
                     "policy_status": policy_row["status"] if policy_row else "active",
-                    "last_violation": None  # TODO: track violations
-                }
-            })
+                    "last_violation": None,
+                },
+            }
+
+        result = list(await asyncio.gather(*(_enrich(a) for a in agents)))
         
         return {
             "status": "success",
