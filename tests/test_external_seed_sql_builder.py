@@ -118,6 +118,35 @@ async def test_fetch_external_seed_rows_can_disable_required_terms_filter() -> N
 
 
 @pytest.mark.asyncio
+async def test_fetch_external_seed_rows_drops_rank_values_when_scope_disables_rank() -> None:
+    """rank_enabled=False scopes (e.g. semantic_expansion) replace the rank
+    expression with a constant '0' in the SQL. The corresponding prefer_N
+    values must NOT be passed to the database, or SQLAlchemy will raise
+    'text() construct doesn't define a bound parameter named prefer_0'.
+    """
+    from services.external_seed_search import fetch_external_seed_rows
+
+    db = _FakeDatabase()
+    await fetch_external_seed_rows(
+        database=db,
+        market="US",
+        query="niacinamide serum",
+        limit=24,
+        offset=0,
+        include_seed_data_text_match=True,
+        prefer_terms=["niacinamide", "serum"],
+        scope="semantic_expansion",
+        query_timeout_seconds=0.5,
+    )
+
+    assert "prefer_0" not in db.last_query
+    assert "0 AS brand_term_hit" in db.last_query
+    placeholders = set(re.findall(r":([a-zA-Z_][a-zA-Z0-9_]*)", db.last_query))
+    extra = sorted(name for name in db.last_values if name not in placeholders)
+    assert not extra, f"values dict contains keys not bound in SQL: {extra}"
+
+
+@pytest.mark.asyncio
 async def test_fetch_external_seed_rows_can_enable_required_terms_filter_and_skip_count() -> None:
     from services.external_seed_search import fetch_external_seed_rows
 

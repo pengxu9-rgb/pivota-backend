@@ -306,7 +306,9 @@ async def fetch_external_seed_rows(
     scope_token = str(scope or "default").strip().lower() or "default"
     rank_enabled = scope_token in {"brand_strict", "brand_broad", "brand", "default"}
     rank_expr = rank_sql if rank_enabled else "0"
-    query_values: Dict[str, Any] = {**values, **rank_values}
+    query_values: Dict[str, Any] = {**values}
+    if rank_enabled:
+        query_values.update(rank_values)
 
     query_sql = f"""
                 SELECT
