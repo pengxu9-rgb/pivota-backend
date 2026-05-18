@@ -118,6 +118,21 @@ catalog_products = Table(
     # catalog_merchants.last_full_sync_at by GRACE_HOURS. Recall layer
     # filters on sync_status='live'.
     Column("sync_status", String(16), nullable=False, server_default="live"),
+    # Phase O-5b — structured fashion fields (mig 094). The catalog
+    # sync path (services/catalog_sync_service.ingest_standard_products)
+    # writes these from Shopify metafields via
+    # services/fashion_field_payload_extractor.py. Without these column
+    # declarations, the SQLAlchemy UPDATE fails with "Unconsumed
+    # column names" — surfaced via the 2026-05-18 E2E validation run.
+    Column("material", Text, nullable=True),
+    Column("material_source", String(32), nullable=True),
+    Column("material_confidence", Float, nullable=True),
+    Column("care", Text, nullable=True),
+    Column("care_source", String(32), nullable=True),
+    Column("care_confidence", Float, nullable=True),
+    Column("size_guide", JSONB_TYPE, nullable=True),
+    Column("size_guide_source", String(32), nullable=True),
+    Column("size_guide_confidence", Float, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index(
