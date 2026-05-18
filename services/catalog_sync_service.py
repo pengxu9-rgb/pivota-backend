@@ -44,7 +44,10 @@ from services.fashion_field_payload_extractor import (
     extract_material_from_payload,
     extract_size_guide_from_payload,
 )
-from services.pdp_category_classifier import fold_category_from_variants
+from services.pdp_category_classifier import (
+    fold_category_from_variants,
+    fold_category_with_llm_fallback,
+)
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
@@ -663,16 +666,18 @@ async def ingest_standard_products(
                 tags=_tags_for_ingest,
             )
             # Phase O-5 (variant-canonical fold-up): classify category_path
-            # inline at sync time using product-level fields first, then
-            # falling back to variant-level fields. Previously this column
-            # was left null at sync and only populated later by
-            # scripts/backfill_pdp_category_path.py, so freshly-synced
-            # products were invisible to category-anchored search until the
-            # next backfill run. See plans/let-s-build-a-full-breezy-taco.md.
-            _category_fold = fold_category_from_variants(
+            # inline at sync time. Regex first (fast, free, deterministic);
+            # LLM fallback for the long-tail when regex misses AND
+            # LLM_CATEGORY_CLASSIFIER_ENABLED=true. Source on the LLM
+            # path is 'llm_category_v1' with a per-product_type cache
+            # so a merchant's catalog of 600 "Dog Harness" rows triggers
+            # one LLM call. See plans/let-s-build-a-full-breezy-taco.md.
+            _category_fold = await fold_category_with_llm_fallback(
+                merchant_id=merchant_id,
                 category=product.product_type,
                 product_type=product.product_type,
                 title=product.title,
+                description=_description_for_ingest,
                 variants=product.variants,
             )
             if _category_fold is not None:
