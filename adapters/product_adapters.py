@@ -6,8 +6,10 @@ Pivota 的核心价值层
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+import asyncio
 import httpx
 import logging
+import os
 import time
 import re
 from urllib.parse import urlparse, parse_qs
@@ -151,8 +153,64 @@ def _split_tags(raw: Any) -> List[str]:
     return tags
 
 
+def _shopify_metafield_ingest_enabled() -> bool:
+    """Phase O-5b #4: feature flag for per-product metafield fetch.
+    Default OFF — flip SHOPIFY_METAFIELD_INGEST_ENABLED=true on the
+    environment to enable. Adds N HTTP calls per sync page.
+    """
+    return os.getenv("SHOPIFY_METAFIELD_INGEST_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 class ShopifyProductAdapter:
     """Shopify 产品适配器：Shopify API → StandardProduct"""
+
+    @staticmethod
+    async def _fetch_metafields_for_products(
+        *,
+        client: httpx.AsyncClient,
+        shop_domain: str,
+        headers: Dict[str, str],
+        products: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Bulk-fetch metafields for a product list using parallel
+        per-product /metafields.json calls. Returns {str(product_id):
+        [metafield_dict, ...]}. Failures per-product log + return [] for
+        that product (one bad product shouldn't kill the whole sync).
+
+        Future-optimization: a single GraphQL bulk query with
+        `metafields(identifiers: [...])` would replace this with one
+        request. Until then, asyncio.gather keeps wall-clock latency
+        bounded by Shopify's per-call response time, not N×serial.
+        """
+        product_ids = [str(p.get("id")) for p in products if p.get("id")]
+        if not product_ids:
+            return {}
+
+        async def _fetch_one(pid: str) -> Tuple[str, List[Dict[str, Any]]]:
+            url = f"https://{shop_domain}/admin/api/2024-07/products/{pid}/metafields.json"
+            try:
+                resp = await client.get(url, headers=headers)
+            except Exception as exc:
+                logger.warning("shopify_metafields.transport_fail pid=%s err=%s", pid, exc)
+                return pid, []
+            if resp.status_code != 200:
+                logger.warning(
+                    "shopify_metafields.http_%d pid=%s body=%s",
+                    resp.status_code, pid, resp.text[:200],
+                )
+                return pid, []
+            try:
+                payload = resp.json() or {}
+                mfs = payload.get("metafields", [])
+                return pid, [m for m in mfs if isinstance(m, dict)]
+            except Exception as exc:
+                logger.warning("shopify_metafields.parse_fail pid=%s err=%s", pid, exc)
+                return pid, []
+
+        results = await asyncio.gather(*[_fetch_one(pid) for pid in product_ids])
+        return dict(results)
 
     @staticmethod
     async def fetch_shop_currency(
@@ -305,10 +363,31 @@ class ShopifyProductAdapter:
                 f"📊 ShopifyAdapter response status={response.status_code} "
                 f"products_len={len(shopify_products)} keys={list(data.keys())}"
             )
-            
+
+            # Optional metafield ingest (Phase O-5b #4). Default OFF; flip
+            # SHOPIFY_METAFIELD_INGEST_ENABLED=true to fetch per-product
+            # metafields in parallel after the product list. Adds N HTTP
+            # calls per sync page (1 per product); Shopify rate limits at
+            # 40 req/s on REST so a 250-product page = ~6s worst case.
+            # See _fetch_metafields_for_products for the bulk fetch impl.
+            metafields_by_product_id: Dict[str, List[Dict[str, Any]]] = {}
+            if _shopify_metafield_ingest_enabled() and shopify_products:
+                async with httpx.AsyncClient(timeout=30.0) as mf_client:
+                    metafields_by_product_id = await ShopifyProductAdapter._fetch_metafields_for_products(
+                        client=mf_client,
+                        shop_domain=shop_domain,
+                        headers=headers,
+                        products=shopify_products,
+                    )
+
             # 转换为标准格式
             standard_products = [
-                ShopifyProductAdapter.convert_to_standard(sp, merchant_id, currency=(shop_currency or "USD"))
+                ShopifyProductAdapter.convert_to_standard(
+                    sp,
+                    merchant_id,
+                    currency=(shop_currency or "USD"),
+                    metafields=metafields_by_product_id.get(str(sp.get("id")), []),
+                )
                 for sp in shopify_products
             ]
             
@@ -336,9 +415,20 @@ class ShopifyProductAdapter:
             return [], None, error_msg
     
     @staticmethod
-    def convert_to_standard(shopify_product: Dict[str, Any], merchant_id: str, currency: str = "USD") -> StandardProduct:
+    def convert_to_standard(
+        shopify_product: Dict[str, Any],
+        merchant_id: str,
+        currency: str = "USD",
+        metafields: Optional[List[Dict[str, Any]]] = None,
+    ) -> StandardProduct:
         """
         核心转换逻辑：Shopify Product → StandardProduct
+
+        metafields (optional): list of Shopify metafield dicts in the
+        {namespace, key, value, type} shape returned by
+        /products/{id}/metafields.json. Attached to platform_metadata
+        under the "metafields" key so the consumer in
+        services/fashion_field_payload_extractor.py can read them.
         """
         sp = shopify_product
         
@@ -514,15 +604,21 @@ class ShopifyProductAdapter:
                 "handle": sp.get("handle"),
                 "product_type": sp.get("product_type"),
                 "template_suffix": sp.get("template_suffix"),
+                # Phase O-5b #4: Shopify metafields surface here so
+                # services/fashion_field_payload_extractor.py can read
+                # material/care/size_guide from authoritative merchant
+                # input. Empty list when the metafield ingest flag is
+                # off OR the product has no metafields.
+                "metafields": list(metafields or []),
             }
         )
-        
+
         # Run orderable validation
         from models.standard_product import validate_orderable
         orderable, validation = validate_orderable(product)
         product.orderable = orderable
         product.orderable_validation = validation
-        
+
         return product
 
 
