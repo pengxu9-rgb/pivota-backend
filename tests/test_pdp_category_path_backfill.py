@@ -405,10 +405,47 @@ def test_handles_none_inputs() -> None:
 
 
 def test_pattern_count_matches_source() -> None:
-    # Lock in that we have 24 patterns ported from
-    # PIVOTA-Agent BEAUTY_CATEGORY_PATTERNS (drift detection if upstream
-    # adds/removes a pattern).
-    assert len(CATEGORY_PATTERNS) >= 23  # at least the 23 unique categories
+    # Lock in pattern count: 23 beauty (original) + 19 fashion/apparel
+    # (Phase O-5b — added so PawStyle and other apparel merchants get
+    # category_path populated, which unblocks the LLM extractor gate).
+    assert len(CATEGORY_PATTERNS) >= 42
+
+
+# Phase O-5b drift-detection: lock in fashion category mappings.
+APPAREL_FIXTURES = [
+    ("Warm Fall/Winter Color-Block Sleeveless Knitted Sweater for Dogs & Cats",
+     "Sweater", "fashion/apparel/tops/sweater"),
+    ("Push-Up Lingerie Set", "Lingerie", "fashion/apparel/intimates/lingerie"),
+    ("Linen Summer Dress", "Dress", "fashion/apparel/dresses"),
+    ("Slim Fit Skinny Jeans", "Jeans", "fashion/apparel/bottoms/jeans"),
+    ("Wool Trench Coat", "Coat", "fashion/apparel/outerwear/coat"),
+    ("Air Jordan 1 Sneakers", "Shoes", "fashion/shoes"),
+    ("Leather Crossbody Handbag", "Bag", "fashion/accessories/bag"),
+    ("Pet Sweater for Small Dogs", "Sweater", "fashion/apparel/tops/sweater"),
+]
+
+
+@pytest.mark.parametrize("title,expected_label,expected_path", APPAREL_FIXTURES)
+def test_apparel_fixtures_classify_to_fashion(title: str, expected_label: str, expected_path: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == expected_label
+    assert hit[1] == expected_path
+
+
+def test_beauty_classifications_unchanged_by_fashion_additions() -> None:
+    # Sanity check: beauty titles still match original beauty paths.
+    cases = [
+        ("MAC Ruby Woo Matte Lipstick", "Lipstick", "beauty/makeup/lip/lipstick"),
+        ("CeraVe Moisturizing Cream", "Moisturizer", "beauty/skincare/moisturize/cream"),
+        ("Maybelline Lash Sensational Mascara", "Mascara", "beauty/makeup/eye/mascara"),
+        ("La Roche-Posay Anthelios SPF 60", "Sunscreen", "beauty/skincare/sun/sunscreen"),
+    ]
+    for title, label, path in cases:
+        hit = classify(title)
+        assert hit is not None, f"beauty regression: no classification for {title!r}"
+        assert hit[0] == label
+        assert hit[1] == path
 
 
 # ---------- fold_category_from_variants (Phase O-5) ----------

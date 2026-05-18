@@ -130,6 +130,83 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Body Care", "beauty/body/care", re.compile(
         r"\b(body milk|body relief|body essentials|body care|hand care|loofah)\b",
         re.IGNORECASE)),
+    # ----- Phase O-5b: fashion / apparel patterns -----
+    # Order: more specific (sweater, hoodie, dress) above the broad "apparel".
+    # Pet apparel is included intentionally — PawStyle (merch_efbc46b4619cfbdf)
+    # is a real fashion merchant whose entire catalog is dog/cat clothing,
+    # and the LLM extractor's category gate filters on category_path
+    # starting with 'fashion/' or 'apparel/'.
+    ("Sweater", "fashion/apparel/tops/sweater", re.compile(
+        r"\b(sweater|knit(?:ted)?\s+sweater|knit\s+top|cardigan|pullover|jumper)\b",
+        re.IGNORECASE)),
+    ("Hoodie", "fashion/apparel/tops/hoodie", re.compile(
+        r"\b(hoodie|sweatshirt|zip[-\s]?up|pullover\s+hoodie)\b",
+        re.IGNORECASE)),
+    ("T-Shirt", "fashion/apparel/tops/tshirt", re.compile(
+        r"\b(t[-\s]?shirt|tee\b|tank\s+top|long[-\s]?sleeve\s+tee|graphic\s+tee)\b",
+        re.IGNORECASE)),
+    ("Shirt", "fashion/apparel/tops/shirt", re.compile(
+        r"\b(button[-\s]?up|button[-\s]?down|dress\s+shirt|blouse|polo\s+shirt)\b",
+        re.IGNORECASE)),
+    ("Dress", "fashion/apparel/dresses", re.compile(
+        r"\b(dress|gown|sundress|maxi\s+dress|midi\s+dress|cocktail\s+dress)\b",
+        re.IGNORECASE)),
+    ("Skirt", "fashion/apparel/bottoms/skirt", re.compile(
+        r"\b(skirt|mini\s+skirt|midi\s+skirt|maxi\s+skirt|pencil\s+skirt)\b",
+        re.IGNORECASE)),
+    ("Pants", "fashion/apparel/bottoms/pants", re.compile(
+        r"\b(pants|trousers|chinos|slacks|jogger\s+pants|cargo\s+pants|leggings)\b",
+        re.IGNORECASE)),
+    ("Jeans", "fashion/apparel/bottoms/jeans", re.compile(
+        r"\b(jeans|denim|skinny\s+jeans|straight\s+leg|boot[-\s]?cut)\b",
+        re.IGNORECASE)),
+    ("Shorts", "fashion/apparel/bottoms/shorts", re.compile(
+        r"\b(shorts|bermuda\s+shorts|denim\s+shorts|athletic\s+shorts)\b",
+        re.IGNORECASE)),
+    ("Coat", "fashion/apparel/outerwear/coat", re.compile(
+        r"\b(coat|overcoat|trench\s+coat|peacoat|parka)\b",
+        re.IGNORECASE)),
+    ("Jacket", "fashion/apparel/outerwear/jacket", re.compile(
+        r"\b(jacket|blazer|bomber|denim\s+jacket|windbreaker|puffer)\b",
+        re.IGNORECASE)),
+    ("Lingerie", "fashion/apparel/intimates/lingerie", re.compile(
+        r"\b(lingerie|bra\b|panty|panties|underwear|brief|boy[-\s]?short|push[-\s]?up)\b",
+        re.IGNORECASE)),
+    ("Swimwear", "fashion/apparel/swimwear", re.compile(
+        r"\b(swimwear|swimsuit|bikini|one[-\s]?piece\s+swim|board\s+shorts|trunks)\b",
+        re.IGNORECASE)),
+    ("Activewear", "fashion/apparel/activewear", re.compile(
+        r"\b(activewear|sportswear|yoga\s+pants|workout\s+(?:top|tee|set))\b",
+        re.IGNORECASE)),
+    ("Sleepwear", "fashion/apparel/sleepwear", re.compile(
+        r"\b(sleepwear|pajamas|pyjamas|nightgown|robe\b|loungewear)\b",
+        re.IGNORECASE)),
+    ("Shoes", "fashion/shoes", re.compile(
+        r"\b(shoes\b|sneakers|loafers|heels|boots|sandals|flats\b|oxfords|mules)\b",
+        re.IGNORECASE)),
+    ("Bag", "fashion/accessories/bag", re.compile(
+        r"\b(handbag|tote\b|backpack|crossbody|clutch|satchel|messenger\s+bag)\b",
+        re.IGNORECASE)),
+    ("Jewelry", "fashion/accessories/jewelry", re.compile(
+        r"\b(jewelry|necklace|earring|bracelet|ring\b|pendant|brooch)\b",
+        re.IGNORECASE)),
+    ("Hat", "fashion/accessories/hat", re.compile(
+        r"\b(hat|cap\b|beanie|fedora|baseball\s+cap|bucket\s+hat)\b",
+        re.IGNORECASE)),
+    ("Scarf", "fashion/accessories/scarf", re.compile(
+        r"\b(scarf|shawl|wrap\b|stole\b)\b",
+        re.IGNORECASE)),
+    # Pet apparel — narrower-but-still-clothing for products explicitly
+    # framed as pet wear (PawStyle catalog). Sits AFTER human apparel
+    # patterns so a "dog sweater" matches Sweater first (the path tree
+    # uses fashion/apparel/* either way, so category_kind=fashion).
+    ("Pet Apparel", "fashion/apparel/pet", re.compile(
+        r"\b(pet\s+(?:apparel|wear|clothing|sweater|coat|jacket)|dog\s+(?:sweater|jacket|coat|hoodie)|cat\s+sweater)\b",
+        re.IGNORECASE)),
+    # Generic apparel/clothing fallback — last so specific patterns win.
+    ("Apparel", "fashion/apparel/general", re.compile(
+        r"\b(apparel|clothing|garment|womenswear|menswear|kidswear)\b",
+        re.IGNORECASE)),
     ("Gift Set", "beauty/sets/gift-set", re.compile(
         r"\b(skincare set|skin care set|gift set|holiday edition|routine|bundle|"
         r"essentials set|essentials|care set|duo|kit|collection|set)\b",
