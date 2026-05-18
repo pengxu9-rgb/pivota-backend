@@ -213,9 +213,20 @@ async def run_fashion_backfill(
             total += 1
             after_key = str(row.get("product_key") or "")
             haystack = _description_haystack(row)
-            material = extract_material(description=haystack)
-            care = extract_care(description=haystack)
-            size_guide = extract_size_guide(description=haystack)
+            # Phase O-5b v2: extractors are async + category-gated. They
+            # short-circuit immediately for non-fashion rows, so iterating
+            # the whole catalog stays cheap even at the global scope.
+            row_title = row.get("title")
+            row_category_path = row.get("category_path")
+            material = await extract_material(
+                title=row_title, description=haystack, category_path=row_category_path,
+            )
+            care = await extract_care(
+                title=row_title, description=haystack, category_path=row_category_path,
+            )
+            size_guide = await extract_size_guide(
+                title=row_title, description=haystack, category_path=row_category_path,
+            )
             any_hit = bool(material.value or care.value or size_guide.value)
             if any_hit:
                 if material.value:
