@@ -80,23 +80,25 @@ def test_haystack_handles_all_null_inputs_gracefully():
 
 # ---------- end-to-end: extractors on a synthetic Shopify-style row ----------
 
-def test_extractors_against_realistic_row_via_haystack():
+def test_extractors_are_noops_during_deprecation_window():
+    # Phase O-5b: the regex extractor was neutered after a 2026-05-18 dry-run
+    # revealed false positives on beauty catalog descriptions. The script
+    # still loops over every row + calls the extractors, but receives
+    # empty results — so an accidental --apply is harmless. When the LLM
+    # extractor v2 lands, swap this assertion for category-gated mock
+    # extraction tests.
     row = {
         "title": "Linen Summer Dress",
         "description": (
             "A breezy linen dress.\n"
             "Material: 100% European linen.\n"
             "Care: Machine wash cold; hang dry.\n"
-            "Size guide: see chart below for measurements per size.\n"
         ),
     }
     haystack = _description_haystack(row)
-    material = extract_material(description=haystack)
-    care = extract_care(description=haystack)
-    size_guide = extract_size_guide(description=haystack)
-    assert material.value is not None and "linen" in material.value.lower()
-    assert care.value is not None and "machine wash" in care.value.lower()
-    assert size_guide.value is not None
+    assert extract_material(description=haystack).value is None
+    assert extract_care(description=haystack).value is None
+    assert extract_size_guide(description=haystack).value is None
 
 
 # ---------- _apply_update behavior (SQL string + params) ----------

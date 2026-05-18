@@ -1,27 +1,40 @@
-"""Fashion field extractor for catalog_products.
+"""Fashion field extractor — DEPRECATED regex v1 stage.
 
-Phase O-5b: heuristic (regex-based) extractor for `material`, `care`, and
-`size_guide` from a product's title + description text. Substring-validated
-so the extracted value is provably grounded in the source text (no
-hallucinated specs even when a future LLM-backed extractor is wired in).
+Historical context:
+  - Shipped 2026-05-17 in PR #540 as a regex-based v1: matched common
+    Shopify text patterns ("Material: 100% cotton", "Care: hand wash", etc.)
+    with substring-grounded validation.
+  - 2026-05-18 dry-run against prod (1000 rows, mostly beauty catalog)
+    revealed quality problems: 1 material hit + 9 care hits, but every
+    care hit was a false positive ("Skin care: 1 Rêve de Miel Honey Lip
+    Balm" captured "1 Rêve de Miel Honey Lip Balm" as the care value).
+    Length-based confidence (0.75) didn't reflect quality — the trust
+    gate would have let these through.
 
-Extraction-engine versions written to `*_source` columns:
-  - regex_extraction_v1 → this file (cheap, deterministic, free)
-  - llm_extraction_v1   → reserved for a future provider-backed extractor
-                          (see services/llm_providers/orchestrator.py for the
-                          dispatch pattern when we get there)
+Decision: the regex extractor was a transitional placeholder. Replacing
+with a category-gated LLM extractor (services/llm_providers/orchestrator.py
+route) is the durable v2. To prevent any accidental backfill --apply
+from poisoning catalog rows in the interim, these functions are now
+no-ops that always return value=None.
 
-Per-field provenance + confidence schema is documented in
-db/migrations/094_catalog_fashion_fields.sql.
+Backwards compatibility: scripts/backfill_fashion_fields.py and any other
+callers continue to import + invoke these functions; they just receive
+empty results until the LLM extractor lands.
+
+Substring grounding invariant: the validator pattern survives the v2
+swap — extracted values must appear verbatim in the source text. The
+LLM extractor will reuse the same _validate_substring check.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Optional
 
 
+# Source enum values. Kept stable across v1 (regex, now no-op) and v2 (LLM)
+# so downstream consumers (gateway trust gate in pdpBuilder.pickFashionMeta)
+# don't need to know which extractor produced a value.
 EXTRACTION_SOURCE_REGEX = "regex_extraction_v1"
 EXTRACTION_SOURCE_LLM = "llm_extraction_v1"
 
@@ -30,10 +43,11 @@ EXTRACTION_SOURCE_LLM = "llm_extraction_v1"
 class ExtractionResult:
     """One extracted field with provenance.
 
-    value: extracted string (or None if the source didn't carry the field)
-    confidence: 0.0-1.0; downstream code should drop low-confidence values
-                from merchant-facing prose (default gate >= 0.6 — see
-                ~/.claude/plans/let-s-build-a-full-breezy-taco.md)
+    value: extracted string (None until v2 LLM extractor ships)
+    confidence: 0.0-1.0; the merchant-facing gate is 0.6 in pivota-agent's
+                pdpBuilder.pickFashionMeta. v2 will compute this from
+                model self-report × substring-match × category-match;
+                today (no-op) confidence is always 0.0.
     source: provenance enum (EXTRACTION_SOURCE_REGEX / EXTRACTION_SOURCE_LLM)
     """
     value: Optional[str]
@@ -41,95 +55,7 @@ class ExtractionResult:
     source: str
 
 
-# Heuristic patterns. Each entry: (label_regex, content_capture_regex, base_confidence).
-# label_regex MUST match the line preamble (e.g. "Material:", "Material -")
-# content_capture_regex extracts the value that follows on the same line.
-
-_MATERIAL_PATTERNS = [
-    # "Material: 100% cotton"  or  "Material - 100% cotton"
-    re.compile(
-        r"(?i)\bmaterial[s]?\s*[:\-–]\s*(?P<value>[^\n\r\.;|<]{3,200})",
-    ),
-    # "Fabric: ..."
-    re.compile(
-        r"(?i)\bfabric\s*[:\-–]\s*(?P<value>[^\n\r\.;|<]{3,200})",
-    ),
-    # "Composition: ..."
-    re.compile(
-        r"(?i)\bcomposition\s*[:\-–]\s*(?P<value>[^\n\r\.;|<]{3,200})",
-    ),
-    # "Made of: ..."
-    re.compile(
-        r"(?i)\bmade\s+of\s*[:\-–]\s*(?P<value>[^\n\r\.;|<]{3,200})",
-    ),
-]
-
-_CARE_PATTERNS = [
-    re.compile(
-        r"(?i)\bcare(?:\s+instructions?)?\s*[:\-–]\s*(?P<value>[^\n\r|<]{3,250})",
-    ),
-    re.compile(
-        r"(?i)\bwashing?\s+instructions?\s*[:\-–]\s*(?P<value>[^\n\r|<]{3,250})",
-    ),
-    re.compile(
-        r"(?i)\bhow\s+to\s+care\s*[:\-–]\s*(?P<value>[^\n\r|<]{3,250})",
-    ),
-]
-
-# Size guide: matches a header line like "Size guide:" / "Size chart:" /
-# "Sizing:" and we capture the following block until a blank line or
-# section break. The extractor only flags it; structured table parsing
-# is intentionally deferred (regex on free-form HTML is brittle — the
-# real win is to know a size guide EXISTS so the LLM upgrade path knows
-# where to look).
-_SIZE_GUIDE_HEADER = re.compile(
-    r"(?i)\b(?:size\s+(?:guide|chart)|sizing|measurements?)\s*[:\-–]\s*(?P<value>[^\n\r]{3,500})",
-)
-
-
-def _validate_substring(value: Optional[str], source_text: str) -> bool:
-    """Confidence gate: the extracted value MUST appear verbatim in the source text.
-    Defends against future LLM extractors hallucinating specs."""
-    if not value or not source_text:
-        return False
-    return value.strip().lower() in source_text.lower()
-
-
-def _confidence_for_regex_hit(value: str) -> float:
-    """Regex extractor base confidence is 0.7 on a clean short match.
-    Longer captures (more likely to overshoot the actual value) get
-    downgraded; very short ones (< 5 chars) too."""
-    n = len(value.strip())
-    if n < 5 or n > 180:
-        return 0.55
-    if n > 100:
-        return 0.65
-    return 0.75
-
-
-def _extract_with_patterns(
-    *, patterns, title: Optional[str], description: Optional[str], html_blob: Optional[str],
-) -> ExtractionResult:
-    haystack = "\n".join(filter(None, [title or "", description or "", html_blob or ""]))
-    for pattern in patterns:
-        match = pattern.search(haystack)
-        if not match:
-            continue
-        raw = (match.group("value") or "").strip(" \t-–•|")
-        if not raw:
-            continue
-        if not _validate_substring(raw, haystack):
-            # Substring check is mostly a guard for LLM extractors. For
-            # regex hits this is essentially always true since we captured
-            # FROM the haystack. Kept here so the validator path stays
-            # symmetric across extractor versions.
-            continue
-        return ExtractionResult(
-            value=raw,
-            confidence=_confidence_for_regex_hit(raw),
-            source=EXTRACTION_SOURCE_REGEX,
-        )
-    return ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_REGEX)
+_DEPRECATED_NOOP = ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_REGEX)
 
 
 def extract_material(
@@ -138,11 +64,9 @@ def extract_material(
     description: Optional[str] = None,
     html_blob: Optional[str] = None,
 ) -> ExtractionResult:
-    """Extract material composition. Returns value=None when no pattern matches."""
-    return _extract_with_patterns(
-        patterns=_MATERIAL_PATTERNS,
-        title=title, description=description, html_blob=html_blob,
-    )
+    """No-op until the LLM extractor v2 lands. See module docstring for why."""
+    del title, description, html_blob  # acknowledged unused
+    return _DEPRECATED_NOOP
 
 
 def extract_care(
@@ -151,11 +75,9 @@ def extract_care(
     description: Optional[str] = None,
     html_blob: Optional[str] = None,
 ) -> ExtractionResult:
-    """Extract care instructions. Returns value=None when no pattern matches."""
-    return _extract_with_patterns(
-        patterns=_CARE_PATTERNS,
-        title=title, description=description, html_blob=html_blob,
-    )
+    """No-op until the LLM extractor v2 lands. See module docstring for why."""
+    del title, description, html_blob
+    return _DEPRECATED_NOOP
 
 
 def extract_size_guide(
@@ -164,22 +86,6 @@ def extract_size_guide(
     description: Optional[str] = None,
     html_blob: Optional[str] = None,
 ) -> ExtractionResult:
-    """Flag presence of a size guide and capture the header line.
-
-    Returns the captured header line as the value. Structured table parsing
-    is deferred to the LLM extractor follow-up — for now we just signal
-    that a size guide is present so the agent can render the description
-    rather than a "size info not available" empty state.
-    """
-    haystack = "\n".join(filter(None, [title or "", description or "", html_blob or ""]))
-    match = _SIZE_GUIDE_HEADER.search(haystack)
-    if not match:
-        return ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_REGEX)
-    raw = (match.group("value") or "").strip(" \t-–•|")
-    if not raw or not _validate_substring(raw, haystack):
-        return ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_REGEX)
-    return ExtractionResult(
-        value=raw,
-        confidence=_confidence_for_regex_hit(raw),
-        source=EXTRACTION_SOURCE_REGEX,
-    )
+    """No-op until the LLM extractor v2 lands. See module docstring for why."""
+    del title, description, html_blob
+    return _DEPRECATED_NOOP
