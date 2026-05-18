@@ -102,6 +102,13 @@ async def test_create_wix_order_posts_payload_and_returns_order_id(monkeypatch):
     order = captured["json"]["order"]
     assert order["lineItems"][0]["name"] == "Wix Test Product"
     assert order["lineItems"][0]["quantity"] == 2
+    assert order["lineItems"][0]["taxInfo"] == {
+        "taxAmount": {"amount": "0.00"},
+        "taxableAmount": {"amount": "25.00"},
+        "taxRate": "0",
+        "taxIncludedInPrice": False,
+        "taxBreakdown": [],
+    }
     assert order["lineItems"][0]["catalogReference"] == {
         "appId": wix_adapter.WIX_STORES_APP_ID,
         "catalogItemId": "prod_wix_1",
@@ -425,6 +432,9 @@ def test_build_wix_order_payload_populates_required_wix_fields_from_order():
     assert order["billingInfo"]["paymentMethod"] == "Pivota External Payment"
     assert order["paymentMethod"] == "Pivota External Payment"
     assert order["paymentStatus"] == "PAID"
+    assert order["taxIncludedInPrices"] is False
+    assert order["lineItems"][0]["taxInfo"]["taxAmount"]["amount"] == "0.00"
+    assert order["lineItems"][0]["taxInfo"]["taxableAmount"]["amount"] == "25.00"
     assert order["priceSummary"]["total"]["amount"] == "31.00"
 
 

@@ -81,6 +81,25 @@ def _money_str(value: Any, default: str = "0.00") -> str:
     return str(_coerce_money(value, default=default))
 
 
+def _line_total_str(unit_price: Any, quantity: int) -> str:
+    total = _coerce_money(unit_price) * Decimal(max(int(quantity or 1), 1))
+    return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    if value in (0, 1):
+        return bool(value)
+    return default
+
+
 def _name_parts(order: Dict[str, Any]) -> tuple[str, str]:
     shipping_address = _coerce_dict(order.get("shipping_address"))
     raw = _clean_str(shipping_address.get("name") or order.get("customer_name"))
@@ -144,6 +163,28 @@ def _line_item_options(item: Dict[str, Any]) -> Any:
     return []
 
 
+def _build_line_item_tax_info(item: Dict[str, Any], *, unit_price: str, quantity: int) -> Dict[str, Any]:
+    tax_amount = _money_str(
+        item.get("tax_amount")
+        or item.get("tax")
+        or item.get("line_tax")
+        or item.get("tax_total")
+    )
+    tax_rate = _clean_str(item.get("tax_rate") or item.get("taxRate")) or "0"
+    return {
+        "taxAmount": {"amount": tax_amount},
+        "taxableAmount": {"amount": _line_total_str(unit_price, quantity)},
+        "taxRate": tax_rate,
+        "taxIncludedInPrice": _coerce_bool(
+            item.get("tax_included_in_price")
+            if item.get("tax_included_in_price") is not None
+            else item.get("taxIncludedInPrice"),
+            default=False,
+        ),
+        "taxBreakdown": [],
+    }
+
+
 def _build_wix_line_item(item: Dict[str, Any]) -> Dict[str, Any]:
     quantity = int(item.get("quantity") or 1)
     if quantity <= 0:
@@ -163,6 +204,7 @@ def _build_wix_line_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "quantity": quantity,
         "price": {"amount": unit_price},
         "itemType": {"preset": "PHYSICAL"},
+        "taxInfo": _build_line_item_tax_info(item, unit_price=unit_price, quantity=quantity),
     }
 
     sku = _clean_str(item.get("sku"))
@@ -240,6 +282,7 @@ def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
         "paymentStatus": "PAID" if payment_status == "paid" else "NOT_PAID",
         "fulfillmentStatus": "NOT_FULFILLED",
         "currency": currency,
+        "taxIncludedInPrices": False,
         "priceSummary": {
             "subtotal": {"amount": _money_str(order.get("subtotal"))},
             "shipping": {"amount": _money_str(order.get("shipping_fee"))},
@@ -384,6 +427,8 @@ def _payload_blockers(payload: Dict[str, Any]) -> List[str]:
         catalog_ref = item.get("catalogReference")
         if not isinstance(catalog_ref, dict) or not _clean_str(catalog_ref.get("catalogItemId")):
             blockers.append(f"lineItems[{index}].catalogReference.catalogItemId")
+        if not isinstance(item.get("taxInfo"), dict) and not isinstance(item.get("taxDetails"), dict):
+            blockers.append(f"lineItems[{index}].taxInfo")
     return blockers
 
 
