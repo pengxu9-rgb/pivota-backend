@@ -4836,6 +4836,10 @@ async def agent_search_products(
                         "reason_code": "ok" if page_items else "no_candidates",
                         "latency_ms": latency_ms,
                         "result_count": len(page_items),
+                        "stage_timings_ms": dict(search_stage_timings),
+                        "auth_total_ms": auth_total_ms,
+                        "db_pool_wait_ms": db_pool_wait_ms,
+                        "fast_path": "cross_merchant_browse_fastpath",
                     },
                 )
                 _record_search_metric(
@@ -5260,6 +5264,10 @@ async def agent_search_products(
                     "result_count": len(paginated_products),
                     "merchants_searched": len(merchant_scope_for_fast or []),
                     "fast_mode": True,
+                    "stage_timings_ms": dict(search_stage_timings),
+                    "auth_total_ms": auth_total_ms,
+                    "db_pool_wait_ms": db_pool_wait_ms,
+                    "fast_path": "cross_merchant_fast",
                 },
             )
             _record_search_metric(
@@ -5653,6 +5661,10 @@ async def agent_search_products(
                     "latency_ms": latency_ms,
                     "result_count": len(paginated_products),
                     "merchants_searched": len(merchants_to_search),
+                    "stage_timings_ms": dict(search_stage_timings),
+                    "auth_total_ms": auth_total_ms,
+                    "db_pool_wait_ms": db_pool_wait_ms,
+                    "fast_path": "cross_merchant_browse_standard",
                 },
             )
             _record_search_metric(
