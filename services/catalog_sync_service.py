@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -39,6 +40,10 @@ from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
 from services.catalog_identity import make_content_key
+from services.fashion_field_extractor import (
+    EXTRACTION_SOURCE_LLM,
+    batch_extract_fashion_fields,
+)
 from services.fashion_field_payload_extractor import (
     extract_care_from_payload,
     extract_material_from_payload,
@@ -53,6 +58,152 @@ from services.pdp_taxonomy import derive_taxonomy_v1
 
 
 logger = logging.getLogger(__name__)
+
+
+# Bounds concurrent in-flight live-ingest fashion enrichment LLM calls so a
+# big-merchant sync (e.g. 1000 fashion products) doesn't fan out into 1000
+# parallel Deepseek requests. 8 is conservative; raise after staging load
+# test confirms headroom. Per feedback_llm_call_multipliers.md, new LLM
+# call sources need bounded blast radius before going live.
+_FASHION_ENRICH_SEM = asyncio.Semaphore(8)
+
+# Trust gate floor — values below this confidence won't be persisted into
+# the merchant-facing fashion columns. Mirrors the PIVOTA-Agent gateway's
+# pdpBuilder.pickFashionMeta cutoff (0.6). Keeping the write-side at the
+# same threshold prevents low-confidence rows from polluting the DB.
+_FASHION_ENRICH_MIN_CONFIDENCE = 0.6
+
+
+async def _async_fashion_enrich(
+    *,
+    product_key: str,
+    title: Optional[str],
+    description: Optional[str],
+    html_blob: Optional[str],
+    category_path: Optional[str],
+    payload_filled: Dict[str, bool],
+) -> None:
+    """Fire-and-forget LLM enrichment for a newly upserted fashion row.
+
+    Runs the batched material+care+size_guide extractor and UPDATEs only
+    fields that (a) the merchant payload didn't already provide and (b)
+    were extracted with confidence >= the trust gate. The UPDATE has
+    `<field> IS NULL` guards so a concurrent backfill or re-sync can't
+    be overwritten.
+
+    Never raises — every exception path is logged. Bounded by the module
+    semaphore so a 1k-product fashion sync doesn't fan out unbounded.
+    """
+    try:
+        async with _FASHION_ENRICH_SEM:
+            results = await batch_extract_fashion_fields(
+                title=title,
+                description=description,
+                html_blob=html_blob,
+                category_path=category_path,
+            )
+        set_clauses: List[str] = []
+        where_clauses: List[str] = ["product_key = :key"]
+        params: Dict[str, Any] = {"key": product_key}
+
+        def _maybe_add(field: str, value_param: Any):
+            r = results.get(field)
+            if r is None or r.value is None:
+                return False
+            if r.confidence < _FASHION_ENRICH_MIN_CONFIDENCE:
+                return False
+            # Don't clobber a merchant_payload write that just landed on
+            # the same row — the upsert already set those columns; the
+            # NULL guard below also prevents it, but skipping the SET
+            # clause keeps the UPDATE narrow.
+            if payload_filled.get(field):
+                return False
+            set_clauses.extend([
+                f"{field} = :{field}",
+                f"{field}_source = :{field}_source",
+                f"{field}_confidence = :{field}_confidence",
+            ])
+            params[field] = value_param
+            params[f"{field}_source"] = EXTRACTION_SOURCE_LLM
+            params[f"{field}_confidence"] = r.confidence
+            where_clauses.append(f"{field} IS NULL")
+            return True
+
+        _maybe_add("material", results["material"].value if results.get("material") else None)
+        _maybe_add("care", results["care"].value if results.get("care") else None)
+        # size_guide column is JSONB; wrap plain string in {raw: ...} so the
+        # gateway can distinguish a flat string from a structured chart later.
+        sg = results.get("size_guide")
+        if sg is not None and sg.value is not None and sg.confidence >= _FASHION_ENRICH_MIN_CONFIDENCE and not payload_filled.get("size_guide"):
+            set_clauses.extend([
+                "size_guide = :size_guide",
+                "size_guide_source = :size_guide_source",
+                "size_guide_confidence = :size_guide_confidence",
+            ])
+            params["size_guide"] = json.dumps({"raw": sg.value})
+            params["size_guide_source"] = EXTRACTION_SOURCE_LLM
+            params["size_guide_confidence"] = sg.confidence
+            where_clauses.append("size_guide IS NULL")
+
+        if not set_clauses:
+            logger.debug(
+                "fashion_enrich.no_writes product_key=%s category=%s",
+                product_key, category_path,
+            )
+            return
+        sql = (
+            "UPDATE catalog_products SET "
+            + ", ".join(set_clauses)
+            + " WHERE "
+            + " AND ".join(where_clauses)
+        )
+        await database.execute(sql, params)
+        logger.info(
+            "fashion_enrich.applied product_key=%s fields=%s",
+            product_key,
+            [s.split(" = ")[0] for s in set_clauses if not s.endswith("_source") and not s.endswith("_confidence")],
+        )
+    except Exception as exc:  # noqa: BLE001 — must not propagate; runs detached
+        logger.warning(
+            "fashion_enrich.failed product_key=%s err=%s",
+            product_key, exc,
+        )
+
+
+def _schedule_fashion_enrichment(
+    *,
+    product_key: str,
+    title: Optional[str],
+    description: Optional[str],
+    html_blob: Optional[str],
+    category_path: Optional[str],
+    payload_filled: Dict[str, bool],
+) -> None:
+    """Spawn fashion-enrichment as a detached task. Sync doesn't wait.
+
+    Early-outs if ALL three fields were already filled by the merchant
+    payload (nothing left to enrich). The batch_extract_fashion_fields
+    callee does its own flag + category + haystack gating, so this
+    function intentionally stays a thin scheduler — kicking the task
+    even when gates may reject keeps the gating logic single-sourced.
+    """
+    if payload_filled.get("material") and payload_filled.get("care") and payload_filled.get("size_guide"):
+        return
+    try:
+        asyncio.create_task(
+            _async_fashion_enrich(
+                product_key=product_key,
+                title=title,
+                description=description,
+                html_blob=html_blob,
+                category_path=category_path,
+                payload_filled=payload_filled,
+            )
+        )
+    except RuntimeError as exc:
+        # No running event loop (shouldn't happen in normal request flow,
+        # but a script-driven entry without asyncio.run() could trip this).
+        logger.warning("fashion_enrich.schedule_no_loop err=%s", exc)
 
 
 def _utcnow() -> datetime:
@@ -802,6 +953,26 @@ async def ingest_standard_products(
                 },
             )
             stats["products_ingested"] += 1
+
+            # Phase O-5b live-ingest enrichment: spawn a fire-and-forget
+            # LLM batched extraction for material/care/size_guide on rows
+            # the merchant_payload couldn't cover. Gated upstream by
+            # FASHION_EXTRACT_ENABLED + fashion category prefix; bounded
+            # by a module-level semaphore so a 1k-product sync can't fan
+            # out unbounded. Closes the "backfill-only" gap that left
+            # newly-onboarded wix products at 0% extraction.
+            _schedule_fashion_enrichment(
+                product_key=product_key,
+                title=product.title,
+                description=_description_for_ingest,
+                html_blob=None,
+                category_path=_cat_path,
+                payload_filled={
+                    "material": bool(_payload_material),
+                    "care": bool(_payload_care),
+                    "size_guide": bool(_payload_size_guide),
+                },
+            )
 
             await _upsert_field_fact(
                 entity_type="product",

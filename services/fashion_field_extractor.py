@@ -310,3 +310,160 @@ async def extract_size_guide(
         html_blob=html_blob,
         category_path=category_path,
     )
+
+
+# ---------- Batched extractor: one LLM call for all three fields ----------
+# Used by catalog_sync_service for live-ingest enrichment so a single LLM
+# round-trip covers material + care + size_guide instead of three. Same
+# gates (flag / category / haystack), same substring grounding, same
+# confidence calibration.
+
+_BATCH_SYSTEM_PROMPT = (
+    "You extract three structured fashion-product fields from merchant "
+    "catalog text: material composition, care instructions, and size guide. "
+    "Output strict JSON only. NEVER invent values. NEVER paraphrase — copy "
+    "each relevant phrase verbatim from the source text. If the source does "
+    "not state a field, return that field as value=null."
+)
+
+_BATCH_INSTRUCTION = (
+    "Extract these three fields, returning ONLY phrases that appear verbatim "
+    "in the source text:\n"
+    "- material: composition string (e.g. '100% cotton', '90% nylon 10% spandex')\n"
+    "- care: care instructions phrase (e.g. 'Hand wash cold; lay flat to dry')\n"
+    "- size_guide: sizing chart description phrase (e.g. 'See size chart below')\n"
+    "If a field is not stated, set its value to null and reason to 'not_stated'.\n"
+    "Do NOT infer."
+)
+
+
+def _build_batch_user_message(
+    *, title: Optional[str], description: Optional[str], html_blob: Optional[str],
+) -> str:
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if description:
+        parts.append(f"Description:\n{description}")
+    if html_blob:
+        parts.append(f"Additional HTML:\n{html_blob}")
+    body = "\n\n".join(parts) if parts else "(no source text)"
+    return (
+        f"{_BATCH_INSTRUCTION}\n\n"
+        f"Source text:\n---\n{body}\n---\n\n"
+        f'Return JSON only: '
+        f'{{"material": {{"value": string|null, "confidence": float in [0,1], "reason": string}}, '
+        f'"care": {{"value": string|null, "confidence": float in [0,1], "reason": string}}, '
+        f'"size_guide": {{"value": string|null, "confidence": float in [0,1], "reason": string}}}}'
+    )
+
+
+async def _call_deepseek_batch(
+    *, user_message: str, timeout_s: float = 20.0,
+) -> Optional[Dict[str, Any]]:
+    """One Deepseek call returning {material, care, size_guide} sub-objects.
+
+    Separate from `_call_deepseek_extract` to keep the single-field code path
+    untouched and to give the batched path its own slightly longer timeout
+    (output is ~3x the size).
+    """
+    api_key = (settings.deepseek_api_key or "").strip()
+    if not api_key:
+        logger.warning("fashion_extract.batch.no_api_key")
+        return None
+    base_url = settings.deepseek_api_base_url.rstrip("/")
+    model = settings.deepseek_model
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+        "max_tokens": 500,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            resp = await client.post(
+                f"{base_url}/v1/chat/completions",
+                json=body,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            )
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        logger.warning("fashion_extract.batch.transport_fail err=%s", exc)
+        return None
+    if resp.status_code >= 400:
+        logger.warning(
+            "fashion_extract.batch.http_%d body=%s",
+            resp.status_code, resp.text[:200],
+        )
+        return None
+    try:
+        payload = resp.json()
+        content = payload["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except (KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("fashion_extract.batch.parse_fail err=%s", exc)
+        return None
+
+
+def _result_from_subobject(
+    *, sub: Any, haystack: str,
+) -> ExtractionResult:
+    """Apply substring grounding + confidence calibration to one
+    {value, confidence, reason} subobject from the batched LLM response.
+    Mirrors the back half of _extract_one_field."""
+    if not isinstance(sub, dict):
+        return ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_LLM)
+    value = sub.get("value")
+    if not isinstance(value, str) or not value.strip():
+        return ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_LLM)
+    value = value.strip()
+    self_report = sub.get("confidence")
+    self_report_n = (
+        float(self_report)
+        if isinstance(self_report, (int, float)) and 0.0 <= float(self_report) <= 1.0
+        else 0.5
+    )
+    substring_score = _substring_grounded(value, haystack)
+    confidence = round(self_report_n * substring_score * _CONFIDENCE_CATEGORY_MATCH, 4)
+    if confidence <= 0.0:
+        return ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_LLM)
+    return ExtractionResult(value=value, confidence=confidence, source=EXTRACTION_SOURCE_LLM)
+
+
+async def batch_extract_fashion_fields(
+    *,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    html_blob: Optional[str] = None,
+    category_path: Optional[str] = None,
+) -> Dict[str, ExtractionResult]:
+    """Extract material + care + size_guide in one LLM round-trip.
+
+    Returns a dict keyed by field name. Every key is always present so
+    callers can `result["material"]` without KeyError. value=None means
+    "don't write" (gated off, no source text, grounding failed, or LLM
+    declined). Guarantees: never raises; failures degrade to value=None.
+    """
+    noop = ExtractionResult(value=None, confidence=0.0, source=EXTRACTION_SOURCE_LLM)
+    empty = {"material": noop, "care": noop, "size_guide": noop}
+    if not _extract_enabled():
+        return empty
+    if not _is_fashion_category(category_path):
+        return empty
+    haystack = "\n".join(filter(None, [title or "", description or "", html_blob or ""]))
+    if not haystack.strip():
+        return empty
+    user_message = _build_batch_user_message(
+        title=title, description=description, html_blob=html_blob,
+    )
+    raw = await _call_deepseek_batch(user_message=user_message)
+    if not isinstance(raw, dict):
+        return empty
+    return {
+        "material": _result_from_subobject(sub=raw.get("material"), haystack=haystack),
+        "care": _result_from_subobject(sub=raw.get("care"), haystack=haystack),
+        "size_guide": _result_from_subobject(sub=raw.get("size_guide"), haystack=haystack),
+    }
