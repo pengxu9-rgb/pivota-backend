@@ -11,7 +11,7 @@ experience, not the public Agent API.
 """
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
 
 from pydantic import BaseModel
@@ -766,10 +766,15 @@ class FashionFieldsBody(BaseModel):
     null on a field means "leave unchanged". Explicit-clear is a v2
     concern; today there's no way to null out a previously-authored
     value via this endpoint.
+
+    size_guide accepts a plain string (wrapped server-side into
+    {raw: ...} for the JSONB column) or a structured chart dict.
+    Lists / numbers / bools are rejected — the column gates
+    merchant-facing prose and untyped input shouldn't reach it.
     """
     material: Optional[str] = None
     care: Optional[str] = None
-    size_guide: Optional[Any] = None  # str | dict — JSONB column accepts both
+    size_guide: Optional[Union[str, Dict[str, Any]]] = None
 
 
 @router.put("/{platform}/{platform_product_id}/fashion_fields")
@@ -782,15 +787,22 @@ async def update_product_fashion_fields(
     """Merchant-authored fashion-field write path (material / care / size_guide).
 
     Writes directly to catalog_products with source=merchant_authored,
-    confidence=1.0. The write respects existing merchant_payload values
-    (Shopify metafields are authoritative — the merchant should edit
-    those in their source platform, not here). LLM-extracted values are
-    overwritten.
+    confidence=1.0, inside a per-row transaction (race-safe vs concurrent
+    merchant_payload sync). The write respects existing merchant_payload
+    values (Shopify metafields are authoritative — the merchant should
+    edit those in their source platform, not here). LLM-extracted values
+    are overwritten. Triggers an inline agent_pdp_view refresh on any
+    successful write so the gateway sees the change immediately.
 
-    Returns the per-field outcome dict from
-    services.fashion_field_authoring.write_merchant_authored_fashion_fields
-    so callers can give honest feedback ("we kept your Shopify metafield
-    value for material").
+    Response codes:
+      - 200 with `outcomes` dict — at least one field was meaningfully
+        considered. Inspect each field's outcome:
+          'written' / 'skipped_payload_owned' / 'unchanged'
+      - 404 — no catalog_products row for this (merchant, platform,
+        source_product_id) tuple. Distinct from the products_cache
+        ownership 404 above so the merchant can tell the difference
+        between "you don't own this product" and "this product hasn't
+        been ingested into the canonical catalog yet."
     """
     if current_user.get("role") != "merchant":
         raise HTTPException(
@@ -821,6 +833,23 @@ async def update_product_fashion_fields(
         care=body.care,
         size_guide=body.size_guide,
     )
+
+    # If every reported outcome is product_not_found, surface as HTTP 404
+    # rather than burying the failure under top-level 200/"success".
+    # Codex review flagged the "false success" risk; this fixes it.
+    if outcomes and all(v == "product_not_found" for v in outcomes.values()):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "catalog_product_not_found",
+                "message": (
+                    "Product exists in your platform cache but no canonical "
+                    "catalog row has been ingested yet. Re-sync from your "
+                    "platform and retry."
+                ),
+                "outcomes": outcomes,
+            },
+        )
 
     return {
         "status": "success",

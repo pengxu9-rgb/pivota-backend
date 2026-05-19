@@ -27,8 +27,12 @@ from services.agent_pdp_view_assembler import (  # noqa: E402
 
 def _p(**fields):
     """Tiny helper: build one product-member row with the fashion-field
-    columns the assembler SELECT projects. Missing keys default to None."""
+    columns the assembler SELECT projects. Missing keys default to None.
+    product_key + group_is_primary default to None / False so tie-breaks
+    are testable without every test specifying them."""
     out = {
+        "product_key": fields.pop("product_key", "prod::default"),
+        "group_is_primary": fields.pop("group_is_primary", False),
         "material": None, "material_source": None, "material_confidence": None,
         "care": None, "care_source": None, "care_confidence": None,
         "size_guide": None, "size_guide_source": None, "size_guide_confidence": None,
@@ -207,3 +211,104 @@ def test_null_source_with_value_still_considered():
     products = [_p(material="orphan_value", material_source=None, material_confidence=None)]
     out = coalesce_fashion_fields(products, None)
     assert out["material"] == "orphan_value"
+
+
+# ---------- codex review fixes ----------
+
+def test_whitespace_only_value_dropped():
+    """Codex review: a `"   "` value was passing the truthiness check and
+    could beat a real lower-priority candidate. Should be ignored."""
+    products = [
+        _p(material="   ", material_source="merchant_payload", material_confidence=1.0),
+        _p(material="100% cotton", material_source="llm_extraction_v1", material_confidence=0.7),
+    ]
+    out = coalesce_fashion_fields(products, None)
+    # Whitespace-only payload value drops, LLM wins.
+    assert out["material"] == "100% cotton"
+    assert out["material_source"] == "llm_extraction_v1"
+
+
+def test_non_string_text_value_dropped():
+    """material / care: list, dict, number are not valid text. Type-gate."""
+    products = [
+        _p(material=[], material_source="merchant_payload", material_confidence=1.0),
+        _p(material="cotton", material_source="llm_extraction_v1", material_confidence=0.5),
+    ]
+    out = coalesce_fashion_fields(products, None)
+    assert out["material"] == "cotton"
+
+    products2 = [
+        _p(care={}, care_source="merchant_payload", care_confidence=1.0),
+        _p(care="hand wash", care_source="llm_extraction_v1", care_confidence=0.5),
+    ]
+    out2 = coalesce_fashion_fields(products2, None)
+    assert out2["care"] == "hand wash"
+
+
+def test_size_guide_accepts_dict_but_not_list_or_number():
+    products_dict = [
+        _p(size_guide={"raw": "see chart"}, size_guide_source="llm_extraction_v1",
+           size_guide_confidence=0.6),
+    ]
+    out = coalesce_fashion_fields(products_dict, None)
+    assert out["size_guide"] == {"raw": "see chart"}
+
+    products_list = [
+        _p(size_guide=[1, 2], size_guide_source="merchant_payload", size_guide_confidence=1.0),
+    ]
+    out2 = coalesce_fashion_fields(products_list, None)
+    assert out2["size_guide"] is None  # list rejected
+
+
+def test_external_seed_size_guide_string_wrapped_to_dict():
+    """Codex review: external_seed size_guide strings flow through to a
+    JSONB column. Wrap into {"raw": ...} so the gateway sees a consistent
+    shape across sources."""
+    products = [_p()]
+    seed = {"seed_data": {"size_guide": "Runs true to size"}}
+    out = coalesce_fashion_fields(products, seed)
+    assert out["size_guide"] == {"raw": "Runs true to size"}
+    assert out["size_guide_source"] == "external_seed"
+
+
+def test_tie_break_prefers_group_primary():
+    """Equal source + confidence: the product_group's primary member wins.
+    Codex review flagged unordered ties as flap-inducing across refreshes."""
+    products = [
+        _p(
+            product_key="prod::nonprimary",
+            group_is_primary=False,
+            material="cotton-A",
+            material_source="merchant_authored",
+            material_confidence=1.0,
+        ),
+        _p(
+            product_key="prod::primary",
+            group_is_primary=True,
+            material="cotton-B",
+            material_source="merchant_authored",
+            material_confidence=1.0,
+        ),
+    ]
+    out = coalesce_fashion_fields(products, None)
+    assert out["material"] == "cotton-B"
+
+
+def test_tie_break_by_product_key_when_no_primary():
+    """No primary flag on either: tie-break by product_key alphabetic."""
+    products = [
+        _p(
+            product_key="prod::zzz",
+            material="cotton-Z",
+            material_source="merchant_authored",
+            material_confidence=1.0,
+        ),
+        _p(
+            product_key="prod::aaa",
+            material="cotton-A",
+            material_source="merchant_authored",
+            material_confidence=1.0,
+        ),
+    ]
+    out = coalesce_fashion_fields(products, None)
+    assert out["material"] == "cotton-A"

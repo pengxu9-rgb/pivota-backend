@@ -4,9 +4,7 @@ When a merchant fills in material / care / size_guide via the dashboard
 or via the agent chat, the value lands here. Today this is the only path
 that writes `<field>_source = 'merchant_authored'` to catalog_products.
 
-Source-precedence rules (also enforced read-side by the canonical PDP
-assembler, but pinned here at the write site to keep merchant_payload
-authoritative):
+Source-precedence rules:
 
     merchant_payload   — Shopify metafield ingest. Always wins; never
                          overwrite. If a merchant wants to change this,
@@ -16,18 +14,28 @@ authoritative):
                          when the merchant's platform didn't supply.
                          Overwritten by merchant_authored.
     external_seed      — (Read-side only, used by the canonical PDP
-                         assembler for inherited values across merchants
-                         in the same product_group.)
+                         assembler for inherited values.)
 
-The function is intentionally narrow: one product per call, one field per
-column, no bulk semantics. Bulk is a v2 concern that can layer on top.
+Race safety: every write happens inside a transaction with a
+`SELECT … FOR UPDATE` on the catalog_products row, so a concurrent
+`merchant_payload` sync (services/catalog_sync_service) or live-ingest
+LLM enrichment (`_async_fashion_enrich`) cannot squeeze between the
+precedence check and the UPDATE. Codex review surfaced this as a
+ship-blocker in PR #563; fix lands here.
+
+After every successful merchant_authored write the affected
+`agent_pdp_view` row (keyed by content_key) is refreshed inline.
+agent_pdp_view is the canonical view the gateway reads on every PDP
+hit — without the refresh the merchant's edit is invisible until the
+next sync. Codex review also surfaced this as a ship-blocker.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Set, Tuple, Union
 
 from db.database import database
 
@@ -35,9 +43,6 @@ logger = logging.getLogger(__name__)
 
 
 # ---- Source enum constants -------------------------------------------------
-# Stringly-typed today (the catalog_products `*_source` columns are TEXT, not
-# a Postgres enum). Centralizing the literals here so future refactors don't
-# have to grep across the codebase.
 
 EXTRACTION_SOURCE_MERCHANT_PAYLOAD = "merchant_payload"
 EXTRACTION_SOURCE_MERCHANT_AUTHORED = "merchant_authored"
@@ -46,11 +51,12 @@ EXTRACTION_SOURCE_EXTERNAL_SEED = "external_seed"
 
 
 _WRITABLE_FIELDS = ("material", "care", "size_guide")
+_AGENT_PDP_VIEW_REFRESH_SOURCE = "merchant_authoring"
 
 
-# Per-field write outcomes returned by the write helper. The agent / UI
-# uses these to give the merchant honest feedback ("we kept your Shopify
-# metafield value instead of overwriting").
+# Per-field write outcomes. The agent / UI surfaces these honestly so the
+# merchant sees which fields landed and which Shopify metafields kept their
+# value (Open Q #5 in the plan — Shopify is authoritative).
 WRITE_OUTCOME_WRITTEN = "written"
 WRITE_OUTCOME_SKIPPED_PAYLOAD_OWNED = "skipped_payload_owned"
 WRITE_OUTCOME_PRODUCT_NOT_FOUND = "product_not_found"
@@ -67,56 +73,96 @@ def _product_key(merchant_id: str, platform: str, source_product_id: str) -> str
     return f"prod::{merchant_id}::{platform}::{source_product_id}"
 
 
-def _normalize_size_guide(value: Union[str, Dict[str, Any]]) -> str:
+def _normalize_size_guide(value: Union[str, Dict[str, Any]]) -> Optional[str]:
     """size_guide column is JSONB. A plain string from the merchant is
     wrapped in {"raw": ...} to match the shape catalog_sync_service uses
     for LLM-extracted plain-text size guides. A dict is JSON-serialized
-    directly so structured charts pass through verbatim."""
+    directly so structured charts pass through verbatim.
+
+    Returns None when the value is empty / whitespace-only / not a
+    recognised type. Codex review flagged that whitespace strings were
+    being written as `{"raw": ""}` at confidence 1.0; this is the fix.
+    """
     if isinstance(value, dict):
+        # Empty dict is treated as "no value" — equivalent to the merchant
+        # not having supplied a chart.
+        if not value:
+            return None
         return json.dumps(value)
-    return json.dumps({"raw": str(value)})
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        return json.dumps({"raw": trimmed})
+    # Anything else (list / number / bool) is rejected — the route is
+    # supposed to filter these out via Pydantic validation, but defending
+    # in depth here too because the column gates merchant-facing prose.
+    return None
 
 
-async def _write_one_field(
+def _normalize_text_field(value: Any) -> Optional[str]:
+    """Material / care input normalization. Rejects empty strings, whitespace,
+    and non-string types. Returns the stripped string when valid."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+async def _write_one_field_in_tx(
     *, product_key: str, field: str, value: Any,
-) -> str:
-    """SELECT the current source, then conditional UPDATE.
+) -> Tuple[str, Optional[str]]:
+    """One field write — must be called inside an open transaction.
 
-    Uses two round-trips so the caller can distinguish payload-owned from
-    overwrite. A single UPDATE ... WHERE source != 'merchant_payload' would
-    suppress the write but couldn't tell us which row was suppressed.
+    Returns (outcome, content_key). content_key is the row's content_key
+    when known (so the caller can refresh agent_pdp_view); None on the
+    not-found path.
+
+    The race fix: `SELECT … FOR UPDATE` locks the catalog_products row
+    for the duration of the transaction. A concurrent merchant_payload
+    sync hitting the same row will block on this lock and see our write
+    or wait for our COMMIT before overwriting — race-free per-row.
     """
     if field not in _WRITABLE_FIELDS:
-        # Hard validation — caller bugs surface immediately rather than
-        # silently writing nothing.
         raise ValueError(f"unknown fashion field {field!r}")
 
+    # Field name is whitelisted above so f-string interpolation is safe.
     row = await database.fetch_one(
-        f"SELECT {field}_source AS src, ({field} IS NULL) AS was_null "
-        f"FROM catalog_products WHERE product_key = :pk",
+        f"""
+        SELECT {field}_source AS src, content_key
+        FROM catalog_products
+        WHERE product_key = :pk
+        FOR UPDATE
+        """,
         {"pk": product_key},
     )
     if row is None:
-        return WRITE_OUTCOME_PRODUCT_NOT_FOUND
+        return WRITE_OUTCOME_PRODUCT_NOT_FOUND, None
+
     current_source = row["src"]
+    content_key = row["content_key"]
+
     if current_source == EXTRACTION_SOURCE_MERCHANT_PAYLOAD:
-        return WRITE_OUTCOME_SKIPPED_PAYLOAD_OWNED
+        return WRITE_OUTCOME_SKIPPED_PAYLOAD_OWNED, content_key
 
     if field == "size_guide":
         db_value = _normalize_size_guide(value)
     else:
-        db_value = str(value).strip()
-        if not db_value:
-            # Empty-string input is treated as "no change" — explicit-clear
-            # is a v2 concern. Tested in test_fashion_field_authoring.py.
-            return WRITE_OUTCOME_UNCHANGED
+        db_value = _normalize_text_field(value)
+
+    if db_value is None:
+        # Empty / whitespace / wrong-type input is a no-op, not a write.
+        # The merchant's intent was "I'm not setting this" — same as null.
+        return WRITE_OUTCOME_UNCHANGED, content_key
 
     await database.execute(
-        f"""UPDATE catalog_products
-            SET {field} = :v,
-                {field}_source = :src,
-                {field}_confidence = :conf
-            WHERE product_key = :pk""",
+        f"""
+        UPDATE catalog_products
+        SET {field} = :v,
+            {field}_source = :src,
+            {field}_confidence = :conf
+        WHERE product_key = :pk
+        """,
         {
             "v": db_value,
             "src": EXTRACTION_SOURCE_MERCHANT_AUTHORED,
@@ -124,7 +170,74 @@ async def _write_one_field(
             "pk": product_key,
         },
     )
-    return WRITE_OUTCOME_WRITTEN
+    return WRITE_OUTCOME_WRITTEN, content_key
+
+
+async def _refresh_view_for_content_key(content_key: str) -> None:
+    """Refresh the agent_pdp_view row for the given content_key after
+    a successful merchant-authored write.
+
+    Imports the assembler lazily — the assembler module imports from
+    services.fashion_field_extractor and we want this module loadable
+    from routes (which it now is).
+
+    Failures are logged but do NOT propagate. agent_pdp_view is a
+    cache; a stale row mustn't roll back the catalog_products write.
+    Same isolation pattern services/seed_data_writer uses.
+    """
+    try:
+        # Lazy import — see docstring.
+        from services.agent_pdp_view_assembler import (
+            UPSERT_SQL as AGENT_PDP_VIEW_UPSERT_SQL,
+            assemble_row as assemble_agent_pdp_view_row,
+            fetch_external_seed_for_keys,
+            fetch_offers_for_keys,
+            fetch_products_for_key,
+            fetch_skus_for_keys,
+            row_to_upsert_params as agent_pdp_view_row_to_upsert_params,
+        )
+
+        products = await fetch_products_for_key(content_key, db=database)
+        if not products:
+            logger.info(
+                "agent_pdp_view refresh skipped for content_key=%s: no products",
+                content_key,
+            )
+            return
+        product_keys = [p["product_key"] for p in products if p.get("product_key")]
+        skus = await fetch_skus_for_keys(product_keys, db=database)
+        offers = await fetch_offers_for_keys(product_keys, db=database)
+        # Use the cluster's matched seed (any active one in the group works
+        # for content fallback). Mirror seed_data_writer's pattern.
+        external_seed = await fetch_external_seed_for_keys(product_keys, db=database)
+
+        row = assemble_agent_pdp_view_row(
+            content_key=content_key,
+            products=products,
+            skus=skus,
+            offers=offers,
+            external_seed=external_seed,
+            refresh_source=_AGENT_PDP_VIEW_REFRESH_SOURCE,
+        )
+        if row is None:
+            logger.info(
+                "agent_pdp_view refresh skipped for content_key=%s: no title",
+                content_key,
+            )
+            return
+        row["refreshed_by_proposal_id"] = None
+        await database.execute(
+            AGENT_PDP_VIEW_UPSERT_SQL,
+            agent_pdp_view_row_to_upsert_params(row),
+        )
+        logger.info(
+            "fashion_authoring.view_refreshed content_key=%s", content_key,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort cache refresh
+        logger.warning(
+            "fashion_authoring.view_refresh_failed content_key=%s err=%s",
+            content_key, exc,
+        )
 
 
 async def write_merchant_authored_fashion_fields(
@@ -136,21 +249,28 @@ async def write_merchant_authored_fashion_fields(
     care: Optional[str] = None,
     size_guide: Optional[Union[str, Dict[str, Any]]] = None,
 ) -> Dict[str, str]:
-    """Write merchant-authored values into catalog_products.
+    """Write merchant-authored values into catalog_products + refresh
+    the canonical agent_pdp_view row.
 
     Per-field semantics:
-      - None: leave unchanged (NOT clear — explicit-clear is v2)
-      - "" (empty string after strip): leave unchanged
-      - non-empty value: write IF the existing source is not 'merchant_payload'
+      - None: leave unchanged
+      - "" / whitespace-only / wrong-type: leave unchanged (treated
+        identically to None — explicit-clear is a v2 concern)
+      - non-empty string (or dict for size_guide): write IF the existing
+        source is not 'merchant_payload'
 
-    Returns a dict keyed by field name with one of:
-      - 'written'                  — value persisted with source=merchant_authored
-      - 'skipped_payload_owned'    — current source is merchant_payload (authoritative); no change
-      - 'product_not_found'        — no catalog_products row matches the identity tuple
-      - 'unchanged'                — input was None or empty after strip
+    Returns a dict keyed by field name. Fields the caller didn't pass
+    (None) are NOT included — only fields the caller asked about are
+    reported on. Possible outcomes:
+      'written'                  — value persisted with source=merchant_authored
+      'skipped_payload_owned'    — current source is merchant_payload (authoritative); no change
+      'product_not_found'        — no catalog_products row matches the identity tuple
+      'unchanged'                — input was empty / whitespace / unsupported type
 
-    Fields that weren't provided (input is None) are NOT included in the
-    output — only fields the caller asked about are reported on.
+    On any 'written' outcome the agent_pdp_view row (keyed by the
+    product's content_key) is refreshed inline before this coroutine
+    returns. The refresh failure mode is isolated — agent_pdp_view is a
+    cache and a stale row should never make the merchant write fail.
     """
     pk = _product_key(merchant_id, platform, source_product_id)
     inputs: Dict[str, Any] = {
@@ -159,24 +279,40 @@ async def write_merchant_authored_fashion_fields(
         "size_guide": size_guide,
     }
     result: Dict[str, str] = {}
+    refresh_keys: Set[str] = set()
 
-    for field, value in inputs.items():
-        if value is None:
-            continue
-        outcome = await _write_one_field(product_key=pk, field=field, value=value)
-        result[field] = outcome
-        # If the product doesn't exist for one field it won't for the others
-        # either — short-circuit the remaining fields with the same outcome
-        # so the caller gets a consistent shape.
-        if outcome == WRITE_OUTCOME_PRODUCT_NOT_FOUND:
-            for remaining_field, remaining_value in inputs.items():
-                if remaining_value is None:
-                    continue
-                result.setdefault(remaining_field, WRITE_OUTCOME_PRODUCT_NOT_FOUND)
-            break
+    # Wrap all per-field writes in one transaction so the precedence check
+    # and the UPDATE are atomic for each field. databases.Database
+    # transactions are reentrant per-task; nesting is fine.
+    async with database.transaction():
+        for field, value in inputs.items():
+            if value is None:
+                continue
+            outcome, content_key = await _write_one_field_in_tx(
+                product_key=pk, field=field, value=value,
+            )
+            result[field] = outcome
+            if outcome == WRITE_OUTCOME_WRITTEN and content_key:
+                refresh_keys.add(content_key)
+            if outcome == WRITE_OUTCOME_PRODUCT_NOT_FOUND:
+                # Subsequent fields on the same product would all hit the
+                # same not-found case. Short-circuit with a consistent
+                # shape so the caller doesn't have to special-case it.
+                for remaining_field, remaining_value in inputs.items():
+                    if remaining_value is None:
+                        continue
+                    result.setdefault(remaining_field, WRITE_OUTCOME_PRODUCT_NOT_FOUND)
+                break
+
+    # Refresh the canonical view OUTSIDE the transaction so the write
+    # has actually committed before the assembler reads catalog_products.
+    # Same-task await is fine; the merchant's PUT waits the extra ~50ms
+    # so the gateway reflects the change on their next read.
+    for content_key in refresh_keys:
+        await _refresh_view_for_content_key(content_key)
 
     logger.info(
-        "fashion_authoring.applied product_key=%s outcomes=%s",
-        pk, result,
+        "fashion_authoring.applied product_key=%s outcomes=%s refresh_keys=%d",
+        pk, result, len(refresh_keys),
     )
     return result
