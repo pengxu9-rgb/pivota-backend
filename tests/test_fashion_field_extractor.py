@@ -232,3 +232,139 @@ def test_extraction_result_has_required_fields():
     assert r.value == "x"
     assert r.confidence == 0.5
     assert r.source == EXTRACTION_SOURCE_LLM
+
+
+# ---------- batched extractor (one LLM call for all three fields) ----------
+
+from services.fashion_field_extractor import (  # noqa: E402
+    batch_extract_fashion_fields,
+)
+
+
+def _install_batch_mock(monkeypatch, response: Optional[Dict[str, Any]]):
+    async def _fake_batch(*, user_message: str, timeout_s: float = 20.0):
+        return response
+    monkeypatch.setattr(fx, "_call_deepseek_batch", _fake_batch)
+
+
+@pytest.mark.asyncio
+async def test_batch_flag_off_returns_three_noops(monkeypatch):
+    monkeypatch.delenv("FASHION_EXTRACT_ENABLED", raising=False)
+    _install_batch_mock(monkeypatch, {
+        "material": {"value": "100% cotton", "confidence": 0.9},
+        "care": {"value": "hand wash", "confidence": 0.9},
+        "size_guide": {"value": "see chart", "confidence": 0.9},
+    })
+    out = await batch_extract_fashion_fields(
+        description="Material: 100% cotton. Care: hand wash. Sizing: see chart.",
+        category_path="fashion/dresses",
+    )
+    assert set(out.keys()) == {"material", "care", "size_guide"}
+    for r in out.values():
+        assert r.value is None
+        assert r.confidence == 0.0
+        assert r.source == EXTRACTION_SOURCE_LLM
+
+
+@pytest.mark.asyncio
+async def test_batch_non_fashion_returns_three_noops(monkeypatch):
+    _enable_flag(monkeypatch)
+    _install_batch_mock(monkeypatch, {
+        "material": {"value": "100% cotton", "confidence": 0.9},
+        "care": {"value": "hand wash", "confidence": 0.9},
+        "size_guide": {"value": "see chart", "confidence": 0.9},
+    })
+    out = await batch_extract_fashion_fields(
+        description="Material: 100% cotton. Care: hand wash.",
+        category_path="beauty/skincare/serum",
+    )
+    for r in out.values():
+        assert r.value is None
+
+
+@pytest.mark.asyncio
+async def test_batch_happy_path_all_three(monkeypatch):
+    _enable_flag(monkeypatch)
+    _install_batch_mock(monkeypatch, {
+        "material": {"value": "100% organic cotton", "confidence": 0.8},
+        "care": {"value": "Hand wash cold", "confidence": 0.7},
+        "size_guide": {"value": "See size chart below", "confidence": 0.9},
+    })
+    out = await batch_extract_fashion_fields(
+        description=(
+            "A breezy dress. Material: 100% organic cotton. "
+            "Care: Hand wash cold; lay flat to dry. "
+            "Sizing: See size chart below for measurements."
+        ),
+        category_path="fashion/dresses",
+    )
+    assert out["material"].value == "100% organic cotton"
+    assert out["material"].confidence == 0.8  # 0.8 × 1.0 verbatim × 1.0 category
+    assert out["care"].value == "Hand wash cold"
+    assert out["care"].confidence == 0.7
+    assert out["size_guide"].value == "See size chart below"
+    assert out["size_guide"].confidence == 0.9
+
+
+@pytest.mark.asyncio
+async def test_batch_substring_grounding_drops_per_field(monkeypatch):
+    _enable_flag(monkeypatch)
+    # material is verbatim, care is hallucinated, size_guide is null.
+    _install_batch_mock(monkeypatch, {
+        "material": {"value": "100% cotton", "confidence": 0.9},
+        "care": {"value": "machine wash hot only", "confidence": 0.9},  # not in source
+        "size_guide": {"value": None, "confidence": 1.0, "reason": "not_stated"},
+    })
+    out = await batch_extract_fashion_fields(
+        description="Material: 100% cotton. Hand wash cold.",
+        category_path="fashion/tops",
+    )
+    assert out["material"].value == "100% cotton"
+    assert out["material"].confidence > 0
+    assert out["care"].value is None  # grounding rejected
+    assert out["care"].confidence == 0.0
+    assert out["size_guide"].value is None  # LLM declined
+    assert out["size_guide"].confidence == 0.0
+
+
+@pytest.mark.asyncio
+async def test_batch_transport_failure_returns_three_noops(monkeypatch):
+    _enable_flag(monkeypatch)
+    _install_batch_mock(monkeypatch, None)
+    out = await batch_extract_fashion_fields(
+        description="Material: 100% cotton",
+        category_path="fashion/tops",
+    )
+    for r in out.values():
+        assert r.value is None
+        assert r.confidence == 0.0
+
+
+@pytest.mark.asyncio
+async def test_batch_empty_haystack_returns_three_noops(monkeypatch):
+    _enable_flag(monkeypatch)
+    _install_batch_mock(monkeypatch, {
+        "material": {"value": "anything", "confidence": 1.0},
+        "care": {"value": "anything", "confidence": 1.0},
+        "size_guide": {"value": "anything", "confidence": 1.0},
+    })
+    out = await batch_extract_fashion_fields(
+        title=None, description=None, category_path="fashion/dresses",
+    )
+    for r in out.values():
+        assert r.value is None
+
+
+@pytest.mark.asyncio
+async def test_batch_partial_response_safe(monkeypatch):
+    """LLM returns malformed shape (missing keys / wrong types) — every
+    field still surfaces as a clean None ExtractionResult, never raises."""
+    _enable_flag(monkeypatch)
+    _install_batch_mock(monkeypatch, {"material": "not-a-dict", "care": None})
+    out = await batch_extract_fashion_fields(
+        description="Material: 100% cotton",
+        category_path="fashion/tops",
+    )
+    assert set(out.keys()) == {"material", "care", "size_guide"}
+    for r in out.values():
+        assert r.value is None
