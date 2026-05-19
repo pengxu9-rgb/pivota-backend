@@ -39,6 +39,8 @@ from services.canonical_commerce_service import (
 )
 from services.beauty_field_authoring import (
     ALLOWED_SKIN_CONCERNS,
+    SUBCATEGORY_SCHEMAS as BEAUTY_SUBCATEGORY_SCHEMAS,
+    subcategory_for_path as beauty_subcategory_for_path,
     write_merchant_authored_beauty_fields,
 )
 from services.fashion_field_authoring import (
@@ -1083,13 +1085,23 @@ async def get_fashion_completeness(
 class BeautyFieldsBody(BaseModel):
     """Merchant-authored beauty fields for one product.
 
-    null on a field means "leave unchanged" — same semantics as the
-    fashion endpoint. skin_concerns is validated as a list of allowed
-    enum values server-side (see ALLOWED_SKIN_CONCERNS).
+    null on a field means "leave unchanged". Different subcategories
+    use different field subsets:
+      - skincare/haircare/bath/body: raw_inci, how_to_use_text, skin_concerns
+      - makeup: raw_inci, how_to_use_text
+      - tools: tool_material, use_with, care_instructions
+
+    The body accepts the union; the service writes only the applicable
+    fields based on the product's subcategory.
     """
+    # Skincare-shape fields
     raw_inci: Optional[str] = None
     how_to_use_text: Optional[str] = None
     skin_concerns: Optional[List[str]] = None
+    # Tools-shape fields (v2.1)
+    tool_material: Optional[str] = None
+    use_with: Optional[str] = None
+    care_instructions: Optional[str] = None
 
 
 @router.put("/{platform}/{platform_product_id}/beauty_fields")
@@ -1135,6 +1147,9 @@ async def update_product_beauty_fields(
         raw_inci=body.raw_inci,
         how_to_use_text=body.how_to_use_text,
         skin_concerns=body.skin_concerns,
+        tool_material=body.tool_material,
+        use_with=body.use_with,
+        care_instructions=body.care_instructions,
     )
 
     if outcomes and all(v == "product_not_found" for v in outcomes.values()):
@@ -1160,14 +1175,14 @@ async def update_product_beauty_fields(
     }
 
 
-_BEAUTY_CATEGORY_PREFIXES = ("beauty/",)
-
-
 def _beauty_field_status(value: Any) -> str:
-    """Beauty fields don't have a *_source column for most tables, so
-    the status reduces to "missing" / "merchant-authored" for v1.
-    raw_inci has source_system so it gets the full enum elsewhere."""
+    """Beauty fields don't all have *_source columns, so the status
+    reduces to "missing" / "merchant-authored" for v1. raw_inci has
+    source_system and gets the full enum (including
+    merchant-payload-locked) elsewhere."""
     if value is None or value == "":
+        return "missing"
+    if isinstance(value, list) and not value:
         return "missing"
     return "merchant-authored"
 
@@ -1178,19 +1193,28 @@ async def get_beauty_completeness(
     page_size: int = Query(50, ge=1, le=500),
     current_user: dict = Depends(get_current_user),
 ):
-    """List the merchant's beauty-categorized products with per-field
-    status across the three primary authored fields. Mirrors the
-    fashion_completeness shape so the UI can share parsing logic.
+    """v2.1 subcategory-aware completeness for beauty products.
 
-    Filters server-side to products where at least one beauty field is
-    missing (any SKU lacks raw_inci, or product lacks how_to_use_text,
-    or concerns_json is null/empty).
+    For each beauty product in a supported subcategory (per
+    BEAUTY_SUBCATEGORY_SCHEMAS — skincare/haircare/bath/body/makeup/tools
+    today; fragrance + accessories deferred to v2.2):
+      - returns the product's `subcategory_kind` ("skincare" / "tools" /
+        etc.) so the UI can pick the right editor form
+      - returns `field_schemas`: per-product list of {name, type, label,
+        placeholder, hint, allowed_values} so the UI renders generic
+        forms without hard-coding the field set
+      - returns `fields`: per-product per-field {status, value} only
+        for the subcategory's applicable fields
 
-    Field status reduces to "missing" / "merchant-authored" /
-    "merchant-payload-locked" depending on the underlying source_system
-    where available (raw_inci tracks source_system today; the other two
-    fields don't have provenance columns yet, so they map to
-    "merchant-authored" when populated by any source).
+    Filters server-side to products where at least one applicable
+    field is missing. Products in unsupported subcategories (fragrance,
+    accessories) are excluded entirely until v2.2 ships their schemas.
+
+    The schema-driven approach replaces v2.0's flat "always return INCI
+    + how-to-use + concerns" shape. Codex review for the brush case
+    (PawStyle had 608 brushes asking for ingredients) is structurally
+    fixed: brushes are in subcategory "tools" and get tool_material /
+    use_with / care_instructions instead.
     """
     if current_user.get("role") != "merchant":
         raise HTTPException(status_code=403, detail="Only merchants can read beauty completeness")
@@ -1199,48 +1223,26 @@ async def get_beauty_completeness(
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
 
+    # Build the WHERE clause from the v2.1 schema table — single source
+    # of truth for "which subcategories are in scope."
+    supported_prefixes = tuple(BEAUTY_SUBCATEGORY_SCHEMAS.keys())
+    if not supported_prefixes:
+        return {
+            "status": "success",
+            "data": {"queue": [], "totals": {
+                "beauty_total": 0, "total_incomplete": 0,
+                "page": page, "page_size": page_size, "has_more": False,
+            }},
+        }
     category_clause = " OR ".join(
-        f"LOWER(cp.category_path) LIKE '{p}%'" for p in _BEAUTY_CATEGORY_PREFIXES
+        f"LOWER(cp.category_path) LIKE '{p}%'" for p in supported_prefixes
     )
     offset = (page - 1) * page_size
 
-    # Aggregated SQL — collapses per-SKU raw_inci into a per-product flag.
-    # "Has raw_inci" means *any* SKU under the product has it set.
-    # Same for source_system: if any SKU is merchant_payload-owned, the
-    # product-level status is locked.
-    totals_sql = f"""
-        WITH product_inci AS (
-          SELECT
-            bsi.product_key,
-            BOOL_OR(bsi.raw_inci IS NOT NULL AND bsi.raw_inci != '') AS has_inci,
-            BOOL_OR(bsi.source_system = 'merchant_payload') AS inci_payload_owned
-          FROM beauty_sku_ingredients bsi
-          GROUP BY bsi.product_key
-        )
-        SELECT
-          COUNT(*) AS beauty_total,
-          COUNT(*) FILTER (WHERE COALESCE(pi.has_inci, FALSE) = FALSE) AS missing_inci,
-          COUNT(*) FILTER (WHERE bug.how_to_use_text IS NULL OR bug.how_to_use_text = '') AS missing_how_to_use,
-          COUNT(*) FILTER (
-            WHERE bpp.concerns_json IS NULL
-              OR bpp.concerns_json::text = 'null'
-              OR jsonb_array_length(COALESCE(bpp.concerns_json, '[]'::jsonb)) = 0
-          ) AS missing_concerns,
-          COUNT(*) FILTER (WHERE
-            COALESCE(pi.has_inci, FALSE) = FALSE
-            OR bug.how_to_use_text IS NULL OR bug.how_to_use_text = ''
-            OR bpp.concerns_json IS NULL
-            OR bpp.concerns_json::text = 'null'
-            OR jsonb_array_length(COALESCE(bpp.concerns_json, '[]'::jsonb)) = 0
-          ) AS total_incomplete
-        FROM catalog_products cp
-        LEFT JOIN product_inci pi ON pi.product_key = cp.product_key
-        LEFT JOIN beauty_usage_guides bug ON bug.product_key = cp.product_key AND bug.sku_key IS NULL
-        LEFT JOIN beauty_product_profiles bpp ON bpp.product_key = cp.product_key
-        WHERE cp.merchant_id = :merchant_id
-          AND ({category_clause})
-    """
-
+    # Pull all relevant data per product (the route then filters
+    # per-subcategory). We always join beauty_* tables; for products in
+    # subcategories that don't use a given field, the value is simply
+    # ignored in the response.
     queue_sql = f"""
         WITH product_inci AS (
           SELECT
@@ -1252,6 +1254,7 @@ async def get_beauty_completeness(
           GROUP BY bsi.product_key
         )
         SELECT
+          cp.product_key,
           cp.platform,
           cp.source_product_id AS platform_product_id,
           cp.title,
@@ -1261,96 +1264,140 @@ async def get_beauty_completeness(
           COALESCE(pi.inci_payload_owned, FALSE) AS inci_payload_owned,
           pi.sample_inci,
           bug.how_to_use_text,
-          bpp.concerns_json
+          bpp.concerns_json,
+          bpp.profile_payload
         FROM catalog_products cp
         LEFT JOIN product_inci pi ON pi.product_key = cp.product_key
         LEFT JOIN beauty_usage_guides bug ON bug.product_key = cp.product_key AND bug.sku_key IS NULL
         LEFT JOIN beauty_product_profiles bpp ON bpp.product_key = cp.product_key
         WHERE cp.merchant_id = :merchant_id
           AND ({category_clause})
-          AND (
-            COALESCE(pi.has_inci, FALSE) = FALSE
-            OR bug.how_to_use_text IS NULL OR bug.how_to_use_text = ''
-            OR bpp.concerns_json IS NULL
-            OR bpp.concerns_json::text = 'null'
-            OR jsonb_array_length(COALESCE(bpp.concerns_json, '[]'::jsonb)) = 0
-          )
         ORDER BY cp.last_seen_in_sync_at DESC NULLS LAST, cp.product_key ASC
-        LIMIT :limit OFFSET :offset
     """
 
-    totals_row = await database.fetch_one(totals_sql, {"merchant_id": merchant_id})
-    rows = await database.fetch_all(
-        queue_sql,
-        {"merchant_id": merchant_id, "limit": page_size, "offset": offset},
-    )
+    rows = await database.fetch_all(queue_sql, {"merchant_id": merchant_id})
 
-    totals = dict(totals_row) if totals_row else {
-        "beauty_total": 0, "missing_inci": 0,
-        "missing_how_to_use": 0, "missing_concerns": 0,
-        "total_incomplete": 0,
-    }
+    # Per-row, figure out the subcategory schema, determine which fields
+    # are missing for that subcategory, and only include products where
+    # at least one applicable field is missing.
+    eligible: List[Dict[str, Any]] = []
+    per_subcategory_totals: Dict[str, Dict[str, int]] = {}
+    per_subcategory_total: Dict[str, int] = {}
 
-    queue: List[Dict[str, Any]] = []
     for r in rows or []:
         row = dict(r)
-        has_inci = bool(row.get("has_inci"))
-        payload_owned = bool(row.get("inci_payload_owned"))
-        inci_status = (
-            "merchant-payload-locked" if payload_owned and has_inci
-            else "merchant-authored" if has_inci
-            else "missing"
-        )
+        schema = beauty_subcategory_for_path(row.get("category_path"))
+        if not schema:
+            continue
+        subcategory_kind = schema["subcategory_kind"]
+        per_subcategory_total[subcategory_kind] = per_subcategory_total.get(subcategory_kind, 0) + 1
+
+        profile_payload = row.get("profile_payload") or {}
+        if isinstance(profile_payload, str):
+            try:
+                profile_payload = json.loads(profile_payload)
+            except Exception:
+                profile_payload = {}
+        if not isinstance(profile_payload, dict):
+            profile_payload = {}
+
         concerns = row.get("concerns_json")
         if isinstance(concerns, str):
             try:
                 concerns = json.loads(concerns)
             except Exception:
                 concerns = None
-        queue.append({
+
+        # Build per-field state for THIS subcategory's fields only.
+        fields_out: Dict[str, Any] = {}
+        any_missing = False
+        for field_spec in schema["fields"]:
+            field_name = field_spec["name"]
+            value: Any = None
+            status = "missing"
+            if field_name == "raw_inci":
+                has_inci = bool(row.get("has_inci"))
+                payload_owned = bool(row.get("inci_payload_owned"))
+                value = row.get("sample_inci")
+                status = (
+                    "merchant-payload-locked" if payload_owned and has_inci
+                    else "merchant-authored" if has_inci
+                    else "missing"
+                )
+            elif field_name == "how_to_use_text":
+                value = row.get("how_to_use_text")
+                status = _beauty_field_status(value)
+            elif field_name == "skin_concerns":
+                value = concerns if isinstance(concerns, list) else None
+                status = _beauty_field_status(value)
+            else:
+                # Subcategory-specific field stored in profile_payload JSONB.
+                value = profile_payload.get(field_name)
+                status = _beauty_field_status(value)
+
+            fields_out[field_name] = {
+                "status": status,
+                "value": value,
+                "confidence": None,
+            }
+            if status == "missing":
+                any_missing = True
+                bucket = per_subcategory_totals.setdefault(subcategory_kind, {})
+                bucket[field_name] = bucket.get(field_name, 0) + 1
+
+        if not any_missing:
+            continue
+
+        eligible.append({
             "platform": row["platform"],
             "platform_product_id": row["platform_product_id"],
             "title": row.get("title") or "Untitled product",
             "image_url": row.get("image_url"),
             "sku": None,
             "category_kind": "beauty",
-            "fields": {
-                "raw_inci": {
-                    "status": inci_status,
-                    "value": row.get("sample_inci"),
-                    "confidence": None,
-                },
-                "how_to_use_text": {
-                    "status": _beauty_field_status(row.get("how_to_use_text")),
-                    "value": row.get("how_to_use_text"),
-                    "confidence": None,
-                },
-                "skin_concerns": {
-                    "status": _beauty_field_status(concerns),
-                    "value": concerns if isinstance(concerns, list) else None,
-                    "confidence": None,
-                },
-            },
+            "subcategory_kind": subcategory_kind,
+            "subcategory_label": schema["label"],
+            "category_path": row.get("category_path"),
+            "field_schemas": list(schema["fields"]),
+            "fields": fields_out,
         })
 
-    total_incomplete = int(totals.get("total_incomplete") or 0)
+    total_incomplete = len(eligible)
+    beauty_total = sum(per_subcategory_total.values())
+    paged = eligible[offset : offset + page_size]
     has_more = (page * page_size) < total_incomplete
 
     return {
         "status": "success",
         "data": {
-            "queue": queue,
+            "queue": paged,
             "totals": {
-                "beauty_total": int(totals.get("beauty_total") or 0),
-                "missing_inci": int(totals.get("missing_inci") or 0),
-                "missing_how_to_use": int(totals.get("missing_how_to_use") or 0),
-                "missing_concerns": int(totals.get("missing_concerns") or 0),
+                "beauty_total": beauty_total,
                 "total_incomplete": total_incomplete,
                 "page": page,
                 "page_size": page_size,
                 "has_more": has_more,
+                # Per-subcategory breakdown — UI can show "Tools: 608 of
+                # 608 need attention" alongside the global total.
+                "per_subcategory": {
+                    kind: {
+                        "total": per_subcategory_total.get(kind, 0),
+                        "missing_per_field": per_subcategory_totals.get(kind, {}),
+                    }
+                    for kind in per_subcategory_total
+                },
             },
             "allowed_skin_concerns": list(ALLOWED_SKIN_CONCERNS),
+            # Surface the full schema table so the UI can render the
+            # form for each subcategory without hard-coding field metadata.
+            "subcategory_schemas": [
+                {
+                    "subcategory_kind": s["subcategory_kind"],
+                    "label": s["label"],
+                    "fields": list(s["fields"]),
+                }
+                for s in BEAUTY_SUBCATEGORY_SCHEMAS.values()
+            ],
         },
     }
 
