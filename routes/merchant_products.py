@@ -35,6 +35,9 @@ from services.canonical_commerce_service import (
     load_canonical_cache_row,
     load_canonical_cache_rows,
 )
+from services.fashion_field_authoring import (
+    write_merchant_authored_fashion_fields,
+)
 from services.product_enrichment_pipeline import run_enrichment_for_product
 from services.product_exposure_service import build_agent_push_projection_from_cache_row
 from services.product_quality_backfill_service import process_quality_backfill_job
@@ -754,6 +757,74 @@ async def update_product_enrichment(
     return {
         "status": "success",
         "enrichment": enrichment or {},
+    }
+
+
+class FashionFieldsBody(BaseModel):
+    """Merchant-authored fashion fields for one product.
+
+    null on a field means "leave unchanged". Explicit-clear is a v2
+    concern; today there's no way to null out a previously-authored
+    value via this endpoint.
+    """
+    material: Optional[str] = None
+    care: Optional[str] = None
+    size_guide: Optional[Any] = None  # str | dict — JSONB column accepts both
+
+
+@router.put("/{platform}/{platform_product_id}/fashion_fields")
+async def update_product_fashion_fields(
+    platform: str,
+    platform_product_id: str,
+    body: FashionFieldsBody,
+    current_user: dict = Depends(get_current_user),
+):
+    """Merchant-authored fashion-field write path (material / care / size_guide).
+
+    Writes directly to catalog_products with source=merchant_authored,
+    confidence=1.0. The write respects existing merchant_payload values
+    (Shopify metafields are authoritative — the merchant should edit
+    those in their source platform, not here). LLM-extracted values are
+    overwritten.
+
+    Returns the per-field outcome dict from
+    services.fashion_field_authoring.write_merchant_authored_fashion_fields
+    so callers can give honest feedback ("we kept your Shopify metafield
+    value for material").
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(
+            status_code=403,
+            detail="Only merchants can author fashion fields",
+        )
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    # Ownership check — same shape as the /enrichment endpoint above.
+    exists = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    outcomes = await write_merchant_authored_fashion_fields(
+        merchant_id=merchant_id,
+        platform=platform,
+        source_product_id=platform_product_id,
+        material=body.material,
+        care=body.care,
+        size_guide=body.size_guide,
+    )
+
+    return {
+        "status": "success",
+        "outcomes": outcomes,
     }
 
 
