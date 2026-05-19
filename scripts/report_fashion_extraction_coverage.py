@@ -225,6 +225,58 @@ async def build_report(*, merchant_id: Optional[str]) -> Dict[str, Any]:
     }
 
 
+async def _canonical_view_inheritance(
+    *, merchant_id: Optional[str]
+) -> Dict[str, Any]:
+    """Count agent_pdp_view rows where a fashion field is populated
+    by inheritance from a co-merchant or external_seed, versus rows
+    where the field is populated only because the merchant's own row
+    has it. The lift between (merchant-row populated) and (canonical
+    view populated) is the value the cross-PDP coalesce adds.
+
+    Scopes to content_keys touched by the merchant when --merchant-id
+    is set; otherwise reports across all fashion content_keys.
+    """
+    where_merchant_join = (
+        "INNER JOIN catalog_products cp_scope "
+        "  ON cp_scope.content_key = apv.content_key "
+        "  AND cp_scope.merchant_id = :merchant_id"
+        if merchant_id else ""
+    )
+    sql = f"""
+        SELECT
+          COUNT(*) FILTER (
+            WHERE (
+              LOWER(apv.category_path) LIKE 'fashion/%'
+              OR LOWER(apv.category_path) LIKE 'apparel/%'
+              OR LOWER(apv.category_path) LIKE 'clothing/%'
+              OR LOWER(apv.category_path) LIKE 'shoes/%'
+              OR LOWER(apv.category_path) LIKE 'accessories/%'
+            )
+          ) AS fashion_canonicals,
+          COUNT(*) FILTER (WHERE apv.material IS NOT NULL) AS material_populated,
+          COUNT(*) FILTER (WHERE apv.care IS NOT NULL) AS care_populated,
+          COUNT(*) FILTER (WHERE apv.size_guide IS NOT NULL) AS size_guide_populated,
+          COUNT(*) FILTER (
+            WHERE apv.material_source = 'merchant_payload'
+          ) AS material_from_merchant_payload,
+          COUNT(*) FILTER (
+            WHERE apv.material_source = 'merchant_authored'
+          ) AS material_from_merchant_authored,
+          COUNT(*) FILTER (
+            WHERE apv.material_source = 'llm_extraction_v1'
+          ) AS material_from_llm,
+          COUNT(*) FILTER (
+            WHERE apv.material_source = 'external_seed'
+          ) AS material_from_external_seed
+        FROM agent_pdp_view apv
+        {where_merchant_join}
+    """
+    params = {"merchant_id": merchant_id} if merchant_id else {}
+    row = await database.fetch_one(sql, params)
+    return dict(row) if row else {}
+
+
 def _format_markdown(report: Dict[str, Any]) -> str:
     lines = ["# Fashion-field extraction coverage", ""]
     t = report["totals"]
@@ -281,8 +333,26 @@ async def _run(args: argparse.Namespace) -> int:
         await database.connect()
     try:
         report = await build_report(merchant_id=args.merchant_id)
+        if args.include_canonical_view:
+            report["canonical_view"] = await _canonical_view_inheritance(
+                merchant_id=args.merchant_id
+            )
         if args.format == "md":
             print(_format_markdown(report))
+            if args.include_canonical_view:
+                cv = report["canonical_view"]
+                print("")
+                print("## Canonical agent_pdp_view (cross-PDP coalesce)")
+                print("")
+                print(f"- Fashion canonical PDPs: {cv.get('fashion_canonicals', 0)}")
+                print(f"- material populated: {cv.get('material_populated', 0)}")
+                print(f"- care populated: {cv.get('care_populated', 0)}")
+                print(f"- size_guide populated: {cv.get('size_guide_populated', 0)}")
+                print("- material winning source counts:")
+                print(f"  - merchant_payload: {cv.get('material_from_merchant_payload', 0)}")
+                print(f"  - merchant_authored: {cv.get('material_from_merchant_authored', 0)}")
+                print(f"  - llm_extraction_v1: {cv.get('material_from_llm', 0)}")
+                print(f"  - external_seed: {cv.get('material_from_external_seed', 0)}")
         else:
             print(json.dumps(report, indent=2, sort_keys=True, default=str))
         return 0
@@ -303,6 +373,14 @@ def main() -> int:
         choices=("json", "md"),
         default="json",
         help="Output format (default: json).",
+    )
+    parser.add_argument(
+        "--include-canonical-view",
+        action="store_true",
+        help="Additionally query agent_pdp_view and report cross-PDP "
+             "coalesced material/care/size_guide coverage (the user-facing "
+             "post-inheritance numbers). Off by default — keeps single-merchant "
+             "audits fast.",
     )
     args = parser.parse_args()
     return asyncio.run(_run(args))
