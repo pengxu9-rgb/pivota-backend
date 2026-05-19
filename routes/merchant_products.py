@@ -896,7 +896,15 @@ def _fashion_field_status(value: Any, source: Optional[str]) -> str:
 @router.get("/fashion_completeness")
 async def get_fashion_completeness(
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
+    # Max raised from 200 → 500 so brands with 200-500 fashion SKUs can
+    # walk the full queue in one fetch. Past 500 the one-at-a-time UX
+    # in the agent surface stops being a sensible interaction model and
+    # the right answer is the bulk-by-product-type / CSV paths planned
+    # for v2 — capping here keeps the v1 surface honest about what it
+    # can handle. Server cost is essentially flat across this range
+    # (one indexed scan + LIMIT); the binding constraint is response
+    # size + client-side localStorage persist, both fine through 500.
+    page_size: int = Query(50, ge=1, le=500),
     current_user: dict = Depends(get_current_user),
 ):
     """List the merchant's fashion-categorized products with per-field
