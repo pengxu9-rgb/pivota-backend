@@ -10,6 +10,8 @@ They are intended to power the Merchant Portal "Product Optimization"
 experience, not the public Agent API.
 """
 
+import json
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
@@ -34,6 +36,10 @@ from models.standard_product import StandardProduct
 from services.canonical_commerce_service import (
     load_canonical_cache_row,
     load_canonical_cache_rows,
+)
+from services.beauty_field_authoring import (
+    ALLOWED_SKIN_CONCERNS,
+    write_merchant_authored_beauty_fields,
 )
 from services.fashion_field_authoring import (
     write_merchant_authored_fashion_fields,
@@ -1060,6 +1066,291 @@ async def get_fashion_completeness(
                 "page_size": page_size,
                 "has_more": has_more,
             },
+        },
+    }
+
+
+# ----------------------------------------------------------------------------
+# Beauty-field authoring + completeness — parallel of the fashion surface
+# at services/beauty_field_authoring.py. Beauty stores authored values
+# across three tables (ingredients per-SKU, usage guides per-product,
+# concerns per-product) instead of flat columns on catalog_products, so
+# the endpoint shape mirrors fashion at the contract layer but the
+# underlying writes are multi-table.
+# ----------------------------------------------------------------------------
+
+
+class BeautyFieldsBody(BaseModel):
+    """Merchant-authored beauty fields for one product.
+
+    null on a field means "leave unchanged" — same semantics as the
+    fashion endpoint. skin_concerns is validated as a list of allowed
+    enum values server-side (see ALLOWED_SKIN_CONCERNS).
+    """
+    raw_inci: Optional[str] = None
+    how_to_use_text: Optional[str] = None
+    skin_concerns: Optional[List[str]] = None
+
+
+@router.put("/{platform}/{platform_product_id}/beauty_fields")
+async def update_product_beauty_fields(
+    platform: str,
+    platform_product_id: str,
+    body: BeautyFieldsBody,
+    current_user: dict = Depends(get_current_user),
+):
+    """Merchant-authored beauty-field write path.
+
+    Writes the three primary merchant-input beauty fields across the
+    beauty_* tables. Race-safe via per-row transactional locks. Returns
+    a per-field outcomes dict mirroring the fashion endpoint so the UI
+    can share outcome-handling.
+
+    Auth + ownership match the fashion endpoint exactly.
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(
+            status_code=403,
+            detail="Only merchants can author beauty fields",
+        )
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    exists = await database.fetch_one(
+        products_cache.select().where(
+            (products_cache.c.merchant_id == merchant_id)
+            & (products_cache.c.platform == platform)
+            & (products_cache.c.platform_product_id == platform_product_id)
+        )
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    outcomes = await write_merchant_authored_beauty_fields(
+        merchant_id=merchant_id,
+        platform=platform,
+        source_product_id=platform_product_id,
+        raw_inci=body.raw_inci,
+        how_to_use_text=body.how_to_use_text,
+        skin_concerns=body.skin_concerns,
+    )
+
+    if outcomes and all(v == "product_not_found" for v in outcomes.values()):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "catalog_product_not_found",
+                "message": (
+                    "Product exists in your platform cache but no canonical "
+                    "catalog row has been ingested yet. Re-sync from your "
+                    "platform and retry."
+                ),
+                "outcomes": outcomes,
+            },
+        )
+
+    return {
+        "status": "success",
+        "outcomes": outcomes,
+        # Surface the allowed enum so a thin client doesn't need to
+        # hard-code it; the UI can render a multi-select from this.
+        "allowed_skin_concerns": list(ALLOWED_SKIN_CONCERNS),
+    }
+
+
+_BEAUTY_CATEGORY_PREFIXES = ("beauty/",)
+
+
+def _beauty_field_status(value: Any) -> str:
+    """Beauty fields don't have a *_source column for most tables, so
+    the status reduces to "missing" / "merchant-authored" for v1.
+    raw_inci has source_system so it gets the full enum elsewhere."""
+    if value is None or value == "":
+        return "missing"
+    return "merchant-authored"
+
+
+@router.get("/beauty_completeness")
+async def get_beauty_completeness(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    current_user: dict = Depends(get_current_user),
+):
+    """List the merchant's beauty-categorized products with per-field
+    status across the three primary authored fields. Mirrors the
+    fashion_completeness shape so the UI can share parsing logic.
+
+    Filters server-side to products where at least one beauty field is
+    missing (any SKU lacks raw_inci, or product lacks how_to_use_text,
+    or concerns_json is null/empty).
+
+    Field status reduces to "missing" / "merchant-authored" /
+    "merchant-payload-locked" depending on the underlying source_system
+    where available (raw_inci tracks source_system today; the other two
+    fields don't have provenance columns yet, so they map to
+    "merchant-authored" when populated by any source).
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can read beauty completeness")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    category_clause = " OR ".join(
+        f"LOWER(cp.category_path) LIKE '{p}%'" for p in _BEAUTY_CATEGORY_PREFIXES
+    )
+    offset = (page - 1) * page_size
+
+    # Aggregated SQL — collapses per-SKU raw_inci into a per-product flag.
+    # "Has raw_inci" means *any* SKU under the product has it set.
+    # Same for source_system: if any SKU is merchant_payload-owned, the
+    # product-level status is locked.
+    totals_sql = f"""
+        WITH product_inci AS (
+          SELECT
+            bsi.product_key,
+            BOOL_OR(bsi.raw_inci IS NOT NULL AND bsi.raw_inci != '') AS has_inci,
+            BOOL_OR(bsi.source_system = 'merchant_payload') AS inci_payload_owned
+          FROM beauty_sku_ingredients bsi
+          GROUP BY bsi.product_key
+        )
+        SELECT
+          COUNT(*) AS beauty_total,
+          COUNT(*) FILTER (WHERE COALESCE(pi.has_inci, FALSE) = FALSE) AS missing_inci,
+          COUNT(*) FILTER (WHERE bug.how_to_use_text IS NULL OR bug.how_to_use_text = '') AS missing_how_to_use,
+          COUNT(*) FILTER (
+            WHERE bpp.concerns_json IS NULL
+              OR bpp.concerns_json::text = 'null'
+              OR jsonb_array_length(COALESCE(bpp.concerns_json, '[]'::jsonb)) = 0
+          ) AS missing_concerns,
+          COUNT(*) FILTER (WHERE
+            COALESCE(pi.has_inci, FALSE) = FALSE
+            OR bug.how_to_use_text IS NULL OR bug.how_to_use_text = ''
+            OR bpp.concerns_json IS NULL
+            OR bpp.concerns_json::text = 'null'
+            OR jsonb_array_length(COALESCE(bpp.concerns_json, '[]'::jsonb)) = 0
+          ) AS total_incomplete
+        FROM catalog_products cp
+        LEFT JOIN product_inci pi ON pi.product_key = cp.product_key
+        LEFT JOIN beauty_usage_guides bug ON bug.product_key = cp.product_key AND bug.sku_key IS NULL
+        LEFT JOIN beauty_product_profiles bpp ON bpp.product_key = cp.product_key
+        WHERE cp.merchant_id = :merchant_id
+          AND ({category_clause})
+    """
+
+    queue_sql = f"""
+        WITH product_inci AS (
+          SELECT
+            bsi.product_key,
+            BOOL_OR(bsi.raw_inci IS NOT NULL AND bsi.raw_inci != '') AS has_inci,
+            BOOL_OR(bsi.source_system = 'merchant_payload') AS inci_payload_owned,
+            (ARRAY_AGG(bsi.raw_inci ORDER BY bsi.updated_at DESC NULLS LAST))[1] AS sample_inci
+          FROM beauty_sku_ingredients bsi
+          GROUP BY bsi.product_key
+        )
+        SELECT
+          cp.platform,
+          cp.source_product_id AS platform_product_id,
+          cp.title,
+          cp.image_url,
+          cp.category_path,
+          COALESCE(pi.has_inci, FALSE) AS has_inci,
+          COALESCE(pi.inci_payload_owned, FALSE) AS inci_payload_owned,
+          pi.sample_inci,
+          bug.how_to_use_text,
+          bpp.concerns_json
+        FROM catalog_products cp
+        LEFT JOIN product_inci pi ON pi.product_key = cp.product_key
+        LEFT JOIN beauty_usage_guides bug ON bug.product_key = cp.product_key AND bug.sku_key IS NULL
+        LEFT JOIN beauty_product_profiles bpp ON bpp.product_key = cp.product_key
+        WHERE cp.merchant_id = :merchant_id
+          AND ({category_clause})
+          AND (
+            COALESCE(pi.has_inci, FALSE) = FALSE
+            OR bug.how_to_use_text IS NULL OR bug.how_to_use_text = ''
+            OR bpp.concerns_json IS NULL
+            OR bpp.concerns_json::text = 'null'
+            OR jsonb_array_length(COALESCE(bpp.concerns_json, '[]'::jsonb)) = 0
+          )
+        ORDER BY cp.last_seen_in_sync_at DESC NULLS LAST, cp.product_key ASC
+        LIMIT :limit OFFSET :offset
+    """
+
+    totals_row = await database.fetch_one(totals_sql, {"merchant_id": merchant_id})
+    rows = await database.fetch_all(
+        queue_sql,
+        {"merchant_id": merchant_id, "limit": page_size, "offset": offset},
+    )
+
+    totals = dict(totals_row) if totals_row else {
+        "beauty_total": 0, "missing_inci": 0,
+        "missing_how_to_use": 0, "missing_concerns": 0,
+        "total_incomplete": 0,
+    }
+
+    queue: List[Dict[str, Any]] = []
+    for r in rows or []:
+        row = dict(r)
+        has_inci = bool(row.get("has_inci"))
+        payload_owned = bool(row.get("inci_payload_owned"))
+        inci_status = (
+            "merchant-payload-locked" if payload_owned and has_inci
+            else "merchant-authored" if has_inci
+            else "missing"
+        )
+        concerns = row.get("concerns_json")
+        if isinstance(concerns, str):
+            try:
+                concerns = json.loads(concerns)
+            except Exception:
+                concerns = None
+        queue.append({
+            "platform": row["platform"],
+            "platform_product_id": row["platform_product_id"],
+            "title": row.get("title") or "Untitled product",
+            "image_url": row.get("image_url"),
+            "sku": None,
+            "category_kind": "beauty",
+            "fields": {
+                "raw_inci": {
+                    "status": inci_status,
+                    "value": row.get("sample_inci"),
+                    "confidence": None,
+                },
+                "how_to_use_text": {
+                    "status": _beauty_field_status(row.get("how_to_use_text")),
+                    "value": row.get("how_to_use_text"),
+                    "confidence": None,
+                },
+                "skin_concerns": {
+                    "status": _beauty_field_status(concerns),
+                    "value": concerns if isinstance(concerns, list) else None,
+                    "confidence": None,
+                },
+            },
+        })
+
+    total_incomplete = int(totals.get("total_incomplete") or 0)
+    has_more = (page * page_size) < total_incomplete
+
+    return {
+        "status": "success",
+        "data": {
+            "queue": queue,
+            "totals": {
+                "beauty_total": int(totals.get("beauty_total") or 0),
+                "missing_inci": int(totals.get("missing_inci") or 0),
+                "missing_how_to_use": int(totals.get("missing_how_to_use") or 0),
+                "missing_concerns": int(totals.get("missing_concerns") or 0),
+                "total_incomplete": total_incomplete,
+                "page": page,
+                "page_size": page_size,
+                "has_more": has_more,
+            },
+            "allowed_skin_concerns": list(ALLOWED_SKIN_CONCERNS),
         },
     }
 
