@@ -443,6 +443,30 @@ def _source_rank(src: Optional[str]) -> int:
         return len(_FASHION_SOURCE_PRIORITY)
 
 
+def _looks_like_text_value(v: Any) -> bool:
+    """material / care must be a non-blank string. Codex review noted
+    that an empty dict, list, or whitespace-only string from a corrupted
+    upstream row was passing the truthiness check and could land in a
+    TEXT column or surface to merchant-facing prose. Defend explicitly."""
+    return isinstance(v, str) and bool(v.strip())
+
+
+def _looks_like_size_guide_value(v: Any) -> bool:
+    """size_guide accepts strings (wrapped as {raw: ...}) or dicts
+    (structured charts). Lists, numbers, bools are rejected."""
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, dict):
+        return bool(v)
+    return False
+
+
+def _value_is_valid_for_field(field: str, value: Any) -> bool:
+    if field == "size_guide":
+        return _looks_like_size_guide_value(value)
+    return _looks_like_text_value(value)
+
+
 def _candidates_for(
     products: List[Dict[str, Any]],
     external_seed: Optional[Dict[str, Any]],
@@ -451,21 +475,28 @@ def _candidates_for(
     """Build the candidate list for one fashion field across all members
     of a product_group plus the matched external_product_seed.
 
-    Each candidate is `{value, source, confidence}` with provenance preserved
-    so the caller can record which source won (and so the read-side surface
-    can show "material from co-merchant X" if it ever wants to).
+    Each candidate is `{value, source, confidence, product_key,
+    is_primary}` with provenance preserved so the caller can record
+    which source won, and so equal-rank ties break deterministically
+    against the product_group primary member.
+
+    Type-gating per field is enforced here — a corrupted upstream row
+    with `material: []` or `care: {}` is dropped before it reaches the
+    coalesce sort or a merchant-facing surface.
     """
     out: List[Dict[str, Any]] = []
     src_col = f"{field}_source"
     conf_col = f"{field}_confidence"
     for p in products:
         v = p.get(field)
-        if v is None or v == "":
+        if not _value_is_valid_for_field(field, v):
             continue
         out.append({
             "value": v,
             "source": p.get(src_col),
             "confidence": p.get(conf_col),
+            "product_key": p.get("product_key") or "",
+            "is_primary": bool(p.get("group_is_primary")),
         })
     if external_seed is not None:
         seed_data = external_seed.get("seed_data") or {}
@@ -476,7 +507,14 @@ def _candidates_for(
                 seed_data = {}
         if isinstance(seed_data, dict):
             seed_val = seed_data.get(field)
-            if seed_val:
+            if _value_is_valid_for_field(field, seed_val):
+                # size_guide from a seed is the same plain-string shape
+                # the LLM extractor and the merchant-authored path use —
+                # wrap into {raw: ...} so downstream JSONB writers see a
+                # consistent dict. Was previously emitted unwrapped,
+                # producing inconsistent gateway shapes.
+                if field == "size_guide" and isinstance(seed_val, str):
+                    seed_val = {"raw": seed_val.strip()}
                 out.append({
                     "value": seed_val,
                     "source": "external_seed",
@@ -484,6 +522,8 @@ def _candidates_for(
                     # today; treat as 1.0 to keep ranking deterministic but
                     # park it at the lowest source priority above.
                     "confidence": 1.0,
+                    "product_key": "",
+                    "is_primary": False,
                 })
     return out
 
@@ -494,11 +534,18 @@ def coalesce_fashion_fields(
 ) -> Dict[str, Optional[Any]]:
     """Pick the winning material / care / size_guide across the product_group.
 
-    For each field, sort candidates by (source priority, confidence DESC) and
-    take the head. Each field is coalesced independently — the winning row
-    for material may differ from the winning row for size_guide. Returns a
-    dict with `<field>`, `<field>_source`, `<field>_confidence` for all three
-    fields (NULL when no candidate exists).
+    For each field, sort candidates by (source priority, confidence DESC,
+    is_primary DESC, product_key ASC) and take the head. Each field is
+    coalesced independently — the winning row for material may differ
+    from the winning row for size_guide.
+
+    Deterministic tie-breaking: equal source + confidence is resolved by
+    preferring the product_group primary member, then by alphabetic
+    product_key. Codex review flagged that unordered ties could flap
+    between merchants on every refresh; this pins them.
+
+    Returns a dict with `<field>`, `<field>_source`, `<field>_confidence`
+    for all three fields (None when no candidate exists).
     """
     coalesced: Dict[str, Optional[Any]] = {}
     for field in ("material", "care", "size_guide"):
@@ -511,6 +558,9 @@ def coalesce_fashion_fields(
         candidates.sort(key=lambda c: (
             _source_rank(c["source"]),
             -(c["confidence"] if isinstance(c.get("confidence"), (int, float)) else 0.0),
+            # is_primary True (0) wins over False (1)
+            0 if c.get("is_primary") else 1,
+            c.get("product_key") or "",
         ))
         winner = candidates[0]
         coalesced[field] = winner["value"]

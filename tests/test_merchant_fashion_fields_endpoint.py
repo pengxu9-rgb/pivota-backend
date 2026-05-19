@@ -153,3 +153,59 @@ async def test_all_null_body_still_calls_service(monkeypatch):
     )
     assert resp == {"status": "success", "outcomes": {}}
     write_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_all_outcomes_product_not_found_returns_404(monkeypatch):
+    """Codex review #8 — `product_not_found` was buried under top-level
+    "success". When every reported outcome is product_not_found, return
+    HTTP 404 with the outcomes payload preserved in the error detail."""
+    import routes.merchant_products as module
+    monkeypatch.setattr(
+        module.database, "fetch_one",
+        AsyncMock(return_value={"platform_product_id": "p1"}),
+    )
+    write_mock = AsyncMock(return_value={
+        "material": "product_not_found",
+        "care": "product_not_found",
+    })
+    monkeypatch.setattr(module, "write_merchant_authored_fashion_fields", write_mock)
+
+    with pytest.raises(HTTPException) as exc:
+        await module.update_product_fashion_fields(
+            platform="shopify",
+            platform_product_id="p1",
+            body=_body(material="x", care="y"),
+            current_user={"role": "merchant", "merchant_id": "m1"},
+        )
+    assert exc.value.status_code == 404
+    assert exc.value.detail["code"] == "catalog_product_not_found"
+    assert exc.value.detail["outcomes"]["material"] == "product_not_found"
+
+
+@pytest.mark.asyncio
+async def test_mixed_outcome_with_some_writes_still_200(monkeypatch):
+    """If some fields wrote and one wasn't found, we keep the 200 path
+    so the merchant sees what landed. Only an all-not-found response
+    escalates to 404."""
+    import routes.merchant_products as module
+    monkeypatch.setattr(
+        module.database, "fetch_one",
+        AsyncMock(return_value={"platform_product_id": "p1"}),
+    )
+    write_mock = AsyncMock(return_value={
+        "material": "written",
+        "care": "product_not_found",  # not possible in practice (service
+        # short-circuits on first not-found) but the route shouldn't crash
+        # if the service ever returns this shape.
+    })
+    monkeypatch.setattr(module, "write_merchant_authored_fashion_fields", write_mock)
+
+    resp = await module.update_product_fashion_fields(
+        platform="shopify",
+        platform_product_id="p1",
+        body=_body(material="x", care="y"),
+        current_user={"role": "merchant", "merchant_id": "m1"},
+    )
+    assert resp["status"] == "success"
+    assert resp["outcomes"]["material"] == "written"
