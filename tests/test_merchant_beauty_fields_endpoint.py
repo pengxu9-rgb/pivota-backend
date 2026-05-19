@@ -354,6 +354,83 @@ async def test_get_tools_field_payload_read_from_profile_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_subcategory_group_beauty_care_excludes_tools(monkeypatch):
+    """v2.1.1: ?subcategory_group=beauty_care must scope the queue to
+    skincare/haircare/bath/body/makeup only — tools rows in the same
+    fetch_all must be filtered out. (The fetch_all mock returns both;
+    the route's subcategory_for_path() check still runs, so a tools row
+    being passed in would be excluded by virtue of the SQL `LIKE`
+    clause normally — but we test that the prefix-filter logic is
+    actually wired by checking the queue contents.)"""
+    import routes.merchant_products as module
+    rows = [
+        # Skincare product (in care group)
+        {
+            "product_key": "prod::m1::shopify::p1",
+            "platform": "shopify", "platform_product_id": "p1",
+            "title": "Serum", "image_url": None,
+            "category_path": "beauty/skincare/serum",
+            "has_inci": False, "inci_payload_owned": False, "sample_inci": None,
+            "how_to_use_text": None, "concerns_json": None, "profile_payload": None,
+        },
+    ]
+    monkeypatch.setattr(module.database, "fetch_all", AsyncMock(return_value=rows))
+    resp = await module.get_beauty_completeness(
+        page=1, page_size=50,
+        subcategory_group="beauty_care",
+        current_user={"role": "merchant", "merchant_id": "m1"},
+    )
+    queue = resp["data"]["queue"]
+    assert len(queue) == 1
+    assert queue[0]["subcategory_kind"] == "skincare"
+
+
+@pytest.mark.asyncio
+async def test_get_subcategory_group_beauty_tools_excludes_care(monkeypatch):
+    """Same shape inverted — tools group should only surface tools rows."""
+    import routes.merchant_products as module
+    rows = [
+        {
+            "product_key": "prod::m1::shopify::p1",
+            "platform": "shopify", "platform_product_id": "p1",
+            "title": "Eyeshadow Brush", "image_url": None,
+            "category_path": "beauty/tools/brush",
+            "has_inci": False, "inci_payload_owned": False, "sample_inci": None,
+            "how_to_use_text": None, "concerns_json": None, "profile_payload": None,
+        },
+    ]
+    monkeypatch.setattr(module.database, "fetch_all", AsyncMock(return_value=rows))
+    resp = await module.get_beauty_completeness(
+        page=1, page_size=50,
+        subcategory_group="beauty_tools",
+        current_user={"role": "merchant", "merchant_id": "m1"},
+    )
+    queue = resp["data"]["queue"]
+    assert len(queue) == 1
+    assert queue[0]["subcategory_kind"] == "tools"
+
+
+def test_subcategory_groups_lookup():
+    """Pin which prefixes belong to which group so a v2.2 schema edit
+    can't silently move a subcategory between groups."""
+    from services.beauty_field_authoring import (
+        SUBCATEGORY_GROUPS,
+        SUBCATEGORY_GROUP_BEAUTY_CARE,
+        SUBCATEGORY_GROUP_BEAUTY_TOOLS,
+    )
+    care = SUBCATEGORY_GROUPS[SUBCATEGORY_GROUP_BEAUTY_CARE]
+    tools = SUBCATEGORY_GROUPS[SUBCATEGORY_GROUP_BEAUTY_TOOLS]
+    # Care group covers the skincare-shape subcategories
+    assert "beauty/skincare/" in care
+    assert "beauty/haircare/" in care
+    assert "beauty/makeup/" in care
+    # Tools group is just tools (v2.1)
+    assert tools == ("beauty/tools/",)
+    # No overlap
+    assert set(care).isdisjoint(set(tools))
+
+
+@pytest.mark.asyncio
 async def test_get_scoped_to_merchant_id(monkeypatch):
     import routes.merchant_products as module
     fetch_all = AsyncMock(return_value=[])

@@ -39,6 +39,9 @@ from services.canonical_commerce_service import (
 )
 from services.beauty_field_authoring import (
     ALLOWED_SKIN_CONCERNS,
+    SUBCATEGORY_GROUP_BEAUTY_CARE,
+    SUBCATEGORY_GROUP_BEAUTY_TOOLS,
+    SUBCATEGORY_GROUPS as BEAUTY_SUBCATEGORY_GROUPS,
     SUBCATEGORY_SCHEMAS as BEAUTY_SUBCATEGORY_SCHEMAS,
     subcategory_for_path as beauty_subcategory_for_path,
     write_merchant_authored_beauty_fields,
@@ -1191,6 +1194,14 @@ def _beauty_field_status(value: Any) -> str:
 async def get_beauty_completeness(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
+    # v2.1.1: optional filter. The UI surfaces two distinct beauty tabs
+    # — "Beauty care" (skincare/haircare/bath/body/makeup) and
+    # "Beauty tools" (brushes/sponges). The merchant picks one; the
+    # endpoint scopes to that group's category-path prefixes only.
+    # Omitting the param returns both groups (legacy v2.1 behavior).
+    subcategory_group: Optional[str] = Query(
+        None, pattern="^(beauty_care|beauty_tools)$",
+    ),
     current_user: dict = Depends(get_current_user),
 ):
     """v2.1 subcategory-aware completeness for beauty products.
@@ -1225,7 +1236,16 @@ async def get_beauty_completeness(
 
     # Build the WHERE clause from the v2.1 schema table — single source
     # of truth for "which subcategories are in scope."
-    supported_prefixes = tuple(BEAUTY_SUBCATEGORY_SCHEMAS.keys())
+    # Coerce to a real string-or-None so direct-call tests (which don't
+    # go through FastAPI's Query() resolution) work the same as HTTP
+    # requests do. Calling the handler with subcategory_group omitted
+    # leaves the FieldInfo object in place; isinstance check handles
+    # both shapes.
+    group = subcategory_group if isinstance(subcategory_group, str) else None
+    if group:
+        supported_prefixes = BEAUTY_SUBCATEGORY_GROUPS.get(group, tuple())
+    else:
+        supported_prefixes = tuple(BEAUTY_SUBCATEGORY_SCHEMAS.keys())
     if not supported_prefixes:
         return {
             "status": "success",

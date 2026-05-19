@@ -124,6 +124,15 @@ _TOOLS_FIELDS: Tuple[Dict[str, Any], ...] = (
 )
 
 
+# Two top-level groups the UI surfaces as separate tabs. "Beauty care" =
+# skincare-shape products (skincare/haircare/bath/body/makeup) which ALL
+# get prompted for INCI + how-to-use. "Beauty tools" = brushes / sponges /
+# applicators which get material + use-with + care instructions. Keeping
+# these distinct in the API + UI is the v2.1.1 simplification (users
+# found a single mixed Beauty tab with mid-flow form-switching confusing).
+SUBCATEGORY_GROUP_BEAUTY_CARE = "beauty_care"
+SUBCATEGORY_GROUP_BEAUTY_TOOLS = "beauty_tools"
+
 SUBCATEGORY_SCHEMAS: Dict[str, Dict[str, Any]] = {
     # Skincare / haircare / bath / body all share the same field set —
     # ingredients, how-to-use, and (loosely) skin concerns. Haircare uses
@@ -131,21 +140,25 @@ SUBCATEGORY_SCHEMAS: Dict[str, Dict[str, Any]] = {
     # sensitive) covers the most-asked cases.
     "beauty/skincare/": {
         "subcategory_kind": "skincare",
+        "subcategory_group": SUBCATEGORY_GROUP_BEAUTY_CARE,
         "label": "Skincare",
         "fields": _SKINCARE_FIELDS,
     },
     "beauty/haircare/": {
         "subcategory_kind": "haircare",
+        "subcategory_group": SUBCATEGORY_GROUP_BEAUTY_CARE,
         "label": "Haircare",
         "fields": _SKINCARE_FIELDS,
     },
     "beauty/bath/": {
         "subcategory_kind": "bath",
+        "subcategory_group": SUBCATEGORY_GROUP_BEAUTY_CARE,
         "label": "Bath",
         "fields": _SKINCARE_FIELDS,
     },
     "beauty/body/": {
         "subcategory_kind": "body",
+        "subcategory_group": SUBCATEGORY_GROUP_BEAUTY_CARE,
         "label": "Body",
         "fields": _SKINCARE_FIELDS,
     },
@@ -155,22 +168,39 @@ SUBCATEGORY_SCHEMAS: Dict[str, Dict[str, Any]] = {
     # in v2.2 as they're per-SKU and need shade-row schema work.
     "beauty/makeup/": {
         "subcategory_kind": "makeup",
+        "subcategory_group": SUBCATEGORY_GROUP_BEAUTY_CARE,
         "label": "Makeup",
         "fields": (
             _SKINCARE_FIELDS[0],  # raw_inci
             _SKINCARE_FIELDS[1],  # how_to_use_text
         ),
     },
-    # Tools — the v2.0 noise case. Brushes have material/use_with/care,
-    # not ingredients.
+    # Tools — distinct group from beauty care. Brushes / sponges /
+    # applicators have material/use_with/care, NOT ingredients.
     "beauty/tools/": {
         "subcategory_kind": "tools",
+        "subcategory_group": SUBCATEGORY_GROUP_BEAUTY_TOOLS,
         "label": "Beauty tools",
         "fields": _TOOLS_FIELDS,
     },
     # Fragrance, accessories, others are NOT in the queue for v2.1 —
     # they need their own schemas (notes/family for fragrance; closer
     # to fashion for accessories). Adding them is a v2.2 follow-up.
+}
+
+
+# Reverse-lookup map: subcategory_group → list of category_path prefixes
+# in that group. Used by the route's GROUP filter so the SQL `LIKE`
+# clauses stay narrow.
+SUBCATEGORY_GROUPS: Dict[str, Tuple[str, ...]] = {
+    SUBCATEGORY_GROUP_BEAUTY_CARE: tuple(
+        prefix for prefix, schema in SUBCATEGORY_SCHEMAS.items()
+        if schema["subcategory_group"] == SUBCATEGORY_GROUP_BEAUTY_CARE
+    ),
+    SUBCATEGORY_GROUP_BEAUTY_TOOLS: tuple(
+        prefix for prefix, schema in SUBCATEGORY_SCHEMAS.items()
+        if schema["subcategory_group"] == SUBCATEGORY_GROUP_BEAUTY_TOOLS
+    ),
 }
 
 
