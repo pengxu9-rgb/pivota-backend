@@ -127,23 +127,35 @@ def _normalize_subdivision(country: str, state: str) -> str:
 
 def _build_wix_address(order: Dict[str, Any]) -> Dict[str, Any]:
     shipping_address = _coerce_dict(order.get("shipping_address"))
-    first_name, last_name = _name_parts(order)
     country = _clean_str(shipping_address.get("country")).upper() or "US"
-    return {
-        "fullName": {
-            "firstName": first_name,
-            "lastName": last_name,
-        },
+    address = {
         "country": country,
         "subdivision": _normalize_subdivision(country, shipping_address.get("state")),
         "city": _clean_str(shipping_address.get("city")),
         "postalCode": _clean_str(shipping_address.get("postal_code")),
-        "zipCode": _clean_str(shipping_address.get("postal_code")),
-        "addressLine1": _clean_str(shipping_address.get("address_line1")),
         "addressLine": _clean_str(shipping_address.get("address_line1")),
-        "addressLine2": _clean_str(shipping_address.get("address_line2")),
+    }
+    address_line_2 = _clean_str(shipping_address.get("address_line2"))
+    if address_line_2:
+        address["addressLine2"] = address_line_2
+    return address
+
+
+def _build_wix_contact_details(order: Dict[str, Any]) -> Dict[str, Any]:
+    shipping_address = _coerce_dict(order.get("shipping_address"))
+    first_name, last_name = _name_parts(order)
+    return {
+        "firstName": first_name,
+        "lastName": last_name,
         "phone": _clean_str(shipping_address.get("phone")),
-        "email": _clean_str(order.get("customer_email")),
+        "company": _clean_str(shipping_address.get("company")),
+    }
+
+
+def _build_wix_address_with_contact(order: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "address": _build_wix_address(order),
+        "contactDetails": _build_wix_contact_details(order),
     }
 
 
@@ -212,7 +224,12 @@ def _build_wix_line_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
     sku = _clean_str(item.get("sku"))
     if sku:
-        line_item["sku"] = sku
+        line_item["physicalProperties"] = {
+            "sku": sku,
+            "shippable": True,
+        }
+    else:
+        line_item["physicalProperties"] = {"shippable": True}
 
     product_id = _clean_str(
         item.get("wix_product_id")
@@ -248,47 +265,42 @@ def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
     order = dict(order_dict or {})
     order_id = _clean_str(order.get("order_id"))
     email = _clean_str(order.get("customer_email"))
-    first_name, last_name = _name_parts(order)
     address = _build_wix_address(order)
-    payment_reference = _clean_str(order.get("payment_intent_id") or order_id)
-    payment_status = _clean_str(order.get("payment_status")).lower()
     currency = _clean_str(order.get("currency")).upper() or "USD"
     line_items = [_build_wix_line_item(item) for item in _as_order_items(order.get("items"))]
+    address_with_contact = _build_wix_address_with_contact(order)
+    shipping_fee = _money_str(order.get("shipping_fee"))
 
     billing_info: Dict[str, Any] = {
         "address": address,
-        "firstName": first_name,
-        "lastName": last_name,
-        "email": email,
-        "phone": address.get("phone") or "",
-        "paymentMethod": DEFAULT_WIX_PAYMENT_METHOD,
+        "contactDetails": _build_wix_contact_details(order),
     }
-    if payment_reference:
-        billing_info["paymentProviderTransactionId"] = payment_reference
 
     wix_order = {
         "lineItems": line_items,
         "shippingInfo": {
-            "shipmentDetails": {
-                "address": address,
-                "shippingCarrier": "Pivota",
-                "shippingMethod": "Pivota External Shipping",
-            }
+            "code": "pivota_standard_shipping",
+            "title": "Pivota Standard Shipping",
+            "logistics": {
+                "deliveryTime": "3 - 5 business days",
+                "shippingDestination": address_with_contact,
+            },
+            "cost": {
+                "price": {"amount": shipping_fee},
+                "totalPriceBeforeTax": {"amount": shipping_fee},
+                "totalPriceAfterTax": {"amount": shipping_fee},
+            },
+            "region": {"name": "Pivota External Shipping"},
         },
+        "recipientInfo": address_with_contact,
         "billingInfo": billing_info,
-        "buyerInfo": {
-            "email": email,
-            "firstName": first_name,
-            "lastName": last_name,
-        },
-        "paymentMethod": DEFAULT_WIX_PAYMENT_METHOD,
-        "paymentStatus": "PAID" if payment_status == "paid" else "NOT_PAID",
-        "fulfillmentStatus": "NOT_FULFILLED",
+        "buyerInfo": {"email": email},
+        "paymentStatus": "NOT_PAID",
         "currency": currency,
         "taxIncludedInPrices": False,
         "priceSummary": {
             "subtotal": {"amount": _money_str(order.get("subtotal"))},
-            "shipping": {"amount": _money_str(order.get("shipping_fee"))},
+            "shipping": {"amount": shipping_fee},
             "tax": {"amount": _money_str(order.get("tax"))},
             "total": {"amount": _money_str(order.get("total"))},
         },
@@ -299,7 +311,16 @@ def build_wix_order_payload(order_dict: Dict[str, Any]) -> Dict[str, Any]:
         },
         "buyerNote": f"Pivota Order ID: {order_id}" if order_id else "Pivota order",
     }
-    return {"order": wix_order}
+    return {
+        "order": wix_order,
+        "settings": {
+            "orderApprovalStrategy": "PAYMENT_RECEIVED",
+            "notifications": {
+                "sendNotificationToBuyer": False,
+                "sendNotificationsToBusiness": False,
+            },
+        },
+    }
 
 
 def build_wix_payment_payload(order_dict: Dict[str, Any], wix_order_id: str) -> Dict[str, Any]:

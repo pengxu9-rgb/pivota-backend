@@ -123,8 +123,25 @@ async def test_create_wix_order_posts_payload_and_returns_order_id(monkeypatch):
         "catalogItemId": "prod_wix_1",
         "options": {"variantId": "var_wix_1"},
     }
-    assert order["shippingInfo"]["shipmentDetails"]["address"]["city"] == "Austin"
-    assert order["billingInfo"]["paymentMethod"] == "Pivota External Payment"
+    assert order["lineItems"][0]["physicalProperties"] == {
+        "sku": "SKU-WIX-1",
+        "shippable": True,
+    }
+    assert order["shippingInfo"]["logistics"]["shippingDestination"]["address"]["city"] == "Austin"
+    assert order["shippingInfo"]["logistics"]["shippingDestination"]["contactDetails"]["firstName"] == "Wix"
+    assert order["shippingInfo"]["cost"]["price"]["amount"] == "4.00"
+    assert order["recipientInfo"] == order["shippingInfo"]["logistics"]["shippingDestination"]
+    assert order["billingInfo"]["contactDetails"]["lastName"] == "Buyer"
+    assert order["paymentStatus"] == "NOT_PAID"
+    assert "fulfillmentStatus" not in order
+    assert "paymentMethod" not in order
+    assert captured["json"]["settings"] == {
+        "orderApprovalStrategy": "PAYMENT_RECEIVED",
+        "notifications": {
+            "sendNotificationToBuyer": False,
+            "sendNotificationsToBusiness": False,
+        },
+    }
     assert captured["payment_url"] == (
         wix_adapter.WIX_ECOM_ADD_PAYMENT_URL_TEMPLATE.format(order_id="wix_order_123")
     )
@@ -556,16 +573,20 @@ def test_build_wix_order_payload_populates_required_wix_fields_from_order():
     assert order["lineItems"][0]["catalogReference"]["catalogItemId"] == "prod_wix_1"
     assert order["lineItems"][0]["catalogReference"]["options"]["variantId"] == "var_wix_1"
     assert order["lineItems"][0]["selectedOptions"] == [{"option": "Size", "selection": "M"}]
-    assert order["shippingInfo"]["shipmentDetails"]["address"]["postalCode"] == "78701"
-    assert order["billingInfo"]["email"] == "buyer@example.com"
-    assert order["billingInfo"]["paymentProviderTransactionId"] == "pi_wix_1"
-    assert order["billingInfo"]["paymentMethod"] == "Pivota External Payment"
-    assert order["paymentMethod"] == "Pivota External Payment"
-    assert order["paymentStatus"] == "PAID"
+    assert order["lineItems"][0]["physicalProperties"]["shippable"] is True
+    assert order["lineItems"][0]["physicalProperties"]["sku"] == "SKU-WIX-1"
+    assert order["shippingInfo"]["logistics"]["shippingDestination"]["address"]["postalCode"] == "78701"
+    assert order["shippingInfo"]["logistics"]["shippingDestination"]["contactDetails"]["phone"] == "555-0100"
+    assert order["buyerInfo"]["email"] == "buyer@example.com"
+    assert order["billingInfo"]["contactDetails"]["firstName"] == "Wix"
+    assert order["paymentStatus"] == "NOT_PAID"
+    assert "paymentMethod" not in order
+    assert "fulfillmentStatus" not in order
     assert order["taxIncludedInPrices"] is False
     assert order["lineItems"][0]["taxInfo"]["taxAmount"]["amount"] == "0.00"
     assert order["lineItems"][0]["taxInfo"]["taxableAmount"]["amount"] == "25.00"
     assert order["priceSummary"]["total"]["amount"] == "31.00"
+    assert payload["settings"]["orderApprovalStrategy"] == "PAYMENT_RECEIVED"
 
 
 @pytest.mark.asyncio
