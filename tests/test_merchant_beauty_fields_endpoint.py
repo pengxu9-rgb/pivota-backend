@@ -259,6 +259,26 @@ async def test_get_scoped_to_merchant_id(monkeypatch):
     assert fetch_all.call_args.args[1]["merchant_id"] == "merch_legit"
 
 
+def test_beauty_prefixes_exclude_tools_and_accessories():
+    """v2.0.1: tools / accessories / brushes don't have INCI or skin
+    concerns. The prefix tuple gates them out at the SQL layer. Pin
+    the exact prefixes so a future refactor can't silently widen the
+    surface back to all of beauty/."""
+    from routes.merchant_products import _BEAUTY_CATEGORY_PREFIXES
+    # Subcategories where the 3 fields apply
+    assert "beauty/skincare/" in _BEAUTY_CATEGORY_PREFIXES
+    assert "beauty/haircare/" in _BEAUTY_CATEGORY_PREFIXES
+    assert "beauty/makeup/" in _BEAUTY_CATEGORY_PREFIXES
+    assert "beauty/fragrance/" in _BEAUTY_CATEGORY_PREFIXES
+    # Excluded subcategories — these had no business being prompted
+    # for ingredients in v2.0
+    assert "beauty/tools/" not in _BEAUTY_CATEGORY_PREFIXES
+    assert "beauty/accessories/" not in _BEAUTY_CATEGORY_PREFIXES
+    # The catch-all `beauty/` prefix MUST NOT appear — that would
+    # re-include the excluded subcategories.
+    assert "beauty/" not in _BEAUTY_CATEGORY_PREFIXES
+
+
 @pytest.mark.asyncio
 async def test_get_response_includes_allowed_skin_concerns_enum(monkeypatch):
     """UI uses this to render the multi-select without hard-coding the enum."""

@@ -1160,7 +1160,34 @@ async def update_product_beauty_fields(
     }
 
 
-_BEAUTY_CATEGORY_PREFIXES = ("beauty/",)
+# Beauty subcategories where INCI / how_to_use / skin_concerns actually
+# apply. Tools, brushes, accessories, applicators don't have ingredients
+# or skin concerns — prompting the merchant for them is wrong (a
+# foundation brush has no INCI list). Per the preview-test feedback from
+# PawStyle, where 608 pet grooming products got mis-classified under
+# `beauty/tools/` and the agent surfaced ingredient prompts for all of
+# them. The classifier mis-classification is a separate concern; this
+# filter at least prevents the agent surface from asking the wrong
+# questions while that's worked through.
+#
+# Subcategories where the 3 fields apply:
+#   - skincare (cleanse, treat, moisturize)
+#   - haircare (skin_concerns becomes hair_concerns conceptually but the
+#     enum overlaps enough — dry, oily, sensitive — for v1)
+#   - makeup (INCI applies; concerns less so but acceptable)
+#   - fragrance (INCI roughly maps to fragrance notes; loose fit, fine)
+#   - bath / body (same as skincare)
+#
+# Future v2.1 should fork per-subcategory field sets — makeup wants
+# shade/finish, fragrance wants notes, tools want material/use_with.
+_BEAUTY_CATEGORY_PREFIXES = (
+    "beauty/skincare/",
+    "beauty/haircare/",
+    "beauty/makeup/",
+    "beauty/fragrance/",
+    "beauty/bath/",
+    "beauty/body/",
+)
 
 
 def _beauty_field_status(value: Any) -> str:
