@@ -1,8 +1,11 @@
+import logging
 from sqlalchemy import Table, Column, Integer, String, DateTime, Float, Index
 from sqlalchemy.sql import func
 from typing import Any, Dict, List, Optional
 
 from db.database import metadata, database
+
+logger = logging.getLogger(__name__)
 
 
 # Event log for Agent product interactions (for LTR / reranker labels).
@@ -62,6 +65,28 @@ async def log_product_events(rows: List[Dict[str, Any]]) -> None:
     if not clean_rows:
         return
 
+    # PR #560 moved this call from awaited-inline to a FastAPI
+    # background_task. Background tasks run after the response is sent,
+    # so under TestClient (and any other lifecycle where the DB pool is
+    # torn down before the task completes) the pool can be None by the
+    # time we get here. `databases.Database.execute_many` asserts the
+    # pool is alive, raising "DatabaseBackend is not running" inside the
+    # background task. The function is documented best-effort — if the
+    # pool isn't up we have nowhere to write to anyway, so no-op cleanly.
+    if not getattr(database, "is_connected", False):
+        logger.debug(
+            "log_product_events: database pool not connected; skipping %d rows",
+            len(clean_rows),
+        )
+        return
+
     query = agent_product_events.insert()
-    await database.execute_many(query, clean_rows)
+    try:
+        await database.execute_many(query, clean_rows)
+    except Exception:  # noqa: BLE001 — best-effort logger must never raise
+        logger.debug(
+            "log_product_events: execute_many failed; dropping %d rows",
+            len(clean_rows),
+            exc_info=True,
+        )
 
