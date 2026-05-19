@@ -568,6 +568,20 @@ agent_pdp_view = Table(
     Column("pdp_lifecycle_stage", String(16), nullable=True),
     Column("sync_status", String(16), nullable=True),
     Column("primary_merchant_id", String(64), nullable=True),
+    # Phase O-5b cross-PDP coalesce: material/care/size_guide aggregated
+    # from all product_group_members + matched external_product_seeds,
+    # picked by source-priority ordering in services/agent_pdp_view_assembler.
+    # Source enum mirrors catalog_products: merchant_payload >
+    # merchant_authored > llm_extraction_v1 > external_seed.
+    Column("material", Text, nullable=True),
+    Column("material_source", String(32), nullable=True),
+    Column("material_confidence", Float, nullable=True),
+    Column("care", Text, nullable=True),
+    Column("care_source", String(32), nullable=True),
+    Column("care_confidence", Float, nullable=True),
+    Column("size_guide", JSONB_TYPE, nullable=True),
+    Column("size_guide_source", String(32), nullable=True),
+    Column("size_guide_confidence", Float, nullable=True),
     Column("refreshed_at", DateTime, server_default=func.now(), nullable=False),
     Column("refreshed_by_proposal_id", BigInteger, nullable=True),
     Column("refresh_source", Text, nullable=True),

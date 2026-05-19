@@ -71,6 +71,15 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
           cp.canonical_url,
           cp.sync_status,
           cp.created_at,
+          cp.material,
+          cp.material_source,
+          cp.material_confidence,
+          cp.care,
+          cp.care_source,
+          cp.care_confidence,
+          cp.size_guide,
+          cp.size_guide_source,
+          cp.size_guide_confidence,
           pgm.product_group_id,
           pgm.is_primary AS group_is_primary
         FROM catalog_products cp
@@ -410,6 +419,106 @@ def build_breadcrumb(canonical: Dict[str, Any], pdp_url: Optional[str]) -> Optio
     return crumbs
 
 
+# Source-priority ordering used by coalesce_fashion_fields. Lower index = higher
+# priority. Merchant_payload always wins (it's the merchant's authoritative
+# platform); merchant_authored beats LLM; LLM beats external_seed; unknown /
+# legacy sources fall through to the lowest priority. Order matters — do not
+# rearrange without updating the corresponding source-precedence rule in
+# services/fashion_field_authoring.py (write-side guard).
+_FASHION_SOURCE_PRIORITY = (
+    "merchant_payload",
+    "merchant_authored",
+    "llm_extraction_v1",
+    "external_seed",
+)
+
+
+def _source_rank(src: Optional[str]) -> int:
+    """Lower is better. Unknown / None falls to the worst rank."""
+    if not src:
+        return len(_FASHION_SOURCE_PRIORITY) + 1
+    try:
+        return _FASHION_SOURCE_PRIORITY.index(src)
+    except ValueError:
+        return len(_FASHION_SOURCE_PRIORITY)
+
+
+def _candidates_for(
+    products: List[Dict[str, Any]],
+    external_seed: Optional[Dict[str, Any]],
+    field: str,
+) -> List[Dict[str, Any]]:
+    """Build the candidate list for one fashion field across all members
+    of a product_group plus the matched external_product_seed.
+
+    Each candidate is `{value, source, confidence}` with provenance preserved
+    so the caller can record which source won (and so the read-side surface
+    can show "material from co-merchant X" if it ever wants to).
+    """
+    out: List[Dict[str, Any]] = []
+    src_col = f"{field}_source"
+    conf_col = f"{field}_confidence"
+    for p in products:
+        v = p.get(field)
+        if v is None or v == "":
+            continue
+        out.append({
+            "value": v,
+            "source": p.get(src_col),
+            "confidence": p.get(conf_col),
+        })
+    if external_seed is not None:
+        seed_data = external_seed.get("seed_data") or {}
+        if isinstance(seed_data, str):
+            try:
+                seed_data = json.loads(seed_data)
+            except Exception:
+                seed_data = {}
+        if isinstance(seed_data, dict):
+            seed_val = seed_data.get(field)
+            if seed_val:
+                out.append({
+                    "value": seed_val,
+                    "source": "external_seed",
+                    # Seed-derived confidence isn't structured in seed_data
+                    # today; treat as 1.0 to keep ranking deterministic but
+                    # park it at the lowest source priority above.
+                    "confidence": 1.0,
+                })
+    return out
+
+
+def coalesce_fashion_fields(
+    products: List[Dict[str, Any]],
+    external_seed: Optional[Dict[str, Any]],
+) -> Dict[str, Optional[Any]]:
+    """Pick the winning material / care / size_guide across the product_group.
+
+    For each field, sort candidates by (source priority, confidence DESC) and
+    take the head. Each field is coalesced independently — the winning row
+    for material may differ from the winning row for size_guide. Returns a
+    dict with `<field>`, `<field>_source`, `<field>_confidence` for all three
+    fields (NULL when no candidate exists).
+    """
+    coalesced: Dict[str, Optional[Any]] = {}
+    for field in ("material", "care", "size_guide"):
+        candidates = _candidates_for(products, external_seed, field)
+        if not candidates:
+            coalesced[field] = None
+            coalesced[f"{field}_source"] = None
+            coalesced[f"{field}_confidence"] = None
+            continue
+        candidates.sort(key=lambda c: (
+            _source_rank(c["source"]),
+            -(c["confidence"] if isinstance(c.get("confidence"), (int, float)) else 0.0),
+        ))
+        winner = candidates[0]
+        coalesced[field] = winner["value"]
+        coalesced[f"{field}_source"] = winner["source"]
+        coalesced[f"{field}_confidence"] = winner["confidence"]
+    return coalesced
+
+
 def assemble_row(
     *,
     content_key: str,
@@ -490,6 +599,8 @@ def assemble_row(
     taxonomy_tags = build_taxonomy_tags(canonical)
     category_path = coalesce_first(canonical.get("category"), canonical.get("product_type"))
 
+    fashion = coalesce_fashion_fields(products, external_seed)
+
     return {
         "content_key": content_key,
         "pivota_signature_id": sig,
@@ -513,6 +624,15 @@ def assemble_row(
         "pdp_lifecycle_stage": canonical.get("pdp_lifecycle_stage"),
         "sync_status": canonical.get("sync_status"),
         "primary_merchant_id": primary_merchant_id,
+        "material": fashion["material"],
+        "material_source": fashion["material_source"],
+        "material_confidence": fashion["material_confidence"],
+        "care": fashion["care"],
+        "care_source": fashion["care_source"],
+        "care_confidence": fashion["care_confidence"],
+        "size_guide": fashion["size_guide"],
+        "size_guide_source": fashion["size_guide_source"],
+        "size_guide_confidence": fashion["size_guide_confidence"],
         "refresh_source": refresh_source,
     }
 
@@ -525,6 +645,9 @@ UPSERT_SQL = """
       variants, variants_count, gtin13,
       category_path, taxonomy_tags, breadcrumb,
       pdp_lifecycle_stage, sync_status, primary_merchant_id,
+      material, material_source, material_confidence,
+      care, care_source, care_confidence,
+      size_guide, size_guide_source, size_guide_confidence,
       refreshed_at, refresh_source, refreshed_by_proposal_id
     ) VALUES (
       :content_key, :pivota_signature_id, :product_group_id,
@@ -533,6 +656,9 @@ UPSERT_SQL = """
       CAST(:variants AS jsonb), :variants_count, :gtin13,
       :category_path, CAST(:taxonomy_tags AS jsonb), CAST(:breadcrumb AS jsonb),
       :pdp_lifecycle_stage, :sync_status, :primary_merchant_id,
+      :material, :material_source, :material_confidence,
+      :care, :care_source, :care_confidence,
+      CAST(:size_guide AS jsonb), :size_guide_source, :size_guide_confidence,
       NOW(), :refresh_source, :refreshed_by_proposal_id
     )
     ON CONFLICT (content_key) DO UPDATE SET
@@ -557,6 +683,15 @@ UPSERT_SQL = """
       pdp_lifecycle_stage = EXCLUDED.pdp_lifecycle_stage,
       sync_status = EXCLUDED.sync_status,
       primary_merchant_id = EXCLUDED.primary_merchant_id,
+      material = EXCLUDED.material,
+      material_source = EXCLUDED.material_source,
+      material_confidence = EXCLUDED.material_confidence,
+      care = EXCLUDED.care,
+      care_source = EXCLUDED.care_source,
+      care_confidence = EXCLUDED.care_confidence,
+      size_guide = EXCLUDED.size_guide,
+      size_guide_source = EXCLUDED.size_guide_source,
+      size_guide_confidence = EXCLUDED.size_guide_confidence,
       refreshed_at = NOW(),
       refresh_source = EXCLUDED.refresh_source,
       refreshed_by_proposal_id = EXCLUDED.refreshed_by_proposal_id
@@ -578,5 +713,10 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     params["variants"] = to_jsonb(row.get("variants"))
     params["taxonomy_tags"] = to_jsonb(row.get("taxonomy_tags"))
     params["breadcrumb"] = to_jsonb(row.get("breadcrumb"))
+    # size_guide on catalog_products is already a JSONB value (stored as
+    # dict by the LLM extractor / authoring path). coalesce_fashion_fields
+    # passes it through verbatim. Re-encode for the SQLAlchemy bind. Other
+    # fashion fields are plain text + float and pass through unchanged.
+    params["size_guide"] = to_jsonb(row.get("size_guide"))
     params["refreshed_by_proposal_id"] = row.get("refreshed_by_proposal_id")
     return params

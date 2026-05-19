@@ -472,6 +472,30 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Phase O-5b cross-PDP coalesce: agent_pdp_view aggregates
+            # material/care/size_guide from all product_group_members +
+            # matched external_product_seeds. The columns mirror the
+            # catalog_products fashion fields (mig 094) but live on the
+            # denormalized view so the gateway gets them in one read.
+            # Migration 096_agent_pdp_view_fashion_fields.sql carries the
+            # same DDL for dev; schema_guard owns the prod-startup apply
+            # since fast-mode skips db/migrations/.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS agent_pdp_view
+                      ADD COLUMN IF NOT EXISTS material TEXT,
+                      ADD COLUMN IF NOT EXISTS material_source VARCHAR(32),
+                      ADD COLUMN IF NOT EXISTS material_confidence REAL,
+                      ADD COLUMN IF NOT EXISTS care TEXT,
+                      ADD COLUMN IF NOT EXISTS care_source VARCHAR(32),
+                      ADD COLUMN IF NOT EXISTS care_confidence REAL,
+                      ADD COLUMN IF NOT EXISTS size_guide JSONB,
+                      ADD COLUMN IF NOT EXISTS size_guide_source VARCHAR(32),
+                      ADD COLUMN IF NOT EXISTS size_guide_confidence REAL;
+                    """
+                )
+            )
             # Phase O-4: partial index covering only the live recall
             # stages so the recall-path WHERE clauses (Phase O-5) hit
             # an index instead of a heap scan.
