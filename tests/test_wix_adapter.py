@@ -176,6 +176,63 @@ async def test_create_wix_order_polls_until_wix_display_number_is_assigned(monke
 
 
 @pytest.mark.asyncio
+async def test_create_wix_order_fails_closed_when_wix_auto_fulfills_physical_order(monkeypatch):
+    from adapters import wix_adapter
+
+    class DummyAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            if url == wix_adapter.WIX_ECOM_CREATE_ORDER_URL:
+                return DummyResponse(201, {"id": "wix_order_auto_fulfilled"})
+            return DummyResponse(200, {"paymentsIds": ["wix_payment_auto_fulfilled"]})
+
+        async def get(self, url, headers=None):
+            return DummyResponse(
+                200,
+                {
+                    "order": {
+                        "id": "wix_order_auto_fulfilled",
+                        "number": "1005",
+                        "paymentStatus": "PAID",
+                        "fulfillmentStatus": "FULFILLED",
+                        "lineItems": [
+                            {
+                                "id": "line_1",
+                                "itemType": {"preset": "PHYSICAL"},
+                                "catalogReference": {
+                                    "catalogItemId": "prod_wix_1",
+                                    "options": {"variantId": "var_wix_1"},
+                                },
+                            }
+                        ],
+                    }
+                },
+            )
+
+    monkeypatch.setattr(wix_adapter.httpx, "AsyncClient", DummyAsyncClient)
+
+    result = await wix_adapter.create_wix_order("merch_wix", _wix_order())
+
+    assert result["order_id"] is None
+    assert result["status"] == "error"
+    assert result["error"] == "wix_physical_order_auto_fulfilled"
+    assert result["retryable"] is False
+    assert result["raw_response"]["platform_order_id"] == "wix_order_auto_fulfilled"
+    assert result["raw_response"]["number"] == "1005"
+    assert result["raw_response"]["observed_fulfillment_status"] == "FULFILLED"
+    assert result["raw_response"]["request_physical_line_items"] == 1
+    assert result["raw_response"]["observed_physical_line_items"] == 1
+
+
+@pytest.mark.asyncio
 async def test_create_wix_order_uses_bearer_only_for_explicit_oauth(monkeypatch):
     from adapters import wix_adapter
 
@@ -588,6 +645,87 @@ async def test_sync_order_to_connected_store_routes_to_wix_adapter(monkeypatch):
     assert order_events[0]["event_type"] == "merchant_order_created"
     assert order_events[0]["metadata"]["platform"] == "wix"
     assert order_events[1]["event_type"] == "wix_order_created"
+
+
+@pytest.mark.asyncio
+async def test_sync_order_to_connected_store_records_wix_auto_fulfilled_failure_metadata(monkeypatch):
+    from routes import order_routes
+
+    order_events: list[Dict[str, Any]] = []
+    sync_failures: list[Dict[str, Any]] = []
+    order = _wix_order()
+    order.pop("store")
+
+    async def fake_get_order(order_id: str):
+        assert order_id == "ORD_WIX_1"
+        return dict(order)
+
+    async def fake_get_primary_store(merchant_id: str):
+        assert merchant_id == "merch_wix"
+        return {"store_id": "store_wix_1", "platform": "wix", "domain": "site_123"}
+
+    async def fake_get_merchant_active_stores(merchant_id: str):
+        assert merchant_id == "merch_wix"
+        return [
+            {
+                "store_id": "store_wix_1",
+                "platform": "wix",
+                "status": "active",
+                "domain": "site_123",
+                "api_key": "IST.test_key",
+                "order_writeback_status": "enabled",
+            }
+        ]
+
+    async def fake_create_wix_order_via_adapter(merchant_id: str, order_dict: Dict[str, Any]):
+        return {
+            "order_id": None,
+            "status": "error",
+            "error": "wix_physical_order_auto_fulfilled",
+            "retryable": False,
+            "raw_response": {
+                "platform_order_id": "wix_order_auto_fulfilled",
+                "number": "1005",
+                "observed_fulfillment_status": "FULFILLED",
+                "request_physical_line_items": 1,
+                "observed_physical_line_items": 1,
+            },
+        }
+
+    async def fake_log_order_event(**kwargs):
+        order_events.append(kwargs)
+
+    async def fake_mark_failed(**kwargs):
+        sync_failures.append(kwargs)
+
+    @asynccontextmanager
+    async def fake_lock(*, lock_key: int):
+        yield True
+
+    monkeypatch.setattr(order_routes, "_pg_advisory_lock_best_effort", fake_lock)
+    monkeypatch.setattr(order_routes, "get_order", fake_get_order)
+    monkeypatch.setattr(order_routes, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(order_routes, "get_merchant_active_stores", fake_get_merchant_active_stores)
+    monkeypatch.setattr(order_routes, "create_wix_order_via_adapter", fake_create_wix_order_via_adapter)
+    monkeypatch.setattr(order_routes, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(order_routes, "_mark_merchant_order_sync_failed_best_effort", fake_mark_failed)
+
+    ok = await order_routes.sync_order_to_connected_store("ORD_WIX_1")
+
+    assert ok is False
+    assert [event["event_type"] for event in order_events] == [
+        "merchant_order_failed",
+        "wix_order_writeback_failed",
+    ]
+    failed_metadata = order_events[0]["metadata"]
+    assert failed_metadata["error"] == "wix_physical_order_auto_fulfilled"
+    assert failed_metadata["retryable"] is False
+    assert failed_metadata["platform_order_id"] == "wix_order_auto_fulfilled"
+    assert failed_metadata["number"] == "1005"
+    assert failed_metadata["observed_fulfillment_status"] == "FULFILLED"
+    assert failed_metadata["request_physical_line_items"] == 1
+    assert failed_metadata["observed_physical_line_items"] == 1
+    assert sync_failures[0]["platform"] == "wix"
 
 
 @pytest.mark.asyncio

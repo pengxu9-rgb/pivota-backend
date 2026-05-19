@@ -5507,6 +5507,17 @@ async def create_wix_order(order_id: str) -> bool:
                 last_error = str((result or {}).get("error") or message or "wix_order_writeback_failed")[:500]
                 last_retryable = bool((result or {}).get("retryable", True))
                 last_failure_metadata = {"platform": "wix", "error": last_error, "retryable": last_retryable}
+                if isinstance(raw_response, dict):
+                    for key in (
+                        "platform_order_id",
+                        "number",
+                        "observed_fulfillment_status",
+                        "request_physical_line_items",
+                        "observed_physical_line_items",
+                    ):
+                        value = raw_response.get(key)
+                        if value is not None:
+                            last_failure_metadata[key] = value
                 continue
 
             raw_response = (result or {}).get("raw_response")

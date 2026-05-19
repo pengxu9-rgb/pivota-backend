@@ -525,6 +525,78 @@ def _extract_wix_order_number(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _order_payload_object(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    order = payload.get("order")
+    if isinstance(order, dict):
+        return order
+    return payload
+
+
+def _order_fulfillment_status(payload: Optional[Dict[str, Any]]) -> str:
+    order = _order_payload_object(payload)
+    return _clean_str(order.get("fulfillmentStatus") or order.get("fulfillment_status")).upper()
+
+
+def _line_item_type(item: Dict[str, Any]) -> str:
+    raw_item_type = item.get("itemType") if isinstance(item, dict) else None
+    if isinstance(raw_item_type, dict):
+        return _clean_str(raw_item_type.get("preset") or raw_item_type.get("type")).upper()
+    return _clean_str(
+        item.get("lineItemType")
+        or item.get("item_type")
+        or raw_item_type
+    ).upper()
+
+
+def _physical_line_item_count(payload: Optional[Dict[str, Any]]) -> int:
+    order = _order_payload_object(payload)
+    line_items = order.get("lineItems")
+    if not isinstance(line_items, list):
+        return 0
+    return sum(1 for item in line_items if isinstance(item, dict) and _line_item_type(item) == "PHYSICAL")
+
+
+def _physical_order_auto_fulfillment_blocker(
+    *,
+    request_payload: Dict[str, Any],
+    create_payload: Dict[str, Any],
+    final_payload: Optional[Dict[str, Any]],
+    wix_order_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Block a paid physical Wix order that the API immediately marks fulfilled.
+
+    Wix computes fulfillmentStatus server-side. For physical goods, immediate
+    FULFILLED means the writeback payload is not preserving a merchant
+    fulfillment workflow, so we fail closed instead of linking the platform
+    order as successful.
+    """
+    observed_payload = final_payload if isinstance(final_payload, dict) and final_payload else create_payload
+    observed_fulfillment_status = _order_fulfillment_status(observed_payload)
+    request_physical_count = _physical_line_item_count(request_payload)
+    observed_physical_count = _physical_line_item_count(observed_payload)
+    if observed_fulfillment_status != "FULFILLED":
+        return None
+    if max(request_physical_count, observed_physical_count) <= 0:
+        return None
+
+    number = _extract_wix_order_number(observed_payload)
+    return {
+        "message": (
+            "Wix marked a physical order fulfilled immediately after create/payment; "
+            "order writeback is blocked until the shipping/fulfillment payload is corrected."
+        ),
+        "platform_order_id": wix_order_id,
+        "number": number or None,
+        "observed_fulfillment_status": observed_fulfillment_status,
+        "request_physical_line_items": request_physical_count,
+        "observed_physical_line_items": observed_physical_count,
+        "create_order_response": create_payload,
+        "add_payment_final_order_response": final_payload or {},
+    }
+
+
 def _paid_order_requires_payment_record(order: Dict[str, Any]) -> bool:
     payment_status = _clean_str(order.get("payment_status")).lower()
     status = _clean_str(order.get("status")).lower()
@@ -709,6 +781,27 @@ async def create_wix_order(
                     wix_order_id=wix_order_id,
                     headers=headers,
                 )
+                fulfillment_blocker = _physical_order_auto_fulfillment_blocker(
+                    request_payload=payload,
+                    create_payload=response_payload,
+                    final_payload=final_payload,
+                    wix_order_id=wix_order_id,
+                )
+                if fulfillment_blocker:
+                    logger.warning(
+                        "[Wix] Physical order auto-fulfilled after writeback; blocking success: "
+                        "merchant_id=%s order_id=%s wix_order_id=%s fulfillment_status=%s",
+                        merchant_id,
+                        order.get("order_id"),
+                        wix_order_id,
+                        fulfillment_blocker.get("observed_fulfillment_status"),
+                    )
+                    return _error_result(
+                        "wix_physical_order_auto_fulfilled",
+                        raw_response=fulfillment_blocker,
+                        status_code=response.status_code,
+                        retryable=False,
+                    )
     except httpx.RequestError as exc:
         logger.warning(
             "[Wix] Order writeback network error: merchant_id=%s order_id=%s error=%s",
