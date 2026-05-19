@@ -857,6 +857,205 @@ async def update_product_fashion_fields(
     }
 
 
+# ----------------------------------------------------------------------------
+# Fashion-field completeness — read endpoint for the merchant agent surface.
+#
+# The existing /merchant/readiness/optimization endpoint computes
+# fashion-field missing codes at the *lane* level (aggregate), not per
+# product, so the agent surface couldn't reliably enumerate "the 19
+# products missing material" from that payload alone. This is the
+# dedicated read for that flow.
+# ----------------------------------------------------------------------------
+
+# Category prefixes the gateway / writer treats as fashion. Mirrors
+# services/fashion_field_extractor._FASHION_CATEGORY_PREFIXES. Keep in
+# sync — drift would silently exclude products from the agent surface.
+_FASHION_CATEGORY_PREFIXES = ("fashion/", "apparel/", "clothing/", "shoes/", "accessories/")
+
+
+def _fashion_field_status(value: Any, source: Optional[str]) -> str:
+    """Map a (value, source) row to the UI's FieldStatus enum.
+
+    Mirrors types/fashion-authoring.ts on the UI side. Stable strings
+    here — adding a new status requires a coordinated UI change.
+    """
+    if value is None or value == "":
+        return "missing"
+    if source == "merchant_payload":
+        return "merchant-payload-locked"
+    if source == "merchant_authored":
+        return "merchant-authored"
+    if source == "llm_extraction_v1":
+        return "filled-by-llm"
+    if source == "external_seed":
+        return "inherited"
+    # Fallback when value exists but source is unknown (legacy rows).
+    return "merchant-authored"
+
+
+@router.get("/fashion_completeness")
+async def get_fashion_completeness(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
+):
+    """List the merchant's fashion-categorized products with per-field
+    material / care / size_guide state.
+
+    Powers the merchant agent surface (`/dashboard/agent-chat`):
+      - The trigger surface uses `queue` to render counts + sample chips
+      - The structured editor walks `queue` row-by-row
+      - The honest-feedback screen reads each product's per-field source
+
+    Filters server-side to products where at least one of material /
+    care / size_guide is missing (NULL or empty). Products already
+    fully covered don't need the agent to prompt.
+
+    Response shape (stable; the UI's `IncompleteProduct` type maps to it):
+        {
+          "status": "success",
+          "data": {
+            "queue": [ { platform, platform_product_id, title, image_url,
+                          sku, fields: { material: { status, value,
+                          confidence }, care: {...}, size_guide: {...} } } ],
+            "totals": { fashion_total, missing_material, missing_care,
+                         missing_size_guide, page, page_size,
+                         has_more }
+          }
+        }
+    """
+    if current_user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Only merchants can read fashion completeness")
+
+    merchant_id = current_user.get("merchant_id")
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Missing merchant_id on current user")
+
+    category_clause = " OR ".join(
+        f"LOWER(cp.category_path) LIKE '{p}%'" for p in _FASHION_CATEGORY_PREFIXES
+    )
+    offset = (page - 1) * page_size
+
+    # Counts first — cheap, lets the UI render totals before the queue
+    # paginates. One round-trip; counts and queue both pull from the
+    # same FROM clause via a filtered aggregate.
+    totals_sql = f"""
+        SELECT
+          COUNT(*) AS fashion_total,
+          COUNT(*) FILTER (WHERE cp.material IS NULL OR cp.material = '') AS missing_material,
+          COUNT(*) FILTER (WHERE cp.care IS NULL OR cp.care = '') AS missing_care,
+          COUNT(*) FILTER (WHERE cp.size_guide IS NULL) AS missing_size_guide,
+          COUNT(*) FILTER (WHERE
+            (cp.material IS NULL OR cp.material = '')
+            OR (cp.care IS NULL OR cp.care = '')
+            OR cp.size_guide IS NULL
+          ) AS total_incomplete
+        FROM catalog_products cp
+        WHERE cp.merchant_id = :merchant_id
+          AND ({category_clause})
+    """
+
+    queue_sql = f"""
+        SELECT
+          cp.platform,
+          cp.source_product_id AS platform_product_id,
+          cp.title,
+          cp.image_url,
+          cp.material,
+          cp.material_source,
+          cp.material_confidence,
+          cp.care,
+          cp.care_source,
+          cp.care_confidence,
+          cp.size_guide,
+          cp.size_guide_source,
+          cp.size_guide_confidence,
+          cp.category_path
+        FROM catalog_products cp
+        WHERE cp.merchant_id = :merchant_id
+          AND ({category_clause})
+          AND (
+            (cp.material IS NULL OR cp.material = '')
+            OR (cp.care IS NULL OR cp.care = '')
+            OR cp.size_guide IS NULL
+          )
+        ORDER BY
+          -- Stable, deterministic order so paging is consistent across
+          -- requests and the cursor in the agent surface lands on the
+          -- same product on remount.
+          cp.last_seen_in_sync_at DESC NULLS LAST,
+          cp.product_key ASC
+        LIMIT :limit OFFSET :offset
+    """
+
+    totals_row = await database.fetch_one(
+        totals_sql, {"merchant_id": merchant_id},
+    )
+    rows = await database.fetch_all(
+        queue_sql,
+        {"merchant_id": merchant_id, "limit": page_size, "offset": offset},
+    )
+
+    totals = dict(totals_row) if totals_row else {
+        "fashion_total": 0, "missing_material": 0,
+        "missing_care": 0, "missing_size_guide": 0,
+        "total_incomplete": 0,
+    }
+    queue: List[Dict[str, Any]] = []
+    for r in rows or []:
+        row = dict(r)
+        material_val = row.get("material")
+        care_val = row.get("care")
+        size_guide_val = row.get("size_guide")
+        queue.append({
+            "platform": row["platform"],
+            "platform_product_id": row["platform_product_id"],
+            "title": row.get("title") or "Untitled product",
+            "image_url": row.get("image_url"),
+            # source_product_id stands in for SKU here — the merchant
+            # recognizes their products by platform identifier; a real
+            # SKU column on catalog_products isn't always populated.
+            "sku": None,
+            "fields": {
+                "material": {
+                    "status": _fashion_field_status(material_val, row.get("material_source")),
+                    "value": material_val,
+                    "confidence": row.get("material_confidence"),
+                },
+                "care": {
+                    "status": _fashion_field_status(care_val, row.get("care_source")),
+                    "value": care_val,
+                    "confidence": row.get("care_confidence"),
+                },
+                "size_guide": {
+                    "status": _fashion_field_status(size_guide_val, row.get("size_guide_source")),
+                    "value": size_guide_val,
+                    "confidence": row.get("size_guide_confidence"),
+                },
+            },
+        })
+
+    total_incomplete = int(totals.get("total_incomplete") or 0)
+    has_more = (page * page_size) < total_incomplete
+
+    return {
+        "status": "success",
+        "data": {
+            "queue": queue,
+            "totals": {
+                "fashion_total": int(totals.get("fashion_total") or 0),
+                "missing_material": int(totals.get("missing_material") or 0),
+                "missing_care": int(totals.get("missing_care") or 0),
+                "missing_size_guide": int(totals.get("missing_size_guide") or 0),
+                "total_incomplete": total_incomplete,
+                "page": page,
+                "page_size": page_size,
+                "has_more": has_more,
+            },
+        },
+    }
+
+
 @router.post("/{platform}/{platform_product_id}/enrichment/run")
 async def run_product_enrichment(
     platform: str,
