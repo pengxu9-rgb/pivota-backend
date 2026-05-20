@@ -110,6 +110,7 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # category_path + provenance inline; without these in both
             # schema_guard and db.catalog metadata, production sync fails.
             "category_path",
+            "category_label",
             "category_confidence",
             "category_label_source",
             # Phase O-4 — see migration 077. Onboarding lifecycle
