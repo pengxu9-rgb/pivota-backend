@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     # API Keys
     stripe_secret_key: Optional[str] = os.getenv("STRIPE_SECRET_KEY")
     stripe_webhook_secret: Optional[str] = os.getenv("STRIPE_WEBHOOK_SECRET")
+    stripe_billing_webhook_secret: Optional[str] = os.getenv("STRIPE_BILLING_WEBHOOK_SECRET")
     
     adyen_api_key: Optional[str] = os.getenv("ADYEN_API_KEY")
     adyen_merchant_account: Optional[str] = os.getenv("ADYEN_MERCHANT_ACCOUNT", "WoopayECOM")

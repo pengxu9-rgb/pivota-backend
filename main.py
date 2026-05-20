@@ -192,6 +192,7 @@ if DEBUG_MODE:
     from routes.admin_populate_products import router as test_populate_router
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
+from routes.billing_routes import router as billing_router
 from routes.product_routes import router as product_router
 from routes.product_routes_v2 import router as product_router_v2
 from routes.product_sync import router as product_sync_router
@@ -938,6 +939,7 @@ if DEBUG_MODE:
     logger.warning("⚠️ DEBUG MODE ENABLED - Debug endpoints are accessible!")
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
+app.include_router(billing_router)  # Stripe Billing monetization
 # Register more specific product routes FIRST to avoid path conflicts
 app.include_router(product_router_v2)  # Product management v2 (cache-based) - MUST be before product_router
 app.include_router(product_sync_router)  # Product sync from platforms (legacy)
