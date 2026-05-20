@@ -755,6 +755,84 @@ async def list_questions(
     return {"count": int(total or 0), "items": items}
 
 
+def _normalize_ugc_moderation_status(status: str) -> str:
+    next_status = str(status or "").strip().lower()
+    if next_status not in {"active", "under_review", "removed"}:
+        raise HTTPException(status_code=400, detail="INVALID_STATUS")
+    return next_status
+
+
+async def set_question_status(
+    *,
+    question_id: int,
+    status: str,
+    reason: Optional[str] = None,
+    actor: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    del reason, actor
+    await ensure_ugc_tables_exist()
+    try:
+        qid = int(question_id)
+    except Exception:
+        qid = 0
+    if qid <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_QUESTION")
+
+    next_status = _normalize_ugc_moderation_status(status)
+    row = await database.fetch_one(ugc_questions.select().where(ugc_questions.c.id == qid))
+    if not row:
+        raise HTTPException(status_code=404, detail="QUESTION_NOT_FOUND")
+
+    await database.execute(
+        ugc_questions.update()
+        .where(ugc_questions.c.id == qid)
+        .values(status=next_status)
+    )
+    return {"status": "success", "question_id": qid, "new_status": next_status}
+
+
+async def set_question_reply_status(
+    *,
+    question_id: int,
+    reply_id: int,
+    status: str,
+    reason: Optional[str] = None,
+    actor: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    del reason, actor
+    await ensure_ugc_tables_exist()
+    try:
+        qid = int(question_id)
+        rid = int(reply_id)
+    except Exception:
+        qid = 0
+        rid = 0
+    if qid <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_QUESTION")
+    if rid <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_REPLY")
+
+    next_status = _normalize_ugc_moderation_status(status)
+    row = await database.fetch_one(
+        ugc_question_replies.select().where(
+            (ugc_question_replies.c.id == rid)
+            & (ugc_question_replies.c.question_id == qid)
+        )
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="REPLY_NOT_FOUND")
+
+    await database.execute(
+        ugc_question_replies.update()
+        .where(
+            (ugc_question_replies.c.id == rid)
+            & (ugc_question_replies.c.question_id == qid)
+        )
+        .values(status=next_status)
+    )
+    return {"status": "success", "question_id": qid, "reply_id": rid, "new_status": next_status}
+
+
 async def _question_exists(question_id: int) -> bool:
     await ensure_ugc_tables_exist()
     try:

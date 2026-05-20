@@ -162,3 +162,90 @@ async def test_create_question_reply_writes_under_review_status(monkeypatch: pyt
     assert captured["user_id"] == "user_123"
     assert captured["body"] == "This worked for me."
     assert captured["status"] == "under_review"
+
+
+@pytest.mark.asyncio
+async def test_set_question_status_updates_moderation_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.ugc_capabilities_service as ugc_service
+
+    captured: dict[str, Any] = {}
+
+    async def noop_ensure() -> None:
+        return None
+
+    class FakeDatabase:
+        async def fetch_one(self, statement: Any) -> dict[str, Any]:
+            return {"id": 456}
+
+        async def execute(self, statement: Any) -> None:
+            captured.update(statement.compile().params)
+            return None
+
+    monkeypatch.setattr(ugc_service, "ensure_ugc_tables_exist", noop_ensure)
+    monkeypatch.setattr(ugc_service, "database", FakeDatabase())
+
+    result = await ugc_service.set_question_status(
+        question_id=456,
+        status="active",
+        reason="approved",
+        actor={"employee_id": "emp_test"},
+    )
+
+    assert result == {"status": "success", "question_id": 456, "new_status": "active"}
+    assert captured["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_set_question_reply_status_updates_moderation_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.ugc_capabilities_service as ugc_service
+
+    captured: dict[str, Any] = {}
+
+    async def noop_ensure() -> None:
+        return None
+
+    class FakeDatabase:
+        async def fetch_one(self, statement: Any) -> dict[str, Any]:
+            return {"id": 123, "question_id": 456}
+
+        async def execute(self, statement: Any) -> None:
+            captured.update(statement.compile().params)
+            return None
+
+    monkeypatch.setattr(ugc_service, "ensure_ugc_tables_exist", noop_ensure)
+    monkeypatch.setattr(ugc_service, "database", FakeDatabase())
+
+    result = await ugc_service.set_question_reply_status(
+        question_id=456,
+        reply_id=123,
+        status="removed",
+        reason="cleanup",
+        actor={"employee_id": "emp_test"},
+    )
+
+    assert result == {"status": "success", "question_id": 456, "reply_id": 123, "new_status": "removed"}
+    assert captured["status"] == "removed"
+
+
+@pytest.mark.asyncio
+async def test_employee_question_status_route_calls_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.questions_api as questions_routes
+
+    captured: dict[str, Any] = {}
+
+    async def fake_set_question_status(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"status": "success", "question_id": kwargs["question_id"], "new_status": kwargs["status"]}
+
+    monkeypatch.setattr(questions_routes, "set_question_status", fake_set_question_status)
+
+    result = await questions_routes.employee_set_question_status(
+        question_id=456,
+        body=questions_routes.SetUgcQuestionStatusRequest(status="active", reason="approved"),
+        actor={"employee_id": "emp_test", "role": "admin"},
+    )
+
+    assert result == {"status": "success", "question_id": 456, "new_status": "active"}
+    assert captured["actor"]["employee_id"] == "emp_test"
+    assert captured["question_id"] == 456
+    assert captured["status"] == "active"

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from routes.accounts_orders_api import AccountsPrincipal, get_accounts_or_guest_principal_ugc
+from utils.auth import require_employee_permissions
 from services.ugc_capabilities_service import (
     create_question,
     create_question_reply,
     get_question,
     list_question_replies,
     list_questions,
+    set_question_reply_status,
+    set_question_status,
 )
 
 
@@ -26,6 +29,11 @@ class CreateQuestionRequest(BaseModel):
 
 class CreateQuestionReplyRequest(BaseModel):
     body: str = Field(..., min_length=1, max_length=4000)
+
+
+class SetUgcQuestionStatusRequest(BaseModel):
+    status: str = Field(..., min_length=1)
+    reason: Optional[str] = None
 
 
 @router.get("/questions")
@@ -265,3 +273,33 @@ async def post_question_reply(
         "question_id": int(question_id),
         "moderation_status": "under_review",
     }
+
+
+@router.post("/employee/questions/v1/questions/{question_id}/status")
+async def employee_set_question_status(
+    question_id: int,
+    body: SetUgcQuestionStatusRequest,
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.moderate.status"])),
+):
+    return await set_question_status(
+        actor=actor,
+        question_id=int(question_id),
+        status=body.status,
+        reason=body.reason,
+    )
+
+
+@router.post("/employee/questions/v1/questions/{question_id}/replies/{reply_id}/status")
+async def employee_set_question_reply_status(
+    question_id: int,
+    reply_id: int,
+    body: SetUgcQuestionStatusRequest,
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.moderate.status"])),
+):
+    return await set_question_reply_status(
+        actor=actor,
+        question_id=int(question_id),
+        reply_id=int(reply_id),
+        status=body.status,
+        reason=body.reason,
+    )
