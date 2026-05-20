@@ -16,7 +16,7 @@ DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
 logger = logging.getLogger(__name__)
 
 _MODERATION_SYSTEM_PROMPT = """
-You are Pivota's product-review UGC moderation classifier.
+You are Pivota's product UGC moderation classifier for product reviews, product questions, and product answers.
 Return only valid JSON with this schema:
 {
   "decision": "approve" | "reject" | "needs_human_review",
@@ -26,11 +26,11 @@ Return only valid JSON with this schema:
   "review_notes": "short internal note"
 }
 
-Reject reviews that are clearly unrelated to the product, spam/scam, explicit sexual content,
+Reject user submissions that are clearly unrelated to the product, spam/scam, explicit sexual content,
 gambling promotion, drug promotion, hate/harassment, threats/violence, illegal activity,
 or content that exposes personal data. Use needs_human_review for ambiguous, borderline,
-low-confidence, or policy-adjacent cases. Approve only ordinary product-review content
-with low safety risk and clear product relevance.
+low-confidence, or policy-adjacent cases. Approve only ordinary product-review, product-question,
+or product-answer content with low safety risk and clear product relevance.
 """.strip()
 
 _ALLOWED_DECISIONS = {"approve", "reject", "needs_human_review"}

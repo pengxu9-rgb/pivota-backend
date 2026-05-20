@@ -11,7 +11,9 @@ from services.ugc_capabilities_service import (
     create_question,
     create_question_reply,
     get_question,
+    list_question_replies_for_moderation,
     list_question_replies,
+    list_questions_for_moderation,
     list_questions,
     set_question_reply_status,
     set_question_status,
@@ -173,7 +175,7 @@ async def post_question(
     subject_id = pgid or pid
 
     try:
-        qid = await create_question(
+        create_result = await create_question(
             user_id=principal.user_id,
             subject_type=subject_type,
             subject_id=subject_id,
@@ -202,12 +204,19 @@ async def post_question(
             detail={"error": {"code": code, "message": message}},
             headers=no_store_headers,
         )
+    if isinstance(create_result, dict):
+        qid = int(create_result.get("question_id") or 0)
+        moderation_status = str(create_result.get("moderation_status") or create_result.get("moderation_state") or "under_review")
+    else:
+        qid = int(create_result)
+        moderation_status = "under_review"
+
     return {
         "status": "success",
         "question_id": int(qid),
         "subject_type": subject_type,
         "subject_id": subject_id,
-        "moderation_status": "under_review",
+        "moderation_status": moderation_status,
     }
 
 
@@ -236,7 +245,7 @@ async def post_question_reply(
     }
 
     try:
-        rid = await create_question_reply(
+        create_result = await create_question_reply(
             user_id=principal.user_id,
             question_id=int(question_id),
             body=str(body.body or "").strip(),
@@ -267,11 +276,18 @@ async def post_question_reply(
             headers=no_store_headers,
         )
 
+    if isinstance(create_result, dict):
+        rid = int(create_result.get("reply_id") or 0)
+        moderation_status = str(create_result.get("moderation_status") or create_result.get("moderation_state") or "under_review")
+    else:
+        rid = int(create_result)
+        moderation_status = "under_review"
+
     return {
         "status": "success",
         "reply_id": int(rid),
         "question_id": int(question_id),
-        "moderation_status": "under_review",
+        "moderation_status": moderation_status,
     }
 
 
@@ -286,6 +302,52 @@ async def employee_set_question_status(
         question_id=int(question_id),
         status=body.status,
         reason=body.reason,
+    )
+
+
+@router.get("/employee/questions/v1/moderation/questions")
+async def employee_list_questions_for_moderation(
+    status: Optional[str] = "under_review",
+    subject_type: Optional[str] = None,
+    subject_id: Optional[str] = None,
+    question_id: Optional[int] = None,
+    moderation_decision: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    employee_review_queue: Optional[bool] = None,
+    limit: int = 50,
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
+):
+    del actor
+    return await list_questions_for_moderation(
+        status=status,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        question_id=question_id,
+        moderation_decision=moderation_decision,
+        risk_level=risk_level,
+        employee_review_queue=employee_review_queue,
+        limit=int(limit),
+    )
+
+
+@router.get("/employee/questions/v1/moderation/replies")
+async def employee_list_question_replies_for_moderation(
+    question_id: Optional[int] = None,
+    status: Optional[str] = "under_review",
+    moderation_decision: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    employee_review_queue: Optional[bool] = None,
+    limit: int = 50,
+    actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
+):
+    del actor
+    return await list_question_replies_for_moderation(
+        question_id=question_id,
+        status=status,
+        moderation_decision=moderation_decision,
+        risk_level=risk_level,
+        employee_review_queue=employee_review_queue,
+        limit=int(limit),
     )
 
 

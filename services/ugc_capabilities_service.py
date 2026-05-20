@@ -11,6 +11,7 @@ from sqlalchemy import and_, func, or_, select, text
 from db.database import database
 from db.orders import orders as orders_table
 from db.reviews_center import buyer_review_user_subject, product_reviews, ugc_question_replies, ugc_questions
+from services.review_moderation_policy import assess_review_text_risk_with_deepseek, merge_moderation_risk_flags
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,7 @@ async def ensure_ugc_tables_exist() -> None:
                   subject_type VARCHAR(32) NOT NULL,
                   subject_id TEXT NOT NULL,
                   question TEXT NOT NULL,
+                  risk_flags JSONB NULL,
                   status VARCHAR(16) NOT NULL DEFAULT 'active',
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -129,6 +131,10 @@ async def ensure_ugc_tables_exist() -> None:
                 """
             )
         )
+    try:
+        await database.execute(text("ALTER TABLE ugc_questions ADD COLUMN IF NOT EXISTS risk_flags JSONB"))
+    except Exception:
+        pass
 
     try:
         await database.fetch_one(text("SELECT 1 FROM ugc_question_replies LIMIT 1"))
@@ -141,6 +147,7 @@ async def ensure_ugc_tables_exist() -> None:
                   question_id BIGINT NOT NULL REFERENCES ugc_questions(id) ON DELETE CASCADE,
                   user_id TEXT NOT NULL,
                   body TEXT NOT NULL,
+                  risk_flags JSONB NULL,
                   status VARCHAR(16) NOT NULL DEFAULT 'active',
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -151,6 +158,10 @@ async def ensure_ugc_tables_exist() -> None:
                 """
             )
         )
+    try:
+        await database.execute(text("ALTER TABLE ugc_question_replies ADD COLUMN IF NOT EXISTS risk_flags JSONB"))
+    except Exception:
+        pass
 
 
 async def get_product_group_member_product_ids(product_group_id: str) -> Set[str]:
@@ -605,7 +616,7 @@ async def create_question(
     subject_id: str,
     question: str,
     window_seconds: int = 60,
-) -> int:
+) -> Dict[str, Any]:
     await ensure_ugc_tables_exist()
     uid = str(user_id or "").strip()
     st = str(subject_type or "").strip()
@@ -623,6 +634,21 @@ async def create_question(
     if await is_question_rate_limited(user_id=uid, subject_type=st, subject_id=sid, window_seconds=window_seconds):
         raise HTTPException(status_code=429, detail="RATE_LIMITED")
 
+    moderation = await assess_review_text_risk_with_deepseek(title="Product question", body=q)
+    moderation_state = _normalize_ugc_moderation_status(str(moderation.get("moderation_state") or "under_review"))
+    risk_flags = merge_moderation_risk_flags(
+        None,
+        moderation=moderation,
+        extra={
+            "source": "accounts",
+            "accounts_user_id": uid,
+            "ugc_actor_type": "guest" if uid.startswith("guest:") else "account",
+            "ugc_content_type": "question",
+            "subject_type": st,
+            "subject_id": sid,
+        },
+    )
+
     try:
         question_id = await database.execute(
             ugc_questions.insert().values(
@@ -630,7 +656,8 @@ async def create_question(
                 subject_type=st,
                 subject_id=sid,
                 question=q,
-                status="under_review",
+                risk_flags=risk_flags,
+                status=moderation_state,
                 created_at=datetime.now(timezone.utc),
             )
         )
@@ -638,9 +665,10 @@ async def create_question(
         raise HTTPException(status_code=500, detail="QUESTION_CREATE_FAILED")
 
     try:
-        return int(question_id)
+        qid = int(question_id)
     except Exception:
-        return 0
+        qid = 0
+    return {"question_id": qid, "moderation_status": moderation_state}
 
 
 async def list_questions(
@@ -791,6 +819,82 @@ async def set_question_status(
     return {"status": "success", "question_id": qid, "new_status": next_status}
 
 
+async def list_questions_for_moderation(
+    *,
+    status: Optional[str] = "under_review",
+    subject_type: Optional[str] = None,
+    subject_id: Optional[str] = None,
+    question_id: Optional[int] = None,
+    moderation_decision: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    employee_review_queue: Optional[bool] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    await ensure_ugc_tables_exist()
+    limit_n = max(1, min(int(limit or 50), 200))
+    where = ["1=1"]
+    params: Dict[str, Any] = {}
+
+    status_norm = str(status or "").strip().lower()
+    if status_norm:
+        where.append("ugc_questions.status = :status")
+        params["status"] = _normalize_ugc_moderation_status(status_norm)
+    subject_type_norm = str(subject_type or "").strip()
+    if subject_type_norm:
+        where.append("ugc_questions.subject_type = :subject_type")
+        params["subject_type"] = subject_type_norm
+    subject_id_norm = str(subject_id or "").strip()
+    if subject_id_norm:
+        where.append("ugc_questions.subject_id = :subject_id")
+        params["subject_id"] = subject_id_norm
+    if question_id is not None:
+        where.append("ugc_questions.id = :question_id")
+        params["question_id"] = int(question_id)
+    moderation_decision_norm = str(moderation_decision or "").strip().lower()
+    if moderation_decision_norm:
+        where.append("ugc_questions.risk_flags ->> 'moderation_decision' = :moderation_decision")
+        params["moderation_decision"] = moderation_decision_norm
+    risk_level_norm = str(risk_level or "").strip().lower()
+    if risk_level_norm:
+        where.append("ugc_questions.risk_flags ->> 'text_risk_level' = :risk_level")
+        params["risk_level"] = risk_level_norm
+    if employee_review_queue is not None:
+        where.append("COALESCE(ugc_questions.risk_flags ->> 'employee_review_queue', 'false') = :employee_review_queue")
+        params["employee_review_queue"] = "true" if employee_review_queue else "false"
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT
+          ugc_questions.id,
+          ugc_questions.user_id,
+          ugc_questions.subject_type,
+          ugc_questions.subject_id,
+          ugc_questions.question,
+          ugc_questions.risk_flags,
+          ugc_questions.status,
+          ugc_questions.created_at,
+          COALESCE(reply_stats.pending_reply_count, 0)::int AS pending_reply_count,
+          COALESCE(reply_stats.active_reply_count, 0)::int AS active_reply_count,
+          COALESCE(reply_stats.total_reply_count, 0)::int AS total_reply_count
+        FROM {ugc_questions.name}
+        LEFT JOIN (
+          SELECT
+            question_id,
+            COUNT(*)::int AS total_reply_count,
+            COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::int AS active_reply_count,
+            COALESCE(SUM(CASE WHEN status = 'under_review' THEN 1 ELSE 0 END), 0)::int AS pending_reply_count
+          FROM {ugc_question_replies.name}
+          GROUP BY question_id
+        ) AS reply_stats ON reply_stats.question_id = ugc_questions.id
+        WHERE {' AND '.join(where)}
+        ORDER BY ugc_questions.created_at DESC, ugc_questions.id DESC
+        LIMIT {limit_n}
+        """,
+        params,
+    )
+    return {"items": [dict(r) for r in rows], "limit": limit_n}
+
+
 async def set_question_reply_status(
     *,
     question_id: int,
@@ -831,6 +935,63 @@ async def set_question_reply_status(
         .values(status=next_status)
     )
     return {"status": "success", "question_id": qid, "reply_id": rid, "new_status": next_status}
+
+
+async def list_question_replies_for_moderation(
+    *,
+    question_id: Optional[int] = None,
+    status: Optional[str] = "under_review",
+    moderation_decision: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    employee_review_queue: Optional[bool] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    await ensure_ugc_tables_exist()
+    limit_n = max(1, min(int(limit or 50), 200))
+    where = ["1=1"]
+    params: Dict[str, Any] = {}
+
+    if question_id is not None:
+        where.append("ugc_question_replies.question_id = :question_id")
+        params["question_id"] = int(question_id)
+    status_norm = str(status or "").strip().lower()
+    if status_norm:
+        where.append("ugc_question_replies.status = :status")
+        params["status"] = _normalize_ugc_moderation_status(status_norm)
+    moderation_decision_norm = str(moderation_decision or "").strip().lower()
+    if moderation_decision_norm:
+        where.append("ugc_question_replies.risk_flags ->> 'moderation_decision' = :moderation_decision")
+        params["moderation_decision"] = moderation_decision_norm
+    risk_level_norm = str(risk_level or "").strip().lower()
+    if risk_level_norm:
+        where.append("ugc_question_replies.risk_flags ->> 'text_risk_level' = :risk_level")
+        params["risk_level"] = risk_level_norm
+    if employee_review_queue is not None:
+        where.append("COALESCE(ugc_question_replies.risk_flags ->> 'employee_review_queue', 'false') = :employee_review_queue")
+        params["employee_review_queue"] = "true" if employee_review_queue else "false"
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT
+          ugc_question_replies.id,
+          ugc_question_replies.question_id,
+          ugc_question_replies.user_id,
+          ugc_question_replies.body,
+          ugc_question_replies.risk_flags,
+          ugc_question_replies.status,
+          ugc_question_replies.created_at,
+          ugc_questions.subject_type,
+          ugc_questions.subject_id,
+          ugc_questions.question
+        FROM {ugc_question_replies.name}
+        LEFT JOIN {ugc_questions.name} ON ugc_questions.id = ugc_question_replies.question_id
+        WHERE {' AND '.join(where)}
+        ORDER BY ugc_question_replies.created_at DESC, ugc_question_replies.id DESC
+        LIMIT {limit_n}
+        """,
+        params,
+    )
+    return {"items": [dict(r) for r in rows], "limit": limit_n}
 
 
 async def _question_exists(question_id: int) -> bool:
@@ -902,7 +1063,7 @@ async def create_question_reply(
     question_id: int,
     body: str,
     window_seconds: int = 30,
-) -> int:
+) -> Dict[str, Any]:
     await ensure_ugc_tables_exist()
     uid = str(user_id or "").strip()
     try:
@@ -925,13 +1086,28 @@ async def create_question_reply(
     if await is_reply_rate_limited(user_id=uid, question_id=qid, window_seconds=window_seconds):
         raise HTTPException(status_code=429, detail="RATE_LIMITED")
 
+    moderation = await assess_review_text_risk_with_deepseek(title="Product question answer", body=b)
+    moderation_state = _normalize_ugc_moderation_status(str(moderation.get("moderation_state") or "under_review"))
+    risk_flags = merge_moderation_risk_flags(
+        None,
+        moderation=moderation,
+        extra={
+            "source": "accounts",
+            "accounts_user_id": uid,
+            "ugc_actor_type": "guest" if uid.startswith("guest:") else "account",
+            "ugc_content_type": "question_reply",
+            "question_id": qid,
+        },
+    )
+
     try:
         reply_id = await database.execute(
             ugc_question_replies.insert().values(
                 question_id=qid,
                 user_id=uid,
                 body=b,
-                status="under_review",
+                risk_flags=risk_flags,
+                status=moderation_state,
                 created_at=datetime.now(timezone.utc),
             )
         )
@@ -939,9 +1115,10 @@ async def create_question_reply(
         raise HTTPException(status_code=500, detail="REPLY_CREATE_FAILED")
 
     try:
-        return int(reply_id)
+        rid = int(reply_id)
     except Exception:
-        return 0
+        rid = 0
+    return {"reply_id": rid, "moderation_status": moderation_state}
 
 
 async def list_question_replies(

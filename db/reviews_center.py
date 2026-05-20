@@ -353,6 +353,7 @@ ugc_questions = Table(
     Column("subject_type", String(32), nullable=False),
     Column("subject_id", Text, nullable=False),
     Column("question", Text, nullable=False),
+    Column("risk_flags", _JSON_TYPE, nullable=True),
     Column("status", String(16), nullable=False, server_default="active"),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )
@@ -367,6 +368,7 @@ ugc_question_replies = Table(
     Column("question_id", _ID_TYPE, ForeignKey("ugc_questions.id", ondelete="CASCADE"), nullable=False),
     Column("user_id", String(128), nullable=False),
     Column("body", Text, nullable=False),
+    Column("risk_flags", _JSON_TYPE, nullable=True),
     Column("status", String(16), nullable=False, server_default="active"),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )
