@@ -607,3 +607,18 @@ agent_pdp_view = Table(
         postgresql_where=Column("brand").isnot(None),
     ),
 )
+
+
+# Migration 097 — ingest-time brand name canonicalization cache.
+# raw_name is the PRIMARY KEY (exact string from product.vendor); lookups
+# normalise via LOWER() and hit the idx_brand_display_names_lower_raw index.
+brand_display_names = Table(
+    "brand_display_names",
+    metadata,
+    Column("raw_name", String(255), primary_key=True),
+    Column("display_name", String(255), nullable=False),
+    Column("confidence", Float, nullable=False),
+    # source: 'llm' | 'manual' | 'crawl'
+    Column("source", String(32), nullable=False, server_default="llm"),
+    Column("resolved_at", DateTime, server_default=func.now(), nullable=False),
+)

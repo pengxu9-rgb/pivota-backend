@@ -10,8 +10,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import httpx
 from sqlalchemy import select
 
+from config.settings import settings
 from db.catalog import (
     beauty_compatibility_rules,
     beauty_content_assets,
@@ -19,6 +21,7 @@ from db.catalog import (
     beauty_shades,
     beauty_sku_ingredients,
     beauty_usage_guides,
+    brand_display_names,
     catalog_field_facts,
     catalog_inventory_snapshots,
     catalog_merchants,
@@ -72,6 +75,19 @@ _FASHION_ENRICH_SEM = asyncio.Semaphore(8)
 # pdpBuilder.pickFashionMeta cutoff (0.6). Keeping the write-side at the
 # same threshold prevents low-confidence rows from polluting the DB.
 _FASHION_ENRICH_MIN_CONFIDENCE = 0.6
+
+# Bounds concurrent in-flight brand resolution LLM calls during live ingest.
+# 4 is conservative — brand strings are short and the LLM round-trip is fast,
+# but a 1k-product sync could still fan out unbounded without this cap.
+# Per feedback_llm_call_multipliers.md, new LLM sources need bounded blast
+# radius before going live.
+_brand_sem = asyncio.Semaphore(4)
+
+# Trust gate for brand resolution. Only persist if the LLM self-reports
+# confidence >= this floor. 0.75 is deliberately stricter than the fashion
+# field gate (0.6) because brand display names surface in merchant-facing
+# prose and must be high-precision.
+_BRAND_RESOLVE_MIN_CONFIDENCE = 0.75
 
 
 async def _async_fashion_enrich(
@@ -204,6 +220,161 @@ def _schedule_fashion_enrichment(
         # No running event loop (shouldn't happen in normal request flow,
         # but a script-driven entry without asyncio.run() could trip this).
         logger.warning("fashion_enrich.schedule_no_loop err=%s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Brand name canonicalization (migration 097)
+# ---------------------------------------------------------------------------
+# Pattern mirrors the fashion enrichment above:
+#   1. _get_canonical_brand — cache-only lookup (no LLM, called inline)
+#   2. _async_brand_resolution — LLM call + DB write, runs as a detached task
+#   3. _schedule_brand_resolution — thin scheduler, same shape as
+#      _schedule_fashion_enrichment
+#
+# Cost model: one DeepSeek call per *unique* raw brand string, ever. After
+# that the brand_display_names table is hit forever at SELECT cost.
+# ---------------------------------------------------------------------------
+
+_BRAND_RESOLVE_SYSTEM_PROMPT = (
+    "You are a brand name canonicalization assistant. Given a raw brand "
+    "string (which may be poorly cased, abbreviated, or stylized) and an "
+    "optional product title for context, return the canonical display form "
+    "of the brand name as it should appear on packaging and in marketing "
+    "materials. Output strict JSON only."
+)
+
+
+async def _get_canonical_brand(raw: Optional[str]) -> Optional[str]:
+    """Cache-only lookup for the canonical display form of a raw brand string.
+
+    Returns the cached display_name if a row exists in brand_display_names
+    for LOWER(raw_name) = LOWER(raw), else None. Never makes an LLM call —
+    that is the caller's responsibility if this returns None.
+
+    Safe to call inside a transaction; the SELECT is a plain read.
+    """
+    if not raw or not raw.strip():
+        return None
+    row = await database.fetch_one(
+        "SELECT display_name FROM brand_display_names "
+        "WHERE LOWER(raw_name) = LOWER(:raw)",
+        {"raw": raw.strip()},
+    )
+    if row:
+        return str(row["display_name"])
+    return None
+
+
+async def _async_brand_resolution(raw: str, product_title: Optional[str]) -> None:
+    """Fire-and-forget: resolve canonical brand via DeepSeek and cache result.
+
+    Called as a detached asyncio task — never raises, never retries. A failed
+    or low-confidence call simply leaves brand_display_names empty for this
+    raw string; the next ingest will retry automatically (cache miss path).
+
+    Bounded by _brand_sem so a large sync doesn't fan out unbounded.
+    """
+    try:
+        async with _brand_sem:
+            api_key = (settings.deepseek_api_key or "").strip()
+            if not api_key:
+                logger.warning("brand_resolve.no_api_key raw=%r", raw)
+                return
+            base_url = settings.deepseek_api_base_url.rstrip("/")
+            model = settings.deepseek_model
+            user_message = (
+                f"Raw brand string: {raw!r}\n"
+                + (f"Product title context: {product_title!r}\n" if product_title else "")
+                + "\nReturn JSON only: "
+                '{"display_name": string, "confidence": float in [0,1], "reason": string}'
+            )
+            body = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _BRAND_RESOLVE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1,
+                "max_tokens": 100,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        f"{base_url}/v1/chat/completions",
+                        json=body,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                logger.warning("brand_resolve.transport_fail raw=%r err=%s", raw, exc)
+                return
+            if resp.status_code >= 400:
+                logger.warning(
+                    "brand_resolve.http_%d raw=%r body=%s",
+                    resp.status_code, raw, resp.text[:200],
+                )
+                return
+            try:
+                payload = resp.json()
+                content = payload["choices"][0]["message"]["content"]
+                result = json.loads(content)
+            except (KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("brand_resolve.parse_fail raw=%r err=%s", raw, exc)
+                return
+
+            display_name = result.get("display_name")
+            if not isinstance(display_name, str) or not display_name.strip():
+                logger.debug("brand_resolve.no_display_name raw=%r result=%s", raw, result)
+                return
+
+            confidence_raw = result.get("confidence")
+            confidence = (
+                float(confidence_raw)
+                if isinstance(confidence_raw, (int, float))
+                and 0.0 <= float(confidence_raw) <= 1.0
+                else 0.0
+            )
+            if confidence < _BRAND_RESOLVE_MIN_CONFIDENCE:
+                logger.debug(
+                    "brand_resolve.below_threshold raw=%r display=%r confidence=%.3f",
+                    raw, display_name, confidence,
+                )
+                return
+
+            await database.execute(
+                """
+                INSERT INTO brand_display_names (raw_name, display_name, confidence, source)
+                VALUES (:raw_name, :display_name, :confidence, 'llm')
+                ON CONFLICT (raw_name) DO NOTHING
+                """,
+                {
+                    "raw_name": raw.strip(),
+                    "display_name": display_name.strip(),
+                    "confidence": confidence,
+                },
+            )
+            logger.info(
+                "brand_resolve.cached raw=%r display=%r confidence=%.3f",
+                raw, display_name, confidence,
+            )
+    except Exception as exc:  # noqa: BLE001 — must not propagate; runs detached
+        logger.warning("brand_resolve.failed raw=%r err=%s", raw, exc)
+
+
+def _schedule_brand_resolution(raw: str, product_title: Optional[str]) -> None:
+    """Spawn brand resolution as a detached task. Sync doesn't wait.
+
+    Same pattern as _schedule_fashion_enrichment: asyncio.create_task so
+    the ingest path is non-blocking. RuntimeError (no event loop) is logged
+    and swallowed — shouldn't occur in normal request flow.
+    """
+    try:
+        asyncio.create_task(_async_brand_resolution(raw, product_title))
+    except RuntimeError as exc:
+        logger.warning("brand_resolve.schedule_no_loop err=%s", exc)
 
 
 def _utcnow() -> datetime:
@@ -801,6 +972,17 @@ async def ingest_standard_products(
             readiness_tier = _readiness_tier_for_product(product)
             canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
             brand = str(product.vendor or metadata.get("brand") or "").strip() or None
+            # Migration 097 — brand name canonicalization.
+            # Cache-only lookup: if brand_display_names has already resolved
+            # this raw string, use the canonical form for the upsert. On a
+            # cache miss, fire a detached LLM task and proceed with the raw
+            # string for now; the next sync will hit the cache.
+            if brand:
+                _canonical_brand = await _get_canonical_brand(brand)
+                if _canonical_brand:
+                    brand = _canonical_brand
+                else:
+                    _schedule_brand_resolution(brand, product.title)
             # Pivota canonical PDP fields (sig_id + agent.pivota.cc URL)
             # — every onboarded merchant product gets one. Deterministic
             # so re-syncs are idempotent.
