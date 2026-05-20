@@ -83,6 +83,22 @@ async def start_scheduler() -> None:
             coalesce=True,            # only run once if multiple firings queued
         )
 
+        # Index health consolidation: reads quality snapshots, seed audit,
+        # identity graph, and offer presence; writes index_pipeline_state +
+        # domain_extractor_baselines. Offset 1h from daily_audit_check
+        # to avoid Postgres query contention.
+        from jobs.nightly_index_health_job import run_nightly_index_health
+        scheduler.add_job(
+            run_nightly_index_health,
+            "cron",
+            hour=4,
+            minute=0,
+            id="nightly_index_health",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+
         # P2.2: drive queued audit_runs through the async lifecycle.
         # No production traffic flows here until P2.3 ships POST
         # /api/audits, so the tick is a safe no-op until then. 10s
@@ -181,6 +197,7 @@ async def start_scheduler() -> None:
         _SCHEDULER = scheduler
         logger.info(
             "audit_scheduler: started with daily_audit_check (03:00 UTC) "
+            "+ nightly_index_health (04:00 UTC) "
             "+ audit_run_worker_tick (10s) "
             "+ audit_run_lease_reaper (60s) "
             "+ executor_run_worker_tick (5s) "
