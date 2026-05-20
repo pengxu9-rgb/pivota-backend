@@ -214,7 +214,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(skirt|mini\s+skirt|midi\s+skirt|maxi\s+skirt|pencil\s+skirt)\b",
         re.IGNORECASE)),
     ("Pants", "fashion/apparel/bottoms/pants", re.compile(
-        r"\b(pants|trousers|chinos|slacks|jogger\s+pants|cargo\s+pants|leggings)\b",
+        r"\b(pants|trousers|chinos|slacks|joggers?\s+pants|joggers\b|cargo\s+pants|leggings)\b",
         re.IGNORECASE)),
     ("Jeans", "fashion/apparel/bottoms/jeans", re.compile(
         r"\b(jeans|denim|skinny\s+jeans|straight\s+leg|boot[-\s]?cut)\b",
@@ -283,6 +283,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # Generic apparel/clothing fallback — last so specific patterns win.
     ("Apparel", "fashion/apparel/general", re.compile(
         r"\b(apparel|clothing|garment|womenswear|menswear|kidswear)\b",
+        re.IGNORECASE)),
+    # ----- Electronics patterns -----
+    # Keyword-matchable subset only. Model-number-only products (WH-1000XM5,
+    # AirPods, etc.) have no keyword signal and go to the LLM backfill path.
+    ("Headphones", "electronics/audio/headphones", re.compile(
+        r"\b(headphones|over[-\s]?ear\s+headphones|on[-\s]?ear\s+headphones|"
+        r"wireless\s+headphones|noise[-\s]?cancell?ing\s+headphones)\b",
+        re.IGNORECASE)),
+    ("Earbuds", "electronics/audio/earbuds", re.compile(
+        r"\b(earbuds|ear\s+buds|true\s+wireless\s+earbuds|wireless\s+earbuds|"
+        r"in[-\s]?ear\s+(?:headphones|earphones))\b",
+        re.IGNORECASE)),
+    ("E-Reader", "electronics/ereader", re.compile(
+        r"\b(e[-\s]?reader|ebook\s+reader|e[-\s]?book\s+reader)\b",
+        re.IGNORECASE)),
+    ("Bluetooth Speaker", "electronics/audio/speaker", re.compile(
+        r"\b(bluetooth\s+speaker|wireless\s+speaker|portable\s+speaker|smart\s+speaker)\b",
         re.IGNORECASE)),
     ("Gift Set", "beauty/sets/gift-set", re.compile(
         r"\b(skincare set|skin care set|gift set|holiday edition|routine|bundle|"
