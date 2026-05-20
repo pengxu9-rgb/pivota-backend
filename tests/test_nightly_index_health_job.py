@@ -25,6 +25,9 @@ import pytest
 from jobs.nightly_index_health_job import (
     MIN_DESCRIPTION_LENGTH,
     QUALITY_SCORE_THRESHOLD,
+    _ORPHAN_COUNT_QUERY,
+    _ORPHAN_DELETE,
+    _STALE_INVALIDATION_UPDATE,
     _classify_product,
     _coerce_dict,
     _extract_domain,
@@ -349,6 +352,30 @@ def test_extract_domain_strips_scheme_and_www():
     assert _extract_domain("http://api.example.com:8080/x?y=1") == "api.example.com:8080"
     assert _extract_domain("") is None
     assert _extract_domain(None) is None
+
+
+def test_orphan_queries_target_index_pipeline_state_via_anti_join():
+    """The orphan-handling SQL must DELETE FROM index_pipeline_state and gate
+    on absence of a catalog_products.content_key match. Regression guard that
+    the catalog prune path's hard-deletes can't leave stale eligible rows."""
+    for sql in (_ORPHAN_COUNT_QUERY, _ORPHAN_DELETE):
+        assert "index_pipeline_state" in sql
+        assert "NOT EXISTS" in sql
+        assert "catalog_products" in sql
+        assert "content_key" in sql
+    assert _ORPHAN_DELETE.lstrip().upper().startswith("DELETE")
+    assert _ORPHAN_COUNT_QUERY.lstrip().upper().startswith("SELECT")
+
+
+def test_stale_invalidation_targets_sync_status_not_live():
+    """The stale-invalidation UPDATE must guard on sync_status != 'live' and
+    flip serving_eligible to FALSE. Regression guard for P0 #2."""
+    assert _STALE_INVALIDATION_UPDATE.lstrip().upper().startswith("UPDATE")
+    assert "index_pipeline_state" in _STALE_INVALIDATION_UPDATE
+    assert "serving_eligible" in _STALE_INVALIDATION_UPDATE
+    assert "FALSE" in _STALE_INVALIDATION_UPDATE
+    assert "'not_live'" in _STALE_INVALIDATION_UPDATE
+    assert "IS DISTINCT FROM 'live'" in _STALE_INVALIDATION_UPDATE
 
 
 def test_extraction_content_hash_is_deterministic():

@@ -620,6 +620,28 @@ ON CONFLICT (domain) DO UPDATE SET
     baseline_set_at   = EXCLUDED.baseline_set_at
 """
 
+# Orphan count / DELETE: catalog_products rows can be hard-deleted by the
+# Shopify catalog source prune (services/catalog_sync_service.py:1450). An
+# orphan IPS row (no matching catalog_products.content_key) can otherwise
+# stay serving_eligible=TRUE forever because the live-only batch query
+# never reaches it. Delete rather than UPDATE — IPS is derived state and
+# the source row is gone; if catalog re-imports the product, the nightly
+# job will rebuild the IPS row from scratch.
+_ORPHAN_COUNT_QUERY = """
+SELECT COUNT(*) AS n
+FROM index_pipeline_state ips
+WHERE NOT EXISTS (
+    SELECT 1 FROM catalog_products cp WHERE cp.content_key = ips.content_key
+)
+"""
+
+_ORPHAN_DELETE = """
+DELETE FROM index_pipeline_state ips
+WHERE NOT EXISTS (
+    SELECT 1 FROM catalog_products cp WHERE cp.content_key = ips.content_key
+)
+"""
+
 # Stale invalidation UPDATE: any IPS row whose catalog_products.sync_status
 # is no longer 'live' must lose serving_eligible. Runs unconditionally before
 # the regression blocker pass so a previously-eligible product that was
@@ -913,7 +935,37 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         summary["eligible_count"] = eligible_count
         summary["stage_counts"] = stage_counts
 
-        # 4. Stale-product invalidation: any IPS row whose catalog_products
+        # 4. Orphan invalidation: catalog_products rows can be hard-deleted by
+        # the Shopify catalog source prune. An IPS row whose catalog product
+        # no longer exists must be removed — the live-only batch query above
+        # never touches it, so without this it would stay serving_eligible=TRUE
+        # forever. Logs the orphan count before deleting for observability;
+        # warns loudly if the orphan share is suspicious so we notice a
+        # catastrophic delete upstream rather than silently shrinking IPS.
+        orphans_deleted = 0
+        try:
+            count_row = await database.fetch_one(_ORPHAN_COUNT_QUERY)
+            orphans = int(dict(count_row).get("n", 0)) if count_row else 0
+            if orphans > 0:
+                ips_total = max(total_processed, 1)
+                share = orphans / (orphans + ips_total)
+                if orphans >= 100 or share >= 0.10:
+                    logger.warning(
+                        "nightly_index_health: orphan IPS rows count=%d "
+                        "(%.1f%% of post-delete table) — verify catalog prune "
+                        "didn't run incorrectly",
+                        orphans, share * 100,
+                    )
+                await database.execute(_ORPHAN_DELETE)
+                orphans_deleted = orphans
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "nightly_index_health: orphan invalidation failed: %s", exc
+            )
+            summary["errors"].append(f"orphan_invalidation: {exc!r}")
+        summary["orphans_deleted"] = orphans_deleted
+
+        # 5. Stale-product invalidation: any IPS row whose catalog_products
         # row is no longer 'live' must be demoted (was the P0 risk where a
         # previously-eligible product could linger as eligible after archival).
         try:
@@ -924,7 +976,7 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             )
             summary["errors"].append(f"stale_invalidation: {exc!r}")
 
-        # 5. Compute domain extractor scorecards
+        # 6. Compute domain extractor scorecards
         try:
             scorecard_summary = await _compute_domain_extractor_scorecards()
             summary["domain_baselines_updated"] = scorecard_summary.get(
@@ -944,7 +996,7 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             )
             summary["errors"].append(f"scorecards: {exc!r}")
 
-        # 6. Second-pass UPDATE: apply extractor_regression blocker
+        # 7. Second-pass UPDATE: apply extractor_regression blocker
         # (only runs if any regression domains exist after scorecard update)
         try:
             regression_count_row = await database.fetch_one(
