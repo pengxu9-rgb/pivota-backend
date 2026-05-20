@@ -25,6 +25,7 @@ import pytest
 from jobs.nightly_index_health_job import (
     MIN_DESCRIPTION_LENGTH,
     QUALITY_SCORE_THRESHOLD,
+    _IPS_TOTAL_COUNT_QUERY,
     _ORPHAN_COUNT_QUERY,
     _ORPHAN_DELETE,
     _STALE_INVALIDATION_UPDATE,
@@ -352,6 +353,15 @@ def test_extract_domain_strips_scheme_and_www():
     assert _extract_domain("http://api.example.com:8080/x?y=1") == "api.example.com:8080"
     assert _extract_domain("") is None
     assert _extract_domain(None) is None
+
+
+def test_ips_total_count_query_is_simple_count():
+    """The pre-delete IPS count drives the orphan-share warning threshold;
+    must be an unconditional COUNT(*) so it isn't subject to filter drift."""
+    sql = _IPS_TOTAL_COUNT_QUERY.strip().upper()
+    assert sql.startswith("SELECT COUNT(*)")
+    assert "INDEX_PIPELINE_STATE" in sql
+    assert "WHERE" not in sql
 
 
 def test_orphan_queries_target_index_pipeline_state_via_anti_join():

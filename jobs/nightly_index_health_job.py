@@ -635,6 +635,8 @@ WHERE NOT EXISTS (
 )
 """
 
+_IPS_TOTAL_COUNT_QUERY = "SELECT COUNT(*) AS n FROM index_pipeline_state"
+
 _ORPHAN_DELETE = """
 DELETE FROM index_pipeline_state ips
 WHERE NOT EXISTS (
@@ -944,20 +946,27 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         # catastrophic delete upstream rather than silently shrinking IPS.
         orphans_deleted = 0
         try:
-            count_row = await database.fetch_one(_ORPHAN_COUNT_QUERY)
-            orphans = int(dict(count_row).get("n", 0)) if count_row else 0
+            orphan_row = await database.fetch_one(_ORPHAN_COUNT_QUERY)
+            ips_total_row = await database.fetch_one(_IPS_TOTAL_COUNT_QUERY)
+            orphans = int(dict(orphan_row).get("n", 0)) if orphan_row else 0
+            ips_total_before = (
+                int(dict(ips_total_row).get("n", 0)) if ips_total_row else 0
+            )
             if orphans > 0:
-                ips_total = max(total_processed, 1)
-                share = orphans / (orphans + ips_total)
+                # Pre-delete share answers "what fraction of IPS was orphaned"
+                # — the right question for catching a catastrophic prune.
+                share = orphans / max(ips_total_before, 1)
+                post_delete_count = max(ips_total_before - orphans, 0)
                 if orphans >= 100 or share >= 0.10:
                     logger.warning(
                         "nightly_index_health: orphan IPS rows count=%d "
-                        "(%.1f%% of post-delete table) — verify catalog prune "
-                        "didn't run incorrectly",
-                        orphans, share * 100,
+                        "(%.1f%% of %d pre-delete; projected %d after) — "
+                        "verify catalog prune didn't run incorrectly",
+                        orphans, share * 100, ips_total_before, post_delete_count,
                     )
                 await database.execute(_ORPHAN_DELETE)
                 orphans_deleted = orphans
+            summary["ips_total_before"] = ips_total_before
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "nightly_index_health: orphan invalidation failed: %s", exc
