@@ -37,6 +37,17 @@ def test_assess_review_text_risk_flags_hate_or_spam_content() -> None:
     assert "hate_content" in result["reason_codes"]
 
 
+def test_assess_review_text_risk_flags_medical_or_legal_advice() -> None:
+    result = assess_review_text_risk(
+        title="Product question",
+        body="I have eczema and use prescription cream. Can this replace it?",
+    )
+
+    assert result["risk_level"] == "high"
+    assert result["moderation_state"] == "under_review"
+    assert "unsafe_medical_or_legal_claim" in result["reason_codes"]
+
+
 @pytest.mark.asyncio
 async def test_deepseek_moderation_without_key_routes_to_employee_review(
     monkeypatch: pytest.MonkeyPatch,
@@ -115,6 +126,60 @@ async def test_deepseek_moderation_approves_high_confidence_clean_review(
     assert result["model"] == "deepseek-v4-flash"
     assert captured["url"] == "https://api.deepseek.com/chat/completions"
     assert captured["kwargs"]["json"]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_deepseek_approval_cannot_override_local_medical_risk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "decision": "approve",
+                                    "risk_level": "low",
+                                    "reason_codes": [],
+                                    "confidence": 0.99,
+                                    "review_notes": "Clean product question.",
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(self, *args: Any, **kwargs: Any) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setenv("DEEPSEEK_REVIEW_MODERATION_API_KEY", "test-key")
+    monkeypatch.setattr("services.review_moderation_policy.httpx.AsyncClient", FakeClient)
+
+    result = await assess_review_text_risk_with_deepseek(
+        title="Product question",
+        body="I have eczema and use prescription cream. Is it okay to layer this essence?",
+    )
+
+    assert result["moderation_state"] == "under_review"
+    assert result["decision"] == "needs_human_review"
+    assert result["employee_review_queue"] is True
+    assert "unsafe_medical_or_legal_claim" in result["reason_codes"]
 
 
 @pytest.mark.asyncio

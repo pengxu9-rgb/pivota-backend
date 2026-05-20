@@ -29,8 +29,10 @@ Return only valid JSON with this schema:
 Reject user submissions that are clearly unrelated to the product, spam/scam, explicit sexual content,
 gambling promotion, drug promotion, hate/harassment, threats/violence, illegal activity,
 or content that exposes personal data. Use needs_human_review for ambiguous, borderline,
-low-confidence, or policy-adjacent cases. Approve only ordinary product-review, product-question,
-or product-answer content with low safety risk and clear product relevance.
+low-confidence, or policy-adjacent cases. Medical/legal advice, diagnosis, treatment/cure claims,
+prescription replacement, or use with a medical condition should be needs_human_review unless it is
+clearly dangerous enough to reject. Approve only ordinary product-review, product-question, or
+product-answer content with low safety risk and clear product relevance.
 """.strip()
 
 _ALLOWED_DECISIONS = {"approve", "reject", "needs_human_review"}
@@ -64,6 +66,18 @@ _SPAM_PATTERNS = (
     re.compile(r"\b(contact\s+me|dm\s+me|whatsapp|telegram)\b", re.IGNORECASE),
     re.compile(r"\b(crypto\s+giveaway|earn\s+\$?\d+|make\s+money\s+fast)\b", re.IGNORECASE),
 )
+_MEDICAL_LEGAL_PATTERNS = (
+    re.compile(
+        r"\b(cure|diagnos(?:e|is)|medical\s+advice|legal\s+advice|prescription|rx|eczema|psoriasis|"
+        r"dermatologist|physician|doctor|steroid|lawsuit|attorney|lawyer)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(replace|instead\s+of|stop|skip|avoid)\b.{0,80}\b(prescription|medicine|medication|doctor|"
+        r"dermatologist|physician|steroid)\b",
+        re.IGNORECASE,
+    ),
+)
 _URL_PATTERN = re.compile(r"(https?://|www\.)", re.IGNORECASE)
 
 
@@ -86,6 +100,8 @@ def assess_review_text_risk(*, title: Optional[str], body: Optional[str]) -> Dic
         spam_hit = any(p.search(combined) for p in _SPAM_PATTERNS)
         if spam_hit or url_hits >= 3:
             reason_codes.append("spam_or_irrelevant")
+        if any(p.search(combined) for p in _MEDICAL_LEGAL_PATTERNS):
+            reason_codes.append("unsafe_medical_or_legal_claim")
 
     # Keep stable ordering for tests/logging.
     deduped_reason_codes = sorted(set(reason_codes))
