@@ -1,0 +1,387 @@
+"""Unit tests for the nightly commerce index health job.
+
+Covers the pure-logic surface of jobs/nightly_index_health_job:
+  - _classify_product: stage, blocker, serving_eligible decisions
+  - _resolve_seed_title: snapshot vs top-level vs row title shapes
+  - _coerce_dict: defensive JSON coercion
+  - _make_extraction_content_hash: stable hash invariants
+  - Quality threshold scale (0-100, not 0-1)
+  - Stale product invalidation in the classifier
+  - public_indexed reachable via pdp_lifecycle_stage='published'
+  - Scorecard recovery/regression decision logic via the same helpers
+
+DB-touching paths (batch upsert, scorecard SQL) are exercised against the
+real database in the deployment smoke test, not here — mocking asyncpg
+adds more brittleness than confidence.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+import pytest
+
+from jobs.nightly_index_health_job import (
+    MIN_DESCRIPTION_LENGTH,
+    QUALITY_SCORE_THRESHOLD,
+    _ORPHAN_COUNT_QUERY,
+    _ORPHAN_DELETE,
+    _STALE_INVALIDATION_UPDATE,
+    _classify_product,
+    _coerce_dict,
+    _extract_domain,
+    _make_extraction_content_hash,
+    _resolve_seed_title,
+)
+
+
+# ---------------------------------------------------------------------------
+# Quality threshold scale (P0)
+# ---------------------------------------------------------------------------
+
+def test_quality_threshold_is_on_0_to_100_scale():
+    """Regression guard: content_quality_score is 0-100 per services/product_quality_service.py.
+
+    A 0-1 threshold would treat a 1.0 score as passing — that was the P0 bug.
+    """
+    assert QUALITY_SCORE_THRESHOLD >= 1.0, (
+        f"QUALITY_SCORE_THRESHOLD={QUALITY_SCORE_THRESHOLD} looks like 0-1 scale; "
+        "content_quality_score is 0-100 (see product_quality_service.py:556)"
+    )
+
+
+def _full_row(**overrides):
+    """Baseline 'eligible' product row; tests override specific fields to test branches."""
+    base = {
+        "content_key": "ck_test_001",
+        "product_key": "pk_001",
+        "pivota_signature_id": "sig_001",
+        "merchant_id": "merch_001",
+        "platform": "shopify",
+        "source_product_id": "prod_001",
+        "pdp_scope": "canonical",
+        "sync_status": "live",
+        "canonical_url": "https://example.com/p/test",
+        "content_quality_score": 80.0,  # 0-100 scale
+        "model_readiness_score": 70.0,
+        "conversion_potential_score": None,
+        "quality_rules_version": "v1",
+        "quality_scored_at": datetime(2026, 5, 20, tzinfo=timezone.utc),
+        "image_url": "https://cdn.example.com/img.jpg",
+        "pdp_description": "x" * 200,  # > MIN_DESCRIPTION_LENGTH
+        "pdp_sync_status": "live",
+        "pdp_lifecycle_stage": "published",
+        "refreshed_at": datetime(2026, 5, 20, tzinfo=timezone.utc),
+        "seed_data_json": {"title": "Test product", "review_summary": {"review_status": "no_issues_found"}},
+        "seed_title": "Test product",
+        "has_price": True,
+        "has_offer_snapshot": True,
+        "product_group_id": "pg_001",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_baseline_eligible_product_classified_correctly():
+    state = _classify_product(_full_row(), regression_domains=set())
+    assert state["serving_eligible"] is True
+    assert state["pipeline_stage"] == "public_indexed"
+    assert state["blocker_code"] == "none"
+    assert state["content_quality_score"] == 80.0
+
+
+def test_quality_score_exactly_at_threshold_passes():
+    state = _classify_product(
+        _full_row(content_quality_score=QUALITY_SCORE_THRESHOLD),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is True
+    assert state["blocker_code"] == "none"
+
+
+def test_quality_score_below_threshold_blocks():
+    state = _classify_product(
+        _full_row(content_quality_score=QUALITY_SCORE_THRESHOLD - 0.1),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is False
+    assert state["blocker_code"] == "low_quality"
+
+
+def test_quality_score_of_1_point_0_is_blocked_low_quality():
+    """Catches the original P0: with 0-1 scale, 1.0 would pass; with 0-100, it's terrible."""
+    state = _classify_product(
+        _full_row(content_quality_score=1.0),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is False
+    assert state["blocker_code"] == "low_quality"
+    assert "1.0" in (state["blocker_detail"] or "")
+
+
+# ---------------------------------------------------------------------------
+# Stale product invalidation (P0)
+# ---------------------------------------------------------------------------
+
+def test_stale_product_blocked_as_not_live():
+    state = _classify_product(_full_row(sync_status="stale"), regression_domains=set())
+    assert state["serving_eligible"] is False
+    assert state["blocker_code"] == "not_live"
+    assert "stale" in (state["blocker_detail"] or "")
+
+
+def test_archived_product_blocked_as_not_live():
+    state = _classify_product(_full_row(sync_status="archived"), regression_domains=set())
+    assert state["serving_eligible"] is False
+    assert state["blocker_code"] == "not_live"
+
+
+def test_not_live_takes_precedence_over_other_blockers():
+    """Even if quality is high and image present, sync_status!='live' wins."""
+    state = _classify_product(
+        _full_row(sync_status="archived", content_quality_score=10.0, image_url=""),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "not_live"
+
+
+# ---------------------------------------------------------------------------
+# Public_indexed mapping (P1)
+# ---------------------------------------------------------------------------
+
+def test_public_indexed_requires_pdp_lifecycle_published():
+    """apv.sync_status is live/stale/archived, NOT 'public' — public_indexed must use lifecycle_stage."""
+    state = _classify_product(
+        _full_row(pdp_lifecycle_stage="published"),
+        regression_domains=set(),
+    )
+    assert state["pipeline_stage"] == "public_indexed"
+
+
+def test_eligible_without_published_lifecycle_is_shadow_indexed():
+    state = _classify_product(
+        _full_row(pdp_lifecycle_stage="validated"),  # eligible but not published
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is True
+    assert state["pipeline_stage"] == "shadow_indexed"
+
+
+def test_apv_sync_status_public_no_longer_promotes_to_public_indexed():
+    """Regression guard: a row with apv.sync_status='public' (which never happens
+    in practice) must NOT be classified as public_indexed — that was the P1 bug."""
+    state = _classify_product(
+        _full_row(pdp_sync_status="public", pdp_lifecycle_stage="validated"),
+        regression_domains=set(),
+    )
+    assert state["pipeline_stage"] != "public_indexed"
+
+
+# ---------------------------------------------------------------------------
+# Seed shape compatibility (P1)
+# ---------------------------------------------------------------------------
+
+def test_resolve_seed_title_prefers_snapshot_title():
+    seed = {"snapshot": {"title": "Snapshot Title"}, "title": "Top Title"}
+    assert _resolve_seed_title(seed, {"seed_title": "Row Title"}) == "Snapshot Title"
+
+
+def test_resolve_seed_title_falls_back_to_row_title():
+    seed = {"snapshot": {}}  # no snapshot title
+    assert _resolve_seed_title(seed, {"seed_title": "Row Title"}) == "Row Title"
+
+
+def test_resolve_seed_title_falls_back_to_top_level_title():
+    seed = {"title": "Top Title"}
+    assert _resolve_seed_title(seed, {"seed_title": None}) == "Top Title"
+
+
+def test_resolve_seed_title_empty_when_all_blank():
+    assert _resolve_seed_title({}, {}) == ""
+    assert _resolve_seed_title({"title": "   "}, {"seed_title": ""}) == ""
+
+
+def test_snapshot_shaped_seed_data_is_extracted_not_no_extraction():
+    """Regression guard: rows with seed_data.snapshot.title but no top-level title
+    were classified as 'no_extraction'. That was the P1 bug."""
+    seed_data = {"snapshot": {"title": "Real product name"}}
+    state = _classify_product(
+        _full_row(seed_data_json=seed_data, seed_title=None),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] != "no_extraction"
+    # With the seed title resolved, it should reach the stage that other checks allow
+    assert state["pipeline_stage"] in ("extracted", "quality_gated", "shadow_indexed", "public_indexed")
+
+
+def test_seed_data_as_json_string_is_parsed():
+    seed_data = '{"snapshot": {"title": "Parsed from string"}}'
+    state = _classify_product(
+        _full_row(seed_data_json=seed_data, seed_title=None),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] != "no_seed"
+    assert state["blocker_code"] != "no_extraction"
+
+
+# ---------------------------------------------------------------------------
+# Other blockers (regression coverage)
+# ---------------------------------------------------------------------------
+
+def test_missing_seed_blocks_as_no_seed():
+    state = _classify_product(
+        _full_row(seed_data_json=None, seed_title=None),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "no_seed"
+
+
+def test_missing_image_blocks_as_no_image():
+    state = _classify_product(_full_row(image_url=""), regression_domains=set())
+    assert state["blocker_code"] == "no_image"
+
+
+def test_missing_price_blocks_as_no_price():
+    state = _classify_product(_full_row(has_price=False), regression_domains=set())
+    assert state["blocker_code"] == "no_price"
+
+
+def test_short_description_blocks():
+    state = _classify_product(
+        _full_row(pdp_description="too short"),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "short_description"
+
+
+def test_entity_unresolved_blocks():
+    state = _classify_product(
+        _full_row(product_group_id=None, pdp_scope="external_seed"),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "entity_unresolved"
+
+
+def test_seed_audit_issues_unresolved_blocks():
+    state = _classify_product(
+        _full_row(seed_data_json={
+            "title": "Test",
+            "review_summary": {"review_status": "issues_unresolved"},
+        }),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "seed_audit_fail"
+
+
+def test_extractor_regression_blocks_at_domain_level():
+    state = _classify_product(
+        _full_row(canonical_url="https://bad-domain.com/p/x"),
+        regression_domains={"bad-domain.com"},
+    )
+    assert state["blocker_code"] == "extractor_regression"
+    assert state["serving_eligible"] is False
+
+
+def test_extractor_regression_not_applied_for_unrelated_domain():
+    state = _classify_product(
+        _full_row(canonical_url="https://good.com/p/x"),
+        regression_domains={"bad-domain.com"},
+    )
+    assert state["blocker_code"] == "none"
+    assert state["serving_eligible"] is True
+
+
+# ---------------------------------------------------------------------------
+# Stage progression (no eligibility)
+# ---------------------------------------------------------------------------
+
+def test_discovered_when_no_seed_no_offer_snapshot():
+    state = _classify_product(
+        _full_row(seed_data_json=None, seed_title=None, has_offer_snapshot=None),
+        regression_domains=set(),
+    )
+    assert state["pipeline_stage"] == "discovered"
+
+
+def test_crawled_when_offer_snapshot_but_no_seed():
+    state = _classify_product(
+        _full_row(seed_data_json=None, seed_title=None, has_offer_snapshot=True),
+        regression_domains=set(),
+    )
+    assert state["pipeline_stage"] == "crawled"
+
+
+def test_extracted_when_seed_title_but_no_quality():
+    state = _classify_product(
+        _full_row(content_quality_score=None),
+        regression_domains=set(),
+    )
+    assert state["pipeline_stage"] == "extracted"
+
+
+def test_quality_gated_when_quality_passes_but_no_pdp_refresh():
+    """All eligibility criteria met, but no apv row → stage caps at quality_gated."""
+    state = _classify_product(
+        _full_row(refreshed_at=None),
+        regression_domains=set(),
+    )
+    # serving_eligible doesn't require an apv row, so it's still True;
+    # but pipeline_stage tops out at quality_gated until the next apv backfill.
+    assert state["pipeline_stage"] == "quality_gated"
+    assert state["serving_eligible"] is True
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def test_coerce_dict_handles_string_json():
+    assert _coerce_dict('{"a": 1}') == {"a": 1}
+
+
+def test_coerce_dict_handles_garbage():
+    assert _coerce_dict("not json") == {}
+    assert _coerce_dict(None) == {}
+    assert _coerce_dict(123) == {}
+    assert _coerce_dict('[1,2,3]') == {}  # list, not dict
+
+
+def test_extract_domain_strips_scheme_and_www():
+    assert _extract_domain("https://www.example.com/path") == "example.com"
+    assert _extract_domain("http://api.example.com:8080/x?y=1") == "api.example.com:8080"
+    assert _extract_domain("") is None
+    assert _extract_domain(None) is None
+
+
+def test_orphan_queries_target_index_pipeline_state_via_anti_join():
+    """The orphan-handling SQL must DELETE FROM index_pipeline_state and gate
+    on absence of a catalog_products.content_key match. Regression guard that
+    the catalog prune path's hard-deletes can't leave stale eligible rows."""
+    for sql in (_ORPHAN_COUNT_QUERY, _ORPHAN_DELETE):
+        assert "index_pipeline_state" in sql
+        assert "NOT EXISTS" in sql
+        assert "catalog_products" in sql
+        assert "content_key" in sql
+    assert _ORPHAN_DELETE.lstrip().upper().startswith("DELETE")
+    assert _ORPHAN_COUNT_QUERY.lstrip().upper().startswith("SELECT")
+
+
+def test_stale_invalidation_targets_sync_status_not_live():
+    """The stale-invalidation UPDATE must guard on sync_status != 'live' and
+    flip serving_eligible to FALSE. Regression guard for P0 #2."""
+    assert _STALE_INVALIDATION_UPDATE.lstrip().upper().startswith("UPDATE")
+    assert "index_pipeline_state" in _STALE_INVALIDATION_UPDATE
+    assert "serving_eligible" in _STALE_INVALIDATION_UPDATE
+    assert "FALSE" in _STALE_INVALIDATION_UPDATE
+    assert "'not_live'" in _STALE_INVALIDATION_UPDATE
+    assert "IS DISTINCT FROM 'live'" in _STALE_INVALIDATION_UPDATE
+
+
+def test_extraction_content_hash_is_deterministic():
+    h1 = _make_extraction_content_hash("a", "b", "c")
+    h2 = _make_extraction_content_hash("a", "b", "c")
+    h3 = _make_extraction_content_hash("a", "b", "d")
+    assert h1 == h2
+    assert h1 != h3
+    assert len(h1) == 64  # sha256 hex

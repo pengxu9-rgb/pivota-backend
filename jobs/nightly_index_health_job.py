@@ -17,26 +17,32 @@ No LLM calls. All stage/blocker decisions are deterministic threshold checks.
 Stage progression (highest satisfied stage wins):
   discovered    → catalog_products row with content_key exists
   crawled       → external_offer_snapshots row for the domain exists
-  extracted     → seed_data non-empty with title present
-  quality_gated → content_quality_score >= 0.65 AND has_image AND has_price
+  extracted     → seed_data non-empty with title present (snapshot.title OR top-level)
+  quality_gated → content_quality_score >= 65 AND has_image AND has_price
                   AND description_length >= 50
   shadow_indexed → serving_eligible=TRUE AND agent_pdp_view refreshed_at IS NOT NULL
-  public_indexed → serving_eligible=TRUE AND agent_pdp_view sync_status='public'
+  public_indexed → serving_eligible=TRUE AND apv.pdp_lifecycle_stage='published'
 
 Serving eligibility (ALL must be true):
-  - content_quality_score >= 0.65
+  - content_quality_score >= 65        (scale is 0-100, see services/product_quality_service.py)
   - has_image = TRUE  (agent_pdp_view.image_url non-null/non-empty)
   - has_price = TRUE  (catalog_offers row with list_price > 0)
   - description_length >= 50 (agent_pdp_view.description stripped)
   - identity_resolved = TRUE (product_group_members row OR pdp_scope='canonical')
   - seed_audit_status IN ('no_issues_found', 'auto_corrected', 'not_audited')
-  - sync_status = 'live' (catalog_products)
+  - catalog_products.sync_status = 'live'
   - no extractor_regression blocker on the product's domain
 
+Stale invalidation: a second-pass UPDATE demotes any index_pipeline_state row
+whose catalog_products.sync_status is no longer 'live' to serving_eligible=FALSE
+with blocker_code='not_live'. This protects against rows that were eligible
+yesterday but archived today.
+
 Blocker codes (first failing check wins):
+  not_live          — catalog_products.sync_status is not 'live' (stale/archived)
   no_seed           — no external_product_seeds row linked to this product_key
-  no_extraction     — seed_data null or title missing
-  low_quality       — content_quality_score < 0.65
+  no_extraction     — seed_data present but title missing in snapshot AND top-level
+  low_quality       — content_quality_score < 65 (0-100 scale)
   no_image          — image_url null or empty
   no_price          — no catalog_offers row with list_price > 0
   short_description — description present but stripped length < 50
@@ -75,7 +81,9 @@ REGRESSION_THRESHOLD = 0.20  # coverage drop > 20% → 'regression'
 MIN_DOMAIN_SAMPLE = 5        # minimum products per domain for scoring
 BATCH_SIZE = 500
 
-QUALITY_SCORE_THRESHOLD = 0.65
+# content_quality_score is on a 0-100 scale; see services/product_quality_service.py
+# (`round(avg_score * 100.0, 1)`). A threshold of 65 ≈ "two-thirds of facets passed".
+QUALITY_SCORE_THRESHOLD = 65.0
 MIN_DESCRIPTION_LENGTH = 50
 
 # Stable signed-int64 advisory lock id for this job.
@@ -137,6 +145,36 @@ def _make_extraction_content_hash(
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _coerce_dict(value: Any) -> Dict[str, Any]:
+    """Best-effort JSON → dict coercion. Returns {} on any failure."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _resolve_seed_title(seed_data: Dict[str, Any], row: Dict[str, Any]) -> str:
+    """Resolve seed title across the shapes used in external_product_seeds.
+
+    Matches services/external_seed_audit.py:audit_external_seed_row resolution
+    order: snapshot.title → row.title → seed_data.title. Returns "" if none.
+    """
+    snapshot = _coerce_dict(seed_data.get("snapshot"))
+    for candidate in (
+        snapshot.get("title"),
+        row.get("seed_title"),  # selected from external_product_seeds.title in batch query
+        seed_data.get("title"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Per-product classification
 # ---------------------------------------------------------------------------
@@ -152,21 +190,14 @@ def _classify_product(
     """
     now = datetime.now(timezone.utc)
 
-    # --- Extract seed signals ---
-    seed_data = row.get("seed_data_json") or {}
-    if isinstance(seed_data, str):
-        try:
-            seed_data = json.loads(seed_data)
-        except (json.JSONDecodeError, TypeError):
-            seed_data = {}
-
-    seed_title = seed_data.get("title") or ""
-    review_summary = seed_data.get("review_summary") or {}
-    if isinstance(review_summary, str):
-        try:
-            review_summary = json.loads(review_summary)
-        except (json.JSONDecodeError, TypeError):
-            review_summary = {}
+    # --- Extract seed signals (snapshot-shape aware) ---
+    seed_data = _coerce_dict(row.get("seed_data_json"))
+    seed_title = _resolve_seed_title(seed_data, row)
+    snapshot = _coerce_dict(seed_data.get("snapshot"))
+    # review_summary may live on the seed_data itself or under snapshot.review_summary
+    review_summary = _coerce_dict(
+        seed_data.get("review_summary") or snapshot.get("review_summary")
+    )
     seed_review_status = review_summary.get("review_status") or ""
     seed_audit_status = (
         seed_review_status if seed_review_status else "not_audited"
@@ -182,8 +213,11 @@ def _classify_product(
     # --- Extract PDP view signals ---
     pdp_image_url = (row.get("image_url") or "").strip()
     pdp_description = (row.get("pdp_description") or "").strip()
-    pdp_sync_status = row.get("pdp_sync_status") or ""
+    pdp_sync_status = (row.get("pdp_sync_status") or "").strip()
+    pdp_lifecycle_stage = (row.get("pdp_lifecycle_stage") or "").strip()
     pdp_refreshed_at = row.get("refreshed_at")
+    # catalog_products.sync_status (the canonical source); apv mirrors it but can lag
+    cp_sync_status = (row.get("sync_status") or "").strip()
 
     has_image = bool(pdp_image_url)
     has_price = bool(row.get("has_price"))
@@ -210,13 +244,16 @@ def _classify_product(
     blocker_code = "none"
     blocker_detail: Optional[str] = None
 
-    if not seed_data or not seed_title:
+    if cp_sync_status and cp_sync_status != "live":
+        blocker_code = "not_live"
+        blocker_detail = f"catalog_products.sync_status={cp_sync_status!r}"
+    elif not seed_data or not seed_title:
         if not seed_data:
             blocker_code = "no_seed"
             blocker_detail = "no external_product_seeds row attached to this product_key"
         else:
             blocker_code = "no_extraction"
-            blocker_detail = "seed_data present but title is missing"
+            blocker_detail = "seed_data present but title is missing in snapshot and top-level"
     elif quality_score is None or quality_score < QUALITY_SCORE_THRESHOLD:
         blocker_code = "low_quality"
         blocker_detail = (
@@ -248,6 +285,7 @@ def _classify_product(
     # --- Serving eligibility (all criteria must pass) ---
     serving_eligible = (
         blocker_code == "none"
+        and cp_sync_status == "live"
         and bool(seed_title)
         and quality_score is not None
         and quality_score >= QUALITY_SCORE_THRESHOLD
@@ -260,12 +298,22 @@ def _classify_product(
     )
 
     # --- Stage assignment (highest satisfied stage wins) ---
-    if serving_eligible and pdp_sync_status == "public":
+    # Each stage is a strict superset of the previous:
+    #   public_indexed ⊃ shadow_indexed ⊃ quality_gated ⊃ extracted ⊃ crawled ⊃ discovered
+    # public_indexed maps to apv.pdp_lifecycle_stage='published' AND a refreshed apv row;
+    # apv.sync_status is inherited from catalog_products (live/stale/archived)
+    # and is NOT the published/shadow distinction.
+    if (
+        serving_eligible
+        and pdp_refreshed_at is not None
+        and pdp_lifecycle_stage == "published"
+    ):
         pipeline_stage = "public_indexed"
     elif serving_eligible and pdp_refreshed_at is not None:
         pipeline_stage = "shadow_indexed"
     elif (
-        quality_score is not None
+        seed_title  # quality_gated requires extraction to have happened
+        and quality_score is not None
         and quality_score >= QUALITY_SCORE_THRESHOLD
         and has_image
         and has_price
@@ -348,8 +396,10 @@ SELECT
     apv.image_url,
     apv.description             AS pdp_description,
     apv.sync_status             AS pdp_sync_status,
+    apv.pdp_lifecycle_stage     AS pdp_lifecycle_stage,
     apv.refreshed_at,
     eps.seed_data               AS seed_data_json,
+    eps.title                   AS seed_title,
     (
         SELECT TRUE
         FROM catalog_offers co
@@ -382,7 +432,7 @@ LEFT JOIN LATERAL (
 LEFT JOIN agent_pdp_view apv
     ON apv.content_key = cp.content_key
 LEFT JOIN LATERAL (
-    SELECT seed_data
+    SELECT seed_data, title
     FROM external_product_seeds
     WHERE attached_product_key = cp.product_key
     ORDER BY updated_at DESC
@@ -482,29 +532,50 @@ ON CONFLICT (content_key) DO UPDATE SET
 # ---------------------------------------------------------------------------
 
 _SCORECARD_QUERY = """
+WITH seeds_in_window AS (
+    -- Dedupe to one row per (domain, seed). Without DISTINCT, a seed with N
+    -- offer snapshots in the window would be counted N times, skewing
+    -- coverage rates and triggering false regressions.
+    SELECT DISTINCT
+        eos.domain,
+        eps.id          AS seed_id,
+        eps.title       AS seed_title_top,
+        eps.seed_data   AS seed_data,
+        eps.attached_product_key
+    FROM external_offer_snapshots eos
+    JOIN external_product_seeds eps
+        ON eps.canonical_url = eos.canonical_url
+    WHERE eos.last_checked_at > NOW() - INTERVAL '72 hours'
+)
 SELECT
-    eos.domain,
-    COUNT(*)                                                          AS total,
-    COUNT(CASE WHEN (eps.seed_data->>'title') IS NOT NULL
-                AND LENGTH(eps.seed_data->>'title') > 0
-               THEN 1 END)                                           AS has_title,
-    COUNT(CASE WHEN (eps.seed_data->>'description') IS NOT NULL
-                AND LENGTH(eps.seed_data->>'description') >= 10
-               THEN 1 END)                                           AS has_description,
-    COUNT(CASE WHEN (eps.seed_data->>'image_url') IS NOT NULL
-               THEN 1 END)                                           AS has_image,
-    COUNT(CASE WHEN co.list_price > 0
-               THEN 1 END)                                           AS has_price
-FROM external_offer_snapshots eos
-JOIN external_product_seeds eps
-    ON eps.canonical_url = eos.canonical_url
-LEFT JOIN catalog_products cp
-    ON cp.product_key = eps.attached_product_key
-LEFT JOIN catalog_offers co
-    ON co.product_key = cp.product_key
-   AND co.list_price > 0
-WHERE eos.last_checked_at > NOW() - INTERVAL '72 hours'
-GROUP BY eos.domain
+    s.domain,
+    COUNT(*) AS total,
+    -- Title: snapshot.title → top-level seed.title → seed_data.title
+    COUNT(CASE WHEN length(coalesce(
+            nullif(s.seed_data->'snapshot'->>'title', ''),
+            nullif(s.seed_title_top, ''),
+            nullif(s.seed_data->>'title', '')
+        )) > 0 THEN 1 END) AS has_title,
+    -- Description: snapshot.description → seed_data.description (>=10 chars)
+    COUNT(CASE WHEN length(coalesce(
+            nullif(s.seed_data->'snapshot'->>'description', ''),
+            nullif(s.seed_data->>'description', '')
+        )) >= 10 THEN 1 END) AS has_description,
+    -- Image: snapshot.image_url → seed_data.image_url → first images[]
+    COUNT(CASE WHEN length(coalesce(
+            nullif(s.seed_data->'snapshot'->>'image_url', ''),
+            nullif(s.seed_data->>'image_url', ''),
+            nullif(s.seed_data->'images'->>0, '')
+        )) > 0 THEN 1 END) AS has_image,
+    -- Price: EXISTS on catalog_offers — never multiplies the seed count
+    COUNT(CASE WHEN EXISTS (
+            SELECT 1
+            FROM catalog_offers co
+            WHERE co.product_key = s.attached_product_key
+              AND co.list_price > 0
+        ) THEN 1 END) AS has_price
+FROM seeds_in_window s
+GROUP BY s.domain
 HAVING COUNT(*) >= :min_sample
 ORDER BY COUNT(*) DESC
 LIMIT 500
@@ -547,6 +618,45 @@ ON CONFLICT (domain) DO UPDATE SET
     last_scored_at    = EXCLUDED.last_scored_at,
     baseline_coverage = EXCLUDED.baseline_coverage,
     baseline_set_at   = EXCLUDED.baseline_set_at
+"""
+
+# Orphan count / DELETE: catalog_products rows can be hard-deleted by the
+# Shopify catalog source prune (services/catalog_sync_service.py:1450). An
+# orphan IPS row (no matching catalog_products.content_key) can otherwise
+# stay serving_eligible=TRUE forever because the live-only batch query
+# never reaches it. Delete rather than UPDATE — IPS is derived state and
+# the source row is gone; if catalog re-imports the product, the nightly
+# job will rebuild the IPS row from scratch.
+_ORPHAN_COUNT_QUERY = """
+SELECT COUNT(*) AS n
+FROM index_pipeline_state ips
+WHERE NOT EXISTS (
+    SELECT 1 FROM catalog_products cp WHERE cp.content_key = ips.content_key
+)
+"""
+
+_ORPHAN_DELETE = """
+DELETE FROM index_pipeline_state ips
+WHERE NOT EXISTS (
+    SELECT 1 FROM catalog_products cp WHERE cp.content_key = ips.content_key
+)
+"""
+
+# Stale invalidation UPDATE: any IPS row whose catalog_products.sync_status
+# is no longer 'live' must lose serving_eligible. Runs unconditionally before
+# the regression blocker pass so a previously-eligible product that was
+# archived since the last run never lingers as eligible.
+_STALE_INVALIDATION_UPDATE = """
+UPDATE index_pipeline_state ips
+SET
+    serving_eligible     = FALSE,
+    blocker_code         = 'not_live',
+    blocker_detail       = 'catalog_products.sync_status=' || quote_literal(cp.sync_status),
+    last_consolidated_at = NOW()
+FROM catalog_products cp
+WHERE cp.content_key = ips.content_key
+  AND cp.sync_status IS DISTINCT FROM 'live'
+  AND (ips.serving_eligible = TRUE OR ips.blocker_code <> 'not_live')
 """
 
 # Second-pass UPDATE: mark index_pipeline_state rows with extractor_regression
@@ -825,7 +935,48 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         summary["eligible_count"] = eligible_count
         summary["stage_counts"] = stage_counts
 
-        # 4. Compute domain extractor scorecards
+        # 4. Orphan invalidation: catalog_products rows can be hard-deleted by
+        # the Shopify catalog source prune. An IPS row whose catalog product
+        # no longer exists must be removed — the live-only batch query above
+        # never touches it, so without this it would stay serving_eligible=TRUE
+        # forever. Logs the orphan count before deleting for observability;
+        # warns loudly if the orphan share is suspicious so we notice a
+        # catastrophic delete upstream rather than silently shrinking IPS.
+        orphans_deleted = 0
+        try:
+            count_row = await database.fetch_one(_ORPHAN_COUNT_QUERY)
+            orphans = int(dict(count_row).get("n", 0)) if count_row else 0
+            if orphans > 0:
+                ips_total = max(total_processed, 1)
+                share = orphans / (orphans + ips_total)
+                if orphans >= 100 or share >= 0.10:
+                    logger.warning(
+                        "nightly_index_health: orphan IPS rows count=%d "
+                        "(%.1f%% of post-delete table) — verify catalog prune "
+                        "didn't run incorrectly",
+                        orphans, share * 100,
+                    )
+                await database.execute(_ORPHAN_DELETE)
+                orphans_deleted = orphans
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "nightly_index_health: orphan invalidation failed: %s", exc
+            )
+            summary["errors"].append(f"orphan_invalidation: {exc!r}")
+        summary["orphans_deleted"] = orphans_deleted
+
+        # 5. Stale-product invalidation: any IPS row whose catalog_products
+        # row is no longer 'live' must be demoted (was the P0 risk where a
+        # previously-eligible product could linger as eligible after archival).
+        try:
+            await database.execute(_STALE_INVALIDATION_UPDATE)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "nightly_index_health: stale invalidation UPDATE failed: %s", exc
+            )
+            summary["errors"].append(f"stale_invalidation: {exc!r}")
+
+        # 6. Compute domain extractor scorecards
         try:
             scorecard_summary = await _compute_domain_extractor_scorecards()
             summary["domain_baselines_updated"] = scorecard_summary.get(
@@ -845,7 +996,7 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             )
             summary["errors"].append(f"scorecards: {exc!r}")
 
-        # 5. Second-pass UPDATE: apply extractor_regression blocker
+        # 7. Second-pass UPDATE: apply extractor_regression blocker
         # (only runs if any regression domains exist after scorecard update)
         try:
             regression_count_row = await database.fetch_one(
