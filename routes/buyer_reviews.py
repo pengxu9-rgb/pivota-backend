@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from observability.reviews_metrics import record_buyer_create, record_buyer_exchange, record_buyer_media_upload
 from db.database import database
 from db.reviews_center import product_reviews, buyer_review_user_subject
-from routes.accounts_orders_api import AccountsPrincipal, get_accounts_principal_ugc
+from routes.accounts_orders_api import AccountsPrincipal, get_accounts_or_guest_principal_ugc
 from services.buyer_reviews_service import (
     buyer_submit_enabled,
     buyer_submit_merchant_allowed,
@@ -22,7 +22,7 @@ from services.buyer_reviews_service import (
     issue_submission_token,
 )
 from services.reviews_service import VARIANT_ID_SENTINEL, build_product_key, build_sku_key
-from services.review_moderation_policy import assess_review_text_risk, merge_moderation_risk_flags
+from services.review_moderation_policy import assess_review_text_risk_with_deepseek, merge_moderation_risk_flags
 from services.ugc_capabilities_service import UgcSubject, bind_user_review_subject, get_review_slot_summary
 
 
@@ -44,6 +44,8 @@ def _moderation_reason_from_state(state: Optional[str], *, fallback: str = "ok")
         return "auto_approved"
     if norm == "under_review":
         return "high_risk_under_review"
+    if norm == "removed":
+        return "rejected_by_moderation"
     return fallback
 
 
@@ -181,10 +183,10 @@ async def buyer_create_review_from_user(
     request: Request,
     response: Response,
     body: CreateReviewFromUserRequest,
-    principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
+    principal: AccountsPrincipal = Depends(get_accounts_or_guest_principal_ugc),
 ) -> Dict[str, Any]:
     """
-    In-app review creation for logged-in users (no invitation token required).
+    In-app review creation for logged-in and guest users (no invitation token required).
     """
     start = time.perf_counter()
     response.headers["Cache-Control"] = "private, no-store"
@@ -218,16 +220,9 @@ async def buyer_create_review_from_user(
         requested_rating = int(body.rating) if body.rating is not None else None
         title_text = (body.title or "").strip() or None
         body_text = (body.body or "").strip() or None
-        moderation = assess_review_text_risk(title=title_text, body=body_text)
-        moderation_state = str(moderation.get("moderation_state") or "under_review")
 
         if requested_rating is None and not title_text and not body_text:
             raise HTTPException(status_code=400, detail="EMPTY_REVIEW")
-
-        if requested_rating is not None and not is_purchaser:
-            raise HTTPException(status_code=403, detail="NOT_VERIFIED_FOR_RATING")
-        if not is_purchaser:
-            raise HTTPException(status_code=403, detail="NOT_PURCHASER")
 
         subject_ref = body.subject
         merchant_id = str(subject_ref.merchant_id or "").strip()
@@ -254,11 +249,14 @@ async def buyer_create_review_from_user(
             platform_product_id=platform_product_id,
             variant_id=variant_id,
         )
+        moderation = await assess_review_text_risk_with_deepseek(title=title_text, body=body_text)
+        moderation_state = str(moderation.get("moderation_state") or "under_review")
 
         now_dt = datetime.now(timezone.utc)
         base_risk_fields = {
             "source": "accounts",
             "accounts_user_id": principal.user_id,
+            "ugc_actor_type": "guest" if str(principal.user_id).startswith("guest:") else "account",
             "subject_type": subject_type,
             "subject_id": subject_id,
         }
@@ -290,7 +288,7 @@ async def buyer_create_review_from_user(
 
             if existing_verification in {"unverified", ""}:
                 update_values: Dict[str, Any] = {
-                    "verification": "verified_purchase",
+                    "verification": "verified_purchase" if is_purchaser else "unverified",
                     "updated_at": now_dt,
                     "status": moderation_state,
                     "risk_flags": merge_moderation_risk_flags(
@@ -360,9 +358,13 @@ async def buyer_create_review_from_user(
                     "updated": True,
                 }
 
-        if not available_order_ids:
+        if not available_order_ids and existing_bindings:
             raise HTTPException(status_code=409, detail="ALREADY_REVIEWED")
-        target_order_id = str(available_order_ids[0]).strip()
+        target_order_id = str(available_order_ids[0]).strip() if available_order_ids else None
+        target_order_key = target_order_id or "unverified"
+        risk_extra = dict(base_risk_fields)
+        if target_order_id:
+            risk_extra["order_id"] = target_order_id
 
         review_id = await database.execute(
             product_reviews.insert().values(
@@ -377,16 +379,16 @@ async def buyer_create_review_from_user(
                 source_type="native",
                 source_system="accounts",
                 external_review_id=None,
-                dedupe_key=f"accounts|{principal.user_id}|{subject_type}|{subject_id}|{target_order_id}",
-                verification="verified_purchase" if is_purchaser else "unverified",
-                rating=requested_rating if is_purchaser else None,
+                dedupe_key=f"accounts|{principal.user_id}|{subject_type}|{subject_id}|{target_order_key}",
+                verification="verified_purchase" if is_purchaser and target_order_id else "unverified",
+                rating=requested_rating,
                 title=title_text,
                 body=body_text,
                 media_count=0,
                 risk_flags=merge_moderation_risk_flags(
                     None,
                     moderation=moderation,
-                    extra={**base_risk_fields, "order_id": target_order_id},
+                    extra=risk_extra,
                 ),
                 status=moderation_state,
                 created_at=now_dt,
@@ -405,12 +407,17 @@ async def buyer_create_review_from_user(
         except HTTPException as e:
             if e.status_code == 409:
                 # Idempotent replay: return existing review_id if we can find it.
+                order_filter = (
+                    buyer_review_user_subject.c.order_id == target_order_id
+                    if target_order_id is not None
+                    else buyer_review_user_subject.c.order_id.is_(None)
+                )
                 existing = await database.fetch_one(
                     buyer_review_user_subject.select().where(
                         (buyer_review_user_subject.c.user_id == principal.user_id)
                         & (buyer_review_user_subject.c.subject_type == subject_type)
                         & (buyer_review_user_subject.c.subject_id == subject_id)
-                        & (buyer_review_user_subject.c.order_id == target_order_id)
+                        & order_filter
                     )
                 )
                 if existing:
@@ -489,7 +496,7 @@ async def buyer_attach_review_media_from_user(
     review_id: int,
     request: Request,
     file: UploadFile = File(...),
-    principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
+    principal: AccountsPrincipal = Depends(get_accounts_or_guest_principal_ugc),
 ) -> Dict[str, Any]:
     start = time.perf_counter()
     try:

@@ -898,6 +898,9 @@ async def employee_list_reviews_for_moderation(
     source_system: Optional[str] = None,
     review_id: Optional[int] = None,
     order_id: Optional[str] = None,
+    moderation_decision: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    employee_review_queue: Optional[bool] = None,
     has_pending_media: Optional[bool] = None,
     limit: int = 50,
     actor: Dict[str, Any] = Depends(require_employee_permissions(["reviews.read"])),
@@ -924,6 +927,17 @@ async def employee_list_reviews_for_moderation(
     if order_id_norm:
         where.append("COALESCE(NULLIF(product_reviews.risk_flags ->> 'order_id', ''), bind.order_id) = :oid")
         params["oid"] = order_id_norm
+    moderation_decision_norm = str(moderation_decision or "").strip().lower()
+    if moderation_decision_norm:
+        where.append("product_reviews.risk_flags ->> 'moderation_decision' = :mdec")
+        params["mdec"] = moderation_decision_norm
+    risk_level_norm = str(risk_level or "").strip().lower()
+    if risk_level_norm:
+        where.append("product_reviews.risk_flags ->> 'text_risk_level' = :risk_level")
+        params["risk_level"] = risk_level_norm
+    if employee_review_queue is not None:
+        where.append("COALESCE(product_reviews.risk_flags ->> 'employee_review_queue', 'false') = :employee_review_queue")
+        params["employee_review_queue"] = "true" if employee_review_queue else "false"
     if has_pending_media is not None:
         if has_pending_media:
             where.append("COALESCE(media_stats.pending_media_count, 0) > 0")
@@ -946,6 +960,7 @@ async def employee_list_reviews_for_moderation(
                product_reviews.title,
                COALESCE(NULLIF(product_reviews.body_redacted, ''), product_reviews.body) AS body_effective,
                product_reviews.media_count,
+               product_reviews.risk_flags,
                COALESCE(media_stats.pending_media_count, 0)::int AS pending_media_count,
                COALESCE(media_stats.active_media_count, 0)::int AS active_media_count,
                COALESCE(media_stats.total_media_count, 0)::int AS total_media_count,

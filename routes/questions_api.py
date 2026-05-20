@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from routes.accounts_orders_api import AccountsPrincipal, get_accounts_principal_ugc
+from routes.accounts_orders_api import AccountsPrincipal, get_accounts_or_guest_principal_ugc
 from services.ugc_capabilities_service import (
     create_question,
     create_question_reply,
@@ -141,14 +141,14 @@ async def post_question(
     request: Request,
     response: Response,
     body: CreateQuestionRequest,
-    principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
+    principal: AccountsPrincipal = Depends(get_accounts_or_guest_principal_ugc),
 ):
     """
     Create a product Q&A question (UGC).
 
     Rules:
-    - must be logged in
-    - basic anti-abuse: per user+product rate limit (60s)
+    - open to logged-in and guest users
+    - basic anti-abuse: per actor+product rate limit (60s)
     """
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Pragma"] = "no-cache"
@@ -189,15 +189,18 @@ async def post_question(
             message = "Question is too long."
         elif code == "INVALID_SUBJECT":
             message = "Invalid product."
-        elif code == "NOT_AUTHENTICATED":
-            message = "Please log in to ask a question."
-
         raise HTTPException(
             status_code=int(getattr(e, "status_code", 500) or 500),
             detail={"error": {"code": code, "message": message}},
             headers=no_store_headers,
         )
-    return {"status": "success", "question_id": int(qid), "subject_type": subject_type, "subject_id": subject_id}
+    return {
+        "status": "success",
+        "question_id": int(qid),
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "moderation_status": "under_review",
+    }
 
 
 @router.post("/questions/{question_id}/replies")
@@ -205,15 +208,15 @@ async def post_question_reply(
     response: Response,
     question_id: int,
     body: CreateQuestionReplyRequest,
-    principal: AccountsPrincipal = Depends(get_accounts_principal_ugc),
+    principal: AccountsPrincipal = Depends(get_accounts_or_guest_principal_ugc),
 ):
     """
     Reply to a question (UGC).
 
     Rules:
-    - must be logged in
+    - open to logged-in and guest users
     - accepted replies are held for moderation before public display
-    - basic anti-abuse: per user+question rate limit (30s)
+    - basic anti-abuse: per actor+question rate limit (30s)
     """
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Pragma"] = "no-cache"
@@ -250,9 +253,6 @@ async def post_question_reply(
             message = "Question not found."
         elif code == "INVALID_QUESTION":
             message = "Invalid question."
-        elif code == "NOT_AUTHENTICATED":
-            message = "Please log in to reply."
-
         raise HTTPException(
             status_code=int(getattr(e, "status_code", 500) or 500),
             detail={"error": {"code": code, "message": message}},

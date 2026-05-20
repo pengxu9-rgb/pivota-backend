@@ -27,7 +27,7 @@ from db.reviews_center import (
     product_reviews,
 )
 from services.merchant_store_service import get_primary_store
-from services.review_moderation_policy import assess_review_text_risk, merge_moderation_risk_flags
+from services.review_moderation_policy import assess_review_text_risk_with_deepseek, merge_moderation_risk_flags
 from services.reviews_service import VARIANT_ID_SENTINEL, _reviews_media_s3_put, build_product_key, build_sku_key
 
 
@@ -1071,7 +1071,7 @@ async def create_buyer_review(
 
     product_key = build_product_key(merchant_id=merchant_id, platform=p, platform_product_id=pp)
     sku_key = build_sku_key(merchant_id=merchant_id, platform=p, platform_product_id=pp, variant_id=vid or None)
-    moderation = assess_review_text_risk(title=title_text, body=body_text)
+    moderation = await assess_review_text_risk_with_deepseek(title=title_text, body=body_text)
     moderation_state = str(moderation.get("moderation_state") or "under_review")
     risk_flags = merge_moderation_risk_flags(
         {"source": "buyer", "ip_hash": _client_ip_hash(request)},

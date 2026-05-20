@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import uuid
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -325,6 +326,36 @@ async def get_accounts_principal_ugc(request: Request) -> AccountsPrincipal:
         return await get_accounts_principal(request)
     except HTTPException:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="NOT_AUTHENTICATED")
+
+
+def _ugc_guest_principal(request: Request) -> AccountsPrincipal:
+    raw_guest_id = (request.headers.get("x-pivota-ugc-guest-id") or "").strip()
+    if raw_guest_id:
+        seed = f"client:{raw_guest_id[:128]}"
+    else:
+        client_host = getattr(request.client, "host", "") if request.client else ""
+        user_agent = (request.headers.get("user-agent") or "").strip()
+        seed = f"request:{client_host}|{user_agent}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+    return AccountsPrincipal(
+        user_id=f"guest:{digest}",
+        email="",
+        email_normalized="",
+        primary_role="guest",
+        amr="guest",
+    )
+
+
+async def get_accounts_or_guest_principal_ugc(request: Request) -> AccountsPrincipal:
+    """
+    UGC write endpoints are open to non-purchasers and logged-out visitors.
+    Logged-in users keep their accounts identity; otherwise we use a stable
+    guest actor for rate limiting and review/media ownership.
+    """
+    try:
+        return await get_accounts_principal(request)
+    except HTTPException:
+        return _ugc_guest_principal(request)
 
 
 # ---------------------------------------------------------------------------

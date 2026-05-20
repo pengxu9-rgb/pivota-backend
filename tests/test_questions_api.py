@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
-from routes.accounts_orders_api import AccountsPrincipal, get_accounts_principal_ugc
+from routes.accounts_orders_api import AccountsPrincipal, get_accounts_or_guest_principal_ugc
 from routes.questions_api import router as questions_router
 
 
@@ -50,13 +50,13 @@ def test_question_reply_is_accepted_for_moderation(
         assert kwargs["body"] == "This worked for me."
         return 9001
 
-    app.dependency_overrides[get_accounts_principal_ugc] = override_principal
+    app.dependency_overrides[get_accounts_or_guest_principal_ugc] = override_principal
     monkeypatch.setattr(questions_routes, "create_question_reply", fake_create_question_reply)
 
     try:
         response = client.post("/questions/42/replies", json={"body": "This worked for me."})
     finally:
-        app.dependency_overrides.pop(get_accounts_principal_ugc, None)
+        app.dependency_overrides.pop(get_accounts_or_guest_principal_ugc, None)
 
     assert response.status_code == 200
     assert response.json() == {
@@ -65,6 +65,65 @@ def test_question_reply_is_accepted_for_moderation(
         "question_id": 42,
         "moderation_status": "under_review",
     }
+
+
+def test_question_is_accepted_from_guest_for_moderation(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.questions_api as questions_routes
+
+    captured: dict[str, Any] = {}
+
+    async def fake_create_question(**kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 8101
+
+    monkeypatch.setattr(questions_routes, "create_question", fake_create_question)
+
+    response = client.post(
+        "/questions",
+        headers={"X-Pivota-Ugc-Guest-Id": "guest-question-123"},
+        json={"productId": "prod_1", "question": "Does this work for oily skin?"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["question_id"] == 8101
+    assert captured["user_id"].startswith("guest:")
+    assert captured["question"] == "Does this work for oily skin?"
+
+
+@pytest.mark.asyncio
+async def test_create_question_writes_under_review_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.ugc_capabilities_service as ugc_service
+
+    captured: dict[str, Any] = {}
+
+    async def noop_ensure() -> None:
+        return None
+
+    async def fake_rate_limited(**_: Any) -> bool:
+        return False
+
+    class FakeDatabase:
+        async def execute(self, statement: Any) -> int:
+            captured.update(statement.compile().params)
+            return 456
+
+    monkeypatch.setattr(ugc_service, "ensure_ugc_tables_exist", noop_ensure)
+    monkeypatch.setattr(ugc_service, "is_question_rate_limited", fake_rate_limited)
+    monkeypatch.setattr(ugc_service, "database", FakeDatabase())
+
+    question_id = await ugc_service.create_question(
+        user_id="guest:abc",
+        subject_type="product",
+        subject_id="prod_1",
+        question="Does this work for oily skin?",
+    )
+
+    assert question_id == 456
+    assert captured["user_id"] == "guest:abc"
+    assert captured["status"] == "under_review"
 
 
 @pytest.mark.asyncio

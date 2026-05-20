@@ -573,7 +573,7 @@ async def is_question_rate_limited(*, user_id: str, subject_type: str, subject_i
             (ugc_questions.c.user_id == uid)
             & (ugc_questions.c.subject_type == st)
             & (ugc_questions.c.subject_id == sid)
-            & (ugc_questions.c.status == "active")
+            & (ugc_questions.c.status.in_(["active", "under_review"]))
         )
         .order_by(ugc_questions.c.created_at.desc())
         .limit(1)
@@ -630,7 +630,7 @@ async def create_question(
                 subject_type=st,
                 subject_id=sid,
                 question=q,
-                status="active",
+                status="under_review",
                 created_at=datetime.now(timezone.utc),
             )
         )

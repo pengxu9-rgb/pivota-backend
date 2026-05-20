@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
-from routes.accounts_orders_api import AccountsPrincipal, get_accounts_principal_ugc
+from routes.accounts_orders_api import AccountsPrincipal, get_accounts_or_guest_principal_ugc
 from routes.buyer_reviews import router as buyer_reviews_router
 
 
@@ -99,7 +99,7 @@ def test_from_user_single_paid_order_allows_once_then_returns_409(
     async def fake_bind_user_review_subject(**kwargs: Any) -> None:
         bind_calls.append(kwargs)
 
-    app.dependency_overrides[get_accounts_principal_ugc] = override_principal
+    app.dependency_overrides[get_accounts_or_guest_principal_ugc] = override_principal
     monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_enabled", lambda: True)
     monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_merchant_allowed", lambda _: True)
     monkeypatch.setattr(buyer_reviews_routes, "get_review_slot_summary", fake_get_review_slot_summary)
@@ -111,11 +111,11 @@ def test_from_user_single_paid_order_allows_once_then_returns_409(
         first = client.post("/buyer/reviews/v1/reviews/from_user", json=_payload())
         second = client.post("/buyer/reviews/v1/reviews/from_user", json=_payload())
     finally:
-        app.dependency_overrides.pop(get_accounts_principal_ugc, None)
+        app.dependency_overrides.pop(get_accounts_or_guest_principal_ugc, None)
 
     assert first.status_code == 200
     assert first.json().get("review_id") == 7101
-    assert first.json().get("moderation_state") == "active"
+    assert first.json().get("moderation_state") == "under_review"
     assert second.status_code == 409
     assert second.json().get("detail") == "ALREADY_REVIEWED"
     assert [c.get("order_id") for c in bind_calls] == ["ord_1"]
@@ -184,7 +184,7 @@ def test_from_user_two_paid_orders_allows_two_reviews_third_is_409(
     async def fake_bind_user_review_subject(**kwargs: Any) -> None:
         bind_calls.append(kwargs)
 
-    app.dependency_overrides[get_accounts_principal_ugc] = override_principal
+    app.dependency_overrides[get_accounts_or_guest_principal_ugc] = override_principal
     monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_enabled", lambda: True)
     monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_merchant_allowed", lambda _: True)
     monkeypatch.setattr(buyer_reviews_routes, "get_review_slot_summary", fake_get_review_slot_summary)
@@ -197,17 +197,69 @@ def test_from_user_two_paid_orders_allows_two_reviews_third_is_409(
         second = client.post("/buyer/reviews/v1/reviews/from_user", json=_payload())
         third = client.post("/buyer/reviews/v1/reviews/from_user", json=_payload())
     finally:
-        app.dependency_overrides.pop(get_accounts_principal_ugc, None)
+        app.dependency_overrides.pop(get_accounts_or_guest_principal_ugc, None)
 
     assert first.status_code == 200
     assert first.json().get("review_id") == 7201
-    assert first.json().get("moderation_state") == "active"
+    assert first.json().get("moderation_state") == "under_review"
     assert second.status_code == 200
     assert second.json().get("review_id") == 7202
-    assert second.json().get("moderation_state") == "active"
+    assert second.json().get("moderation_state") == "under_review"
     assert third.status_code == 409
     assert third.json().get("detail") == "ALREADY_REVIEWED"
     assert [c.get("order_id") for c in bind_calls] == ["ord_2", "ord_1"]
+
+
+def test_from_user_non_purchaser_creates_unverified_under_review_review(
+    app: FastAPI,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.buyer_reviews as buyer_reviews_routes
+
+    captured_insert: Dict[str, Any] = {}
+    bind_calls: List[Dict[str, Any]] = []
+
+    async def override_principal() -> AccountsPrincipal:
+        return _principal()
+
+    async def fake_get_review_slot_summary(**_: Any) -> Dict[str, Any]:
+        return {
+            "paid_order_ids": [],
+            "available_order_ids": [],
+            "bindings": [],
+            "total_paid_orders": 0,
+            "used_slots": 0,
+            "available_slots": 0,
+            "legacy_binding_count": 0,
+        }
+
+    async def fake_execute(query: Any) -> int:
+        if "insert into product_reviews" not in str(query).lower():
+            raise AssertionError(f"Unexpected execute query: {query}")
+        captured_insert.update(query.compile().params)
+        return 7251
+
+    async def fake_bind_user_review_subject(**kwargs: Any) -> None:
+        bind_calls.append(kwargs)
+
+    app.dependency_overrides[get_accounts_or_guest_principal_ugc] = override_principal
+    monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_enabled", lambda: True)
+    monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_merchant_allowed", lambda _: True)
+    monkeypatch.setattr(buyer_reviews_routes, "get_review_slot_summary", fake_get_review_slot_summary)
+    monkeypatch.setattr(buyer_reviews_routes, "bind_user_review_subject", fake_bind_user_review_subject)
+    monkeypatch.setattr(buyer_reviews_routes.database, "execute", fake_execute)
+
+    try:
+        response = client.post("/buyer/reviews/v1/reviews/from_user", json=_payload())
+    finally:
+        app.dependency_overrides.pop(get_accounts_or_guest_principal_ugc, None)
+
+    assert response.status_code == 200
+    assert response.json().get("review_id") == 7251
+    assert captured_insert["verification"] == "unverified"
+    assert captured_insert["rating"] == 5
+    assert bind_calls[0]["order_id"] is None
 
 
 def test_from_user_high_risk_text_stays_under_review(
@@ -246,7 +298,7 @@ def test_from_user_high_risk_text_stays_under_review(
     async def fake_bind_user_review_subject(**kwargs: Any) -> None:
         _ = kwargs
 
-    app.dependency_overrides[get_accounts_principal_ugc] = override_principal
+    app.dependency_overrides[get_accounts_or_guest_principal_ugc] = override_principal
     monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_enabled", lambda: True)
     monkeypatch.setattr(buyer_reviews_routes, "buyer_submit_merchant_allowed", lambda _: True)
     monkeypatch.setattr(buyer_reviews_routes, "get_review_slot_summary", fake_get_review_slot_summary)
@@ -263,7 +315,7 @@ def test_from_user_high_risk_text_stays_under_review(
             },
         )
     finally:
-        app.dependency_overrides.pop(get_accounts_principal_ugc, None)
+        app.dependency_overrides.pop(get_accounts_or_guest_principal_ugc, None)
 
     assert response.status_code == 200
     assert response.json().get("review_id") == 7301
