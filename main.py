@@ -1129,7 +1129,8 @@ async def startup():
         try:
             from db.schema_guard import ensure_required_schema_light
 
-            await ensure_required_schema_light()
+            schema_guard_timeout = float(os.getenv("SCHEMA_GUARD_STARTUP_TIMEOUT_S", "12"))
+            await asyncio.wait_for(ensure_required_schema_light(), timeout=schema_guard_timeout)
             logger.info("✅ Schema guard: critical columns ensured")
         except Exception as schema_guard_err:
             logger.warning(f"Schema guard warning: {schema_guard_err}")
