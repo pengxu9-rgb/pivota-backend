@@ -104,6 +104,12 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(hair care|hair repair|repair bundle|maintenance crew|"
         r"detangling|leave-in|leave in|hair|scalp)\b",
         re.IGNORECASE)),
+    # Foundation before Sunscreen: "Foundation Broad Spectrum SPF 50+" should
+    # match Foundation, not Sunscreen.
+    ("Foundation", "beauty/makeup/face/foundation", re.compile(
+        r"\b(foundation|bb\s+cream|cc\s+cream|skin\s+tint|tint\s+stick|"
+        r"foundation\s+stick|cushion\s+foundation)\b",
+        re.IGNORECASE)),
     ("Sunscreen", "beauty/skincare/sun/sunscreen", _SUNSCREEN_RE),
     ("Fragrance", "beauty/fragrance/perfume", re.compile(
         r"\b(perfume|parfum|extrait|extract|eau de parfum|eau de toilette|cologne|body spray|scent)\b|"
@@ -114,7 +120,10 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|wipes?|wash)\b",
         re.IGNORECASE)),
     ("Toner", "beauty/skincare/treat/toner", re.compile(
-        r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
+        # essence added: K-beauty essences are functionally toners; placing it
+        # here (before Mask) prevents "Mask Fit Tone Up Essence" from matching
+        # Mask on the product-line word "Mask".
+        r"\b(toner|tonic|mist|pad|skin booster|essence)\b", re.IGNORECASE)),
     ("Mask", "beauty/skincare/treat/mask", re.compile(
         r"\b(face mask|clay mask|charcoal mask|sheet mask|gel mask|sleeping mask|"
         r"sleep mask|wash[-\s]?off mask|under eye patch|eye patch|pimple patch|"
@@ -144,12 +153,16 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick|"
         r"eye brightener|bright fix)\b",
         re.IGNORECASE)),
-    ("Foundation", "beauty/makeup/face/foundation", re.compile(
-        r"\b(foundation|skin tint|tint stick|foundation stick|cushion foundation)\b",
-        re.IGNORECASE)),
     ("Powder", "beauty/makeup/face/powder", re.compile(
         r"\b(powder|setting powder|pressed powder|loose powder|"
         r"blurring powder|finishing powder)\b",
+        re.IGNORECASE)),
+    # Lip Gloss before Highlighter: "Gloss Bomb Universal Lip Luminizer" contains
+    # "luminizer" which the Highlighter pattern would catch — but it's a lip gloss.
+    # Placing Lip Gloss here lets "gloss bomb" win before "luminizer" is seen.
+    ("Lip Gloss", "beauty/makeup/lip/gloss", re.compile(
+        r"\b(lip\s+gloss|gloss\s+bomb|gloss\s+luxe|gloss\s+drip|"
+        r"gloss\s+stick|gloss\s+stix|lip\s+luminizer|clear\s+gloss)\b",
         re.IGNORECASE)),
     ("Highlighter", "beauty/makeup/face/highlighter", re.compile(
         r"\b(highlighter|illuminator|luminizer|luminiser|killawatt|diamond bomb|"
@@ -173,15 +186,19 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(lip balm|lip butter|lip treatment|lip care|lip serum|lipserum|"
         r"nightbalm|lip scrub|scrubstick)\b",
         re.IGNORECASE)),
+    ("Lip Oil", "beauty/makeup/lip/oil", re.compile(
+        r"\b(lip\s+oil)\b", re.IGNORECASE)),
+    ("Lip Liner", "beauty/makeup/lip/liner", re.compile(
+        r"\b(lip\s+liner|lip\s+pencil|pout\s+liner|precision\s+pout)\b",
+        re.IGNORECASE)),
+    ("Lip Tint", "beauty/makeup/lip/tint", re.compile(
+        r"\b(lip\s+tint|lip\s+stain)\b", re.IGNORECASE)),
     ("Lipstick", "beauty/makeup/lip/lipstick", re.compile(
-        # `lip[\s-]*stick` matches "lipstick", "lip stick", "lip-stick",
-        # and double-space variants. User typos like "lip stick" were
-        # silently classifying as None and falling back to a generic
-        # skincare term list, returning serums/cleansers for lipstick
-        # queries. See lipstick-recall regression 2026-05-09.
-        r"\b(lip[\s-]*stick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
-        r"lip gloss|lip oil|lip liner|lip stain|lip tint|pout lip|gloss luxe|"
-        r"gloss drip|gloss bomb|gloss stick|gloss stix|lip combo|lip duo)\b",
+        # Narrowed: lip gloss/oil/liner/tint/stain each have their own patterns above.
+        # `lip[\s-]*stick` catches "lipstick", "lip stick", "lip-stick".
+        # See lipstick-recall regression 2026-05-09.
+        r"\b(lip[\s-]*stick|lip\s+color|lip\s+colour|liquid\s+lip|lip\s+luxe|"
+        r"lip\s+lacquer|pout\s+lip|lip\s+combo|lip\s+duo)\b",
         re.IGNORECASE)),
     ("Moisturizer", "beauty/skincare/moisturize/cream", re.compile(
         r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|"
