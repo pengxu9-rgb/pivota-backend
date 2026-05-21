@@ -265,7 +265,11 @@ async def test_run_billing_cycle_happy_path_one_merchant_multiple_rollups(
 
     assert billing_run_id == 101
     assert stripe_client.calls[0][0] == "invoice.create"
-    assert stripe_client.invoice_create_params[0]["auto_advance"] is False
+    # Step 5 (commit df79065) flipped Invoice.create auto_advance from False to
+    # True. With True, Stripe auto-finalizes empty drafts on its internal timer
+    # if our explicit finalize_invoice() never fires (and finalize_invoice now
+    # tolerates the resulting "already finalized" race via commit 462d2ce).
+    assert stripe_client.invoice_create_params[0]["auto_advance"] is True
     assert stripe_client.invoice_create_params[0]["collection_method"] == "charge_automatically"
     assert len(stripe_client.invoice_item_create_params) == 2
     assert all(params["invoice"] == "in_1" for params in stripe_client.invoice_item_create_params)
