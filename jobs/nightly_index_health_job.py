@@ -17,7 +17,8 @@ No LLM calls. All stage/blocker decisions are deterministic threshold checks.
 Stage progression (highest satisfied stage wins):
   discovered    → catalog_products row with content_key exists
   crawled       → external_offer_snapshots row for the domain exists
-  extracted     → seed_data non-empty with title present (snapshot.title OR top-level)
+  extracted     → source document present:
+                  external seed title OR agent_pdp_view title+description
   quality_gated → content_quality_score >= 65 AND has_image AND has_price
                   AND description_length >= 50
   shadow_indexed → serving_eligible=TRUE AND agent_pdp_view refreshed_at IS NOT NULL
@@ -28,7 +29,7 @@ Serving eligibility (ALL must be true):
   - has_image = TRUE  (agent_pdp_view.image_url non-null/non-empty)
   - has_price = TRUE  (catalog_offers row with list_price > 0)
   - description_length >= 50 (agent_pdp_view.description stripped)
-  - identity_resolved = TRUE (product_group_members row OR pdp_scope='canonical')
+  - identity_resolved = TRUE (product_group_members row OR resolved pdp_scope)
   - seed_audit_status IN ('no_issues_found', 'auto_corrected', 'not_audited')
   - catalog_products.sync_status = 'live'
   - no extractor_regression blocker on the product's domain
@@ -40,8 +41,8 @@ yesterday but archived today.
 
 Blocker codes (first failing check wins):
   not_live          — catalog_products.sync_status is not 'live' (stale/archived)
-  no_seed           — no external_product_seeds row linked to this product_key
-  no_extraction     — seed_data present but title missing in snapshot AND top-level
+  no_seed           — no external seed and no APV-backed source document
+  no_extraction     — a source row exists but no usable source title/document
   low_quality       — content_quality_score < 65 (0-100 scale)
   no_image          — image_url null or empty
   no_price          — no catalog_offers row with list_price > 0
@@ -96,6 +97,11 @@ _JOB_LOCK_ID: int = int.from_bytes(
 
 # Seed audit statuses that do NOT block serving.
 _SEED_AUDIT_OK = {"no_issues_found", "auto_corrected", "not_audited"}
+_RESOLVED_PDP_SCOPES = {
+    "canonical",  # legacy pre-070 label used in tests / old rows
+    "merchant_owned",
+    "multi_merchant_canonical",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +181,16 @@ def _resolve_seed_title(seed_data: Dict[str, Any], row: Dict[str, Any]) -> str:
     return ""
 
 
+def _has_seed_row(row: Dict[str, Any]) -> bool:
+    """Infer whether the lateral seed join found a row.
+
+    The batch query does not need the seed id for classification. Presence of
+    either seed_data or top-level seed title is enough to distinguish "no seed"
+    from "seed row exists but extraction shape is thin/malformed".
+    """
+    return row.get("seed_data_json") is not None or row.get("seed_title") is not None
+
+
 # ---------------------------------------------------------------------------
 # Per-product classification
 # ---------------------------------------------------------------------------
@@ -192,6 +208,7 @@ def _classify_product(
 
     # --- Extract seed signals (snapshot-shape aware) ---
     seed_data = _coerce_dict(row.get("seed_data_json"))
+    has_seed_row = _has_seed_row(row)
     seed_title = _resolve_seed_title(seed_data, row)
     snapshot = _coerce_dict(seed_data.get("snapshot"))
     # review_summary may live on the seed_data itself or under snapshot.review_summary
@@ -211,6 +228,7 @@ def _classify_product(
     quality_scored_at = row.get("quality_scored_at")
 
     # --- Extract PDP view signals ---
+    pdp_title = (row.get("pdp_title") or "").strip()
     pdp_image_url = (row.get("image_url") or "").strip()
     pdp_description = (row.get("pdp_description") or "").strip()
     pdp_sync_status = (row.get("pdp_sync_status") or "").strip()
@@ -223,10 +241,15 @@ def _classify_product(
     has_price = bool(row.get("has_price"))
     description_length = len(pdp_description)
 
+    has_seed_document = bool(seed_title)
+    has_apv_document = bool(pdp_title and pdp_description)
+    source_title = seed_title or (pdp_title if has_apv_document else "")
+    source_document_present = has_seed_document or has_apv_document
+
     # --- Extract identity signals ---
     pdp_scope = (row.get("pdp_scope") or "").strip()
     product_group_id = row.get("product_group_id")
-    identity_resolved = bool(product_group_id) or (pdp_scope == "canonical")
+    identity_resolved = bool(product_group_id) or (pdp_scope in _RESOLVED_PDP_SCOPES)
 
     # --- Domain regression check ---
     canonical_url = (row.get("canonical_url") or "").strip()
@@ -235,7 +258,7 @@ def _classify_product(
 
     # --- Extraction content hash ---
     extraction_content_hash = _make_extraction_content_hash(
-        seed_title or pdp_description[:80] or None,
+        source_title or pdp_description[:80] or None,
         pdp_description or None,
         pdp_image_url or None,
     )
@@ -247,13 +270,19 @@ def _classify_product(
     if cp_sync_status and cp_sync_status != "live":
         blocker_code = "not_live"
         blocker_detail = f"catalog_products.sync_status={cp_sync_status!r}"
-    elif not seed_data or not seed_title:
-        if not seed_data:
+    elif not source_document_present:
+        if not has_seed_row:
             blocker_code = "no_seed"
-            blocker_detail = "no external_product_seeds row attached to this product_key"
+            blocker_detail = (
+                "no external_product_seeds row and no agent_pdp_view "
+                "title+description source document"
+            )
         else:
             blocker_code = "no_extraction"
-            blocker_detail = "seed_data present but title is missing in snapshot and top-level"
+            blocker_detail = (
+                "source row present but title is missing in seed snapshot/top-level "
+                "and no APV title+description fallback is available"
+            )
     elif quality_score is None or quality_score < QUALITY_SCORE_THRESHOLD:
         blocker_code = "low_quality"
         blocker_detail = (
@@ -274,7 +303,9 @@ def _classify_product(
         )
     elif not identity_resolved:
         blocker_code = "entity_unresolved"
-        blocker_detail = "no product_group_members row and pdp_scope != 'canonical'"
+        blocker_detail = (
+            "no product_group_members row and pdp_scope is not a resolved scope"
+        )
     elif seed_audit_status == "issues_unresolved":
         blocker_code = "seed_audit_fail"
         blocker_detail = "seed content audit reported issues_unresolved"
@@ -286,7 +317,7 @@ def _classify_product(
     serving_eligible = (
         blocker_code == "none"
         and cp_sync_status == "live"
-        and bool(seed_title)
+        and bool(source_title)
         and quality_score is not None
         and quality_score >= QUALITY_SCORE_THRESHOLD
         and has_image
@@ -312,7 +343,7 @@ def _classify_product(
     elif serving_eligible and pdp_refreshed_at is not None:
         pipeline_stage = "shadow_indexed"
     elif (
-        seed_title  # quality_gated requires extraction to have happened
+        source_document_present  # quality_gated requires extraction/source document
         and quality_score is not None
         and quality_score >= QUALITY_SCORE_THRESHOLD
         and has_image
@@ -320,7 +351,7 @@ def _classify_product(
         and description_length >= MIN_DESCRIPTION_LENGTH
     ):
         pipeline_stage = "quality_gated"
-    elif seed_title:
+    elif source_document_present:
         pipeline_stage = "extracted"
     elif row.get("has_offer_snapshot"):
         pipeline_stage = "crawled"
@@ -394,6 +425,7 @@ SELECT
     pqs.rules_version           AS quality_rules_version,
     pqs.snapshot_date           AS quality_scored_at,
     apv.image_url,
+    apv.title                   AS pdp_title,
     apv.description             AS pdp_description,
     apv.sync_status             AS pdp_sync_status,
     apv.pdp_lifecycle_stage     AS pdp_lifecycle_stage,
