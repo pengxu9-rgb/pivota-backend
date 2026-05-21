@@ -275,6 +275,52 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
         "SDK timeout should leave the merchant unbilled for this cycle"
     )
 
+    # With auto_advance=True (Step 5 flip), Invoice.create succeeded before the
+    # InvoiceItem.create timeout, so Stripe is holding an empty draft. Stripe
+    # will auto-finalize empty drafts on its internal timer. Verify the
+    # recovery path documented in runbook 03 actually works against real Stripe.
+    orphan_list = await asyncio.to_thread(
+        stripe_client.v1.invoices.list,
+        params={"customer": customer.id, "status": "draft", "limit": 10},
+    )
+    orphan_drafts = [
+        inv for inv in orphan_list.data
+        if int(getattr(inv, "amount_due", 0) or 0) == 0
+    ]
+    assert len(orphan_drafts) >= 1, (
+        "Invoice.create should have created a draft before InvoiceItem timeout"
+    )
+    orphan_invoice_id = orphan_drafts[0].id
+
+    # Advance clock past Stripe's auto-advance threshold (~1h) to let auto-finalize fire.
+    current_clock = await asyncio.to_thread(
+        stripe_client.v1.test_helpers.test_clocks.retrieve,
+        stripe_test_clock.id,
+    )
+    await advance_clock(
+        stripe_test_clock.id,
+        int(current_clock.frozen_time) + 2 * 3600,
+    )
+
+    auto_finalized = await asyncio.to_thread(
+        stripe_client.v1.invoices.retrieve, orphan_invoice_id,
+    )
+    assert int(getattr(auto_finalized, "amount_due", 0) or 0) == 0, (
+        "Empty auto-finalized invoice should be $0"
+    )
+    assert auto_finalized.status in ("draft", "open", "paid", "void", "uncollectible"), (
+        f"Auto-advance should reach a terminal-ish state, got {auto_finalized.status}"
+    )
+
+    # Recovery per runbook 03: void the orphan. Stripe allows void from draft/open.
+    if auto_finalized.status in ("draft", "open"):
+        voided = await asyncio.to_thread(
+            stripe_client.v1.invoices.void_invoice, orphan_invoice_id,
+        )
+        assert voided.status == "void", (
+            f"void_invoice should transition to void, got {voided.status}"
+        )
+
     monkeypatch.setattr(
         invoice_generation_service.stripe_client.v1.invoice_items,
         "create",

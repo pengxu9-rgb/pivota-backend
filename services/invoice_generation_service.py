@@ -376,7 +376,14 @@ async def generate_merchant_invoice(
                 params={
                     "customer": stripe_customer_id,
                     "collection_method": "charge_automatically",
-                    "auto_advance": False,
+                    # auto_advance=True: Stripe auto-finalizes the draft after its
+                    # internal timer (~1h) if our explicit finalize_invoice() never
+                    # fires. In the happy path we attach InvoiceItems and finalize
+                    # immediately, so Stripe's timer never elapses. The risk is a
+                    # crash between Invoice.create and the InvoiceItem.create loop:
+                    # Stripe could auto-finalize a $0 empty invoice. Recovery is
+                    # stripe.Invoice.void() — documented in runbook 03.
+                    "auto_advance": True,
                     "description": f"Pivota {_DASH} {period_start.strftime('%B %Y')}",
                     "metadata": {
                         "merchant_id": merchant_id,

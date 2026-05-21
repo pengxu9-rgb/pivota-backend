@@ -33,6 +33,11 @@ or a `stripe.error.InvalidRequestError` from `finalize_invoice`.
 
 ## Resolution
 
+- **Stripe says finalized + amount_due = 0 + no local `invoices` row (empty auto-finalized invoice):** this state appears when `generate_merchant_invoice` crashed between `Invoice.create` and the `InvoiceItem.create` loop, leaving an empty draft. With `auto_advance=True` (Step 5+), Stripe finalizes the draft on its ~1h timer. Void it:
+  ```python
+  stripe.Invoice.void_invoice(stripe_invoice_id, params={"metadata": {"void_reason": "empty_auto_finalized"}})
+  ```
+  Then the next `run_billing_cycle` for that merchant + period will produce a correct invoice (the failed merchant has no `invoices` row, so T7's per-merchant idempotency doesn't skip it). If `run_billing_cycle` already completed the period (no per-merchant retry — v1.4 gap, runbook 06), follow runbook 06's manual catch-up path.
 - **Stripe says finalized, local says finalizing:** the `invoice.finalized` webhook may have been dropped or arrived before the local row existed. Sync manually:
   ```sql
   -- AUTHORIZATION REQUIRED before running
