@@ -331,3 +331,58 @@ async def test_apply_refund_recomputes_daily_rollup(monkeypatch: pytest.MonkeyPa
 
     edge_update_sql = next(sql for sql, _ in fake_db.executed if "UPDATE commerce_attribution_edges" in sql)
     assert "net_attributed_gmv_cents" not in edge_update_sql
+
+
+def test_rollup_query_casts_merchant_id_to_text() -> None:
+    """Regression: bug C surfaced in Step 6 staging run 2026-05-21.
+
+    asyncpg cannot infer the type of `:merchant_id` when used in
+    `:merchant_id IS NULL` — the query fails with a parameter-typing error
+    against a real Postgres connection. The cron path (aggregate_daily
+    with no merchant filter) was broken because of this.
+
+    The fix is `CAST(:merchant_id AS TEXT) IS NULL`. Guard that the query
+    keeps using the CAST form so we don't quietly regress.
+    """
+    assert "CAST(:merchant_id AS TEXT) IS NULL" in service._ROLLUP_QUERY
+    assert "CAST(:merchant_id AS TEXT)" in service._ROLLUP_QUERY
+
+
+def test_subscription_period_helper_reads_items_data_first() -> None:
+    """Regression: bug B surfaced in Step 6 staging run 2026-05-21.
+
+    Post-2025 Stripe API moved `current_period_start/end` from the Subscription
+    object to its per-item rows (`subscription.items.data[0]`). Old code paths
+    that read `subscription.current_period_start` get NULL on modern accounts.
+    The fix uses an items-first / top-level-fallback helper.
+
+    Imported lazily because billing_routes pulls in FastAPI + database + stripe.
+    """
+    from routes.billing_routes import _extract_subscription_period
+
+    # Modern API shape — fields on subscription.items.data[0]
+    modern = {
+        "items": {
+            "data": [
+                {"current_period_start": 1700000000, "current_period_end": 1702592000},
+            ],
+        },
+        # Top-level fields absent (or stale).
+    }
+    assert _extract_subscription_period(modern) == (1700000000, 1702592000)
+
+    # Legacy API shape — fields on the subscription itself
+    legacy = {"current_period_start": 1500000000, "current_period_end": 1502592000, "items": {"data": []}}
+    assert _extract_subscription_period(legacy) == (1500000000, 1502592000)
+
+    # Mixed shape — items.data wins
+    mixed = {
+        "current_period_start": 1500000000,
+        "current_period_end": 1502592000,
+        "items": {
+            "data": [
+                {"current_period_start": 1700000000, "current_period_end": 1702592000},
+            ],
+        },
+    }
+    assert _extract_subscription_period(mixed) == (1700000000, 1702592000)

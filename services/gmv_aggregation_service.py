@@ -26,7 +26,7 @@ SELECT
     SUM(COALESCE(e.refund_amount_cents, 0)) AS refund_sum
 FROM commerce_attribution_edges e
 WHERE DATE(e.created_at) = :date
-  AND (:merchant_id IS NULL OR e.merchant_id = :merchant_id)
+  AND (CAST(:merchant_id AS TEXT) IS NULL OR e.merchant_id = CAST(:merchant_id AS TEXT))
   AND e.gross_attributed_gmv_cents IS NOT NULL
 GROUP BY DATE(e.created_at), e.merchant_id, e.agent_id, e.channel_partner_id
 """

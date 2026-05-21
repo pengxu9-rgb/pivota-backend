@@ -272,6 +272,7 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                   operation_id,
                   credits_delta,
                   balance_after,
+                  source_type,
                   metadata
                 )
                 VALUES (
@@ -280,6 +281,7 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                   :operation_id,
                   :credits_delta,
                   :balance_after,
+                  'subscription_grant',
                   CAST(:metadata AS jsonb)
                 )
                 """,
@@ -296,6 +298,66 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                         }
                     ),
                 },
+            )
+
+            # Create / refresh the merchant_credits row T5 metering operates on.
+            # Without this, the first reserve() call fails because there's no
+            # row to SELECT FOR UPDATE. Idempotent: ON CONFLICT updates allowance
+            # if the merchant re-subscribes after cancellation.
+            tier_allowance = int(plan["monthly_credit_allowance"] or 0)
+            await db.execute(
+                """
+                INSERT INTO merchant_credits (
+                  merchant_id, balance, tier_allowance, period_start, created_at, last_updated
+                )
+                VALUES (
+                  :merchant_id, :balance, :tier_allowance, NOW(), NOW(), NOW()
+                )
+                ON CONFLICT (merchant_id) DO UPDATE SET
+                  balance = EXCLUDED.balance,
+                  tier_allowance = EXCLUDED.tier_allowance,
+                  last_updated = NOW()
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "balance": tier_allowance,
+                    "tier_allowance": tier_allowance,
+                },
+            )
+
+        # Stripe sends customer.subscription.updated soon after checkout, which
+        # populates current_period_start/end on the user_subscriptions row. But
+        # the .updated event isn't guaranteed to fire before downstream code
+        # (e.g. test-mode flows, programmatic fulfillment, immediate metering
+        # reservations) reads the row. Fetch the subscription now and stamp the
+        # period fields directly so the row is immediately consistent.
+        try:
+            sub_obj = await asyncio.to_thread(
+                stripe_client.v1.subscriptions.retrieve, stripe_subscription_id
+            )
+            sub_dict = _stripe_object_to_dict(sub_obj)
+            period_start_raw, period_end_raw = _extract_subscription_period(sub_dict)
+            if period_start_raw and period_end_raw:
+                await db.execute(
+                    """
+                    UPDATE user_subscriptions
+                    SET current_period_start = :ps, current_period_end = :pe
+                    WHERE id = :id
+                    """,
+                    {
+                        "ps": _stripe_timestamp(period_start_raw),
+                        "pe": _stripe_timestamp(period_end_raw),
+                        "id": local_subscription_id,
+                    },
+                )
+        except Exception as period_exc:
+            # Don't fail fulfillment over period stamping — customer.subscription.updated
+            # will converge it later. Just log so it's noticeable.
+            logger.warning(
+                "Could not stamp subscription period on checkout fulfillment for %s: %s; "
+                "customer.subscription.updated webhook will populate later",
+                stripe_subscription_id,
+                period_exc,
             )
 
         await _mark_event_processed(event_id, db)
@@ -345,8 +407,8 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
                 "stripe_subscription_id": stripe_subscription_id,
                 "status": status_value,
                 "plan_id": int(plan["id"]) if plan else None,
-                "current_period_start": _stripe_timestamp(subscription.get("current_period_start")),
-                "current_period_end": _stripe_timestamp(subscription.get("current_period_end")),
+                "current_period_start": _stripe_timestamp(_extract_subscription_period(subscription)[0]),
+                "current_period_end": _stripe_timestamp(_extract_subscription_period(subscription)[1]),
                 "cancel_at_period_end": bool(subscription.get("cancel_at_period_end") or False),
                 "canceled_at": _stripe_timestamp(subscription.get("canceled_at")),
             },
@@ -1022,6 +1084,24 @@ def _extract_subscription_price_and_product(subscription: Dict[str, Any]) -> Tup
     first_item = _coerce_dict(data[0])
     price = _coerce_dict(first_item.get("price"))
     return _as_text(price.get("id")) or None, _as_text(price.get("product")) or None
+
+
+def _extract_subscription_period(subscription: Dict[str, Any]) -> Tuple[Optional[Any], Optional[Any]]:
+    """Return (current_period_start, current_period_end) Stripe timestamps.
+
+    Stripe moved these from the Subscription object to per-item in API version
+    2025+. Read from `subscription.items.data[0]` first, fall back to top-level
+    for older API versions / test clients that still return the legacy shape.
+    """
+    items = _coerce_dict(subscription.get("items"))
+    data = items.get("data") if isinstance(items.get("data"), list) else []
+    if data:
+        first_item = _coerce_dict(data[0])
+        item_start = first_item.get("current_period_start")
+        item_end = first_item.get("current_period_end")
+        if item_start is not None and item_end is not None:
+            return item_start, item_end
+    return subscription.get("current_period_start"), subscription.get("current_period_end")
 
 
 def _stripe_timestamp(value: Any) -> Optional[datetime]:
