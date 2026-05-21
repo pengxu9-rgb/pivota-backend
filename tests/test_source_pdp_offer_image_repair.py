@@ -63,6 +63,14 @@ def test_title_gate_rejects_overly_broad_source_title() -> None:
     assert gate["reason"] == "title_mismatch"
 
 
+def test_title_gate_rejects_source_title_with_extra_specific_tokens() -> None:
+    gate = repair.title_gate("AirPods Max", "AirPods Max 2")
+
+    assert gate["ok"] is False
+    assert gate["reason"] == "source_title_extra_tokens"
+    assert gate["source_extra_tokens"] == ["2"]
+
+
 def test_evaluate_candidate_accepts_exact_price_and_image_gap() -> None:
     extracted = {
         "canonical_url": "https://www.jurlique.com/us/dry-body-brush",

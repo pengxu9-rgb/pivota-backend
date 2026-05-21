@@ -277,12 +277,16 @@ async def extract_source_content(url: str) -> Dict[str, Any]:
 def evaluate_candidate(row: Dict[str, Any], extracted: Dict[str, Any]) -> Dict[str, Any]:
     current_description = clean_description(row.get("apv_description") or row.get("cp_description"))
     need_description = len(current_description) < MIN_EXISTING_DESCRIPTION_LENGTH
-    safe_quality_refresh = not need_description and len(current_description) >= MIN_EXISTING_DESCRIPTION_LENGTH
     source_url = row.get("canonical_url") or ""
     extracted_title = extracted.get("title") or ""
     title = title_gate(row.get("apv_title") or row.get("title"), extracted_title, brand=row.get("brand"))
     host_ok = same_host_family(source_url, extracted.get("canonical_url") or source_url)
     description = usable_description(extracted.get("description"))
+    current_description_mentions_title = description_mentions_product(
+        current_description,
+        row.get("apv_title") or row.get("title"),
+        brand=row.get("brand"),
+    )
     description_mentions_title = description_mentions_product(
         description,
         row.get("apv_title") or row.get("title"),
@@ -295,10 +299,29 @@ def evaluate_candidate(row: Dict[str, Any], extracted: Dict[str, Any]) -> Dict[s
         and description
         and description_mentions_title
     )
+    safe_quality_refresh = bool(
+        not need_description
+        and title["ok"]
+        and host_ok
+        and description
+        and description_mentions_title
+        and current_description_mentions_title
+    )
     reject_reason = None
-    if not safe:
+    if not safe and not safe_quality_refresh:
         if not need_description:
-            reject_reason = "not_needed"
+            if not title["ok"]:
+                reject_reason = title["reason"]
+            elif not host_ok:
+                reject_reason = "canonical_host_mismatch"
+            elif not description:
+                reject_reason = "missing_or_unsafe_description"
+            elif not description_mentions_title:
+                reject_reason = "description_not_product_specific"
+            elif not current_description_mentions_title:
+                reject_reason = "current_description_not_product_specific"
+            else:
+                reject_reason = "not_needed"
         elif not title["ok"]:
             reject_reason = title["reason"]
         elif not host_ok:
@@ -321,6 +344,7 @@ def evaluate_candidate(row: Dict[str, Any], extracted: Dict[str, Any]) -> Dict[s
         "title_exact": title["exact"],
         "title_gate_reason": title["reason"],
         "current_description_len": len(current_description),
+        "current_description_mentions_title": current_description_mentions_title,
         "description_len": len(description),
         "description_preview": description[:220],
         "description_mentions_title": description_mentions_title,

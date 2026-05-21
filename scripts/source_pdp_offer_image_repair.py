@@ -386,7 +386,7 @@ def token_set(value: Any, *, brand: Optional[str] = None) -> Set[str]:
     return {
         token
         for token in _tokens(value)
-        if len(token) > 1
+        if (len(token) > 1 or token.isdigit())
         and token not in STOPWORDS
         and token not in GENERIC_PRODUCT_TOKENS
         and token not in brand_tokens
@@ -449,6 +449,18 @@ def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] 
                 "source_variant_tokens": sorted(source_variant_tokens),
             }
 
+    source_extra_tokens = source_tokens - target_tokens
+    if source_extra_tokens and not exact:
+        return {
+            "ok": False,
+            "reason": "source_title_extra_tokens",
+            "score": round(score, 3),
+            "exact": exact,
+            "target_variant_tokens": sorted(target_variant_tokens),
+            "source_variant_tokens": sorted(source_variant_tokens),
+            "source_extra_tokens": sorted(source_extra_tokens),
+        }
+
     if exact:
         ok = True
     else:
@@ -461,6 +473,7 @@ def title_gate(target_title: Any, extracted_title: Any, *, brand: Optional[str] 
         "exact": exact,
         "target_variant_tokens": sorted(target_variant_tokens),
         "source_variant_tokens": sorted(source_variant_tokens),
+        "source_extra_tokens": sorted(source_extra_tokens),
     }
 
 

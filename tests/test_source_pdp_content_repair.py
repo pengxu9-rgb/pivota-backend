@@ -114,8 +114,8 @@ def test_evaluate_candidate_accepts_description_with_product_tokens() -> None:
 
 def test_evaluate_candidate_does_not_overwrite_good_description() -> None:
     existing = (
-        "A complete product description already exists with enough detail for the PDP "
-        "and should not be replaced by public source repair."
+        "Glam Eyeshadow Palette already has enough detail for the PDP and should not "
+        "be replaced by public source repair."
     )
     extracted = {
         "source": "html",
@@ -129,7 +129,56 @@ def test_evaluate_candidate_does_not_overwrite_good_description() -> None:
 
     assert out["safe_content_repair"] is False
     assert out["safe_quality_refresh"] is True
-    assert out["reject_reason"] == "not_needed"
+    assert out["current_description_mentions_title"] is True
+    assert out["reject_reason"] is None
+
+
+def test_quality_refresh_rejects_weak_source_evidence() -> None:
+    existing = "Kindle Colorsoft Signature Edition has a short but product-specific description."
+    extracted = {
+        "source": "html",
+        "canonical_url": "https://www.amazon.com/All-New-Amazon-Kindle-Colorsoft-Signature-Edition/dp/B0CN3XR57P",
+        "title": "Amazon",
+        "description": "",
+        "evidence_provider": "og",
+    }
+
+    out = repair.evaluate_candidate(
+        _row(
+            title="Kindle Colorsoft Signature Edition",
+            apv_title="Kindle Colorsoft Signature Edition",
+            apv_description=existing,
+            brand="Amazon",
+            canonical_url="https://www.amazon.com/dp/B0CN3XR57P",
+        ),
+        extracted,
+    )
+
+    assert out["safe_content_repair"] is False
+    assert out["safe_quality_refresh"] is False
+    assert out["reject_reason"] == "missing_title_tokens"
+
+
+def test_quality_refresh_rejects_current_description_without_product_tokens() -> None:
+    existing = (
+        "A complete description already exists with enough detail for the PDP, "
+        "but it does not prove that it belongs to the target product."
+    )
+    extracted = {
+        "source": "html",
+        "canonical_url": "https://natashadenona.com/products/glam-eyeshadow-palette",
+        "title": "Glam Eyeshadow Palette",
+        "description": (
+            "Glam Eyeshadow Palette includes neutral matte, metallic, and sparkling shades "
+            "for soft glam eye looks and deeper evening dimension."
+        ),
+        "evidence_provider": "jsonld",
+    }
+
+    out = repair.evaluate_candidate(_row(apv_description=existing), extracted)
+
+    assert out["safe_quality_refresh"] is False
+    assert out["reject_reason"] == "current_description_not_product_specific"
 
 
 def test_evaluate_candidate_rejects_title_mismatch() -> None:
