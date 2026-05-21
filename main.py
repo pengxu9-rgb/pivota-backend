@@ -1485,12 +1485,13 @@ async def startup():
                         # Use raw connection for complex SQL with functions
                         from sqlalchemy import create_engine
                         engine = create_engine(str(database.url))
-                        # engine.begin() opens a transactional context and commits on exit;
-                        # SQLAlchemy 1.4 legacy Connection has no .commit() method, so the
-                        # previous `engine.connect() + conn.commit()` pattern silently rolled
-                        # back fresh DDL — historical migrations only persisted because they
-                        # were re-applied via admin endpoints.
-                        with engine.begin() as conn:
+                        # AUTOCOMMIT isolation: each DDL statement commits implicitly.
+                        # Required because some migrations use CREATE INDEX CONCURRENTLY,
+                        # which Postgres forbids inside a transaction block. The previous
+                        # `engine.connect() + conn.commit()` pattern silently rolled back
+                        # fresh DDL (Connection has no .commit() in SA 1.4 legacy mode);
+                        # `engine.begin()` would commit but breaks the CONCURRENTLY paths.
+                        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                             conn.execute(text(sql_content))
                     except Exception as e:
                         logger.warning(f"   Migration {os.path.basename(sql_file)} error (may be already applied): {e}")
