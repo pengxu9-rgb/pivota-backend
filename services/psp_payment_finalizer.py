@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -7,6 +8,16 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 AwaitableBoolFn = Callable[..., Awaitable[bool]]
 AwaitableAnyFn = Callable[..., Awaitable[Any]]
+
+logger = logging.getLogger(__name__)
+database: Any = None
+
+_STAMP_GROSS_ATTRIBUTED_GMV_QUERY = """
+UPDATE commerce_attribution_edges
+SET gross_attributed_gmv_cents = :gross
+WHERE order_id = :order_id
+  AND gross_attributed_gmv_cents IS NULL
+"""
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -37,6 +48,67 @@ def _money_from_minor_units(value: Any, currency: Optional[str]) -> Decimal:
     if code in three_decimal:
         return minor / Decimal("1000")
     return minor / Decimal("100")
+
+
+def _get_database() -> Any:
+    global database
+    if database is None:
+        from db.database import database as configured_database
+
+        database = configured_database
+    return database
+
+
+def _money_to_cents(value: Decimal) -> int:
+    return int((value * Decimal("100")).quantize(Decimal("1")))
+
+
+def _gross_attributed_gmv_cents(subtotal: Any, discount_total: Any) -> int:
+    gross = _decimal_money(subtotal) - _decimal_money(discount_total)
+    if gross < Decimal("0"):
+        gross = Decimal("0")
+    return _money_to_cents(gross)
+
+
+def _coerce_update_count(result: Any) -> Optional[int]:
+    if isinstance(result, bool):
+        return None
+    if isinstance(result, int):
+        return result
+    if isinstance(result, str):
+        parts = result.strip().split()
+        if len(parts) >= 2 and parts[0].upper() == "UPDATE":
+            try:
+                return int(parts[-1])
+            except Exception:
+                return None
+    return None
+
+
+async def stamp_gross_attributed_gmv(
+    order_id: str,
+    *,
+    subtotal: Any,
+    discount_total: Any = None,
+) -> Optional[int]:
+    """Stamp initial attributed GMV in cents for a paid commerce order.
+
+    v1.3 GMV is strictly subtotal minus discount_total. Tax and shipping are
+    excluded from this attribution basis, and refunds are handled elsewhere.
+    """
+    # Tax and shipping are intentionally excluded from v1.3 attributed GMV.
+    gross = _gross_attributed_gmv_cents(subtotal, discount_total)
+    result = await _get_database().execute(
+        _STAMP_GROSS_ATTRIBUTED_GMV_QUERY,
+        {"order_id": order_id, "gross": gross},
+    )
+    updated_count = _coerce_update_count(result)
+    if updated_count == 0:
+        logger.info(
+            "No unstamped commerce attribution edges found for paid order %s",
+            order_id,
+        )
+    return updated_count
 
 
 def _order_status_lower(order: Dict[str, Any]) -> str:
@@ -152,6 +224,18 @@ async def finalize_payment_success(
         )
 
     await mark_order_paid_fn(order_id)
+    try:
+        await stamp_gross_attributed_gmv(
+            order_id,
+            subtotal=order.get("subtotal"),
+            discount_total=order.get("discount_total"),
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to stamp gross attributed GMV for paid order %s: %s",
+            order_id,
+            exc,
+        )
     await log_order_event_fn(
         event_type=source_event,
         order_id=order_id,
