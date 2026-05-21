@@ -104,6 +104,13 @@ canonical_product AS (
       row_number() OVER (
         PARTITION BY content_key
         ORDER BY
+          CASE
+            WHEN lower(coalesce(canonical_url, '')) ~ '(sephora|nordstrom|ulta|amazon|amzn\\.to|bestbuy)\\.'
+              THEN 1
+            ELSE 0
+          END,
+          CASE WHEN product_key LIKE 'ext:%' THEN 0 ELSE 1 END,
+          CASE WHEN length(btrim(coalesce(cp_description, ''))) >= :min_existing_description_length THEN 0 ELSE 1 END,
           CASE WHEN group_is_primary THEN 0 ELSE 1 END,
           CASE WHEN pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END,
           product_key ASC

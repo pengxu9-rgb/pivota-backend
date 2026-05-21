@@ -188,6 +188,16 @@ def test_candidate_query_excludes_non_repairable_blockers() -> None:
     assert "ips.has_image IS FALSE" in sql
 
 
+def test_candidate_query_prefers_direct_source_rows_over_retailer_rows() -> None:
+    sql, _ = repair.build_candidate_query(limit=10, include_upstream_blockers=True)
+
+    assert "sephora|nordstrom|ulta|amazon" in sql
+    assert "amzn" in sql
+    assert "bestbuy" in sql
+    assert "CASE WHEN product_key LIKE 'ext:%' THEN 0 ELSE 1 END" in sql
+    assert "length(btrim(coalesce(cp_description, ''))) >= 50" in sql
+
+
 def test_candidate_query_can_explicitly_include_upstream_blockers() -> None:
     sql, _ = repair.build_candidate_query(limit=10, include_upstream_blockers=True)
 

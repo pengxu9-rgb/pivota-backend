@@ -237,3 +237,13 @@ def test_candidate_query_targets_content_blockers() -> None:
     assert "CAST(:content_key AS text) IS NULL" in sql
     assert "CAST(:content_key AS text) IS NOT NULL" in sql
     assert values["min_existing_description_length"] == repair.MIN_EXISTING_DESCRIPTION_LENGTH
+
+
+def test_candidate_query_prefers_direct_source_rows_over_retailer_rows() -> None:
+    sql, _ = repair.build_candidate_query(limit=10)
+
+    assert "sephora|nordstrom|ulta|amazon" in sql
+    assert "amzn" in sql
+    assert "bestbuy" in sql
+    assert "CASE WHEN product_key LIKE 'ext:%' THEN 0 ELSE 1 END" in sql
+    assert "length(btrim(coalesce(cp_description, ''))) >= :min_existing_description_length" in sql

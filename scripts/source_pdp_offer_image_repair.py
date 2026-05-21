@@ -146,6 +146,7 @@ WITH product_rows AS (
     cp.platform,
     cp.source_product_id,
     cp.title,
+    cp.description AS cp_description,
     cp.brand,
     cp.canonical_url,
     cp.image_url AS cp_image_url,
@@ -168,6 +169,13 @@ canonical_product AS (
       row_number() OVER (
         PARTITION BY content_key
         ORDER BY
+          CASE
+            WHEN lower(coalesce(canonical_url, '')) ~ '(sephora|nordstrom|ulta|amazon|amzn\\.to|bestbuy)\\.'
+              THEN 1
+            ELSE 0
+          END,
+          CASE WHEN product_key LIKE 'ext:%' THEN 0 ELSE 1 END,
+          CASE WHEN length(btrim(coalesce(cp_description, ''))) >= 50 THEN 0 ELSE 1 END,
           CASE WHEN group_is_primary THEN 0 ELSE 1 END,
           CASE WHEN pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END,
           product_key ASC
