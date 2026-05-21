@@ -83,8 +83,9 @@ async def test_full_billing_cycle(stripe_test_clock: Any) -> None:
         },
     )
 
-    period_start = datetime.fromtimestamp(subscription.current_period_start, tz=timezone.utc).date()
-    period_end = datetime.fromtimestamp(subscription.current_period_end, tz=timezone.utc).date()
+    period_start_ts, period_end_ts = _subscription_period(subscription)
+    period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
+    period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
     await _seed_local_billing_state(
         merchant_id=merchant_id,
         stripe_customer_id=customer.id,
@@ -99,7 +100,7 @@ async def test_full_billing_cycle(stripe_test_clock: Any) -> None:
         connect_account_id=f"acct_clock_{merchant_id}",
     )
 
-    await advance_clock(stripe_test_clock.id, subscription.current_period_end - 86400)
+    await advance_clock(stripe_test_clock.id, period_end_ts - 86400)
     billing_run_id = await invoice_generation_service.run_billing_cycle(period_start, period_end)
 
     invoice_row = await database.fetch_one(
@@ -188,8 +189,9 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
             "metadata": {"merchant_id": merchant_id},
         },
     )
-    period_start = datetime.fromtimestamp(subscription.current_period_start, tz=timezone.utc).date()
-    period_end = datetime.fromtimestamp(subscription.current_period_end, tz=timezone.utc).date()
+    period_start_ts, period_end_ts = _subscription_period(subscription)
+    period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
+    period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
     await _seed_local_billing_state(
         merchant_id=merchant_id,
         stripe_customer_id=customer.id,
@@ -354,6 +356,32 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
     assert clawback_row is not None
     assert clawback_row["amount_cents"] == -5000
     assert await _partner_balance(partner_id) == balance_before - 5000
+
+
+def _subscription_period(subscription: Any) -> tuple[int, int]:
+    """Return (period_start_ts, period_end_ts) for a Stripe Subscription.
+
+    Stripe moved `current_period_start`/`current_period_end` from the
+    Subscription object to per-item in API version 2025+; older API versions
+    keep them at the top level. Read from items.data[0] first, fall back to
+    the top-level fields so the harness works across API versions.
+    """
+    items = getattr(subscription, "items", None)
+    data = getattr(items, "data", None) if items is not None else None
+    if data:
+        item = data[0]
+        period_start = getattr(item, "current_period_start", None)
+        period_end = getattr(item, "current_period_end", None)
+        if period_start is not None and period_end is not None:
+            return int(period_start), int(period_end)
+    period_start = getattr(subscription, "current_period_start", None)
+    period_end = getattr(subscription, "current_period_end", None)
+    if period_start is None or period_end is None:
+        raise RuntimeError(
+            "Stripe Subscription is missing current_period_start/end on both "
+            "subscription.items.data[0] and the top level"
+        )
+    return int(period_start), int(period_end)
 
 
 async def _create_clock_customer(test_clock_id: str, merchant_id: str) -> Any:
