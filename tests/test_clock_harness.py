@@ -385,7 +385,9 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
     assert second_response.status_code == 200
     assert await _stripe_event_count(event["id"]) == 1
 
-    finalized_invoice_id = "in_already_finalized_clock"
+    # Per-run unique to avoid collision with stripe_invoice_id from prior runs
+    # (invoices.stripe_invoice_id is unique-indexed via uq_invoices_stripe_invoice_id).
+    finalized_invoice_id = f"in_already_finalized_{int(time.time())}"
     await _insert_local_invoice(merchant_id, finalized_invoice_id, period_start, period_end, "finalizing")
 
     def already_finalized(*_args: Any, **_kwargs: Any) -> Any:
@@ -396,8 +398,14 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
         "finalize_invoice",
         already_finalized,
     )
-    with pytest.raises(RuntimeError):
-        await invoice_generation_service.finalize_invoice(finalized_invoice_id)
+    # Post-Step-5 contract: finalize_invoice() must tolerate Stripe's
+    # auto-finalize race ("already finalized" / "non-draft" / "cannot
+    # finalize") and return successfully. The invoice.finalized webhook
+    # converges local state. The wrapper swallows the Stripe error.
+    await invoice_generation_service.finalize_invoice(finalized_invoice_id)
+    # Local row stays 'finalizing' because the webhook handler hasn't fired
+    # in this test scope. In production, T4's _handle_invoice_finalized
+    # transitions it to 'finalized' when Stripe POSTs the webhook.
     assert await _invoice_status(finalized_invoice_id) == "finalizing"
 
     payout_id = await _seed_pending_partner_payout(partner_id, first_run, amount_dollars="12.34")
