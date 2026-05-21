@@ -120,7 +120,7 @@ _NON_CORE_PRODUCT_RE = re.compile(
     r"deluxe\s+sample|"
     r"gift\s+card|e\s*gift\s+card|"
     r"shipping\s+protection|route\s+package\s+protection|delivery\s+protection|"
-    r"stickers?|packette|"
+    r"(?:decal|enamel)\s+stickers?|tirtir\s+stickers?|packette|"
     r"gwp|gift\s+with\s+purchase|free\s+gift|"
     r"100\s*%\s*off|mystery\s+.*product"
     r")\b",
