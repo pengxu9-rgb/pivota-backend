@@ -193,6 +193,127 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # ===== v1.3 monetization cron jobs =====
+        # Stage 1: T6 GMV aggregation + T5 reservation reaper run ACTIVE.
+        # Stage 4: T7 invoice generation + T8 partner settlement registered
+        # PAUSED (next_run_time=None) so promotion is a one-line resume call
+        # rather than a code-change + redeploy cycle. See
+        # docs/monetization/deploy/STAGE_1_SHADOW_MODE_ROLLOUT.md §0.
+
+        from services.metering_service import expire_stale_reservations
+        from services.gmv_aggregation_service import aggregate_daily
+        from services.invoice_generation_service import run_billing_cycle
+        from services.partner_settlement_service import run_settlement
+        from db.database import database
+
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        async def _run_gmv_aggregation_yesterday() -> None:
+            """T6 daily wrapper: aggregate yesterday's edges into gmv_attribution_daily."""
+            yesterday = (_dt.now(_tz.utc) - _td(days=1)).date()
+            rows = await aggregate_daily(yesterday)
+            logger.info("audit_scheduler: gmv_aggregation_daily for %s -> %d rollup rows", yesterday, rows)
+
+        async def _run_billing_cycle_previous_month() -> None:
+            """T7 monthly wrapper: invoice the previous calendar month.
+
+            Picks the calendar month that ENDED before today. E.g., run on
+            2026-07-02 -> period = 2026-06-01..2026-06-30. Idempotent on
+            billing_runs.idempotency_key.
+            """
+            today = _dt.now(_tz.utc).date()
+            first_of_this_month = today.replace(day=1)
+            last_of_prev_month = first_of_this_month - _td(days=1)
+            period_start = last_of_prev_month.replace(day=1)
+            period_end = last_of_prev_month
+            run_id = await run_billing_cycle(period_start, period_end)
+            logger.info("audit_scheduler: invoice_generation_monthly %s..%s -> billing_run_id=%s",
+                        period_start, period_end, run_id)
+
+        async def _run_partner_settlement_latest() -> None:
+            """T8 monthly wrapper: settle the latest completed billing_runs row.
+
+            Pairs with T7 — runs on day 3 (one day after T7's day 2) so the
+            invoice cycle has finished. Picks the most recent billing_runs
+            row whose status='completed' and runs settlement against it.
+            """
+            row = await database.fetch_one(
+                "SELECT id, period_start, period_end FROM billing_runs "
+                "WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1"
+            )
+            if not row:
+                logger.info("audit_scheduler: partner_settlement_monthly: no completed billing_runs row; skipping")
+                return
+            billing_run_id = int(row["id"])
+            n_payouts = await run_settlement(billing_run_id)
+            logger.info(
+                "audit_scheduler: partner_settlement_monthly billing_run_id=%s -> %d payout rows",
+                billing_run_id, n_payouts,
+            )
+
+        # T5 — credit reservation reaper, every 5 minutes (ACTIVE).
+        # No-op when no reservations are outstanding (current state in
+        # production), so safe to run continuously from Stage 1 onward.
+        scheduler.add_job(
+            expire_stale_reservations,
+            "interval",
+            minutes=5,
+            id="metering_expire_reservations",
+            replace_existing=True,
+            misfire_grace_time=60,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # T6 — GMV aggregation, daily at 02:00 UTC (ACTIVE).
+        # Aggregates the previous UTC day's stamped attribution edges into
+        # gmv_attribution_daily. Output feeds T7's monthly invoice run.
+        scheduler.add_job(
+            _run_gmv_aggregation_yesterday,
+            "cron",
+            hour=2,
+            minute=0,
+            id="gmv_aggregation_daily",
+            replace_existing=True,
+            misfire_grace_time=900,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # T7 — invoice generation, monthly on day 2 03:00 UTC (PAUSED).
+        # Registered paused so Stage 4 promotion is `scheduler.resume_job(
+        # "invoice_generation_monthly")` — no code change, no redeploy.
+        scheduler.add_job(
+            _run_billing_cycle_previous_month,
+            "cron",
+            day=2,
+            hour=3,
+            minute=0,
+            id="invoice_generation_monthly",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+            next_run_time=None,  # paused — see Stage 1 §0 and Stage 4 promotion
+        )
+
+        # T8 — partner settlement, monthly on day 3 04:00 UTC (PAUSED).
+        # Day after T7 so the invoice cycle has finalized. Same paused
+        # pattern as T7 — Stage 4 resume call enables.
+        scheduler.add_job(
+            _run_partner_settlement_latest,
+            "cron",
+            day=3,
+            hour=4,
+            minute=0,
+            id="partner_settlement_monthly",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+            next_run_time=None,  # paused — see Stage 1 §0 and Stage 4 promotion
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
@@ -203,7 +324,11 @@ async def start_scheduler() -> None:
             "+ executor_run_worker_tick (5s) "
             "+ executor_run_lease_reaper (60s) "
             "+ verification_run_worker_tick (30s) "
-            "+ verification_run_lease_reaper (60s)"
+            "+ verification_run_lease_reaper (60s) "
+            "+ metering_expire_reservations (5min, ACTIVE) "
+            "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "
+            "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
+            "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
