@@ -41,6 +41,7 @@ yesterday but archived today.
 
 Blocker codes (first failing check wins):
   not_live          — catalog_products.sync_status is not 'live' (stale/archived)
+  non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
   no_seed           — no external seed and no APV-backed source document
   no_extraction     — a source row exists but no usable source title/document
   low_quality       — content_quality_score < 65 (0-100 scale)
@@ -68,6 +69,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -111,6 +113,30 @@ _PIPELINE_STAGE_RANK = {
     "shadow_indexed": 4,
     "public_indexed": 5,
 }
+
+_NON_CORE_PRODUCT_RE = re.compile(
+    r"\b(?:"
+    r"sample\s+(?:card|vial|pack|sachet)|"
+    r"deluxe\s+sample|"
+    r"gift\s+card|e\s*gift\s+card|"
+    r"shipping\s+protection|route\s+package\s+protection|delivery\s+protection|"
+    r"stickers?|packette|"
+    r"gwp|gift\s+with\s+purchase|free\s+gift|"
+    r"100\s*%\s*off|mystery\s+.*product"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_NON_CORE_COMPACT_RE = re.compile(
+    r"(?:"
+    r"samplecard|samplevial|deluxesample|"
+    r"giftcard|egiftcard|"
+    r"shippingprotection|deliveryprotection|packageprotection|"
+    r"narvardeliveryprotection|"
+    r"packette"
+    r")",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +226,30 @@ def _has_seed_row(row: Dict[str, Any]) -> bool:
     return row.get("seed_data_json") is not None or row.get("seed_title") is not None
 
 
+def _is_non_core_product(row: Dict[str, Any], *, seed_title: str) -> bool:
+    """Return True for sellable artifacts that should not enter PDP serving.
+
+    These rows are operational or promo artifacts rather than products users
+    should discover through the commerce index: sample cards/vials, shipping
+    protection, gift cards, GWP placeholders, stickers, packettes, and promo
+    placeholders. The matcher is deliberately narrow to avoid suppressing a
+    legitimate product that happens to contain a broad word like "sample".
+    """
+    values = [
+        seed_title,
+        row.get("seed_title"),
+        row.get("pdp_title"),
+        row.get("canonical_url"),
+    ]
+    raw = " ".join(str(value or "") for value in values)
+    normalized = re.sub(r"[^a-z0-9%]+", " ", raw.lower())
+    compact = re.sub(r"[^a-z0-9%]+", "", raw.lower())
+    return bool(
+        _NON_CORE_PRODUCT_RE.search(normalized)
+        or _NON_CORE_COMPACT_RE.search(compact)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-product classification
 # ---------------------------------------------------------------------------
@@ -279,6 +329,11 @@ def _classify_product(
     if cp_sync_status and cp_sync_status != "live":
         blocker_code = "not_live"
         blocker_detail = f"catalog_products.sync_status={cp_sync_status!r}"
+    elif _is_non_core_product(row, seed_title=seed_title):
+        blocker_code = "non_core_product"
+        blocker_detail = (
+            "sample/gift/protection/GWP row is not eligible for commerce index serving"
+        )
     elif not source_document_present:
         if not has_seed_row:
             blocker_code = "no_seed"

@@ -8,15 +8,17 @@
 --   discovered    → catalog_products row with content_key exists
 --   crawled       → external_offer_snapshots row exists for the domain
 --   extracted     → seed_data non-empty with title present
---   quality_gated → content_quality_score >= 0.65 AND has_image AND has_price
+--   quality_gated → content_quality_score >= 65 AND has_image AND has_price
 --                   AND description_length >= 50
 --   shadow_indexed → serving_eligible=TRUE AND agent_pdp_view row exists
---   public_indexed → serving_eligible=TRUE AND agent_pdp_view.sync_status='public'
+--   public_indexed → serving_eligible=TRUE AND apv.pdp_lifecycle_stage='published'
 --
 -- blocker_code values (first failing check wins):
+--   not_live          — catalog_products.sync_status is not 'live'
+--   non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
 --   no_seed           — no external_product_seeds row linked to this content_key
 --   no_extraction     — seed_data null or title missing
---   low_quality       — content_quality_score < 0.65
+--   low_quality       — content_quality_score < 65
 --   no_image          — image_url null/empty after extraction
 --   no_price          — no catalog_offers row with list_price > 0
 --   short_description — description present but < 50 chars after strip
