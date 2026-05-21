@@ -42,6 +42,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from services.catalog_identity import make_content_key
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
+from services.text_normalization.brand_case import proper_case_brand
 
 logger = logging.getLogger("catalog_enrichment_agent.ingestion")
 
@@ -143,8 +144,11 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     # diverging from Path A's GTIN-included key for the same product.
     # Pass through unchanged; downstream callers handle empty values.
     gtin_raw = pdp.get("gtin") or pdp.get("barcode") or ""
+    # Display-cased — upstream candidates routinely arrive lowercase
+    # ("fenty beauty"). Identity/dedup keys use lowercase via
+    # canonical_product_name() below, so this only fixes display.
     payload = {
-        "brand": str(pdp.get("brand") or "").strip(),
+        "brand": proper_case_brand(pdp.get("brand")),
         "product_name": str(pdp.get("product_name") or "").strip(),
         "category_path": str(pdp.get("category_path") or "").strip(),
         "attribute_summary": str(pdp.get("attribute_summary") or "").strip(),
