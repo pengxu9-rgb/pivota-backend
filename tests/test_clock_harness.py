@@ -349,7 +349,12 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
     with pytest.raises(PayoutMissingConnectAccountError):
         await partner_settlement_service.execute_payout(payout_id)
 
-    await _set_partner_connect_account(partner_id, "acct_test_insufficient_balance")
+    # Use a per-test-run unique connect account so reruns don't violate
+    # the unique index on channel_partners.stripe_connect_account_id from
+    # leftover rows of prior runs. merchant_id is already unique per run.
+    await _set_partner_connect_account(
+        partner_id, f"acct_test_insufficient_{merchant_id}"
+    )
 
     class FakeStripeError(Exception):
         pass
