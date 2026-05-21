@@ -99,9 +99,19 @@ async def test_full_billing_cycle(stripe_test_clock: Any) -> None:
         },
     )
 
+    # Use a per-run-unique offset so this harness invocation doesn't collide
+    # with leftover billing_runs rows from previous runs. run_billing_cycle is
+    # idempotent on idempotency_key=f"{period_start}-billing" — if the row
+    # exists, T7 returns the existing run without processing this test's new
+    # merchant. Shifting period by a time-derived offset gives each run its
+    # own period; staging accumulates dated test rows over time but tests
+    # remain repeatable.
     period_start_ts, period_end_ts = _subscription_period(subscription)
-    period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
-    period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
+    raw_period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
+    raw_period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
+    unique_offset_days = int(time.time() // 60) % 8000  # minute-resolution; ~21 years range
+    period_start = raw_period_start + timedelta(days=unique_offset_days)
+    period_end = raw_period_end + timedelta(days=unique_offset_days)
     await _seed_local_billing_state(
         merchant_id=merchant_id,
         stripe_customer_id=customer.id,
@@ -237,16 +247,38 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
         "create",
         timeout_invoice_item,
     )
-    with pytest.raises(TimeoutError):
-        await invoice_generation_service.run_billing_cycle(period_start, period_end)
+    # T7 spec (services/invoice_generation_service.py::run_billing_cycle):
+    # per-merchant exceptions are caught and logged; the cycle completes so a
+    # single broken merchant doesn't abort the whole run. SDK timeout therefore
+    # does NOT propagate — assert run completes and the affected merchant has
+    # no invoice. (Note: this currently leaves the merchant permanently
+    # unbilled for the cycle; v1.4 should add a retry path — flagged in
+    # questions_for_cowork.md.)
+    await invoice_generation_service.run_billing_cycle(period_start, period_end)
     first_run = await _billing_run_id(period_start)
     assert first_run is not None
+
+    timed_out_invoice = await database.fetch_one(
+        """
+        SELECT id FROM invoices
+        WHERE merchant_id = :merchant_id
+          AND billing_period_start = :period_start
+        """,
+        {"merchant_id": merchant_id, "period_start": period_start},
+    )
+    assert timed_out_invoice is None, (
+        "SDK timeout should leave the merchant unbilled for this cycle"
+    )
 
     monkeypatch.setattr(
         invoice_generation_service.stripe_client.v1.invoice_items,
         "create",
         original_create,
     )
+    # Retry verifies T7's period-level idempotency: same idempotency_key
+    # returns the existing billing_run_id, the cycle is not re-executed
+    # even though the SDK mock is now removed. This is intentional behavior
+    # but a known limitation of v1 (see v1.4 retry note in questions_for_cowork.md).
     retry_run = await invoice_generation_service.run_billing_cycle(period_start, period_end)
     assert retry_run == first_run
 
