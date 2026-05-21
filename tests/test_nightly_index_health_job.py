@@ -190,6 +190,28 @@ def test_non_core_detector_stays_narrow_for_regular_products():
     assert _is_non_core_product(row, seed_title="Sampled Iris Eau de Parfum") is False
 
 
+def test_non_core_detector_allows_real_sticker_treatments():
+    """Blemish/spot/undereye stickers are legitimate beauty PDPs, not decals."""
+    for title in (
+        "Clarity Blemish Stickers",
+        "Overnight Spot Stickers",
+        "Showstopp'r Undereye Sticker",
+    ):
+        row = _full_row(
+            pdp_title=title,
+            canonical_url=f"https://example.com/products/{title.lower().replace(' ', '-')}",
+        )
+        assert _is_non_core_product(row, seed_title=title) is False
+
+
+def test_non_core_detector_blocks_decal_stickers():
+    row = _full_row(
+        pdp_title="Rare Beauty Decal Stickers",
+        canonical_url="https://example.com/products/rare-beauty-decal-stickers",
+    )
+    assert _is_non_core_product(row, seed_title="Rare Beauty Decal Stickers") is True
+
+
 # ---------------------------------------------------------------------------
 # Public_indexed mapping (P1)
 # ---------------------------------------------------------------------------
