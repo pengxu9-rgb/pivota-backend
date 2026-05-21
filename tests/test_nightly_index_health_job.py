@@ -29,11 +29,13 @@ from jobs.nightly_index_health_job import (
     _ORPHAN_COUNT_QUERY,
     _ORPHAN_DELETE,
     _STALE_INVALIDATION_UPDATE,
+    _BATCH_QUERY,
     _classify_product,
     _coerce_dict,
     _extract_domain,
     _make_extraction_content_hash,
     _resolve_seed_title,
+    _select_content_key_state,
 )
 
 
@@ -280,6 +282,39 @@ def test_no_seed_apv_backed_product_without_quality_is_low_quality_not_no_seed()
     assert state["pipeline_stage"] == "extracted"
 
 
+def test_content_key_state_selection_prefers_apv_backed_eligible_row():
+    """Duplicate live catalog rows for one content_key must not let a weaker
+    source row overwrite the content-key PDP state."""
+    blocked = _classify_product(
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            pdp_title="Catalog title only",
+            pdp_description="",
+            content_quality_score=57.1,
+        ),
+        regression_domains=set(),
+    )
+    eligible = _classify_product(
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            pdp_scope="merchant_owned",
+            product_group_id=None,
+            pdp_title="Catalog/APV product",
+            pdp_description="A source-backed PDP description with enough detail for the index.",
+            pdp_lifecycle_stage="validated",
+            content_quality_score=71.4,
+        ),
+        regression_domains=set(),
+    )
+
+    selected = _select_content_key_state([blocked, eligible])
+    assert selected["blocker_code"] == "none"
+    assert selected["serving_eligible"] is True
+    assert selected["pipeline_stage"] == "shadow_indexed"
+
+
 def test_no_seed_without_apv_document_still_blocks_as_no_seed():
     state = _classify_product(
         _full_row(
@@ -462,6 +497,16 @@ def test_orphan_queries_target_index_pipeline_state_via_anti_join():
     assert _ORPHAN_COUNT_QUERY.lstrip().upper().startswith("SELECT")
 
 
+def test_batch_query_pages_by_distinct_content_key():
+    """IPS is keyed by content_key, so the batch must page keys first and then
+    classify all live catalog rows for those keys."""
+    sql = _BATCH_QUERY
+    assert "WITH content_keys AS" in sql
+    assert "SELECT DISTINCT cp.content_key" in sql
+    assert "JOIN catalog_products cp" in sql
+    assert "ORDER BY cp.content_key, cp.updated_at DESC NULLS LAST" in sql
+
+
 def test_stale_invalidation_targets_sync_status_not_live():
     """The stale-invalidation UPDATE must guard on sync_status != 'live' and
     flip serving_eligible to FALSE. Regression guard for P0 #2."""
@@ -471,6 +516,8 @@ def test_stale_invalidation_targets_sync_status_not_live():
     assert "FALSE" in _STALE_INVALIDATION_UPDATE
     assert "'not_live'" in _STALE_INVALIDATION_UPDATE
     assert "IS DISTINCT FROM 'live'" in _STALE_INVALIDATION_UPDATE
+    assert "NOT EXISTS" in _STALE_INVALIDATION_UPDATE
+    assert "live_cp.sync_status = 'live'" in _STALE_INVALIDATION_UPDATE
 
 
 def test_extraction_content_hash_is_deterministic():
