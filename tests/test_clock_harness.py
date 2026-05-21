@@ -365,16 +365,14 @@ async def _create_clock_customer(test_clock_id: str, merchant_id: str) -> Any:
             "metadata": {"merchant_id": merchant_id},
         },
     )
+    # Stripe accounts default to rejecting raw card numbers; use a pre-tokenized
+    # test card instead. tok_visa is Stripe's permanent test token, available in
+    # every test account, and bypasses the "raw card data API" restriction.
     payment_method = await asyncio.to_thread(
         stripe_client.v1.payment_methods.create,
         params={
             "type": "card",
-            "card": {
-                "number": "4242424242424242",
-                "exp_month": 12,
-                "exp_year": datetime.now(timezone.utc).year + 2,
-                "cvc": "314",
-            },
+            "card": {"token": "tok_visa"},
         },
     )
     await asyncio.to_thread(
