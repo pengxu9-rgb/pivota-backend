@@ -70,7 +70,23 @@ railway variables --json --environment production --service web | jq 'keys[] | s
 
 **Connect platform account note**: v1.3 does not require a separate `STRIPE_CONNECT_PLATFORM_ACCOUNT_ID` env var. T7/T8 use platform `STRIPE_SECRET_KEY` for Customer/Invoice/Transfer calls; merchant Connect account IDs live per-row in `merchant_psps.account_id` and `channel_partners.stripe_connect_account_id`.
 
-**Prerequisite**: `STRIPE_PRICE_ID_*` env vars currently hold **Test mode** price IDs (created during Step 6). Before live billing on Stage 3+, three new **Live mode** Stripe Prices must be created and these env vars rotated. **AUTHORIZATION REQUIRED** for the rotation. Stage 0 does not strictly require this — but if you want the `/api/billing/checkout-session` route to work in Live mode immediately, do it now.
+**Prerequisite — Stripe Live key + Live Prices**: discovered during Stage 0 prep (2026-05-22) that production `STRIPE_SECRET_KEY` is currently `sk_test_*` (not `sk_live_*`). Commerce paths are unaffected because they run through merchant-scoped credentials in `merchant_psps`, not the platform `STRIPE_SECRET_KEY`. But Live Price creation requires a Live key (Stripe API segregates modes completely). Three steps to complete before Stage 1:
+
+1. **AUTHORIZATION REQUIRED.** Stripe Dashboard → Developers → API Keys (Live mode) → copy `sk_live_*` secret. Set on Railway:
+   ```bash
+   railway variables --environment production --service web --set "STRIPE_SECRET_KEY=sk_live_..."
+   ```
+   Railway auto-redeploys. Verify:
+   ```bash
+   railway variables --json -e production -s web | jq -r '.STRIPE_SECRET_KEY' | head -c 8
+   # Expected: sk_live_
+   ```
+
+2. **AUTHORIZATION REQUIRED.** Create 3 Live-mode Prices on Live-mode Pivota Products via the codex dispatch in `docs/monetization/codex_dispatch/stripe_live_price_rotation.md`. Pre-flight aborts if STRIPE_SECRET_KEY is still `sk_test_*`, so this must follow step 1.
+
+3. Same codex dispatch handles rotating `STRIPE_PRICE_ID_STARTER` / `_GROWTH` / `_SCALE` env vars to the new Live IDs. Triggers a second Railway redeploy.
+
+Test-mode Prices created in Step 5 remain active in Stripe Test for harness re-runs. Staging env vars keep pointing at them.
 
 ## 3. Pre-deployment database backup
 
