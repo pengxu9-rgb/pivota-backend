@@ -1225,6 +1225,13 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         u = str(raw).strip()
         if not u:
             return
+        if u.startswith("//"):
+            scheme = urlparse(canonical).scheme or urlparse(base_url).scheme or "https"
+            u = f"{scheme}:{u}"
+        if not u.startswith(("http://", "https://")):
+            u = urljoin(canonical or base_url, u)
+        if not u.startswith(("http://", "https://")):
+            return
         key = _image_dedupe_key(u) or u
         score = _image_resolution_score(u)
         if key in idx_by_key:
