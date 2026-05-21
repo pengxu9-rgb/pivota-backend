@@ -876,13 +876,16 @@ async def _insert_partner_balance_ledger(
 async def _mark_payout_failed(payout_id: int, error_message: str) -> None:
     agent_payout_columns = await _table_columns("agent_payouts")
     assignments = ["status = 'failed'"]
-    values: dict[str, Any] = {
-        "payout_id": payout_id,
-        "error_message": error_message[:1000],
-    }
+    # Only add :error_message to values when the SQL references it. SQLAlchemy
+    # 1.4+ rejects unused bind parameters (ArgumentError: "doesn't define a
+    # bound parameter named X"), so building the values dict eagerly with
+    # error_message and then choosing the column-dependent SQL fragment broke
+    # on schemas where `agent_payouts.error_message` doesn't exist.
+    values: dict[str, Any] = {"payout_id": payout_id}
 
     if "error_message" in agent_payout_columns:
         assignments.append("error_message = :error_message")
+        values["error_message"] = error_message[:1000]
     elif "metadata" in agent_payout_columns:
         assignments.append(f"metadata = { _json_value_sql('metadata_json') }")
         values["metadata_json"] = json.dumps(
