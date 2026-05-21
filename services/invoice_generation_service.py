@@ -461,18 +461,45 @@ async def generate_merchant_invoice(
 
 
 async def finalize_invoice(stripe_invoice_id: str) -> None:
-    """Mark a local invoice finalizing, then ask Stripe to finalize and collect it."""
+    """Mark a local invoice finalizing, then ask Stripe to finalize and collect it.
+
+    With auto_advance=True on Invoice.create (Step 5+), Stripe may auto-finalize
+    the draft before this explicit call lands — the cron's wall-clock gap between
+    Invoice.create and finalize_invoice can exceed Stripe's auto-advance timer.
+    Treat 'already finalized' as success; the invoice.finalized webhook will
+    converge local state from 'finalizing' to 'finalized' regardless of which
+    path triggered the finalize.
+    """
 
     await _ensure_invoice_generation_schema()
     await database.execute(
         _MARK_INVOICE_FINALIZING_QUERY,
         {"stripe_invoice_id": stripe_invoice_id},
     )
-    await asyncio.to_thread(
-        stripe_client.v1.invoices.finalize_invoice,
-        stripe_invoice_id,
-        params={"auto_advance": True},
-    )
+    try:
+        await asyncio.to_thread(
+            stripe_client.v1.invoices.finalize_invoice,
+            stripe_invoice_id,
+            params={"auto_advance": True},
+        )
+    except Exception as exc:
+        # Catch the Stripe-auto-finalized race specifically. Match by Stripe's
+        # error message because stripe.error.InvalidRequestError isn't a strict
+        # type guarantee across SDK versions, and we want to fail loudly on any
+        # other Stripe error (e.g., not found, permission denied).
+        message = str(exc).lower()
+        if (
+            "already finalized" in message
+            or "non-draft" in message
+            or "cannot finalize" in message
+        ):
+            logger.info(
+                "Stripe invoice %s already finalized (auto-advance race); "
+                "local state will converge via invoice.finalized webhook",
+                stripe_invoice_id,
+            )
+            return
+        raise
 
 
 async def handle_dispute(invoice_dispute_id: int) -> None:
