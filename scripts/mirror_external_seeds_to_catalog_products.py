@@ -42,6 +42,7 @@ from services.pdp_category_classifier import (
 )
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
+from services.text_normalization.brand_case import proper_case_brand
 
 
 MERCHANT_ID = "external_seed"
@@ -188,6 +189,53 @@ _SEED_DATA_VARIANT_PATHS: Tuple[Tuple[str, ...], ...] = (
     ("product", "variants"),
     ("variants",),
 )
+
+
+# Top-level seed_data keys carrying force-fill PDP content. These are
+# surfaced flat onto product_payload so the PIVOTA-Agent PDP composer
+# can find them at the shape it already reads (top-level on product),
+# rather than buried under product_payload.seed_data where the read path
+# doesn't look.
+_SEED_DATA_RICH_CONTENT_KEYS = (
+    "pdp_description_raw",
+    "pdp_details_sections",
+    "pdp_how_to_use_raw",
+    "pdp_faq_items",
+    "pdp_ingredients_raw",
+    "pdp_review_summary",
+    "ingredient_intel",
+    "key_ingredients",
+    "inci_list",
+    "ingredient_tokens",
+    "commerce_facts_v1",
+    "pdp_force_fill_v1",
+    "pdp_field_capture_status",
+    "pdp_field_quality_summary",
+    "bundle_components",
+    "bundle_component_refs",
+    "review_summary",
+    "shade_detail_label",
+    "variant_detail_label",
+    "product_kind",
+)
+
+
+def _extract_rich_content_for_payload(seed_data: Any) -> Dict[str, Any]:
+    """Project the force-filled PDP content from seed_data into a flat
+    dict mirrored at the top of product_payload.
+
+    These keys are already populated by upstream force-fill on 3,500+
+    of the 4,578 external_seed rows; the previous mirror discarded them
+    by writing only description/brand/product_type/category. The PDP
+    composer reads top-level shape — nesting under seed_data hid them.
+    """
+    if not isinstance(seed_data, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _SEED_DATA_RICH_CONTENT_KEYS:
+        if key in seed_data and seed_data[key] is not None:
+            out[key] = seed_data[key]
+    return out
 
 
 def _extract_variants_from_seed_data(seed_data: Any) -> List[Any]:
@@ -812,6 +860,7 @@ async def _apply(limit: int) -> int:
         mirror_lifecycle_stage = _compute_mirror_lifecycle_stage(
             row_dict, category_meta, seed_tags, taxonomy
         )
+        mirrored_brand_display = proper_case_brand(row_dict.get("mirrored_brand"))
         product_payload = {
             "external_seed": {
                 "id": row_dict.get("id"),
@@ -833,6 +882,18 @@ async def _apply(limit: int) -> int:
                 "duplicate_count": row_dict.get("duplicate_count"),
                 "selection_rank": row_dict.get("rn"),
             },
+            # Structured brand object so the PIVOTA-Agent PDP composer's
+            # resolveProductBrandLabel picks up `product.brand.name`
+            # without falling back to the bare `brand` column (which the
+            # ingest path may still store lowercase for older rows).
+            **(
+                {"brand": {"name": mirrored_brand_display}}
+                if mirrored_brand_display
+                else {}
+            ),
+            # Flatten the force-filled PDP fields up to the top level so
+            # the read path finds them without traversing seed_data.
+            **_extract_rich_content_for_payload(row_dict.get("seed_data")),
         }
         freshness_json = {
             "mirrored_from": "external_product_seeds",
@@ -921,7 +982,11 @@ async def _apply(limit: int) -> int:
                 "source_ref": row_dict.get("id"),
                 "title": row_dict.get("title"),
                 "description": row_dict.get("mirrored_description"),
-                "brand": row_dict.get("mirrored_brand"),
+                # Display-cased — see services.text_normalization.brand_case.
+                # The dedup/identity key still uses the lowercase form via
+                # services.catalog_identity.normalize_brand, so this only
+                # affects what users see.
+                "brand": mirrored_brand_display or row_dict.get("mirrored_brand"),
                 "product_type": row_dict.get("mirrored_product_type"),
                 "category": row_dict.get("mirrored_category"),
                 "category_path": category_meta.get("category_path"),
