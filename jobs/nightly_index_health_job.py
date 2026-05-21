@@ -103,6 +103,15 @@ _RESOLVED_PDP_SCOPES = {
     "multi_merchant_canonical",
 }
 
+_PIPELINE_STAGE_RANK = {
+    "discovered": 0,
+    "crawled": 1,
+    "extracted": 2,
+    "quality_gated": 3,
+    "shadow_indexed": 4,
+    "public_indexed": 5,
+}
+
 
 # ---------------------------------------------------------------------------
 # Advisory lock helpers (single lock for the whole job run)
@@ -385,6 +394,33 @@ def _classify_product(
     }
 
 
+def _state_rank(state: Dict[str, Any]) -> tuple:
+    """Rank candidate states for the same content_key.
+
+    `index_pipeline_state` is keyed by content_key while catalog_products can
+    contain multiple live source rows for that key. Pick the row that best
+    represents the content-key PDP instead of letting row order decide which
+    source row overwrites the state.
+    """
+    return (
+        1 if state.get("serving_eligible") else 0,
+        _PIPELINE_STAGE_RANK.get(str(state.get("pipeline_stage") or ""), -1),
+        1 if state.get("blocker_code") == "none" else 0,
+        float(state.get("content_quality_score") or -1),
+        1 if state.get("has_image") else 0,
+        1 if state.get("has_price") else 0,
+        int(state.get("description_length") or 0),
+        1 if state.get("identity_resolved") else 0,
+    )
+
+
+def _select_content_key_state(states: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Select one deterministic index state for a content_key group."""
+    if not states:
+        raise ValueError("states must not be empty")
+    return max(states, key=_state_rank)
+
+
 def _extract_domain(url: str) -> Optional[str]:
     """Extract apex domain from a URL. Returns None if URL is empty/invalid."""
     if not url:
@@ -409,6 +445,15 @@ def _extract_domain(url: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 _BATCH_QUERY = """
+WITH content_keys AS (
+    SELECT DISTINCT cp.content_key
+    FROM catalog_products cp
+    WHERE cp.content_key IS NOT NULL
+      AND cp.sync_status = 'live'
+      AND cp.content_key > :cursor
+    ORDER BY cp.content_key
+    LIMIT :batch_size
+)
 SELECT
     cp.content_key,
     cp.product_key,
@@ -446,7 +491,9 @@ SELECT
         LIMIT 1
     )                           AS has_offer_snapshot,
     pgm.product_group_id
-FROM catalog_products cp
+FROM content_keys ck
+JOIN catalog_products cp
+  ON cp.content_key = ck.content_key
 LEFT JOIN LATERAL (
     SELECT
         content_quality_score,
@@ -478,11 +525,8 @@ LEFT JOIN LATERAL (
       AND platform_product_id = cp.source_product_id
     LIMIT 1
 ) pgm ON TRUE
-WHERE cp.content_key IS NOT NULL
-  AND cp.sync_status = 'live'
-  AND cp.content_key > :cursor
-ORDER BY cp.content_key
-LIMIT :batch_size
+WHERE cp.sync_status = 'live'
+ORDER BY cp.content_key, cp.updated_at DESC NULLS LAST, cp.product_key
 """
 
 _UPSERT_QUERY = """
@@ -690,6 +734,12 @@ SET
 FROM catalog_products cp
 WHERE cp.content_key = ips.content_key
   AND cp.sync_status IS DISTINCT FROM 'live'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM catalog_products live_cp
+      WHERE live_cp.content_key = ips.content_key
+        AND live_cp.sync_status = 'live'
+  )
   AND (ips.serving_eligible = TRUE OR ips.blocker_code <> 'not_live')
 """
 
@@ -929,22 +979,28 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             if not rows:
                 break
 
-            batch_states: List[Dict[str, Any]] = []
+            states_by_content_key: Dict[str, List[Dict[str, Any]]] = {}
             for raw in rows:
                 row = dict(raw)
                 try:
                     state = _classify_product(row, regression_domains)
-                    batch_states.append(state)
-                    stage = state["pipeline_stage"]
-                    stage_counts[stage] = stage_counts.get(stage, 0) + 1
-                    if state["serving_eligible"]:
-                        eligible_count += 1
+                    states_by_content_key.setdefault(row["content_key"], []).append(state)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "nightly_index_health: classify failed for "
                         "content_key=%r: %s",
                         row.get("content_key"), exc,
                     )
+
+            batch_states = [
+                _select_content_key_state(candidate_states)
+                for candidate_states in states_by_content_key.values()
+            ]
+            for state in batch_states:
+                stage = state["pipeline_stage"]
+                stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                if state["serving_eligible"]:
+                    eligible_count += 1
 
             if batch_states:
                 try:
@@ -959,10 +1015,15 @@ async def run_nightly_index_health() -> Dict[str, Any]:
                     summary["batch_errors"] += 1
                     summary["errors"].append(f"batch_upsert cursor={cursor!r}: {exc!r}")
 
-            # Advance cursor to the last content_key in this batch
-            cursor = dict(rows[-1])["content_key"]
+            # Advance cursor to the last distinct content_key in this batch.
+            # The query pages by content key but returns all live catalog rows
+            # for each key, so raw row count can exceed BATCH_SIZE.
+            batch_content_keys = sorted({dict(row)["content_key"] for row in rows})
+            if not batch_content_keys:
+                break
+            cursor = batch_content_keys[-1]
 
-            if len(rows) < BATCH_SIZE:
+            if len(batch_content_keys) < BATCH_SIZE:
                 break  # last batch
 
         summary["total_processed"] = total_processed
