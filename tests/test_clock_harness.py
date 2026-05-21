@@ -106,10 +106,13 @@ async def test_full_billing_cycle(stripe_test_clock: Any) -> None:
     # merchant. Shifting period by a time-derived offset gives each run its
     # own period; staging accumulates dated test rows over time but tests
     # remain repeatable.
+    #
+    # Range [0..4000) days. test_failure_modes uses [4000..8000) — the two
+    # ranges are disjoint so the two tests in a single run never collide.
     period_start_ts, period_end_ts = _subscription_period(subscription)
     raw_period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
     raw_period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
-    unique_offset_days = int(time.time() // 60) % 8000  # minute-resolution; ~21 years range
+    unique_offset_days = int(time.time() // 60) % 4000
     period_start = raw_period_start + timedelta(days=unique_offset_days)
     period_end = raw_period_end + timedelta(days=unique_offset_days)
     await _seed_local_billing_state(
@@ -220,18 +223,24 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
             "metadata": {"merchant_id": merchant_id},
         },
     )
-    # Shift this test's billing period off `test_full_billing_cycle`'s period.
-    # run_billing_cycle is idempotent on (period_start, period_end) — if both
-    # tests share a period, the second test's mocks never fire because the
-    # billing_runs row already exists. Use a far-future period unique to this
-    # test (subscription period from Stripe + 90 days) so the SDK-timeout,
-    # signature, duplicate-event, idempotent-retry, and other monkeypatched
-    # assertions actually execute.
+    # Shift this test's billing period off `test_full_billing_cycle`'s period
+    # AND off any leftover billing_runs row from a prior harness run.
+    # run_billing_cycle is idempotent on (period_start, period_end) — if a
+    # billing_runs row with this idempotency_key already exists, T7 returns
+    # the existing run without calling Stripe, so the SDK-timeout / signature
+    # / duplicate-event / orphan-draft / etc. assertions in this test would
+    # all silently no-op.
+    #
+    # Use a per-run unique offset like test_full_billing_cycle does, but in
+    # a disjoint range (4000..8000 days) so the two tests can't land on the
+    # same period within a single harness invocation. Both ranges are within
+    # the 21-year horizon and don't bump into real-world dates.
     period_start_ts, period_end_ts = _subscription_period(subscription)
     raw_period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
     raw_period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
-    period_start = raw_period_start + timedelta(days=90)
-    period_end = raw_period_end + timedelta(days=90)
+    unique_offset_days = 4000 + (int(time.time() // 60) % 4000)
+    period_start = raw_period_start + timedelta(days=unique_offset_days)
+    period_end = raw_period_end + timedelta(days=unique_offset_days)
     await _seed_local_billing_state(
         merchant_id=merchant_id,
         stripe_customer_id=customer.id,
