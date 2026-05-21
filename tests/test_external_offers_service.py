@@ -39,6 +39,35 @@ def test_extract_from_html_collects_multiple_images_from_meta_and_jsonld() -> No
     assert "https://example.com/og_2.jpg" in image_urls
 
 
+def test_extract_from_html_normalizes_relative_jsonld_image_url() -> None:
+    html = """
+    <html>
+      <head>
+        <link rel="canonical" href="https://example.com/products/mascara" />
+        <script type="application/ld+json">
+          {
+            "@context": "https://schema.org",
+            "@type": "Product",
+            "name": "Mascara",
+            "image": "/-/media/products/mascara.jpg?rev=1",
+            "offers": {
+              "@type": "Offer",
+              "price": "13.99",
+              "priceCurrency": "USD"
+            }
+          }
+        </script>
+      </head>
+      <body></body>
+    </html>
+    """
+
+    out = _extract_from_html("https://example.com/products/mascara", html)
+    expected = "https://example.com/-/media/products/mascara.jpg?rev=1"
+    assert out.get("image_url") == expected
+    assert (out.get("image_urls") or [])[0] == expected
+
+
 def test_extract_from_html_collects_images_from_data_product_skus_value() -> None:
     import html as html_lib
     import json
