@@ -198,6 +198,128 @@ def test_aggregate_offers_skips_offers_with_no_price() -> None:
     assert top == []
 
 
+def test_aggregate_offers_skips_nonpositive_prices() -> None:
+    """Zero-price placeholders are not usable offer prices. This pins
+    the public PDP guard that prevents scraped '$0' rows from becoming
+    price aggregates."""
+    offers = [
+        {"merchant_id": "m1", "merchant_name": "M1", "availability": "in_stock",
+         "currency": "USD", "list_price": Decimal("0.00"),
+         "merchant_effective_price": None, "estimated_best_price": None},
+        {"merchant_id": "m2", "merchant_name": "M2", "availability": "in_stock",
+         "currency": "USD", "list_price": Decimal("-4.00"),
+         "merchant_effective_price": None, "estimated_best_price": None},
+    ]
+    _, price_min, price_max, count, top = backfill.aggregate_offers(
+        offers, primary_merchant_id=None, merchant_url_by_id={},
+    )
+    assert price_min is None and price_max is None
+    assert count == 0
+    assert top == []
+
+
+def test_source_price_fallback_uses_external_seed_when_no_offer_price() -> None:
+    row = _assemble(
+        offers=[],
+        external_seed={
+            "id": "seed_1",
+            "attached_product_key": "pk_1",
+            "title": "Hydrating Toner",
+            "image_url": None,
+            "price_amount": 13,
+            "price_currency": "USD",
+            "market": "US",
+            "seed_data": {"description": "Official product copy."},
+        },
+    )
+    assert row["currency"] == "USD"
+    assert row["price_min"] == Decimal("13.00")
+    assert row["price_max"] == Decimal("13.00")
+    assert row["offer_count"] == 0
+    assert row["offers"] is None
+
+
+def test_source_price_fallback_reads_mirrored_product_payload() -> None:
+    row = _assemble(
+        products=[{
+            "product_key": "pk_1",
+            "merchant_id": "external_seed",
+            "platform": "external_seed",
+            "source_product_id": "ext_1",
+            "title": "Apricot Blossom Peeling Gel",
+            "description": "Gentle peeling gel.",
+            "brand": "Beauty of Joseon",
+            "product_payload": {
+                "external_seed": {
+                    "price_amount": "13.00",
+                    "price_currency": "USD",
+                },
+                "seed_data": {
+                    "snapshot": {"price": {"amount": "13.00", "currency": "USD"}},
+                },
+            },
+            "pdp_lifecycle_stage": "published",
+            "pivota_signature_id": "sig_apricot",
+            "canonical_url": "https://beautyofjoseon.example/apricot",
+            "sync_status": "live",
+            "product_group_id": None,
+            "group_is_primary": True,
+        }],
+        offers=[],
+        external_seed=None,
+    )
+    assert row["currency"] == "USD"
+    assert row["price_min"] == Decimal("13.00")
+    assert row["price_max"] == Decimal("13.00")
+
+
+def test_source_price_fallback_ignores_nonpositive_seed_price() -> None:
+    row = _assemble(
+        offers=[],
+        external_seed={
+            "id": "seed_1",
+            "attached_product_key": "pk_1",
+            "title": "Hydrating Toner",
+            "image_url": None,
+            "price_amount": 0,
+            "price_currency": "USD",
+            "market": "US",
+            "seed_data": {"price_amount": -1, "price_currency": "USD"},
+        },
+    )
+    assert row["currency"] is None
+    assert row["price_min"] is None
+    assert row["price_max"] is None
+
+
+def test_source_price_fallback_does_not_override_valid_offer_price() -> None:
+    row = _assemble(
+        offers=[{
+            "merchant_id": "m_primary",
+            "merchant_name": "Primary Merchant",
+            "availability": "in_stock",
+            "currency": "USD",
+            "list_price": Decimal("44.00"),
+            "merchant_effective_price": None,
+            "estimated_best_price": None,
+        }],
+        external_seed={
+            "id": "seed_1",
+            "attached_product_key": "pk_1",
+            "title": "Hydrating Toner",
+            "image_url": None,
+            "price_amount": 13,
+            "price_currency": "USD",
+            "market": "US",
+            "seed_data": {"description": "Official product copy."},
+        },
+    )
+    assert row["price_min"] == Decimal("44.00")
+    assert row["price_max"] == Decimal("44.00")
+    assert row["offer_count"] == 1
+    assert row["offers"][0]["price"] == 44.0
+
+
 # ---------------------------------------------------------------------------
 # variant aggregation
 # ---------------------------------------------------------------------------
