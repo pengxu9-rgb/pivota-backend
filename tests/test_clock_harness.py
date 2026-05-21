@@ -151,7 +151,12 @@ async def test_full_billing_cycle(stripe_test_clock: Any) -> None:
     await invoice_generation_service.handle_dispute(dispute_id)
     assert await _count_billing_items(billing_run_id, merchant_id) >= item_count
 
-    await advance_clock(stripe_test_clock.id, int(time.time()) + 5 * 24 * 60 * 60)
+    # Advance 5 days past the subscription period end (simulating the 5-day
+    # dispute window closing). Stripe Test Clocks can only move forward, and
+    # the prior advance already moved the clock to period_end_ts - 86400, so
+    # the target must be after the clock's current frozen time — using real
+    # wall-clock time + 5 days would be in the clock's past.
+    await advance_clock(stripe_test_clock.id, period_end_ts + 5 * 24 * 60 * 60)
     await invoice_generation_service.finalize_invoice(invoice_row["stripe_invoice_id"])
     await _mark_invoice_status(invoice_row["stripe_invoice_id"], "finalized")
     assert await _invoice_status(invoice_row["stripe_invoice_id"]) == "finalized"
