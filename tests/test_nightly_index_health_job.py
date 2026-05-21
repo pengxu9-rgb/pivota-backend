@@ -69,6 +69,7 @@ def _full_row(**overrides):
         "conversion_potential_score": None,
         "quality_rules_version": "v1",
         "quality_scored_at": datetime(2026, 5, 20, tzinfo=timezone.utc),
+        "pdp_title": "Test product",
         "image_url": "https://cdn.example.com/img.jpg",
         "pdp_description": "x" * 200,  # > MIN_DESCRIPTION_LENGTH
         "pdp_sync_status": "live",
@@ -232,7 +233,61 @@ def test_seed_data_as_json_string_is_parsed():
 
 def test_missing_seed_blocks_as_no_seed():
     state = _classify_product(
-        _full_row(seed_data_json=None, seed_title=None),
+        _full_row(seed_data_json=None, seed_title=None, pdp_title="", pdp_description=""),
+        regression_domains=set(),
+    )
+    assert state["blocker_code"] == "no_seed"
+
+
+def test_no_seed_apv_backed_product_can_be_indexed():
+    """Merchant/APV-backed PDPs are valid source documents even without an
+    external seed. Regression guard for the production commerce-index gap where
+    good APV rows were stuck at no_seed forever."""
+    state = _classify_product(
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            pdp_scope="merchant_owned",
+            product_group_id=None,
+            pdp_title="Catalog/APV product",
+            pdp_description="A source-backed PDP description with enough detail for the index.",
+            pdp_lifecycle_stage="validated",
+        ),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is True
+    assert state["blocker_code"] == "none"
+    assert state["pipeline_stage"] == "shadow_indexed"
+    assert state["identity_resolved"] is True
+    assert state["seed_audit_status"] == "not_audited"
+
+
+def test_no_seed_apv_backed_product_without_quality_is_low_quality_not_no_seed():
+    state = _classify_product(
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            content_quality_score=None,
+            pdp_scope="merchant_owned",
+            product_group_id=None,
+            pdp_title="Catalog/APV product",
+            pdp_description="A source-backed PDP description with enough detail for the index.",
+        ),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is False
+    assert state["blocker_code"] == "low_quality"
+    assert state["pipeline_stage"] == "extracted"
+
+
+def test_no_seed_without_apv_document_still_blocks_as_no_seed():
+    state = _classify_product(
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            pdp_title="Catalog title only",
+            pdp_description="",
+        ),
         regression_domains=set(),
     )
     assert state["blocker_code"] == "no_seed"
@@ -258,10 +313,28 @@ def test_short_description_blocks():
 
 def test_entity_unresolved_blocks():
     state = _classify_product(
-        _full_row(product_group_id=None, pdp_scope="external_seed"),
+        _full_row(product_group_id=None, pdp_scope="unverified"),
         regression_domains=set(),
     )
     assert state["blocker_code"] == "entity_unresolved"
+
+
+def test_multi_merchant_scope_resolves_identity_without_group_member():
+    state = _classify_product(
+        _full_row(product_group_id=None, pdp_scope="multi_merchant_canonical"),
+        regression_domains=set(),
+    )
+    assert state["identity_resolved"] is True
+    assert state["blocker_code"] == "none"
+
+
+def test_merchant_owned_scope_resolves_identity_without_group_member():
+    state = _classify_product(
+        _full_row(product_group_id=None, pdp_scope="merchant_owned"),
+        regression_domains=set(),
+    )
+    assert state["identity_resolved"] is True
+    assert state["blocker_code"] == "none"
 
 
 def test_seed_audit_issues_unresolved_blocks():
@@ -299,7 +372,13 @@ def test_extractor_regression_not_applied_for_unrelated_domain():
 
 def test_discovered_when_no_seed_no_offer_snapshot():
     state = _classify_product(
-        _full_row(seed_data_json=None, seed_title=None, has_offer_snapshot=None),
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            pdp_title="",
+            pdp_description="",
+            has_offer_snapshot=None,
+        ),
         regression_domains=set(),
     )
     assert state["pipeline_stage"] == "discovered"
@@ -307,7 +386,13 @@ def test_discovered_when_no_seed_no_offer_snapshot():
 
 def test_crawled_when_offer_snapshot_but_no_seed():
     state = _classify_product(
-        _full_row(seed_data_json=None, seed_title=None, has_offer_snapshot=True),
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            pdp_title="",
+            pdp_description="",
+            has_offer_snapshot=True,
+        ),
         regression_domains=set(),
     )
     assert state["pipeline_stage"] == "crawled"
