@@ -124,7 +124,7 @@ async def test_full_billing_cycle(stripe_test_clock: Any) -> None:
         SELECT id, stripe_invoice_id, status
         FROM invoices
         WHERE merchant_id = :merchant_id
-          AND DATE(billing_period_start) = :period_start
+          AND billing_period_start = :period_start
         ORDER BY created_at DESC
         LIMIT 1
         """,
@@ -205,9 +205,18 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
             "metadata": {"merchant_id": merchant_id},
         },
     )
+    # Shift this test's billing period off `test_full_billing_cycle`'s period.
+    # run_billing_cycle is idempotent on (period_start, period_end) — if both
+    # tests share a period, the second test's mocks never fire because the
+    # billing_runs row already exists. Use a far-future period unique to this
+    # test (subscription period from Stripe + 90 days) so the SDK-timeout,
+    # signature, duplicate-event, idempotent-retry, and other monkeypatched
+    # assertions actually execute.
     period_start_ts, period_end_ts = _subscription_period(subscription)
-    period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
-    period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
+    raw_period_start = datetime.fromtimestamp(period_start_ts, tz=timezone.utc).date()
+    raw_period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc).date()
+    period_start = raw_period_start + timedelta(days=90)
+    period_end = raw_period_end + timedelta(days=90)
     await _seed_local_billing_state(
         merchant_id=merchant_id,
         stripe_customer_id=customer.id,
@@ -906,7 +915,7 @@ async def _mark_invoice_status_by_merchant(merchant_id: str, period_start, statu
         SET status = :status,
             updated_at = {_now_sql()}
         WHERE merchant_id = :merchant_id
-          AND DATE(billing_period_start) = :period_start
+          AND billing_period_start = :period_start
         """,
         {"merchant_id": merchant_id, "period_start": period_start, "status": status},
     )

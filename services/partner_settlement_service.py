@@ -577,7 +577,7 @@ async def _subscription_revenue_by_merchant(
         FROM invoices i
         JOIN partner_attribution pa ON pa.merchant_id = i.merchant_id
         WHERE pa.channel_partner_id = :channel_partner_id
-          AND DATE(i.billing_period_start) = :period_start
+          AND i.billing_period_start = :period_start
           AND i.status = 'paid'
         GROUP BY i.merchant_id
         """,
