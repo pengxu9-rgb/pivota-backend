@@ -152,7 +152,8 @@ async def fetch_external_seed_for_keys(
     row = await read_db.fetch_one(
         """
         SELECT id, attached_product_key, title, image_url, seed_data,
-               canonical_url, destination_url
+               canonical_url, destination_url, price_amount, price_currency,
+               market
         FROM external_product_seeds
         WHERE attached_product_key = ANY(:keys)
           AND status = 'active'
@@ -179,7 +180,8 @@ async def fetch_external_seed_by_id(
     row = await read_db.fetch_one(
         """
         SELECT id, attached_product_key, title, image_url, seed_data,
-               canonical_url, destination_url
+               canonical_url, destination_url, price_amount, price_currency,
+               market
         FROM external_product_seeds
         WHERE id = :seed_id
         """,
@@ -261,6 +263,8 @@ def normalize_offer(offer: Dict[str, Any], primary_merchant_id: Optional[str]) -
         price_decimal = Decimal(price)
     except Exception:
         return None
+    if price_decimal <= 0:
+        return None
     return {
         "merchant_id": offer.get("merchant_id"),
         "merchant_name": offer.get("merchant_name"),
@@ -328,6 +332,141 @@ def aggregate_offers(
 
     top = sorted(normalized, key=sort_key)[:OFFER_TOP_N]
     return currency, price_min, price_max, len(normalized), top
+
+
+def _coerce_positive_decimal(value: Any) -> Optional[Decimal]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = Decimal(str(value).strip())
+    except Exception:
+        return None
+    if amount <= 0:
+        return None
+    return amount.quantize(Decimal("0.01"))
+
+
+def _normalize_currency(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    if len(normalized) < 3 or len(normalized) > 8:
+        return None
+    return normalized
+
+
+def _source_price_candidates_from_payload(
+    payload: Any,
+    *,
+    currency_hint: Optional[str] = None,
+) -> List[Tuple[Decimal, Optional[str]]]:
+    if not isinstance(payload, dict):
+        return []
+
+    candidates: List[Tuple[Decimal, Optional[str]]] = []
+    local_currency = (
+        _normalize_currency(payload.get("price_currency"))
+        or _normalize_currency(payload.get("currency"))
+        or _normalize_currency(payload.get("currency_code"))
+        or currency_hint
+    )
+
+    for key in ("price_amount", "amount", "price", "list_price", "sale_price"):
+        amount = _coerce_positive_decimal(payload.get(key))
+        if amount is not None:
+            candidates.append((amount, local_currency))
+            break
+
+    for key in ("external_seed", "pricing", "price", "current_price", "snapshot"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.extend(
+                _source_price_candidates_from_payload(nested, currency_hint=local_currency)
+            )
+
+    seed_data = payload.get("seed_data")
+    if isinstance(seed_data, dict):
+        candidates.extend(
+            _source_price_candidates_from_payload(seed_data, currency_hint=local_currency)
+        )
+
+    for key in ("variants", "skus", "offers"):
+        values = payload.get(key)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if isinstance(item, dict):
+                candidates.extend(
+                    _source_price_candidates_from_payload(item, currency_hint=local_currency)
+                )
+
+    return candidates
+
+
+def resolve_source_price_fallback(
+    *,
+    products: List[Dict[str, Any]],
+    external_seed: Optional[Dict[str, Any]],
+    seed_data: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[Decimal], Optional[Decimal]]:
+    """Resolve display-price aggregates from seed/catalog payloads only
+    when catalog_offers has no positive price.
+
+    This is deliberately not an offer substitute: caller keeps
+    offer_count/offers unchanged. The fallback only prevents the
+    denormalized PDP cache from showing NULL price fields while source
+    data already carries a positive price. Zero and negative prices are
+    ignored so bad placeholders cannot leak into serving/audit rows.
+    """
+    candidates: List[Tuple[Decimal, Optional[str]]] = []
+
+    if external_seed:
+        seed_currency = (
+            _normalize_currency(external_seed.get("price_currency"))
+            or _normalize_currency(seed_data.get("price_currency"))
+            or (
+                "USD"
+                if str(external_seed.get("market") or "").strip().upper() == "US"
+                else None
+            )
+        )
+        amount = _coerce_positive_decimal(external_seed.get("price_amount"))
+        if amount is not None:
+            candidates.append((amount, seed_currency))
+        candidates.extend(
+            _source_price_candidates_from_payload(seed_data, currency_hint=seed_currency)
+        )
+
+    for product in products:
+        payload = product.get("product_payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        if isinstance(payload, dict):
+            candidates.extend(_source_price_candidates_from_payload(payload))
+
+    if not candidates:
+        return None, None, None
+
+    currency_counts: Dict[str, int] = {}
+    for _, currency in candidates:
+        if currency:
+            currency_counts[currency] = currency_counts.get(currency, 0) + 1
+
+    currency = (
+        max(currency_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        if currency_counts
+        else None
+    )
+    prices = [
+        amount for amount, candidate_currency in candidates
+        if currency is None or candidate_currency in (None, currency)
+    ]
+    if not prices:
+        return currency, None, None
+    return currency, min(prices), max(prices)
 
 
 def aggregate_variants(skus: List[Dict[str, Any]], canonical_source_product_id: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
@@ -637,6 +776,17 @@ def assemble_row(
     currency, price_min, price_max, offer_count, top_offers = aggregate_offers(
         offers, primary_merchant_id, merchant_url_by_id
     )
+    if price_min is None or price_max is None:
+        fallback_currency, fallback_min, fallback_max = resolve_source_price_fallback(
+            products=products,
+            external_seed=external_seed,
+            seed_data=seed_data if isinstance(seed_data, dict) else {},
+        )
+        if fallback_min is not None and fallback_max is not None:
+            price_min = fallback_min
+            price_max = fallback_max
+            if currency is None:
+                currency = fallback_currency
 
     variants_capped, variants_count = aggregate_variants(
         skus, canonical.get("source_product_id")
