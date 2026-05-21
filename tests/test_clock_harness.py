@@ -29,6 +29,22 @@ pytestmark = pytest.mark.asyncio
 stripe_client = stripe.StripeClient(api_key=settings.stripe_secret_key or "")
 
 
+@pytest.fixture(autouse=True)
+async def _connected_database() -> AsyncIterator[None]:
+    """Connect the async `databases` pool for the duration of each harness test.
+
+    The harness reads/writes staging Postgres via `db.database.database`, which
+    requires an explicit `connect()` before `fetch_one`/`execute` calls work
+    (otherwise the backend asserts `pool is not None`). Function-scoped per
+    asyncio_default_fixture_loop_scope=function in pytest.ini.
+    """
+    await database.connect()
+    try:
+        yield
+    finally:
+        await database.disconnect()
+
+
 @pytest.fixture
 async def stripe_test_clock() -> AsyncIterator[Any]:
     """Create and delete a Stripe Test Clock for one billing-cycle harness run."""
