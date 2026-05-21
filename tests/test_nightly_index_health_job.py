@@ -33,6 +33,7 @@ from jobs.nightly_index_health_job import (
     _classify_product,
     _coerce_dict,
     _extract_domain,
+    _is_non_core_product,
     _make_extraction_content_hash,
     _resolve_seed_title,
     _select_content_key_state,
@@ -148,6 +149,45 @@ def test_not_live_takes_precedence_over_other_blockers():
         regression_domains=set(),
     )
     assert state["blocker_code"] == "not_live"
+
+
+def test_non_core_sample_card_blocks_before_seed_or_quality_checks():
+    state = _classify_product(
+        _full_row(
+            seed_data_json=None,
+            seed_title=None,
+            pdp_title="Find Comfort Sample Card",
+            pdp_description="",
+            content_quality_score=None,
+            has_price=False,
+        ),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is False
+    assert state["blocker_code"] == "non_core_product"
+    assert "not eligible" in (state["blocker_detail"] or "")
+
+
+def test_non_core_shipping_protection_blocks_even_with_good_content():
+    state = _classify_product(
+        _full_row(
+            seed_data_json={"title": "Shipping Protection"},
+            seed_title="Shipping Protection",
+            pdp_title="Shipping Protection",
+            canonical_url="https://example.com/products/narvardeliveryprotection",
+        ),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is False
+    assert state["blocker_code"] == "non_core_product"
+
+
+def test_non_core_detector_stays_narrow_for_regular_products():
+    row = _full_row(
+        pdp_title="Sampled Iris Eau de Parfum",
+        canonical_url="https://example.com/products/sampled-iris-eau-de-parfum",
+    )
+    assert _is_non_core_product(row, seed_title="Sampled Iris Eau de Parfum") is False
 
 
 # ---------------------------------------------------------------------------
