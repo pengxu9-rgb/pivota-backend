@@ -94,7 +94,7 @@ pg_restore --list "/tmp/pivota-prod-prev-stage0-${TS}.dump" | wc -l
 # Expected: > 200 (many table/index entries)
 ```
 
-Retain the dump file until Stage 1 promotion completes successfully.
+**Retention**: retain the dump file until **Stage 3 → Stage 4 promotion** (one clean billing cycle on the alpha completes successfully). Real money flows in Stage 3; a regression surfacing then may need schema rollback that requires the Stage 0 backup state. That's 4–6 weeks from now; Postgres custom-format dumps compress small. Worth the storage.
 
 ## 4. Migration application order
 

@@ -98,6 +98,23 @@ WHERE date = CURRENT_DATE - INTERVAL '1 day';
 
 Expected: rollups_today ≥ 0 (depends on whether any agent orders landed yesterday). Stage 1 doesn't require a non-zero number; it requires that the query returns and matches §3 sanity check.
 
+### 2.4 Capture DB stamp-update timing baseline (after first real stamp)
+
+`pg_stat_statements.mean_exec_time` for the T9 stamp UPDATE is meaningless until that UPDATE has fired at least once. Stage 0 §6 smoke tests are read-only; Stage 1 must capture the baseline once 1–2 live agent orders have stamped real edges.
+
+Wait for the first live agent order to land after Stage 0 deploy:
+```sql
+SELECT edge_id, order_id, gross_attributed_gmv_cents, updated_at
+FROM commerce_attribution_edges
+WHERE gross_attributed_gmv_cents IS NOT NULL
+  AND updated_at > '<STAGE_0_DEPLOY_TIMESTAMP_UTC>'
+ORDER BY updated_at ASC LIMIT 5;
+```
+
+When ≥ 1 row returns (first stamp landed), capture the baseline using the query in Appendix A §A.5. Record `stamp_update_baseline_ms` somewhere shared (questions_for_cowork.md or the deployment record) — every subsequent daily comparison in §3.5 references it.
+
+If pg_stat_statements is not installed or returns no row, install it first (`CREATE EXTENSION IF NOT EXISTS pg_stat_statements;` — **AUTHORIZATION REQUIRED**) and let one more stamp fire before retrying baseline capture.
+
 ## 3. What to monitor during shadow mode
 
 Six checks, run daily. Full SQL for each is in **Appendix A** (one block per check, copy-paste-able). Stage 1→2 promotion needs 3 consecutive clean days across all six.
@@ -109,7 +126,7 @@ Six checks, run daily. Full SQL for each is in **Appendix A** (one block per che
 | 3.3 | `gmv_attribution_daily` rollups reconcile to raw edges via the COALESCE join | 0 mismatched rows | T6 aggregation drifted OR upsert missed via the expression-index join key (migration 110) |
 | 3.4 | Error log scan on `psp_payment_finalizer` + `gmv_aggregation_service` | no error/exception/traceback lines | Any hit = Stage 2 blocker |
 | 3.5 | DB stamp UPDATE p99 timing vs Stage 0 baseline | `current_ms ≤ 1.5 × baseline` | Lock contention; check `pg_locks` |
-| 3.6 | Duplicate edges per order_id (belt-and-suspenders against the unique index) | 0 rows | Unique index in migration 109 isn't holding |
+| 3.6 | True duplicate edges — same (order_id, merchant_id, agent_id, channel_partner_id) tuple | 0 rows | Concurrent stamping race; legitimate multi-edge-per-order fan-out (one per surface_click_event) is NOT a duplicate |
 
 ## 4. Duration and exit criteria
 
@@ -263,7 +280,7 @@ Expected: no output.
 
 ### A.5 DB stamp-update timing (§3.5)
 
-Capture baseline once during Stage 0 smoke:
+Capture baseline once during Stage 1 §2.4 (after the first live agent order stamps in Stage 1 — pg_stat_statements has nothing to report until then; Stage 0 smoke is read-only so no UPDATE fires):
 ```sql
 SELECT now() AS captured_at,
        (SELECT COUNT(*) FROM commerce_attribution_edges) AS total_edges,
@@ -285,14 +302,17 @@ ORDER BY calls DESC LIMIT 1;
 
 Expected: `current_ms ≤ 1.5 × baseline_ms`.
 
-### A.6 Concurrent stamping race (§3.6)
+### A.6 Concurrent stamping race — true duplicates only (§3.6)
+
+v1.3 permits multiple attribution edges per order (one per `surface_click_event` — explicit in T9 acceptance criteria). A true race-bug duplicate is two edges with **identical attribution dimensions** for the same order, not just the same order_id.
 
 ```sql
-SELECT order_id, COUNT(*) AS edge_count, ARRAY_AGG(edge_id) AS edges
+SELECT order_id, merchant_id, agent_id, channel_partner_id,
+       COUNT(*) AS dup_count, ARRAY_AGG(edge_id) AS edges
 FROM commerce_attribution_edges
 WHERE DATE(created_at) = CURRENT_DATE - INTERVAL '1 day'
-GROUP BY order_id
+GROUP BY order_id, merchant_id, agent_id, channel_partner_id
 HAVING COUNT(*) > 1;
 ```
 
-Expected: 0 rows (migration 109's unique index on order_id should prevent it; this is belt-and-suspenders).
+Expected: 0 rows. Multi-edge fan-out across distinct (merchant/agent/partner) tuples is legitimate and not flagged.
