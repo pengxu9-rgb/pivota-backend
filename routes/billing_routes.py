@@ -73,9 +73,26 @@ async def handle_stripe_billing_webhook(
     if not event_id or not event_type:
         raise HTTPException(status_code=400, detail="Invalid Stripe event")
 
+    # Stripe retries deliver the same event_id on transient failures. Cases:
+    #   - status='processed'/'ignored' → genuine duplicate; ack and exit.
+    #   - status='failed' → previous handler errored; reprocess this retry.
+    #   - status='pending' stale (> STALE_PENDING_SECONDS) → previous handler
+    #     crashed before writing terminal state. Reclaim same as 'failed'.
+    #   - status='pending' fresh → another worker is currently processing this
+    #     event; respond 409 so Stripe retries later.
     inserted = await _insert_stripe_event(event_id, event_type, event, database)
     if not inserted:
-        return JSONResponse({"status": "duplicate"}, status_code=200)
+        claim = await _claim_retryable_event(event_id, event_type, event, database)
+        if claim == "ack_duplicate":
+            return JSONResponse({"status": "duplicate"}, status_code=200)
+        if claim == "concurrent_in_flight":
+            return JSONResponse({"status": "in_progress"}, status_code=409)
+        logger.info(
+            "Reclaiming retryable stripe event event_id=%s type=%s prior_status=%s",
+            event_id,
+            event_type,
+            claim,
+        )
 
     logger.info("Received Stripe billing webhook: %s event_id=%s", event_type, event_id)
 
@@ -596,6 +613,100 @@ async def _insert_stripe_event(
             },
         )
     return row is not None
+
+
+# Pending rows older than this are treated as orphaned (handler crashed mid-
+# flight). Tuned so a legitimate slow handler doesn't get reclaimed under it,
+# while a crashed-then-retried Stripe event still gets reprocessed within ~1
+# delivery cycle of Stripe's exponential backoff (~ couple of minutes).
+STALE_PENDING_SECONDS = 300
+
+
+async def _claim_retryable_event(
+    event_id: str,
+    event_type: str,
+    event: Dict[str, Any],
+    db: Database,
+) -> str:
+    """Decide what to do with a Stripe event whose row already exists.
+
+    Returns one of:
+      - "ack_duplicate" → already processed/ignored; caller should 200 OK.
+      - "concurrent_in_flight" → another worker is processing; 409.
+      - "reclaimed_failed" / "reclaimed_stale_pending" → caller should run the
+        handler. The row has been transitioned back to 'pending' with the
+        latest payload under a row lock.
+    """
+    if IS_POSTGRES:
+        # SKIP LOCKED so a concurrent retry sees no row to claim and surfaces
+        # "concurrent_in_flight" instead of blocking on the lock.
+        row = await db.fetch_one(
+            """
+            SELECT id, status,
+                   EXTRACT(EPOCH FROM (NOW() - received_at)) AS age_seconds
+            FROM stripe_events
+            WHERE event_id = :event_id
+            FOR UPDATE SKIP LOCKED
+            """,
+            {"event_id": event_id},
+        )
+    else:
+        row = await db.fetch_one(
+            "SELECT id, status, "
+            "(strftime('%s','now') - strftime('%s', received_at)) AS age_seconds "
+            "FROM stripe_events WHERE event_id = :event_id",
+            {"event_id": event_id},
+        )
+
+    if row is None:
+        # Lost the race for the lock — another worker has the row open.
+        return "concurrent_in_flight"
+
+    status = str(row["status"] or "").lower()
+    if status in ("processed", "ignored"):
+        return "ack_duplicate"
+
+    age_seconds = float(row["age_seconds"] or 0)
+    if status == "pending" and age_seconds < STALE_PENDING_SECONDS:
+        return "concurrent_in_flight"
+
+    # status == 'failed' OR status == 'pending' stale → reclaim. Refresh the
+    # payload (Stripe sometimes enriches on retry) and reset status to
+    # 'pending' under the same lock we already hold.
+    payload = json.dumps(event, default=str)
+    if IS_POSTGRES:
+        await db.execute(
+            """
+            UPDATE stripe_events
+            SET status = 'pending',
+                error = NULL,
+                payload_jsonb = CAST(:payload_json AS jsonb),
+                event_type = :event_type,
+                received_at = NOW(),
+                processed_at = NULL,
+                updated_at = NOW()
+            WHERE event_id = :event_id
+            """,
+            {"event_id": event_id, "event_type": event_type, "payload_json": payload},
+        )
+    else:
+        await db.execute(
+            """
+            UPDATE stripe_events
+            SET status = 'pending',
+                error = NULL,
+                payload_jsonb = :payload_json,
+                event_type = :event_type,
+                received_at = CURRENT_TIMESTAMP,
+                processed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE event_id = :event_id
+            """,
+            {"event_id": event_id, "event_type": event_type, "payload_json": payload},
+        )
+    if status == "failed":
+        return "reclaimed_failed"
+    return "reclaimed_stale_pending"
 
 
 async def _mark_event_processed(event_id: str, db: Database) -> None:
