@@ -188,6 +188,11 @@ All must be ✓ before kicking off Stage 2 (the historical-edge backfill).
 - [ ] No errors in `psp_payment_finalizer` or `gmv_aggregation_service` logs.
 - [ ] No unexpected cron failures: `railway logs --service web --environment production | grep "gmv_aggregation_daily" | tail -7` shows successful daily completion for the last 3 ticks.
 - [ ] One-shot dry run of `aggregate_daily` for a future date returns 0 rows (proves the merchant_id=NULL cron path works post-Bug-C fix from commit `ba78b0b`).
+- [ ] **Ultrareview findings reconciled.** `/ultrareview` was launched against PR #581 (core v1.3) in parallel with Stage 1; findings live in `docs/monetization/CODE_REVIEW_FINDINGS_v1.3.md`. Promotion gate:
+  - **Critical-severity findings affecting stamping math, idempotency, money flow, or partner balance accounting** → fix with a scoped v1.3.x PR + redeploy; Stage 1 monitoring window restarts.
+  - **Critical-severity findings affecting only paused code paths (T7/T8) or read-only diagnostic paths** → fix as v1.3.x patch; does NOT restart the Stage 1 window because Stage 1 doesn't exercise those paths. Stage 4 promotion gate (not here) re-checks.
+  - **Medium / low-severity findings** → log into `CODE_REVIEW_FINDINGS_v1.3.md` with a disposition (fix-now / fix-in-v1.4 / wontfix-with-rationale); they do not block Stage 2 promotion.
+  - **No ultrareview run completed** → run it before promoting. The 3-day monitoring window is necessary but not sufficient on its own.
 - [ ] Cowork sign-off on the 3-day report.
 
 When all ticked, Stage 2 prompt drafts and the alpha's 91 historical edges get backfilled retroactively. That stage will be briefed separately.
