@@ -228,6 +228,15 @@ try:
     except ValueError:
         traffic_taxonomy_diagnostics_warning_total = _existing_collector("traffic_taxonomy_diagnostics_warning_total")
 
+    try:
+        commerce_attribution_silent_reject_total = Counter(
+            "commerce_attribution_silent_reject_total",
+            "Order attribution edges skipped before insert (gate rejected metadata).",
+            ["merchant_id", "reason"],
+        )
+    except ValueError:
+        commerce_attribution_silent_reject_total = _existing_collector("commerce_attribution_silent_reject_total")
+
 except Exception:  # pragma: no cover
     Counter = Gauge = Histogram = None  # type: ignore
     payment_attempt_total = None
@@ -252,6 +261,7 @@ except Exception:  # pragma: no cover
     traffic_taxonomy_records_total = None
     traffic_taxonomy_missing_total = None
     traffic_taxonomy_diagnostics_warning_total = None
+    commerce_attribution_silent_reject_total = None
 
 
 def record_payment_attempt(
@@ -440,3 +450,16 @@ def record_traffic_taxonomy(
             stage=str(stage or "unknown"),
             reason=str(warning_reason or "unknown"),
         ).inc()
+
+
+def record_commerce_attribution_silent_reject(
+    *,
+    merchant_id: Optional[str],
+    reason: str = "no_attribution_signal",
+) -> None:
+    if commerce_attribution_silent_reject_total is None:
+        return
+    commerce_attribution_silent_reject_total.labels(
+        merchant_id=str(merchant_id or "unknown"),
+        reason=str(reason or "unknown"),
+    ).inc()

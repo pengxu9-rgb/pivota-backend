@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -10,13 +11,18 @@ from sqlalchemy import select
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
 from db.database import database
-from observability.reliability_metrics import record_traffic_taxonomy
+from observability.reliability_metrics import (
+    record_commerce_attribution_silent_reject,
+    record_traffic_taxonomy,
+)
 from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
 )
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
+
+logger = logging.getLogger("commerce_attribution_service")
 
 PVT_SURFACE = "pvt_surface"
 PVT_CLICK_ID = "pvt_click_id"
@@ -301,6 +307,19 @@ async def upsert_order_attribution_edge(
 ) -> Optional[Dict[str, Any]]:
     payload = dict(metadata or {})
     if not has_attribution_signal(payload):
+        # Surface gate rejections so Stage 1 can size the direct-checkout gap
+        # instead of treating "no edge" as zero events.
+        logger.warning(
+            "commerce_attribution: skipping edge order_id=%s merchant_id=%s "
+            "reason=no_attribution_signal metadata_keys=%s",
+            order_id,
+            merchant_id,
+            sorted(payload.keys()) if payload else [],
+        )
+        record_commerce_attribution_silent_reject(
+            merchant_id=merchant_id,
+            reason="no_attribution_signal",
+        )
         return None
     attribution = materialize_attribution_context(
         payload,
