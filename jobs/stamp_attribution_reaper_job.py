@@ -37,11 +37,16 @@ logger = logging.getLogger("stamp_attribution_reaper")
 # 24h look-back is the recovery window. Anything older that's still unstamped
 # should surface in alerting (the gross-null count) rather than be silently
 # patched up days later — that would mask a systemic stamping failure.
+#
+# paid_at must be in the SELECT list because Postgres requires every ORDER BY
+# expression to appear there under SELECT DISTINCT. The aggregator below
+# ignores the field — it's only there to satisfy the SQL grammar.
 _UNSTAMPED_PAID_ORDERS_QUERY = """
 SELECT DISTINCT
     o.order_id,
     o.subtotal,
-    o.discount_total
+    o.discount_total,
+    o.paid_at
 FROM commerce_attribution_edges e
 JOIN orders o ON o.order_id = e.order_id
 WHERE e.gross_attributed_gmv_cents IS NULL

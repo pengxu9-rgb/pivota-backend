@@ -136,3 +136,26 @@ def test_reaper_query_uses_paid_at_window_and_payment_status_predicate() -> None
     assert "INTERVAL '2 minutes'" in sql, "fresh paid orders must be skipped"
     assert "payment_status" in sql
     assert "'paid'" in sql or "paid" in sql.lower()
+
+
+def test_reaper_query_distinct_includes_order_by_columns() -> None:
+    """Regression for the 2026-05-22 prod outage of PR #597 (first deploy):
+    `SELECT DISTINCT ... ORDER BY o.paid_at` errored every tick with
+    'ORDER BY expressions must appear in select list'. Postgres requires
+    every ORDER BY column to be in the projection under DISTINCT.
+
+    Guard: if the query keeps DISTINCT + ORDER BY paid_at, paid_at must
+    also be in the SELECT projection. FakeDB-based tests cannot catch
+    this — they bypass real SQL semantics — so the grammar check has
+    to live as a regex-style assertion on the SQL string.
+    """
+    sql = reaper._UNSTAMPED_PAID_ORDERS_QUERY
+    has_distinct = "SELECT DISTINCT" in sql
+    has_order_by_paid_at = "ORDER BY o.paid_at" in sql or "ORDER BY paid_at" in sql
+    if has_distinct and has_order_by_paid_at:
+        # The projection before FROM must mention paid_at.
+        select_clause = sql.split("FROM", 1)[0]
+        assert "paid_at" in select_clause, (
+            "SELECT DISTINCT with ORDER BY paid_at requires paid_at in projection; "
+            f"projection was: {select_clause.strip()}"
+        )
