@@ -251,3 +251,81 @@ Full dispatch report: `docs/monetization/codex_dispatch/outputs/stripe_live_pric
 ### Resolved: v1.3 Stage 1 monitoring correction — §A.6 duplicate detection
 
 Original `tests/test_clock_harness.py`-style assertion grouped by `order_id` alone. v1.3 allows legitimate multi-edge fan-out (one edge per `surface_click_event` — explicit in T9 acceptance criteria), so grouping by `order_id` alone flags legitimate fan-out as duplicates. Corrected query groups by `(order_id, merchant_id, agent_id, channel_partner_id)` — detects true concurrent-stamping races without false alarms on fan-out. See `docs/monetization/deploy/STAGE_1_SHADOW_MODE_ROLLOUT.md` §A.6.
+
+---
+
+## v1.3 Stage 1 post-deploy trail log (2026-05-22)
+
+Append-only history of work that landed on top of the Stage 0 → Stage 1 transition. Same pattern as the Stage 0/1 trail log above: not architectural questions, just a record of resolved items so the next reviewer sees the through-line.
+
+### Resolved: Stage 1 §2.1 T9 verification surfaced a pre-existing commerce-attribution gap
+
+Codex dispatched against Stage 1 §2.1 returned 0 edges in the 24h window. Investigation: only 7 `commerce_attribution_edges` rows exist for the alpha merchant across 6 months / 98 paid orders. Not a T9 bug — `services/commerce_attribution_service.py:upsert_order_attribution_edge` silently returned `None` whenever the order metadata had no attribution signal (`pvt_click_id`, `product_id`, `surface`, etc). Direct Shopify checkouts pass empty metadata because Shopify encodes product IDs in line items, not request payloads.
+
+Pre-existing behavior, **not a v1.3 regression**. But the Stage 1 promotion gate ("≥5 stamped edges from live agent traffic") is unmeetable if the direct-checkout cohort stays invisible.
+
+Fix: keep the gate (correct for agent-routed monetization), add observability so the rejection volume is visible — **PR #594** (`d1499fa`) merged. New Prometheus counter `commerce_attribution_silent_reject_total{merchant_id, reason}` + WARN log on every gate rejection. Lets Stage 1 size the direct-checkout cohort with one PromQL.
+
+### Resolved: Migration 121 manual apply + pg_stat_statements activation
+
+Per `reference_railway_prod_startup_skip` memory, production runs with `SKIP_HEAVY_STARTUP_INIT=true`, so the migration runner short-circuits. Migration 121 (`billing_runs.period_{start,end}` TIMESTAMPTZ → DATE) was discovered missing during PR #593's verification.
+
+- **Migration 121**: applied manually via public Postgres proxy (`psql -f`). Verified post-apply: both columns are `data_type='date'`.
+- **pg_stat_statements**: `CREATE EXTENSION` succeeded (v1.11 registered), but `shared_preload_libraries` is empty on the Railway-managed Postgres, so the view errors with "must be loaded via shared_preload_libraries". Needs `ALTER SYSTEM SET` + Postgres restart, deferred to a planned window because the single-DB tenancy means the restart blips both prod and staging.
+
+Stage 1 §3.5 baseline timing query is uninstrumentable until the Postgres restart happens — flagged as a known limitation, not a promotion-blocker.
+
+### Resolved: POSTGRES_PASSWORD rotation gotcha (incident, no data loss)
+
+While investigating the env scan tooling, attempted to rotate `POSTGRES_PASSWORD` via `railway variables --set`. This DOES NOT rotate the role's password in Postgres — it only updates the env var (and `DATABASE_URL`/`DATABASE_PUBLIC_URL` references). Production web reported `db_ok: false, TimeoutError` within ~1 minute as fresh connections via the new URL failed auth. Reverted to the original value within ~2 minutes; restoration verified via `GET /health → db_ok=true`.
+
+Gotcha now documented in `~/.claude/projects/-dev/memory/reference_railway_db_public_proxy.md`. Proper rotation requires either (a) `ALTER ROLE postgres PASSWORD '<new>'` inside Postgres AND the env var update, or (b) Postgres container restart (Railway re-applies the env var to the role on init). Safest path is the Railway dashboard rotation flow.
+
+Deferred: cowork to rotate the leaked password manually before Stage 2 / real-money traffic.
+
+### Resolved: Codex review of PR #581 (Stage 1 §6 promotion gate)
+
+Dispatched `codex exec` against merge commit `ae4e93a` with the Stage 1 §6 brief at `/tmp/codex_pr581_review_brief.md`. Verdict: **fail for Stage 1 → Stage 2/3 promotion** on the criticals, pass-with-caveats once criticals close.
+
+Findings landed (severity / file:line / PR that fixed it):
+
+| # | sev | file:line | finding | PR |
+|---|---|---|---|---|
+| 1 | critical | `services/refund_service.py:119` + `commerce_attribution_service.py:403` | Prod refund path only writes legacy `refunded_amount` column; T6 reads `refund_amount_cents` — never populated. Refunded orders bill at gross. | **#595** `776634f` |
+| 2 | critical | `services/gmv_aggregation_service.py:21` | `DATE(timestamptz)` is session-TZ dependent; same drift class that drove migrations 120/121, still live on source column. | **#596** `8417852` |
+| 3 | high | (none) | Migration 121 absent from PR #581's tree. **False positive** — landed in PR #590, applied manually as documented above. | n/a |
+| 4 | high | `routes/billing_routes.py:76` | Stripe retry on `failed`/stale `pending` events hit `ON CONFLICT DO NOTHING` and returned `"duplicate"` without reprocessing. | **#599** `f42d9d7` |
+| 5 | high | `services/psp_payment_finalizer.py:226` | T9 synchronous stamp inside try/except — paid order with null `gross_attributed_gmv_cents` exits T6 forever. | **#597** `781d84d` + hotfix **#598** `6d0a944` |
+| 6 | high | `routes/billing_routes.py:142` + `invoice_generation_service.py:374` + `partner_settlement_service.py:517` | Live Stripe `create`/`transfer` calls lack idempotency keys. Network retries can duplicate customers/invoices/transfers. | **#600** `4c66142` |
+| 7 | high | `services/invoice_generation_service.py:318` | `run_billing_cycle` marks the run `'completed'` even when per-merchant invoices fail; idempotency key blocks retry. | **#601** `b15ae2f` (+ migration 122) |
+| 8 | medium | `commerce_attribution_service.py:129` | `has_attribution_signal()` field list misses agent taxonomy fields, accepts weak signals. | deferred — PR #594 makes the cohort visible; revisit once Stage 1 data sizes the impact |
+| 9 | low | `tests/test_invoice_generation_service.py:268` | `auto_advance` test mismatch. | deferred — trivial alignment, batch with next test pass |
+
+### Resolved: PR #597 hotfix (reaper SQL DISTINCT/ORDER BY)
+
+PR #597's reaper went live and immediately failed every 5-minute tick with `for SELECT DISTINCT, ORDER BY expressions must appear in select list`. The FakeDB unit tests bypassed real Postgres grammar. Caught by tailing `railway logs --service web --environment production` minutes after redeploy. PR #598 (`6d0a944`) added `o.paid_at` to the SELECT projection and a regression test that string-checks the SQL grammar.
+
+Re-verified post-hotfix: scheduler shows `stamp_attribution_reaper` next tick scheduled, no scan-failed lines, 0 candidate orders in the current window (idle prod state — no failed stamps to recover).
+
+### Resolved: Multi-edge refund attribution — atomic SQL UPDATE
+
+PR #595 wired `refund_amount_cents` but kept a read-modify-write pattern: `fetch_one` reads ONE edge for an order, computes new totals in Python, writes those to ALL N edges via bulk UPDATE. Two failure modes that scale with agent traffic: state drift across edges gets silently flattened, and concurrent refund webhooks for the same `order_id` can double-count.
+
+Important framing: T9 stamps every edge with the **full** gross per the v1.3 acceptance criteria (one edge per `surface_click_event`), so per-edge **full-refund** symmetry is the intended semantic. The bug was only the read-modify-write implementation, not the semantics.
+
+**PR #602**: single UPDATE with per-row CASE expressions. JSONB `?` containment drives idempotency without a Python read; `refund_amount_cents`/`refunded_amount` accumulate via `COALESCE(col, 0) + CASE WHEN already_seen THEN 0 ELSE delta END`. Each matching row updates atomically against its own prior state — no drift flattening, no read-modify-write race.
+
+### Resolved: Migration 122 applied
+
+PR #601 introduced `billing_runs.status='partial_failed'`. Migration 122 extends `ck_billing_runs_status` to allow the new value. Applied 2026-05-22 via public Postgres proxy under user authorization. Pre-flight: old constraint (`running | completed | failed | cancelled`), 15 rows all `completed`. Post-apply: new constraint accepts `partial_failed`, rollback-only smoke INSERT confirmed semantics, prod web `db_ok=true` throughout. Code on prod (`b15ae2f`) can now legitimately write `status='partial_failed'`; future cron retries will resume only missing merchants per the PR #601 logic.
+
+### Outstanding before Stage 4 unpause
+
+Not blockers for Stage 1 monitoring; required before T7/T8 cron resume:
+
+- POSTGRES_PASSWORD manual rotation (operator owns; Railway dashboard recommended).
+- pg_stat_statements full activation via `ALTER SYSTEM SET shared_preload_libraries` + Postgres restart, scheduled when a single-DB tenancy blip is acceptable.
+- `scheduler.resume_job("invoice_generation_monthly")` and `scheduler.resume_job("partner_settlement_monthly")` — already wired for one-line activation per PR #592.
+- Recommended dry run before resume: manually invoke `services.invoice_generation_service.run_billing_cycle(test_period_start, test_period_end)` against the alpha merchant to exercise the full T6→T7 path with a Live Stripe key for the first time. PR #600's idempotency keys make this safely re-runnable.
+
+Findings #8 and #9 from codex remain open (medium / low). #8 needs Stage 1 traffic data to size; #9 is a trivial test alignment that can ride with any next PR through `test_invoice_generation_service.py`.
