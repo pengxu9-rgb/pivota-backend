@@ -180,10 +180,34 @@ async def create_billing_checkout_session(
             stripe_customer_id=stripe_customer_id,
         )
         if not updated:
-            logger.warning(
-                "Created Stripe customer %s for merchant_id=%s but no merchants row was updated",
+            # The merchants row backing this merchant_id is missing — most
+            # likely the merchant was approved at the merchant_onboarding
+            # layer but the merchants/user_subscriptions provisioning never
+            # completed (or got rolled back). Without persisting the
+            # customer id, the returned checkout URL would refer to a Stripe
+            # customer our DB has no record of, and subsequent webhooks for
+            # that customer would not find a matching merchant. Better to
+            # fail loud here than orphan a customer in Stripe.
+            #
+            # Surfaced by staging shakeout 2026-05-23 against
+            # merch_shakeout_* (audit doc §A). Idempotency key
+            # merchant_customer:{merchant_id} ensures a retry returns the
+            # same Stripe customer rather than creating a new one.
+            logger.error(
+                "Orphan Stripe customer: created %s for merchant_id=%s but "
+                "no merchants row matched the UPDATE. Provision the "
+                "merchants + user_subscriptions row, then retry — the "
+                "idempotency key replays cleanly.",
                 stripe_customer_id,
                 merchant_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Merchant subscription provisioning incomplete: "
+                    "Stripe customer created but local merchants row "
+                    "missing. Retry after provisioning completes."
+                ),
             )
 
     metadata = {"merchant_id": merchant_id, "price_id": price_id}
