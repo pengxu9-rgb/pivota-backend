@@ -514,6 +514,10 @@ async def execute_payout(payout_id: int) -> None:
     billing_run_id = int(_row_get(payout_row, "billing_run_id"))
 
     try:
+        # Exactly one Stripe transfer per agent_payouts row. Critical for
+        # real-money: a duplicate transfer is unrecoverable without manual
+        # Stripe Dashboard intervention. Stripe caches the response for 24h
+        # so any network retry inside that window is a no-op.
         transfer = await asyncio.to_thread(
             stripe_client.v1.transfers.create,
             params={
@@ -527,6 +531,7 @@ async def execute_payout(payout_id: int) -> None:
                     "billing_run_id": str(billing_run_id),
                 },
             },
+            options={"idempotency_key": f"payout:{payout_id}"},
         )
     except Exception as exc:
         if not _is_stripe_error(exc):

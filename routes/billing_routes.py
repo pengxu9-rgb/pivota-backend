@@ -156,13 +156,18 @@ async def create_billing_checkout_session(
 
     stripe_customer_id = _as_text((billing_row or {}).get("stripe_customer_id"))
     if not stripe_customer_id:
+        # Deterministic idempotency: at most one Stripe customer per merchant
+        # ever. Stripe caches idempotency keys for 24h, which covers the
+        # typical retry window for a single signup flow. A second legitimate
+        # signup after 24h would hit the (billing_row.stripe_customer_id IS
+        # NOT NULL) guard above and skip this branch entirely.
         customer = await asyncio.to_thread(
             stripe_client.v1.customers.create,
             {
                 "email": contact_email,
                 "metadata": {"merchant_id": merchant_id},
             },
-            None,
+            {"idempotency_key": f"merchant_customer:{merchant_id}"},
         )
         stripe_customer_id = _as_text(getattr(customer, "id", None) or _stripe_object_to_dict(customer).get("id"))
         if not stripe_customer_id:
@@ -182,6 +187,11 @@ async def create_billing_checkout_session(
             )
 
     metadata = {"merchant_id": merchant_id, "price_id": price_id}
+    # Daily idempotency bucket: rapid retries of "subscribe" return the same
+    # session; a fresh attempt the next UTC day creates a new one (Stripe
+    # checkout sessions expire after 24h anyway). Coarser than per-second
+    # so transient network retries dedupe naturally.
+    idempotency_bucket = datetime.now(timezone.utc).date().isoformat()
     session = await asyncio.to_thread(
         stripe_client.v1.checkout.sessions.create,
         {
@@ -192,7 +202,11 @@ async def create_billing_checkout_session(
             "cancel_url": cancel_url,
             "metadata": metadata,
         },
-        None,
+        {
+            "idempotency_key": (
+                f"checkout_session:{merchant_id}:{price_id}:{idempotency_bucket}"
+            ),
+        },
     )
 
     session_id = _as_text(getattr(session, "id", None) or _stripe_object_to_dict(session).get("id"))

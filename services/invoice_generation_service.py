@@ -392,6 +392,12 @@ async def generate_merchant_invoice(
                         "period_end": period_end.isoformat(),
                     },
                 },
+                # Exactly one draft invoice per (billing_run, merchant). A retry
+                # after a transient failure must hit Stripe's idempotency cache
+                # instead of creating a second draft we'd have to void.
+                options={
+                    "idempotency_key": f"invoice:{billing_run_id}:{merchant_id}",
+                },
             )
             draft_invoice_id = _stripe_id(invoice)
             if not draft_invoice_id:
@@ -399,6 +405,10 @@ async def generate_merchant_invoice(
 
             for row in rows:
                 description = _line_description(row)
+                # Exactly one invoice_item per (billing_run, gmv_rollup row).
+                # Mid-loop retries can't duplicate a previously-created line
+                # because Stripe returns the cached response on key replay.
+                rollup_id = str(_get(row, "id"))
                 item = await asyncio.to_thread(
                     stripe_client.v1.invoice_items.create,
                     params={
@@ -409,9 +419,12 @@ async def generate_merchant_invoice(
                         "description": description,
                         "metadata": {
                             "merchant_id": merchant_id,
-                            "gmv_rollup_id": str(_get(row, "id")),
+                            "gmv_rollup_id": rollup_id,
                             "billing_run_id": str(billing_run_id),
                         },
+                    },
+                    options={
+                        "idempotency_key": f"invoice_item:{billing_run_id}:{rollup_id}",
                     },
                 )
                 stripe_invoice_item_id = _stripe_id(item)
@@ -562,6 +575,7 @@ async def handle_dispute(invoice_dispute_id: int) -> None:
                     _as_text(_get(original_item, "description"))
                     or f"GMV Take Rate {_DASH} adjusted dispute {invoice_dispute_id}"
                 )
+                # Exactly one adjustment replacement per (dispute, original line).
                 replacement = await asyncio.to_thread(
                     stripe_client.v1.invoice_items.create,
                     params={
@@ -576,6 +590,11 @@ async def handle_dispute(invoice_dispute_id: int) -> None:
                             "original_billing_run_item_id": str(billing_run_item_id),
                             "billing_run_id": str(_get(original_item, "billing_run_id")),
                         },
+                    },
+                    options={
+                        "idempotency_key": (
+                            f"invoice_item_adj:{invoice_dispute_id}:{billing_run_item_id}"
+                        ),
                     },
                 )
                 replacement_item_id = _stripe_id(replacement)
