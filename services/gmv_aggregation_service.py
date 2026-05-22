@@ -16,19 +16,23 @@ PROMO_CACHE_TTL_SECONDS = 300
 _promo_cache: dict[str, tuple[datetime | None, float]] = {}
 
 
+# DATE(timestamptz) and (timestamptz)::date both read session timezone.
+# Bucketing must be UTC to match billing-period DATE columns (migrations
+# 120/121) — otherwise an order created at 23:30 UTC drifts to the next
+# calendar day under a Tokyo/Shanghai session and double-bills.
 _ROLLUP_QUERY = """
 SELECT
-    DATE(e.created_at) AS date,
+    (e.created_at AT TIME ZONE 'UTC')::date AS date,
     e.merchant_id,
     e.agent_id,
     e.channel_partner_id,
     SUM(e.gross_attributed_gmv_cents) AS gross_sum,
     SUM(COALESCE(e.refund_amount_cents, 0)) AS refund_sum
 FROM commerce_attribution_edges e
-WHERE DATE(e.created_at) = :date
+WHERE (e.created_at AT TIME ZONE 'UTC')::date = :date
   AND (CAST(:merchant_id AS TEXT) IS NULL OR e.merchant_id = CAST(:merchant_id AS TEXT))
   AND e.gross_attributed_gmv_cents IS NOT NULL
-GROUP BY DATE(e.created_at), e.merchant_id, e.agent_id, e.channel_partner_id
+GROUP BY (e.created_at AT TIME ZONE 'UTC')::date, e.merchant_id, e.agent_id, e.channel_partner_id
 """
 
 
@@ -99,12 +103,21 @@ def _as_int(value: Any) -> int:
 
 
 def _coerce_date(value: Any) -> date:
+    # Bucket in UTC to match the (created_at AT TIME ZONE 'UTC')::date used by
+    # _ROLLUP_QUERY. apply_refund() reuses this to pick the rollup day for
+    # recompute_for_date(); if they drift, the recompute targets the wrong day.
     if isinstance(value, datetime):
-        return value.date()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).date()
     if isinstance(value, date):
         return value
     if isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        return (
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            .astimezone(timezone.utc)
+            .date()
+        )
     raise ValueError(f"Cannot derive date from value {value!r}")
 
 

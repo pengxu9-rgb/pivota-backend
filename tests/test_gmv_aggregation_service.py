@@ -386,3 +386,47 @@ def test_subscription_period_helper_reads_items_data_first() -> None:
         },
     }
     assert _extract_subscription_period(mixed) == (1700000000, 1702592000)
+
+
+def test_rollup_query_uses_utc_bucketing() -> None:
+    """Regression: `DATE(timestamptz)` and `(timestamptz)::date` both read
+    session timezone. The same drift-class that drove migrations 120/121
+    (Asia/Shanghai midnight → 2026-02-28 16:00 UTC misattribution) lived on
+    in the rollup source query until codex review of PR #581 surfaced it.
+
+    Guard the explicit AT TIME ZONE 'UTC' anchor in projection, predicate,
+    and GROUP BY so future edits don't silently regress.
+    """
+    sql = service._ROLLUP_QUERY
+    assert "AT TIME ZONE 'UTC'" in sql, "rollup must bucket in UTC, not session TZ"
+    # Three anchors required: projection AS date, WHERE predicate, GROUP BY.
+    assert sql.count("AT TIME ZONE 'UTC'") >= 3, (
+        f"expected UTC anchor on projection + WHERE + GROUP BY, got {sql.count('AT TIME ZONE')}"
+    )
+    # Detect accidental revert: bare DATE(e.created_at) is the regression form.
+    assert "DATE(e.created_at)" not in sql, (
+        "bare DATE(timestamptz) is session-tz dependent; use AT TIME ZONE 'UTC'"
+    )
+
+
+def test_coerce_date_normalizes_non_utc_to_utc_day() -> None:
+    """Regression: apply_refund() derives the recompute day from edge.created_at
+    via _coerce_date. If the datetime arrives in a non-UTC tz (or naive), the
+    Python .date() call returns the wrong day relative to the rollup query's
+    UTC bucketing — leaving the rollup stale for the actual UTC day.
+
+    2026-05-22 02:30 in Asia/Tokyo (UTC+9) is 2026-05-21 17:30 UTC; the UTC
+    date is the 21st, not the 22nd.
+    """
+    tokyo = timezone(timedelta(hours=9))
+    tokyo_dt = datetime(2026, 5, 22, 2, 30, tzinfo=tokyo)
+    assert service._coerce_date(tokyo_dt) == date(2026, 5, 21)
+
+    naive_at_utc_evening = datetime(2026, 5, 21, 23, 59)
+    assert service._coerce_date(naive_at_utc_evening) == date(2026, 5, 21)
+
+    iso_z = "2026-05-22T02:30:00+09:00"
+    assert service._coerce_date(iso_z) == date(2026, 5, 21)
+
+    iso_z_utc = "2026-05-22T00:00:00Z"
+    assert service._coerce_date(iso_z_utc) == date(2026, 5, 22)
