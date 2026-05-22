@@ -402,66 +402,105 @@ async def upsert_order_attribution_edge(
     return values
 
 
+# Atomic refund attribution UPDATE that handles the multi-edge fan-out case
+# correctly. v1.3 T9 stamps every commerce_attribution_edges row sharing an
+# order_id with the same gross_attributed_gmv_cents — by design (one edge per
+# surface_click_event). The matching refund behavior is to apply the same
+# refund delta to every edge, so per-rollup-group (date, merchant, agent,
+# channel_partner) net math stays symmetric.
+#
+# Prior implementation read one edge via fetch_one, computed new totals in
+# Python, and wrote the same values to all N edges via a bulk UPDATE. Two
+# failure modes:
+#   1) If the N edges ever drifted in refund_amount_cents/refunded_amount,
+#      the read-modify-write silently flattened them to a single value.
+#   2) Two concurrent refund webhooks for the same order_id could
+#      interleave between fetch_one and execute, double-counting.
+#
+# This SQL-side version does the increment and idempotency check atomically
+# per-edge, in one statement. refund_ids is JSONB — use the JSONB `?`
+# containment operator to dedupe on refund_id.
+_ATTRIBUTE_REFUND_QUERY = """
+UPDATE commerce_attribution_edges
+SET
+  latest_refund_id = :refund_id,
+  refund_ids = CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN COALESCE(refund_ids, '[]'::jsonb)
+    ELSE COALESCE(refund_ids, '[]'::jsonb) || to_jsonb(:refund_id::text)
+  END,
+  refund_count = CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN COALESCE(refund_count, 0)
+    ELSE COALESCE(refund_count, 0) + 1
+  END,
+  refund_amount_cents = COALESCE(refund_amount_cents, 0) + CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN 0
+    ELSE :amount_cents
+  END,
+  refunded_amount = COALESCE(refunded_amount, 0) + CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? :refund_id THEN 0
+    ELSE :amount_decimal
+  END,
+  refunded_at = COALESCE(refunded_at, :now),
+  latest_refund_at = :now,
+  updated_at = :now
+WHERE order_id = :order_id
+RETURNING edge_id, merchant_id, click_id, canonical_product_id,
+          canonical_variant_id, surface, prompt_cluster, interaction_id,
+          metadata, refund_ids, refund_count, refund_amount_cents,
+          refunded_amount, refunded_at, latest_refund_at
+"""
+
+
 async def attach_refund_to_attribution_edge(
     *,
     order_id: str,
     refund_id: str,
     amount: Any,
 ) -> Optional[Dict[str, Any]]:
-    existing = await database.fetch_one(
-        select(commerce_attribution_edges).where(commerce_attribution_edges.c.order_id == order_id)
-    )
-    if not existing:
-        return None
-    row = dict(existing)
-    refund_ids = list(row.get("refund_ids") or [])
-    is_new_refund = refund_id not in refund_ids
-    if is_new_refund:
-        refund_ids.append(refund_id)
     amount_decimal = Decimal(str(amount or "0"))
-    # Mirror the decimal refunded_amount into refund_amount_cents so the T6
-    # gmv_aggregation_service rollup (which reads refund_amount_cents only)
-    # accounts for refunded GMV. Both columns dedupe on refund_id so webhook
-    # retries of the same refund don't double-count either side.
-    amount_decimal_delta = amount_decimal if is_new_refund else Decimal("0")
-    amount_cents_delta = int(amount_decimal * Decimal("100")) if is_new_refund else 0
-    refunded_amount = Decimal(str(row.get("refunded_amount") or "0")) + amount_decimal_delta
-    refund_amount_cents = int(row.get("refund_amount_cents") or 0) + amount_cents_delta
+    amount_cents = int(amount_decimal * Decimal("100"))
     now = _now()
-    values = {
-        "latest_refund_id": refund_id,
-        "refund_ids": refund_ids,
-        "refund_count": len(refund_ids),
-        "refunded_amount": refunded_amount,
-        "refund_amount_cents": refund_amount_cents,
-        "refunded_at": row.get("refunded_at") or now,
-        "latest_refund_at": now,
-        "updated_at": now,
-    }
+    rows = await database.fetch_all(
+        _ATTRIBUTE_REFUND_QUERY,
+        {
+            "order_id": order_id,
+            "refund_id": refund_id,
+            "amount_cents": amount_cents,
+            "amount_decimal": amount_decimal,
+            "now": now,
+        },
+    )
+    if not rows:
+        return None
+    # Emit the commerce event once per refund regardless of fan-out — one
+    # logical event maps to N attribution edges. Use the first edge's
+    # context for the event metadata since merchant_id is invariant across
+    # the fan-out and order_id is the same.
+    first = dict(rows[0])
     await record_commerce_event_best_effort(
         event_type="refund.succeeded",
         metadata={
-            **row.get("metadata", {}),
-            "merchant_id": row.get("merchant_id"),
-            "interaction_id": row.get("interaction_id"),
+            **(first.get("metadata") or {}),
+            "merchant_id": first.get("merchant_id"),
+            "interaction_id": first.get("interaction_id"),
             "order_id": order_id,
             "refund_id": refund_id,
-            "click_id": row.get("click_id"),
-            "canonical_product_id": row.get("canonical_product_id"),
-            "canonical_variant_id": row.get("canonical_variant_id"),
-            "surface": row.get("surface"),
-            "prompt_cluster": row.get("prompt_cluster"),
+            "click_id": first.get("click_id"),
+            "canonical_product_id": first.get("canonical_product_id"),
+            "canonical_variant_id": first.get("canonical_variant_id"),
+            "surface": first.get("surface"),
+            "prompt_cluster": first.get("prompt_cluster"),
             "refunded_amount": str(amount or "0"),
+            "edge_count": len(rows),
         },
         source="commerce_attribution_edges",
         upstream_idempotency_key=f"refund:{refund_id}",
     )
-    await database.execute(
-        commerce_attribution_edges.update()
-        .where(commerce_attribution_edges.c.order_id == order_id)
-        .values(**values)
-    )
-    return {**row, **values}
+    # Backwards-compatible return shape: callers expect a single dict.
+    # When fan-out exists, surface the first edge with an added edge_count
+    # field so callers can distinguish single-edge vs multi-edge refunds.
+    first["edge_count"] = len(rows)
+    return first
 
 
 async def trace_click_id(click_id: str) -> Dict[str, Any]:
