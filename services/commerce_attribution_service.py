@@ -415,15 +415,26 @@ async def attach_refund_to_attribution_edge(
         return None
     row = dict(existing)
     refund_ids = list(row.get("refund_ids") or [])
-    if refund_id not in refund_ids:
+    is_new_refund = refund_id not in refund_ids
+    if is_new_refund:
         refund_ids.append(refund_id)
-    refunded_amount = Decimal(str(row.get("refunded_amount") or "0")) + Decimal(str(amount or "0"))
+    amount_decimal = Decimal(str(amount or "0"))
+    # Mirror the decimal refunded_amount into refund_amount_cents so the T6
+    # gmv_aggregation_service rollup (which reads refund_amount_cents only)
+    # accounts for refunded GMV. Both columns dedupe on refund_id so webhook
+    # retries of the same refund don't double-count either side.
+    amount_decimal_delta = amount_decimal if is_new_refund else Decimal("0")
+    amount_cents_delta = int(amount_decimal * Decimal("100")) if is_new_refund else 0
+    refunded_amount = Decimal(str(row.get("refunded_amount") or "0")) + amount_decimal_delta
+    refund_amount_cents = int(row.get("refund_amount_cents") or 0) + amount_cents_delta
     now = _now()
     values = {
         "latest_refund_id": refund_id,
         "refund_ids": refund_ids,
         "refund_count": len(refund_ids),
         "refunded_amount": refunded_amount,
+        "refund_amount_cents": refund_amount_cents,
+        "refunded_at": row.get("refunded_at") or now,
         "latest_refund_at": now,
         "updated_at": now,
     }
