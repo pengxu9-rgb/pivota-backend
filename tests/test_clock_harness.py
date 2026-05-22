@@ -24,6 +24,47 @@ from services import partner_settlement_service
 from services.partner_settlement_service import PayoutMissingConnectAccountError
 
 
+# Production-safety guard. The harness deletes the Stripe Test Clock at
+# teardown but does NOT clean up the `clock_*` rows it inserts into
+# `merchants`, `user_subscriptions`, `invoices`, `billing_run_items`, and
+# `gmv_attribution_daily`. Manual runs against the prod-connected DB
+# polluted those tables — 42 rows had to be cleaned on 2026-05-22 (see
+# `docs/monetization/questions_for_cowork.md` Stage 1 post-deploy trail
+# log). Block the run before the first DB write if the resolved DATABASE_URL
+# points at the production host.
+def _looks_like_production_db(url: object) -> bool:
+    url_str = str(url or "").lower()
+    if not url_str:
+        return False
+    prod_markers = (
+        # Railway-managed Postgres for Pivota Infra production.
+        "postgres-xmr6",
+        # Public proxy hostname pattern for the same instance.
+        "nozomi.proxy.rlwy.net",
+        # Any service explicitly labelled production / live.
+        "?application_name=production",
+    )
+    return any(marker in url_str for marker in prod_markers)
+
+
+_resolved_db_url = (
+    getattr(settings, "database_url", None)
+    or os.getenv("DATABASE_URL")
+    or os.getenv("DATABASE_PUBLIC_URL")
+    or ""
+)
+if _looks_like_production_db(_resolved_db_url):
+    if os.getenv("I_KNOW_THIS_RUNS_AGAINST_PROD") != "1":
+        pytest.fail(
+            "test_clock_harness writes `clock_*` rows to the connected DB "
+            "and does NOT clean them up. The resolved DATABASE_URL points "
+            "at the production Postgres. Refusing to run. To override "
+            "(e.g. for a tightly-scoped staging mirror), set "
+            "I_KNOW_THIS_RUNS_AGAINST_PROD=1.",
+            pytrace=False,
+        )
+
+
 pytestmark = pytest.mark.asyncio
 
 stripe_client = stripe.StripeClient(api_key=settings.stripe_secret_key or "")
