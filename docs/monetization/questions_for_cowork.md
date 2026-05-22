@@ -212,3 +212,42 @@ In production, a single Stripe API hiccup during the monthly billing cron would 
 The Test Clock harness's `test_failure_modes::SDK timeout` assertion has been temporarily adjusted to match current T7 behavior (run completes, merchant has no invoice). When v1.4 lands, the test should re-assert: "merchant has a failed billing_run_item; retry endpoint produces an invoice."
 
 Not a v1.3 acceptance blocker — Markato-ready exit criteria are about the happy path. Track for v1.4 alongside the Markato term sheet.
+
+---
+
+## v1.3 Stage 0/1 trail log (2026-05-22)
+
+Three log entries from the Stage 0+1 deployment runbook handoff and the corrections round. Append-only history; not architectural questions.
+
+### Resolved: v1.3 Stage 1 prerequisite — scheduler registration
+
+Cron registration in `services/audit_scheduler.py` approved by Cowork.
+
+- **T6 GMV aggregation**: ACTIVE, daily 02:00 UTC. Wraps `services.gmv_aggregation_service.aggregate_daily(yesterday)`.
+- **T5 reservation reaper**: ACTIVE, every 5 minutes. Calls `services.metering_service.expire_stale_reservations`.
+- **T7 invoice generation**: REGISTERED PAUSED via `next_run_time=None`, monthly day 2 03:00 UTC. Wraps a no-arg call that picks the previous calendar month period. Stage 4 promotion is a scheduler-resume call, not a code-deploy cycle.
+- **T8 partner settlement**: REGISTERED PAUSED via `next_run_time=None`, monthly day 3 04:00 UTC (after T7's day 2). Stage 4 promotion = scheduler-resume.
+
+Land as a small follow-up PR (separate from the runbook docs PR #591). Rationale for paused-but-registered: Stage 4 enablement becomes operational, not a code change.
+
+### Resolved: v1.3 Stage 0 prerequisite — Stripe Live Price rotation
+
+Executed 2026-05-22. First attempt aborted at pre-flight because production `STRIPE_SECRET_KEY` was `sk_test_*` (commerce paths use merchant-scoped keys from `merchant_psps`, so the platform key being Test mode hadn't broken anything pre-v1.3). Operator rotated `STRIPE_SECRET_KEY` to `sk_live_*` on Railway production; second codex dispatch passed pre-flight.
+
+Three new Live-mode Products + Prices created (all newly-created — no pre-existing Live Products to find):
+
+| Tier | Product ID | Price ID | Amount |
+|------|-----------|----------|--------|
+| Starter | `prod_UYq0HQiNTfoaGd` | `price_1TZiKzKBoATcx2vH2N0Zpt6v` | $99/mo USD recurring |
+| Growth | `prod_UYq0X4buVWL7WV` | `price_1TZiL0KBoATcx2vHYIcGh1wI` | $299/mo USD recurring |
+| Scale | `prod_UYq1mvY2dRV93p` | `price_1TZiL1KBoATcx2vHkdc0AWxF` | $999/mo USD recurring |
+
+Railway production env vars `STRIPE_PRICE_ID_STARTER` / `_GROWTH` / `_SCALE` set to the three Live Price IDs (were previously unset — these are first-time sets on production, not Test→Live overwrites). Production redeployed automatically to deployment `11d266cc-fa9c-40bf-9128-56647335762b` on commit `73d4631`. Health check post-redeploy: 200 OK, `db_ok=true`.
+
+Test-mode Stripe Products + Prices from Step 5 (`prod_UYSms5SXfJYvUO`, `price_1TZLrOGeIEg0wZyUP6lYbUJ6` and siblings) remain active in Stripe Test mode for harness re-runs. Staging env vars on `web-staging` still point at them.
+
+Full dispatch report: `docs/monetization/codex_dispatch/outputs/stripe_live_price_rotation.md`.
+
+### Resolved: v1.3 Stage 1 monitoring correction — §A.6 duplicate detection
+
+Original `tests/test_clock_harness.py`-style assertion grouped by `order_id` alone. v1.3 allows legitimate multi-edge fan-out (one edge per `surface_click_event` — explicit in T9 acceptance criteria), so grouping by `order_id` alone flags legitimate fan-out as duplicates. Corrected query groups by `(order_id, merchant_id, agent_id, channel_partner_id)` — detects true concurrent-stamping races without false alarms on fan-out. See `docs/monetization/deploy/STAGE_1_SHADOW_MODE_ROLLOUT.md` §A.6.
