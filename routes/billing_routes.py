@@ -534,6 +534,14 @@ async def _handle_invoice_paid(event: Dict[str, Any], db: Database) -> None:
 
         merchant_id = await _resolve_invoice_merchant_id(db, invoice)
         invoice_values = _invoice_values(invoice, merchant_id=merchant_id, status_value="paid")
+        # The UPDATE only references a subset of invoice_values; the databases
+        # async wrapper around SQLAlchemy text() rejects extra bound parameters
+        # ("This text() construct doesn't define a bound parameter named X").
+        # Project only the keys the UPDATE actually binds.
+        update_params = {
+            k: invoice_values[k]
+            for k in ("total_cents", "due_date", "finalized_at", "stripe_invoice_id")
+        }
         updated = await db.fetch_one(
             """
             UPDATE invoices
@@ -545,7 +553,7 @@ async def _handle_invoice_paid(event: Dict[str, Any], db: Database) -> None:
             WHERE stripe_invoice_id = :stripe_invoice_id
             RETURNING id
             """,
-            invoice_values,
+            update_params,
         )
         if not updated:
             await _insert_minimal_invoice(db, invoice_values)
@@ -565,6 +573,13 @@ async def _handle_invoice_payment_failed(event: Dict[str, Any], db: Database) ->
 
         merchant_id = await _resolve_invoice_merchant_id(db, invoice)
         invoice_values = _invoice_values(invoice, merchant_id=merchant_id, status_value="payment_failed")
+        # See note in _handle_invoice_paid above — UPDATE references a subset
+        # of the values; project to avoid the databases-wrapper bound-param
+        # rejection.
+        update_params = {
+            k: invoice_values[k]
+            for k in ("total_cents", "due_date", "finalized_at", "stripe_invoice_id")
+        }
         updated = await db.fetch_one(
             """
             UPDATE invoices
@@ -575,7 +590,7 @@ async def _handle_invoice_payment_failed(event: Dict[str, Any], db: Database) ->
             WHERE stripe_invoice_id = :stripe_invoice_id
             RETURNING id
             """,
-            invoice_values,
+            update_params,
         )
         if not updated:
             await _insert_minimal_invoice(db, invoice_values)
