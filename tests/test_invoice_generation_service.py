@@ -57,6 +57,13 @@ class _FakeDatabase:
         self.invoices_by_id: dict[int, dict[str, Any]] = {}
         self.invoice_disputes: dict[int, dict[str, Any]] = {}
         self.completed_billing_runs: list[int] = []
+        # Tracks current status per billing_run_id. UPDATE billing_runs handler
+        # below transitions this; the new run_billing_cycle resume logic reads
+        # it via SELECT id, status FROM billing_runs WHERE id = ...
+        self.billing_run_statuses: dict[int, str] = {}
+        # Tracks the most recent error string written to billing_runs.error
+        # when transitioning to partial_failed. Useful for assertions.
+        self.billing_run_errors: dict[int, str | None] = {}
         self.executed: list[tuple[str, dict[str, Any]]] = []
         self.fetch_all_calls: list[tuple[str, dict[str, Any]]] = []
         self.fetch_one_calls: list[tuple[str, dict[str, Any]]] = []
@@ -75,10 +82,19 @@ class _FakeDatabase:
             if self.billing_run_inserted:
                 return None
             self.billing_run_inserted = True
+            self.billing_run_statuses[self.billing_run_id] = "running"
             return {"id": self.billing_run_id}
 
         if "from billing_runs" in q and "where idempotency_key" in q:
             return {"id": self.billing_run_id}
+
+        # New for PR F: resume logic queries the current status of the
+        # billing_run row to decide whether to short-circuit (completed) or
+        # resume (any other status).
+        if q.startswith("select id, status from billing_runs"):
+            run_id = int(params["billing_run_id"])
+            status = self.billing_run_statuses.get(run_id, "running")
+            return {"id": run_id, "status": status}
 
         if "from merchants m join user_subscriptions us" in q:
             customer_id = self.merchant_customers.get(params["merchant_id"])
@@ -107,6 +123,18 @@ class _FakeDatabase:
         if "from gmv_attribution_daily" in q:
             return list(self.gmv_rows_by_merchant.get(params["merchant_id"], []))
 
+        # New for PR F: resume-path query — merchants that already have an
+        # invoices row for this billing_run_id (so we don't re-bill them).
+        if q.startswith("select distinct merchant_id from invoices"):
+            run_id = int(params["billing_run_id"])
+            seen: set[str] = set()
+            for inv in self.invoices:
+                if int(inv.get("billing_run_id", -1)) == run_id:
+                    mid = inv.get("merchant_id")
+                    if mid:
+                        seen.add(str(mid))
+            return [{"merchant_id": mid} for mid in sorted(seen)]
+
         raise AssertionError(f"Unhandled fetch_all query: {query}")
 
     async def execute(self, query: str, values: dict[str, Any] | None = None):
@@ -118,7 +146,15 @@ class _FakeDatabase:
             return None
 
         if q.startswith("update billing_runs"):
-            self.completed_billing_runs.append(int(params["billing_run_id"]))
+            run_id = int(params["billing_run_id"])
+            # Tell the two transition queries apart by their SET clause.
+            if "status = 'completed'" in q:
+                self.completed_billing_runs.append(run_id)
+                self.billing_run_statuses[run_id] = "completed"
+                self.billing_run_errors[run_id] = None
+            elif "status = 'partial_failed'" in q:
+                self.billing_run_statuses[run_id] = "partial_failed"
+                self.billing_run_errors[run_id] = params.get("error")
             return None
 
         if q.startswith("insert into billing_run_items"):
@@ -409,3 +445,159 @@ async def test_generate_merchant_invoice_stripe_failure_mid_loop_logs_and_rerais
     assert "Stripe invoice generation failed" in caplog.text
     assert "stripe_invoice_id=in_1" in caplog.text
     assert "ii_1" in caplog.text
+
+
+# === PR F: partial billing-run recovery (codex finding #7) ===
+# run_billing_cycle previously marked the run 'completed' even when some
+# per-merchant invoices failed — the same idempotency_key then prevented a
+# clean retry of the failed merchants. The fix:
+#   - track per-merchant success/failure during the loop
+#   - mark 'partial_failed' if any failed (new status, migration 122)
+#   - on resume, skip merchants that already have an invoices row.
+
+
+class _MerchantFailingStripeClient(_FakeStripeClient):
+    """Variant that fails invoice.create only for a named merchant."""
+
+    def __init__(self, fail_for_merchant_id: str) -> None:
+        super().__init__()
+        self.fail_for_merchant_id = fail_for_merchant_id
+        self._orig_invoices_create = self.v1.invoices.create
+
+        def conditional_create(*args, **kwargs):
+            params = _extract_stripe_params(args, kwargs)
+            metadata = params.get("metadata") or {}
+            if metadata.get("merchant_id") == self.fail_for_merchant_id:
+                raise RuntimeError(f"stripe invoice.create failure for {self.fail_for_merchant_id}")
+            return self._orig_invoices_create(*args, **kwargs)
+
+        self.v1.invoices = SimpleNamespace(create=conditional_create)
+
+
+@pytest.mark.asyncio
+async def test_run_billing_cycle_partial_failure_marks_run_partial_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-merchant failure must surface in billing_runs.status; the previous
+    code marked everything 'completed' and the idempotency key then locked
+    the failed merchants out of retry."""
+    period_start = date(2026, 4, 1)
+    period_end = date(2026, 4, 30)
+    db = _FakeDatabase(
+        merchants_to_bill=["merch_ok", "merch_fail"],
+        merchant_customers={"merch_ok": "cus_ok", "merch_fail": "cus_fail"},
+        gmv_rows_by_merchant={
+            "merch_ok": [_gmv_row(1, amount=100, merchant_id="merch_ok")],
+            "merch_fail": [_gmv_row(2, amount=200, merchant_id="merch_fail")],
+        },
+    )
+    stripe = _MerchantFailingStripeClient(fail_for_merchant_id="merch_fail")
+    _install_fakes(monkeypatch, db, stripe)
+
+    billing_run_id = await service.run_billing_cycle(period_start, period_end)
+
+    assert billing_run_id == 101
+    # Exactly one merchant got an invoices row.
+    assert len(db.invoices) == 1
+    assert db.invoices[0]["merchant_id"] == "merch_ok"
+    # The run is NOT completed — it's partial_failed.
+    assert db.completed_billing_runs == []
+    assert db.billing_run_statuses[101] == "partial_failed"
+    # Error column carries the failing merchant id.
+    assert "merch_fail" in (db.billing_run_errors[101] or "")
+
+
+@pytest.mark.asyncio
+async def test_run_billing_cycle_resume_only_processes_missing_merchants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a partial_failed run, calling again with the same idempotency_key
+    must resume only the merchants without an invoices row, leaving the
+    already-billed ones untouched (PR E idempotency keys protect Stripe-side
+    duplicates as a belt-and-suspenders backstop)."""
+    period_start = date(2026, 4, 1)
+    period_end = date(2026, 4, 30)
+    db = _FakeDatabase(
+        merchants_to_bill=["merch_ok", "merch_fail"],
+        merchant_customers={"merch_ok": "cus_ok", "merch_fail": "cus_fail"},
+        gmv_rows_by_merchant={
+            "merch_ok": [_gmv_row(1, amount=100, merchant_id="merch_ok")],
+            "merch_fail": [_gmv_row(2, amount=200, merchant_id="merch_fail")],
+        },
+    )
+
+    # First attempt: merch_fail fails.
+    stripe = _MerchantFailingStripeClient(fail_for_merchant_id="merch_fail")
+    _install_fakes(monkeypatch, db, stripe)
+    await service.run_billing_cycle(period_start, period_end)
+
+    assert db.billing_run_statuses[101] == "partial_failed"
+    assert len(db.invoices) == 1
+    first_call_count = len(stripe.calls)
+
+    # Second attempt: now merch_fail's stripe is healthy. Install a fresh
+    # client that never fails so the resume actually completes.
+    healthy_stripe = _install_fakes(monkeypatch, db)
+    billing_run_id = await service.run_billing_cycle(period_start, period_end)
+
+    assert billing_run_id == 101
+    assert db.billing_run_statuses[101] == "completed"
+    assert len(db.invoices) == 2
+    # The healthy_stripe is a fresh client — only the missing merchant should
+    # have hit it. invoice.create called exactly once (for merch_fail).
+    invoice_create_calls = [c for c in healthy_stripe.calls if c[0] == "invoice.create"]
+    assert len(invoice_create_calls) == 1, (
+        f"resume should re-create exactly one invoice; got {invoice_create_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_billing_cycle_completed_short_circuits_on_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second call against an already-completed billing_run must not
+    re-query merchants or hit Stripe at all — that's the original
+    idempotency contract preserved by the new resume logic."""
+    period_start = date(2026, 4, 1)
+    period_end = date(2026, 4, 30)
+    db = _FakeDatabase(
+        merchants_to_bill=["merch_1"],
+        merchant_customers={"merch_1": "cus_1"},
+        gmv_rows_by_merchant={"merch_1": [_gmv_row(1, amount=125)]},
+    )
+    stripe_client = _install_fakes(monkeypatch, db)
+
+    first_id = await service.run_billing_cycle(period_start, period_end)
+    first_call_count = len(stripe_client.calls)
+    assert db.billing_run_statuses[101] == "completed"
+
+    second_id = await service.run_billing_cycle(period_start, period_end)
+
+    assert first_id == second_id == 101
+    # No new Stripe calls. No re-query of merchants.
+    assert len(stripe_client.calls) == first_call_count
+    assert db.distinct_merchant_fetches == 1
+
+
+def test_partial_failed_status_value_is_what_migration_expects() -> None:
+    """Migration 122 extends ck_billing_runs_status to include 'partial_failed'.
+    The string MUST match between the migration's CHECK constraint and the
+    service's UPDATE — a typo silently fails the DB write at runtime, and
+    the FakeDB pattern won't catch it.
+    """
+    sql = service._PARTIAL_FAILED_BILLING_RUN_QUERY
+    assert "status = 'partial_failed'" in sql, (
+        "service writes 'partial_failed' — migration 122's CHECK constraint "
+        "must include this exact string"
+    )
+
+
+def test_completed_query_clears_error_column() -> None:
+    """A successful retry must clear the partial_failed error message so
+    ops doesn't see a stale failure summary on a row that's now actually
+    done.
+    """
+    sql = service._COMPLETE_BILLING_RUN_QUERY
+    assert "error = NULL" in sql, (
+        "completed transition must clear the partial_failed error summary"
+    )
