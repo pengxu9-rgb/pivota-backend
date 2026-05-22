@@ -114,11 +114,27 @@ pg_restore --list "/tmp/pivota-prod-prev-stage0-${TS}.dump" | wc -l
 
 ## 4. Migration application order
 
-Migrations apply automatically via the startup runner in `main.py:1488–1497` (commit `e05b2db` switched to `engine.connect().execution_options(isolation_level="AUTOCOMMIT")` — required because some migrations use `CREATE INDEX CONCURRENTLY` which cannot run inside a transaction block).
+**Important correction discovered during the 2026-05-22 Stage 0 deploy: the startup migration runner is SKIPPED on production.** Production sets `SKIP_HEAVY_STARTUP_INIT=true` (or defaults to it when `RAILWAY_ENVIRONMENT=production`) so the runner at `main.py:1146–1158` short-circuits before reaching the migration loop at `main.py:1488–1497`. Migrations on the shared DB persist only because **staging deploys** (which don't set the skip flag) ran them. New v1.3 migrations require a **manual apply step** on production.
 
-Of the 22 v1.3 migration files (`100`–`121`), migrations `100`–`120` are already applied to the shared DB from staging deploys (verified by the query in §1). **Only `121_billing_runs_period_to_date.sql` runs on this Stage 0 deploy.**
+Of the 22 v1.3 migration files (`100`–`121`), migrations `100`–`120` were already on the shared DB via prior staging deploys (verified by the query in §1). **Migration 121 must be applied manually.**
 
-Verification after deploy:
+### Manual migration apply (production)
+
+**AUTHORIZATION REQUIRED.** Apply via the public Postgres proxy. Same pattern as the readiness-check codex paths:
+
+```bash
+DATABASE_PUBLIC_URL=$(railway variables --json -e production -s Postgres-xMr6 | jq -r '.DATABASE_PUBLIC_URL')
+psql "$DATABASE_PUBLIC_URL" -v ON_ERROR_STOP=on -f db/migrations/121_billing_runs_period_to_date.sql
+```
+
+Or for a single-statement migration like 121, inline:
+```sql
+ALTER TABLE billing_runs
+  ALTER COLUMN period_start TYPE DATE USING period_start::date,
+  ALTER COLUMN period_end   TYPE DATE USING period_end::date;
+```
+
+Verify post-apply:
 ```sql
 SELECT data_type FROM information_schema.columns
 WHERE table_schema='public' AND table_name='billing_runs'
@@ -128,9 +144,15 @@ WHERE table_schema='public' AND table_name='billing_runs'
 
 Expected runtime: < 2 seconds (~30 rows in `billing_runs` from prior harness runs).
 
-Full enumeration of all 22 migrations (table + columns + notes) is in **Appendix A**. Notable for ops awareness:
+### Pattern for future migrations
 
-- `109` rewrote `commerce_attribution_edges` to add the STORED generated column — was applied during a low-traffic window in staging; the shared-DB state means production has already paid this cost.
+Any new migration added in v1.3.x or v1.4+ deploys to production via the same manual psql path. Future option: add a per-migration admin route following the `routes/admin_run_migration_*` pattern that already exists for migrations 081–099 (callable via authenticated HTTP). Either path works; the startup runner does NOT.
+
+### Reference — all 22 v1.3 migrations
+
+Full enumeration (file + table + columns + notes) is in **Appendix A**. Notable for ops awareness:
+
+- `109` rewrote `commerce_attribution_edges` to add the STORED generated column — applied during a low-traffic window in staging; the shared-DB state means production has already paid this cost.
 - `119` ("expanded-scope migration") — briefing refers to this as "migration 085"; renumbered during Wave-2 dedup. It codified T7's runtime `_SCHEMA_GUARD_STATEMENTS` (see `services/invoice_generation_service.py:176–200`), which become defensive no-ops post-119. No further careful handling needed in prod because the shared DB has already run it.
 
 ## 5. Code deployment sequence
@@ -209,6 +231,20 @@ curl -sS -o /dev/null -w "%{http_code}\n" -X POST https://api.pivota.cc/api/bill
 
 # Both expected. 404 from either = deploy didn't pick up routes/billing_routes.py.
 ```
+
+### 6.2.1 v1.3 cron jobs registered
+
+```bash
+curl -sS https://api.pivota.cc/__scheduler_health | jq '.'
+```
+
+Expected: `running: true`, `job_count: 12` (or more), with v1.3 jobs:
+- `metering_expire_reservations` — `next_run_time` populated (ACTIVE)
+- `gmv_aggregation_daily` — `next_run_time` populated (ACTIVE; next 02:00 UTC)
+- `invoice_generation_monthly` — `next_run_time: null` (PAUSED)
+- `partner_settlement_monthly` — `next_run_time: null` (PAUSED)
+
+If the v1.3 jobs are missing, PR #592 didn't take — investigate scheduler init logs.
 
 ### 6.3 T9 attribution stamping wired
 
