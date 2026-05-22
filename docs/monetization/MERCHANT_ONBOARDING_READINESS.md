@@ -204,9 +204,30 @@ The right sequence mirrors the merchant journey but starts at the riskiest point
 ## 4. Open prerequisites
 
 - [ ] Connect Test account on staging for §I — TBD whether one exists
-- [ ] Synthetic Test merchant on staging — TBD whether one exists with valid API key
+- [x] Synthetic Test merchant on staging — `merch_shakeout_938623c93f73432a` provisioned 2026-05-23 across `merchant_onboarding` + `user_subscriptions` (id 21, status incomplete) + `merchants` (id 20, status approved). API key stored in `/tmp/shakeout_api_key.txt` (chmod 600).
 - [ ] `STRIPE_CLI` or similar for §B event triggering — install if needed
 - [ ] Stripe Test Dashboard access to inspect the side effects of §A, §H, §J
+- [x] Stripe Test webhook endpoint `we_1Ta1gd...` provisioned on staging subscribing to all 6 v1.3 event types
+- [x] `SKIP_HEAVY_STARTUP_INIT=true` set on staging — matches prod fast-start pattern; eliminates the 5–10 min migration-runner-vs-healthcheck race that was flapping staging 502s
+
+## 4.5. Shakeout log
+
+### 2026-05-23 — §A subscription signup: PASS (with one substantive finding)
+
+Driven via `scripts/shakeout/a_subscription_signup.py` against staging Stripe Test mode using the synthetic shakeout merchant.
+
+| Assertion | Result |
+|---|---|
+| HTTP 200 on first call | ✓ |
+| Response has `session_url` + `session_id` | ✓ |
+| Latency < 3.0s | ✗ (4.16s on staging cold-start — prod should be faster; soft fail) |
+| Replay returns same `session_id` | ✓ — **validates PR #600 idempotency key shape `checkout_session:{merchant_id}:{price_id}:{date_iso}` against real Stripe** |
+| Replay returns same `session_url` | ✓ |
+| `merchants.stripe_customer_id` populated after first call | ✓ (`cus_UZAYVJzf0JjBXj` persisted) |
+
+**Substantive finding — fixed in the same PR:** the original code at `routes/billing_routes.py:182-187` logged a WARNING when `_update_merchant_stripe_customer_id` returned False (no matching row in `merchants` table) but still returned HTTP 200 with a valid checkout URL. Outcome: a real Stripe customer gets created, the merchant's browser gets a checkout URL pointing at it, but our DB never persists the customer ID. Subsequent webhooks for that customer can't find a matching merchant. **The shakeout caught this** because the first synthetic fixture only had a `merchant_onboarding` row, not the full `merchant_onboarding` + `merchants` + `user_subscriptions` triple.
+
+Fix: upgraded the warning to a hard 500 with explicit detail. Retry replays cleanly via the idempotency key (Stripe returns the same customer; our DB now sees the missing-row condition before creating an orphan).
 
 ## 5. Pass / fail rubric for "merchant-ready"
 
