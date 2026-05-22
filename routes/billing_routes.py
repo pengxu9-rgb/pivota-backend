@@ -1183,6 +1183,19 @@ def _event_object(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _stripe_object_to_dict(value: Any) -> Any:
+    # Stripe SDK 15.x (pinned in requirements.txt) renamed `to_dict_recursive`
+    # to `to_dict()` and removed the dict-subclass shim, so the old check fell
+    # through and returned the StripeObject as-is. Downstream `.get(...)` then
+    # raised AttributeError on every real Stripe webhook (the clock harness
+    # masked this by monkeypatching construct_event to return a plain dict;
+    # surfaced 2026-05-23 by the §B webhook mirror shakeout).
+    if hasattr(value, "to_dict"):
+        result = value.to_dict()
+        # to_dict() in 15.x already returns a fully-recursive plain dict, but
+        # walk it anyway so older SDKs (with shallow to_dict) work too.
+        if isinstance(result, dict):
+            return {str(k): _stripe_object_to_dict(v) for k, v in result.items()}
+        return result
     if hasattr(value, "to_dict_recursive"):
         return value.to_dict_recursive()
     if isinstance(value, dict):
