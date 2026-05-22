@@ -57,7 +57,38 @@ ORDER BY merchant_id
 _COMPLETE_BILLING_RUN_QUERY = """
 UPDATE billing_runs
 SET status = 'completed',
-    completed_at = NOW()
+    completed_at = NOW(),
+    error = NULL
+WHERE id = :billing_run_id
+"""
+
+# Marks a run that finished its loop but had per-merchant failures. The
+# error column captures the last failure summary for ops triage. Retries
+# of the same idempotency_key resume only the failed merchants — see
+# the resume-logic in run_billing_cycle.
+_PARTIAL_FAILED_BILLING_RUN_QUERY = """
+UPDATE billing_runs
+SET status = 'partial_failed',
+    error = :error
+WHERE id = :billing_run_id
+"""
+
+# Per-merchant completion check: an `invoices` row keyed by
+# (billing_run_id, merchant_id) is written inside the same transaction
+# that records the Stripe invoice id, so its presence is the durable
+# signal that the merchant's invoice generation completed.
+_BILLED_MERCHANTS_IN_RUN_QUERY = """
+SELECT DISTINCT merchant_id
+FROM invoices
+WHERE billing_run_id = :billing_run_id
+"""
+
+# Read the current status of a billing_run we resolved via idempotency_key.
+# We need this to decide whether a retry should resume (status != completed)
+# or short-circuit (status == completed, original semantics).
+_BILLING_RUN_STATUS_QUERY = """
+SELECT id, status
+FROM billing_runs
 WHERE id = :billing_run_id
 """
 
@@ -285,7 +316,14 @@ async def _ensure_invoice_generation_schema() -> None:
 
 
 async def run_billing_cycle(period_start: date, period_end: date) -> int:
-    """Run an idempotent GMV-take billing cycle and return billing_runs.id."""
+    """Run an idempotent GMV-take billing cycle and return billing_runs.id.
+
+    Resumable: if a prior run with the same idempotency_key ended in
+    'partial_failed' or 'running'/'failed', this call resumes only the
+    merchants that don't yet have an invoices row. The per-merchant Stripe
+    idempotency_keys from PR E ensure replayed merchants don't create
+    duplicate Stripe-side state.
+    """
 
     idempotency_key = f"{period_start.isoformat()}-billing"
     row = await database.fetch_one(
@@ -297,6 +335,7 @@ async def run_billing_cycle(period_start: date, period_end: date) -> int:
         },
     )
 
+    is_resume = False
     if not row:
         existing = await database.fetch_one(
             _SELECT_BILLING_RUN_BY_KEY_QUERY,
@@ -304,9 +343,19 @@ async def run_billing_cycle(period_start: date, period_end: date) -> int:
         )
         if not existing:
             raise InvoiceGenerationError(f"Unable to resolve billing run for {idempotency_key}")
-        return int(_get(existing, "id"))
+        billing_run_id = int(_get(existing, "id"))
+        status_row = await database.fetch_one(
+            _BILLING_RUN_STATUS_QUERY, {"billing_run_id": billing_run_id}
+        )
+        status = _as_text(_get(status_row, "status")).lower()
+        if status == "completed":
+            # Already done — preserve original idempotent behavior.
+            return billing_run_id
+        # 'running' / 'partial_failed' / 'failed' → resume below.
+        is_resume = True
+    else:
+        billing_run_id = int(_get(row, "id"))
 
-    billing_run_id = int(_get(row, "id"))
     merchant_rows = await database.fetch_all(
         _DISTINCT_MERCHANTS_QUERY,
         {
@@ -314,21 +363,84 @@ async def run_billing_cycle(period_start: date, period_end: date) -> int:
             "period_end": period_end,
         },
     )
+    candidate_merchants = [
+        _as_text(_get(mr, "merchant_id"))
+        for mr in merchant_rows
+        if _as_text(_get(mr, "merchant_id"))
+    ]
 
-    for merchant_row in merchant_rows:
-        merchant_id = _as_text(_get(merchant_row, "merchant_id"))
-        if not merchant_id:
+    # On resume, skip merchants whose invoice row already exists. PR E's
+    # per-merchant Stripe idempotency_keys ensure that even if a previous
+    # attempt got partway through Stripe but failed before the local INSERT
+    # INTO invoices, a retry returns the cached Stripe invoice id rather
+    # than creating a duplicate.
+    already_billed: set[str] = set()
+    if is_resume:
+        billed_rows = await database.fetch_all(
+            _BILLED_MERCHANTS_IN_RUN_QUERY, {"billing_run_id": billing_run_id}
+        )
+        already_billed = {
+            _as_text(_get(br, "merchant_id"))
+            for br in billed_rows
+            if _as_text(_get(br, "merchant_id"))
+        }
+        if already_billed:
+            logger.info(
+                "Resuming billing_run_id=%s: skipping %d already-billed merchants",
+                billing_run_id,
+                len(already_billed),
+            )
+
+    failures: list[tuple[str, str]] = []  # (merchant_id, error message)
+    succeeded = 0
+    attempted = 0
+    for merchant_id in candidate_merchants:
+        if merchant_id in already_billed:
             continue
+        attempted += 1
         try:
-            await generate_merchant_invoice(billing_run_id, merchant_id, period_start, period_end)
-        except Exception:
+            await generate_merchant_invoice(
+                billing_run_id, merchant_id, period_start, period_end
+            )
+            succeeded += 1
+        except Exception as exc:
             logger.exception(
                 "Merchant invoice generation failed billing_run_id=%s merchant_id=%s",
                 billing_run_id,
                 merchant_id,
             )
+            failures.append((merchant_id, str(exc)[:300]))
 
-    await database.execute(_COMPLETE_BILLING_RUN_QUERY, {"billing_run_id": billing_run_id})
+    # Status transition: completed only if every eligible merchant (across
+    # this attempt + any prior attempts captured in already_billed) has an
+    # invoices row. Otherwise partial_failed so a future call resumes.
+    total_eligible = len(candidate_merchants)
+    total_billed = len(already_billed) + succeeded
+    if total_billed >= total_eligible:
+        await database.execute(
+            _COMPLETE_BILLING_RUN_QUERY, {"billing_run_id": billing_run_id}
+        )
+    else:
+        # Summarize at most 5 failed merchants in the error column; the full
+        # set is in the logs.
+        summary_pairs = failures[:5]
+        summary = "; ".join(f"{mid}: {err}" for mid, err in summary_pairs)
+        if len(failures) > 5:
+            summary += f"; (+{len(failures) - 5} more)"
+        await database.execute(
+            _PARTIAL_FAILED_BILLING_RUN_QUERY,
+            {"billing_run_id": billing_run_id, "error": summary[:2000]},
+        )
+        logger.warning(
+            "Billing run partial_failed billing_run_id=%s attempted=%d succeeded=%d "
+            "already_billed=%d failures=%d total_eligible=%d",
+            billing_run_id,
+            attempted,
+            succeeded,
+            len(already_billed),
+            len(failures),
+            total_eligible,
+        )
     return billing_run_id
 
 
