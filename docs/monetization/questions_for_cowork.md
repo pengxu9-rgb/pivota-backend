@@ -232,15 +232,21 @@ Land as a small follow-up PR (separate from the runbook docs PR #591). Rationale
 
 ### Resolved: v1.3 Stage 0 prerequisite — Stripe Live Price rotation
 
-Three new Stripe Prices created in **Live mode** for the existing Pivota tier Product objects:
+Executed 2026-05-22. First attempt aborted at pre-flight because production `STRIPE_SECRET_KEY` was `sk_test_*` (commerce paths use merchant-scoped keys from `merchant_psps`, so the platform key being Test mode hadn't broken anything pre-v1.3). Operator rotated `STRIPE_SECRET_KEY` to `sk_live_*` on Railway production; second codex dispatch passed pre-flight.
 
-- Starter: $99/mo recurring USD → new `price_...` ID
-- Growth: $299/mo recurring USD → new `price_...` ID
-- Scale: $999/mo recurring USD → new `price_...` ID
+Three new Live-mode Products + Prices created (all newly-created — no pre-existing Live Products to find):
 
-Railway env vars `STRIPE_PRICE_ID_STARTER` / `_GROWTH` / `_SCALE` rotated on production to the new Live IDs. Old Test-mode Price IDs remain in staging env vars for harness re-runs.
+| Tier | Product ID | Price ID | Amount |
+|------|-----------|----------|--------|
+| Starter | `prod_UYq0HQiNTfoaGd` | `price_1TZiKzKBoATcx2vH2N0Zpt6v` | $99/mo USD recurring |
+| Growth | `prod_UYq0X4buVWL7WV` | `price_1TZiL0KBoATcx2vHYIcGh1wI` | $299/mo USD recurring |
+| Scale | `prod_UYq1mvY2dRV93p` | `price_1TZiL1KBoATcx2vHkdc0AWxF` | $999/mo USD recurring |
 
-Verification post-rotation: `railway variables --json -e production -s web | jq '{starter: .STRIPE_PRICE_ID_STARTER, growth: .STRIPE_PRICE_ID_GROWTH, scale: .STRIPE_PRICE_ID_SCALE}'` returns three `price_...` strings matching the Live IDs recorded at creation time.
+Railway production env vars `STRIPE_PRICE_ID_STARTER` / `_GROWTH` / `_SCALE` set to the three Live Price IDs (were previously unset — these are first-time sets on production, not Test→Live overwrites). Production redeployed automatically to deployment `11d266cc-fa9c-40bf-9128-56647335762b` on commit `73d4631`. Health check post-redeploy: 200 OK, `db_ok=true`.
+
+Test-mode Stripe Products + Prices from Step 5 (`prod_UYSms5SXfJYvUO`, `price_1TZLrOGeIEg0wZyUP6lYbUJ6` and siblings) remain active in Stripe Test mode for harness re-runs. Staging env vars on `web-staging` still point at them.
+
+Full dispatch report: `docs/monetization/codex_dispatch/outputs/stripe_live_price_rotation.md`.
 
 ### Resolved: v1.3 Stage 1 monitoring correction — §A.6 duplicate detection
 
