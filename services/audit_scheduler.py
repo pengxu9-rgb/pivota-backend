@@ -204,6 +204,7 @@ async def start_scheduler() -> None:
         from services.gmv_aggregation_service import aggregate_daily
         from services.invoice_generation_service import run_billing_cycle
         from services.partner_settlement_service import run_settlement
+        from jobs.stamp_attribution_reaper_job import run_stamp_attribution_reaper_tick
         from db.database import database
 
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
@@ -259,6 +260,24 @@ async def start_scheduler() -> None:
             "interval",
             minutes=5,
             id="metering_expire_reservations",
+            replace_existing=True,
+            misfire_grace_time=60,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # T9 — stamping reaper, every 5 minutes (ACTIVE).
+        # Catches up on paid orders whose synchronous T9 stamp silently
+        # failed (psp_payment_finalizer.py:226-238 swallows stamping
+        # exceptions so payment success isn't blocked by observability
+        # hiccups). Without this, an unstamped paid edge is invisible to
+        # T6 forever. 2-minute grace + 24h window are encoded in the
+        # job's SQL query.
+        scheduler.add_job(
+            run_stamp_attribution_reaper_tick,
+            "interval",
+            minutes=5,
+            id="stamp_attribution_reaper",
             replace_existing=True,
             misfire_grace_time=60,
             coalesce=True,
@@ -326,6 +345,7 @@ async def start_scheduler() -> None:
             "+ verification_run_worker_tick (30s) "
             "+ verification_run_lease_reaper (60s) "
             "+ metering_expire_reservations (5min, ACTIVE) "
+            "+ stamp_attribution_reaper (5min, ACTIVE) "
             "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "
             "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
             "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED)"
