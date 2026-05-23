@@ -26,7 +26,7 @@ from db.merchant_onboarding import (
 from db.payment_router import register_merchant_psp_route
 from db.database import database
 from readiness.summary import build_readiness_summary
-from utils.auth import get_current_user, require_admin
+from utils.auth import ADMIN_ROLES, get_current_user, require_admin
 from urllib.parse import urlparse
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
 from fastapi.responses import StreamingResponse
@@ -705,12 +705,18 @@ async def update_kyb_status_alias(
     return {"status": "success", "merchant_id": merchant_id, "new_status": kyb_update.status}
 
 @router.post("/psp/setup", response_model=Dict[str, Any])
-async def setup_psp(psp_data: PSPSetupRequest):
+async def setup_psp(
+    psp_data: PSPSetupRequest,
+    current_user: dict = Depends(get_current_user)
+):
     """
     Step 3: Setup PSP connection and get merchant API key
     Only allowed if KYC is approved
     Now with REAL PSP credential validation!
     """
+    if current_user.get("merchant_id") != psp_data.merchant_id and current_user.get("role") not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="merchant_id does not match authenticated user")
+
     merchant = await get_merchant_onboarding(psp_data.merchant_id)
     
     if not merchant:
@@ -725,12 +731,10 @@ async def setup_psp(psp_data: PSPSetupRequest):
         )
     
     if merchant["psp_connected"]:
-        # Idempotent behavior: if already connected, return existing credentials
         return {
             "status": "success",
             "message": "PSP already connected",
             "merchant_id": merchant["merchant_id"],
-            "api_key": merchant.get("api_key"),
             "psp_type": merchant.get("psp_type"),
             "validated": True
         }
