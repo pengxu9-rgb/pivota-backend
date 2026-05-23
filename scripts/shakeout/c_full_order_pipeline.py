@@ -169,11 +169,13 @@ def step_d_create_order_and_edge(conn) -> bool:
           edge_id, merchant_id, click_id, order_id,
           surface, commerce_surface, agent_id, channel_partner_id,
           gross_attributed_gmv_cents, refund_amount_cents,
+          refund_count, refund_ids, refunded_amount,
           checkout_started_at, created_at, updated_at, metadata
         ) VALUES (
           %(edge_id)s, %(merchant_id)s, %(click_id)s, %(order_id)s,
           'shakeout_pipeline', 'shakeout_pipeline', %(agent_id)s, NULL,
           NULL, 0,
+          0, '[]'::jsonb, 0,
           NOW(), NOW(), NOW(),
           %(metadata)s::jsonb
         )
