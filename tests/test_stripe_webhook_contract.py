@@ -874,9 +874,11 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
 ) -> None:
     import db.database as database_module
     import routes.webhook_routes as webhook_routes_module
+    import services.commerce_attribution_service as attribution_module
 
     status_updates: list[Dict[str, Any]] = []
     order_events: list[Dict[str, Any]] = []
+    attribution_calls: list[Dict[str, Any]] = []
 
     event = _stripe_event(
         "charge.refunded",
@@ -922,9 +924,13 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
+    async def fake_attach_refund_to_attribution_edge(**kwargs: Any) -> None:
+        attribution_calls.append(kwargs)
+
     def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
         return event
 
+    monkeypatch.delenv("ATTRIBUTION_REVERSE_ON_REFUND", raising=False)
     monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
     monkeypatch.setattr(
         webhook_routes_module.stripe.Webhook,
@@ -934,6 +940,7 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fake_update_order_status)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fake_attach_refund_to_attribution_edge)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -954,6 +961,79 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     assert order_events[0]["event_type"] == "refund_processed_webhook"
     assert order_events[0]["metadata"]["charge_id"] == "ch_refund_contract"
     assert order_events[0]["metadata"]["refund_amount"] == 1200
+    assert attribution_calls == [
+        {
+            "order_id": "ORD_STRIPE_REFUND",
+            "refund_id": "ch_refund_contract",
+            "amount": 1200,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stripe_webhook_charge_refunded_skips_attribution_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as database_module
+    import routes.webhook_routes as webhook_routes_module
+    import services.commerce_attribution_service as attribution_module
+
+    event = _stripe_event(
+        "charge.refunded",
+        {
+            "id": "ch_refund_disabled",
+            "payment_intent": "pi_refund_disabled",
+            "amount_refunded": 500,
+            "currency": "usd",
+        },
+    )
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        assert values["payment_intent_id"] == "pi_refund_disabled"
+        return {
+            "order_id": "ORD_STRIPE_REFUND_DISABLED",
+            "merchant_id": "m_stripe",
+            "payment_intent_id": "pi_refund_disabled",
+            "total": "20.00",
+            "total_refunded": "0.00",
+            "currency": "USD",
+            "metadata": {},
+        }
+
+    async def fake_update_order_status(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def fake_log_order_event(**kwargs: Any) -> None:
+        return None
+
+    async def fail_attach_refund_to_attribution_edge(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("refund attribution should be disabled")
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
+        return event
+
+    monkeypatch.setenv("ATTRIBUTION_REVERSE_ON_REFUND", "false")
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+    monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(webhook_routes_module, "update_order_status", fake_update_order_status)
+    monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fail_attach_refund_to_attribution_edge)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe",
+            content=b'{"id":"evt_refund_disabled"}',
+            headers={"stripe-signature": "sig_refund_disabled"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "event": "charge.refunded"}
 
 
 @pytest.mark.asyncio
@@ -1459,9 +1539,12 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
     import routes.webhook_routes as webhook_routes_module
     import services.dispute_records_service as dispute_records_module
     import services.pcs_evidence_pack_service as pcs_module
+    import services.commerce_attribution_service as attribution_module
 
     dispute_upserts: list[Dict[str, Any]] = []
     evidence_pack_calls: list[Dict[str, Any]] = []
+    attribution_calls: list[Dict[str, Any]] = []
+    order_events: list[Dict[str, Any]] = []
 
     event = _stripe_event(
         "charge.dispute.created",
@@ -1469,6 +1552,7 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
             "id": "dp_contract_1",
             "status": "needs_response",
             "charge": "ch_dispute_1",
+            "amount": 1500,
             "metadata": {
                 "merchant_id": "m_stripe",
                 "order_id": "ORD_STRIPE_DISPUTE",
@@ -1482,12 +1566,19 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
     async def fake_create_dispute_evidence_pack(**kwargs: Any) -> None:
         evidence_pack_calls.append(kwargs)
 
+    async def fake_attach_refund_to_attribution_edge(**kwargs: Any) -> None:
+        attribution_calls.append(kwargs)
+
+    async def fake_log_order_event(**kwargs: Any) -> None:
+        order_events.append(kwargs)
+
     async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("dispute webhook should not mutate order payment state")
 
     def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
         return event
 
+    monkeypatch.delenv("ATTRIBUTION_REVERSE_ON_CHARGEBACK", raising=False)
     monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
     monkeypatch.setattr(
         webhook_routes_module.stripe.Webhook,
@@ -1500,9 +1591,10 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
         fake_upsert_stripe_dispute_record_best_effort,
     )
     monkeypatch.setattr(pcs_module, "create_dispute_evidence_pack", fake_create_dispute_evidence_pack)
+    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fake_attach_refund_to_attribution_edge)
     monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fail_if_called)
-    monkeypatch.setattr(webhook_routes_module, "log_order_event", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1527,6 +1619,7 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
                 "id": "dp_contract_1",
                 "status": "needs_response",
                 "charge": "ch_dispute_1",
+                "amount": 1500,
                 "metadata": {
                     "merchant_id": "m_stripe",
                     "order_id": "ORD_STRIPE_DISPUTE",
@@ -1538,6 +1631,93 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
             "triggered_by": "stripe_webhook:charge.dispute.created",
         }
     ]
+    assert attribution_calls == [
+        {
+            "order_id": "ORD_STRIPE_DISPUTE",
+            "refund_id": "dp_contract_1",
+            "amount": 1500,
+        }
+    ]
+    assert order_events == [
+        {
+            "event_type": "chargeback_received",
+            "order_id": "ORD_STRIPE_DISPUTE",
+            "merchant_id": "m_stripe",
+            "metadata": {"dispute_id": "dp_contract_1", "amount": 1500},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stripe_webhook_dispute_order_status_flag_is_noop_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.webhook_routes as webhook_routes_module
+    import services.dispute_records_service as dispute_records_module
+    import services.pcs_evidence_pack_service as pcs_module
+
+    info_logs: list[Any] = []
+
+    event = _stripe_event(
+        "charge.dispute.created",
+        {
+            "id": "dp_contract_flag",
+            "status": "needs_response",
+            "charge": "ch_dispute_flag",
+            "metadata": {
+                "merchant_id": "m_stripe",
+                "order_id": "ORD_STRIPE_DISPUTE_FLAG",
+            },
+        },
+    )
+
+    async def fake_upsert_stripe_dispute_record_best_effort(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def fake_create_dispute_evidence_pack(**kwargs: Any) -> None:
+        return None
+
+    async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("chargeback order status reversal is a v1 dogfood no-op")
+
+    def fake_logger_info(message: Any, *args: Any, **kwargs: Any) -> None:
+        info_logs.append(message)
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
+        return event
+
+    monkeypatch.setenv("CHARGEBACK_REVERSE_ORDER_STATUS", "true")
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+    monkeypatch.setattr(
+        dispute_records_module,
+        "upsert_stripe_dispute_record_best_effort",
+        fake_upsert_stripe_dispute_record_best_effort,
+    )
+    monkeypatch.setattr(pcs_module, "create_dispute_evidence_pack", fake_create_dispute_evidence_pack)
+    monkeypatch.setattr(webhook_routes_module, "update_order_status", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module.logger, "info", fake_logger_info)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe",
+            content=b'{"id":"evt_dispute_flag"}',
+            headers={"stripe-signature": "sig_dispute_flag"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "event": "charge.dispute.created"}
+    assert {
+        "event": "stripe_chargeback_order_status_reversal_skipped",
+        "order_id": "ORD_STRIPE_DISPUTE_FLAG",
+        "dispute_id": "dp_contract_flag",
+        "reason": "not_implemented_for_v1_dogfood",
+    } in info_logs
 
 
 @pytest.mark.asyncio
