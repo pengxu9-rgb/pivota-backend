@@ -52,3 +52,13 @@ def test_agent_order_events_route_precedes_dynamic_order_route():
     assert matches, "GET /agent/v1/orders/events should match a registered route"
     endpoint = getattr(matches[0], "endpoint", None)
     assert getattr(endpoint, "__name__", None) == "agent_list_order_events"
+
+
+def test_merchant_payout_routes_are_not_mounted():
+    payout_routes = [
+        getattr(route, "path", "")
+        for route in app.routes
+        if str(getattr(route, "path", "")).startswith("/merchant/payouts")
+    ]
+
+    assert payout_routes == []

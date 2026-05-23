@@ -112,7 +112,6 @@ from routes.merchant_analytics_routes import router as merchant_analytics_router
 from routes.pivot_routes import router as pivot_router
 from routes.catalog_routes import router as catalog_router
 from routes.merchant_api_extensions import router as merchant_api_extensions_router
-from routes.payout_routes import router as payout_router
 from routes.direct_db_check import router as direct_db_check_router
 from routes.cleanup_test_data import router as cleanup_test_data_router
 from routes.manage_integrations import router as manage_integrations_router
@@ -892,7 +891,6 @@ app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
 app.include_router(pivot_router)  # Pivot catalog query and quote APIs
 app.include_router(catalog_router)  # Catalog sync and webhook ingest APIs
 app.include_router(merchant_api_extensions_router)  # Extended merchant API features
-app.include_router(payout_router)  # Payout management
 app.include_router(direct_db_check_router)  # Direct DB check
 app.include_router(cleanup_test_data_router)  # Cleanup test data
 app.include_router(manage_integrations_router)  # Manage integrations (delete/update)
