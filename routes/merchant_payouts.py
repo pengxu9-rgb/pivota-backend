@@ -3,12 +3,14 @@ Merchant Payout Management Routes
 Handles commission payout operations for merchants
 """
 
+import os
+
 from fastapi import APIRouter, Depends, Query, Path, HTTPException
 from typing import Optional, List, Dict, Any
-from datetime import date, timedelta, datetime
+from datetime import date, datetime
 from db.database import database
 from db.payout_repo import PayoutRepo
-from utils.auth import ADMIN_ROLES, get_current_user
+from utils.auth import get_current_user
 import logging
 
 logger = logging.getLogger(__name__)
@@ -95,150 +97,23 @@ async def _fetch_unpaid_commission_entries(
 # ============================================================================
 
 @router.get("/pending-commissions")
-async def get_pending_commissions(
-    merchant_id: str,
-    days: int = Query(30, ge=1, le=365, description="Period to check (days)"),
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    Get summary of unpaid commissions grouped by agent
-    This shows what commission is owed but hasn't been converted to payouts yet
-    """
-    if current_user.get("merchant_id") != merchant_id and current_user.get("role") not in ADMIN_ROLES:
-        raise HTTPException(status_code=403, detail="cannot access another merchant's payouts")
-
-    try:
-        period_end = datetime.now()
-        period_start = period_end - timedelta(days=days)
-
-        aggregated = await _fetch_unpaid_commission_entries(
-            merchant_id=merchant_id,
-            period_start=period_start,
-            period_end=period_end
-        )
-
-        if not aggregated:
-            return {
-                "status": "success",
-                "summary": {
-                    "total_amount": 0,
-                    "total_transactions": 0,
-                    "unique_agents": 0,
-                    "period_days": days
-                },
-                "agents": []
-            }
-
-        agents = []
-        total_amount = 0.0
-        total_transactions = 0
-
-        for agent_data in aggregated.values():
-            total_amount += agent_data["total_commission"]
-            total_transactions += agent_data["transaction_count"]
-            agents.append({
-                "agent_id": agent_data["agent_id"],
-                "transaction_count": agent_data["transaction_count"],
-                "total_commission": agent_data["total_commission"],
-                "currency": agent_data["currency"],
-                "earliest_transaction": agent_data["earliest"].isoformat() if agent_data["earliest"] else None,
-                "latest_transaction": agent_data["latest"].isoformat() if agent_data["latest"] else None
-            })
-
-        agents.sort(key=lambda item: item["total_commission"], reverse=True)
-
-        return {
-            "status": "success",
-            "summary": {
-                "total_amount": total_amount,
-                "total_transactions": total_transactions,
-                "unique_agents": len(aggregated),
-                "period_days": days
-            },
-            "agents": agents
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to get pending commissions: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get pending commissions: {str(e)}")
+async def get_pending_commissions_gone(merchant_id: str):
+    if os.getenv("LEGACY_SETTLEMENT_LIVE", "").strip().lower() == "true":
+        raise HTTPException(status_code=503, detail="legacy bypass requested but legacy handlers are removed")
+    raise HTTPException(status_code=410, detail={
+        "status": "gone",
+        "message": "legacy commission endpoints retired; use Stage-1 monetization endpoints",
+    })
 
 
 @router.post("/generate-from-commissions")
-async def generate_payouts_from_commissions(
-    merchant_id: str,
-    days: int = Query(30, ge=1, le=365, description="Period to include (days)"),
-    agent_ids: Optional[List[str]] = None,  # If None, generate for all agents
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    Generate payouts from unpaid commissions
-    Creates payout records and links them to the source commissions
-    """
-    if current_user.get("merchant_id") != merchant_id and current_user.get("role") not in ADMIN_ROLES:
-        raise HTTPException(status_code=403, detail="cannot access another merchant's payouts")
-
-    try:
-        # Calculate period
-        period_end = datetime.now()
-        period_start = period_end - timedelta(days=days)
-        
-        aggregated = await _fetch_unpaid_commission_entries(
-            merchant_id=merchant_id,
-            period_start=period_start,
-            period_end=period_end,
-            agent_ids=agent_ids
-        )
-        
-        if not aggregated:
-            return {
-                "status": "success",
-                "message": "No unpaid commissions found for the selected period",
-                "payouts_created": 0
-            }
-        
-        # Create payouts per agent
-        repo = PayoutRepo()
-        created_ids: List[int] = []
-        
-        for agent_id, agent_data in aggregated.items():
-            payout_data = {
-                "agent_id": agent_id,
-                "amount": float(agent_data["total_commission"]),
-                "currency": agent_data["currency"],
-                "period_start": period_start,
-                "period_end": period_end
-            }
-            payout_ids = await repo.create_bulk(merchant_id, [payout_data])
-            if not payout_ids:
-                continue
-            created_ids.extend(payout_ids)
-            payout_id = payout_ids[0]
-            
-            # Link each commission entry to the newly created payout
-            for entry in agent_data["entries"]:
-                await database.execute(
-                    """
-                    INSERT INTO agent_payout_links (payout_id, revenue_id, amount)
-                    VALUES (:payout_id, :revenue_id, :amount)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    {
-                        "payout_id": payout_id,
-                        "revenue_id": entry["id"],
-                        "amount": entry["amount"]
-                    }
-                )
-        
-        return {
-            "status": "success",
-            "message": f"Created {len(created_ids)} payouts",
-            "payouts_created": len(created_ids),
-            "payout_ids": created_ids
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to generate payouts: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate payouts: {str(e)}")
+async def generate_payouts_from_commissions_gone(merchant_id: str):
+    if os.getenv("LEGACY_SETTLEMENT_LIVE", "").strip().lower() == "true":
+        raise HTTPException(status_code=503, detail="legacy bypass requested but legacy handlers are removed")
+    raise HTTPException(status_code=410, detail={
+        "status": "gone",
+        "message": "legacy commission endpoints retired; use Stage-1 monetization endpoints",
+    })
 
 
 # ============================================================================
