@@ -802,6 +802,7 @@ async def ingest_standard_products(
             readiness_tier = _readiness_tier_for_product(product)
             canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
             brand = str(product.vendor or metadata.get("brand") or "").strip() or None
+            content_key = make_content_key(brand, product.title, product.barcode)
             # Pivota canonical PDP fields (sig_id + agent.pivota.cc URL)
             # — every onboarded merchant product gets one. Deterministic
             # so re-syncs are idempotent.
@@ -934,7 +935,7 @@ async def ingest_standard_products(
                     # across merchants/paths gets the same content_key,
                     # which Stage 2 uses to auto-group product_group_members.
                     # See services/catalog_identity.py + plan.
-                    "content_key": make_content_key(brand, product.title, product.barcode),
+                    "content_key": content_key,
                     # Stage 2a (mig 084): mark this row as freshly seen
                     # in a Path A sync. The nightly sweep
                     # (scripts/sweep_stale_catalog_products.py) compares
@@ -1273,6 +1274,22 @@ async def ingest_standard_products(
                     [beauty_compatibility_rules.c.product_key == product_key],
                     beauty_compat_rows,
                 )
+
+        if content_key:
+            try:
+                from services.index_pipeline_state_service import recompute_serving_eligibility
+
+                await recompute_serving_eligibility(
+                    content_key,
+                    reason="catalog_sync",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning({
+                    "event": "serving_eligibility_hook_failed",
+                    "site": "ingest_standard_products",
+                    "content_key": content_key,
+                    "error": str(exc),
+                })
 
     if job_id:
         await _upsert_by_pk(

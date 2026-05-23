@@ -230,6 +230,21 @@ async def _refresh_view_for_content_key(content_key: str) -> None:
             AGENT_PDP_VIEW_UPSERT_SQL,
             agent_pdp_view_row_to_upsert_params(row),
         )
+        if content_key:
+            try:
+                from services.index_pipeline_state_service import recompute_serving_eligibility
+
+                await recompute_serving_eligibility(
+                    content_key,
+                    reason="agent_pdp_view_refresh",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning({
+                    "event": "serving_eligibility_hook_failed",
+                    "site": "_refresh_view_for_content_key",
+                    "content_key": content_key,
+                    "error": str(exc),
+                })
         logger.info(
             "fashion_authoring.view_refreshed content_key=%s", content_key,
         )
