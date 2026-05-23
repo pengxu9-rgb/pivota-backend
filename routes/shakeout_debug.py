@@ -40,13 +40,25 @@ _SHAKEOUT_MERCHANT_PREFIX = "merch_shakeout_"
 def _require_non_prod() -> None:
     env = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower()
     if env == "production":
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "shakeout debug endpoints are disabled in production "
-                "(RAILWAY_ENVIRONMENT=production)"
-            ),
-        )
+        # Bypass for one-off prod shakeouts: requires explicit env var
+        # `ALLOW_SHAKEOUT_ON_PROD=true` set on the service. Token auth
+        # (_require_shakeout_token) + merchant-prefix gate
+        # (_require_shakeout_merchant) still apply, so the bypass alone
+        # doesn't open anything to public traffic. Operator pattern:
+        # set the env var, run the shakeout, unset it. Surfaced
+        # 2026-05-23 when staging's DATABASE_URL via public proxy was
+        # unreliable enough to block §D-H E2E validation and prod was
+        # the only stable surface left.
+        if (os.getenv("ALLOW_SHAKEOUT_ON_PROD") or "").lower() not in ("1", "true", "yes"):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "shakeout debug endpoints are disabled in production "
+                    "(RAILWAY_ENVIRONMENT=production). Set "
+                    "ALLOW_SHAKEOUT_ON_PROD=true to enable for a "
+                    "specific shakeout window."
+                ),
+            )
 
 
 def _require_shakeout_token(x_shakeout_token: Optional[str] = Header(None)) -> None:
