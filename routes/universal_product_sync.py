@@ -1,6 +1,6 @@
 """Universal Product Sync - Works for all platforms"""
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, status
 from typing import Optional, Dict, Any
 from pydantic import BaseModel
 from utils.auth import get_current_user
@@ -40,6 +40,8 @@ class UniversalSyncResponse(BaseModel):
     merchant_id: str
     platform: str
     products_synced: int
+    catalog_synced: int = 0
+    error: Optional[str] = None
     sync_time: str
     demo_mode: bool = False
 
@@ -47,7 +49,8 @@ class UniversalSyncResponse(BaseModel):
 async def universal_product_sync(
     request: UniversalSyncRequest,
     background_tasks: BackgroundTasks,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    response: Response = None,
 ):
     """
     Universal product sync endpoint that intelligently handles all platforms.
@@ -212,16 +215,21 @@ async def universal_product_sync(
                 f"merchant={request.merchant_id}, platform={platform}: {cleanup_error}"
             )
 
+        catalog_synced = 0
+        catalog_error_message = None
         if catalog_payloads:
             try:
-                await ingest_standard_products(
+                catalog_result = await ingest_standard_products(
                     merchant_id=request.merchant_id,
                     platform=platform,
                     product_payloads=catalog_payloads,
                     source_system="universal_product_sync",
                     source_ref=f"universal_product_sync:{request.merchant_id}:{platform}",
                 )
+                if isinstance(catalog_result, dict):
+                    catalog_synced = int(catalog_result.get("products_ingested") or 0)
             except Exception as catalog_error:
+                catalog_error_message = str(catalog_error)
                 logger.error(
                     "Failed canonical catalog ingest after universal sync merchant=%s platform=%s err=%s",
                     request.merchant_id,
@@ -231,6 +239,23 @@ async def universal_product_sync(
 
         # 6. Update store sync status
         await update_sync_status(store_info.get("store_id"), synced_count)
+
+        if catalog_error_message:
+            if response is not None:
+                response.status_code = status.HTTP_207_MULTI_STATUS
+            return UniversalSyncResponse(
+                status="partial_failure",
+                message=(
+                    f"Synced {synced_count} products from {platform.title()}, "
+                    "but canonical catalog ingest failed"
+                ),
+                merchant_id=request.merchant_id,
+                platform=platform,
+                products_synced=synced_count,
+                catalog_synced=0,
+                error=catalog_error_message,
+                sync_time=datetime.now().isoformat()
+            )
         
         return UniversalSyncResponse(
             status="success",
@@ -238,6 +263,7 @@ async def universal_product_sync(
             merchant_id=request.merchant_id,
             platform=platform,
             products_synced=synced_count,
+            catalog_synced=catalog_synced,
             sync_time=datetime.now().isoformat()
         )
         

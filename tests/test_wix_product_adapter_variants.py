@@ -1,3 +1,4 @@
+from adapters import product_adapters
 from adapters.product_adapters import WixProductAdapter
 
 
@@ -103,6 +104,16 @@ def _dummy_wix_products_query_response() -> dict:
     }
 
 
+def _wix_product(product_id: int) -> dict:
+    return {
+        "id": f"prod_{product_id}",
+        "name": f"Product {product_id}",
+        "visible": True,
+        "priceData": {"price": 10.0, "currency": "USD"},
+        "stock": {"quantity": 5, "inStock": True, "trackQuantity": True},
+    }
+
+
 def _dummy_httpx_response(payload: dict):
     class DummyResponse:
         status_code = 200
@@ -110,6 +121,18 @@ def _dummy_httpx_response(payload: dict):
 
         def json(self):
             return payload
+
+    return DummyResponse()
+
+
+def _dummy_httpx_status_response(status_code: int, text: str):
+    class DummyResponse:
+        def __init__(self):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {}
 
     return DummyResponse()
 
@@ -130,6 +153,28 @@ def _dummy_httpx_client_factory(captured: dict, response_payload: dict):
             captured["json"] = json
             captured["headers"] = headers
             return _dummy_httpx_response(response_payload)
+
+    return DummyAsyncClient
+
+
+def _paginated_httpx_client_factory(captured: dict, responses: list):
+    class DummyAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self._index = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            captured.setdefault("requests", []).append(
+                {"url": url, "json": json, "headers": headers}
+            )
+            response = responses[self._index]
+            self._index += 1
+            return response
 
     return DummyAsyncClient
 
@@ -158,6 +203,141 @@ async def test_wix_fetch_products_includes_variants(monkeypatch):
     assert len(products[0].variants) == 1
     assert captured["url"].endswith("/stores-reader/v1/products/query")
     assert captured["json"]["includeVariants"] is True
+    assert captured["json"]["query"]["paging"]["offset"] == 0
+
+
+async def test_wix_fetch_products_pages_until_last_page(monkeypatch):
+    import httpx
+
+    captured = {}
+    responses = [
+        _dummy_httpx_response(
+            {"products": [_wix_product(i) for i in range(100)], "totalResults": 150}
+        ),
+        _dummy_httpx_response(
+            {"products": [_wix_product(i) for i in range(100, 150)], "totalResults": 150}
+        ),
+    ]
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _paginated_httpx_client_factory(captured, responses),
+    )
+
+    products, next_token, err = await WixProductAdapter.fetch_products(
+        site_id="site_1",
+        api_key="api_key_1",
+        merchant_id="merch_test",
+        limit=100,
+        page_token=None,
+    )
+
+    assert err is None
+    assert next_token is None
+    assert len(products) == 150
+    assert [req["json"]["query"]["paging"]["offset"] for req in captured["requests"]] == [
+        0,
+        100,
+    ]
+
+
+async def test_wix_fetch_products_stops_at_max_products_and_flags_truncation(monkeypatch):
+    import httpx
+
+    captured = {}
+    monkeypatch.setattr(product_adapters, "WIX_MAX_PRODUCTS", 200)
+    responses = [
+        _dummy_httpx_response(
+            {"products": [_wix_product(i) for i in range(100)], "totalResults": 250}
+        ),
+        _dummy_httpx_response(
+            {"products": [_wix_product(i) for i in range(100, 200)], "totalResults": 250}
+        ),
+    ]
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _paginated_httpx_client_factory(captured, responses),
+    )
+
+    products, next_token, err = await WixProductAdapter.fetch_products(
+        site_id="site_1",
+        api_key="api_key_1",
+        merchant_id="merch_test",
+        limit=100,
+        page_token=None,
+    )
+
+    assert err is None
+    assert next_token == "200"
+    assert len(products) == 200
+    assert [req["json"]["query"]["paging"]["offset"] for req in captured["requests"]] == [
+        0,
+        100,
+    ]
+
+
+async def test_wix_fetch_products_returns_partial_results_on_mid_page_error(monkeypatch):
+    import httpx
+
+    captured = {}
+    responses = [
+        _dummy_httpx_response(
+            {"products": [_wix_product(i) for i in range(100)], "totalResults": 150}
+        ),
+        _dummy_httpx_status_response(500, "upstream error"),
+    ]
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _paginated_httpx_client_factory(captured, responses),
+    )
+
+    products, next_token, err = await WixProductAdapter.fetch_products(
+        site_id="site_1",
+        api_key="api_key_1",
+        merchant_id="merch_test",
+        limit=100,
+        page_token=None,
+    )
+
+    assert len(products) == 100
+    assert next_token is None
+    assert "Wix API error: 500" in err
+    assert [req["json"]["query"]["paging"]["offset"] for req in captured["requests"]] == [
+        0,
+        100,
+    ]
+
+
+async def test_wix_max_pages_one_reverts_to_single_page(monkeypatch):
+    import httpx
+
+    captured = {}
+    monkeypatch.setenv("WIX_MAX_PAGES", "1")
+    responses = [
+        _dummy_httpx_response(
+            {"products": [_wix_product(i) for i in range(100)], "totalResults": 150}
+        ),
+    ]
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _paginated_httpx_client_factory(captured, responses),
+    )
+
+    products, next_token, err = await WixProductAdapter.fetch_products(
+        site_id="site_1",
+        api_key="api_key_1",
+        merchant_id="merch_test",
+        limit=100,
+        page_token=None,
+    )
+
+    assert err is None
+    assert next_token is None
+    assert len(products) == 100
+    assert len(captured["requests"]) == 1
 
 
 def test_wix_convert_product_emits_explicit_empty_tags():
