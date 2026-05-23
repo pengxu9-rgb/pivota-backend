@@ -606,6 +606,7 @@ async def _resolve_catalog_sku_key(
         select(catalog_skus.c.sku_key)
         .where(catalog_skus.c.merchant_id == merchant_id)
         .where(catalog_skus.c.platform == platform)
+        .where(catalog_skus.c.product_key == product_key)
         .where(catalog_skus.c.source_variant_id == source_variant_id)
         .limit(1)
     )
@@ -1006,7 +1007,11 @@ async def ingest_standard_products(
             ingredient_row_upserts = 0
 
             for variant in variants:
-                source_variant_id = str(variant.variant_id or variant.id or "default")
+                source_variant_id = str(
+                    variant.variant_id
+                    or variant.id
+                    or product_key  # no variant id: collide only within this product
+                )
                 sku_key = await _resolve_catalog_sku_key(
                     merchant_id=merchant_id,
                     platform=platform,

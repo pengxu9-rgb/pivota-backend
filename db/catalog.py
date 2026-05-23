@@ -192,9 +192,10 @@ catalog_skus = Table(
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_catalog_skus_product_key", "product_key"),
     Index(
-        "idx_catalog_skus_source_identity",
+        "idx_catalog_skus_source_identity_v2",
         "merchant_id",
         "platform",
+        "product_key",
         "source_variant_id",
         unique=True,
     ),
