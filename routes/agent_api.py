@@ -8925,21 +8925,12 @@ async def agent_confirm_payment(
         except Exception as e:
             logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
 
-        # [Phase 6.2] 自动触发 commission 计算
-        if order.get("agent_id"):
-
-            async def trigger_commission():
-                try:
-                    from services.order_commission_service import OrderCommissionService
-                    from db.database import database
-
-                    service = OrderCommissionService(database)
-                    await service.calculate_commission_for_order(order_id)
-                    logger.info(f"✅ Commission auto-calculated for order {order_id}")
-                except Exception as e:
-                    logger.error(f"Commission auto-calculation failed for {order_id}: {e}")
-
-            background_tasks.add_task(trigger_commission)
+        # Legacy Phase 5.5/6 merchant→agent commission dispatch was removed
+        # 2026-05-23. See docs/monetization/LEGACY_COMMISSION_SYSTEM_AUDIT.md.
+        # v1.3 attribution + T9 stamping fire from
+        # services.psp_payment_finalizer.finalize_payment_success on every
+        # paid order (including agent-confirmed ones); no second dispatch
+        # needed here.
 
         # 记录支付成功事件（best-effort; do not fail confirm if event logging hits DB busy）
         try:

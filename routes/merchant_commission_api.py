@@ -1,148 +1,79 @@
 """
-[Phase 5.5] Merchant Commission API
-Endpoints for merchants to manage commission offers
+Merchant Commission API.
+
+DEPRECATED 2026-05-23. Phase 5.5 / Phase 6 introduced this API so merchants
+could set per-agent-type commission rates and Pivota would dispatch
+payouts. v1.3 monetization replaced it: merchants pay Pivota a take rate;
+Pivota allocates partner shares via T8 Connect transfers. The
+`merchant_commission_offers` table is no longer consulted by the runtime.
+
+All endpoints return HTTP 410 Gone. The merchant-portal frontend at
+merchant.pivota.cc/dashboard/commission should be hidden in
+pivota-merchants-portal — that change is out of scope for this repo.
+
+See docs/monetization/LEGACY_COMMISSION_SYSTEM_AUDIT.md for the
+disposition rationale (codex industry research + Cowork decision).
+
+Original implementation removed from this file; recoverable via git log
+if needed.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Path
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from datetime import datetime
-from decimal import Decimal
+from fastapi import APIRouter, Depends, HTTPException, Path
+from typing import Any, Dict
 
-from db.database import database
 from utils.auth import get_current_user
 
 router = APIRouter(
     prefix="/merchants/{merchant_id}/commission",
-    tags=["[Phase 5.5] Merchant Commission"]
+    tags=["[Deprecated] Merchant Commission"],
 )
 
 
-class CommissionOfferRequest(BaseModel):
-    agent_type: Optional[str] = Field(None, description="Agent type (premium/standard/basic) or NULL for all")
-    offered_commission_rate: float = Field(..., ge=0, le=1, description="Commission rate (0.0-1.0)")
-    min_order_amount: float = Field(default=0, description="Minimum order amount")
-    max_order_amount: Optional[float] = Field(None, description="Maximum order amount")
-    currency: str = Field(default="USD")
-    valid_from: Optional[datetime] = None
-    valid_until: Optional[datetime] = None
-    notes: Optional[str] = None
+_DEPRECATION_DETAIL = (
+    "Merchant→agent direct commission was deprecated 2026-05-23. v1.3 "
+    "monetization is the sole post-payment economic model: Pivota charges "
+    "the merchant a take rate via T7 monthly Stripe Invoice and allocates "
+    "partner shares via T8 Connect transfers. See "
+    "docs/monetization/LEGACY_COMMISSION_SYSTEM_AUDIT.md for details."
+)
+
+
+def _check_merchant_self(merchant_id: str, current_user: Dict[str, Any]) -> None:
+    # Preserve the original auth shape so any caller hitting the route in a
+    # transition window gets the expected 403 before the 410.
+    if current_user.get("merchant_id") != merchant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Cannot manage other merchant's commission",
+        )
 
 
 @router.post("/offers")
 async def create_commission_offer(
     merchant_id: str = Path(...),
-    request: CommissionOfferRequest = ...,
-    current_user: dict = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """[Phase 5.5] Create commission offer"""
-    
-    # [Phase 6] Auth check - merchant can only manage their own commission
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Cannot manage other merchant's commission")
-    
-    try:
-        await database.execute(
-            """
-            INSERT INTO merchant_commission_offers (
-                merchant_id, agent_type, offered_commission_rate,
-                min_order_amount, max_order_amount, currency,
-                valid_from, valid_until, created_by, notes
-            ) VALUES (
-                :merchant_id, :agent_type, :rate,
-                :min_amount, :max_amount, :currency,
-                :valid_from, :valid_until, :created_by, :notes
-            )
-            """,
-            {
-                "merchant_id": merchant_id,
-                "agent_type": request.agent_type,
-                "rate": request.offered_commission_rate,
-                "min_amount": request.min_order_amount,
-                "max_amount": request.max_order_amount,
-                "currency": request.currency,
-                "valid_from": request.valid_from,
-                "valid_until": request.valid_until,
-                "created_by": current_user.get("email"),
-                "notes": request.notes
-            }
-        )
-        
-        return {"status": "success", "message": "Commission offer created"}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED — see module docstring. Returns 410 Gone."""
+    _check_merchant_self(merchant_id, current_user)
+    raise HTTPException(status_code=410, detail=_DEPRECATION_DETAIL)
 
 
 @router.get("/offers")
 async def get_commission_offers(
     merchant_id: str = Path(...),
-    current_user: dict = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """[Phase 5.5] Get all commission offers"""
-    
-    # [Phase 6] Auth check 
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Cannot access other merchant's commission")
-    
-    try:
-        offers = await database.fetch_all(
-            "SELECT * FROM merchant_commission_offers WHERE merchant_id = :merchant_id ORDER BY created_at DESC",
-            {"merchant_id": merchant_id}
-        )
-        
-        return {
-            "merchant_id": merchant_id,
-            "offers": [
-                {
-                    "id": o["id"],
-                    "agent_type": o["agent_type"],
-                    "rate": float(o["offered_commission_rate"]),
-                    "min_amount": float(o["min_order_amount"]),
-                    "is_active": o["is_active"],
-                    "created_at": o["created_at"].isoformat()
-                }
-                for o in offers
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED — see module docstring. Returns 410 Gone."""
+    _check_merchant_self(merchant_id, current_user)
+    raise HTTPException(status_code=410, detail=_DEPRECATION_DETAIL)
 
 
 @router.delete("/offers/{offer_id}")
 async def delete_commission_offer(
     merchant_id: str = Path(...),
     offer_id: int = Path(...),
-    current_user: dict = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """[Phase 6] Delete commission offer"""
-    
-    # Auth check
-    if current_user.get("merchant_id") != merchant_id:
-        raise HTTPException(status_code=403, detail="Cannot delete other merchant's commission")
-    
-    try:
-        # Verify offer belongs to merchant
-        existing = await database.fetch_one(
-            "SELECT id FROM merchant_commission_offers WHERE id = :id AND merchant_id = :merchant_id",
-            {"id": offer_id, "merchant_id": merchant_id}
-        )
-        
-        if not existing:
-            raise HTTPException(status_code=404, detail="Offer not found")
-        
-        # Soft delete
-        await database.execute(
-            "UPDATE merchant_commission_offers SET is_active = false WHERE id = :id",
-            {"id": offer_id}
-        )
-        
-        return {"status": "success", "message": "Offer deleted"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-print("[Phase 5.5] Merchant commission API initialized")
+    """DEPRECATED — see module docstring. Returns 410 Gone."""
+    _check_merchant_self(merchant_id, current_user)
+    raise HTTPException(status_code=410, detail=_DEPRECATION_DETAIL)
