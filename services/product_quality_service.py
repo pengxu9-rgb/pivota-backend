@@ -13,6 +13,7 @@ pipeline (with behavior data and models) can be added separately.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -24,6 +25,8 @@ from models.standard_product import StandardProduct
 from utils.rich_text import rich_text_to_plain_text
 
 ProductKey = Tuple[str, str]
+
+logger = logging.getLogger(__name__)
 
 QUALITY_SOURCE_SNAPSHOT = "snapshot"
 QUALITY_SOURCE_PREVIEW = "preview"
@@ -616,4 +619,37 @@ async def full_quality_eval(
     }
 
     await database.execute(product_quality_snapshot.insert().values(row))
+    try:
+        catalog_row = await database.fetch_one(
+            """
+            SELECT content_key
+            FROM catalog_products
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND source_product_id = :source_product_id
+            LIMIT 1
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "source_product_id": platform_product_id,
+            },
+        )
+        content_key = (dict(catalog_row) if catalog_row else {}).get("content_key")
+        if content_key:
+            from services.index_pipeline_state_service import recompute_serving_eligibility
+
+            await recompute_serving_eligibility(
+                content_key,
+                reason="quality_snapshot",
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning({
+            "event": "serving_eligibility_hook_failed",
+            "site": "full_quality_eval",
+            "merchant_id": merchant_id,
+            "platform": platform,
+            "source_product_id": platform_product_id,
+            "error": str(exc),
+        })
     return result
