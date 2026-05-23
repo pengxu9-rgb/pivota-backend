@@ -488,6 +488,17 @@ async def generate_merchant_invoice(
                 params={
                     "customer": stripe_customer_id,
                     "collection_method": "charge_automatically",
+                    # currency MUST be explicit. If omitted, Stripe defaults to
+                    # the account's default currency (HKD for Pivota's HK-based
+                    # Stripe account), which then locks the customer's
+                    # default_currency to HKD on the first invoice — and
+                    # invoice_items.create below is hardcoded to USD, so the
+                    # currencies conflict and the invoice is rejected with
+                    # "You cannot combine currencies on a single invoice."
+                    # Pivota v1.3 monetization is USD-only (STRIPE_PRICE_ID_*
+                    # are USD prices), so force USD here. Surfaced by the
+                    # §D-H pipeline shakeout 2026-05-23.
+                    "currency": "usd",
                     # auto_advance=True: Stripe auto-finalizes the draft after its
                     # internal timer (~1h) if our explicit finalize_invoice() never
                     # fires. In the happy path we attach InvoiceItems and finalize
