@@ -776,6 +776,15 @@ app.include_router(audit_runs_router)  # P2.3: async audit_runs lifecycle (POST/
 # log line never surfaces in log fetches; this endpoint provides direct state.
 from routes.scheduler_health import router as scheduler_health_router
 app.include_router(scheduler_health_router)
+
+# Operational endpoint family for v1.3 monetization shakeout — wraps the
+# T6/T7/T9 cron tasks as synchronously-invokable HTTP endpoints so end-to-end
+# shakeout scripts (scripts/shakeout/c_full_order_pipeline.py et al.) can
+# drive the pipeline without waiting for the daily/monthly schedulers.
+# Gated to non-production environments + a shared-secret header
+# (SHAKEOUT_DEBUG_TOKEN). See routes/shakeout_debug.py for the safety model.
+from routes.shakeout_debug import router as shakeout_debug_router
+app.include_router(shakeout_debug_router)
 app.include_router(gsc_oauth_router)  # Phase D: Google Search Console OAuth start + callback
 app.include_router(pivota_canonical_router)  # Public canonical PDP resolver (sig_* → product) + sitemap list
 app.include_router(agent_pdp_v1_router)  # Agent PDP v1 denormalized read path (/api/agent/pdp/*)
