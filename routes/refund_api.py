@@ -4,7 +4,7 @@ Handles full and partial refunds for orders
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, status
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from decimal import Decimal
@@ -179,6 +179,7 @@ async def process_refund(
     order_id: str,
     refund_request: RefundRequest,
     background_tasks: BackgroundTasks,
+    response: Response = None,
     current_user: dict = Depends(require_admin)
 ):
     """
@@ -368,6 +369,8 @@ async def process_refund(
             except Exception:
                 stripe_refund_snapshot = None
         
+        finalize_failed = False
+        finalize_error = None
         try:
             await finalize_refund_success(
                 order,
@@ -394,8 +397,17 @@ async def process_refund(
                 update_order_status_fn=update_order_status,
                 log_order_event_fn=log_order_event,
             )
-        except Exception:
-            pass
+        except Exception as fin_exc:
+            finalize_failed = True
+            finalize_error = str(fin_exc)
+            logger.error(
+                {
+                    "event": "refund_finalize_failed_after_psp_refund_succeeded",
+                    "order_id": order_id,
+                    "refund_id": refund_id,
+                    "error": finalize_error,
+                }
+            )
 
         # PCS v0.2-b (best-effort): internal refund processed fact for reducer replay (no PII).
         try:
@@ -523,7 +535,7 @@ async def process_refund(
                 exc,
             )
 
-        response = {
+        response_payload = {
             "status": "success",
             "message": f"{'Partial refund' if is_partial else 'Full refund'} processed successfully",
             "order_id": order_id,
@@ -536,10 +548,21 @@ async def process_refund(
             "remaining_refundable": str(max(order_total - next_total_refunded, Decimal('0'))),
         }
         if stripe_refund_snapshot:
-            response["psp_refund"] = build_order_refund_tracking_payload(
+            response_payload["psp_refund"] = build_order_refund_tracking_payload(
                 {"metadata": stripe_refund_metadata_patch(stripe_refund_snapshot), "psp_used": "stripe"},
                 psp_used="stripe",
             )
+
+        if finalize_failed:
+            if response is not None:
+                response.status_code = status.HTTP_207_MULTI_STATUS
+            response_payload = {
+                "status": "partial_failure",
+                "refund_id": refund_id,
+                "psp_refund_id": refund_id,
+                "manual_reconciliation_required": True,
+                "error": finalize_error,
+            }
 
         # Best-effort idempotency record
         if refund_request.idempotency_key:
@@ -547,11 +570,11 @@ async def process_refund(
                 from mvp.idempotency import PostgresIdempotencyStore
 
                 idem = PostgresIdempotencyStore()
-                await idem.put(scope="refund", key=refund_request.idempotency_key, value=response)
+                await idem.put(scope="refund", key=refund_request.idempotency_key, value=response_payload)
             except Exception:
                 pass
 
-        return response
+        return response_payload
         
     except HTTPException:
         raise

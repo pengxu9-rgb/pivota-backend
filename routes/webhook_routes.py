@@ -348,7 +348,7 @@ async def _finalize_stripe_refund_success(
     metadata_extra: Optional[Dict[str, Any]] = None,
     metadata_patch: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return await finalize_refund_success(
+    finalization = await finalize_refund_success(
         order,
         psp="stripe",
         refund_reference=refund_reference,
@@ -360,6 +360,26 @@ async def _finalize_stripe_refund_success(
         update_order_status_fn=update_order_status,
         log_order_event_fn=log_order_event,
     )
+    # FIX-05 C5: PSP-initiated refunds must reverse attribution like app-initiated do.
+    if os.getenv("ATTRIBUTION_REVERSE_ON_REFUND", "true").strip().lower() != "false":
+        try:
+            from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+            await attach_refund_to_attribution_edge(
+                order_id=str(order.get("order_id") or ""),
+                refund_id=refund_reference,
+                amount=refund_amount_minor,
+            )
+        except Exception as edge_exc:
+            logger.warning(
+                {
+                    "event": "stripe_refund_attribution_edge_attach_failed",
+                    "order_id": str(order.get("order_id") or ""),
+                    "refund_id": refund_reference,
+                    "error": str(edge_exc),
+                }
+            )
+    return finalization
 
 
 async def _finalize_stripe_refund_failure(
@@ -1114,21 +1134,30 @@ async def handle_stripe_webhook(
                 )
 
         elif event_type and str(event_type).startswith("charge.dispute."):
-            # Stripe dispute/chargeback signals.
-            # Do not mutate order state here; treat as risk/ops signal and persist best-effort.
+            # Stripe dispute/chargeback signals. Order state mutation is gated by
+            # CHARGEBACK_REVERSE_ORDER_STATUS (default off). Attribution + order_events
+            # do fire for chargebacks.
+            dispute_payload = {}
+            if isinstance(data, dict):
+                dispute_payload = data
+            elif hasattr(data, "to_dict"):
+                try:
+                    dispute_payload = data.to_dict()
+                except Exception:
+                    dispute_payload = {}
+            dispute_meta = {}
+            if isinstance(dispute_payload, dict):
+                raw_meta = dispute_payload.get("metadata") or {}
+                dispute_meta = raw_meta if isinstance(raw_meta, dict) else {}
+            merchant_id = str(dispute_meta.get("merchant_id") or "").strip()
+            order_id = str(dispute_meta.get("order_id") or "").strip() or None
+            dispute_id = str((dispute_payload or {}).get("id") or "").strip()
+            raw_status = str((dispute_payload or {}).get("status") or "").strip().lower()
             try:
                 from services.dispute_records_service import (
                     stripe_dispute_status_detail,
                     upsert_stripe_dispute_record_best_effort,
                 )
-                dispute_payload = {}
-                if isinstance(data, dict):
-                    dispute_payload = data
-                elif hasattr(data, "to_dict"):
-                    try:
-                        dispute_payload = data.to_dict()
-                    except Exception:
-                        dispute_payload = {}
 
                 await upsert_stripe_dispute_record_best_effort(
                     dispute_payload,
@@ -1139,19 +1168,11 @@ async def handle_stripe_webhook(
             try:
                 from services.pcs_evidence_pack_service import create_dispute_evidence_pack
 
-                dispute_meta = {}
-                if isinstance(dispute_payload, dict):
-                    raw_meta = dispute_payload.get("metadata") or {}
-                    dispute_meta = raw_meta if isinstance(raw_meta, dict) else {}
-                merchant_id = str(dispute_meta.get("merchant_id") or "").strip()
-                order_id = str(dispute_meta.get("order_id") or "").strip() or None
-                dispute_ref = str((dispute_payload or {}).get("id") or "").strip()
-                raw_status = str((dispute_payload or {}).get("status") or "").strip().lower()
                 dispute_status_detail = stripe_dispute_status_detail(raw=raw_status or None, event_type=event_type)
-                if merchant_id and dispute_ref:
+                if merchant_id and dispute_id:
                     await create_dispute_evidence_pack(
                         merchant_id=merchant_id,
-                        dispute_ref=dispute_ref,
+                        dispute_ref=dispute_id,
                         order_id=order_id,
                         dispute_payload=dict(dispute_payload or {}),
                         source="stripe",
@@ -1161,6 +1182,49 @@ async def handle_stripe_webhook(
                     )
             except Exception:
                 pass
+
+            # FIX-05 C6: For dogfood we reverse attribution only; order status stays gated.
+            if os.getenv("ATTRIBUTION_REVERSE_ON_CHARGEBACK", "true").strip().lower() != "false":
+                try:
+                    raw_dispute_amount = (dispute_payload or {}).get("amount")
+                    dispute_amount_minor = (
+                        int(Decimal(str(raw_dispute_amount)))
+                        if raw_dispute_amount is not None
+                        else None
+                    )
+                    if order_id and dispute_id and dispute_amount_minor and dispute_amount_minor > 0:
+                        from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+                        await attach_refund_to_attribution_edge(
+                            order_id=order_id,
+                            refund_id=dispute_id,
+                            amount=dispute_amount_minor,
+                        )
+                        await log_order_event(
+                            event_type="chargeback_received",
+                            order_id=order_id,
+                            merchant_id=merchant_id,
+                            metadata={"dispute_id": dispute_id, "amount": dispute_amount_minor},
+                        )
+                except Exception as edge_exc:
+                    logger.warning(
+                        {
+                            "event": "stripe_chargeback_attribution_edge_attach_failed",
+                            "order_id": order_id,
+                            "dispute_id": dispute_id,
+                            "error": str(edge_exc),
+                        }
+                    )
+
+            if os.getenv("CHARGEBACK_REVERSE_ORDER_STATUS", "false").strip().lower() == "true":
+                logger.info(
+                    {
+                        "event": "stripe_chargeback_order_status_reversal_skipped",
+                        "order_id": order_id,
+                        "dispute_id": dispute_id,
+                        "reason": "not_implemented_for_v1_dogfood",
+                    }
+                )
         
         await _mark_stripe_webhook_event_status_best_effort(stripe_webhook_event_id, "processed")
         return {"status": "success", "event": event_type}
