@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.pcs_hash import sha256_json
 from utils.logger import logger
+
+
+MONETIZATION_BEARING_FACT_TYPES = frozenset(
+    {
+        "order_completed",
+        "refund_issued",
+        "chargeback",
+        "payment_attempted",
+    }
+)
 
 
 def _utc_now() -> datetime:
@@ -195,19 +206,34 @@ async def append_internal_fact_best_effort(
     db=None,
 ) -> None:
     """
-    Best-effort internal fact emission (no PII).
-    - Never raises.
+    Internal fact emission (no PII).
+    - Raises on failure for monetization-bearing fact types. Non-monetization facts remain best-effort.
     - Strict dedupe at DB layer via pcs_order_facts(merchant_id, dedupe_key).
     """
+    fact_type_str = str(fact_type)
+    never_raises = os.getenv("PCS_FACT_NEVER_RAISES", "").strip().lower() == "true"
+    raise_on_failure = fact_type_str in MONETIZATION_BEARING_FACT_TYPES and not never_raises
+
     if db is None:
         try:
             from db.database import database as db
-        except Exception:
+        except Exception as e:
+            if raise_on_failure:
+                raise
+            if not never_raises:
+                logger.warning(
+                    {
+                        "event": "pcs_internal_fact_emit_failed",
+                        "fact_type": fact_type_str,
+                        "order_id": order_id,
+                        "error": str(e),
+                    }
+                )
             return
 
     try:
         dedupe_key = build_internal_fact_dedupe_key(
-            fact_type=fact_type, order_id=order_id, idempotency_key=idempotency_key
+            fact_type=fact_type_str, order_id=order_id, idempotency_key=idempotency_key
         )
         payload_json_str = json.dumps(payload or {}, ensure_ascii=False)
         payload_sha = sha256_json(payload or {})
@@ -225,7 +251,7 @@ async def append_internal_fact_best_effort(
                 "merchant_id": merchant_id,
                 "stream_id": "orders",
                 "order_id": order_id,
-                "fact_type": str(fact_type),
+                "fact_type": fact_type_str,
                 "occurred_at": occurred_at or _utc_now(),
                 "source": "internal",
                 "topic": None,
@@ -235,5 +261,16 @@ async def append_internal_fact_best_effort(
                 "payload_sha256": payload_sha,
             },
         )
-    except Exception:
+    except Exception as e:
+        if raise_on_failure:
+            raise
+        if not never_raises:
+            logger.warning(
+                {
+                    "event": "pcs_internal_fact_emit_failed",
+                    "fact_type": fact_type_str,
+                    "order_id": order_id,
+                    "error": str(e),
+                }
+            )
         return
