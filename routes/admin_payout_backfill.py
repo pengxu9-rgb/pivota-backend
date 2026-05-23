@@ -10,9 +10,12 @@ docs/monetization/deploy/STAGE_2_HISTORICAL_BACKFILL.md for the v1.3
 attribution-edge backfill that replaces this admin path.
 
 Service modules (services/order_commission_service.py,
-services/revenue_share_service.py) are kept for historical traceability
-of the `commissions` and `revenue_matching_logs` tables; a future cleanup
-PR will remove them once we're confident nothing else references them.
+services/revenue_share_service.py) were removed 2026-05-23 (followup
+to PR #612) — the only remaining caller was this file's docstring +
+the services' own tests. The legacy `commissions` and
+`revenue_matching_logs` tables remain in the schema for historical
+traceability; a separate schema-deprecation migration will retire
+them.
 
 Original implementation removed from this file; recoverable via git log if
 needed.
