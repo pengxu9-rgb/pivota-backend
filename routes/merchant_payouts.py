@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from datetime import date, timedelta, datetime
 from db.database import database
 from db.payout_repo import PayoutRepo
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 import logging
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,9 @@ async def get_pending_commissions(
     Get summary of unpaid commissions grouped by agent
     This shows what commission is owed but hasn't been converted to payouts yet
     """
+    if current_user.get("merchant_id") != merchant_id and current_user.get("role") not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="cannot access another merchant's payouts")
+
     try:
         period_end = datetime.now()
         period_start = period_end - timedelta(days=days)
@@ -171,6 +174,9 @@ async def generate_payouts_from_commissions(
     Generate payouts from unpaid commissions
     Creates payout records and links them to the source commissions
     """
+    if current_user.get("merchant_id") != merchant_id and current_user.get("role") not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="cannot access another merchant's payouts")
+
     try:
         # Calculate period
         period_end = datetime.now()

@@ -3,7 +3,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, Dict, Any
 from pydantic import BaseModel
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from datetime import datetime
@@ -59,6 +59,9 @@ async def universal_product_sync(
     - No 500 errors - always returns meaningful responses
     """
     start_time = datetime.now()
+
+    if current_user.get("merchant_id") != request.merchant_id and current_user.get("role") not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="cannot sync products for another merchant")
     
     try:
         logger.info(f"🔄 Universal sync request: merchant_id={request.merchant_id}")
