@@ -7,9 +7,11 @@ denormalized Stage 3a table and no fallback joins or hot-path enrichment.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 
 from db.database import database
@@ -17,6 +19,7 @@ from services.catalog_identity import is_content_key
 
 
 router = APIRouter(prefix="/api/agent/pdp", tags=["agent-pdp"])
+logger = logging.getLogger(__name__)
 
 
 AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
@@ -48,8 +51,42 @@ AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
 )
 
 _SELECT_COLUMNS = ",\n      ".join(AGENT_PDP_VIEW_COLUMNS)
+_SELECT_APV_COLUMNS = ",\n      ".join(f"apv.{column}" for column in AGENT_PDP_VIEW_COLUMNS)
 
 SELECT_BY_CONTENT_KEY_SQL = f"""
+    SELECT
+      {_SELECT_APV_COLUMNS}
+    FROM agent_pdp_view apv
+    INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
+    WHERE apv.content_key = :id
+      AND ips.serving_eligible = TRUE
+    LIMIT 1
+"""
+
+SELECT_BY_SIGNATURE_SQL = f"""
+    SELECT
+      {_SELECT_APV_COLUMNS}
+    FROM agent_pdp_view apv
+    INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
+    WHERE apv.pivota_signature_id = :id
+      AND ips.serving_eligible = TRUE
+    LIMIT 1
+"""
+
+SELECT_BY_PRODUCT_GROUP_SQL = f"""
+    SELECT
+      {_SELECT_APV_COLUMNS}
+    FROM agent_pdp_view apv
+    INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key
+    WHERE apv.product_group_id = :id
+      AND ips.serving_eligible = TRUE
+    ORDER BY
+      CASE WHEN apv.pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END,
+      apv.content_key ASC
+    LIMIT 1
+"""
+
+BYPASS_SELECT_BY_CONTENT_KEY_SQL = f"""
     SELECT
       {_SELECT_COLUMNS}
     FROM agent_pdp_view
@@ -57,7 +94,7 @@ SELECT_BY_CONTENT_KEY_SQL = f"""
     LIMIT 1
 """
 
-SELECT_BY_SIGNATURE_SQL = f"""
+BYPASS_SELECT_BY_SIGNATURE_SQL = f"""
     SELECT
       {_SELECT_COLUMNS}
     FROM agent_pdp_view
@@ -65,7 +102,7 @@ SELECT_BY_SIGNATURE_SQL = f"""
     LIMIT 1
 """
 
-SELECT_BY_PRODUCT_GROUP_SQL = f"""
+BYPASS_SELECT_BY_PRODUCT_GROUP_SQL = f"""
     SELECT
       {_SELECT_COLUMNS}
     FROM agent_pdp_view
@@ -98,13 +135,73 @@ def _strip_group_wrapper(value: str) -> str:
     return value
 
 
-def _query_for_id(value: str) -> Optional[str]:
+def _bypass_serving_eligibility() -> bool:
+    return (
+        (os.getenv("AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY") or "")
+        .strip()
+        .lower()
+        == "true"
+    )
+
+
+def _request_context(request: Request) -> Dict[str, Optional[str]]:
+    request_id = (
+        getattr(request.state, "request_id", None)
+        or request.headers.get("x-request-id")
+        or request.headers.get("x-correlation-id")
+    )
+    merchant_id = (
+        getattr(request.state, "merchant_id", None)
+        or request.headers.get("x-merchant-id")
+        or request.query_params.get("merchant_id")
+    )
+    return {
+        "request_id": str(request_id) if request_id else None,
+        "merchant_id": str(merchant_id) if merchant_id else None,
+    }
+
+
+def _warn_serving_eligibility_bypass(request: Request, lookup_id: str) -> None:
+    context = _request_context(request)
+    logger.warning(
+        json.dumps(
+            {
+                "event": "agent_pdp_v1_serving_eligibility_bypass_enabled",
+                "request_id": context["request_id"],
+                "merchant_id": context["merchant_id"],
+                "lookup_id": lookup_id,
+                "bypass_env": "AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY",
+            },
+            sort_keys=True,
+        ),
+        extra={
+            "request_id": context["request_id"],
+            "merchant_id": context["merchant_id"],
+            "lookup_id": lookup_id,
+            "bypass_env": "AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY",
+        },
+    )
+
+
+def _query_for_id(value: str, *, bypass_serving_eligibility: bool = False) -> Optional[str]:
     if is_content_key(value):
-        return SELECT_BY_CONTENT_KEY_SQL
+        return (
+            BYPASS_SELECT_BY_CONTENT_KEY_SQL
+            if bypass_serving_eligibility
+            else SELECT_BY_CONTENT_KEY_SQL
+        )
     if _is_pivota_signature_id(value):
-        return SELECT_BY_SIGNATURE_SQL
+        return (
+            BYPASS_SELECT_BY_SIGNATURE_SQL
+            if bypass_serving_eligibility
+            else SELECT_BY_SIGNATURE_SQL
+        )
     if _is_product_group_id(value):
-        return SELECT_BY_PRODUCT_GROUP_SQL
+        return (
+            BYPASS_SELECT_BY_PRODUCT_GROUP_SQL
+            if bypass_serving_eligibility
+            else SELECT_BY_PRODUCT_GROUP_SQL
+        )
     return None
 
 
@@ -229,8 +326,11 @@ def _build_response(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/{id}")
-async def get_agent_pdp(id: str) -> Dict[str, Any]:
+async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
     raw_id = str(id or "")
+    bypass_serving_eligibility = _bypass_serving_eligibility()
+    if bypass_serving_eligibility:
+        _warn_serving_eligibility_bypass(request, raw_id)
 
     # ext_*: resolve to a content_key via external_product_seeds + catalog_products,
     # then fall through to the standard content_key SELECT.
@@ -241,9 +341,19 @@ async def get_agent_pdp(id: str) -> Dict[str, Any]:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="PDP not found",
             )
+        resolved_content_key = str(dict(resolved).get("content_key") or "")
+        query = _query_for_id(
+            resolved_content_key,
+            bypass_serving_eligibility=bypass_serving_eligibility,
+        )
+        if query is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="PDP not found",
+            )
         row = await database.fetch_one(
-            SELECT_BY_CONTENT_KEY_SQL,
-            {"id": dict(resolved).get("content_key")},
+            query,
+            {"id": resolved_content_key},
         )
         if not row:
             raise HTTPException(
@@ -253,7 +363,7 @@ async def get_agent_pdp(id: str) -> Dict[str, Any]:
         return _build_response(_row_to_dict(row))
 
     lookup_id = _strip_group_wrapper(raw_id)
-    query = _query_for_id(lookup_id)
+    query = _query_for_id(lookup_id, bypass_serving_eligibility=bypass_serving_eligibility)
     if query is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -89,35 +91,50 @@ class FakeAgentPdpDatabase:
         self,
         rows: List[Dict[str, Any]],
         ext_id_to_content_key: Optional[Dict[str, str]] = None,
+        serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
     ) -> None:
         self.rows = rows
         self.ext_id_to_content_key = ext_id_to_content_key or {}
+        self.serving_eligible_by_content_key = serving_eligible_by_content_key
         self.calls: List[Dict[str, Any]] = []
 
+    def _passes_serving_eligibility(self, query: str, row: Dict[str, Any]) -> bool:
+        if "index_pipeline_state ips" not in query:
+            return True
+        if self.serving_eligible_by_content_key is None:
+            return True
+        return self.serving_eligible_by_content_key.get(row["content_key"]) is True
+
     async def fetch_one(self, query: str, values: Optional[Dict[str, Any]] = None):
-        self.calls.append({"query": str(query), "values": dict(values or {})})
+        query_text = str(query)
+        self.calls.append({"query": query_text, "values": dict(values or {})})
         params = values or {}
 
         # ext_* resolution path (different bind name + JOIN shape)
-        if "FROM external_product_seeds eps" in str(query):
+        if "FROM external_product_seeds eps" in query_text:
             ext_id = str(params.get("ext_id") or "")
             ck = self.ext_id_to_content_key.get(ext_id)
             return {"content_key": ck} if ck else None
 
         lookup_id = str(params.get("id") or "")
 
-        if "WHERE content_key = :id" in str(query):
-            return next((row for row in self.rows if row["content_key"] == lookup_id), None)
+        if "WHERE apv.content_key = :id" in query_text or "WHERE content_key = :id" in query_text:
+            row = next((row for row in self.rows if row["content_key"] == lookup_id), None)
+            return row if row and self._passes_serving_eligibility(query_text, row) else None
 
-        if "WHERE pivota_signature_id = :id" in str(query):
-            return next(
+        if "WHERE apv.pivota_signature_id = :id" in query_text or "WHERE pivota_signature_id = :id" in query_text:
+            row = next(
                 (row for row in self.rows if row.get("pivota_signature_id") == lookup_id),
                 None,
             )
+            return row if row and self._passes_serving_eligibility(query_text, row) else None
 
-        if "WHERE product_group_id = :id" in str(query):
+        if "WHERE apv.product_group_id = :id" in query_text or "WHERE product_group_id = :id" in query_text:
             group_rows = [
-                row for row in self.rows if row.get("product_group_id") == lookup_id
+                row
+                for row in self.rows
+                if row.get("product_group_id") == lookup_id
+                and self._passes_serving_eligibility(query_text, row)
             ]
             group_rows.sort(
                 key=lambda row: (
@@ -135,8 +152,13 @@ def _client(
     rows: List[Dict[str, Any]],
     *,
     ext_id_to_content_key: Optional[Dict[str, str]] = None,
+    serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
 ):
-    db = FakeAgentPdpDatabase(rows, ext_id_to_content_key=ext_id_to_content_key)
+    db = FakeAgentPdpDatabase(
+        rows,
+        ext_id_to_content_key=ext_id_to_content_key,
+        serving_eligible_by_content_key=serving_eligible_by_content_key,
+    )
     monkeypatch.setattr(agent_pdp_v1, "database", db)
     app = FastAPI()
     app.include_router(agent_pdp_v1.router)
@@ -175,7 +197,87 @@ def test_get_agent_pdp_by_content_key_returns_modules_envelope(monkeypatch) -> N
     assert body["subject"] == {"type": "product_group", "id": GROUP_ID}
     assert _offers_module(body)["data"]["offers_count"] == 2
     assert db.calls[0]["values"] == {"id": CK_A}
-    assert "WHERE content_key = :id" in db.calls[0]["query"]
+    assert "INNER JOIN index_pipeline_state ips" in db.calls[0]["query"]
+    assert "WHERE apv.content_key = :id" in db.calls[0]["query"]
+    assert "ips.serving_eligible = TRUE" in db.calls[0]["query"]
+
+
+def test_get_agent_pdp_by_content_key_returns_when_serving_eligible(monkeypatch) -> None:
+    client, db = _client(
+        monkeypatch,
+        [_row()],
+        serving_eligible_by_content_key={CK_A: True},
+    )
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 200
+    assert _canonical_product(response.json())["content_key"] == CK_A
+    assert "INNER JOIN index_pipeline_state ips" in db.calls[0]["query"]
+    assert "ips.serving_eligible = TRUE" in db.calls[0]["query"]
+
+
+def test_get_agent_pdp_returns_404_when_serving_state_missing(monkeypatch) -> None:
+    client, db = _client(
+        monkeypatch,
+        [_row()],
+        serving_eligible_by_content_key={},
+    )
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "PDP not found"
+    assert "INNER JOIN index_pipeline_state ips" in db.calls[0]["query"]
+    assert "ips.serving_eligible = TRUE" in db.calls[0]["query"]
+
+
+def test_get_agent_pdp_returns_404_when_serving_eligible_false(monkeypatch) -> None:
+    client, db = _client(
+        monkeypatch,
+        [_row()],
+        serving_eligible_by_content_key={CK_A: False},
+    )
+
+    response = client.get(f"/api/agent/pdp/{CK_A}")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "PDP not found"
+    assert "INNER JOIN index_pipeline_state ips" in db.calls[0]["query"]
+    assert "ips.serving_eligible = TRUE" in db.calls[0]["query"]
+
+
+def test_get_agent_pdp_bypass_env_reverts_to_legacy_query(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("AGENT_PDP_V1_BYPASS_SERVING_ELIGIBILITY", "true")
+    client, db = _client(
+        monkeypatch,
+        [_row()],
+        serving_eligible_by_content_key={CK_A: False},
+    )
+
+    with caplog.at_level(logging.WARNING, logger=agent_pdp_v1.__name__):
+        response = client.get(
+            f"/api/agent/pdp/{CK_A}",
+            headers={"x-request-id": "req_01", "x-merchant-id": "merch_1"},
+        )
+
+    assert response.status_code == 200
+    query = db.calls[0]["query"]
+    assert "index_pipeline_state" not in query
+    assert "WHERE content_key = :id" in query
+    warning = next(
+        record
+        for record in caplog.records
+        if "agent_pdp_v1_serving_eligibility_bypass_enabled" in record.message
+    )
+    payload = json.loads(warning.message)
+    assert payload["event"] == "agent_pdp_v1_serving_eligibility_bypass_enabled"
+    assert payload["request_id"] == "req_01"
+    assert payload["merchant_id"] == "merch_1"
+    assert payload["lookup_id"] == CK_A
+    assert warning.request_id == "req_01"
+    assert warning.merchant_id == "merch_1"
+    assert warning.lookup_id == CK_A
 
 
 def test_get_agent_pdp_by_signature_returns_same_row(monkeypatch) -> None:
@@ -188,7 +290,7 @@ def test_get_agent_pdp_by_signature_returns_same_row(monkeypatch) -> None:
     assert product["content_key"] == CK_A
     assert product["pivota_signature_id"] == SIG_A
     assert db.calls[0]["values"] == {"id": SIG_A}
-    assert "WHERE pivota_signature_id = :id" in db.calls[0]["query"]
+    assert "WHERE apv.pivota_signature_id = :id" in db.calls[0]["query"]
 
 
 def test_get_agent_pdp_by_group_id_prefers_signature_bearing_row(monkeypatch) -> None:
@@ -211,9 +313,9 @@ def test_get_agent_pdp_by_group_id_prefers_signature_bearing_row(monkeypatch) ->
     assert product["content_key"] == CK_C
     assert product["title"] == "Canonical Signed Row"
     query = db.calls[0]["query"]
-    assert "WHERE product_group_id = :id" in query
-    assert "CASE WHEN pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END" in query
-    assert "content_key ASC" in query
+    assert "WHERE apv.product_group_id = :id" in query
+    assert "CASE WHEN apv.pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END" in query
+    assert "apv.content_key ASC" in query
 
 
 def test_get_agent_pdp_by_group_id_uses_lowest_content_key_when_no_signature(monkeypatch) -> None:
@@ -279,7 +381,7 @@ def test_get_agent_pdp_resolves_ext_id_via_external_product_seeds(monkeypatch) -
     assert len(db.calls) == 2
     assert "external_product_seeds eps" in db.calls[0]["query"]
     assert db.calls[0]["values"] == {"ext_id": "ext_xyz123"}
-    assert "WHERE content_key = :id" in db.calls[1]["query"]
+    assert "WHERE apv.content_key = :id" in db.calls[1]["query"]
     assert db.calls[1]["values"] == {"id": CK_A}
 
 
@@ -304,17 +406,18 @@ def test_sql_uses_agent_pdp_view_indexed_lookup_paths() -> None:
     for sql in sql_by_kind.values():
         normalized = " ".join(sql.split())
         assert "SELECT *" not in normalized
-        assert "FROM agent_pdp_view" in normalized
-        assert " JOIN " not in f" {normalized.upper()} "
+        assert "FROM agent_pdp_view apv" in normalized
+        assert "INNER JOIN index_pipeline_state ips ON ips.content_key = apv.content_key" in normalized
+        assert "ips.serving_eligible = TRUE" in normalized
         assert "catalog_products" not in normalized
         assert "catalog_skus" not in normalized
         assert "catalog_offers" not in normalized
         assert "product_group_members" not in normalized
         assert "subject_resolve" not in normalized
 
-    assert "WHERE content_key = :id" in " ".join(sql_by_kind["content_key"].split())
-    assert "WHERE pivota_signature_id = :id" in " ".join(sql_by_kind["signature"].split())
+    assert "WHERE apv.content_key = :id" in " ".join(sql_by_kind["content_key"].split())
+    assert "WHERE apv.pivota_signature_id = :id" in " ".join(sql_by_kind["signature"].split())
     group_sql = " ".join(sql_by_kind["product_group"].split())
-    assert "WHERE product_group_id = :id" in group_sql
-    assert "CASE WHEN pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END" in group_sql
-    assert "content_key ASC" in group_sql
+    assert "WHERE apv.product_group_id = :id" in group_sql
+    assert "CASE WHEN apv.pivota_signature_id IS NOT NULL THEN 0 ELSE 1 END" in group_sql
+    assert "apv.content_key ASC" in group_sql
