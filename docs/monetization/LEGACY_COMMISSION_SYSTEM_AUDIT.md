@@ -1,7 +1,7 @@
 # Legacy Phase 5.5/6 Commission System — Audit
 
 **Date:** 2026-05-23
-**Status:** Disposition deferred pending Cowork architectural design discussion.
+**Status:** **RESOLVED 2026-05-23 — full deprecation of the legacy system; v1.3 take-rate is the sole post-payment economic model going forward.** See §Resolution at the bottom for the decision rationale, the executed actions, and the remaining frontend follow-up.
 
 User flagged that the original merchant→agent payout system, built ~2025-11 (Phase 5.5 / Phase 6 commits), runs in parallel with v1.3 monetization and could collide on the same orders. This document captures the audit findings so the design call has concrete numbers and code paths to reference. **No code or DB changes from this audit** — surface and document only.
 
@@ -94,3 +94,45 @@ These are operationally safe and don't pre-judge the architectural decision:
 - `services/order_commission_service.py:process_order_commission` — the call entry point for legacy commission calculation
 - `services/revenue_share_service.py:RevenueShareService.match_commission` — the rate-negotiation engine
 - `routes/merchant_commission_api.py` — the merchant-facing API the dashboard calls
+
+---
+
+## Resolution (2026-05-23)
+
+**Decision:** Drop the legacy Phase 5.5/6 merchant→agent direct commission system fully. v1.3 take-rate becomes the sole post-payment economic model. Pivota charges merchants a take rate (5%/10%) via T7 monthly Stripe invoices; partner shares are allocated via T8 Connect transfers; no merchant-set per-agent commission is collected or paid.
+
+**Evidence base.** Codex industry research dispatched 2026-05-23 (full report at `/tmp/codex_monetization_research_output.md` — local artifact, ~28 platforms cited). Headline findings that drove the decision:
+
+- **Comparable platforms converge on one economic clearing layer per order.** Faire (15% on Faire-sourced demand, 0% on merchant-direct), Substack/OnlyFans (single platform fee, no second commission), ChatGPT Instant Checkout (one "small fee" on completion, organic ranking), Apple/Google/Shopify App Stores (single tiered take rate). None of these maintains a parallel "merchant pays agent + platform pays itself" double-extraction.
+- **Pivota's 5%/10% take rate is squarely in the defensible 5–10% range for AI-agent commerce** per codex's category analysis. No need to dilute it with a parallel commission system.
+- **Faire's source-based model** (different rate by how the buyer was acquired) was the closest analog if a dual-rate structure was desired. But Cowork chose the cleaner "single rate, no dual model" path — fewer contractual surfaces, easier to explain to merchants.
+
+**Actions taken (this resolution).**
+
+| # | Action | Where | PR / commit |
+|---|---|---|---|
+| 1 | Removed `calculate_commission_task()` background dispatch from `/payment/confirm` | `routes/order_routes.py:~4442` | PR #612 |
+| 2 | Removed `trigger_commission()` background dispatch from `/orders/{order_id}/confirm-payment` | `routes/agent_api.py:~8928` | PR #612 |
+| 3 | `/admin/payouts/backfill` and `/admin/payouts/patch-schema` return HTTP 410 Gone | `routes/admin_payout_backfill.py` | PR #612 |
+| 4 | `/merchants/{id}/commission/offers` (POST/GET/DELETE) all return HTTP 410 Gone | `routes/merchant_commission_api.py` | PR #612 |
+| 5 | `UPDATE merchant_commission_offers SET is_active=false` (5 rows) with audit note | Production DB (direct psql via public proxy) | n/a — no code change |
+
+**Actions deliberately NOT taken.**
+
+- Service modules `services/order_commission_service.py` and `services/revenue_share_service.py` are **kept in the tree** for historical traceability of the existing `commissions` / `revenue_matching_logs` data. A future cleanup PR can remove them once we're confident nothing else in the codebase references them (already greppable: only the deprecated routes do).
+- Historical data in `commissions`, `revenue_matching_logs`, `merchant_commission_offers`, `agent_revenue_expectations` is **not deleted**. The 35 commission rows + 5 offers are part of the alpha merchant's transaction history. Archival vs delete is a future call.
+- The 30-overlap question for Stage 2 backfill is **moot post-deprecation**: legacy paid agent_982b... $11.51 historically (sunk cost). Stage 2 will create v1.3 attribution edges for all 80 qualifying alpha orders including those 30; T7 will charge the merchant 10% on the resulting net GMV with no offsetting credit. Since the alpha merchant is Chydan (the user), no external reconciliation needed. Document explicitly in Stage 2 runbook.
+
+**Open follow-ups.**
+
+1. **Frontend (different repo).** `merchant.pivota.cc/dashboard/commission` lives in `pivota-merchants-portal`, not this repo. UI clicks now return HTTP 410. Should be hidden in the merchant portal before any external merchant onboarding (Markato or other) to avoid showing a deprecated commission-config interface. **Tracking owner: needs assignment.**
+2. **Stage 2 backfill runbook update.** Add a §1.6 to `docs/monetization/deploy/STAGE_2_HISTORICAL_BACKFILL.md` noting the legacy disposition and confirming all 80 orders are in scope (no skip list needed for the overlap).
+3. **Service module cleanup.** Once one full Stage 4 monthly billing cycle has passed without incident, delete `services/order_commission_service.py`, `services/revenue_share_service.py`, and the `routes/admin_check_hidden_offers.py` / `routes/admin_fix_commission_offers.py` admin helpers (if they're also unused). Verify via grep that no other module imports them.
+4. **Schema cleanup (defer to v1.5 or later).** `merchant_commission_offers`, `agent_revenue_expectations`, `revenue_matching_logs`, `commissions` tables can be marked DEPRECATED in COMMENT ON TABLE for now. Outright dropping needs a separate migration + backup, and is not urgent.
+
+**Answers to the audit's open questions.**
+
+1. *When Phase 5.5/6 launched 2025-11, was the merchant→agent direct commission the only intended payout model?* Per Cowork: yes — it predated the v1.3 design. v1.3 took shape ~2026-03/04 with a different economic model. The two never had a unified contract; the parallel-systems state is the result of evolution, not deliberate dual design.
+2. *Is the dashboard UX promise compatible with "Pivota takes 10%"?* No. The dashboard implied merchants control their agent compensation; v1.3 implies Pivota does. The UI needs to go away (follow-up #1).
+3. *Stage 2 overlap reconciliation?* See "Actions deliberately NOT taken" — moot under full deprecation; alpha = Chydan, no external counterparty.
+4. *How were the historical 35 commissions paid out?* Unknown; the legacy system writes to `commissions` but has no Stripe-transfer execution layer. Likely manual ops if any payouts actually flowed. Future cleanup can confirm.
