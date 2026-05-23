@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 _SHOP_CURRENCY_CACHE: Dict[str, tuple[float, str]] = {}
 _SHOP_CURRENCY_TTL_SECONDS = 6 * 60 * 60
 SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE = "__SHOPIFY_NEXT_PAGE_TOKEN_UNPARSEABLE__"
+WIX_MAX_PRODUCTS = 5000
 
 
 def extract_shopify_next_page_token(link_header: str) -> Tuple[Optional[str], bool, Optional[str]]:
@@ -126,6 +127,14 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except Exception:
         return default
+
+
+def _wix_max_pages_override() -> Optional[int]:
+    raw = os.getenv("WIX_MAX_PAGES")
+    if raw is None or str(raw).strip() == "":
+        return None
+    pages = _as_int(raw, 0)
+    return pages if pages > 0 else None
 
 
 def _parse_platform_datetime(value: Any) -> Optional[datetime]:
@@ -891,43 +900,116 @@ class WixProductAdapter:
         page_token: Optional[str] = None
     ) -> Tuple[List[StandardProduct], Optional[str], Optional[str]]:
         """实时从 Wix 拉取产品"""
-        import httpx
-        
         try:
             logger.info(f"🔄 Fetching Wix products: site_id={site_id}")
             
             url = WIX_PRODUCTS_QUERY_URL
             headers = build_wix_catalog_headers(api_key, site_id)
-            
-            # Wix products query does NOT include `variants` by default even when a product has
-            # productOptions/manageVariants=true. We must opt in.
-            payload = {"query": {"paging": {"limit": min(limit, 100)}}, "includeVariants": True}
-            
+            page_limit = max(1, min(_as_int(limit, 50), 100))
+            max_total_products = max(1, _as_int(WIX_MAX_PRODUCTS, 5000))
+            offset = max(_as_int(page_token, 0), 0)
+            max_pages_override = _wix_max_pages_override()
+            max_pages = max_pages_override or max(
+                1,
+                (max_total_products + page_limit - 1) // page_limit,
+            )
+            single_page_rollback = max_pages_override == 1
+
+            standard_products: List[StandardProduct] = []
+            total_raw_products = 0
+            pages_fetched = 0
+            next_page_token = None
+            truncated = False
+
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, json=payload, headers=headers)
-                
-                logger.info(f"🔍 Wix API response: status={response.status_code}, content_length={len(response.text)}")
-                
-                if response.status_code != 200:
-                    error_msg = f"Wix API error: {response.status_code} - {response.text[:200]}"
-                    logger.error(error_msg)
-                    return [], None, error_msg
-                
-                data = response.json()
-                wix_products = data.get("products", [])
-                logger.info(f"✅ Wix API returned {len(wix_products)} products (total_results={data.get('totalResults', 'unknown')})")
-                
-                standard_products = []
-                for wp in wix_products:
+                while total_raw_products < max_total_products and pages_fetched < max_pages:
+                    current_limit = min(page_limit, max_total_products - total_raw_products)
+                    payload = {
+                        "query": {"paging": {"limit": current_limit, "offset": offset}},
+                        "includeVariants": True,
+                    }
+
                     try:
-                        product = WixProductAdapter._convert_product(wp, merchant_id=merchant_id)
-                        if product:
-                            standard_products.append(product)
-                    except Exception as product_error:
-                        logger.error(f"Error converting Wix product: {product_error}")
-                        continue
-                
-                return standard_products, None, None
+                        response = await client.post(url, json=payload, headers=headers)
+                    except Exception as exc:
+                        error_msg = f"Error fetching Wix products: {str(exc)}"
+                        logger.error(error_msg)
+                        return standard_products, None, error_msg
+
+                    logger.info(
+                        "Wix API response merchant_id=%s offset=%s limit=%s status=%s content_length=%s",
+                        merchant_id,
+                        offset,
+                        current_limit,
+                        response.status_code,
+                        len(response.text),
+                    )
+
+                    if response.status_code != 200:
+                        error_msg = f"Wix API error: {response.status_code} - {response.text[:200]}"
+                        logger.error(error_msg)
+                        return standard_products, None, error_msg
+
+                    try:
+                        data = response.json() or {}
+                    except Exception as exc:
+                        error_msg = f"Invalid Wix API response: {str(exc)}"
+                        logger.error(error_msg)
+                        return standard_products, None, error_msg
+
+                    wix_products = data.get("products", [])
+                    if not isinstance(wix_products, list):
+                        error_msg = "Invalid Wix API response: missing products list"
+                        logger.error(error_msg)
+                        return standard_products, None, error_msg
+
+                    page_count = len(wix_products)
+                    total_results = _as_int(data.get("totalResults"), 0) or None
+                    logger.info(
+                        "Wix API page merchant_id=%s offset=%s page_count=%s total_fetched=%s total_results=%s",
+                        merchant_id,
+                        offset,
+                        page_count,
+                        total_raw_products + page_count,
+                        total_results if total_results is not None else "unknown",
+                    )
+
+                    for wp in wix_products:
+                        try:
+                            product = WixProductAdapter._convert_product(wp, merchant_id=merchant_id)
+                            if product:
+                                standard_products.append(product)
+                        except Exception as product_error:
+                            logger.error(f"Error converting Wix product: {product_error}")
+                            continue
+
+                    pages_fetched += 1
+                    total_raw_products += page_count
+                    next_offset = offset + page_count
+                    has_more = page_count >= current_limit and (
+                        total_results is None or next_offset < total_results
+                    )
+
+                    if not has_more:
+                        break
+
+                    if total_raw_products >= max_total_products or pages_fetched >= max_pages:
+                        truncated = True
+                        if not single_page_rollback:
+                            next_page_token = str(next_offset)
+                        break
+
+                    offset = next_offset
+
+            logger.info(
+                "Wix products fetch complete merchant_id=%s total_fetched=%s pages=%s truncated=%s next_page_token=%s",
+                merchant_id,
+                len(standard_products),
+                pages_fetched,
+                truncated,
+                next_page_token,
+            )
+            return standard_products, next_page_token, None
                 
         except Exception as e:
             error_msg = f"Error fetching Wix products: {str(e)}"
