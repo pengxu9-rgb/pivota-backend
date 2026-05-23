@@ -212,6 +212,12 @@ def main() -> int:
         200, "ignored",
     )
 
+    # Invoice events: include realistic period_start/period_end one month
+    # apart. billing_period_* are DATE columns (migration 120). Same-day
+    # values violate ck_invoices_billing_period_order.
+    _now_ts = int(time.time())
+    _month_ago = _now_ts - 30 * 24 * 3600
+
     # 5. invoice.paid — writes/updates invoices row by stripe_invoice_id
     inv_id_1 = f"in_shakeout_{RUN_ID}_paid"
     ev_id_5 = f"evt_ip_{RUN_ID}_5"
@@ -224,6 +230,8 @@ def main() -> int:
         "amount_due": 9900,
         "status": "paid",
         "currency": "usd",
+        "period_start": _month_ago,
+        "period_end": _now_ts,
         "metadata": {"merchant_id": SHAKEOUT_MERCHANT_ID},
     }
     all_ok &= _run_case(
@@ -244,6 +252,8 @@ def main() -> int:
         "amount_due": 9900,
         "status": "open",
         "currency": "usd",
+        "period_start": _month_ago,
+        "period_end": _now_ts,
         "metadata": {"merchant_id": SHAKEOUT_MERCHANT_ID},
     }
     all_ok &= _run_case(
