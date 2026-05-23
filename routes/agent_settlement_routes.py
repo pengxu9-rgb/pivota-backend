@@ -1,116 +1,68 @@
-"""
-[Phase 5.6] Agent Settlement Routes
-Endpoints for agents to view settlements and payouts
+"""[FIX-09] Legacy agent settlement routes - retired.
+
+The Phase 5.5/6 settlement system was deprecated in PR #612/#613. v1.3
+monetization runs through the new Stage 1+ pipeline. This file remains only to
+serve 410-Gone for clients still calling legacy paths; do not re-add live
+handlers here.
+
+Rollback: set LEGACY_SETTLEMENT_LIVE=true to bypass the 410 stubs (emergency
+only).
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Path
-from datetime import datetime, timedelta
-from typing import Optional
+import os
 
-from db.database import database
-from core.settlement_engine import AgentSettlementEngine
-from services.revenue_share_service import RevenueShareService
-from utils.auth import get_current_user
+from fastapi import APIRouter, HTTPException, status
 
 router = APIRouter(
     prefix="/agents/{agent_id}/settlements",
-    tags=["[Phase 5.6] Agent Settlements"]
+    tags=["[Phase 5.6] Agent Settlements (retired)"],
 )
 
-# Initialize services (REUSE existing)
-revenue_service = RevenueShareService(database)
-settlement_engine = AgentSettlementEngine(revenue_service, database)
+
+def _maybe_bypass_410():
+    return os.getenv("LEGACY_SETTLEMENT_LIVE", "").strip().lower() == "true"
+
+
+def _gone():
+    if _maybe_bypass_410():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="legacy bypass requested but legacy handlers are removed",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "status": "gone",
+            "message": "agent settlement legacy endpoints retired; use Stage-1 monetization endpoints",
+        },
+    )
 
 
 @router.get("")
-async def get_agent_settlements(
-    agent_id: str = Path(...),
-    status: Optional[str] = Query(None),
-    limit: int = Query(20, ge=1, le=100),
-    current_user: dict = Depends(get_current_user)
-):
-    """[Phase 5.6] List all settlements for agent"""
-    
-    # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    try:
-        query = "SELECT * FROM agent_settlements WHERE agent_id = :agent_id"
-        params = {"agent_id": agent_id, "limit": limit}
-        
-        if status:
-            query += " AND status = :status"
-            params["status"] = status
-        
-        query += " ORDER BY created_at DESC LIMIT :limit"
-        
-        settlements = await database.fetch_all(query, params)
-        
-        return {
-            "agent_id": agent_id,
-            "settlements": [
-                {
-                    "settlement_id": s["settlement_id"],
-                    "amount": float(s["settlement_amount"]),
-                    "status": s["status"],
-                    "transactions": s["total_transactions"],
-                    "period": {
-                        "start": s["settlement_period_start"].isoformat(),
-                        "end": s["settlement_period_end"].isoformat()
-                    },
-                    "payout_date": s["payout_date"].isoformat() if s["payout_date"] else None,
-                    "created_at": s["created_at"].isoformat()
-                }
-                for s in settlements
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def list_settlements_gone(agent_id: str):
+    _gone()
+
+
+@router.post("")
+async def create_settlement_gone(agent_id: str):
+    _gone()
 
 
 @router.get("/pending")
-async def get_pending_settlements(
-    agent_id: str = Path(...),
-    current_user: dict = Depends(get_current_user)
-):
-    """[Phase 5.6] Get pending settlements"""
-    
-    # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    try:
-        pending = await settlement_engine.get_pending_settlements(agent_id)
-        return {"agent_id": agent_id, "pending_settlements": pending}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_pending_settlements_gone(agent_id: str):
+    _gone()
 
 
 @router.post("/calculate")
-async def calculate_settlement(
-    agent_id: str = Path(...),
-    days: int = Query(30, ge=1, le=90),
-    current_user: dict = Depends(get_current_user)
-):
-    """[Phase 5.6] Calculate settlement for recent period"""
-    
-    if current_user.get("role") not in ["admin", "employee"]:
-        raise HTTPException(status_code=403, detail="Only employees can calculate settlements")
-    
-    try:
-        period_end = datetime.utcnow()
-        period_start = period_end - timedelta(days=days)
-        
-        result = await settlement_engine.calculate_settlement(
-            agent_id=agent_id,
-            period_start=period_start,
-            period_end=period_end
-        )
-        
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def calculate_settlement_gone(agent_id: str):
+    _gone()
 
 
-print("[Phase 5.6] Agent settlement routes initialized")
+@router.get("/payouts")
+async def list_payouts_gone(agent_id: str):
+    _gone()
+
+
+@router.get("/{settlement_id}")
+async def get_settlement_gone(agent_id: str, settlement_id: str):
+    _gone()
