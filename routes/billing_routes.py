@@ -1307,9 +1307,14 @@ def _invoice_values(
 
     now = datetime.now(timezone.utc)
     period_start = period_start or _stripe_timestamp(invoice.get("created")) or now
-    period_end = period_end or period_start + timedelta(seconds=1)
-    if period_end <= period_start:
-        period_end = period_start + timedelta(seconds=1)
+    # billing_period_{start,end} are DATE columns (migration 120 converted
+    # them from TIMESTAMPTZ). A timedelta(seconds=1) round-trips to the same
+    # DATE, violating ck_invoices_billing_period_order. Use days to guarantee
+    # period_end > period_start at the DATE level. Surfaced by §B shakeout
+    # 2026-05-23.
+    period_end = period_end or period_start + timedelta(days=1)
+    if period_end.date() <= period_start.date():
+        period_end = period_start + timedelta(days=1)
 
     status_transitions = _coerce_dict(invoice.get("status_transitions"))
     return {
