@@ -87,6 +87,25 @@ async def start_scheduler() -> None:
             coalesce=True,            # only run once if multiple firings queued
         )
 
+        # External-seed mirror: copy active external_product_seeds rows
+        # into catalog_products so the nightly index-health job below
+        # can produce index_pipeline_state rows for them. Without this
+        # the PDP serving gate (which checks index_pipeline_state) fails
+        # for any seed that was never hand-mirrored. Runs at 03:30 UTC,
+        # 30m before nightly_index_health so freshly mirrored rows are
+        # included in the same daily cycle. Idempotent.
+        from jobs.external_seed_mirror_job import run_external_seed_mirror
+        scheduler.add_job(
+            run_external_seed_mirror,
+            "cron",
+            hour=3,
+            minute=30,
+            id="external_seed_mirror",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+
         # Index health consolidation: reads quality snapshots, seed audit,
         # identity graph, and offer presence; writes index_pipeline_state +
         # domain_extractor_baselines. Offset 1h from daily_audit_check
