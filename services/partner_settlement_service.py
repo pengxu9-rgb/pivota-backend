@@ -198,6 +198,10 @@ async def compute_partner_comp(
 
     clawbacks = await _compute_churn_clawbacks(channel_partner_id, merchant_ids)
     clawback_total = sum(_as_int(item.get("amount_cents")) for item in clawbacks)
+    # NOTE: Credit overage revenue is unimplemented in v1.3. Overage billing
+    # is scheduled to land in the channel-partner program rebuild (see
+    # project_pivota_channel_partner_program memory). Until then, partners
+    # accrue zero on the credit stream regardless of allowance consumption.
     credit_overage_rev_cents = 0
     net_comp_cents = max(
         subscription_rev_cents
@@ -584,6 +588,12 @@ async def _subscription_revenue_by_merchant(
         WHERE pa.channel_partner_id = :channel_partner_id
           AND i.billing_period_start = :period_start
           AND i.status = 'paid'
+          AND i.billing_run_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM billing_run_items bri
+            WHERE bri.stripe_invoice_id = i.stripe_invoice_id
+          )
         GROUP BY i.merchant_id
         """,
         {"channel_partner_id": channel_partner_id, "period_start": period_start},
