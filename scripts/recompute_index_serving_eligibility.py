@@ -118,8 +118,9 @@ async def _fetch_and_apply_stream_page(
     attempts = max(int(args.page_retries or 0), 0) + 1
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
-        was_connected = await _connect_if_needed(db)
+        was_connected = False
         try:
+            was_connected = await _connect_if_needed(db)
             page = await audit_serving_contract_violation_page(
                 cursor=cursor,
                 batch_size=args.batch_size,
@@ -165,12 +166,13 @@ async def _drive_stream_pages(
     db: Any = database,
 ) -> Dict[str, Any]:
     max_results = int(args.limit or 0)
-    cursor = ""
+    cursor = str(getattr(args, "start_cursor", "") or "")
     report: Dict[str, Any] = {
         "apply": bool(args.apply),
         "stream_pages": True,
         "limit": args.limit,
         "batch_size": args.batch_size,
+        "start_cursor": cursor,
         "content_key": args.content_key or None,
         "pages_scanned": 0,
         "rows_scanned": 0,
@@ -392,6 +394,14 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Retries per streamed audit page before failing. Default 2.",
+    )
+    parser.add_argument(
+        "--start-cursor",
+        default="",
+        help=(
+            "Optional content_key cursor for --stream-pages resume. The scan "
+            "starts after this content_key."
+        ),
     )
     parser.set_defaults(postcheck=True)
     return parser.parse_args()
