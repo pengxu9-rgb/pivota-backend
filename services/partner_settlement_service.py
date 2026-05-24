@@ -99,6 +99,16 @@ async def run_settlement(billing_run_id: int) -> int:
             comp_dict,
         )
 
+        # When the v2 flag is on, the settlement_file pipeline (PR #8 — the
+        # day-5 generate + day-10 Stripe Connect transfer crons) handles
+        # payment by reading these snapshots directly. Skip the legacy
+        # partner_balance + agent_payouts code path; running both pipelines
+        # against the same snapshots would double-pay the partner (once via
+        # the legacy payout system, once via Stripe Connect transfer).
+        # Surfaced in codex post-merge review of PR #641.
+        if settings.partner_rev_share_use_v2:
+            continue
+
         net_comp_cents = _as_int(comp_dict.get("net_comp_cents"))
         if net_comp_cents > 0:
             await credit_partner_balance(channel_partner_id, net_comp_cents, snapshot_id)
