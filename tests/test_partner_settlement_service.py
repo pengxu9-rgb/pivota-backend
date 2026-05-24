@@ -50,6 +50,26 @@ class _FakeSettlementDatabase:
                 "source_type": "gmv_rollup",
             },
         ]
+        self.monthly_brand_statements = [
+            {
+                "merchant_id": "merch_1",
+                "calendar_month": date(2026, 4, 1),
+                "overage_revenue_usd_cents": 1950,
+                "status": "frozen",
+            },
+            {
+                "merchant_id": "merch_1",
+                "calendar_month": date(2026, 4, 1),
+                "overage_revenue_usd_cents": 500,
+                "status": "open",
+            },
+            {
+                "merchant_id": "merch_1",
+                "calendar_month": date(2026, 3, 1),
+                "overage_revenue_usd_cents": 700,
+                "status": "invoiced",
+            },
+        ]
 
     async def fetch_all(self, query: str, values: dict[str, Any] | None = None):
         params = dict(values or {})
@@ -78,6 +98,24 @@ class _FakeSettlementDatabase:
             {"merchant_id": merchant_id, "revenue_cents": revenue_cents}
             for merchant_id, revenue_cents in sorted(totals.items())
         ]
+
+    async def fetch_one(self, query: str, values: dict[str, Any] | None = None):
+        params = dict(values or {})
+        sql = _normalize_sql(query)
+        if "from monthly_brand_statements mbs" not in sql:
+            raise AssertionError(f"Unhandled fetch_one query: {query}")
+
+        total = 0
+        for statement in self.monthly_brand_statements:
+            merchant_id = str(statement["merchant_id"])
+            if not self._partner_matches(merchant_id, int(params["channel_partner_id"])):
+                continue
+            if statement["status"] not in {"frozen", "invoiced"}:
+                continue
+            if not (params["period_start"] <= statement["calendar_month"] < params["period_end"]):
+                continue
+            total += int(statement["overage_revenue_usd_cents"])
+        return {"revenue_cents": total}
 
     def _partner_matches(self, merchant_id: str, channel_partner_id: int) -> bool:
         return any(
@@ -114,3 +152,19 @@ async def test_subscription_revenue_excludes_gmv_take_invoices(
     sql, _ = db.fetch_all_calls[0]
     assert "i.billing_run_id is null" in sql
     assert "from billing_run_items" in sql
+
+
+@pytest.mark.asyncio
+async def test_credit_overage_for_partner_reads_frozen_statements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _FakeSettlementDatabase()
+    monkeypatch.setattr(service, "database", db)
+
+    revenue = await service._credit_overage_for_partner(
+        7,
+        date(2026, 4, 1),
+        date(2026, 5, 1),
+    )
+
+    assert revenue == 1950

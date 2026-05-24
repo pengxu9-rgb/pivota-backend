@@ -198,10 +198,15 @@ async def compute_partner_comp(
 
     clawbacks = await _compute_churn_clawbacks(channel_partner_id, merchant_ids)
     clawback_total = sum(_as_int(item.get("amount_cents")) for item in clawbacks)
-    # NOTE: Credit overage revenue is unimplemented in v1.3. Overage billing
-    # is scheduled to land in the channel-partner program rebuild (see
-    # project_pivota_channel_partner_program memory). Until then, partners
-    # accrue zero on the credit stream regardless of allowance consumption.
+    # NOTE: Credit-overage revenue is now assembled into monthly_brand_statements
+    # by PR #3 (services/billing/monthly_brand_statements_service.py). The
+    # helper _credit_overage_for_partner() below sums RAW overage revenue
+    # across attributed brands — it is intentionally NOT folded into net_comp
+    # in this PR. The per-(scope, brand_year) credit-share rate from
+    # partner_rate_schedules is wired up by PR #5 (rev-share engine v2);
+    # plugging raw revenue in here would overpay partners by ~6x (the partner
+    # earns ~17% of overage on Y1 Scope B, not 100%). Until PR #5 ships,
+    # partners accrue zero on the credit stream in net_comp.
     credit_overage_rev_cents = 0
     net_comp_cents = max(
         subscription_rev_cents
@@ -635,6 +640,30 @@ async def _gmv_take_revenue_by_merchant(
         str(_row_get(row, "merchant_id")): _as_int(_row_get(row, "revenue_cents"))
         for row in rows
     }
+
+
+async def _credit_overage_for_partner(
+    channel_partner_id: int,
+    period_start: date,
+    period_end: date,
+) -> int:
+    row = await database.fetch_one(
+        """
+        SELECT COALESCE(SUM(mbs.overage_revenue_usd_cents), 0) AS revenue_cents
+        FROM monthly_brand_statements mbs
+        JOIN partner_attribution pa ON pa.merchant_id = mbs.merchant_id
+        WHERE pa.channel_partner_id = :channel_partner_id
+          AND mbs.calendar_month >= :period_start
+          AND mbs.calendar_month < :period_end
+          AND mbs.status IN ('frozen', 'invoiced')
+        """,
+        {
+            "channel_partner_id": channel_partner_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    )
+    return _as_int(_row_get(row, "revenue_cents") if row else 0)
 
 
 async def _attributed_merchants(channel_partner_id: int) -> list[str]:
