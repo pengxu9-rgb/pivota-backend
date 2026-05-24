@@ -17,6 +17,8 @@ def _args(**overrides):
         "sample_limit": 20,
         "postcheck": True,
         "postcheck_limit": 600,
+        "stream_pages": False,
+        "page_retries": 2,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -161,3 +163,85 @@ async def test_apply_violation_uses_audit_state_without_recompute(monkeypatch):
         )
     ]
     assert recomputes == []
+
+
+@pytest.mark.asyncio
+async def test_drive_stream_pages_applies_each_page(monkeypatch):
+    connect_calls = []
+    disconnect_calls = []
+    apply_calls = []
+    cursors = []
+
+    class FakeDb:
+        is_connected = False
+
+        async def connect(self):
+            connect_calls.append(True)
+            self.is_connected = True
+
+        async def disconnect(self):
+            disconnect_calls.append(True)
+            self.is_connected = False
+
+    async def fake_page(**kwargs):
+        cursors.append(kwargs["cursor"])
+        if kwargs["cursor"] == "":
+            return {
+                "next_cursor": "ck_1",
+                "rows_scanned": 1,
+                "done": False,
+                "violations": [
+                    {
+                        "content_key": "ck_1",
+                        "expected_blocker_code": "low_quality",
+                        "input_rows": 1,
+                        "_expected_state": {"content_key": "ck_1"},
+                    }
+                ],
+            }
+        return {
+            "next_cursor": "ck_2",
+            "rows_scanned": 1,
+            "done": True,
+            "violations": [
+                {
+                    "content_key": "ck_2",
+                    "expected_blocker_code": "no_price",
+                    "input_rows": 1,
+                    "_expected_state": {"content_key": "ck_2"},
+                }
+            ],
+        }
+
+    async def fake_apply(violation):
+        apply_calls.append(violation["content_key"])
+        return "applied_audit_state"
+
+    monkeypatch.setattr(module, "audit_serving_contract_violation_page", fake_page)
+    monkeypatch.setattr(module, "_apply_violation", fake_apply)
+
+    report = await module._drive(
+        _args(
+            apply=True,
+            confirm=module.CONFIRM_TOKEN,
+            stream_pages=True,
+            postcheck=False,
+        ),
+        db=FakeDb(),
+    )
+
+    assert cursors == ["", "ck_1"]
+    assert apply_calls == ["ck_1", "ck_2"]
+    assert report["stream_pages"] is True
+    assert report["completed_scan"] is True
+    assert report["pages_scanned"] == 2
+    assert report["rows_scanned"] == 2
+    assert report["violations_found"] == 2
+    assert report["expected_blocker_counts"] == {
+        "low_quality": 1,
+        "no_price": 1,
+    }
+    assert report["applied"]["applied_audit_state"] == 2
+    assert "_expected_state" not in report["samples"][0]
+    assert len(connect_calls) == 2
+    assert len(disconnect_calls) == 2
