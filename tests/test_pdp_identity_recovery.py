@@ -1,4 +1,8 @@
 from services.pdp_identity_recovery import (
+    IDENTITY_LANE_APPROVED_NOT_LIVE,
+    IDENTITY_LANE_LIVE_APPROVED,
+    IDENTITY_LANE_MISSING,
+    IDENTITY_LANE_REVIEW_REQUIRED,
     build_attached_external_seed_group_member_proposal,
     build_ext_identity_group_member_proposal,
     build_external_seed_catalog_group_member_proposal,
@@ -6,6 +10,7 @@ from services.pdp_identity_recovery import (
     build_multi_merchant_group_proposals,
     build_singleton_group_proposal,
     build_stale_title_attachment_proposal,
+    classify_identity_lane,
     deterministic_ext_identity_group_id,
     deterministic_product_group_id,
     make_catalog_product_key,
@@ -350,3 +355,70 @@ def test_ext_identity_group_member_proposal_skips_existing_correct_member() -> N
     )
 
     assert proposal is None
+
+
+def test_classify_identity_lane_missing_when_no_group_member() -> None:
+    lane = classify_identity_lane(
+        {
+            "product_key": "prod::merch::shopify::1",
+            "product_group_id": None,
+            "sync_status": "live",
+            "pdp_lifecycle_stage": "published",
+        }
+    )
+
+    assert lane["identity_lane"] == IDENTITY_LANE_MISSING
+    assert "no product_group_members" in lane["identity_lane_detail"]
+
+
+def test_classify_identity_lane_approved_not_live_for_stale_catalog() -> None:
+    lane = classify_identity_lane(
+        {
+            "product_group_id": "pg_1",
+            "sync_status": "stale",
+            "pdp_lifecycle_stage": "published",
+        }
+    )
+
+    assert lane["identity_lane"] == IDENTITY_LANE_APPROVED_NOT_LIVE
+    assert "sync_status" in lane["identity_lane_detail"]
+
+
+def test_classify_identity_lane_approved_not_live_for_candidate_lifecycle() -> None:
+    lane = classify_identity_lane(
+        {
+            "product_group_id": "pg_1",
+            "sync_status": "live",
+            "pdp_lifecycle_stage": "candidate",
+        }
+    )
+
+    assert lane["identity_lane"] == IDENTITY_LANE_APPROVED_NOT_LIVE
+    assert "pdp_lifecycle_stage" in lane["identity_lane_detail"]
+
+
+def test_classify_identity_lane_review_required_takes_precedence() -> None:
+    lane = classify_identity_lane(
+        {
+            "review_required": True,
+            "review_reason": "exact_title_brand_multi_domain_review_required",
+            "product_group_id": None,
+            "sync_status": "live",
+            "pdp_lifecycle_stage": "published",
+        }
+    )
+
+    assert lane["identity_lane"] == IDENTITY_LANE_REVIEW_REQUIRED
+    assert lane["identity_lane_detail"] == "exact_title_brand_multi_domain_review_required"
+
+
+def test_classify_identity_lane_live_approved_when_group_and_live() -> None:
+    lane = classify_identity_lane(
+        {
+            "product_group_id": "pg_1",
+            "sync_status": "live",
+            "pdp_lifecycle_stage": "validated",
+        }
+    )
+
+    assert lane["identity_lane"] == IDENTITY_LANE_LIVE_APPROVED

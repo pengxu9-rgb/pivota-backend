@@ -29,6 +29,11 @@ DEFAULT_SUSPECT_MERCHANT_IDS = tuple(
     for value in os.getenv("PDP_IDENTITY_RECOVERY_SUSPECT_MERCHANT_IDS", "").split(",")
     if value.strip()
 )
+IDENTITY_LANE_LIVE_APPROVED = "live_approved"
+IDENTITY_LANE_MISSING = "missing"
+IDENTITY_LANE_APPROVED_NOT_LIVE = "approved_not_live"
+IDENTITY_LANE_REVIEW_REQUIRED = "review_required"
+LIVE_IDENTITY_LIFECYCLE_STAGES = {"validated", "published"}
 
 
 def _clean(value: Any) -> str:
@@ -420,6 +425,245 @@ def build_ext_identity_group_member_proposal(row: Dict[str, Any]) -> Optional[Id
         source_product_id=external_product_id,
         is_primary=should_be_primary,
     )
+
+
+def classify_identity_lane(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify a catalog row into the identity operating lane.
+
+    Lane semantics:
+      - missing: no approved product_group_members edge exists.
+      - approved_not_live: approved identity exists, but catalog/live-read
+        state is not ready for public serving.
+      - review_required: ambiguous multi-domain/title/brand signal; do not
+        auto-merge.
+      - live_approved: approved identity is aligned with live catalog state.
+    """
+    if row.get("review_required"):
+        return {
+            "identity_lane": IDENTITY_LANE_REVIEW_REQUIRED,
+            "identity_lane_detail": row.get("review_reason")
+            or "identity requires human review before merge",
+        }
+
+    product_group_id = _clean(row.get("product_group_id"))
+    if not product_group_id:
+        return {
+            "identity_lane": IDENTITY_LANE_MISSING,
+            "identity_lane_detail": "no product_group_members row for catalog product",
+        }
+
+    sync_status = _clean(row.get("sync_status")) or "live"
+    if sync_status != "live":
+        return {
+            "identity_lane": IDENTITY_LANE_APPROVED_NOT_LIVE,
+            "identity_lane_detail": f"catalog_products.sync_status={sync_status!r}",
+        }
+
+    lifecycle_stage = _clean(row.get("pdp_lifecycle_stage"))
+    if lifecycle_stage not in LIVE_IDENTITY_LIFECYCLE_STAGES:
+        return {
+            "identity_lane": IDENTITY_LANE_APPROVED_NOT_LIVE,
+            "identity_lane_detail": (
+                "identity approved but pdp_lifecycle_stage is not "
+                "validated/published"
+            ),
+        }
+
+    return {
+        "identity_lane": IDENTITY_LANE_LIVE_APPROVED,
+        "identity_lane_detail": "approved identity is aligned with live catalog state",
+    }
+
+
+def _lane_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    lane = classify_identity_lane(row)
+    return {
+        "identity_lane": lane["identity_lane"],
+        "identity_lane_detail": lane["identity_lane_detail"],
+        "product_key": row.get("product_key"),
+        "content_key": row.get("content_key"),
+        "merchant_id": row.get("merchant_id"),
+        "platform": row.get("platform"),
+        "source_product_id": row.get("source_product_id"),
+        "title": row.get("title"),
+        "brand": row.get("brand"),
+        "canonical_url": row.get("canonical_url"),
+        "sync_status": row.get("sync_status"),
+        "pdp_lifecycle_stage": row.get("pdp_lifecycle_stage"),
+        "pdp_scope": row.get("pdp_scope"),
+        "product_group_id": row.get("product_group_id"),
+        "has_positive_offer": row.get("has_positive_offer"),
+        "review_cluster_key": row.get("review_cluster_key"),
+    }
+
+
+async def fetch_identity_lane_gap_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        SELECT cp.product_key,
+               cp.content_key,
+               cp.merchant_id,
+               cp.platform,
+               cp.source_product_id,
+               cp.title,
+               cp.brand,
+               cp.canonical_url,
+               cp.sync_status,
+               cp.pdp_lifecycle_stage,
+               cp.pdp_scope,
+               pgm.product_group_id,
+               pgm.is_primary,
+               EXISTS (
+                 SELECT 1
+                 FROM catalog_offers co
+                 WHERE co.product_key = cp.product_key
+                   AND co.suppressed_at IS NULL
+                   AND co.list_price > 0
+               ) AS has_positive_offer
+        FROM catalog_products cp
+        LEFT JOIN product_group_members pgm
+          ON pgm.merchant_id = cp.merchant_id
+         AND pgm.platform = cp.platform
+         AND pgm.platform_product_id = cp.source_product_id
+        WHERE cp.source_product_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM catalog_offers co
+            WHERE co.product_key = cp.product_key
+              AND co.suppressed_at IS NULL
+              AND co.list_price > 0
+          )
+          AND (
+            pgm.product_group_id IS NULL
+            OR cp.sync_status IS DISTINCT FROM 'live'
+            OR COALESCE(cp.pdp_lifecycle_stage, '') NOT IN ('validated', 'published')
+          )
+        ORDER BY
+          CASE
+            WHEN pgm.product_group_id IS NULL THEN 0
+            ELSE 1
+          END,
+          cp.updated_at DESC NULLS LAST,
+          cp.product_key ASC
+        LIMIT :limit OFFSET :offset
+        """,
+        {"limit": int(limit), "offset": int(offset)},
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def fetch_identity_review_required_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(
+        """
+        WITH base AS (
+          SELECT cp.product_key,
+                 cp.content_key,
+                 cp.merchant_id,
+                 cp.platform,
+                 cp.source_product_id,
+                 cp.title,
+                 cp.brand,
+                 cp.canonical_url,
+                 cp.sync_status,
+                 cp.pdp_lifecycle_stage,
+                 cp.pdp_scope,
+                 lower(regexp_replace(coalesce(cp.canonical_url,''), '^https?://([^/]+).*$','\\1')) AS domain,
+                 regexp_replace(lower(btrim(coalesce(cp.title,''))), '[^a-z0-9%+]+', ' ', 'g') AS title_norm,
+                 regexp_replace(lower(btrim(coalesce(cp.brand,''))), '[^a-z0-9%+]+', ' ', 'g') AS brand_norm,
+                 pgm.product_group_id,
+                 EXISTS (
+                   SELECT 1
+                   FROM catalog_offers co
+                   WHERE co.product_key = cp.product_key
+                     AND co.suppressed_at IS NULL
+                     AND co.list_price > 0
+                 ) AS has_positive_offer
+          FROM catalog_products cp
+          LEFT JOIN product_group_members pgm
+            ON pgm.merchant_id = cp.merchant_id
+           AND pgm.platform = cp.platform
+           AND pgm.platform_product_id = cp.source_product_id
+          WHERE cp.merchant_id = 'external_seed'
+            AND cp.source_product_id IS NOT NULL
+            AND EXISTS (
+              SELECT 1
+              FROM catalog_offers co
+              WHERE co.product_key = cp.product_key
+                AND co.suppressed_at IS NULL
+                AND co.list_price > 0
+            )
+        ),
+        clusters AS (
+          SELECT title_norm,
+                 brand_norm,
+                 COUNT(DISTINCT product_key)::int AS products,
+                 COUNT(DISTINCT domain)::int AS domains,
+                 COUNT(DISTINCT product_group_id) FILTER (WHERE product_group_id IS NOT NULL)::int AS groups,
+                 COUNT(*) FILTER (WHERE product_group_id IS NULL)::int AS missing_group_rows
+          FROM base
+          WHERE title_norm <> '' AND brand_norm <> ''
+          GROUP BY title_norm, brand_norm
+          HAVING COUNT(DISTINCT product_key) > 1
+             AND COUNT(DISTINCT domain) > 1
+             AND (
+               COUNT(DISTINCT product_group_id) FILTER (WHERE product_group_id IS NOT NULL) > 1
+               OR COUNT(*) FILTER (WHERE product_group_id IS NULL) > 0
+             )
+        )
+        SELECT base.*,
+               TRUE AS review_required,
+               'exact_title_brand_multi_domain_review_required' AS review_reason,
+               base.title_norm || '::' || base.brand_norm AS review_cluster_key
+        FROM base
+        JOIN clusters
+          ON clusters.title_norm = base.title_norm
+         AND clusters.brand_norm = base.brand_norm
+        ORDER BY base.title_norm ASC, base.domain ASC, base.product_key ASC
+        LIMIT :limit OFFSET :offset
+        """,
+        {"limit": int(limit), "offset": int(offset)},
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def build_identity_lane_report(*, limit: int, offset: int) -> Dict[str, Any]:
+    gap_rows = await fetch_identity_lane_gap_rows(limit=limit, offset=offset)
+    review_rows = await fetch_identity_review_required_rows(limit=limit, offset=offset)
+    recovery = await build_recovery_proposals(limit=limit, offset=offset)
+
+    items_by_product_key: Dict[str, Dict[str, Any]] = {}
+    for row in review_rows:
+        product_key = _clean(row.get("product_key"))
+        if product_key:
+            items_by_product_key[product_key] = _lane_item(row)
+    for row in gap_rows:
+        product_key = _clean(row.get("product_key"))
+        if product_key and product_key not in items_by_product_key:
+            items_by_product_key[product_key] = _lane_item(row)
+
+    items = list(items_by_product_key.values())
+    lane_counts: Dict[str, int] = {}
+    for item in items:
+        lane = str(item.get("identity_lane") or "unknown")
+        lane_counts[lane] = lane_counts.get(lane, 0) + 1
+
+    return {
+        "dry_run": True,
+        "limit": int(limit),
+        "offset": int(offset),
+        "lane_counts": lane_counts,
+        "rows_considered": {
+            "identity_gap_rows": len(gap_rows),
+            "review_required_rows": len(review_rows),
+            "deduped_lane_items": len(items),
+        },
+        "lanes": items,
+        "proposal_preview": {
+            "proposal_counts": recovery.get("proposal_counts", {}),
+            "proposal_reason_counts": recovery.get("proposal_reason_counts", {}),
+            "rejected_count": len(recovery.get("rejected", [])),
+        },
+    }
 
 
 async def fetch_internal_group_gap_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
