@@ -37,7 +37,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Dict, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, func, select, table
 
 from db.catalog import catalog_products
 from db.database import database
@@ -90,6 +90,17 @@ async def _bounded_db(awaitable: Awaitable[T], operation: str) -> T:
                 "timeout_seconds": CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS,
             },
         ) from exc
+
+
+index_pipeline_state = table(
+    "index_pipeline_state",
+    column("content_key", String),
+    column("serving_eligible", Boolean),
+    column("blocker_code", Text),
+    column("blocker_detail", Text),
+    column("content_quality_score", Float),
+    column("quality_scored_at", DateTime),
+)
 
 
 def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -175,7 +186,19 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             catalog_products.c.pivota_canonical_url,
             catalog_products.c.updated_at,
         )
-        .where(catalog_products.c.pivota_signature_id == sig)
+        .select_from(
+            catalog_products.join(
+                index_pipeline_state,
+                catalog_products.c.content_key == index_pipeline_state.c.content_key,
+            )
+        )
+        .where(
+            and_(
+                catalog_products.c.pivota_signature_id == sig,
+                catalog_products.c.content_key.isnot(None),
+                index_pipeline_state.c.serving_eligible.is_(True),
+            )
+        )
         .limit(1)
     )
     row = await _bounded_db(database.fetch_one(query), "product_by_signature")
@@ -203,42 +226,84 @@ async def list_canonical_pdp_signatures(
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> Dict[str, Any]:
-    """Paginated list of all canonical PDP signatures. Backs the
-    pivota-agent-ui sitemap-products.xml route. Returns minimal fields
-    (sig_id + canonical_url + last_modified) — no need for the full
-    product object; sitemap only needs URL + lastmod."""
-    # Fetch one extra row to expose a total lower-bound without paying for
-    # COUNT(*). The sitemap consumer accepts total as a continuation hint.
-    page_limit = limit + 1
+    """Paginated list of public-serving canonical PDP signatures.
+
+    This route backs the pivota-agent-ui product sitemap. It must use the
+    same fail-closed serving gate as the PDP read path: a sig is public only
+    when its content_key is present in index_pipeline_state with
+    serving_eligible=TRUE.
+    """
+    eligibility_filter = and_(
+        catalog_products.c.pivota_signature_id.isnot(None),
+        catalog_products.c.pivota_signature_id.like("sig_%"),
+        catalog_products.c.content_key.isnot(None),
+        index_pipeline_state.c.serving_eligible.is_(True),
+    )
+    serving_join = catalog_products.join(
+        index_pipeline_state,
+        catalog_products.c.content_key == index_pipeline_state.c.content_key,
+    )
+
+    total_q = (
+        select(func.count())
+        .select_from(serving_join)
+        .where(eligibility_filter)
+    )
+    total = int(
+        await _bounded_db(database.fetch_val(total_q), "product_signature_count") or 0
+    )
+
     rows_q = (
         select(
+            catalog_products.c.product_key,
             catalog_products.c.pivota_signature_id,
+            catalog_products.c.content_key,
             catalog_products.c.pivota_canonical_url,
             catalog_products.c.updated_at,
+            index_pipeline_state.c.serving_eligible,
+            index_pipeline_state.c.blocker_code,
+            index_pipeline_state.c.blocker_detail,
+            index_pipeline_state.c.content_quality_score,
+            index_pipeline_state.c.quality_scored_at,
         )
-        .where(catalog_products.c.pivota_signature_id.isnot(None))
-        .order_by(catalog_products.c.pivota_signature_id.asc())
-        .limit(page_limit)
+        .select_from(serving_join)
+        .where(eligibility_filter)
+        .order_by(
+            catalog_products.c.updated_at.desc(),
+            catalog_products.c.pivota_signature_id.asc(),
+            catalog_products.c.content_key.asc(),
+            catalog_products.c.product_key.asc(),
+        )
+        .limit(limit)
         .offset(offset)
     )
     rows = await _bounded_db(database.fetch_all(rows_q), "product_signature_list")
-    page_rows = rows[:limit]
-    has_more = len(rows) > limit
+    has_more = offset + len(rows) < total
     items = [
         {
             "sig_id": r["pivota_signature_id"],
+            "content_key": r["content_key"],
             "canonical_url": r["pivota_canonical_url"],
+            "serving_eligible": bool(r["serving_eligible"]),
+            "blocker_code": r["blocker_code"],
+            "blocker_detail": r["blocker_detail"],
+            "content_quality_score": r["content_quality_score"],
+            "quality_scored_at": (
+                r["quality_scored_at"].isoformat()
+                if isinstance(r["quality_scored_at"], datetime)
+                else None
+            ),
             "last_modified": (
                 r["updated_at"].isoformat()
                 if isinstance(r["updated_at"], datetime)
                 else None
             ),
         }
-        for r in page_rows
+        for r in rows
     ]
     return {
         "items": items,
-        "total": offset + len(items) + (1 if has_more else 0),
+        "total": total,
         "limit": limit,
         "offset": offset,
         "has_more": has_more,
