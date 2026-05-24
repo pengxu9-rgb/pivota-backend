@@ -103,6 +103,9 @@ class Settings(BaseSettings):
     
     # Metrics feature flag
     metrics_query_version: str = os.getenv("METRICS_QUERY_VERSION", "legacy")  # legacy | new
+    partner_rev_share_use_v2: bool = (
+        os.getenv("PARTNER_REV_SHARE_USE_V2", "false").lower() == "true"
+    )
 
     # Nightly backfill guard
     enable_nightly_psp_id_backfill: bool = os.getenv("ENABLE_NIGHTLY_PSP_ID_BACKFILL", "false").lower() == "true"
