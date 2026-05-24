@@ -86,7 +86,8 @@ async def _ensure_schema() -> None:
             sku_key TEXT,
             product_key TEXT,
             merchant_id TEXT,
-            list_price REAL
+            list_price REAL,
+            suppressed_at TIMESTAMP
         )
         """,
         """
@@ -142,6 +143,9 @@ async def _ensure_schema() -> None:
     ]
     for statement in ddl:
         await database.execute(statement)
+    offer_columns = await database.fetch_all("PRAGMA table_info(catalog_offers)")
+    if "suppressed_at" not in {dict(row).get("name") for row in offer_columns}:
+        await database.execute("ALTER TABLE catalog_offers ADD COLUMN suppressed_at TIMESTAMP")
 
 
 async def _cleanup() -> None:
@@ -528,6 +532,78 @@ async def test_recompute_nonexistent_content_key_returns_false() -> None:
         row = await _ips_row("ck_vis2_missing")
         assert result is False
         assert row is None
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_audit_serving_contract_violations_reuses_canonical_classifier() -> None:
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product(
+            "contract_violation",
+            identity=False,
+            pdp_scope="unverified",
+        )
+        await database.execute(
+            """
+            INSERT INTO index_pipeline_state (
+                content_key, pivota_signature_id, merchant_id, pipeline_stage,
+                blocker_code, serving_eligible, identity_resolved, has_image,
+                has_price, description_length
+            ) VALUES (
+                :content_key, :signature_id, :merchant_id, 'public_indexed',
+                'none', TRUE, TRUE, TRUE, TRUE, 120
+            )
+            """,
+            {
+                "content_key": ids["content_key"],
+                "signature_id": ids["signature_id"],
+                "merchant_id": ids["merchant_id"],
+            },
+        )
+
+        violations = await svc.audit_serving_contract_violations(
+            limit=10,
+            batch_size=2,
+        )
+
+        assert len(violations) == 1
+        assert violations[0]["content_key"] == ids["content_key"]
+        assert violations[0]["expected_blocker_code"] == "entity_unresolved"
+        assert violations[0]["identity_resolved"] is False
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_fail_close_index_pipeline_state_demotes_orphan_serving_row() -> None:
+    was_connected = await _prepare_db()
+    try:
+        await database.execute(
+            """
+            INSERT INTO index_pipeline_state (
+                content_key, pipeline_stage, blocker_code, serving_eligible,
+                identity_resolved, has_image, has_price
+            ) VALUES (
+                'ck_vis2_orphan_ips', 'public_indexed', 'none', TRUE,
+                TRUE, TRUE, TRUE
+            )
+            """
+        )
+
+        await svc.fail_close_index_pipeline_state(
+            "ck_vis2_orphan_ips",
+            blocker_code="not_live",
+            blocker_detail="no catalog_products rows found during unit test",
+        )
+
+        row = await _ips_row("ck_vis2_orphan_ips")
+        assert row is not None
+        assert bool(row["serving_eligible"]) is False
+        assert row["blocker_code"] == "not_live"
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)

@@ -677,6 +677,43 @@ ON CONFLICT (content_key) DO UPDATE SET
 """
 
 
+_SERVING_ELIGIBLE_INDEX_ROWS_QUERY = """
+SELECT
+    content_key,
+    blocker_code,
+    pipeline_stage,
+    last_consolidated_at
+FROM index_pipeline_state
+WHERE serving_eligible = TRUE
+  AND content_key > :cursor
+ORDER BY content_key
+LIMIT :batch_size
+"""
+
+_SERVING_ELIGIBLE_INDEX_ROW_QUERY = """
+SELECT
+    content_key,
+    blocker_code,
+    pipeline_stage,
+    last_consolidated_at
+FROM index_pipeline_state
+WHERE serving_eligible = TRUE
+  AND content_key = :content_key
+LIMIT 1
+"""
+
+_FAIL_CLOSE_QUERY = """
+UPDATE index_pipeline_state
+SET
+    serving_eligible     = FALSE,
+    blocker_code         = :blocker_code,
+    blocker_detail       = :blocker_detail,
+    consolidation_version = :consolidation_version,
+    last_consolidated_at = :last_consolidated_at
+WHERE content_key = :content_key
+"""
+
+
 def _is_sqlite_database() -> bool:
     db_url = str(getattr(database, "url", "") or "").lower()
     return db_url.startswith(("sqlite://", "sqlite+aiosqlite://"))
@@ -707,6 +744,130 @@ async def _upsert_index_pipeline_state(
     upsert_values = dict(state)
     upsert_values["content_key"] = content_key
     await database.execute(_UPSERT_QUERY, upsert_values)
+
+
+async def _fetch_serving_eligible_index_rows(
+    *,
+    cursor: str = "",
+    batch_size: int = 500,
+    content_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch current IPS rows that claim public serving eligibility."""
+    if content_key:
+        rows = await database.fetch_all(
+            _SERVING_ELIGIBLE_INDEX_ROW_QUERY,
+            {"content_key": content_key},
+        )
+    else:
+        rows = await database.fetch_all(
+            _SERVING_ELIGIBLE_INDEX_ROWS_QUERY,
+            {
+                "cursor": cursor or "",
+                "batch_size": max(int(batch_size or 500), 1),
+            },
+        )
+    return [dict(row) for row in rows or []]
+
+
+async def fail_close_index_pipeline_state(
+    content_key: str,
+    *,
+    blocker_code: str,
+    blocker_detail: str,
+) -> None:
+    """Demote an IPS row when source rows are gone and recompute cannot classify.
+
+    Normal recompute derives state from catalog_products. If the catalog row was
+    hard-deleted, there is nothing to classify, but public serving must still
+    fail closed until the nightly orphan cleanup deletes derived IPS state.
+    """
+    await database.execute(
+        _FAIL_CLOSE_QUERY,
+        {
+            "content_key": content_key,
+            "blocker_code": blocker_code,
+            "blocker_detail": blocker_detail,
+            "consolidation_version": CONSOLIDATION_VERSION,
+            "last_consolidated_at": datetime.now(timezone.utc),
+        },
+    )
+
+
+async def audit_serving_contract_violations(
+    *,
+    limit: int = 500,
+    batch_size: int = 500,
+    content_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return IPS rows that are marked serving_eligible but no longer pass.
+
+    This is the canonical serving-contract audit: it reuses the same
+    _fetch_eligibility_inputs + _classify_content_key_rows path as realtime
+    recompute instead of duplicating the gate in selector SQL.
+    """
+    max_results = int(limit or 0)
+    page_size = max(int(batch_size or 500), 1)
+    regression_domains = await _fetch_regression_domains()
+    cursor = ""
+    violations: List[Dict[str, Any]] = []
+
+    while True:
+        current_rows = await _fetch_serving_eligible_index_rows(
+            cursor=cursor,
+            batch_size=page_size,
+            content_key=content_key,
+        )
+        if not current_rows:
+            break
+
+        for current in current_rows:
+            ck = str(current.get("content_key") or "").strip()
+            if not ck:
+                continue
+            input_rows = await _fetch_eligibility_inputs(ck)
+            if not input_rows:
+                violations.append({
+                    "content_key": ck,
+                    "current_blocker_code": current.get("blocker_code"),
+                    "current_pipeline_stage": current.get("pipeline_stage"),
+                    "expected_serving_eligible": False,
+                    "expected_blocker_code": "not_live",
+                    "expected_blocker_detail": (
+                        "no catalog_products rows found for content_key during "
+                        "serving contract audit"
+                    ),
+                    "expected_pipeline_stage": "discovered",
+                    "input_rows": 0,
+                })
+            else:
+                expected = _classify_content_key_rows(input_rows, regression_domains)
+                if expected is not None and not bool(expected.get("serving_eligible")):
+                    violations.append({
+                        "content_key": ck,
+                        "current_blocker_code": current.get("blocker_code"),
+                        "current_pipeline_stage": current.get("pipeline_stage"),
+                        "expected_serving_eligible": False,
+                        "expected_blocker_code": expected.get("blocker_code"),
+                        "expected_blocker_detail": expected.get("blocker_detail"),
+                        "expected_pipeline_stage": expected.get("pipeline_stage"),
+                        "input_rows": len(input_rows),
+                        "has_image": expected.get("has_image"),
+                        "has_price": expected.get("has_price"),
+                        "identity_resolved": expected.get("identity_resolved"),
+                        "description_length": expected.get("description_length"),
+                        "content_quality_score": expected.get("content_quality_score"),
+                    })
+
+            if max_results > 0 and len(violations) >= max_results:
+                return violations
+
+        if content_key:
+            break
+        cursor = str(current_rows[-1].get("content_key") or "")
+        if len(current_rows) < page_size:
+            break
+
+    return violations
 
 
 async def recompute_serving_eligibility(
