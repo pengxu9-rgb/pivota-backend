@@ -27,19 +27,25 @@ class FakeDb:
 
     def __init__(self, rows: List[Dict[str, Any]]) -> None:
         self._rows = rows
+        self.compiled_sql: List[str] = []
 
     async def fetch_one(self, query):
         try:
             sql = str(query.compile(compile_kwargs={"literal_binds": True}))
         except Exception:
             return None
+        self.compiled_sql.append(sql)
         import re
         m = re.search(r"pivota_signature_id\s*=\s*'([^']+)'", sql)
         if not m:
             return None
         sig = m.group(1)
         for r in self._rows:
-            if r.get("pivota_signature_id") == sig:
+            if (
+                r.get("pivota_signature_id") == sig
+                and r.get("content_key")
+                and r.get("serving_eligible") is True
+            ):
                 return r
         return None
 
@@ -49,18 +55,38 @@ class FakeDb:
             sql = str(query.compile(compile_kwargs={"literal_binds": True}))
         except Exception:
             return []
+        self.compiled_sql.append(sql)
         # Crude limit/offset parse.
         import re
         m_lim = re.search(r"LIMIT\s+(\d+)", sql, re.I)
         m_off = re.search(r"OFFSET\s+(\d+)", sql, re.I)
         lim = int(m_lim.group(1)) if m_lim else 200
         off = int(m_off.group(1)) if m_off else 0
-        with_sig = [r for r in self._rows if r.get("pivota_signature_id")]
+        with_sig = [
+            r
+            for r in self._rows
+            if r.get("pivota_signature_id")
+            and r.get("content_key")
+            and r.get("serving_eligible") is True
+        ]
         return with_sig[off : off + lim]
 
     async def fetch_val(self, query):
-        # Just used for COUNT — return total of rows with sig.
-        return len([r for r in self._rows if r.get("pivota_signature_id")])
+        try:
+            sql = str(query.compile(compile_kwargs={"literal_binds": True}))
+        except Exception:
+            sql = ""
+        self.compiled_sql.append(sql)
+        # Just used for COUNT — return total of public-serving rows with sig.
+        return len(
+            [
+                r
+                for r in self._rows
+                if r.get("pivota_signature_id")
+                and r.get("content_key")
+                and r.get("serving_eligible") is True
+            ]
+        )
 
 
 class SlowDb:
@@ -87,6 +113,12 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "product_payload": {"id": sig_suffix, "handle": sig_suffix},
         "pivota_signature_id": f"sig_{sig_suffix}",
         "pivota_canonical_url": f"https://agent.pivota.cc/products/sig_{sig_suffix}",
+        "content_key": f"ck_{sig_suffix}",
+        "serving_eligible": True,
+        "blocker_code": None,
+        "blocker_detail": None,
+        "content_quality_score": 91.0,
+        "quality_scored_at": datetime(2026, 5, 7, tzinfo=timezone.utc),
         "updated_at": datetime(2026, 5, 7, tzinfo=timezone.utc),
     }
     base.update(overrides)
@@ -100,7 +132,8 @@ def env(monkeypatch: pytest.MonkeyPatch):
     rows = [
         _row("abc"),
         _row("def", brand="Other Brand"),
-        _row("xyz", title="No-image SKU", image_url=None),
+        _row("xyz", title="No-image SKU", image_url=None, serving_eligible=False, blocker_code="no_image"),
+        _row("noimg", title="Eligible No-image SKU", image_url=None),
         # one row without a sig to confirm the list endpoint filters it out
         {
             **_row("nosig"),
@@ -147,14 +180,21 @@ def test_get_canonical_pdp_400_for_malformed_sig(env):
     assert "sig_" in res.json()["detail"]
 
 
-def test_get_canonical_pdp_handles_missing_image_gracefully(env):
+def test_get_canonical_pdp_handles_missing_image_gracefully_for_eligible_rows(env):
     client = env
-    res = client.get("/api/canonical/products/sig_xyz")
+    res = client.get("/api/canonical/products/sig_noimg")
     assert res.status_code == 200
     p = res.json()["product"]
-    assert p["title"] == "No-image SKU"
+    assert p["title"] == "Eligible No-image SKU"
     assert p["image_url"] is None
     assert p["main_image_url"] is None
+
+
+def test_get_canonical_pdp_404_for_blocked_sig(env):
+    client = env
+    res = client.get("/api/canonical/products/sig_xyz")
+    assert res.status_code == 404
+    assert res.json()["detail"]["sig_id"] == "sig_xyz"
 
 
 # ---------------------------------------------------------------------------
@@ -162,18 +202,24 @@ def test_get_canonical_pdp_handles_missing_image_gracefully(env):
 # ---------------------------------------------------------------------------
 
 
-def test_list_canonical_pdps_returns_only_rows_with_sig(env):
+def test_list_canonical_pdps_returns_only_serving_eligible_rows_with_sig(env):
     client = env
     res = client.get("/api/canonical/products")
     assert res.status_code == 200
     body = res.json()
-    # 3 rows have sigs; 1 doesn't
+    # abc/def/noimg are serving eligible; xyz has a sig but is blocked.
     assert body["total"] == 3
     assert body["has_more"] is False
     assert len(body["items"]) == 3
     sigs = [item["sig_id"] for item in body["items"]]
     assert all(s.startswith("sig_") for s in sigs)
+    assert "sig_xyz" not in sigs
     assert "sig_nosig" not in sigs
+    for item in body["items"]:
+        assert item["serving_eligible"] is True
+        assert item["content_key"].startswith("ck_")
+        assert item["blocker_code"] is None
+        assert item["quality_scored_at"] == "2026-05-07T00:00:00+00:00"
 
 
 def test_list_canonical_pdps_pagination_bounds(env):
@@ -191,6 +237,18 @@ def test_list_canonical_pdps_pagination_bounds(env):
     assert len(body2["items"]) == 1
     assert body2["total"] == 3
     assert body2["has_more"] is False
+
+
+def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
+    client = env
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+
+    from routes import pivota_canonical_routes as pcr
+
+    sql = "\n".join(pcr.database.compiled_sql)
+    assert "JOIN index_pipeline_state" in sql
+    assert "serving_eligible IS true" in sql
 
 
 def test_list_canonical_pdps_rejects_oversized_limit(env):
