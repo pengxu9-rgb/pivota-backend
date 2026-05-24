@@ -28,6 +28,10 @@ Job registration happens at start-up time. Currently registers:
   cadence than executor worker because verifiers are not latency-
   critical.
 - `verification_run_lease_reaper` — fires every 60 seconds.
+- `settlement_file_generate` — in-process monthly day-5 UTC cron,
+  generates prior-month partner settlement files from snapshots.
+- `settlement_file_transfer` — in-process monthly day-10 UTC cron,
+  transfers prior-month pending settlement files through Stripe Connect.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -204,6 +208,7 @@ async def start_scheduler() -> None:
         from services.gmv_aggregation_service import aggregate_daily
         from services.invoice_generation_service import run_billing_cycle
         from services.partner_settlement_service import run_settlement
+        from services import settlement_file_service
         from jobs.stamp_attribution_reaper_job import run_stamp_attribution_reaper_tick
         from db.database import database
 
@@ -250,6 +255,32 @@ async def start_scheduler() -> None:
             logger.info(
                 "audit_scheduler: partner_settlement_monthly billing_run_id=%s -> %d payout rows",
                 billing_run_id, n_payouts,
+            )
+
+        async def _generate_prior_month_for_all_partners() -> None:
+            """PR #8 day-5 wrapper: generate prior-month settlement files."""
+            today = _dt.now(_tz.utc).date()
+            prior_month = (today.replace(day=1) - _td(days=1)).replace(day=1)
+            file_ids = await settlement_file_service.generate_for_all_active_partners(
+                prior_month
+            )
+            logger.info(
+                "audit_scheduler: settlement_file_generate %s -> %d file rows",
+                prior_month,
+                len(file_ids),
+            )
+
+        async def _transfer_prior_month_for_all_partners() -> None:
+            """PR #8 day-10 wrapper: transfer prior-month pending settlement files."""
+            today = _dt.now(_tz.utc).date()
+            prior_month = (today.replace(day=1) - _td(days=1)).replace(day=1)
+            results = await settlement_file_service.transfer_all_pending_for_month(
+                prior_month
+            )
+            logger.info(
+                "audit_scheduler: settlement_file_transfer %s -> %d file rows",
+                prior_month,
+                len(results),
             )
 
         # T5 — credit reservation reaper, every 5 minutes (ACTIVE).
@@ -333,6 +364,39 @@ async def start_scheduler() -> None:
             next_run_time=None,  # paused — see Stage 1 §0 and Stage 4 promotion
         )
 
+        # PR #8 — settlement file generation, monthly on day 5 02:00 UTC.
+        # Generates DB-only settlement_files rows for the previous calendar
+        # month. Safe in staging because no external call is made.
+        scheduler.add_job(
+            _generate_prior_month_for_all_partners,
+            "cron",
+            day=5,
+            hour=2,
+            minute=0,
+            id="settlement_file_generate",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # PR #8 — Stripe Connect transfer, monthly on day 10 02:00 UTC.
+        # Registered in-process alongside the audit scheduler; the service
+        # itself gates real Stripe transfers to production unless an explicit
+        # staging override env var is set.
+        scheduler.add_job(
+            _transfer_prior_month_for_all_partners,
+            "cron",
+            day=10,
+            hour=2,
+            minute=0,
+            id="settlement_file_transfer",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
@@ -348,7 +412,9 @@ async def start_scheduler() -> None:
             "+ stamp_attribution_reaper (5min, ACTIVE) "
             "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "
             "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
-            "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED)"
+            "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "
+            "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
+            "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
