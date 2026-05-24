@@ -31,11 +31,13 @@ own gateway/sitemap from working.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+import asyncio
+import os
+from datetime import datetime
+from typing import Any, Awaitable, Dict, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select, func
+from sqlalchemy import select
 
 from db.catalog import catalog_products
 from db.database import database
@@ -45,6 +47,49 @@ router = APIRouter(
     prefix="/api/canonical",
     tags=["canonical-pdp"],
 )
+
+T = TypeVar("T")
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS = _env_float(
+    "CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS",
+    4.0,
+    min_value=0.2,
+    max_value=15.0,
+)
+
+
+async def _bounded_db(awaitable: Awaitable[T], operation: str) -> T:
+    try:
+        return await asyncio.wait_for(
+            awaitable,
+            timeout=CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        logger.warning(
+            "canonical_products route timed out",
+            extra={
+                "operation": operation,
+                "timeout_seconds": CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "message": "Canonical products lookup timed out",
+                "operation": operation,
+                "timeout_seconds": CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS,
+            },
+        ) from exc
 
 
 def _shape_product_for_pdp(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,7 +178,7 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
         .where(catalog_products.c.pivota_signature_id == sig)
         .limit(1)
     )
-    row = await database.fetch_one(query)
+    row = await _bounded_db(database.fetch_one(query), "product_by_signature")
     if not row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -162,15 +207,9 @@ async def list_canonical_pdp_signatures(
     pivota-agent-ui sitemap-products.xml route. Returns minimal fields
     (sig_id + canonical_url + last_modified) — no need for the full
     product object; sitemap only needs URL + lastmod."""
-    # Total count (cached upstream by the sitemap consumer; this is a
-    # simple SELECT COUNT — fine on the indexed column for now).
-    total_q = (
-        select(func.count())
-        .select_from(catalog_products)
-        .where(catalog_products.c.pivota_signature_id.isnot(None))
-    )
-    total = await database.fetch_val(total_q) or 0
-
+    # Fetch one extra row to expose a total lower-bound without paying for
+    # COUNT(*). The sitemap consumer accepts total as a continuation hint.
+    page_limit = limit + 1
     rows_q = (
         select(
             catalog_products.c.pivota_signature_id,
@@ -178,11 +217,13 @@ async def list_canonical_pdp_signatures(
             catalog_products.c.updated_at,
         )
         .where(catalog_products.c.pivota_signature_id.isnot(None))
-        .order_by(catalog_products.c.updated_at.desc())
-        .limit(limit)
+        .order_by(catalog_products.c.pivota_signature_id.asc())
+        .limit(page_limit)
         .offset(offset)
     )
-    rows = await database.fetch_all(rows_q)
+    rows = await _bounded_db(database.fetch_all(rows_q), "product_signature_list")
+    page_rows = rows[:limit]
+    has_more = len(rows) > limit
     items = [
         {
             "sig_id": r["pivota_signature_id"],
@@ -193,11 +234,12 @@ async def list_canonical_pdp_signatures(
                 else None
             ),
         }
-        for r in rows
+        for r in page_rows
     ]
     return {
         "items": items,
-        "total": int(total),
+        "total": offset + len(items) + (1 if has_more else 0),
         "limit": limit,
         "offset": offset,
+        "has_more": has_more,
     }

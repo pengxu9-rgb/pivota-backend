@@ -5,6 +5,7 @@ HTTP-level tests for the canonical PDP resolver
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -60,6 +61,16 @@ class FakeDb:
     async def fetch_val(self, query):
         # Just used for COUNT — return total of rows with sig.
         return len([r for r in self._rows if r.get("pivota_signature_id")])
+
+
+class SlowDb:
+    async def fetch_one(self, query):
+        await asyncio.sleep(0.1)
+        return None
+
+    async def fetch_all(self, query):
+        await asyncio.sleep(0.1)
+        return []
 
 
 def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
@@ -158,6 +169,7 @@ def test_list_canonical_pdps_returns_only_rows_with_sig(env):
     body = res.json()
     # 3 rows have sigs; 1 doesn't
     assert body["total"] == 3
+    assert body["has_more"] is False
     assert len(body["items"]) == 3
     sigs = [item["sig_id"] for item in body["items"]]
     assert all(s.startswith("sig_") for s in sigs)
@@ -171,10 +183,14 @@ def test_list_canonical_pdps_pagination_bounds(env):
     assert body["limit"] == 2
     assert body["offset"] == 0
     assert len(body["items"]) == 2
+    assert body["total"] == 3
+    assert body["has_more"] is True
 
     res2 = client.get("/api/canonical/products?limit=2&offset=2")
     body2 = res2.json()
     assert len(body2["items"]) == 1
+    assert body2["total"] == 3
+    assert body2["has_more"] is False
 
 
 def test_list_canonical_pdps_rejects_oversized_limit(env):
@@ -182,3 +198,35 @@ def test_list_canonical_pdps_rejects_oversized_limit(env):
     client = env
     res = client.get("/api/canonical/products?limit=10000")
     assert res.status_code == 422
+
+
+def test_get_canonical_pdp_times_out_slow_database(monkeypatch: pytest.MonkeyPatch):
+    from routes import pivota_canonical_routes as pcr
+
+    monkeypatch.setattr(pcr, "database", SlowDb())
+    monkeypatch.setattr(pcr, "CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS", 0.01)
+
+    app = FastAPI()
+    app.include_router(pcr.router)
+    client = TestClient(app)
+
+    res = client.get("/api/canonical/products/sig_abc")
+
+    assert res.status_code == 504
+    assert res.json()["detail"]["operation"] == "product_by_signature"
+
+
+def test_list_canonical_pdps_times_out_slow_database(monkeypatch: pytest.MonkeyPatch):
+    from routes import pivota_canonical_routes as pcr
+
+    monkeypatch.setattr(pcr, "database", SlowDb())
+    monkeypatch.setattr(pcr, "CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS", 0.01)
+
+    app = FastAPI()
+    app.include_router(pcr.router)
+    client = TestClient(app)
+
+    res = client.get("/api/canonical/products")
+
+    assert res.status_code == 504
+    assert res.json()["detail"]["operation"] == "product_signature_list"
