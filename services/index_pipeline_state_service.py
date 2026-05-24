@@ -397,7 +397,16 @@ def _classify_content_key_rows(
     return _select_content_key_state(states)
 
 
-_ELIGIBILITY_COLUMNS = """
+_HAS_OFFER_SNAPSHOT_COLUMN = """
+    (
+        SELECT TRUE
+        FROM external_offer_snapshots eos
+        WHERE eos.canonical_url = cp.canonical_url
+        LIMIT 1
+    )                           AS has_offer_snapshot
+""".strip()
+
+_ELIGIBILITY_COLUMNS = f"""
     cp.content_key,
     cp.product_key,
     cp.pivota_signature_id,
@@ -428,14 +437,18 @@ _ELIGIBILITY_COLUMNS = """
           AND co.list_price > 0
         LIMIT 1
     )                           AS has_price,
-    (
-        SELECT TRUE
-        FROM external_offer_snapshots eos
-        WHERE eos.canonical_url = cp.canonical_url
-        LIMIT 1
-    )                           AS has_offer_snapshot,
+{_HAS_OFFER_SNAPSHOT_COLUMN},
     pgm.product_group_id
 """
+
+# `has_offer_snapshot` only influences the low-confidence crawled/discovered
+# stage, not public serving eligibility. Full audit pages must avoid probing
+# external_offer_snapshots by canonical_url because prod has no index on that
+# column; single-key recompute keeps the complete canonical input query.
+_AUDIT_ELIGIBILITY_COLUMNS = _ELIGIBILITY_COLUMNS.replace(
+    _HAS_OFFER_SNAPSHOT_COLUMN,
+    "    FALSE                       AS has_offer_snapshot",
+)
 
 _ELIGIBILITY_LATERAL_JOINS = """
 LEFT JOIN LATERAL (
@@ -497,6 +510,15 @@ SELECT
 FROM catalog_products cp
 {_ELIGIBILITY_LATERAL_JOINS}
 WHERE cp.content_key = :content_key
+ORDER BY cp.content_key, cp.updated_at DESC NULLS LAST, cp.product_key
+"""
+
+_MULTI_QUERY = f"""
+SELECT
+{_AUDIT_ELIGIBILITY_COLUMNS}
+FROM catalog_products cp
+{_ELIGIBILITY_LATERAL_JOINS}
+WHERE cp.content_key = ANY(:content_keys)
 ORDER BY cp.content_key, cp.updated_at DESC NULLS LAST, cp.product_key
 """
 
@@ -736,6 +758,32 @@ async def _fetch_eligibility_inputs(content_key: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+async def _fetch_eligibility_inputs_for_content_keys(
+    content_keys: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch eligibility signal rows for a page of content_keys.
+
+    Production Postgres can fetch a full audit page in one query. SQLite tests
+    keep the single-key fallback because the query shapes intentionally differ.
+    """
+    keys = [str(key or "").strip() for key in content_keys if str(key or "").strip()]
+    if not keys:
+        return {}
+    grouped: Dict[str, List[Dict[str, Any]]] = {key: [] for key in keys}
+    if _is_sqlite_database():
+        for key in keys:
+            grouped[key] = await _fetch_eligibility_inputs(key)
+        return grouped
+
+    rows = await database.fetch_all(_MULTI_QUERY, {"content_keys": keys})
+    for row in rows or []:
+        item = dict(row)
+        key = str(item.get("content_key") or "").strip()
+        if key:
+            grouped.setdefault(key, []).append(item)
+    return grouped
+
+
 async def _upsert_index_pipeline_state(
     content_key: str,
     state: Dict[str, Any],
@@ -820,11 +868,20 @@ async def audit_serving_contract_violations(
         if not current_rows:
             break
 
+        content_keys = [
+            str(current.get("content_key") or "").strip()
+            for current in current_rows
+            if str(current.get("content_key") or "").strip()
+        ]
+        input_rows_by_key = await _fetch_eligibility_inputs_for_content_keys(
+            content_keys
+        )
+
         for current in current_rows:
             ck = str(current.get("content_key") or "").strip()
             if not ck:
                 continue
-            input_rows = await _fetch_eligibility_inputs(ck)
+            input_rows = input_rows_by_key.get(ck, [])
             if not input_rows:
                 violations.append({
                     "content_key": ck,

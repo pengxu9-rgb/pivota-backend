@@ -150,15 +150,15 @@ async def _ensure_schema() -> None:
 
 async def _cleanup() -> None:
     statements = [
-        "DELETE FROM index_pipeline_state WHERE content_key LIKE 'ck_vis2_%'",
-        "DELETE FROM agent_pdp_view WHERE content_key LIKE 'ck_vis2_%'",
-        "DELETE FROM catalog_offers WHERE product_key LIKE 'pk_vis2_%'",
-        "DELETE FROM external_product_seeds WHERE id LIKE 'seed_vis2_%' OR attached_product_key LIKE 'pk_vis2_%'",
-        "DELETE FROM product_group_members WHERE merchant_id LIKE 'm_vis2_%'",
-        "DELETE FROM product_quality_snapshot WHERE merchant_id LIKE 'm_vis2_%'",
-        "DELETE FROM external_offer_snapshots WHERE canonical_url LIKE 'https://vis2-%'",
-        "DELETE FROM domain_extractor_baselines WHERE domain LIKE 'vis2-%'",
-        "DELETE FROM catalog_products WHERE content_key LIKE 'ck_vis2_%' OR product_key LIKE 'pk_vis2_%'",
+        "DELETE FROM index_pipeline_state WHERE content_key LIKE 'ck_vis2_%%'",
+        "DELETE FROM agent_pdp_view WHERE content_key LIKE 'ck_vis2_%%'",
+        "DELETE FROM catalog_offers WHERE product_key LIKE 'pk_vis2_%%'",
+        "DELETE FROM external_product_seeds WHERE id LIKE 'seed_vis2_%%' OR attached_product_key LIKE 'pk_vis2_%%'",
+        "DELETE FROM product_group_members WHERE merchant_id LIKE 'm_vis2_%%'",
+        "DELETE FROM product_quality_snapshot WHERE merchant_id LIKE 'm_vis2_%%'",
+        "DELETE FROM external_offer_snapshots WHERE canonical_url LIKE 'https://vis2-%%'",
+        "DELETE FROM domain_extractor_baselines WHERE domain LIKE 'vis2-%%'",
+        "DELETE FROM catalog_products WHERE content_key LIKE 'ck_vis2_%%' OR product_key LIKE 'pk_vis2_%%'",
     ]
     for statement in statements:
         await database.execute(statement)
@@ -538,13 +538,90 @@ async def test_recompute_nonexistent_content_key_returns_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_audit_serving_contract_violations_reuses_canonical_classifier() -> None:
+async def test_audit_serving_contract_violations_reuses_canonical_classifier(monkeypatch) -> None:
     was_connected = await _prepare_db()
     try:
         ids = await _insert_product(
             "contract_violation",
             identity=False,
             pdp_scope="unverified",
+        )
+        good_ids = await _insert_product("contract_good")
+        await database.execute(
+            """
+            INSERT INTO index_pipeline_state (
+                content_key, pivota_signature_id, merchant_id, pipeline_stage,
+                blocker_code, serving_eligible, identity_resolved, has_image,
+                has_price, description_length
+            ) VALUES (
+                :content_key, :signature_id, :merchant_id, 'public_indexed',
+                'none', TRUE, TRUE, TRUE, TRUE, 120
+            )
+            """,
+            {
+                "content_key": ids["content_key"],
+                "signature_id": ids["signature_id"],
+                "merchant_id": ids["merchant_id"],
+            },
+        )
+        await database.execute(
+            """
+            INSERT INTO index_pipeline_state (
+                content_key, pivota_signature_id, merchant_id, pipeline_stage,
+                blocker_code, serving_eligible, identity_resolved, has_image,
+                has_price, description_length
+            ) VALUES (
+                :content_key, :signature_id, :merchant_id, 'public_indexed',
+                'none', TRUE, TRUE, TRUE, TRUE, 120
+            )
+            """,
+            {
+                "content_key": good_ids["content_key"],
+                "signature_id": good_ids["signature_id"],
+                "merchant_id": good_ids["merchant_id"],
+            },
+        )
+
+        batch_calls = []
+        original_batch_fetch = svc._fetch_eligibility_inputs_for_content_keys
+
+        async def spy_batch_fetch(content_keys):
+            batch_calls.append(list(content_keys))
+            return await original_batch_fetch(content_keys)
+
+        monkeypatch.setattr(
+            svc,
+            "_fetch_eligibility_inputs_for_content_keys",
+            spy_batch_fetch,
+        )
+
+        violations = await svc.audit_serving_contract_violations(
+            limit=10,
+            batch_size=2,
+        )
+
+        assert len(violations) == 1
+        assert violations[0]["content_key"] == ids["content_key"]
+        assert violations[0]["expected_blocker_code"] == "entity_unresolved"
+        assert violations[0]["identity_resolved"] is False
+        assert len(batch_calls) == 1
+        assert set(batch_calls[0]) == {
+            ids["content_key"],
+            good_ids["content_key"],
+        }
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+async def test_audit_serving_contract_violations_accepts_resolved_pdp_scope_without_identity_row() -> None:
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product(
+            "scope_resolved_without_identity",
+            identity=False,
+            pdp_scope="merchant_owned",
         )
         await database.execute(
             """
@@ -569,10 +646,7 @@ async def test_audit_serving_contract_violations_reuses_canonical_classifier() -
             batch_size=2,
         )
 
-        assert len(violations) == 1
-        assert violations[0]["content_key"] == ids["content_key"]
-        assert violations[0]["expected_blocker_code"] == "entity_unresolved"
-        assert violations[0]["identity_resolved"] is False
+        assert violations == []
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)
