@@ -19,6 +19,7 @@ def _args(**overrides):
         "postcheck_limit": 600,
         "stream_pages": False,
         "page_retries": 2,
+        "start_cursor": "",
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -245,3 +246,77 @@ async def test_drive_stream_pages_applies_each_page(monkeypatch):
     assert "_expected_state" not in report["samples"][0]
     assert len(connect_calls) == 2
     assert len(disconnect_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_page_retries_connect_failure(monkeypatch):
+    connect_attempts = []
+    page_calls = []
+
+    class FakeDb:
+        is_connected = False
+
+        async def connect(self):
+            connect_attempts.append(True)
+            if len(connect_attempts) == 1:
+                raise ConnectionError("temporary connect loss")
+            self.is_connected = True
+
+        async def disconnect(self):
+            self.is_connected = False
+
+    async def fake_page(**kwargs):
+        page_calls.append(kwargs["cursor"])
+        return {
+            "next_cursor": "ck_next",
+            "rows_scanned": 1,
+            "done": True,
+            "violations": [],
+        }
+
+    monkeypatch.setattr(module, "audit_serving_contract_violation_page", fake_page)
+
+    result = await module._fetch_and_apply_stream_page(
+        _args(stream_pages=True, page_retries=1),
+        db=FakeDb(),
+        cursor="ck_start",
+        remaining_limit=0,
+    )
+
+    assert len(connect_attempts) == 2
+    assert page_calls == ["ck_start"]
+    assert result["page"]["next_cursor"] == "ck_next"
+
+
+@pytest.mark.asyncio
+async def test_drive_stream_pages_honors_start_cursor(monkeypatch):
+    seen_cursors = []
+
+    class FakeDb:
+        is_connected = False
+
+        async def connect(self):
+            self.is_connected = True
+
+        async def disconnect(self):
+            self.is_connected = False
+
+    async def fake_page(**kwargs):
+        seen_cursors.append(kwargs["cursor"])
+        return {
+            "next_cursor": "ck_after",
+            "rows_scanned": 0,
+            "done": True,
+            "violations": [],
+        }
+
+    monkeypatch.setattr(module, "audit_serving_contract_violation_page", fake_page)
+
+    report = await module._drive(
+        _args(stream_pages=True, start_cursor="ck_resume"),
+        db=FakeDb(),
+    )
+
+    assert seen_cursors == ["ck_resume"]
+    assert report["start_cursor"] == "ck_resume"
+    assert report["completed_scan"] is True
