@@ -94,6 +94,10 @@ class SlowDb:
         await asyncio.sleep(0.1)
         return None
 
+    async def fetch_val(self, query):
+        await asyncio.sleep(0.1)
+        return 0
+
     async def fetch_all(self, query):
         await asyncio.sleep(0.1)
         return []
@@ -291,4 +295,4 @@ def test_list_canonical_pdps_times_out_slow_database(monkeypatch: pytest.MonkeyP
     res = client.get("/api/canonical/products")
 
     assert res.status_code == 504
-    assert res.json()["detail"]["operation"] == "product_signature_list"
+    assert res.json()["detail"]["operation"] == "product_signature_count"
