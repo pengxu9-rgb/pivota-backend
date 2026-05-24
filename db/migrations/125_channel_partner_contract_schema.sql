@@ -238,7 +238,7 @@ COMMENT ON TABLE partner_cohort_targets IS
 
 UPDATE channel_partners
 SET
-  term_start_date = COALESCE(term_start_date, CURRENT_DATE),
+  term_start_date = CURRENT_DATE,
   term_months = 12,
   term_auto_renew = TRUE,
   per_brand_tail_months = 36,
@@ -249,7 +249,10 @@ SET
   active_rate_scope = 'B',
   gmv_take_definition = 'net'
 WHERE archetype = 'curated_marketplace'
-  AND legal_name ILIKE 'markato%';
+  AND legal_name ILIKE 'markato%'
+  AND term_start_date IS NULL;  -- gate seed to first apply only; preserves
+                                 -- any manual tuning on re-apply (staging
+                                 -- migration runner re-fires on every deploy)
 
 -- Seed Scope B rates for Markato (build brief §6.4). Idempotent via the
 -- unique (channel_partner_id, scope, stream, brand_year, effective_from)
