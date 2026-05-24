@@ -103,6 +103,13 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "size_guide_confidence",
         },
     ),
+    RequiredTableColumns(
+        table="catalog_offers",
+        columns={
+            "suppression_reason",
+            "suppressed_at",
+        },
+    ),
 )
 
 
@@ -469,6 +476,19 @@ async def ensure_required_schema_light() -> None:
                     CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_products_pivota_signature
                       ON catalog_products (pivota_signature_id)
                       WHERE pivota_signature_id IS NOT NULL;
+                    """
+                )
+            )
+            # PDP / commerce-index repair PR-1: reversible offer
+            # suppression primitive. Code paths filter suppressed offers,
+            # so the runtime guard self-heals these additive columns in
+            # environments where raw db/migrations/ are skipped.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_offers
+                      ADD COLUMN IF NOT EXISTS suppression_reason TEXT NULL,
+                      ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ NULL;
                     """
                 )
             )

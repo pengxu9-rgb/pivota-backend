@@ -671,7 +671,9 @@ async def _fetch_canonical_search_rows(
             o.offer_payload,
             c.rank_score + CASE WHEN o.catalog_track = 'internal_merchant' THEN 10 ELSE 0 END AS rank_score
         FROM candidate_skus c
-        JOIN catalog_offers o ON o.sku_key = c.sku_key
+        JOIN catalog_offers o
+          ON o.sku_key = c.sku_key
+         AND o.suppressed_at IS NULL
         ORDER BY rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,
@@ -727,7 +729,9 @@ async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, 
             o.offer_payload
         FROM catalog_products p
         JOIN catalog_skus s ON s.product_key = p.product_key
-        JOIN catalog_offers o ON o.sku_key = s.sku_key
+        JOIN catalog_offers o
+          ON o.sku_key = s.sku_key
+         AND o.suppressed_at IS NULL
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
         WHERE p.product_key = :product_key
         ORDER BY o.updated_at DESC
@@ -784,7 +788,9 @@ async def _fetch_canonical_rows_for_sku(sku_key: str) -> List[Dict[str, Any]]:
             o.offer_payload
         FROM catalog_skus s
         JOIN catalog_products p ON p.product_key = s.product_key
-        JOIN catalog_offers o ON o.sku_key = s.sku_key
+        JOIN catalog_offers o
+          ON o.sku_key = s.sku_key
+         AND o.suppressed_at IS NULL
         LEFT JOIN catalog_merchants m ON m.merchant_id = p.merchant_id
         WHERE s.sku_key = :sku_key
         ORDER BY o.updated_at DESC
@@ -1315,6 +1321,7 @@ async def _fetch_offer_row(offer_id: str) -> Optional[Dict[str, Any]]:
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
         WHERE o.offer_id = :offer_id
+          AND o.suppressed_at IS NULL
         LIMIT 1
         """,
         {"offer_id": offer_id},
@@ -1341,6 +1348,7 @@ async def _fetch_default_offer_for_sku(sku_key: str) -> Optional[Dict[str, Any]]
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
         WHERE o.sku_key = :sku_key
+          AND o.suppressed_at IS NULL
         ORDER BY o.updated_at DESC
         LIMIT 1
         """,
@@ -1368,6 +1376,7 @@ async def _fetch_default_offer_for_product(product_key: str) -> Optional[Dict[st
         JOIN catalog_skus s ON s.sku_key = o.sku_key
         JOIN catalog_products p ON p.product_key = o.product_key
         WHERE o.product_key = :product_key
+          AND o.suppressed_at IS NULL
         ORDER BY o.updated_at DESC
         LIMIT 1
         """,

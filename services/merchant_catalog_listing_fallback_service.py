@@ -69,7 +69,9 @@ async def _fetch_catalog_listing_fallback_rows(merchant_id: str, surface: Option
                 ) AS row_number
             FROM catalog_products p
             JOIN catalog_skus s ON s.product_key = p.product_key
-            JOIN catalog_offers o ON o.sku_key = s.sku_key
+            JOIN catalog_offers o
+              ON o.sku_key = s.sku_key
+             AND o.suppressed_at IS NULL
             WHERE p.merchant_id = :merchant_id
               AND COALESCE(NULLIF(LOWER(o.offer_mode), ''), 'merchant_checkout') = 'merchant_checkout'
         ) AS sku_rows
