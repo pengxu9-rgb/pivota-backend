@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_EVEN
@@ -22,6 +23,8 @@ class _PartnerContract:
     active_rate_scope: str
     gmv_take_definition: str
     per_brand_tail_months: int
+    churn_clawback_days: int
+    nonpayment_clawback_days: int
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ async def compute_partner_comp_v2(
     brand_count_computed = 0
     brand_count_skipped_no_activation = 0
     brand_count_skipped_tail_exhausted = 0
+    brand_count_suspended_nonpayment = 0
 
     for brand_row in attributed_brand_rows:
         merchant_id = str(_row_get(brand_row, "merchant_id"))
@@ -75,6 +79,7 @@ async def compute_partner_comp_v2(
                 brand_year=0,
                 tail_exhausted=False,
                 gmv_take_definition=partner_contract.gmv_take_definition,
+                nonpayment_suspended=False,
             )
             continue
 
@@ -90,6 +95,21 @@ async def compute_partner_comp_v2(
                 brand_year=brand_year,
                 tail_exhausted=True,
                 gmv_take_definition=partner_contract.gmv_take_definition,
+                nonpayment_suspended=False,
+            )
+            continue
+
+        if await _merchant_has_nonpayment_suspension(
+            merchant_id=merchant_id,
+            nonpayment_clawback_days=partner_contract.nonpayment_clawback_days,
+        ):
+            brand_count_suspended_nonpayment += 1
+            merchant_accruals[merchant_id] = _zero_merchant_accrual(
+                merchant_id=merchant_id,
+                brand_year=brand_year,
+                tail_exhausted=False,
+                gmv_take_definition=partner_contract.gmv_take_definition,
+                nonpayment_suspended=True,
             )
             continue
 
@@ -100,6 +120,7 @@ async def compute_partner_comp_v2(
                 brand_year=brand_year,
                 tail_exhausted=False,
                 gmv_take_definition=partner_contract.gmv_take_definition,
+                nonpayment_suspended=False,
             )
             continue
 
@@ -123,9 +144,12 @@ async def compute_partner_comp_v2(
         # SHARE + SHARE: aggregate partner GMV share by brand.
         total_gmv_share_cents += _as_int(brand_accrual["gmv_share_cents"])
 
-    clawbacks: list[dict[str, Any]] = []
+    clawbacks = await _compute_churn_clawbacks(
+        partner_contract=partner_contract,
+        attributed_brand_rows=attributed_brand_rows,
+    )
     subsidy_cap_applied_cents = 0
-    clawback_share_total_cents = 0
+    clawback_share_total_cents = _sum_clawback_share_cents(clawbacks)
     # SHARE + SHARE + SHARE: total partner shares across streams before PR #7 subsidies.
     gross_partner_share_total_cents = (
         total_subscription_share_cents
@@ -154,6 +178,8 @@ async def compute_partner_comp_v2(
             "active_rate_scope": partner_contract.active_rate_scope,
             "gmv_take_definition": partner_contract.gmv_take_definition,
             "per_brand_tail_months": partner_contract.per_brand_tail_months,
+            "churn_clawback_days": partner_contract.churn_clawback_days,
+            "nonpayment_clawback_days": partner_contract.nonpayment_clawback_days,
         },
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
@@ -162,11 +188,14 @@ async def compute_partner_comp_v2(
             "active_rate_scope": partner_contract.active_rate_scope,
             "gmv_take_definition": partner_contract.gmv_take_definition,
             "per_brand_tail_months": partner_contract.per_brand_tail_months,
+            "churn_clawback_days": partner_contract.churn_clawback_days,
+            "nonpayment_clawback_days": partner_contract.nonpayment_clawback_days,
             "engine_version": "v2.0",
             "computed_at": datetime.now(timezone.utc).isoformat(),
             "brand_count_computed": brand_count_computed,
             "brand_count_skipped_no_activation": brand_count_skipped_no_activation,
             "brand_count_skipped_tail_exhausted": brand_count_skipped_tail_exhausted,
+            "brand_count_suspended_nonpayment": brand_count_suspended_nonpayment,
         },
     }
 
@@ -174,7 +203,13 @@ async def compute_partner_comp_v2(
 async def _read_partner_contract(channel_partner_id: int) -> _PartnerContract:
     row = await database.fetch_one(
         """
-        SELECT id, active_rate_scope, gmv_take_definition, per_brand_tail_months
+        SELECT
+          id,
+          active_rate_scope,
+          gmv_take_definition,
+          per_brand_tail_months,
+          churn_clawback_days,
+          nonpayment_clawback_days
         FROM channel_partners
         WHERE id = :channel_partner_id
         """,
@@ -190,6 +225,14 @@ async def _read_partner_contract(channel_partner_id: int) -> _PartnerContract:
         per_brand_tail_months=max(
             _as_int(_row_get(row, "per_brand_tail_months")),
             0,
+        ),
+        churn_clawback_days=_positive_int_or_default(
+            _row_get(row, "churn_clawback_days"),
+            90,
+        ),
+        nonpayment_clawback_days=_positive_int_or_default(
+            _row_get(row, "nonpayment_clawback_days"),
+            60,
         ),
     )
 
@@ -228,6 +271,148 @@ async def _read_brand_statement(merchant_id: str, calendar_month: date) -> Any |
         """,
         {"merchant_id": merchant_id, "calendar_month": calendar_month},
     )
+
+
+async def _merchant_has_nonpayment_suspension(
+    *,
+    merchant_id: str,
+    nonpayment_clawback_days: int,
+) -> bool:
+    row = await database.fetch_one(
+        """
+        SELECT 1
+        FROM invoices
+        WHERE merchant_id = :merchant_id
+          AND status IN (
+            'draft',
+            'finalizing',
+            'finalized',
+            'failed',
+            'payment_failed',
+            'uncollectible'
+          )
+          AND COALESCE(due_date, created_at) < (
+            CURRENT_DATE - :nonpayment_days * INTERVAL '1 day'
+          )
+        LIMIT 1
+        """,
+        {
+            "merchant_id": merchant_id,
+            "nonpayment_days": max(nonpayment_clawback_days, 1),
+        },
+    )
+    return row is not None
+
+
+async def _compute_churn_clawbacks(
+    *,
+    partner_contract: _PartnerContract,
+    attributed_brand_rows: list[Any],
+) -> list[dict[str, Any]]:
+    clawbacks: list[dict[str, Any]] = []
+    for brand_row in attributed_brand_rows:
+        merchant_id = str(_row_get(brand_row, "merchant_id"))
+        activated_at = _row_get(brand_row, "activated_at")
+        if activated_at is None:
+            continue
+        if not await _merchant_churned_within_clawback_window(
+            merchant_id=merchant_id,
+            activated_at=activated_at,
+            churn_clawback_days=partner_contract.churn_clawback_days,
+        ):
+            continue
+
+        historical_accrued_share_cents = (
+            await _historical_accrued_share_cents_for_merchant(
+                channel_partner_id=partner_contract.channel_partner_id,
+                merchant_id=merchant_id,
+            )
+        )
+        if historical_accrued_share_cents <= 0:
+            continue
+        clawbacks.append(
+            {
+                "merchant_id": merchant_id,
+                "amount_cents": historical_accrued_share_cents,
+                "reason": "90_day_churn",
+            }
+        )
+    return clawbacks
+
+
+async def _merchant_churned_within_clawback_window(
+    *,
+    merchant_id: str,
+    activated_at: date | datetime,
+    churn_clawback_days: int,
+) -> bool:
+    row = await database.fetch_one(
+        """
+        SELECT us.id, us.status, us.canceled_at
+        FROM user_subscriptions us
+        WHERE us.merchant_id = :merchant_id
+          AND NOT EXISTS (
+            SELECT 1
+            FROM user_subscriptions active_us
+            WHERE active_us.merchant_id = us.merchant_id
+              AND active_us.status IN ('active', 'trialing', 'past_due')
+          )
+        ORDER BY COALESCE(us.current_period_start, us.started_at, us.created_at) DESC, us.id DESC
+        LIMIT 1
+        """,
+        {"merchant_id": merchant_id},
+    )
+    if not row:
+        return False
+
+    if str(_row_get(row, "status") or "") != "canceled":
+        return False
+
+    canceled_at = _row_get(row, "canceled_at")
+    if canceled_at is None:
+        return False
+
+    activation_date = _as_date(activated_at)
+    canceled_date = _as_date(canceled_at)
+    days_from_activation = (canceled_date - activation_date).days
+    return 0 <= days_from_activation <= max(churn_clawback_days, 1)
+
+
+async def _historical_accrued_share_cents_for_merchant(
+    *,
+    channel_partner_id: int,
+    merchant_id: str,
+) -> int:
+    rows = await database.fetch_all(
+        """
+        SELECT snapshot_payload_jsonb
+        FROM settlement_snapshots
+        WHERE channel_partner_id = :channel_partner_id
+        ORDER BY created_at ASC
+        """,
+        {"channel_partner_id": channel_partner_id},
+    )
+
+    accrued_share_decimal_cents = Decimal("0")
+    for row in rows or []:
+        payload = _coerce_json(_row_get(row, "snapshot_payload_jsonb"))
+        merchant_accruals = _coerce_json(payload.get("merchant_accruals"))
+        merchant_payload = merchant_accruals.get(merchant_id)
+        if not isinstance(merchant_payload, dict):
+            continue
+        # SHARE + SHARE: add prior credited partner share cents for this merchant.
+        accrued_share_decimal_cents += Decimal(
+            _as_int(merchant_payload.get("credited_comp_cents"))
+        )
+    return int(accrued_share_decimal_cents)
+
+
+def _sum_clawback_share_cents(clawbacks: list[dict[str, Any]]) -> int:
+    clawback_share_decimal_cents = Decimal("0")
+    for clawback in clawbacks:
+        # SHARE + SHARE: aggregate clawback share cents from reversal entries.
+        clawback_share_decimal_cents += Decimal(_as_int(clawback.get("amount_cents")))
+    return int(clawback_share_decimal_cents)
 
 
 def _resolve_brand_year(
@@ -410,6 +595,7 @@ async def _compute_per_brand_shares(
         "subsidy_cap_applied_cents": 0,
         "subsidy_cap_remaining_before_cents": None,
         "subsidy_cap_remaining_after_cents": None,
+        "nonpayment_suspended": False,
     }
 
 
@@ -559,6 +745,7 @@ def _zero_merchant_accrual(
     brand_year: int,
     tail_exhausted: bool,
     gmv_take_definition: str,
+    nonpayment_suspended: bool,
 ) -> dict[str, Any]:
     return {
         "merchant_id": merchant_id,
@@ -579,6 +766,7 @@ def _zero_merchant_accrual(
         "subsidy_cap_applied_cents": 0,
         "subsidy_cap_remaining_before_cents": None,
         "subsidy_cap_remaining_after_cents": None,
+        "nonpayment_suspended": nonpayment_suspended,
     }
 
 
@@ -621,10 +809,29 @@ def _as_int(value: Any) -> int:
     return int(value)
 
 
+def _positive_int_or_default(value: Any, default: int) -> int:
+    parsed = _as_int(value)
+    if parsed <= 0:
+        return default
+    return parsed
+
+
 def _optional_int(value: Any) -> Optional[int]:
     if value is None:
         return None
     return int(value)
+
+
+def _coerce_json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _row_get(row: Any, key: str) -> Any:
