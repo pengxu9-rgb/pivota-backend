@@ -28,6 +28,9 @@ Job registration happens at start-up time. Currently registers:
   cadence than executor worker because verifiers are not latency-
   critical.
 - `verification_run_lease_reaper` — fires every 60 seconds.
+- `external_seed_catalog_materialization` — fires every 15 minutes,
+  materializes newly crawled external_product_seeds into guarded catalog
+  mirrors without public-serving promotion.
 - `settlement_file_generate` — in-process monthly day-5 UTC cron,
   generates prior-month partner settlement files from snapshots.
 - `settlement_file_transfer` — in-process monthly day-10 UTC cron,
@@ -193,6 +196,24 @@ async def start_scheduler() -> None:
             seconds=60,
             id="verification_run_lease_reaper",
             replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # External crawl/backfill sessions write external_product_seeds first.
+        # This catch-up materializes only missing catalog mirrors in small
+        # batches. It mints sig_* for new catalog rows, but public PDP serving
+        # remains gated by nightly_index_health and agent_pdp_view.
+        from jobs.external_seed_catalog_materialization_job import (
+            run_external_seed_catalog_materialization_tick,
+        )
+        scheduler.add_job(
+            run_external_seed_catalog_materialization_tick,
+            "interval",
+            minutes=15,
+            id="external_seed_catalog_materialization",
+            replace_existing=True,
+            misfire_grace_time=300,
             coalesce=True,
             max_instances=1,
         )
@@ -408,6 +429,7 @@ async def start_scheduler() -> None:
             "+ executor_run_lease_reaper (60s) "
             "+ verification_run_worker_tick (30s) "
             "+ verification_run_lease_reaper (60s) "
+            "+ external_seed_catalog_materialization (15min, ACTIVE) "
             "+ metering_expire_reservations (5min, ACTIVE) "
             "+ stamp_attribution_reaper (5min, ACTIVE) "
             "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "

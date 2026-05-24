@@ -40,6 +40,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.catalog_identity import make_content_key
+from services.catalog_sync_service import make_pivota_canonical_fields
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 from services.text_normalization.brand_case import proper_case_brand
@@ -170,6 +171,15 @@ def _build_pdp_insert(
     """Construct the catalog_products row dict that the runner will
     INSERT. The product_key is deterministic so re-runs UPSERT cleanly."""
     product_key = derive_product_key(pdp_payload["brand"], pdp_payload["product_name"])
+    source_product_id = canonical_product_name(
+        pdp_payload["brand"],
+        pdp_payload["product_name"],
+    )
+    pivota_fields = make_pivota_canonical_fields(
+        SYNTHETIC_MERCHANT_ID,
+        SYNTHETIC_PLATFORM,
+        source_product_id,
+    )
     canonical_url = ""
     image_url = ""
     if offers:
@@ -188,7 +198,10 @@ def _build_pdp_insert(
         "product_key": product_key,
         "merchant_id": SYNTHETIC_MERCHANT_ID,
         "platform": SYNTHETIC_PLATFORM,
-        "source_product_id": canonical_product_name(pdp_payload["brand"], pdp_payload["product_name"]),
+        "source_product_id": source_product_id,
+        "pivota_signature_id": pivota_fields["pivota_signature_id"],
+        "pivota_canonical_url": pivota_fields["pivota_canonical_url"],
+        "pivota_signature_minted_at": pivota_fields["pivota_signature_minted_at"],
         "catalog_track": DEFAULT_CATALOG_TRACK,
         "truth_tier": DEFAULT_TRUTH_TIER,
         "readiness_tier": DEFAULT_READINESS_TIER,

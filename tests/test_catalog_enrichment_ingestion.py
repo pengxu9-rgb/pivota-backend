@@ -115,6 +115,9 @@ def test_ingest_record_builds_pdp_and_seed_rows():
     assert pdp["category_label_source"] == "enrichment_agent_v1"
     assert 0.0 <= pdp["category_confidence"] <= 1.0
     assert pdp["canonical_url"] == "https://maccosmetics.com/products/ruby-woo"
+    assert pdp["pivota_signature_id"].startswith("sig_")
+    assert pdp["pivota_canonical_url"].endswith(pdp["pivota_signature_id"])
+    assert pdp["pivota_signature_minted_at"] is not None
     payload = json.loads(pdp["product_payload"])
     assert payload["enrichment_meta"]["agent_version"] == AGENT_VERSION
     assert payload["enrichment_meta"]["source_jsonl"] == "data/x.jsonl"
@@ -125,6 +128,19 @@ def test_ingest_record_builds_pdp_and_seed_rows():
     assert seed["tool"] == AGENT_VERSION
     assert seed["domain"] == "maccosmetics.com"
     assert seed["price_amount"] == 21.0
+
+
+def test_runner_persists_canonical_signature_fields():
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_catalog_enrichment.py"
+    ).read_text()
+
+    assert "pivota_signature_id, pivota_canonical_url, pivota_signature_minted_at" in source
+    assert ":pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at" in source
+    assert (
+        "pivota_signature_id = COALESCE(catalog_products.pivota_signature_id, "
+        "EXCLUDED.pivota_signature_id)"
+    ) in source
 
 
 def test_ingest_record_handles_multiple_offers():
