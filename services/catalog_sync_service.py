@@ -55,8 +55,8 @@ from services.pdp_category_classifier import (
 )
 from services.catalog_offer_writer_guard import (
     WriterAuditAccumulator,
-    guard_catalog_offer_rows,
     make_batch_id,
+    validate_catalog_offer_rows,
     write_writer_audit_log,
 )
 from services.pdp_lifecycle import compute_lifecycle_stage
@@ -1100,7 +1100,10 @@ async def ingest_standard_products(
                     },
                 }
                 if audit is not None:
-                    accepted_offers, skip_reasons, _rejected = await guard_catalog_offer_rows([offer_values])
+                    accepted_offers, skip_reasons, _rejected = validate_catalog_offer_rows(
+                        [offer_values],
+                        existing_sku_keys={sku_key},
+                    )
                     if skip_reasons:
                         audit.record_skips(skip_reasons)
                         stats["offers_skipped"] += sum(skip_reasons.values())

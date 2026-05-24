@@ -316,8 +316,8 @@ async def test_ingest_standard_products_shopify_offer_guard_filters_invalid_batc
         if getattr(table, "name", None) == "catalog_offers":
             offer_writes.append(dict(values))
 
-    async def fake_fetch_all(_sql, values):
-        return [{"sku_key": sku} for sku in values.get("sku_keys", []) if sku in inserted_skus]
+    async def fake_fetch_all(_sql, _values):
+        raise AssertionError("guarded offer ingest should validate against the SKU inserted in this transaction")
 
     async def fake_execute(*args, **_kwargs):
         if len(args) >= 2 and isinstance(args[1], dict) and args[1].get("writer_name"):
