@@ -598,6 +598,19 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # PR #8 settlement files: snapshot settle markers. The full
+            # settlement_files table and triggers are owned by migration 131,
+            # but these ADD COLUMNs are mirrored here so startup self-heal
+            # covers the runtime columns used by settlement_file_service.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS settlement_snapshots
+                      ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS settled_via_file_id BIGINT;
+                    """
+                )
+            )
             return
 
         if IS_SQLITE:
