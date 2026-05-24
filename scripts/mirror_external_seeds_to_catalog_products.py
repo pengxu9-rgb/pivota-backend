@@ -11,7 +11,8 @@ This is intentionally a narrow bridge for the canonical PDP migration:
 
 It is idempotent. Dry-run is the default; pass --apply to insert missing
 catalog_products rows. Existing catalog_products rows are not overwritten.
-Run scripts/backfill_pivota_canonical_pdp.py --apply afterwards to mint sig_*.
+New mirror rows mint their deterministic sig_* at insert time, but public
+serving still depends on the downstream quality / identity / offer gates.
 
 Attached seeds are included. Those rows already represent review-gated product
 identity edges, and PDP offer fusion needs the mirrored catalog_product/offer
@@ -36,6 +37,7 @@ if str(ROOT) not in sys.path:
 
 from db.database import database
 from services.catalog_identity import make_content_key
+from services.catalog_sync_service import make_pivota_canonical_fields
 from services.pdp_category_classifier import (
     fold_category_from_variants,
     resolve_path_from_row,
@@ -824,6 +826,11 @@ async def _apply(limit: int) -> int:
     for row in rows or []:
         row_dict = dict(row)
         mirrored_at = datetime.now(timezone.utc).isoformat()
+        pivota_fields = make_pivota_canonical_fields(
+            MERCHANT_ID,
+            PLATFORM,
+            str(row_dict.get("external_product_id") or ""),
+        )
         category_meta = resolve_mirror_category_metadata(
             category=row_dict.get("mirrored_category"),
             product_type=row_dict.get("mirrored_product_type"),
@@ -913,6 +920,9 @@ async def _apply(limit: int) -> int:
               readiness_tier,
               source_system,
               source_ref,
+              pivota_signature_id,
+              pivota_canonical_url,
+              pivota_signature_minted_at,
               title,
               description,
               brand,
@@ -945,6 +955,9 @@ async def _apply(limit: int) -> int:
               :readiness_tier,
               :source_system,
               :source_ref,
+              :pivota_signature_id,
+              :pivota_canonical_url,
+              :pivota_signature_minted_at,
               :title,
               :description,
               :brand,
@@ -980,6 +993,9 @@ async def _apply(limit: int) -> int:
                 "readiness_tier": READINESS_TIER,
                 "source_system": SOURCE_SYSTEM,
                 "source_ref": row_dict.get("id"),
+                "pivota_signature_id": pivota_fields["pivota_signature_id"],
+                "pivota_canonical_url": pivota_fields["pivota_canonical_url"],
+                "pivota_signature_minted_at": pivota_fields["pivota_signature_minted_at"],
                 "title": row_dict.get("title"),
                 "description": row_dict.get("mirrored_description"),
                 # Display-cased — see services.text_normalization.brand_case.

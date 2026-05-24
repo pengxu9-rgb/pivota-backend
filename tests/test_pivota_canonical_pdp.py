@@ -83,10 +83,14 @@ def test_canonical_url_strips_trailing_slash(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_make_pivota_canonical_fields_shape():
-    """Convenience wrapper returns exactly the two columns the
-    catalog upsert wants."""
+    """Convenience wrapper returns the canonical fields the catalog upsert wants."""
     from services.catalog_sync_service import make_pivota_canonical_fields
     out = make_pivota_canonical_fields("m1", "shopify", "p1")
-    assert set(out.keys()) == {"pivota_signature_id", "pivota_canonical_url"}
+    assert set(out.keys()) == {
+        "pivota_signature_id",
+        "pivota_canonical_url",
+        "pivota_signature_minted_at",
+    }
     assert out["pivota_signature_id"].startswith("sig_")
     assert out["pivota_canonical_url"].endswith(out["pivota_signature_id"])
+    assert out["pivota_signature_minted_at"] is not None

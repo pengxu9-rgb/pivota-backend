@@ -235,6 +235,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                 """
                 INSERT INTO catalog_products
                   (product_key, merchant_id, platform, source_product_id,
+                   pivota_signature_id, pivota_canonical_url, pivota_signature_minted_at,
                    catalog_track, truth_tier, readiness_tier, source_system,
                    title, description, brand, product_type, category,
                    category_path, category_confidence, category_label_source,
@@ -245,6 +246,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    content_key)
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
+                   :pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at,
                    :catalog_track, :truth_tier, :readiness_tier, :source_system,
                    :title, :description, :brand, :product_type, :category,
                    :category_path, :category_confidence, :category_label_source,
@@ -258,6 +260,9 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                    :pdp_scope, :pdp_scope_source, NOW(),
                    :content_key)
                 ON CONFLICT (product_key) DO UPDATE SET
+                  pivota_signature_id = COALESCE(catalog_products.pivota_signature_id, EXCLUDED.pivota_signature_id),
+                  pivota_canonical_url = COALESCE(catalog_products.pivota_canonical_url, EXCLUDED.pivota_canonical_url),
+                  pivota_signature_minted_at = COALESCE(catalog_products.pivota_signature_minted_at, EXCLUDED.pivota_signature_minted_at),
                   category_path = EXCLUDED.category_path,
                   category_confidence = EXCLUDED.category_confidence,
                   category_label_source = EXCLUDED.category_label_source,

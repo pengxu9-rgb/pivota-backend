@@ -163,8 +163,9 @@ def test_path_a_sync_service_wires_content_key_into_upsert_values() -> None:
     ).read_text()
     # Import wired
     assert "from services.catalog_identity import make_content_key" in src
-    # Used inside the _upsert_by_pk values dict
-    assert '"content_key": make_content_key(' in src
+    # Computed before the _upsert_by_pk values dict and bound into it.
+    assert "content_key = make_content_key(" in src
+    assert '"content_key": content_key' in src
     # Path A uses brand + product.title + product.barcode (GTIN)
     assert "make_content_key(brand, product.title, product.barcode)" in src
 

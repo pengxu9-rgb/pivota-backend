@@ -37,6 +37,19 @@ def test_mirror_query_includes_attached_seed_rows() -> None:
     assert "FROM active_mirrorable eps" in COMMON_CTES
 
 
+def test_mirror_insert_mints_canonical_signature_on_new_rows() -> None:
+    """New Path B catalog mirror rows should be addressable by sig_* as soon
+    as they are created. Public serving is still controlled elsewhere."""
+    source = Path(mirror_module.__file__).read_text()
+
+    assert "from services.catalog_sync_service import make_pivota_canonical_fields" in source
+    assert "pivota_fields = make_pivota_canonical_fields(" in source
+    assert "pivota_signature_id" in source
+    assert "pivota_canonical_url" in source
+    assert "pivota_signature_minted_at" in source
+    assert "ON CONFLICT (merchant_id, platform, source_product_id) DO NOTHING" in source
+
+
 def test_mirror_insert_classifies_category_path() -> None:
     meta = resolve_mirror_category_metadata(
         category=None,
