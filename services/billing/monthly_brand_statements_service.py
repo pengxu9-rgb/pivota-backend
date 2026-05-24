@@ -15,6 +15,9 @@ from core.billing_constants import (
 from db.database import IS_POSTGRES, database
 
 
+SYSTEM_DEFAULT_GMV_TAKE_RATE_BP = 1000
+
+
 class StatementAlreadyFrozenError(Exception):
     """Raised when a statement transition requires an open row."""
 
@@ -43,8 +46,9 @@ async def assemble_for_month(merchant_id: str, calendar_month: date) -> int:
     - bundled_credits_consumed = min(allowance, credits_consumed)
     - overage_credits = max(0, credits_consumed - allowance)
     - overage_revenue_usd_cents = overage_revenue_cents(overage_credits) from core.billing_constants
-    - GMV fields: ZERO in this PR. (PR #4 populates them.)
-    - total_revenue_usd_cents = sub_revenue + overage_revenue + pivota_gmv_take (gmv_take is 0 in this PR)
+    - GMV fields: raw classified net GMV from commerce_attribution_edges.
+      Unclassified positive-GMV edges are excluded from gmv_usd_cents and counted in metadata.
+    - total_revenue_usd_cents = sub_revenue + overage_revenue + pivota_gmv_take
     - total_cogs_usd_cents: per brief §6.3, computed but INTERNAL.
         bundled_credit_cogs  = bundled_credits_consumed × CREDIT_TO_USD_CENTS × DEFAULT_CREDIT_COST_RATIO
         overage_credit_cogs  = overage_credits          × CREDIT_TO_USD_CENTS × DEFAULT_CREDIT_COST_RATIO
@@ -95,7 +99,7 @@ async def assemble_for_month(merchant_id: str, calendar_month: date) -> int:
             period_start=calendar_month,
             period_end=period_end,
         )
-        values = _statement_values(
+        values = await _statement_values(
             merchant_id=merchant_id,
             calendar_month=calendar_month,
             period_end=period_end,
@@ -116,10 +120,10 @@ async def assemble_for_month(merchant_id: str, calendar_month: date) -> int:
                   bundled_credits_consumed = :bundled_credits_consumed,
                   overage_credits = :overage_credits,
                   overage_revenue_usd_cents = :overage_revenue_usd_cents,
-                  gmv_usd_cents = 0,
-                  gmv_personal_usd_cents = 0,
-                  gmv_third_party_usd_cents = 0,
-                  pivota_gmv_take_usd_cents = 0,
+                  gmv_usd_cents = :gmv_usd_cents,
+                  gmv_personal_usd_cents = :gmv_personal_usd_cents,
+                  gmv_third_party_usd_cents = :gmv_third_party_usd_cents,
+                  pivota_gmv_take_usd_cents = :pivota_gmv_take_usd_cents,
                   total_revenue_usd_cents = :total_revenue_usd_cents,
                   total_cogs_usd_cents = :total_cogs_usd_cents,
                   pivota_gross_margin_usd_cents = :pivota_gross_margin_usd_cents,
@@ -163,10 +167,10 @@ async def assemble_for_month(merchant_id: str, calendar_month: date) -> int:
                   :bundled_credits_consumed,
                   :overage_credits,
                   :overage_revenue_usd_cents,
-                  0,
-                  0,
-                  0,
-                  0,
+                  :gmv_usd_cents,
+                  :gmv_personal_usd_cents,
+                  :gmv_third_party_usd_cents,
+                  :pivota_gmv_take_usd_cents,
                   :total_revenue_usd_cents,
                   :total_cogs_usd_cents,
                   :pivota_gross_margin_usd_cents,
@@ -305,7 +309,7 @@ async def _latest_active_subscription(
     )
 
 
-def _statement_values(
+async def _statement_values(
     *,
     merchant_id: str,
     calendar_month: date,
@@ -330,7 +334,24 @@ def _statement_values(
     bundled_credits = min(allowance, credits_consumed)
     overage_credits = max(0, credits_consumed - allowance)
     overage_revenue = overage_revenue_cents(overage_credits)
-    total_revenue = sub_revenue + overage_revenue
+    gmv_row = await _gmv_attribution_for_month(
+        merchant_id=merchant_id,
+        period_start=calendar_month,
+        period_end=period_end,
+    )
+    # Raw classified brand-sales GMV in cents. These values are not partner
+    # shares. Positive-GMV unclassified edges stay out of gmv_usd_cents so the
+    # monthly_brand_statements GMV split CHECK remains true.
+    gmv_personal_raw_cents = int(_row_get(gmv_row, "gmv_personal_cents") or 0)
+    gmv_third_party_raw_cents = int(_row_get(gmv_row, "gmv_third_party_cents") or 0)
+    gmv_total_raw_cents = gmv_personal_raw_cents + gmv_third_party_raw_cents
+    gmv_unclassified_edge_count = int(_row_get(gmv_row, "unclassified_edge_count") or 0)
+    # Pivota's raw GMV take in cents, before any partner-share calculation.
+    # PR #5 replaces this system default with a partner_rate_schedules lookup.
+    pivota_gmv_take_cents = int(
+        round(gmv_total_raw_cents * SYSTEM_DEFAULT_GMV_TAKE_RATE_BP / 10000)
+    )
+    total_revenue = sub_revenue + overage_revenue + pivota_gmv_take_cents
     total_cogs = _total_cogs_cents(
         bundled_credits_consumed=bundled_credits,
         overage_credits=overage_credits,
@@ -351,6 +372,12 @@ def _statement_values(
         "subscription_plan_id": subscription_plan_id,
         "no_subscription_for_month": no_subscription,
         "gmv_populated_by_pr": 4,
+        "gmv_personal_usd_cents": gmv_personal_raw_cents,
+        "gmv_third_party_usd_cents": gmv_third_party_raw_cents,
+        "gmv_unclassified_edge_count": gmv_unclassified_edge_count,
+        "gmv_take_rate_bp_applied": SYSTEM_DEFAULT_GMV_TAKE_RATE_BP,
+        "gmv_take_rate_source": "system_default_pr4_pending_pr5_partner_lookup",
+        "gmv_take_cogs_pending_pr5": True,
     }
 
     return {
@@ -363,11 +390,48 @@ def _statement_values(
         "bundled_credits_consumed": bundled_credits,
         "overage_credits": overage_credits,
         "overage_revenue_usd_cents": overage_revenue,
+        "gmv_usd_cents": gmv_total_raw_cents,
+        "gmv_personal_usd_cents": gmv_personal_raw_cents,
+        "gmv_third_party_usd_cents": gmv_third_party_raw_cents,
+        "pivota_gmv_take_usd_cents": pivota_gmv_take_cents,
         "total_revenue_usd_cents": total_revenue,
         "total_cogs_usd_cents": total_cogs,
         "pivota_gross_margin_usd_cents": gross_margin,
         "metadata_json": json.dumps(metadata, sort_keys=True),
     }
+
+
+async def _gmv_attribution_for_month(
+    *,
+    merchant_id: str,
+    period_start: date,
+    period_end: date,
+) -> Any:
+    return await database.fetch_one(
+        """
+        SELECT
+          COALESCE(SUM(net_attributed_gmv_cents), 0) AS gmv_raw_total_cents,
+          COALESCE(
+            SUM(net_attributed_gmv_cents) FILTER (WHERE gmv_channel = 'personal_agent'),
+            0
+          ) AS gmv_personal_cents,
+          COALESCE(
+            SUM(net_attributed_gmv_cents) FILTER (WHERE gmv_channel = 'third_party_agent'),
+            0
+          ) AS gmv_third_party_cents,
+          COUNT(*) FILTER (WHERE gmv_channel IS NULL) AS unclassified_edge_count
+        FROM commerce_attribution_edges
+        WHERE merchant_id = :merchant_id
+          AND created_at >= :period_start
+          AND created_at < :period_end
+          AND net_attributed_gmv_cents > 0
+        """,
+        {
+            "merchant_id": merchant_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    )
 
 
 def _total_cogs_cents(
@@ -419,6 +483,8 @@ def _json_param(name: str) -> str:
 
 
 def _row_get(row: Any, key: str) -> Any:
+    if row is None:
+        return None
     try:
         return row[key]
     except Exception:
