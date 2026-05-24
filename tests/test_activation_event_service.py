@@ -276,7 +276,12 @@ async def test_try_activate_brand_is_write_once(
     attribution = fake_db.partner_attribution[0]
     assert first_decision.activation_date == date(2025, 6, 10)
     assert second_decision.activation_date == date(2025, 6, 1)
-    assert attribution["activated_at"] == date(2025, 6, 10)
+    # The UPDATE now stores the full TIMESTAMPTZ from the qualifying invoice's
+    # paid_at (per the post-merge fix for the activated_at >= signed_at CHECK
+    # constraint on partner_attribution from migration 111). The DATE portion
+    # must still match the first eligible invoice's paid_at date.
+    assert attribution["activated_at"] == datetime(2025, 6, 10, tzinfo=timezone.utc)
+    assert first_decision.activation_at == datetime(2025, 6, 10, tzinfo=timezone.utc)
     assert fake_db.update_count == 1
 
 
