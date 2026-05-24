@@ -421,6 +421,29 @@ def _resolve_brand_year(
     calendar_month: date,
     tail_months: int,
 ) -> tuple[int, bool]:
+    """Map (activated_at, calendar_month) → (brand_year, tail_exhausted).
+
+    Interpretation locked 2026-05-24 (codex post-merge review of PR #631–#641,
+    HIGH #1): the architectural decision \"activation month counts as month 1 of
+    tail\" governs. tail_months=36 means 36 payable months TOTAL, of which the
+    first is the activation month itself.
+
+    paid_month_index numbering:
+      activation_month        → index 1 (Y1)
+      activation_month + 1mo  → index 2 (Y1)
+      ...
+      activation_month + 11mo → index 12 (Y1, last Y1 month)
+      activation_month + 12mo → index 13 (Y2 starts)
+      activation_month + 23mo → index 24 (Y2 last)
+      activation_month + 24mo → index 25 (Y3 starts)
+      activation_month + 35mo → index 36 (Y3 last, last payable)
+      activation_month + 36mo → index 37 → tail exhausted
+
+    Diverges from build brief §9.5's table (which labels post-activation months
+    1..36 and lists 2028-04 as payable). The architectural decision overrides
+    the brief example; brief §9.5 should be updated in a follow-up doc PR.
+    """
+
     activated_month = _month_start(_as_date(activated_at))
     months_since_activation = (
         (calendar_month.year - activated_month.year) * 12
@@ -428,12 +451,10 @@ def _resolve_brand_year(
     )
     if months_since_activation < 0:
         return 0, False
-    if months_since_activation > tail_months:
+    if months_since_activation >= tail_months:
         return 0, True
 
-    # Brief section 9.5 defines elapsed month 36 as payable Y3 and month 37 as zero.
-    # Activation-month accruals still map to Y1 for the section 9.1 month-1 example.
-    paid_month_index = max(months_since_activation, 1)
+    paid_month_index = months_since_activation + 1
     brand_year = ((paid_month_index - 1) // 12) + 1
     if brand_year > 3:
         return 0, True
