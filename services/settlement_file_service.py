@@ -424,6 +424,14 @@ async def _mark_file_transferred_locked(
 
 
 async def _mark_source_snapshots_settled_locked(settlement_file_id: int) -> None:
+    # Defensive: only mark snapshots whose settled_via_file_id is unset OR
+    # already points at THIS file. The UNIQUE(partner, calendar_month) on
+    # settlement_files + the unsettled-filter at generate time should make
+    # cross-file conflicts impossible, but if any race ever did surface
+    # (manual operator re-generate, concurrent transfer attempt), the
+    # guard prevents this file from stealing snapshots already settled by
+    # another file. Codex caught the missing re-check in PR #631–#641
+    # post-merge review.
     if IS_POSTGRES:
         await database.execute(
             f"""
@@ -435,6 +443,7 @@ async def _mark_source_snapshots_settled_locked(settlement_file_id: int) -> None
               FROM settlement_files
               WHERE id = :settlement_file_id
             )
+              AND (settled_via_file_id IS NULL OR settled_via_file_id = :settlement_file_id)
             """,
             {"settlement_file_id": settlement_file_id},
         )
@@ -458,6 +467,7 @@ async def _mark_source_snapshots_settled_locked(settlement_file_id: int) -> None
             SET settled_at = COALESCE(settled_at, {_now_sql()}),
                 settled_via_file_id = :settlement_file_id
             WHERE id = :snapshot_id
+              AND (settled_via_file_id IS NULL OR settled_via_file_id = :settlement_file_id)
             """,
             {
                 "settlement_file_id": settlement_file_id,

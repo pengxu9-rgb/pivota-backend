@@ -11,6 +11,13 @@ from db.database import database
 class ActivationDecision:
     eligible: bool
     activation_date: date | None
+    # Full timestamp of the qualifying invoice's paid_at (fallback finalized_at).
+    # Used by try_activate_brand for the UPDATE so partner_attribution.activated_at
+    # (TIMESTAMPTZ) satisfies the activated_at >= signed_at CHECK constraint when
+    # signed_at is later in the same day. Same-day signup-then-pay would fail the
+    # constraint if we stored only the date (00:00 UTC). Codex caught this in the
+    # post-merge review of the PR #631–#641 series.
+    activation_at: datetime | None
     reason: str
     qualifying_invoice_id: int | None
     net_cash_received_cents: int
@@ -65,6 +72,7 @@ async def evaluate_activation(*, merchant_id: str) -> ActivationDecision:
         return ActivationDecision(
             eligible=False,
             activation_date=None,
+            activation_at=None,
             reason="No paid positive-net Pivota invoice found",
             qualifying_invoice_id=None,
             net_cash_received_cents=0,
@@ -82,6 +90,7 @@ async def evaluate_activation(*, merchant_id: str) -> ActivationDecision:
         return ActivationDecision(
             eligible=False,
             activation_date=None,
+            activation_at=None,
             reason="First paid positive-net invoice is missing paid_at/finalized_at",
             qualifying_invoice_id=_optional_int(_row_get(qualifying_invoice_row, "id")),
             net_cash_received_cents=0,
@@ -108,6 +117,7 @@ async def evaluate_activation(*, merchant_id: str) -> ActivationDecision:
     return ActivationDecision(
         eligible=True,
         activation_date=activation_date,
+        activation_at=activation_timestamp if isinstance(activation_timestamp, datetime) else None,
         reason="First paid positive-net Pivota invoice qualifies for activation",
         qualifying_invoice_id=_optional_int(_row_get(qualifying_invoice_row, "id")),
         net_cash_received_cents=net_cash_received_cents,
@@ -161,6 +171,13 @@ async def try_activate_brand(
         if _row_get(attribution_row, "activated_at") is not None:
             return decision
 
+        # Prefer the full TIMESTAMPTZ from the qualifying invoice so the
+        # partner_attribution.activated_at >= signed_at CHECK from migration
+        # 111 holds when signed_at is later in the same day. Fall back to the
+        # date-at-midnight only if no timestamp is available (the eligible
+        # path always sets activation_at, but the fallback keeps callers
+        # forward-compat).
+        activated_at_value = decision.activation_at or decision.activation_date
         await database.execute(
             """
             UPDATE partner_attribution
@@ -169,7 +186,7 @@ async def try_activate_brand(
               AND activated_at IS NULL
             """,
             {
-                "activated_at": decision.activation_date,
+                "activated_at": activated_at_value,
                 "attribution_id": _row_get(attribution_row, "id"),
             },
         )
