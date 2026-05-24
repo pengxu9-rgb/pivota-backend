@@ -103,6 +103,7 @@ from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
 from routes.admin_api import router as admin_api_router
+from routes.admin_partner_cohort import router as admin_partner_cohort_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
 from routes.platform_onboarding_routes import router as platform_onboarding_router
@@ -790,6 +791,7 @@ app.include_router(agent_pdp_v1_router)  # Agent PDP v1 denormalized read path (
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints
+app.include_router(admin_partner_cohort_router)  # Admin channel-partner cohort progress/evaluation
 app.include_router(admin_reset_employee_router)  # Admin employee password reset
 app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplicate data
 app.include_router(admin_data_consistency_router)  # Admin data consistency check and fix
