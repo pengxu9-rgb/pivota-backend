@@ -41,6 +41,7 @@ async def test_drive_dry_run_reports_violations_without_apply(monkeypatch):
                 "content_key": "ck_1",
                 "expected_blocker_code": "entity_unresolved",
                 "input_rows": 1,
+                "_expected_state": {"content_key": "ck_1"},
             }
         ]
 
@@ -58,6 +59,7 @@ async def test_drive_dry_run_reports_violations_without_apply(monkeypatch):
     assert report["apply"] is False
     assert report["violations_found"] == 1
     assert report["expected_blocker_counts"] == {"entity_unresolved": 1}
+    assert "_expected_state" not in report["samples"][0]
     assert apply_calls == []
     assert report["safety"]["price_or_availability_fallbacks"] == 0
 
@@ -118,3 +120,44 @@ async def test_drive_apply_recomputes_and_postchecks(monkeypatch):
     assert report["applied"]["recomputed"] == 1
     assert report["applied"]["fail_closed_no_catalog_inputs"] == 1
     assert report["postcheck"]["remaining_violations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_apply_violation_uses_audit_state_without_recompute(monkeypatch):
+    upserts = []
+    recomputes = []
+
+    async def fake_upsert(content_key, state):
+        upserts.append((content_key, state))
+
+    async def fake_recompute(content_key, *, reason=None):
+        recomputes.append((content_key, reason))
+        return False
+
+    monkeypatch.setattr(module, "upsert_classified_index_pipeline_state", fake_upsert)
+    monkeypatch.setattr(module, "recompute_serving_eligibility", fake_recompute)
+
+    outcome = await module._apply_violation(
+        {
+            "content_key": "ck_1",
+            "input_rows": 1,
+            "_expected_state": {
+                "content_key": "ck_1",
+                "blocker_code": "low_quality",
+                "serving_eligible": False,
+            },
+        }
+    )
+
+    assert outcome == "applied_audit_state"
+    assert upserts == [
+        (
+            "ck_1",
+            {
+                "content_key": "ck_1",
+                "blocker_code": "low_quality",
+                "serving_eligible": False,
+            },
+        )
+    ]
+    assert recomputes == []

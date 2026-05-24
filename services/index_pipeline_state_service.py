@@ -849,6 +849,23 @@ async def fail_close_index_pipeline_state(
     )
 
 
+async def upsert_classified_index_pipeline_state(
+    content_key: str,
+    state: Dict[str, Any],
+) -> None:
+    """Persist a state already produced by the canonical classifier.
+
+    Bulk serving-contract repair uses the audit query to classify rows once.
+    Reusing that state avoids a second single-key fetch per violation while
+    still writing through the same index_pipeline_state upsert contract.
+    """
+    if not content_key:
+        raise ValueError("content_key is required")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("classified state is required")
+    await _upsert_index_pipeline_state(content_key, state)
+
+
 async def audit_serving_contract_violations(
     *,
     limit: int = 500,
@@ -921,6 +938,7 @@ async def audit_serving_contract_violations(
                         "identity_resolved": expected.get("identity_resolved"),
                         "description_length": expected.get("description_length"),
                         "content_quality_score": expected.get("content_quality_score"),
+                        "_expected_state": expected,
                     })
 
             if max_results > 0 and len(violations) >= max_results:

@@ -37,6 +37,7 @@ from services.index_pipeline_state_service import (  # noqa: E402
     audit_serving_contract_violations,
     fail_close_index_pipeline_state,
     recompute_serving_eligibility,
+    upsert_classified_index_pipeline_state,
 )
 
 
@@ -68,6 +69,14 @@ async def _disconnect_if_needed(db: Any, was_connected: bool) -> None:
             await disconnect()
 
 
+def _public_violation(violation: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in violation.items()
+        if not str(key).startswith("_")
+    }
+
+
 async def _apply_violation(violation: Dict[str, Any]) -> str:
     content_key = str(violation.get("content_key") or "").strip()
     if not content_key:
@@ -82,6 +91,10 @@ async def _apply_violation(violation: Dict[str, Any]) -> str:
             ),
         )
         return "fail_closed_no_catalog_inputs"
+    expected_state = violation.get("_expected_state")
+    if isinstance(expected_state, dict) and expected_state:
+        await upsert_classified_index_pipeline_state(content_key, expected_state)
+        return "applied_audit_state"
     await recompute_serving_eligibility(content_key, reason=RECOMPUTE_REASON)
     return "recomputed"
 
@@ -108,8 +121,12 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
             "content_key": args.content_key or None,
             "violations_found": len(violations),
             "expected_blocker_counts": dict(blocker_counts),
-            "samples": violations[: args.sample_limit],
+            "samples": [
+                _public_violation(row)
+                for row in violations[: args.sample_limit]
+            ],
             "applied": {
+                "applied_audit_state": 0,
                 "recomputed": 0,
                 "fail_closed_no_catalog_inputs": 0,
                 "skipped_missing_content_key": 0,
@@ -135,7 +152,10 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
                 )
                 report["postcheck"] = {
                     "remaining_violations": len(remaining),
-                    "remaining_samples": remaining[: args.sample_limit],
+                    "remaining_samples": [
+                        _public_violation(row)
+                        for row in remaining[: args.sample_limit]
+                    ],
                 }
         return report
     finally:
