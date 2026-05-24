@@ -675,7 +675,7 @@ async def _fetch_candidate_rows(
     product_ids = sorted({target.product_id for target in targets if target.product_id})
     variant_ids = sorted({target.variant_id for target in targets if target.variant_id})
 
-    where: List[str] = ["o.merchant_id = :merchant_id"]
+    where: List[str] = ["o.merchant_id = :merchant_id", "o.suppressed_at IS NULL"]
     params: Dict[str, Any] = {"merchant_id": merchant_id}
 
     filters: List[str] = []

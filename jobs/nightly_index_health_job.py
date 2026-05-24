@@ -187,6 +187,7 @@ SELECT
             SELECT 1
             FROM catalog_offers co
             WHERE co.product_key = s.attached_product_key
+              AND co.suppressed_at IS NULL
               AND co.list_price > 0
         ) THEN 1 END) AS has_price
 FROM seeds_in_window s

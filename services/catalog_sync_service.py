@@ -53,6 +53,12 @@ from services.pdp_category_classifier import (
     fold_category_from_variants,
     fold_category_with_llm_fallback,
 )
+from services.catalog_offer_writer_guard import (
+    WriterAuditAccumulator,
+    guard_catalog_offer_rows,
+    make_batch_id,
+    write_writer_audit_log,
+)
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
 
@@ -72,6 +78,7 @@ _FASHION_ENRICH_SEM = asyncio.Semaphore(8)
 # pdpBuilder.pickFashionMeta cutoff (0.6). Keeping the write-side at the
 # same threshold prevents low-confidence rows from polluting the DB.
 _FASHION_ENRICH_MIN_CONFIDENCE = 0.6
+GUARDED_OFFER_WRITERS = {"shopify_products_sync"}
 
 
 async def _async_fashion_enrich(
@@ -769,6 +776,8 @@ async def ingest_standard_products(
         "products_failed": 0,
         "skus_ingested": 0,
         "offers_ingested": 0,
+        "offers_skipped": 0,
+        "offer_skip_reasons": {},
         "beauty_profiles_upserted": 0,
         "beauty_ingredient_rows_upserted": 0,
         "beauty_usage_guides_upserted": 0,
@@ -776,6 +785,14 @@ async def ingest_standard_products(
         "beauty_content_assets_upserted": 0,
         "beauty_compatibility_rules_upserted": 0,
     }
+    audit = (
+        WriterAuditAccumulator(
+            writer_name=source_system,
+            batch_id=job_id or make_batch_id(source_system, source_ref),
+        )
+        if source_system in GUARDED_OFFER_WRITERS
+        else None
+    )
 
     async with database.transaction():
         await upsert_catalog_merchant(
@@ -1057,36 +1074,50 @@ async def ingest_standard_products(
                 availability = "in_stock" if (inventory_quantity or 0) > 0 else "out_of_stock"
                 offer_mode = "merchant_checkout" if product.orderable is not False else "merchant_view_only"
 
+                offer_values = {
+                    "offer_id": offer_id,
+                    "sku_key": sku_key,
+                    "product_key": product_key,
+                    "merchant_id": merchant_id,
+                    "catalog_track": "internal_merchant",
+                    "truth_tier": "primary",
+                    "readiness_tier": readiness_tier,
+                    "offer_mode": offer_mode,
+                    "channel": "default",
+                    "availability": availability,
+                    "inventory_quantity": inventory_quantity,
+                    "currency": product.currency,
+                    "list_price": list_price,
+                    "merchant_effective_price": merchant_effective_price,
+                    "estimated_best_price": merchant_effective_price,
+                    "price_confidence": Decimal("1.0"),
+                    "source_system": source_system,
+                    "source_ref": source_ref,
+                    "offer_payload": {
+                        "product_id": str(product.product_id or product.id),
+                        "variant_id": source_variant_id,
+                        "sku": variant.sku or product.sku,
+                    },
+                }
+                if audit is not None:
+                    accepted_offers, skip_reasons, _rejected = await guard_catalog_offer_rows([offer_values])
+                    if skip_reasons:
+                        audit.record_skips(skip_reasons)
+                        stats["offers_skipped"] += sum(skip_reasons.values())
+                        for reason, count in skip_reasons.items():
+                            stats["offer_skip_reasons"][reason] = stats["offer_skip_reasons"].get(reason, 0) + count
+                    if not accepted_offers:
+                        continue
+                    offer_values = accepted_offers[0]
+
                 await _upsert_by_pk(
                     catalog_offers,
                     "offer_id",
-                    {
-                        "offer_id": offer_id,
-                        "sku_key": sku_key,
-                        "product_key": product_key,
-                        "merchant_id": merchant_id,
-                        "catalog_track": "internal_merchant",
-                        "truth_tier": "primary",
-                        "readiness_tier": readiness_tier,
-                        "offer_mode": offer_mode,
-                        "channel": "default",
-                        "availability": availability,
-                        "inventory_quantity": inventory_quantity,
-                        "currency": product.currency,
-                        "list_price": list_price,
-                        "merchant_effective_price": merchant_effective_price,
-                        "estimated_best_price": merchant_effective_price,
-                        "price_confidence": Decimal("1.0"),
-                        "source_system": source_system,
-                        "source_ref": source_ref,
-                        "offer_payload": {
-                            "product_id": str(product.product_id or product.id),
-                            "variant_id": source_variant_id,
-                            "sku": variant.sku or product.sku,
-                        },
-                    },
+                    offer_values,
                 )
                 stats["offers_ingested"] += 1
+                if audit is not None:
+                    audit.record_applied(1)
 
                 await _append_snapshot(
                     catalog_inventory_snapshots,
@@ -1306,6 +1337,9 @@ async def ingest_standard_products(
                 "completed_at": _utcnow(),
             },
         )
+
+    if audit is not None:
+        await write_writer_audit_log(audit)
 
     # Stage 2a (mig 084): bump catalog_merchants.last_full_sync_at on
     # successful sync completion. The sweep

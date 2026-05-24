@@ -224,9 +224,27 @@ catalog_offers = Table(
     Column("source_system", String(64), nullable=True),
     Column("source_ref", String(255), nullable=True),
     Column("offer_payload", JSONB_TYPE, nullable=True),
+    Column("suppression_reason", Text, nullable=True),
+    Column("suppressed_at", DateTime, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_catalog_offers_merchant_track", "merchant_id", "catalog_track"),
+)
+
+
+writer_audit_log = Table(
+    "writer_audit_log",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("writer_name", Text, nullable=False),
+    Column("batch_id", Text, nullable=False),
+    Column("dry_run_report_hash", Text, nullable=True),
+    Column("applied_rows", Integer, nullable=False, server_default="0"),
+    Column("skipped_rows", Integer, nullable=False, server_default="0"),
+    Column("reasons", JSONB_TYPE, nullable=True),
+    Column("actor", Text, nullable=True),
+    Column("applied_at", DateTime, server_default=func.now(), nullable=False),
+    Index("idx_writer_audit_writer_time", "writer_name", "applied_at"),
 )
 
 

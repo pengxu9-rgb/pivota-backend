@@ -424,6 +424,7 @@ _ELIGIBILITY_COLUMNS = """
         SELECT TRUE
         FROM catalog_offers co
         WHERE co.product_key = cp.product_key
+          AND co.suppressed_at IS NULL
           AND co.list_price > 0
         LIMIT 1
     )                           AS has_price,
@@ -579,6 +580,7 @@ SELECT
         SELECT 1
         FROM catalog_offers co
         WHERE co.product_key = cp.product_key
+          AND co.suppressed_at IS NULL
           AND co.list_price > 0
     ) AS has_price,
     EXISTS (
