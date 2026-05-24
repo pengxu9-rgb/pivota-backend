@@ -866,6 +866,115 @@ async def upsert_classified_index_pipeline_state(
     await _upsert_index_pipeline_state(content_key, state)
 
 
+def _serving_contract_violation_from_state(
+    current: Dict[str, Any],
+    *,
+    input_rows: int,
+    expected: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ck = str(current.get("content_key") or "").strip()
+    if expected is None:
+        return {
+            "content_key": ck,
+            "current_blocker_code": current.get("blocker_code"),
+            "current_pipeline_stage": current.get("pipeline_stage"),
+            "expected_serving_eligible": False,
+            "expected_blocker_code": "not_live",
+            "expected_blocker_detail": (
+                "no catalog_products rows found for content_key during "
+                "serving contract audit"
+            ),
+            "expected_pipeline_stage": "discovered",
+            "input_rows": input_rows,
+        }
+    return {
+        "content_key": ck,
+        "current_blocker_code": current.get("blocker_code"),
+        "current_pipeline_stage": current.get("pipeline_stage"),
+        "expected_serving_eligible": False,
+        "expected_blocker_code": expected.get("blocker_code"),
+        "expected_blocker_detail": expected.get("blocker_detail"),
+        "expected_pipeline_stage": expected.get("pipeline_stage"),
+        "input_rows": input_rows,
+        "has_image": expected.get("has_image"),
+        "has_price": expected.get("has_price"),
+        "identity_resolved": expected.get("identity_resolved"),
+        "description_length": expected.get("description_length"),
+        "content_quality_score": expected.get("content_quality_score"),
+        "_expected_state": expected,
+    }
+
+
+async def audit_serving_contract_violation_page(
+    *,
+    cursor: str = "",
+    batch_size: int = 500,
+    content_key: Optional[str] = None,
+    regression_domains: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Classify one serving-eligible IPS page against the canonical contract."""
+    page_size = max(int(batch_size or 500), 1)
+    domains = (
+        regression_domains
+        if regression_domains is not None
+        else await _fetch_regression_domains()
+    )
+    current_rows = await _fetch_serving_eligible_index_rows(
+        cursor=cursor,
+        batch_size=page_size,
+        content_key=content_key,
+    )
+    violations: List[Dict[str, Any]] = []
+    if not current_rows:
+        return {
+            "cursor": cursor or "",
+            "next_cursor": cursor or "",
+            "rows_scanned": 0,
+            "done": True,
+            "violations": violations,
+        }
+
+    content_keys = [
+        str(current.get("content_key") or "").strip()
+        for current in current_rows
+        if str(current.get("content_key") or "").strip()
+    ]
+    input_rows_by_key = await _fetch_eligibility_inputs_for_content_keys(content_keys)
+
+    for current in current_rows:
+        ck = str(current.get("content_key") or "").strip()
+        if not ck:
+            continue
+        input_rows = input_rows_by_key.get(ck, [])
+        if not input_rows:
+            violations.append(
+                _serving_contract_violation_from_state(
+                    current,
+                    input_rows=0,
+                    expected=None,
+                )
+            )
+            continue
+        expected = _classify_content_key_rows(input_rows, domains)
+        if expected is not None and not bool(expected.get("serving_eligible")):
+            violations.append(
+                _serving_contract_violation_from_state(
+                    current,
+                    input_rows=len(input_rows),
+                    expected=expected,
+                )
+            )
+
+    next_cursor = str(current_rows[-1].get("content_key") or "")
+    return {
+        "cursor": cursor or "",
+        "next_cursor": next_cursor,
+        "rows_scanned": len(current_rows),
+        "done": bool(content_key) or len(current_rows) < page_size,
+        "violations": violations,
+    }
+
+
 async def audit_serving_contract_violations(
     *,
     limit: int = 500,
@@ -885,70 +994,22 @@ async def audit_serving_contract_violations(
     violations: List[Dict[str, Any]] = []
 
     while True:
-        current_rows = await _fetch_serving_eligible_index_rows(
+        page = await audit_serving_contract_violation_page(
             cursor=cursor,
             batch_size=page_size,
             content_key=content_key,
+            regression_domains=regression_domains,
         )
-        if not current_rows:
+        if not int(page.get("rows_scanned") or 0):
             break
-
-        content_keys = [
-            str(current.get("content_key") or "").strip()
-            for current in current_rows
-            if str(current.get("content_key") or "").strip()
-        ]
-        input_rows_by_key = await _fetch_eligibility_inputs_for_content_keys(
-            content_keys
-        )
-
-        for current in current_rows:
-            ck = str(current.get("content_key") or "").strip()
-            if not ck:
-                continue
-            input_rows = input_rows_by_key.get(ck, [])
-            if not input_rows:
-                violations.append({
-                    "content_key": ck,
-                    "current_blocker_code": current.get("blocker_code"),
-                    "current_pipeline_stage": current.get("pipeline_stage"),
-                    "expected_serving_eligible": False,
-                    "expected_blocker_code": "not_live",
-                    "expected_blocker_detail": (
-                        "no catalog_products rows found for content_key during "
-                        "serving contract audit"
-                    ),
-                    "expected_pipeline_stage": "discovered",
-                    "input_rows": 0,
-                })
-            else:
-                expected = _classify_content_key_rows(input_rows, regression_domains)
-                if expected is not None and not bool(expected.get("serving_eligible")):
-                    violations.append({
-                        "content_key": ck,
-                        "current_blocker_code": current.get("blocker_code"),
-                        "current_pipeline_stage": current.get("pipeline_stage"),
-                        "expected_serving_eligible": False,
-                        "expected_blocker_code": expected.get("blocker_code"),
-                        "expected_blocker_detail": expected.get("blocker_detail"),
-                        "expected_pipeline_stage": expected.get("pipeline_stage"),
-                        "input_rows": len(input_rows),
-                        "has_image": expected.get("has_image"),
-                        "has_price": expected.get("has_price"),
-                        "identity_resolved": expected.get("identity_resolved"),
-                        "description_length": expected.get("description_length"),
-                        "content_quality_score": expected.get("content_quality_score"),
-                        "_expected_state": expected,
-                    })
-
+        for violation in page.get("violations") or []:
+            violations.append(violation)
             if max_results > 0 and len(violations) >= max_results:
                 return violations
 
-        if content_key:
+        if page.get("done"):
             break
-        cursor = str(current_rows[-1].get("content_key") or "")
-        if len(current_rows) < page_size:
-            break
+        cursor = str(page.get("next_cursor") or "")
 
     return violations
 
