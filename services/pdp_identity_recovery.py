@@ -493,6 +493,8 @@ def _lane_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "pdp_lifecycle_stage": row.get("pdp_lifecycle_stage"),
         "pdp_scope": row.get("pdp_scope"),
         "product_group_id": row.get("product_group_id"),
+        "resolved_identity_key": row.get("resolved_identity_key"),
+        "resolved_identity_source": row.get("resolved_identity_source"),
         "has_positive_offer": row.get("has_positive_offer"),
         "review_cluster_key": row.get("review_cluster_key"),
     }
@@ -556,7 +558,25 @@ async def fetch_identity_lane_gap_rows(*, limit: int, offset: int) -> List[Dict[
 async def fetch_identity_review_required_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
-        WITH base AS (
+        WITH seed_identity AS (
+          SELECT external_product_id, attached_product_key
+          FROM (
+            SELECT eps.external_product_id,
+                   eps.attached_product_key,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY eps.external_product_id
+                     ORDER BY
+                       CASE WHEN eps.attached_product_key LIKE 'ext:%' THEN 0 ELSE 1 END,
+                       eps.updated_at DESC NULLS LAST,
+                       eps.id ASC
+                   ) AS rn
+            FROM external_product_seeds eps
+            WHERE eps.status = 'active'
+              AND NULLIF(BTRIM(COALESCE(eps.external_product_id, '')), '') IS NOT NULL
+          ) ranked
+          WHERE rn = 1
+        ),
+        base AS (
           SELECT cp.product_key,
                  cp.content_key,
                  cp.merchant_id,
@@ -572,6 +592,21 @@ async def fetch_identity_review_required_rows(*, limit: int, offset: int) -> Lis
                  regexp_replace(lower(btrim(coalesce(cp.title,''))), '[^a-z0-9%+]+', ' ', 'g') AS title_norm,
                  regexp_replace(lower(btrim(coalesce(cp.brand,''))), '[^a-z0-9%+]+', ' ', 'g') AS brand_norm,
                  pgm.product_group_id,
+                 CASE
+                   WHEN cp.product_key LIKE 'ext:%' THEN cp.product_key
+                   WHEN seed_identity.attached_product_key LIKE 'ext:%'
+                    AND pgm.product_group_id LIKE 'pg_ext_%'
+                     THEN seed_identity.attached_product_key
+                   ELSE pgm.product_group_id
+                 END AS resolved_identity_key,
+                 CASE
+                   WHEN cp.product_key LIKE 'ext:%' THEN 'canonical_ext_product_key'
+                   WHEN seed_identity.attached_product_key LIKE 'ext:%'
+                    AND pgm.product_group_id LIKE 'pg_ext_%'
+                     THEN 'ext_identity_group_member'
+                   WHEN pgm.product_group_id IS NOT NULL THEN 'product_group_member'
+                   ELSE 'missing_group_member'
+                 END AS resolved_identity_source,
                  EXISTS (
                    SELECT 1
                    FROM catalog_offers co
@@ -584,6 +619,8 @@ async def fetch_identity_review_required_rows(*, limit: int, offset: int) -> Lis
             ON pgm.merchant_id = cp.merchant_id
            AND pgm.platform = cp.platform
            AND pgm.platform_product_id = cp.source_product_id
+          LEFT JOIN seed_identity
+            ON seed_identity.external_product_id = cp.source_product_id
           WHERE cp.merchant_id = 'external_seed'
             AND cp.source_product_id IS NOT NULL
             AND EXISTS (
@@ -600,15 +637,18 @@ async def fetch_identity_review_required_rows(*, limit: int, offset: int) -> Lis
                  COUNT(DISTINCT product_key)::int AS products,
                  COUNT(DISTINCT domain)::int AS domains,
                  COUNT(DISTINCT product_group_id) FILTER (WHERE product_group_id IS NOT NULL)::int AS groups,
-                 COUNT(*) FILTER (WHERE product_group_id IS NULL)::int AS missing_group_rows
+                 COUNT(DISTINCT resolved_identity_key) FILTER (
+                   WHERE resolved_identity_key IS NOT NULL
+                 )::int AS resolved_identities,
+                 COUNT(*) FILTER (WHERE resolved_identity_key IS NULL)::int AS missing_identity_rows
           FROM base
           WHERE title_norm <> '' AND brand_norm <> ''
           GROUP BY title_norm, brand_norm
           HAVING COUNT(DISTINCT product_key) > 1
              AND COUNT(DISTINCT domain) > 1
              AND (
-               COUNT(DISTINCT product_group_id) FILTER (WHERE product_group_id IS NOT NULL) > 1
-               OR COUNT(*) FILTER (WHERE product_group_id IS NULL) > 0
+               COUNT(DISTINCT resolved_identity_key) FILTER (WHERE resolved_identity_key IS NOT NULL) > 1
+               OR COUNT(*) FILTER (WHERE resolved_identity_key IS NULL) > 0
              )
         )
         SELECT base.*,

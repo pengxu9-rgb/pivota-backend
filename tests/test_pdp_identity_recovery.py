@@ -1,3 +1,5 @@
+import inspect
+
 from services.pdp_identity_recovery import (
     IDENTITY_LANE_APPROVED_NOT_LIVE,
     IDENTITY_LANE_LIVE_APPROVED,
@@ -13,6 +15,7 @@ from services.pdp_identity_recovery import (
     classify_identity_lane,
     deterministic_ext_identity_group_id,
     deterministic_product_group_id,
+    fetch_identity_review_required_rows,
     make_catalog_product_key,
     parse_legacy_attached_product_key,
 )
@@ -411,6 +414,16 @@ def test_classify_identity_lane_review_required_takes_precedence() -> None:
 
     assert lane["identity_lane"] == IDENTITY_LANE_REVIEW_REQUIRED
     assert lane["identity_lane_detail"] == "exact_title_brand_multi_domain_review_required"
+
+
+def test_review_required_query_collapses_resolved_ext_identity_groups() -> None:
+    source = inspect.getsource(fetch_identity_review_required_rows)
+
+    assert "cp.product_key LIKE 'ext:%' THEN cp.product_key" in source
+    assert "seed_identity.attached_product_key LIKE 'ext:%'" in source
+    assert "pgm.product_group_id LIKE 'pg_ext_%'" in source
+    assert "COUNT(DISTINCT resolved_identity_key)" in source
+    assert "COUNT(*) FILTER (WHERE resolved_identity_key IS NULL)" in source
 
 
 def test_classify_identity_lane_live_approved_when_group_and_live() -> None:
