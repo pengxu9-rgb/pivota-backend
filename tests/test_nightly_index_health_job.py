@@ -445,6 +445,22 @@ def test_seed_audit_issues_unresolved_blocks():
     assert state["blocker_code"] == "seed_audit_fail"
 
 
+def test_retailer_review_status_does_not_block_seed_audit_gate():
+    state = _classify_product(
+        _full_row(seed_data_json={
+            "title": "Test",
+            "review_summary": {
+                "review_status": "aggregate_only_no_public_preview_text",
+                "review_policy": "source_backed_retailer_public_aggregate",
+            },
+        }),
+        regression_domains=set(),
+    )
+    assert state["seed_audit_status"] == "not_audited"
+    assert state["blocker_code"] == "none"
+    assert state["serving_eligible"] is True
+
+
 def test_extractor_regression_blocks_at_domain_level():
     state = _classify_product(
         _full_row(canonical_url="https://bad-domain.com/p/x"),
