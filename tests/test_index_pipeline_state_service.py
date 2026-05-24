@@ -604,6 +604,8 @@ async def test_audit_serving_contract_violations_reuses_canonical_classifier(mon
         assert violations[0]["content_key"] == ids["content_key"]
         assert violations[0]["expected_blocker_code"] == "entity_unresolved"
         assert violations[0]["identity_resolved"] is False
+        assert violations[0]["_expected_state"]["content_key"] == ids["content_key"]
+        assert violations[0]["_expected_state"]["blocker_code"] == "entity_unresolved"
         assert len(batch_calls) == 1
         assert set(batch_calls[0]) == {
             ids["content_key"],
