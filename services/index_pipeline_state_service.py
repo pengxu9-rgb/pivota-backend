@@ -30,6 +30,8 @@ MIN_DESCRIPTION_LENGTH = 50
 
 # Seed audit statuses that do NOT block serving.
 _SEED_AUDIT_OK = {"no_issues_found", "auto_corrected", "not_audited"}
+_SEED_AUDIT_BLOCKING = {"issues_unresolved"}
+_SEED_AUDIT_KNOWN = _SEED_AUDIT_OK | _SEED_AUDIT_BLOCKING
 _RESOLVED_PDP_SCOPES = {
     "canonical",  # legacy pre-070 label used in tests / old rows
     "merchant_owned",
@@ -181,9 +183,15 @@ def _classify_product(
     review_summary = _coerce_dict(
         seed_data.get("review_summary") or snapshot.get("review_summary")
     )
-    seed_review_status = review_summary.get("review_status") or ""
+    seed_review_status = str(review_summary.get("review_status") or "").strip()
+    # `review_summary.review_status` is overloaded by retailer/public-review
+    # aggregate importers. Only known seed-audit statuses should participate in
+    # the serving gate; unrelated review aggregate states are not seed audit
+    # failures and must not produce serving_eligible=false with blocker none.
     seed_audit_status = (
-        seed_review_status if seed_review_status else "not_audited"
+        seed_review_status
+        if seed_review_status in _SEED_AUDIT_KNOWN
+        else "not_audited"
     )
 
     # --- Extract quality signals ---
@@ -277,9 +285,9 @@ def _classify_product(
         blocker_detail = (
             "no product_group_members row and pdp_scope is not a resolved scope"
         )
-    elif seed_audit_status == "issues_unresolved":
+    elif seed_audit_status in _SEED_AUDIT_BLOCKING:
         blocker_code = "seed_audit_fail"
-        blocker_detail = "seed content audit reported issues_unresolved"
+        blocker_detail = f"seed content audit reported {seed_audit_status}"
     elif domain_has_regression:
         blocker_code = "extractor_regression"
         blocker_detail = f"domain {domain!r} has regression alert in domain_extractor_baselines"
