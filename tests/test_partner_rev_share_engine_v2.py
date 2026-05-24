@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -70,6 +70,15 @@ class _FakeV2Database:
             ]
             return sorted(rows, key=lambda row: row["merchant_id"])
 
+        if "from settlement_snapshots" in sql:
+            partner_id = int(params["channel_partner_id"])
+            rows = [
+                {"snapshot_payload_jsonb": row["snapshot_payload_jsonb"]}
+                for row in self.settlement_snapshots
+                if int(row["channel_partner_id"]) == partner_id
+            ]
+            return sorted(rows, key=lambda row: row.get("created_at") or date.min)
+
         raise AssertionError(f"Unhandled fetch_all query: {query}")
 
     async def fetch_one(self, query: str, values: dict[str, Any] | None = None):
@@ -78,6 +87,12 @@ class _FakeV2Database:
 
         if sql.startswith("select id, active_rate_scope"):
             return self._partner_by_id(int(params["channel_partner_id"]))
+
+        if sql.startswith("select 1 from invoices"):
+            return self._overdue_unpaid_invoice(
+                params["merchant_id"],
+                int(params["nonpayment_days"]),
+            )
 
         if "from monthly_brand_statements" in sql and "where merchant_id" in sql:
             statement = self._statement_for_month(
@@ -89,6 +104,11 @@ class _FakeV2Database:
                     return statement
                 return None
             return statement
+
+        if sql.startswith("select us.id, us.status, us.canceled_at"):
+            return self._latest_subscription_without_active_replacement(
+                params["merchant_id"]
+            )
 
         if "from user_subscriptions us" in sql:
             return self._latest_subscription(
@@ -225,6 +245,8 @@ class _FakeV2Database:
         active_rate_scope: str = "B",
         gmv_take_definition: str = "net",
         per_brand_tail_months: int = 36,
+        churn_clawback_days: int = 90,
+        nonpayment_clawback_days: int = 60,
     ) -> int:
         partner_id = self._next_partner_id
         self._next_partner_id += 1
@@ -234,6 +256,8 @@ class _FakeV2Database:
                 "active_rate_scope": active_rate_scope,
                 "gmv_take_definition": gmv_take_definition,
                 "per_brand_tail_months": per_brand_tail_months,
+                "churn_clawback_days": churn_clawback_days,
+                "nonpayment_clawback_days": nonpayment_clawback_days,
             }
         )
         return partner_id
@@ -347,7 +371,15 @@ class _FakeV2Database:
         if not any(row["merchant_id"] == merchant_id for row in self.merchants):
             self.merchants.append({"merchant_id": merchant_id})
 
-    def add_subscription(self, *, merchant_id: str, plan_id: int, month: date) -> int:
+    def add_subscription(
+        self,
+        *,
+        merchant_id: str,
+        plan_id: int,
+        month: date,
+        status: str = "active",
+        canceled_at: datetime | None = None,
+    ) -> int:
         subscription_id = self._next_subscription_id
         self._next_subscription_id += 1
         self.user_subscriptions.append(
@@ -355,14 +387,46 @@ class _FakeV2Database:
                 "id": subscription_id,
                 "merchant_id": merchant_id,
                 "plan_id": plan_id,
-                "status": "active",
+                "status": status,
                 "current_period_start": month,
                 "current_period_end": _next_month(month),
                 "started_at": month,
+                "canceled_at": canceled_at,
+                "created_at": month,
                 "updated_at": month,
             }
         )
         return subscription_id
+
+    def cancel_all_subscriptions(
+        self,
+        *,
+        merchant_id: str,
+        canceled_at: datetime,
+    ) -> None:
+        for row in self.user_subscriptions:
+            if row["merchant_id"] == merchant_id:
+                row["status"] = "canceled"
+                row["canceled_at"] = canceled_at
+                row["updated_at"] = canceled_at
+
+    def add_unpaid_invoice(
+        self,
+        *,
+        merchant_id: str,
+        status: str,
+        created_at: datetime,
+        due_date: datetime | None = None,
+    ) -> None:
+        self.invoices.append(
+            {
+                "id": len(self.invoices) + 1,
+                "merchant_id": merchant_id,
+                "status": status,
+                "created_at": created_at,
+                "due_date": due_date,
+            }
+        )
 
     def consume_credits(
         self,
@@ -464,6 +528,55 @@ class _FakeV2Database:
             "monthly_credit_allowance": plan["monthly_credit_allowance"],
             "subscription_revenue_usd_cents": plan["price_cents"],
         }
+
+    def _latest_subscription_without_active_replacement(
+        self,
+        merchant_id: str,
+    ) -> dict[str, Any] | None:
+        if any(
+            row["merchant_id"] == merchant_id
+            and row["status"] in {"active", "trialing", "past_due"}
+            for row in self.user_subscriptions
+        ):
+            return None
+        candidates = [
+            row for row in self.user_subscriptions if row["merchant_id"] == merchant_id
+        ]
+        if not candidates:
+            return None
+        return sorted(
+            candidates,
+            key=lambda row: (
+                row.get("current_period_start") or row.get("started_at") or date.min,
+                row["id"],
+            ),
+        )[-1]
+
+    def _overdue_unpaid_invoice(
+        self,
+        merchant_id: str,
+        nonpayment_days: int,
+    ) -> dict[str, int] | None:
+        threshold = datetime.now(timezone.utc).date() - timedelta(
+            days=nonpayment_days
+        )
+        unpaid_statuses = {
+            "draft",
+            "finalizing",
+            "finalized",
+            "failed",
+            "payment_failed",
+            "uncollectible",
+        }
+        for invoice in self.invoices:
+            if invoice["merchant_id"] != merchant_id:
+                continue
+            if invoice["status"] not in unpaid_statuses:
+                continue
+            invoice_anchor = invoice.get("due_date") or invoice.get("created_at")
+            if _as_date(invoice_anchor) < threshold:
+                return {"?column?": 1}
+        return None
 
     def _gmv_aggregation(
         self,
@@ -765,6 +878,215 @@ async def test_rate_schedule_effective_from_window(
     assert accrual["gmv_share_cents"] == 0
 
 
+async def test_90_day_churn_clawback(
+    fake_db: _FakeV2Database,
+) -> None:
+    merchant_id = "merch_churn_90"
+    partner_id = fake_db.add_partner(gmv_take_definition="net")
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        partner_id=partner_id,
+        activated_at=datetime(2025, 4, 1, tzinfo=timezone.utc),
+    )
+    fake_db.seed_default_scope_b_rates(partner_id)
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2025, 4, 1))
+    april_comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2025, 4, 1),
+        date(2025, 5, 1),
+    )
+    await partner_settlement_service.write_settlement_snapshot(
+        201,
+        partner_id,
+        april_comp,
+    )
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2025, 5, 1))
+    may_comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2025, 5, 1),
+        date(2025, 6, 1),
+    )
+    await partner_settlement_service.write_settlement_snapshot(
+        202,
+        partner_id,
+        may_comp,
+    )
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2025, 6, 1))
+    fake_db.cancel_all_subscriptions(
+        merchant_id=merchant_id,
+        canceled_at=datetime(2025, 5, 15, tzinfo=timezone.utc),
+    )
+
+    comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2025, 6, 1),
+        date(2025, 7, 1),
+    )
+
+    assert april_comp["net_comp_cents"] == 11045
+    assert may_comp["net_comp_cents"] == 11045
+    assert comp["clawbacks"] == [
+        {
+            "merchant_id": merchant_id,
+            "amount_cents": 22090,
+            "reason": "90_day_churn",
+        }
+    ]
+    assert comp["net_comp_cents"] == 0
+
+
+async def test_churn_outside_90_day_window_no_clawback(
+    fake_db: _FakeV2Database,
+) -> None:
+    merchant_id = "merch_churn_outside"
+    partner_id = fake_db.add_partner(gmv_take_definition="net")
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        partner_id=partner_id,
+        activated_at=datetime(2025, 4, 1, tzinfo=timezone.utc),
+    )
+    fake_db.seed_default_scope_b_rates(partner_id)
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2025, 4, 1))
+    april_comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2025, 4, 1),
+        date(2025, 5, 1),
+    )
+    await partner_settlement_service.write_settlement_snapshot(
+        203,
+        partner_id,
+        april_comp,
+    )
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2025, 9, 1))
+    fake_db.cancel_all_subscriptions(
+        merchant_id=merchant_id,
+        canceled_at=datetime(2025, 9, 1, tzinfo=timezone.utc),
+    )
+
+    comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2025, 9, 1),
+        date(2025, 10, 1),
+    )
+
+    assert comp["clawbacks"] == []
+    assert comp["net_comp_cents"] > 0
+
+
+async def test_churn_clawback_uses_channel_partners_churn_clawback_days(
+    fake_db: _FakeV2Database,
+) -> None:
+    merchant_id = "merch_churn_custom_window"
+    partner_id = fake_db.add_partner(
+        gmv_take_definition="net",
+        churn_clawback_days=30,
+    )
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        partner_id=partner_id,
+        activated_at=datetime(2025, 4, 1, tzinfo=timezone.utc),
+    )
+    fake_db.seed_default_scope_b_rates(partner_id)
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2025, 4, 1))
+    april_comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2025, 4, 1),
+        date(2025, 5, 1),
+    )
+    await partner_settlement_service.write_settlement_snapshot(
+        204,
+        partner_id,
+        april_comp,
+    )
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2025, 5, 1))
+    fake_db.cancel_all_subscriptions(
+        merchant_id=merchant_id,
+        canceled_at=datetime(2025, 5, 15, tzinfo=timezone.utc),
+    )
+
+    comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2025, 5, 1),
+        date(2025, 6, 1),
+    )
+
+    assert comp["v2_metadata"]["churn_clawback_days"] == 30
+    assert comp["clawbacks"] == []
+    assert comp["net_comp_cents"] > 0
+
+
+async def test_nonpayment_suspension_60_days_default(
+    fake_db: _FakeV2Database,
+) -> None:
+    merchant_id = "merch_nonpayment_default"
+    month = _current_month_start()
+    partner_id = fake_db.add_partner(gmv_take_definition="net")
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        partner_id=partner_id,
+        activated_at=datetime(month.year, month.month, 1, tzinfo=timezone.utc),
+    )
+    fake_db.seed_default_scope_b_rates(partner_id)
+    await _assemble_and_freeze_statement(fake_db, merchant_id, month)
+    fake_db.add_unpaid_invoice(
+        merchant_id=merchant_id,
+        status="finalized",
+        created_at=datetime.now(timezone.utc) - timedelta(days=70),
+    )
+
+    comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        month,
+        _next_month(month),
+    )
+    accrual = comp["merchant_accruals"][merchant_id]
+
+    assert accrual["nonpayment_suspended"] is True
+    assert accrual["subscription_share_cents"] == 0
+    assert accrual["credit_overage_share_cents"] == 0
+    assert accrual["gmv_share_cents"] == 0
+    assert accrual["gross_comp_cents"] == 0
+    assert accrual["credited_comp_cents"] == 0
+    assert comp["v2_metadata"]["brand_count_suspended_nonpayment"] == 1
+    assert comp["clawbacks"] == []
+    assert comp["net_comp_cents"] == 0
+
+
+async def test_nonpayment_threshold_uses_channel_partners_nonpayment_clawback_days(
+    fake_db: _FakeV2Database,
+) -> None:
+    merchant_id = "merch_nonpayment_custom"
+    month = _current_month_start()
+    partner_id = fake_db.add_partner(
+        gmv_take_definition="net",
+        nonpayment_clawback_days=30,
+    )
+    fake_db.add_attribution(
+        merchant_id=merchant_id,
+        partner_id=partner_id,
+        activated_at=datetime(month.year, month.month, 1, tzinfo=timezone.utc),
+    )
+    fake_db.seed_default_scope_b_rates(partner_id)
+    await _assemble_and_freeze_statement(fake_db, merchant_id, month)
+    fake_db.add_unpaid_invoice(
+        merchant_id=merchant_id,
+        status="finalized",
+        created_at=datetime.now(timezone.utc) - timedelta(days=45),
+    )
+
+    comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        month,
+        _next_month(month),
+    )
+    accrual = comp["merchant_accruals"][merchant_id]
+
+    assert comp["v2_metadata"]["nonpayment_clawback_days"] == 30
+    assert accrual["nonpayment_suspended"] is True
+    assert accrual["gross_comp_cents"] == 0
+    assert comp["clawbacks"] == []
+
+
 async def _assemble_and_freeze_statement(
     fake_db: _FakeV2Database,
     merchant_id: str,
@@ -812,6 +1134,11 @@ def _as_date(value: date | datetime) -> date:
     if isinstance(value, datetime):
         return value.date()
     return value
+
+
+def _current_month_start() -> date:
+    today = datetime.now(timezone.utc).date()
+    return date(today.year, today.month, 1)
 
 
 def _next_month(value: date) -> date:
