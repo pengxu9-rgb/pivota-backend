@@ -11,6 +11,7 @@ import stripe
 
 from config.settings import settings
 from db.database import IS_POSTGRES, database
+from services import partner_rev_share_engine_v2
 
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,18 @@ async def run_settlement(billing_run_id: int) -> int:
     payout_count = 0
     for partner_row in partner_rows:
         channel_partner_id = int(_row_get(partner_row, "channel_partner_id"))
-        comp_dict = await compute_partner_comp(channel_partner_id, period_start, period_end)
+        if settings.partner_rev_share_use_v2:
+            comp_dict = await partner_rev_share_engine_v2.compute_partner_comp_v2(
+                channel_partner_id,
+                period_start,
+                period_end,
+            )
+        else:
+            comp_dict = await compute_partner_comp(
+                channel_partner_id,
+                period_start,
+                period_end,
+            )
         snapshot_id = await write_settlement_snapshot(
             billing_run_id,
             channel_partner_id,
