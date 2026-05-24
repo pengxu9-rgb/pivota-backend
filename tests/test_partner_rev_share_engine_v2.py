@@ -678,9 +678,23 @@ async def test_brief_9_1_starter_y1_scope_b_net_definition(
     assert comp["net_comp_cents"] == 11045
 
 
-async def test_tail_boundary_month_36_is_paid_month_37_is_zero(
+async def test_tail_boundary_36_months_total_activation_month_is_month_1(
     fake_db: _FakeV2Database,
 ) -> None:
+    """Architectural decision (2026-05-24): tail_months=36 means 36 payable
+    months TOTAL, with activation_month = month 1 of Y1.
+
+    For activated_at=2025-04-01 with tail_months=36:
+      - 2028-03 (35 months after activation) → paid_idx=36, brand_year=3, payable
+      - 2028-04 (36 months after activation) → exhausted
+      - 2028-05 (37 months after activation) → exhausted
+
+    Replaces the previous interpretation that paid 37 months total
+    (matching build brief §9.5's literal table). The brief example needs a
+    corresponding doc update; the architectural decision is canonical.
+    Codex post-merge review of PR #631–#641 caught the off-by-one.
+    """
+
     merchant_id = "merch_tail"
     partner_id = fake_db.add_partner(gmv_take_definition="net")
     fake_db.add_attribution(
@@ -689,29 +703,44 @@ async def test_tail_boundary_month_36_is_paid_month_37_is_zero(
         activated_at=datetime(2025, 4, 1, tzinfo=timezone.utc),
     )
     fake_db.seed_default_scope_b_rates(partner_id)
+    await _assemble_and_freeze_statement(fake_db, merchant_id, date(2028, 3, 1))
     await _assemble_and_freeze_statement(fake_db, merchant_id, date(2028, 4, 1))
     await _assemble_and_freeze_statement(fake_db, merchant_id, date(2028, 5, 1))
 
-    paid_comp = await engine.compute_partner_comp_v2(
+    last_payable_comp = await engine.compute_partner_comp_v2(
+        partner_id,
+        date(2028, 3, 1),
+        date(2028, 4, 1),
+    )
+    first_exhausted_comp = await engine.compute_partner_comp_v2(
         partner_id,
         date(2028, 4, 1),
         date(2028, 5, 1),
     )
-    exhausted_comp = await engine.compute_partner_comp_v2(
+    deep_exhausted_comp = await engine.compute_partner_comp_v2(
         partner_id,
         date(2028, 5, 1),
         date(2028, 6, 1),
     )
 
-    paid_accrual = paid_comp["merchant_accruals"][merchant_id]
-    exhausted_accrual = exhausted_comp["merchant_accruals"][merchant_id]
-    assert paid_accrual["brand_year"] == 3
-    assert paid_accrual["tail_exhausted"] is False
-    assert paid_accrual["gross_comp_cents"] > 0
-    assert exhausted_accrual["tail_exhausted"] is True
-    assert exhausted_accrual["gross_comp_cents"] == 0
-    assert exhausted_comp["net_comp_cents"] == 0
-    assert exhausted_comp["v2_metadata"]["brand_count_skipped_tail_exhausted"] == 1
+    last_payable_accrual = last_payable_comp["merchant_accruals"][merchant_id]
+    first_exhausted_accrual = first_exhausted_comp["merchant_accruals"][merchant_id]
+    deep_exhausted_accrual = deep_exhausted_comp["merchant_accruals"][merchant_id]
+
+    # 2028-03: months_since=35, paid_idx=36, brand_year=3 — last payable Y3 month
+    assert last_payable_accrual["brand_year"] == 3
+    assert last_payable_accrual["tail_exhausted"] is False
+    assert last_payable_accrual["gross_comp_cents"] > 0
+
+    # 2028-04: months_since=36 == tail_months → exhausted
+    assert first_exhausted_accrual["tail_exhausted"] is True
+    assert first_exhausted_accrual["gross_comp_cents"] == 0
+    assert first_exhausted_comp["net_comp_cents"] == 0
+    assert first_exhausted_comp["v2_metadata"]["brand_count_skipped_tail_exhausted"] == 1
+
+    # 2028-05: months_since=37 → exhausted
+    assert deep_exhausted_accrual["tail_exhausted"] is True
+    assert deep_exhausted_accrual["gross_comp_cents"] == 0
 
 
 async def test_non_retroactive_snapshot_keeps_pre_flag_rates(
