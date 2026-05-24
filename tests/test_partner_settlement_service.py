@@ -168,3 +168,106 @@ async def test_credit_overage_for_partner_reads_frozen_statements(
     )
 
     assert revenue == 1950
+
+
+@pytest.mark.asyncio
+async def test_run_settlement_skips_legacy_payout_path_when_v2_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex post-merge review of PR #641 caught a real double-pay risk:
+
+    PR #8 (#640) added settlement_file_generate + settlement_file_transfer
+    crons as a NEW payment pipeline. The OLD path in run_settlement still
+    calls credit_partner_balance + create_payout. Both pipelines consume the
+    same settlement_snapshots — without this skip, partners would be paid
+    twice (once via the legacy agent_payouts flow, once via Stripe Connect
+    transfer).
+
+    When PARTNER_REV_SHARE_USE_V2=true, run_settlement should write the
+    snapshot (so the new pipeline has data) and then SKIP the legacy
+    credit/debit/payout steps.
+    """
+
+    calls = {
+        "compute_v2": 0,
+        "compute_v1": 0,
+        "snapshot_writes": 0,
+        "credit": 0,
+        "debit": 0,
+        "create_payout": 0,
+    }
+
+    async def fake_fetch_run(billing_run_id):
+        return {"period_start": date(2026, 4, 1), "period_end": date(2026, 5, 1)}
+
+    async def fake_fetch_all(query, params=None):
+        return [{"channel_partner_id": 7}]
+
+    fake_db = type("FakeDB", (), {"fetch_all": staticmethod(fake_fetch_all)})
+
+    async def fake_compute_v2(*a, **kw):
+        calls["compute_v2"] += 1
+        return {
+            "net_comp_cents": 5000,
+            "clawbacks": [{"amount_cents": 1000, "merchant_id": "m1", "reason": "x"}],
+        }
+
+    async def fake_compute_v1(*a, **kw):
+        calls["compute_v1"] += 1
+        return {
+            "net_comp_cents": 5000,
+            "clawbacks": [{"amount_cents": 1000, "merchant_id": "m1", "reason": "x"}],
+        }
+
+    async def fake_write_snapshot(billing_run_id, partner_id, comp):
+        calls["snapshot_writes"] += 1
+        return 999
+
+    async def fake_credit(*a, **kw):
+        calls["credit"] += 1
+
+    async def fake_debit(*a, **kw):
+        calls["debit"] += 1
+
+    async def fake_create_payout(*a, **kw):
+        calls["create_payout"] += 1
+        return 1
+
+    monkeypatch.setattr(service, "_fetch_billing_run", fake_fetch_run)
+    monkeypatch.setattr(service, "database", fake_db)
+    monkeypatch.setattr(
+        service.partner_rev_share_engine_v2,
+        "compute_partner_comp_v2",
+        fake_compute_v2,
+    )
+    monkeypatch.setattr(service, "compute_partner_comp", fake_compute_v1)
+    monkeypatch.setattr(service, "write_settlement_snapshot", fake_write_snapshot)
+    monkeypatch.setattr(service, "credit_partner_balance", fake_credit)
+    monkeypatch.setattr(service, "debit_partner_balance", fake_debit)
+    monkeypatch.setattr(service, "create_payout", fake_create_payout)
+
+    # Flag ON: v2 compute fires, snapshot written, legacy payout path SKIPPED
+    monkeypatch.setattr(service.settings, "partner_rev_share_use_v2", True)
+    await service.run_settlement(101)
+    assert calls == {
+        "compute_v2": 1,
+        "compute_v1": 0,
+        "snapshot_writes": 1,
+        "credit": 0,
+        "debit": 0,
+        "create_payout": 0,
+    }, f"v2 path leaked into legacy payout calls: {calls}"
+
+    # Reset + flag OFF: v1.3 path runs unchanged
+    for k in calls:
+        calls[k] = 0
+    monkeypatch.setattr(service.settings, "partner_rev_share_use_v2", False)
+    await service.run_settlement(101)
+    assert calls == {
+        "compute_v2": 0,
+        "compute_v1": 1,
+        "snapshot_writes": 1,
+        "credit": 1,
+        "debit": 1,
+        "create_payout": 1,
+    }, f"legacy path regressed: {calls}"
