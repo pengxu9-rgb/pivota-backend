@@ -336,6 +336,7 @@ def test_ext_identity_group_member_proposal_uses_shared_identity_group() -> None
     assert proposal.platform == "external_seed"
     assert proposal.source_product_id == "mac:62c89320b830814c"
     assert proposal.is_primary is True
+    assert proposal.from_attached_product_key == attached_key
 
 
 def test_ext_identity_group_member_proposal_skips_existing_correct_member() -> None:

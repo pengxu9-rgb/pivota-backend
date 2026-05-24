@@ -424,6 +424,7 @@ def build_ext_identity_group_member_proposal(row: Dict[str, Any]) -> Optional[Id
         platform=EXTERNAL_SEED_PLATFORM,
         source_product_id=external_product_id,
         is_primary=should_be_primary,
+        from_attached_product_key=attached_product_key,
     )
 
 
