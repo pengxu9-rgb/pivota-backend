@@ -21,6 +21,7 @@ class _FakeStatementsDatabase:
         self.merchants: list[dict[str, Any]] = []
         self.user_subscriptions: list[dict[str, Any]] = []
         self.credit_ledger: list[dict[str, Any]] = []
+        self.commerce_attribution_edges: list[dict[str, Any]] = []
         self.monthly_brand_statements: list[dict[str, Any]] = []
         self.invoices: list[dict[str, Any]] = []
         self.billing_run_items: list[dict[str, Any]] = []
@@ -58,7 +59,14 @@ class _FakeStatementsDatabase:
             return self._statement_for_month(params["merchant_id"], params["calendar_month"])
 
         if "from user_subscriptions us" in sql:
-            return self._latest_subscription(params["merchant_id"], params["period_start"], params["period_end"])
+            return self._latest_subscription(
+                params["merchant_id"],
+                params["period_start"],
+                params["period_end"],
+            )
+
+        if "from commerce_attribution_edges" in sql:
+            return self._gmv_aggregation(params["merchant_id"], params["period_start"], params["period_end"])
 
         if sql.startswith("insert into monthly_brand_statements"):
             statement = {
@@ -72,10 +80,10 @@ class _FakeStatementsDatabase:
                 "bundled_credits_consumed": params["bundled_credits_consumed"],
                 "overage_credits": params["overage_credits"],
                 "overage_revenue_usd_cents": params["overage_revenue_usd_cents"],
-                "gmv_usd_cents": 0,
-                "gmv_personal_usd_cents": 0,
-                "gmv_third_party_usd_cents": 0,
-                "pivota_gmv_take_usd_cents": 0,
+                "gmv_usd_cents": params["gmv_usd_cents"],
+                "gmv_personal_usd_cents": params["gmv_personal_usd_cents"],
+                "gmv_third_party_usd_cents": params["gmv_third_party_usd_cents"],
+                "pivota_gmv_take_usd_cents": params["pivota_gmv_take_usd_cents"],
                 "total_revenue_usd_cents": params["total_revenue_usd_cents"],
                 "total_cogs_usd_cents": params["total_cogs_usd_cents"],
                 "pivota_gross_margin_usd_cents": params["pivota_gross_margin_usd_cents"],
@@ -102,10 +110,10 @@ class _FakeStatementsDatabase:
                     "bundled_credits_consumed": params["bundled_credits_consumed"],
                     "overage_credits": params["overage_credits"],
                     "overage_revenue_usd_cents": params["overage_revenue_usd_cents"],
-                    "gmv_usd_cents": 0,
-                    "gmv_personal_usd_cents": 0,
-                    "gmv_third_party_usd_cents": 0,
-                    "pivota_gmv_take_usd_cents": 0,
+                    "gmv_usd_cents": params["gmv_usd_cents"],
+                    "gmv_personal_usd_cents": params["gmv_personal_usd_cents"],
+                    "gmv_third_party_usd_cents": params["gmv_third_party_usd_cents"],
+                    "pivota_gmv_take_usd_cents": params["pivota_gmv_take_usd_cents"],
                     "total_revenue_usd_cents": params["total_revenue_usd_cents"],
                     "total_cogs_usd_cents": params["total_cogs_usd_cents"],
                     "pivota_gross_margin_usd_cents": params["pivota_gross_margin_usd_cents"],
@@ -146,7 +154,9 @@ class _FakeStatementsDatabase:
         if sql.startswith("update monthly_brand_statements") and "set overage_credits" in sql:
             statement = self._statement_by_id(params["statement_id"])
             if statement["status"] == "frozen":
-                raise RuntimeError("monthly_brand_statements frozen row does not allow computed field mutation")
+                raise RuntimeError(
+                    "monthly_brand_statements frozen row does not allow computed field mutation"
+                )
             statement["overage_credits"] = params["overage_credits"]
             return None
         raise AssertionError(f"Unhandled execute query: {query}")
@@ -202,6 +212,31 @@ class _FakeStatementsDatabase:
         )
         return ledger_id
 
+    def add_gmv_edge(
+        self,
+        *,
+        merchant_id: str,
+        net_attributed_gmv_cents: int,
+        gmv_channel: str | None,
+        created_at: datetime,
+        edge_id: str | None = None,
+        third_party_platform: str | None = None,
+        third_party_platform_fee_pct: float | None = None,
+    ) -> str:
+        edge_id = edge_id or f"edge_{len(self.commerce_attribution_edges) + 1}"
+        self.commerce_attribution_edges.append(
+            {
+                "edge_id": edge_id,
+                "merchant_id": merchant_id,
+                "net_attributed_gmv_cents": net_attributed_gmv_cents,
+                "gmv_channel": gmv_channel,
+                "third_party_platform": third_party_platform,
+                "third_party_platform_fee_pct": third_party_platform_fee_pct,
+                "created_at": created_at,
+            }
+        )
+        return edge_id
+
     def statement(self, statement_id: int) -> dict[str, Any]:
         return dict(self._statement_by_id(statement_id))
 
@@ -221,7 +256,12 @@ class _FakeStatementsDatabase:
             None,
         )
 
-    def _latest_subscription(self, merchant_id: str, period_start: date, period_end: date) -> dict[str, Any] | None:
+    def _latest_subscription(
+        self,
+        merchant_id: str,
+        period_start: date,
+        period_end: date,
+    ) -> dict[str, Any] | None:
         candidates = [
             row
             for row in self.user_subscriptions
@@ -232,13 +272,37 @@ class _FakeStatementsDatabase:
         ]
         if not candidates:
             return None
-        subscription = sorted(candidates, key=lambda row: (row["current_period_start"] or date.min, row["id"]))[-1]
+        subscription = sorted(
+            candidates,
+            key=lambda row: (row["current_period_start"] or date.min, row["id"]),
+        )[-1]
         plan = next(row for row in self.subscription_plans if row["id"] == subscription["plan_id"])
         return {
             "subscription_plan_id": plan["id"],
             "tier_name": plan["name"],
             "monthly_credit_allowance": plan["monthly_credit_allowance"],
             "subscription_revenue_usd_cents": plan["price_cents"],
+        }
+
+    def _gmv_aggregation(self, merchant_id: str, period_start: date, period_end: date) -> dict[str, Any]:
+        rows = [
+            row
+            for row in self.commerce_attribution_edges
+            if row["merchant_id"] == merchant_id
+            and period_start <= _as_date(row["created_at"]) < period_end
+            and int(row.get("net_attributed_gmv_cents") or 0) > 0
+        ]
+        return {
+            "gmv_raw_total_cents": sum(int(row["net_attributed_gmv_cents"]) for row in rows),
+            "gmv_personal_cents": sum(
+                int(row["net_attributed_gmv_cents"]) for row in rows if row["gmv_channel"] == "personal_agent"
+            ),
+            "gmv_third_party_cents": sum(
+                int(row["net_attributed_gmv_cents"])
+                for row in rows
+                if row["gmv_channel"] == "third_party_agent"
+            ),
+            "unclassified_edge_count": sum(1 for row in rows if row["gmv_channel"] is None),
         }
 
 
@@ -262,6 +326,20 @@ async def test_starter_brand_normal_usage_brief_9_1(fake_db: _FakeStatementsData
         credits=5500,
         occurred_at=datetime(2025, 6, 15, tzinfo=timezone.utc),
     )
+    fake_db.add_gmv_edge(
+        merchant_id=merchant_id,
+        net_attributed_gmv_cents=150000,
+        gmv_channel="personal_agent",
+        created_at=datetime(2025, 6, 16, tzinfo=timezone.utc),
+    )
+    fake_db.add_gmv_edge(
+        merchant_id=merchant_id,
+        net_attributed_gmv_cents=350000,
+        gmv_channel="third_party_agent",
+        third_party_platform="openai",
+        third_party_platform_fee_pct=0.65,
+        created_at=datetime(2025, 6, 17, tzinfo=timezone.utc),
+    )
 
     statement_id = await statements.assemble_for_month(merchant_id, month)
 
@@ -271,10 +349,63 @@ async def test_starter_brand_normal_usage_brief_9_1(fake_db: _FakeStatementsData
     assert row["bundled_credits_consumed"] == 4000
     assert row["overage_credits"] == 1500
     assert row["overage_revenue_usd_cents"] == 1950
-    assert row["total_revenue_usd_cents"] == 11850
+    assert row["gmv_usd_cents"] == 500000
+    assert row["gmv_personal_usd_cents"] == 150000
+    assert row["gmv_third_party_usd_cents"] == 350000
+    assert row["pivota_gmv_take_usd_cents"] == 50000
+    assert row["total_revenue_usd_cents"] == 61850
     assert row["total_cogs_usd_cents"] == 5060
-    assert row["pivota_gross_margin_usd_cents"] == 6790
-    assert row["gmv_usd_cents"] == 0
+    # PR #4 records raw GMV take as revenue, but PR #5 owns channel-tiered GMV COGS.
+    # Until then, gross margin is total_revenue - credit/SaaS COGS only.
+    assert row["pivota_gross_margin_usd_cents"] == 56790
+    assert row["metadata"]["gmv_unclassified_edge_count"] == 0
+    assert row["metadata"]["gmv_take_rate_bp_applied"] == 1000
+    assert row["metadata"]["gmv_take_cogs_pending_pr5"] is True
+
+
+async def test_gmv_unclassified_edges_are_excluded_from_statement_total(
+    fake_db: _FakeStatementsDatabase,
+) -> None:
+    month = date(2025, 6, 1)
+    merchant_id = "merch_unclassified"
+    plan_id = fake_db.add_plan(name="starter", price_cents=9900, allowance=4000)
+    fake_db.add_merchant(merchant_id)
+    fake_db.add_subscription(merchant_id=merchant_id, plan_id=plan_id, month=month)
+    fake_db.consume_credits(
+        merchant_id=merchant_id,
+        credits=5500,
+        occurred_at=datetime(2025, 6, 15, tzinfo=timezone.utc),
+    )
+    fake_db.add_gmv_edge(
+        merchant_id=merchant_id,
+        net_attributed_gmv_cents=150000,
+        gmv_channel="personal_agent",
+        created_at=datetime(2025, 6, 16, tzinfo=timezone.utc),
+    )
+    fake_db.add_gmv_edge(
+        merchant_id=merchant_id,
+        net_attributed_gmv_cents=350000,
+        gmv_channel="third_party_agent",
+        third_party_platform="openai",
+        third_party_platform_fee_pct=0.65,
+        created_at=datetime(2025, 6, 17, tzinfo=timezone.utc),
+    )
+    fake_db.add_gmv_edge(
+        merchant_id=merchant_id,
+        net_attributed_gmv_cents=20000,
+        gmv_channel=None,
+        created_at=datetime(2025, 6, 18, tzinfo=timezone.utc),
+    )
+
+    statement_id = await statements.assemble_for_month(merchant_id, month)
+
+    row = fake_db.statement(statement_id)
+    assert row["gmv_usd_cents"] == 500000
+    assert row["gmv_personal_usd_cents"] == 150000
+    assert row["gmv_third_party_usd_cents"] == 350000
+    assert row["pivota_gmv_take_usd_cents"] == 50000
+    assert row["total_revenue_usd_cents"] == 61850
+    assert row["metadata"]["gmv_unclassified_edge_count"] == 1
 
 
 async def test_no_double_charge_within_allowance_brief_9_3(fake_db: _FakeStatementsDatabase) -> None:
@@ -313,6 +444,12 @@ async def test_assemble_is_idempotent_for_open_statement(fake_db: _FakeStatement
         credits=5500,
         occurred_at=datetime(2025, 6, 7, tzinfo=timezone.utc),
     )
+    fake_db.add_gmv_edge(
+        merchant_id=merchant_id,
+        net_attributed_gmv_cents=100000,
+        gmv_channel="personal_agent",
+        created_at=datetime(2025, 6, 7, 12, tzinfo=timezone.utc),
+    )
 
     first_id = await statements.assemble_for_month(merchant_id, month)
     first_row = fake_db.statement(first_id)
@@ -322,6 +459,10 @@ async def test_assemble_is_idempotent_for_open_statement(fake_db: _FakeStatement
     assert second_id == first_id
     assert len(fake_db.monthly_brand_statements) == 1
     assert second_row == first_row
+    assert second_row["gmv_usd_cents"] == 100000
+    assert second_row["gmv_personal_usd_cents"] == 100000
+    assert second_row["gmv_third_party_usd_cents"] == 0
+    assert second_row["pivota_gmv_take_usd_cents"] == 10000
 
 
 async def test_frozen_statement_blocks_computed_field_mutation(fake_db: _FakeStatementsDatabase) -> None:
