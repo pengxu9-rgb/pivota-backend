@@ -249,6 +249,10 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     sql = "\n".join(pcr.database.compiled_sql)
     assert "JOIN index_pipeline_state" in sql
     assert "serving_eligible IS true" in sql
+    assert "ORDER BY catalog_products.updated_at DESC" in sql
+    assert "catalog_products.pivota_signature_id ASC" in sql
+    assert "catalog_products.content_key ASC" in sql
+    assert "catalog_products.product_key ASC" in sql
 
 
 def test_list_canonical_pdps_rejects_oversized_limit(env):
