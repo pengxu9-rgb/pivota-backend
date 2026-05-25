@@ -78,7 +78,11 @@ _FASHION_ENRICH_SEM = asyncio.Semaphore(8)
 # pdpBuilder.pickFashionMeta cutoff (0.6). Keeping the write-side at the
 # same threshold prevents low-confidence rows from polluting the DB.
 _FASHION_ENRICH_MIN_CONFIDENCE = 0.6
-GUARDED_OFFER_WRITERS = {"shopify_products_sync"}
+GUARDED_OFFER_WRITERS = {
+    "shopify_products_sync",
+    # Wix catalog sync currently routes through routes.universal_product_sync.
+    "universal_product_sync",
+}
 
 
 async def _async_fashion_enrich(
