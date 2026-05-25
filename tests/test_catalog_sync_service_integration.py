@@ -468,6 +468,76 @@ async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
 
 
 @pytest.mark.asyncio
+async def test_ingest_standard_products_wix_universal_sync_writes_content_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog_products_writes: list[dict] = []
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_resolve_merchant_name(_merchant_id):
+        return "Wix Brand Co."
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_products":
+            catalog_products_writes.append(dict(values))
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module.database, "execute", _noop_execute)
+    monkeypatch.setattr(module, "_resolve_merchant_name", fake_resolve_merchant_name)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+
+    stats = await module.ingest_standard_products(
+        merchant_id="merch_wix",
+        platform="wix",
+        product_payloads=[
+            {
+                "id": "prod_wix",
+                "product_id": "prod_wix",
+                "merchant_id": "merch_wix",
+                "platform": "wix",
+                "title": "Niacinamide Serum",
+                "price": 18.0,
+                "currency": "USD",
+                "inventory_quantity": 5,
+                "variants": [],
+            }
+        ],
+        source_system="universal_product_sync",
+        source_ref="universal_product_sync:merch_wix:wix",
+    )
+
+    assert stats["products_ingested"] == 1
+    assert len(catalog_products_writes) == 1
+    row = catalog_products_writes[0]
+    assert row["content_key"] == module.make_content_key(
+        "Wix Brand Co.",
+        "Niacinamide Serum",
+        None,
+    )
+    assert row["content_key"] is not None
+    assert row["brand"] is None
+
+
+@pytest.mark.asyncio
 async def test_ingest_standard_products_persists_merchant_tags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

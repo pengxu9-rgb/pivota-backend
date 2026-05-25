@@ -378,6 +378,31 @@ def _extract_metadata_values(metadata: Dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _text_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _wix_universal_content_key_brand(
+    metadata: Dict[str, Any],
+    merchant_name: Optional[str],
+) -> Optional[str]:
+    return _text_or_none(
+        _extract_metadata_values(
+            metadata,
+            "brand",
+            "brandName",
+            "brand_name",
+            "vendor",
+            "manufacturer",
+            "merchant_brand",
+            "merchantBrand",
+        )
+    ) or _text_or_none(merchant_name)
+
+
 def _split_text_steps(text: str) -> List[str]:
     raw = str(text or "").strip()
     if not raw:
@@ -747,7 +772,7 @@ async def upsert_catalog_merchant(
     source_system: str,
     source_ref: Optional[str],
     metadata_json: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> Optional[str]:
     if not merchant_name:
         merchant_name = await _resolve_merchant_name(merchant_id)
     await _upsert_by_pk(
@@ -763,6 +788,7 @@ async def upsert_catalog_merchant(
             "metadata_json": metadata_json or {},
         },
     )
+    return merchant_name
 
 
 async def ingest_standard_products(
@@ -799,7 +825,7 @@ async def ingest_standard_products(
     )
 
     async with database.transaction():
-        await upsert_catalog_merchant(
+        merchant_name = await upsert_catalog_merchant(
             merchant_id=merchant_id,
             merchant_name=None,
             primary_platform=platform,
@@ -823,7 +849,10 @@ async def ingest_standard_products(
             readiness_tier = _readiness_tier_for_product(product)
             canonical_url = str(metadata.get("canonical_url") or metadata.get("url") or "").strip() or None
             brand = str(product.vendor or metadata.get("brand") or "").strip() or None
-            content_key = make_content_key(brand, product.title, product.barcode)
+            content_key_brand = brand
+            if not content_key_brand and platform == "wix" and source_system == "universal_product_sync":
+                content_key_brand = _wix_universal_content_key_brand(metadata, merchant_name)
+            content_key = make_content_key(content_key_brand, product.title, product.barcode)
             # Pivota canonical PDP fields (sig_id + agent.pivota.cc URL)
             # — every onboarded merchant product gets one. Deterministic
             # so re-syncs are idempotent.
