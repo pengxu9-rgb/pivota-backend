@@ -380,6 +380,94 @@ async def test_ingest_standard_products_shopify_offer_guard_filters_invalid_batc
 
 
 @pytest.mark.asyncio
+async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inserted_skus: set[str] = set()
+    offer_writes = []
+    audit_rows = []
+    wix_source_system = "universal_product_sync"
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_upsert_catalog_merchant(**_kwargs):
+        return None
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_skus":
+            inserted_skus.add(values["sku_key"])
+        if getattr(table, "name", None) == "catalog_offers":
+            offer_writes.append(dict(values))
+
+    async def fake_fetch_all(_sql, _values):
+        raise AssertionError("guarded offer ingest should validate against the SKU inserted in this transaction")
+
+    async def fake_execute(*args, **_kwargs):
+        if len(args) >= 2 and isinstance(args[1], dict) and args[1].get("writer_name"):
+            audit_rows.append(dict(args[1]))
+        return None
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "upsert_catalog_merchant", fake_upsert_catalog_merchant)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+
+    stats = await module.ingest_standard_products(
+        merchant_id="merch_guard",
+        platform="wix",
+        product_payloads=[
+            {
+                "id": "prod_guard",
+                "product_id": "prod_guard",
+                "merchant_id": "merch_guard",
+                "platform": "wix",
+                "title": "Vitamin C Serum",
+                "price": 12.0,
+                "currency": "USD",
+                "variants": [
+                    {"id": "v_valid", "title": "Valid", "price": 12.0, "inventory_quantity": 2},
+                    {"id": "v_zero", "title": "Zero", "price": 0.0, "inventory_quantity": 2},
+                    {"id": "v_negative", "title": "Negative", "price": -1.0, "inventory_quantity": 2},
+                ],
+            }
+        ],
+        source_system=wix_source_system,
+        source_ref="batch_guard",
+    )
+
+    assert stats["offers_ingested"] == 1
+    assert stats["offers_skipped"] == 2
+    assert stats["offer_skip_reasons"] == {"zero_or_missing_price": 2}
+    assert len(offer_writes) == 1
+    assert offer_writes[0]["offer_payload"]["variant_id"] == "v_valid"
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["writer_name"] == wix_source_system
+    assert audit_rows[0]["batch_id"] == "batch_guard"
+    assert audit_rows[0]["applied_rows"] == 1
+    assert audit_rows[0]["skipped_rows"] == 2
+    assert '"zero_or_missing_price": 2' in audit_rows[0]["reasons"]
+
+
+@pytest.mark.asyncio
 async def test_ingest_standard_products_persists_merchant_tags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
