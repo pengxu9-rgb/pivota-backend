@@ -468,6 +468,106 @@ async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "source_system"),
+    [
+        ("shopify", "shopify_products_sync"),
+        ("wix", "universal_product_sync"),
+    ],
+)
+async def test_ingest_standard_products_captures_strong_identifiers_into_sku_barcode(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    source_system: str,
+) -> None:
+    sku_writes = []
+    audit_rows = []
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_upsert_catalog_merchant(**_kwargs):
+        return None
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_skus":
+            sku_writes.append(dict(values))
+
+    async def fake_execute(*args, **_kwargs):
+        if len(args) >= 2 and isinstance(args[1], dict) and args[1].get("writer_name"):
+            audit_rows.append(dict(args[1]))
+        return None
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    async def fake_fold_category_with_llm_fallback(**_kwargs):
+        return None
+
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "upsert_catalog_merchant", fake_upsert_catalog_merchant)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module, "fold_category_with_llm_fallback", fake_fold_category_with_llm_fallback)
+    monkeypatch.setattr(module, "_schedule_fashion_enrichment", lambda **_kwargs: None)
+
+    stats = await module.ingest_standard_products(
+        merchant_id="merch_barcode",
+        platform=platform,
+        product_payloads=[
+            {
+                "id": "prod_barcode",
+                "product_id": "prod_barcode",
+                "merchant_id": "merch_barcode",
+                "platform": platform,
+                "title": "Barrier Repair Serum",
+                "price": 12.0,
+                "currency": "USD",
+                "variants": [
+                    {"id": "v_gtin13", "title": "GTIN-13", "price": 12.0, "inventory_quantity": 2, "gtin": "1234567890123"},
+                    {"id": "v_upc12", "title": "UPC-12", "price": 12.0, "inventory_quantity": 2, "upc": "123456789012"},
+                    {"id": "v_gtin8", "title": "GTIN-8", "price": 12.0, "inventory_quantity": 2, "gtin": "12345678"},
+                    {"id": "v_formatted", "title": "Formatted", "price": 12.0, "inventory_quantity": 2, "barcode": "0-12345-67890-5"},
+                    {"id": "v_missing", "title": "Missing", "price": 12.0, "inventory_quantity": 2},
+                    {"id": "v_garbage", "title": "Garbage", "price": 12.0, "inventory_quantity": 2, "barcode": "N/A"},
+                ],
+            }
+        ],
+        source_system=source_system,
+        source_ref="batch_barcode",
+    )
+
+    by_variant = {row["source_variant_id"]: row for row in sku_writes}
+    assert by_variant["v_gtin13"]["barcode"] == "1234567890123"
+    assert by_variant["v_upc12"]["barcode"] == "123456789012"
+    assert by_variant["v_gtin8"]["barcode"] == "12345678"
+    assert by_variant["v_formatted"]["barcode"] == "012345678905"
+    assert by_variant["v_missing"]["barcode"] is None
+    assert by_variant["v_garbage"]["barcode"] is None
+    assert stats["skus_ingested"] == 6
+    assert stats["offers_ingested"] == 6
+    assert stats["offers_skipped"] == 0
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["writer_name"] == source_system
+    assert audit_rows[0]["skipped_rows"] == 0
+    assert '"no_strong_identifier": 2' in audit_rows[0]["reasons"]
+
+
+@pytest.mark.asyncio
 async def test_ingest_standard_products_persists_merchant_tags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

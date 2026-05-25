@@ -43,6 +43,12 @@ from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
+from services.strong_identifier import (
+    MPN_CAPTURED_AS_BARCODE,
+    NO_STRONG_IDENTIFIER,
+    StrongIdentifier,
+    extract_strong_identifier,
+)
 from services.text_normalization.brand_case import proper_case_brand
 
 logger = logging.getLogger("catalog_enrichment_agent.ingestion")
@@ -145,6 +151,10 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     # diverging from Path A's GTIN-included key for the same product.
     # Pass through unchanged; downstream callers handle empty values.
     gtin_raw = pdp.get("gtin") or pdp.get("barcode") or ""
+    upc_raw = pdp.get("upc") or ""
+    ean_raw = pdp.get("ean") or ""
+    barcode_raw = pdp.get("barcode") or ""
+    mpn_raw = pdp.get("mpn") or ""
     # Display-cased — upstream candidates routinely arrive lowercase
     # ("fenty beauty"). Identity/dedup keys use lowercase via
     # canonical_product_name() below, so this only fixes display.
@@ -154,6 +164,17 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "category_path": str(pdp.get("category_path") or "").strip(),
         "attribute_summary": str(pdp.get("attribute_summary") or "").strip(),
         "gtin": str(gtin_raw).strip() if gtin_raw else None,
+        "upc": str(upc_raw).strip() if upc_raw else None,
+        "ean": str(ean_raw).strip() if ean_raw else None,
+        "barcode": str(barcode_raw).strip() if barcode_raw else None,
+        "mpn": str(mpn_raw).strip() if mpn_raw else None,
+        "strong_identity": {
+            "gtin": str(pdp.get("gtin") or "").strip() or None,
+            "upc": str(upc_raw).strip() if upc_raw else None,
+            "ean": str(ean_raw).strip() if ean_raw else None,
+            "barcode": str(barcode_raw).strip() if barcode_raw else None,
+            "mpn": str(mpn_raw).strip() if mpn_raw else None,
+        },
         "tags": tags,
         "agent_version": AGENT_VERSION,
     }
@@ -448,6 +469,10 @@ def _build_sku_insert(
     catalog_offers without our agent rows looking different from
     merchant-sync rows."""
     sku_key = derive_sku_key(product_key)
+    strong_identifier = extract_strong_identifier(pdp_payload.get("strong_identity"))
+    sku_payload = {"agent_version": AGENT_VERSION}
+    if strong_identifier is not None:
+        sku_payload["strong_identifier_kind"] = strong_identifier.kind
     return {
         "sku_key": sku_key,
         "product_key": product_key,
@@ -463,16 +488,24 @@ def _build_sku_insert(
         # makes it deterministic across re-runs.
         "source_variant_id": product_key,
         "sku": None,
-        "barcode": None,
+        "barcode": strong_identifier.value if strong_identifier else None,
         "title": pdp_payload["product_name"],
         "currency": "USD",
         "image_url": image_url or None,
         "visible_attributes": json.dumps({}),
         "visible_option_labels": json.dumps([]),
         "ingredient_ids": json.dumps([]),
-        "sku_payload": json.dumps({"agent_version": AGENT_VERSION}),
+        "sku_payload": json.dumps(sku_payload),
         "readiness_tier": OFFER_READINESS_TIER,
     }
+
+
+def _identifier_audit_reasons(identifier: Optional[StrongIdentifier]) -> Dict[str, int]:
+    if identifier is None:
+        return {NO_STRONG_IDENTIFIER: 1}
+    if identifier.kind == "mpn":
+        return {MPN_CAPTURED_AS_BARCODE: 1}
+    return {}
 
 
 def _build_merchant_upserts(
@@ -630,6 +663,9 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         "merchants": merchant_rows,
         "offers": offer_rows,
         "seeds": seed_rows,
+        "audit_reasons": _identifier_audit_reasons(
+            extract_strong_identifier(pdp_payload.get("strong_identity"))
+        ),
     }
 
 
@@ -651,6 +687,7 @@ def ingest_validated_jsonl(
     merchant_rows: List[Dict[str, Any]] = []
     offer_rows: List[Dict[str, Any]] = []
     seed_rows: List[Dict[str, Any]] = []
+    audit_reasons: Dict[str, int] = {}
     skipped = 0
     for record in rows:
         result = ingest_validated_record(record, source_jsonl=source_jsonl)
@@ -662,6 +699,8 @@ def ingest_validated_jsonl(
         merchant_rows.extend(result["merchants"])
         offer_rows.extend(result["offers"])
         seed_rows.extend(result["seeds"])
+        for reason, count in (result.get("audit_reasons") or {}).items():
+            audit_reasons[reason] = audit_reasons.get(reason, 0) + int(count or 0)
 
     def _dedupe(rows_in: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
         by_key: Dict[str, Dict[str, Any]] = {}
@@ -679,4 +718,5 @@ def ingest_validated_jsonl(
         "offers": _dedupe(offer_rows, "offer_id"),
         "seeds": _dedupe(seed_rows, "id"),
         "skipped": skipped,
+        "audit_reasons": audit_reasons,
     }

@@ -16,6 +16,7 @@ def test_wix_convert_product_parses_variants_list():
                 "id": "var_1",
                 "choices": {"Size": "S", "Color": "Red"},
                 "sku": "SKU-S-RED",
+                "gtin": "1234567890123",
                 "priceData": {"price": 11.0},
                 "stock": {"quantity": 2, "inStock": True, "trackQuantity": True},
                 "media": {"items": [{"image": {"url": "https://example.com/v1.jpg"}}]},
@@ -45,6 +46,8 @@ def test_wix_convert_product_parses_variants_list():
     assert v1.options == {"Size": "S", "Color": "Red"}
     assert v1.title == "S / Red"
     assert v1.image_url == "https://example.com/v1.jpg"
+    assert v1.barcode == "1234567890123"
+    assert v1.platform_metadata == {"raw_wix_variant": wp["variants"][0]}
 
     # When variants exist, product inventory is derived from variants.
     assert product.inventory_quantity == 5
@@ -65,6 +68,7 @@ def test_wix_convert_product_handles_nested_variant_payload_and_price_fallback()
                         "priceData": {"price": 12.0},
                         "stock": {"quantity": 1, "inStock": True, "trackQuantity": True},
                         "sku": "SKU-M",
+                        "upc": "123456789012",
                     },
                 }
             ]
@@ -79,6 +83,7 @@ def test_wix_convert_product_handles_nested_variant_payload_and_price_fallback()
     assert len(product.variants) == 1
     assert product.variants[0].id == "v_1"
     assert product.variants[0].sku == "SKU-M"
+    assert product.variants[0].barcode == "123456789012"
     assert product.variants[0].options == {"Size": "M"}
 
 

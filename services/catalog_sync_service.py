@@ -61,6 +61,12 @@ from services.catalog_offer_writer_guard import (
 )
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
+from services.strong_identifier import (
+    MPN_CAPTURED_AS_BARCODE,
+    NO_STRONG_IDENTIFIER,
+    StrongIdentifier,
+    extract_strong_identifier,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -369,6 +375,54 @@ def _coerce_variant(product: StandardProduct) -> StandardProductVariant:
 def _iter_variants(product: StandardProduct) -> List[StandardProductVariant]:
     variants = list(product.variants or [])
     return variants or [_coerce_variant(product)]
+
+
+def _raw_variant_payloads(raw_product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_variants = raw_product.get("variants")
+    if isinstance(raw_variants, list):
+        return [item for item in raw_variants if isinstance(item, dict)]
+    if isinstance(raw_variants, dict):
+        for key in ("variants", "items", "results"):
+            inner = raw_variants.get(key)
+            if isinstance(inner, list):
+                return [item for item in inner if isinstance(item, dict)]
+    return []
+
+
+def _raw_variant_payload(
+    raw_product: Dict[str, Any],
+    variant: StandardProductVariant,
+    source_variant_id: str,
+) -> Dict[str, Any]:
+    targets = {
+        str(source_variant_id or "").strip(),
+        str(variant.variant_id or "").strip(),
+        str(variant.id or "").strip(),
+    }
+    targets.discard("")
+    for raw_variant in _raw_variant_payloads(raw_product):
+        raw_body = raw_variant.get("variant") if isinstance(raw_variant.get("variant"), dict) else {}
+        candidate_ids = {
+            str(raw_variant.get("id") or "").strip(),
+            str(raw_variant.get("variant_id") or "").strip(),
+            str(raw_variant.get("source_variant_id") or "").strip(),
+            str(raw_body.get("id") or "").strip(),
+            str(raw_body.get("variant_id") or "").strip(),
+            str(raw_body.get("source_variant_id") or "").strip(),
+        }
+        candidate_ids.discard("")
+        if targets & candidate_ids:
+            return raw_variant
+    return {}
+
+
+def _record_identifier_audit(audit: Optional[WriterAuditAccumulator], identifier: Optional[StrongIdentifier]) -> None:
+    if audit is None:
+        return
+    if identifier is None:
+        audit.record_info({NO_STRONG_IDENTIFIER: 1})
+    elif identifier.kind == "mpn":
+        audit.record_info({MPN_CAPTURED_AS_BARCODE: 1})
 
 
 def _extract_metadata_values(metadata: Dict[str, Any], *keys: str) -> Any:
@@ -1047,6 +1101,16 @@ async def ingest_standard_products(
                 inventory_quantity = _safe_int(
                     variant.inventory_quantity if variant.inventory_quantity is not None else product.inventory_quantity
                 )
+                raw_variant = _raw_variant_payload(raw_product, variant, source_variant_id)
+                strong_identifier = extract_strong_identifier(
+                    raw_variant,
+                    getattr(variant, "platform_metadata", None),
+                    variant.model_dump(mode="json"),
+                    raw_product,
+                    metadata,
+                    {"barcode": product.barcode},
+                )
+                _record_identifier_audit(audit, strong_identifier)
 
                 await _upsert_by_pk(
                     catalog_skus,
@@ -1059,7 +1123,7 @@ async def ingest_standard_products(
                         "source_product_id": str(product.product_id or product.id),
                         "source_variant_id": source_variant_id,
                         "sku": variant.sku or product.sku,
-                        "barcode": variant.barcode or product.barcode,
+                        "barcode": strong_identifier.value if strong_identifier else None,
                         "title": variant.title or product.title,
                         "currency": product.currency,
                         "image_url": variant.image_url or product.image_url,
