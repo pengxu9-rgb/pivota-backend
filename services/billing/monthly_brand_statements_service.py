@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -24,6 +24,113 @@ class StatementAlreadyFrozenError(Exception):
 
 class StatementInvalidTransitionError(Exception):
     """Raised when a statement cannot transition to the requested state."""
+
+
+async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
+    """Merchant-safe current-month usage snapshot for billing self-serve UI."""
+
+    if not merchant_id:
+        raise ValueError("merchant_id is required")
+
+    today = _utc_today()
+    period_start = today.replace(day=1)
+    period_end = _next_month(period_start)
+    subscription = await _latest_active_subscription(
+        merchant_id=merchant_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    if not subscription:
+        return {
+            "tier": None,
+            "allowance_credits": 0,
+            "consumed_credits": 0,
+            "overage_count": 0,
+            "overage_total_usd_cents": 0,
+            "days_remaining": 0,
+            "period_start": period_start,
+            "period_end": period_end,
+            "in_overage": False,
+        }
+
+    credit_events = await _credit_consumption_events(
+        merchant_id=merchant_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    consumed_credits = -sum(
+        int(_row_get(row, "credits_delta") or 0) for row in credit_events
+    )
+    allowance_credits = int(_row_get(subscription, "monthly_credit_allowance") or 0)
+    overage_count = max(0, consumed_credits - allowance_credits)
+    overage_total_raw_cents = overage_revenue_cents(overage_count)
+    current_period_end = (
+        _as_date_or_none(_row_get(subscription, "current_period_end")) or period_end
+    )
+
+    return {
+        "tier": _row_get(subscription, "tier_name"),
+        "allowance_credits": allowance_credits,
+        "consumed_credits": consumed_credits,
+        "overage_count": overage_count,
+        "overage_total_usd_cents": overage_total_raw_cents,
+        "days_remaining": max((current_period_end - today).days, 0),
+        "period_start": period_start,
+        "period_end": period_end,
+        "in_overage": overage_count > 0,
+    }
+
+
+async def list_merchant_statement_rows(
+    *,
+    merchant_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Merchant-safe frozen/invoiced statement rows, newest first."""
+
+    if not merchant_id:
+        raise ValueError("merchant_id is required")
+    safe_limit = min(max(int(limit), 1), 36)
+    rows = await database.fetch_all(
+        """
+        SELECT
+          calendar_month,
+          tier_name,
+          subscription_revenue_usd_cents,
+          overage_credits,
+          overage_revenue_usd_cents,
+          status,
+          frozen_at,
+          invoiced_at
+        FROM monthly_brand_statements
+        WHERE merchant_id = :merchant_id
+          AND status IN ('frozen', 'invoiced')
+        ORDER BY calendar_month DESC
+        LIMIT :limit
+        """,
+        {"merchant_id": merchant_id, "limit": safe_limit},
+    )
+    statements: list[dict[str, Any]] = []
+    for row in rows or []:
+        subscription_revenue_raw_cents = int(
+            _row_get(row, "subscription_revenue_usd_cents") or 0
+        )
+        overage_revenue_raw_cents = int(
+            _row_get(row, "overage_revenue_usd_cents") or 0
+        )
+        statements.append(
+            {
+                "calendar_month": _row_get(row, "calendar_month"),
+                "tier_name": _row_get(row, "tier_name"),
+                "subscription_revenue_usd_cents": subscription_revenue_raw_cents,
+                "overage_credits": int(_row_get(row, "overage_credits") or 0),
+                "overage_revenue_usd_cents": overage_revenue_raw_cents,
+                "status": _row_get(row, "status"),
+                "frozen_at": _row_get(row, "frozen_at"),
+                "invoiced_at": _row_get(row, "invoiced_at"),
+            }
+        )
+    return statements
 
 
 async def assemble_for_month(merchant_id: str, calendar_month: date) -> int:
@@ -285,6 +392,7 @@ async def _latest_active_subscription(
         """
         SELECT
           us.plan_id AS subscription_plan_id,
+          us.current_period_end AS current_period_end,
           sp.name AS tier_name,
           sp.monthly_credit_allowance AS monthly_credit_allowance,
           sp.price_cents AS subscription_revenue_usd_cents
@@ -476,6 +584,22 @@ def _next_month(value: date) -> date:
 def _validate_month_start(value: date) -> None:
     if value.day != 1:
         raise ValueError("calendar_month must be the first day of a calendar month")
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _as_date_or_none(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value.strip():
+        return date.fromisoformat(value[:10])
+    return None
 
 
 def _json_param(name: str) -> str:

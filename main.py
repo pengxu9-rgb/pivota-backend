@@ -104,6 +104,7 @@ from routes.agent_account import router as agent_account_router  # Agent account
 from routes.agent_commerce import router as agent_commerce_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
+from routes.admin_partners import router as admin_partners_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
 from routes.platform_onboarding_routes import router as platform_onboarding_router
@@ -792,6 +793,7 @@ app.include_router(agent_account_router)  # Agent account management (/agent/acc
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_partner_cohort_router)  # Admin channel-partner cohort progress/evaluation
+app.include_router(admin_partners_router)  # Admin channel-partner list, subsidies, settlement retry
 app.include_router(admin_reset_employee_router)  # Admin employee password reset
 app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplicate data
 app.include_router(admin_data_consistency_router)  # Admin data consistency check and fix

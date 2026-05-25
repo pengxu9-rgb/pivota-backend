@@ -14,13 +14,14 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import stripe
 from databases import Database
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from config.settings import settings
 from db.database import IS_POSTGRES, database
 from routes.payment_execution_routes import verify_merchant_api_key
+from services.billing import monthly_brand_statements_service
 from utils.logger import logger
 
 
@@ -44,6 +45,36 @@ async def require_approved_merchant(
     """Authenticate a merchant API key using the existing payment-route dependency."""
 
     return await verify_merchant_api_key(x_merchant_api_key or "")
+
+
+@router.get("/api/billing/me/current-period")
+async def get_my_current_billing_period(
+    merchant: Dict[str, Any] = Depends(require_approved_merchant),
+) -> Dict[str, Any]:
+    """Merchant-safe current-period credit usage snapshot."""
+
+    merchant_id = _as_text(merchant.get("merchant_id"))
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Authenticated merchant is missing merchant_id")
+    return await monthly_brand_statements_service.current_period_usage_snapshot(merchant_id)
+
+
+@router.get("/api/billing/me/statements")
+async def list_my_billing_statements(
+    limit: int = Query(12, ge=1),
+    merchant: Dict[str, Any] = Depends(require_approved_merchant),
+) -> Dict[str, Any]:
+    """Merchant-safe frozen/invoiced monthly statement history."""
+
+    merchant_id = _as_text(merchant.get("merchant_id"))
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="Authenticated merchant is missing merchant_id")
+    capped_limit = min(int(limit), 36)
+    statements = await monthly_brand_statements_service.list_merchant_statement_rows(
+        merchant_id=merchant_id,
+        limit=capped_limit,
+    )
+    return {"statements": statements}
 
 
 @router.post("/webhooks/stripe/billing")
