@@ -1,0 +1,156 @@
+[
+  {
+    "name": "ordinary_niacinamide_no_gtin",
+    "brand": "The Ordinary",
+    "title": "Niacinamide 10% + Zinc 1%",
+    "gtin": null,
+    "content_key": "ck_939480cbc7bca69ca2792d22b2d83bf2"
+  },
+  {
+    "name": "ordinary_niacinamide_brand_prefixed_title",
+    "brand": "The Ordinary",
+    "title": "The Ordinary Niacinamide 10% + Zinc 1%",
+    "gtin": null,
+    "content_key": "ck_8f3c4e2c448beff58e2531942d4f273f"
+  },
+  {
+    "name": "ordinary_niacinamide_with_gtin",
+    "brand": "The Ordinary",
+    "title": "Niacinamide 10% + Zinc 1%",
+    "gtin": "769915190311",
+    "content_key": "ck_f01288706102f731356e968e2e1047ca"
+  },
+  {
+    "name": "glow_recipe_suffix_and_case",
+    "brand": "Glow Recipe Inc.",
+    "title": "PLUM PLUMP HYALURONIC SERUM",
+    "gtin": null,
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1"
+  },
+  {
+    "name": "glow_recipe_trimmed_whitespace",
+    "brand": "  glow recipe  ",
+    "title": "Plum  Plump  Hyaluronic  Serum",
+    "gtin": "",
+    "content_key": "ck_b5f2d541f0c18a6f2576a938746806a1"
+  },
+  {
+    "name": "mac_gtin_13",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": "0773602443796",
+    "content_key": "ck_e5a98e798f306cb894df880b70a43c4e"
+  },
+  {
+    "name": "mac_gtin_12_hyphen",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": "773-602-443796",
+    "content_key": "ck_e5a98e798f306cb894df880b70a43c4e"
+  },
+  {
+    "name": "mac_no_gtin",
+    "brand": "MAC",
+    "title": "Lipstick Russian Red",
+    "gtin": null,
+    "content_key": "ck_d27f0eae95dd8300fea2ded8a02eea3d"
+  },
+  {
+    "name": "tom_ford_trademark",
+    "brand": "Tom Ford Beauty™",
+    "title": "Traceless Soft Matte Concealer 3.5g",
+    "gtin": null,
+    "content_key": "ck_31a30811a64bd9481d498e83a7c0245f"
+  },
+  {
+    "name": "creme_diacritics",
+    "brand": "La Mer",
+    "title": "Crème de la Mer Moisturizing Cream",
+    "gtin": null,
+    "content_key": "ck_89c6d37aed515b09eb4a47d1bbb92822"
+  },
+  {
+    "name": "creme_ascii",
+    "brand": "La Mer",
+    "title": "Creme de la Mer Moisturizing Cream",
+    "gtin": null,
+    "content_key": "ck_89c6d37aed515b09eb4a47d1bbb92822"
+  },
+  {
+    "name": "anti_aging_hyphen",
+    "brand": "Acme Co.",
+    "title": "Anti-Aging Cream, Original (NEW!)",
+    "gtin": null,
+    "content_key": "ck_a294e0c6b162ece1a0bf10e1ea564b9f"
+  },
+  {
+    "name": "registered_mark",
+    "brand": "Tylenol®",
+    "title": "Extra Strength Caplets 100 ct",
+    "gtin": "123456789012",
+    "content_key": "ck_74d8fcafa6093ed4a2195eb03bd58120"
+  },
+  {
+    "name": "malformed_long_gtin",
+    "brand": "Brand",
+    "title": "Long Code Product",
+    "gtin": "1111111111111111",
+    "content_key": "ck_b7c6b4dedd4701d4ab2dde0f429a2b19"
+  },
+  {
+    "name": "empty_gtin_spaces",
+    "brand": "Brand",
+    "title": "Title",
+    "gtin": "   ",
+    "content_key": "ck_1ac9dcd67f5fe0395ee0bb41539b61a3"
+  },
+  {
+    "name": "brand_a_same_title",
+    "brand": "Brand A",
+    "title": "Lipstick",
+    "gtin": null,
+    "content_key": "ck_a7fb0eb9e7b2a726b188cb7784837424"
+  },
+  {
+    "name": "brand_b_same_title",
+    "brand": "Brand B",
+    "title": "Lipstick",
+    "gtin": null,
+    "content_key": "ck_bec82ed277f08b6fc5e5ff4ab53eac08"
+  },
+  {
+    "name": "punctuation_drop",
+    "brand": "Fenty Beauty",
+    "title": "Gloss Bomb Heat Universal Lip Luminizer + Plumper",
+    "gtin": null,
+    "content_key": "ck_5bc05acf76bfc2388a30e5204a121cdc"
+  },
+  {
+    "name": "underscore_kept",
+    "brand": "Test_Brand",
+    "title": "Product_Name 30ml",
+    "gtin": null,
+    "content_key": "ck_085bd08909abc9b5916734ca467edc29"
+  },
+  {
+    "name": "non_latin_unicode",
+    "brand": "雪花秀",
+    "title": "润燥精华 60ml",
+    "gtin": null,
+    "content_key": "ck_a3709381907513bcf46c3de11afe9a1a"
+  },
+  {
+    "name": "missing_brand_returns_null",
+    "brand": "",
+    "title": "Title",
+    "gtin": null,
+    "content_key": null
+  },
+  {
+    "name": "missing_title_returns_null",
+    "brand": "Brand",
+    "title": "",
+    "gtin": null,
+    "content_key": null
+  }
+]

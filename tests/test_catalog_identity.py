@@ -18,6 +18,8 @@ Failures here break the architecture roadmap. Be paranoid.
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,6 +32,9 @@ from services.catalog_identity import (  # noqa: E402
     normalize_gtin,
     normalize_title,
 )
+
+
+FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "content_key_v1_cases.json"
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +248,35 @@ def test_make_content_key_different_title_same_brand_differs() -> None:
     a = make_content_key("MAC", "Lipstick Russian Red")
     b = make_content_key("MAC", "Lipstick Velvet Teddy")
     assert a != b
+
+
+def test_make_content_key_v1_known_regression_cases() -> None:
+    cases = json.loads(FIXTURE_PATH.read_text())
+    assert len(cases) >= 20
+    assert any(case["name"].startswith("ordinary_niacinamide") for case in cases)
+
+    for case in cases:
+        assert make_content_key(case["brand"], case["title"], case.get("gtin")) == case["content_key"], case["name"]
+
+
+def test_compute_content_key_cli_matches_known_regression_cases() -> None:
+    cases = json.loads(FIXTURE_PATH.read_text())
+    script = Path(__file__).resolve().parents[1] / "scripts" / "compute_content_key.py"
+
+    for case in cases:
+        payload = {
+            "brand": case["brand"],
+            "title": case["title"],
+            "gtin": case.get("gtin"),
+        }
+        result = subprocess.run(
+            [sys.executable, str(script), json.dumps(payload, ensure_ascii=False)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        expected = "null" if case["content_key"] is None else case["content_key"]
+        assert result.stdout.strip() == expected, case["name"]
 
 
 # ---------------------------------------------------------------------------
