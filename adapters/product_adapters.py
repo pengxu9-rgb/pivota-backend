@@ -759,6 +759,43 @@ class WixProductAdapter:
         return {}
 
     @staticmethod
+    def _pick_wix_identifier(*sources: Any) -> Optional[str]:
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in (
+                "gtin",
+                "gtin8",
+                "gtin12",
+                "gtin13",
+                "gtin14",
+                "gtin_8",
+                "gtin_12",
+                "gtin_13",
+                "gtin_14",
+                "upc",
+                "upcA",
+                "upc_a",
+                "upc12",
+                "upc_12",
+                "ean",
+                "ean8",
+                "ean13",
+                "ean_8",
+                "ean_13",
+                "barcode",
+                "barCode",
+                "bar_code",
+                "mpn",
+                "manufacturerPartNumber",
+                "manufacturer_part_number",
+            ):
+                value = str(source.get(key) or "").strip()
+                if value:
+                    return value
+        return None
+
+    @staticmethod
     def _extract_wix_variants(wp: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw = wp.get("variants")
         if isinstance(raw, list):
@@ -814,6 +851,7 @@ class WixProductAdapter:
             v_inventory = WixProductAdapter._stock_to_inventory(v_stock)
 
             v_sku = str(v_body.get("sku") or v.get("sku") or "").strip() or None
+            v_barcode = WixProductAdapter._pick_wix_identifier(v_body, v)
 
             v_media = v_body.get("media") if isinstance(v_body.get("media"), dict) else v.get("media")
             v_image_url = WixProductAdapter._first_image_url(v_media) or image_url
@@ -826,23 +864,28 @@ class WixProductAdapter:
                     id=variant_id,
                     title=title,
                     sku=v_sku,
+                    barcode=v_barcode,
                     price=v_price,
                     inventory_quantity=int(v_inventory),
                     options=choices or None,
                     image_url=v_image_url,
+                    platform_metadata={"raw_wix_variant": v},
                 )
             )
 
         # If no real variants, keep legacy behavior with a synthetic default variant.
         if not variants_out:
+            product_identifier = WixProductAdapter._pick_wix_identifier(wp)
             variants_out = [
                 StandardProductVariant(
                     id=str(product_id or sku or "default"),
                     title=name,
                     sku=sku,
+                    barcode=product_identifier,
                     price=base_price,
                     inventory_quantity=int(inventory),
                     image_url=image_url,
+                    platform_metadata={"raw_wix_product": wp},
                 )
             ]
         else:
@@ -872,6 +915,7 @@ class WixProductAdapter:
             currency=currency,
             inventory_quantity=int(inventory),
             sku=sku,
+            barcode=variants_out[0].barcode if len(variants_out) == 1 else WixProductAdapter._pick_wix_identifier(wp),
             image_url=image_url,
             platform="wix",
             merchant_id=merchant_id,

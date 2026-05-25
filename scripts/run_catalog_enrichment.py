@@ -173,9 +173,10 @@ async def _do_ingest(args: argparse.Namespace) -> int:
     offers = plan["offers"]
     seeds = plan["seeds"]
     skipped = plan["skipped"]
+    audit_reasons = plan.get("audit_reasons") or {}
     logger.info(
-        "ingest plan: pdps=%s skus=%s merchants=%s offers=%s seeds=%s skipped=%s",
-        len(pdps), len(skus), len(merchants), len(offers), len(seeds), skipped,
+        "ingest plan: pdps=%s skus=%s merchants=%s offers=%s seeds=%s skipped=%s audit_reasons=%s",
+        len(pdps), len(skus), len(merchants), len(offers), len(seeds), skipped, audit_reasons,
     )
     if not args.apply:
         if pdps:
@@ -202,6 +203,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
         writer_name=AGENT_VERSION,
         batch_id=make_batch_id(AGENT_VERSION, f"run_catalog_enrichment:{args.category}:{in_path}"),
     )
+    audit.record_info(audit_reasons)
 
     # 1. catalog_merchants — UPSERT by merchant_id (FK target for offers).
     for merchant in merchants:
@@ -311,6 +313,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                        CAST(:ingredient_ids AS jsonb),
                        CAST(:sku_payload AS jsonb), :readiness_tier)
                     ON CONFLICT (sku_key) DO UPDATE SET
+                      barcode = EXCLUDED.barcode,
                       title = EXCLUDED.title,
                       image_url = EXCLUDED.image_url,
                       sku_payload = EXCLUDED.sku_payload,

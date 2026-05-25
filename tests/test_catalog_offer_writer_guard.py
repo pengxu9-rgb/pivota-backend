@@ -75,6 +75,21 @@ def test_offer_guard_mixed_batch_writes_only_valid_rows() -> None:
     assert [row["offer_id"] for row in rejected] == ["offer_zero", "offer_orphan"]
 
 
+def test_writer_audit_info_reasons_do_not_increment_skipped_rows() -> None:
+    audit = WriterAuditAccumulator(writer_name="shopify_products_sync", batch_id="batch_1")
+
+    audit.record_applied(2)
+    audit.record_skips({ZERO_OR_MISSING_PRICE: 1})
+    audit.record_info({"no_strong_identifier": 3})
+
+    assert audit.applied_rows == 2
+    assert audit.skipped_rows == 1
+    assert audit.reasons == {
+        ZERO_OR_MISSING_PRICE: 1,
+        "no_strong_identifier": 3,
+    }
+
+
 @pytest.mark.asyncio
 async def test_writer_audit_log_records_counts_and_reasons() -> None:
     calls = []

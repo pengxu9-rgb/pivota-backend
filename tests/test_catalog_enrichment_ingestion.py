@@ -343,6 +343,45 @@ def test_ingest_record_emits_complete_canonical_chain():
     assert seeds[0]["attached_product_key"] == pdp["product_key"]
 
 
+@pytest.mark.parametrize(
+    ("pdp_fields", "expected"),
+    [
+        ({"gtin": "1234567890123"}, "1234567890123"),
+        ({"upc": "123456789012"}, "123456789012"),
+        ({"gtin": "12345678"}, "12345678"),
+        ({"barcode": "0-12345-67890-5"}, "012345678905"),
+    ],
+)
+def test_ingest_record_captures_strong_identifier_into_sku_barcode(pdp_fields, expected):
+    result = ingest_validated_record(_record(**pdp_fields))
+
+    assert result is not None
+    assert result["sku"]["barcode"] == expected
+    assert "no_strong_identifier" not in result["audit_reasons"]
+
+
+def test_ingest_record_skips_missing_and_garbage_identifier_without_rejection():
+    missing = ingest_validated_record(_record())
+    assert missing is not None
+    assert missing["sku"]["barcode"] is None
+    assert missing["audit_reasons"] == {"no_strong_identifier": 1}
+
+    garbage = ingest_validated_record(_record(gtin="N/A", barcode="0"))
+    assert garbage is not None
+    assert garbage["sku"]["barcode"] is None
+    assert garbage["audit_reasons"] == {"no_strong_identifier": 1}
+
+
+def test_ingest_record_captures_mpn_as_last_fallback_and_marks_audit():
+    result = ingest_validated_record(_record(mpn=" MPN-ABC-123 "))
+
+    assert result is not None
+    assert result["sku"]["barcode"] == "MPN-ABC-123"
+    payload = json.loads(result["sku"]["sku_payload"])
+    assert payload["strong_identifier_kind"] == "mpn"
+    assert result["audit_reasons"] == {"mpn_captured_as_barcode": 1}
+
+
 def test_ingest_record_collapses_two_mac_offers_into_one_merchant():
     """Two offers from the same retailer → one merchant upsert, two
     offer rows. Phase 6 seller_count stays accurate."""

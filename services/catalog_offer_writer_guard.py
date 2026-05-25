@@ -37,6 +37,13 @@ class WriterAuditAccumulator:
             self.reasons[reason] = self.reasons.get(reason, 0) + numeric
             self.skipped_rows += numeric
 
+    def record_info(self, reasons: Mapping[str, int]) -> None:
+        for reason, count in reasons.items():
+            numeric = int(count or 0)
+            if numeric <= 0:
+                continue
+            self.reasons[reason] = self.reasons.get(reason, 0) + numeric
+
 
 def make_batch_id(prefix: str, source_ref: Optional[str] = None) -> str:
     raw = str(source_ref or "").strip()
