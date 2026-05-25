@@ -827,7 +827,9 @@ async def ingest_standard_products(
     source_system: str,
     source_ref: Optional[str] = None,
     job_id: Optional[str] = None,
+    source_domain: Optional[str] = None,
 ) -> Dict[str, Any]:
+    source_domain_value = str(source_domain or "").strip() or None
     stats = {
         "products_scanned": len(product_payloads or []),
         "products_ingested": 0,
@@ -957,6 +959,7 @@ async def ingest_standard_products(
                     "readiness_tier": readiness_tier,
                     "source_system": source_system,
                     "source_ref": source_ref,
+                    "source_domain": source_domain_value,
                     "title": product.title,
                     "description": _description_for_ingest,
                     "brand": brand,
@@ -1122,6 +1125,7 @@ async def ingest_standard_products(
                         "platform": platform,
                         "source_product_id": str(product.product_id or product.id),
                         "source_variant_id": source_variant_id,
+                        "source_domain": source_domain_value,
                         "sku": variant.sku or product.sku,
                         "barcode": strong_identifier.value if strong_identifier else None,
                         "title": variant.title or product.title,
@@ -1161,6 +1165,7 @@ async def ingest_standard_products(
                     "price_confidence": Decimal("1.0"),
                     "source_system": source_system,
                     "source_ref": source_ref,
+                    "source_domain": source_domain_value,
                     "offer_payload": {
                         "product_id": str(product.product_id or product.id),
                         "variant_id": source_variant_id,

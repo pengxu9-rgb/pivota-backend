@@ -228,6 +228,7 @@ async def universal_product_sync(
                     product_payloads=catalog_payloads,
                     source_system="universal_product_sync",
                     source_ref=f"universal_product_sync:{request.merchant_id}:{platform}",
+                    source_domain=store_info.get("domain"),
                 )
                 if isinstance(catalog_result, dict):
                     catalog_synced = int(catalog_result.get("products_ingested") or 0)

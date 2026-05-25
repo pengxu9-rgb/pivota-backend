@@ -270,6 +270,7 @@ async def sync_shopify_products_for_merchant(
             product_payloads=catalog_payloads,
             source_system="shopify_products_sync",
             source_ref=f"shopify_products_sync:{merchant_id}:{datetime.utcnow().isoformat()}",
+            source_domain=credentials.get("shop_domain"),
         )
         if truncated:
             catalog_prune_skipped_reason = truncated_reason or "sync_truncated"

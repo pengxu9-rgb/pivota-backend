@@ -1,0 +1,8 @@
+ALTER TABLE IF EXISTS catalog_products
+  ADD COLUMN IF NOT EXISTS source_domain TEXT NULL;
+
+ALTER TABLE IF EXISTS catalog_skus
+  ADD COLUMN IF NOT EXISTS source_domain TEXT NULL;
+
+ALTER TABLE IF EXISTS catalog_offers
+  ADD COLUMN IF NOT EXISTS source_domain TEXT NULL;

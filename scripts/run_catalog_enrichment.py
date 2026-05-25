@@ -238,7 +238,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                 INSERT INTO catalog_products
                   (product_key, merchant_id, platform, source_product_id,
                    pivota_signature_id, pivota_canonical_url, pivota_signature_minted_at,
-                   catalog_track, truth_tier, readiness_tier, source_system,
+                   catalog_track, truth_tier, readiness_tier, source_system, source_domain,
                    title, description, brand, product_type, category,
                    category_path, category_confidence, category_label_source,
                    canonical_url, image_url, product_payload, tags,
@@ -249,7 +249,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                 VALUES
                   (:product_key, :merchant_id, :platform, :source_product_id,
                    :pivota_signature_id, :pivota_canonical_url, :pivota_signature_minted_at,
-                   :catalog_track, :truth_tier, :readiness_tier, :source_system,
+                   :catalog_track, :truth_tier, :readiness_tier, :source_system, :source_domain,
                    :title, :description, :brand, :product_type, :category,
                    :category_path, :category_confidence, :category_label_source,
                    :canonical_url, :image_url, CAST(:product_payload AS jsonb),
@@ -266,6 +266,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                   pivota_canonical_url = COALESCE(catalog_products.pivota_canonical_url, EXCLUDED.pivota_canonical_url),
                   pivota_signature_minted_at = COALESCE(catalog_products.pivota_signature_minted_at, EXCLUDED.pivota_signature_minted_at),
                   category_path = EXCLUDED.category_path,
+                  source_domain = EXCLUDED.source_domain,
                   category_confidence = EXCLUDED.category_confidence,
                   category_label_source = EXCLUDED.category_label_source,
                   canonical_url = EXCLUDED.canonical_url,
@@ -300,19 +301,20 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                     """
                     INSERT INTO catalog_skus
                       (sku_key, product_key, merchant_id, platform,
-                       source_product_id, source_variant_id, sku, barcode,
+                       source_product_id, source_variant_id, source_domain, sku, barcode,
                        title, currency, image_url,
                        visible_attributes, visible_option_labels, ingredient_ids,
                        sku_payload, readiness_tier)
                     VALUES
                       (:sku_key, :product_key, :merchant_id, :platform,
-                       :source_product_id, :source_variant_id, :sku, :barcode,
+                       :source_product_id, :source_variant_id, :source_domain, :sku, :barcode,
                        :title, :currency, :image_url,
                        CAST(:visible_attributes AS jsonb),
                        CAST(:visible_option_labels AS jsonb),
                        CAST(:ingredient_ids AS jsonb),
                        CAST(:sku_payload AS jsonb), :readiness_tier)
                     ON CONFLICT (sku_key) DO UPDATE SET
+                      source_domain = EXCLUDED.source_domain,
                       barcode = EXCLUDED.barcode,
                       title = EXCLUDED.title,
                       image_url = EXCLUDED.image_url,
@@ -341,13 +343,13 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                        catalog_track, truth_tier, readiness_tier, offer_mode,
                        channel, availability, inventory_quantity, currency,
                        list_price, merchant_effective_price, estimated_best_price,
-                       price_confidence, source_system, source_ref, offer_payload)
+                       price_confidence, source_system, source_ref, source_domain, offer_payload)
                     VALUES
                       (:offer_id, :sku_key, :product_key, :merchant_id,
                        :catalog_track, :truth_tier, :readiness_tier, :offer_mode,
                        :channel, :availability, :inventory_quantity, :currency,
                        :list_price, :merchant_effective_price, :estimated_best_price,
-                       :price_confidence, :source_system, :source_ref,
+                       :price_confidence, :source_system, :source_ref, :source_domain,
                        CAST(:offer_payload AS jsonb))
                     ON CONFLICT (offer_id) DO UPDATE SET
                       availability = EXCLUDED.availability,
@@ -356,6 +358,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                       merchant_effective_price = EXCLUDED.merchant_effective_price,
                       estimated_best_price = EXCLUDED.estimated_best_price,
                       price_confidence = EXCLUDED.price_confidence,
+                      source_domain = EXCLUDED.source_domain,
                       offer_payload = EXCLUDED.offer_payload,
                       updated_at = NOW()
                     """,

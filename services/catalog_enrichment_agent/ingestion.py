@@ -155,6 +155,7 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     ean_raw = pdp.get("ean") or ""
     barcode_raw = pdp.get("barcode") or ""
     mpn_raw = pdp.get("mpn") or ""
+    source_domain = str(pdp.get("source_domain") or "").strip() or None
     # Display-cased — upstream candidates routinely arrive lowercase
     # ("fenty beauty"). Identity/dedup keys use lowercase via
     # canonical_product_name() below, so this only fixes display.
@@ -175,6 +176,7 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
             "barcode": str(barcode_raw).strip() if barcode_raw else None,
             "mpn": str(mpn_raw).strip() if mpn_raw else None,
         },
+        "source_domain": source_domain,
         "tags": tags,
         "agent_version": AGENT_VERSION,
     }
@@ -227,6 +229,7 @@ def _build_pdp_insert(
         "truth_tier": DEFAULT_TRUTH_TIER,
         "readiness_tier": DEFAULT_READINESS_TIER,
         "source_system": AGENT_VERSION,
+        "source_domain": pdp_payload.get("source_domain") or None,
         "title": pdp_payload["product_name"],
         "description": pdp_payload.get("attribute_summary") or None,
         "brand": pdp_payload["brand"],
@@ -487,6 +490,7 @@ def _build_sku_insert(
         # source_variant_id has to vary per PDP. Using product_key
         # makes it deterministic across re-runs.
         "source_variant_id": product_key,
+        "source_domain": pdp_payload.get("source_domain") or None,
         "sku": None,
         "barcode": strong_identifier.value if strong_identifier else None,
         "title": pdp_payload["product_name"],
@@ -542,6 +546,7 @@ def _build_offer_inserts(
     product_key: str,
     sku_key: str,
     offers: List[Dict[str, Any]],
+    source_domain: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
@@ -586,6 +591,7 @@ def _build_offer_inserts(
             "price_confidence": 0.7 if price_value is not None else None,
             "source_system": AGENT_VERSION,
             "source_ref": destination_url,
+            "source_domain": source_domain,
             "offer_payload": json.dumps({
                 "agent_version": AGENT_VERSION,
                 "destination_url": destination_url,
@@ -651,6 +657,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         product_key=pdp_row["product_key"],
         sku_key=sku_row["sku_key"],
         offers=offers,
+        source_domain=pdp_row.get("source_domain"),
     )
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],

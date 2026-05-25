@@ -101,6 +101,15 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "size_guide",
             "size_guide_source",
             "size_guide_confidence",
+            # Source-level provenance — see migration 133. Lets new
+            # ingests distinguish stores under the same merchant/platform.
+            "source_domain",
+        },
+    ),
+    RequiredTableColumns(
+        table="catalog_skus",
+        columns={
+            "source_domain",
         },
     ),
     RequiredTableColumns(
@@ -108,6 +117,7 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
         columns={
             "suppression_reason",
             "suppressed_at",
+            "source_domain",
         },
     ),
 )
@@ -467,6 +477,32 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS size_guide JSONB,
                       ADD COLUMN IF NOT EXISTS size_guide_source VARCHAR(32),
                       ADD COLUMN IF NOT EXISTS size_guide_confidence REAL;
+                    """
+                )
+            )
+            # Store-domain provenance (migration 133). This is additive and
+            # nullable; legacy rows and legacy callers remain NULL.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS source_domain TEXT;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_skus
+                      ADD COLUMN IF NOT EXISTS source_domain TEXT;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_offers
+                      ADD COLUMN IF NOT EXISTS source_domain TEXT;
                     """
                 )
             )
