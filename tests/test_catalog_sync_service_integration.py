@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,24 @@ def test_catalog_sync_service_utcnow_is_naive_utc() -> None:
 
     assert isinstance(value, datetime)
     assert value.tzinfo is None
+
+
+def test_catalog_source_domain_migration_shape() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    up_sql = (repo_root / "db" / "migrations" / "133_catalog_source_domain.sql").read_text()
+    down_sql = (
+        repo_root
+        / "db"
+        / "migrations"
+        / "down"
+        / "133_catalog_source_domain_down.sql"
+    ).read_text()
+
+    for table in ("catalog_products", "catalog_skus", "catalog_offers"):
+        assert f"ALTER TABLE IF EXISTS {table}" in up_sql
+        assert "ADD COLUMN IF NOT EXISTS source_domain TEXT NULL" in up_sql
+        assert f"ALTER TABLE IF EXISTS {table}" in down_sql
+        assert "DROP COLUMN IF EXISTS source_domain" in down_sql
 
 
 @pytest.mark.asyncio
@@ -297,6 +316,7 @@ async def test_ingest_standard_products_shopify_offer_guard_filters_invalid_batc
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inserted_skus: set[str] = set()
+    product_writes = []
     offer_writes = []
     audit_rows = []
 
@@ -311,6 +331,8 @@ async def test_ingest_standard_products_shopify_offer_guard_filters_invalid_batc
         return None
 
     async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_products":
+            product_writes.append(dict(values))
         if getattr(table, "name", None) == "catalog_skus":
             inserted_skus.add(values["sku_key"])
         if getattr(table, "name", None) == "catalog_offers":
@@ -364,12 +386,15 @@ async def test_ingest_standard_products_shopify_offer_guard_filters_invalid_batc
         ],
         source_system="shopify_products_sync",
         source_ref="batch_guard",
+        source_domain="guard-shop.myshopify.com",
     )
 
     assert stats["offers_ingested"] == 1
     assert stats["offers_skipped"] == 2
     assert stats["offer_skip_reasons"] == {"zero_or_missing_price": 2}
+    assert product_writes[0]["source_domain"] == "guard-shop.myshopify.com"
     assert len(offer_writes) == 1
+    assert offer_writes[0]["source_domain"] == "guard-shop.myshopify.com"
     assert offer_writes[0]["offer_payload"]["variant_id"] == "v_valid"
     assert len(audit_rows) == 1
     assert audit_rows[0]["writer_name"] == "shopify_products_sync"
@@ -384,6 +409,7 @@ async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inserted_skus: set[str] = set()
+    product_writes = []
     offer_writes = []
     audit_rows = []
     wix_source_system = "universal_product_sync"
@@ -399,6 +425,8 @@ async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
         return None
 
     async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_products":
+            product_writes.append(dict(values))
         if getattr(table, "name", None) == "catalog_skus":
             inserted_skus.add(values["sku_key"])
         if getattr(table, "name", None) == "catalog_offers":
@@ -452,12 +480,15 @@ async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
         ],
         source_system=wix_source_system,
         source_ref="batch_guard",
+        source_domain="guard-shop.wixsite.com",
     )
 
     assert stats["offers_ingested"] == 1
     assert stats["offers_skipped"] == 2
     assert stats["offer_skip_reasons"] == {"zero_or_missing_price": 2}
+    assert product_writes[0]["source_domain"] == "guard-shop.wixsite.com"
     assert len(offer_writes) == 1
+    assert offer_writes[0]["source_domain"] == "guard-shop.wixsite.com"
     assert offer_writes[0]["offer_payload"]["variant_id"] == "v_valid"
     assert len(audit_rows) == 1
     assert audit_rows[0]["writer_name"] == wix_source_system
@@ -465,6 +496,85 @@ async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
     assert audit_rows[0]["applied_rows"] == 1
     assert audit_rows[0]["skipped_rows"] == 2
     assert '"zero_or_missing_price": 2' in audit_rows[0]["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_standard_products_propagates_source_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes = {
+        "catalog_products": [],
+        "catalog_skus": [],
+        "catalog_offers": [],
+    }
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_upsert_catalog_merchant(**_kwargs):
+        return None
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        table_name = getattr(table, "name", None)
+        if table_name in writes:
+            writes[table_name].append(dict(values))
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module.database, "execute", _noop_execute)
+    monkeypatch.setattr(module, "upsert_catalog_merchant", fake_upsert_catalog_merchant)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module, "_schedule_fashion_enrichment", lambda **_kwargs: None)
+
+    stats = await module.ingest_standard_products(
+        merchant_id="merch_source_domain",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_source_domain",
+                "product_id": "prod_source_domain",
+                "merchant_id": "merch_source_domain",
+                "platform": "shopify",
+                "title": "Source Domain Serum",
+                "price": 29.0,
+                "currency": "USD",
+                "variants": [
+                    {
+                        "id": "v_source_domain",
+                        "title": "Default",
+                        "price": 29.0,
+                        "inventory_quantity": 5,
+                    },
+                ],
+            }
+        ],
+        source_system="shopify_products_sync",
+        source_ref="batch_source_domain",
+        source_domain="source-domain.example",
+    )
+
+    assert stats["products_ingested"] == 1
+    assert stats["skus_ingested"] == 1
+    assert stats["offers_ingested"] == 1
+    assert writes["catalog_products"][0]["source_domain"] == "source-domain.example"
+    assert writes["catalog_skus"][0]["source_domain"] == "source-domain.example"
+    assert writes["catalog_offers"][0]["source_domain"] == "source-domain.example"
 
 
 @pytest.mark.asyncio
