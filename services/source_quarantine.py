@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import inspect
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Mapping, Optional, Sequence
+
+
+MATCH_TYPE_DOMAIN = "domain"
+MATCH_TYPE_MERCHANT_PLATFORM = "merchant_platform"
+MATCH_TYPE_SOURCE_SYSTEM_REF = "source_system_ref"
+VALID_MATCH_TYPES = {
+    MATCH_TYPE_DOMAIN,
+    MATCH_TYPE_MERCHANT_PLATFORM,
+    MATCH_TYPE_SOURCE_SYSTEM_REF,
+}
+VALID_STATES = {"active", "revoked", "expired"}
+
+QUARANTINE_COLUMNS = """
+  quarantine_id,
+  match_type,
+  match_value,
+  state,
+  reason,
+  expires_at,
+  created_by,
+  created_at,
+  revoked_at,
+  revoked_by,
+  metadata
+"""
+
+
+@dataclass(frozen=True)
+class Quarantine:
+    quarantine_id: int
+    match_type: str
+    match_value: str
+    state: str
+    reason: Optional[str]
+    expires_at: Optional[datetime]
+    created_by: str
+    created_at: Optional[datetime]
+    revoked_at: Optional[datetime]
+    revoked_by: Optional[str]
+    metadata: Optional[dict[str, Any]]
+
+
+def build_quarantine_anti_join_sql(
+    row_domain_expr: str,
+    row_merchant_expr: str,
+    row_platform_expr: str,
+    row_source_system_expr: str,
+    row_source_ref_expr: str,
+) -> str:
+    """
+    Return an inline SQL anti-join fragment for opt-in source quarantine.
+
+    Match value conventions:
+    - domain: bare domain, compared case-insensitively to source_domain.
+    - merchant_platform: <merchant_id>:<platform>.
+    - source_system_ref: <source_system>:<source_ref>.
+
+    The expression arguments are trusted SQL snippets supplied by the caller
+    for the row being filtered, for example "p.source_domain".
+    """
+    expressions = [
+        row_domain_expr,
+        row_merchant_expr,
+        row_platform_expr,
+        row_source_system_expr,
+        row_source_ref_expr,
+    ]
+    if any(not str(expr or "").strip() for expr in expressions):
+        raise ValueError("all row SQL expressions are required")
+
+    return f"""
+AND NOT EXISTS (
+  SELECT 1 FROM catalog_source_quarantine q
+  WHERE q.state = 'active'
+    AND (q.expires_at IS NULL OR q.expires_at > now())
+    AND (
+      (q.match_type = 'domain' AND lower(q.match_value) = lower({row_domain_expr}))
+      OR (q.match_type = 'merchant_platform' AND q.match_value = {row_merchant_expr} || ':' || {row_platform_expr})
+      OR (q.match_type = 'source_system_ref' AND q.match_value = {row_source_system_expr} || ':' || {row_source_ref_expr})
+    )
+)""".strip()
+
+
+async def load_active_quarantines(*, db: Any) -> list[Quarantine]:
+    rows = await _fetch_all(
+        db,
+        f"""
+        SELECT {QUARANTINE_COLUMNS}
+        FROM catalog_source_quarantine
+        WHERE state = 'active'
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY created_at DESC, quarantine_id DESC
+        """,
+    )
+    return [_quarantine_from_row(row) for row in rows]
+
+
+async def is_source_quarantined(
+    domain: Optional[str],
+    merchant_id: Optional[str],
+    platform: Optional[str],
+    source_system: Optional[str],
+    source_ref: Optional[str],
+    *,
+    db: Any,
+) -> bool:
+    quarantines = await load_active_quarantines(db=db)
+    return any(
+        quarantine_matches_source(
+            quarantine,
+            domain=domain,
+            merchant_id=merchant_id,
+            platform=platform,
+            source_system=source_system,
+            source_ref=source_ref,
+        )
+        for quarantine in quarantines
+    )
+
+
+async def create_quarantine(
+    *,
+    match_type: str,
+    match_value: str,
+    reason: Optional[str],
+    created_by: str,
+    expires_at: Optional[datetime] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    db: Any,
+) -> Quarantine:
+    _validate_match_type(match_type)
+    normalized_match_value = _required_text(match_value, "match_value")
+    normalized_created_by = _required_text(created_by, "created_by")
+    row = await _fetch_one(
+        db,
+        f"""
+        INSERT INTO catalog_source_quarantine (
+          match_type,
+          match_value,
+          reason,
+          expires_at,
+          created_by,
+          metadata
+        )
+        VALUES (
+          :match_type,
+          :match_value,
+          :reason,
+          :expires_at,
+          :created_by,
+          :metadata
+        )
+        RETURNING {QUARANTINE_COLUMNS}
+        """,
+        {
+            "match_type": match_type,
+            "match_value": normalized_match_value,
+            "reason": reason,
+            "expires_at": expires_at,
+            "created_by": normalized_created_by,
+            "metadata": metadata,
+        },
+    )
+    if row is None:
+        raise RuntimeError("create quarantine did not return a row")
+    return _quarantine_from_row(row)
+
+
+async def revoke_quarantine(
+    *,
+    quarantine_id: int,
+    revoked_by: str,
+    db: Any,
+) -> Quarantine:
+    normalized_revoked_by = _required_text(revoked_by, "revoked_by")
+    row = await _fetch_one(
+        db,
+        f"""
+        UPDATE catalog_source_quarantine
+        SET state = 'revoked',
+            revoked_at = now(),
+            revoked_by = :revoked_by
+        WHERE quarantine_id = :quarantine_id
+        RETURNING {QUARANTINE_COLUMNS}
+        """,
+        {"quarantine_id": int(quarantine_id), "revoked_by": normalized_revoked_by},
+    )
+    if row is None:
+        raise LookupError(f"catalog_source_quarantine row not found: {quarantine_id}")
+    return _quarantine_from_row(row)
+
+
+def quarantine_matches_source(
+    quarantine: Quarantine,
+    *,
+    domain: Optional[str],
+    merchant_id: Optional[str],
+    platform: Optional[str],
+    source_system: Optional[str],
+    source_ref: Optional[str],
+    now: Optional[datetime] = None,
+) -> bool:
+    if quarantine.state != "active":
+        return False
+    if _is_expired(quarantine.expires_at, now=now):
+        return False
+
+    if quarantine.match_type == MATCH_TYPE_DOMAIN:
+        return _normalize_domain(quarantine.match_value) == _normalize_domain(domain)
+
+    if quarantine.match_type == MATCH_TYPE_MERCHANT_PLATFORM:
+        return quarantine.match_value == _join_match_value(merchant_id, platform)
+
+    if quarantine.match_type == MATCH_TYPE_SOURCE_SYSTEM_REF:
+        return quarantine.match_value == _join_match_value(source_system, source_ref)
+
+    return False
+
+
+def _validate_match_type(match_type: str) -> None:
+    if match_type not in VALID_MATCH_TYPES:
+        allowed = ", ".join(sorted(VALID_MATCH_TYPES))
+        raise ValueError(f"invalid match_type {match_type!r}; expected one of: {allowed}")
+
+
+def _required_text(value: Optional[str], name: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError(f"{name} is required")
+    return normalized
+
+
+def _normalize_domain(value: Optional[str]) -> str:
+    return str(value or "").strip().lower()
+
+
+def _join_match_value(left: Optional[str], right: Optional[str]) -> Optional[str]:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return None
+    return f"{left_text}:{right_text}"
+
+
+def _is_expired(expires_at: Optional[datetime], *, now: Optional[datetime]) -> bool:
+    if expires_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if expires_at.tzinfo is None:
+        current = current.replace(tzinfo=None)
+    else:
+        current = current.astimezone(expires_at.tzinfo)
+    return expires_at <= current
+
+
+async def _fetch_all(db: Any, query: str, values: Optional[dict[str, Any]] = None) -> Sequence[Any]:
+    if hasattr(db, "fetch_all"):
+        return await _maybe_await(db.fetch_all(query, values or {}))
+    if hasattr(db, "fetch"):
+        return await _maybe_await(db.fetch(query, values or {}))
+    raise TypeError("db must expose fetch_all(query, values) or fetch(query, values)")
+
+
+async def _fetch_one(db: Any, query: str, values: Optional[dict[str, Any]] = None) -> Any:
+    if hasattr(db, "fetch_one"):
+        return await _maybe_await(db.fetch_one(query, values or {}))
+    rows = await _fetch_all(db, query, values)
+    return rows[0] if rows else None
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _quarantine_from_row(row: Any) -> Quarantine:
+    return Quarantine(
+        quarantine_id=int(_row_value(row, "quarantine_id")),
+        match_type=str(_row_value(row, "match_type")),
+        match_value=str(_row_value(row, "match_value")),
+        state=str(_row_value(row, "state")),
+        reason=_row_value(row, "reason"),
+        expires_at=_row_value(row, "expires_at"),
+        created_by=str(_row_value(row, "created_by")),
+        created_at=_row_value(row, "created_at"),
+        revoked_at=_row_value(row, "revoked_at"),
+        revoked_by=_row_value(row, "revoked_by"),
+        metadata=_row_value(row, "metadata"),
+    )
+
+
+def _row_value(row: Any, key: str) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(key)
+    return getattr(row, key)
