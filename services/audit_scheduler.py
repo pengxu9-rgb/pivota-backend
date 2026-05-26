@@ -418,6 +418,24 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # C1 Phase 2d — catalog_row_trust defensive backfill, every 6h.
+        # Catches rows missed by the dual-write producer hooks (Phase 2b/2c).
+        # Idempotent UPSERT means idle runs (no drift) emit zero writes.
+        # Disable via CATALOG_TRUST_BACKFILL_ENABLED=false without a deploy.
+        from jobs.catalog_row_trust_backfill_cron import (
+            run_catalog_row_trust_backfill_tick,
+        )
+        scheduler.add_job(
+            run_catalog_row_trust_backfill_tick,
+            "interval",
+            hours=6,
+            id="catalog_row_trust_backfill",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+            max_instances=1,
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
@@ -436,7 +454,8 @@ async def start_scheduler() -> None:
             "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
             "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
-            "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE)"
+            "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
+            "+ catalog_row_trust_backfill (6h, ACTIVE)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

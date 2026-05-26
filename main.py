@@ -780,6 +780,11 @@ app.include_router(audit_runs_router)  # P2.3: async audit_runs lifecycle (POST/
 from routes.scheduler_health import router as scheduler_health_router
 app.include_router(scheduler_health_router)
 
+# C1 Phase 2d — read-only trust table health (total rows, decision distribution,
+# drift count, stale rows). Mirrors /__scheduler_health in naming convention.
+from routes.__trust_health import router as trust_health_router
+app.include_router(trust_health_router)
+
 # Operational endpoint family for v1.3 monetization shakeout — wraps the
 # T6/T7/T9 cron tasks as synchronously-invokable HTTP endpoints so end-to-end
 # shakeout scripts (scripts/shakeout/c_full_order_pipeline.py et al.) can
