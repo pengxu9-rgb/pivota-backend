@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 MATCH_TYPE_DOMAIN = "domain"
@@ -169,7 +172,13 @@ async def create_quarantine(
     )
     if row is None:
         raise RuntimeError("create quarantine did not return a row")
-    return _quarantine_from_row(row)
+    result = _quarantine_from_row(row)
+
+    # C1 Phase 2: recompute trust for all catalog rows matching this quarantine
+    # so serving_decision flips to 'blocked' immediately.
+    await _trust_refresh_for_quarantine(result, db=db)
+
+    return result
 
 
 async def revoke_quarantine(
@@ -193,7 +202,13 @@ async def revoke_quarantine(
     )
     if row is None:
         raise LookupError(f"catalog_source_quarantine row not found: {quarantine_id}")
-    return _quarantine_from_row(row)
+    result = _quarantine_from_row(row)
+
+    # C1 Phase 2: recompute trust for catalog rows that were blocked by this
+    # quarantine; now revoked, they may become public again.
+    await _trust_refresh_for_quarantine(result, db=db)
+
+    return result
 
 
 def quarantine_matches_source(
@@ -300,3 +315,38 @@ def _row_value(row: Any, key: str) -> Any:
     if isinstance(row, Mapping):
         return row.get(key)
     return getattr(row, key)
+
+
+async def _trust_refresh_for_quarantine(quarantine: Quarantine, *, db: Any) -> None:
+    """Recompute catalog_row_trust for all rows matching a quarantine predicate.
+
+    Fire-and-forget: called after create_quarantine and revoke_quarantine so
+    affected rows flip serving_decision without waiting for the cron. Errors
+    are logged and swallowed so a trust failure can never break quarantine ops.
+    """
+    try:
+        from services.catalog_row_trust_upserter import (
+            upsert_catalog_row_trust_for_quarantine_match,
+        )
+
+        wrote = await upsert_catalog_row_trust_for_quarantine_match(
+            db=db,
+            match_type=quarantine.match_type,
+            match_value=quarantine.match_value,
+        )
+        logger.info(
+            "catalog_row_trust refreshed after quarantine op "
+            "quarantine_id=%s match_type=%s match_value=%s wrote=%s",
+            quarantine.quarantine_id,
+            quarantine.match_type,
+            quarantine.match_value,
+            wrote,
+        )
+    except Exception:  # pragma: no cover
+        logger.exception(
+            "catalog_row_trust refresh failed after quarantine op "
+            "quarantine_id=%s match_type=%s match_value=%s",
+            quarantine.quarantine_id,
+            quarantine.match_type,
+            quarantine.match_value,
+        )
