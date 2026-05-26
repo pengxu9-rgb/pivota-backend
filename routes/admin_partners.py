@@ -87,6 +87,85 @@ async def list_admin_partners(
     return {"partners": partners}
 
 
+@router.get("/admin/partners/{channel_partner_id}", response_model=None)
+async def get_admin_partner(
+    channel_partner_id: int,
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any] | JSONResponse:
+    """Fetch a single partner with dashboard aggregates and contract fields."""
+
+    row = await database.fetch_one(
+        """
+        SELECT
+          cp.id,
+          cp.legal_name,
+          cp.archetype,
+          cp.status,
+          cp.term_start_date,
+          cp.term_months,
+          cp.auto_renew,
+          cp.per_brand_tail_months,
+          cp.churn_clawback_days,
+          cp.nonpayment_clawback_days,
+          cp.per_brand_subsidy_cap_cents,
+          cp.gmv_take_rate_bp,
+          cp.gmv_take_definition,
+          cp.stripe_connect_account_id,
+          COALESCE(abc.active_brand_count, 0) AS active_brand_count,
+          COALESCE(ytd.ytd_gmv_cents, 0) AS ytd_gmv_cents
+        FROM channel_partners cp
+        LEFT JOIN (
+          SELECT
+            pa.channel_partner_id,
+            COUNT(DISTINCT pa.merchant_id) AS active_brand_count
+          FROM partner_attribution pa
+          WHERE pa.status IN ('signed', 'active')
+            AND pa.activated_at IS NOT NULL
+          GROUP BY pa.channel_partner_id
+        ) abc ON abc.channel_partner_id = cp.id
+        LEFT JOIN (
+          SELECT
+            pa.channel_partner_id,
+            COALESCE(SUM(mbs.gmv_usd_cents), 0) AS ytd_gmv_cents
+          FROM partner_attribution pa
+          JOIN monthly_brand_statements mbs ON mbs.merchant_id = pa.merchant_id
+          WHERE mbs.calendar_month >= CAST(DATE_TRUNC('year', CURRENT_DATE) AS date)
+            AND mbs.status IN ('frozen', 'invoiced')
+          GROUP BY pa.channel_partner_id
+        ) ytd ON ytd.channel_partner_id = cp.id
+        WHERE cp.id = :channel_partner_id
+        LIMIT 1
+        """,
+        {"channel_partner_id": channel_partner_id},
+    )
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "partner_not_found"})
+
+    partner_id = int(_row_get(row, "id"))
+    cohort_progress = await _first_open_cohort_progress(partner_id)
+    return {
+        "id": partner_id,
+        "legal_name": _row_get(row, "legal_name"),
+        "archetype": _row_get(row, "archetype"),
+        "status": _row_get(row, "status"),
+        "term_start_date": _row_get(row, "term_start_date"),
+        "term_months": _row_get(row, "term_months"),
+        "auto_renew": _row_get(row, "auto_renew"),
+        "per_brand_tail_months": _row_get(row, "per_brand_tail_months"),
+        "churn_clawback_days": _row_get(row, "churn_clawback_days"),
+        "nonpayment_clawback_days": _row_get(row, "nonpayment_clawback_days"),
+        "per_brand_subsidy_cap_cents": _row_get(
+            row, "per_brand_subsidy_cap_cents"
+        ),
+        "gmv_take_rate_bp": _row_get(row, "gmv_take_rate_bp"),
+        "gmv_take_definition": _row_get(row, "gmv_take_definition"),
+        "stripe_connect_account_id": _row_get(row, "stripe_connect_account_id"),
+        "active_brand_count": int(_row_get(row, "active_brand_count") or 0),
+        "ytd_gmv_cents": int(_row_get(row, "ytd_gmv_cents") or 0),
+        "cohort_progress": cohort_progress,
+    }
+
+
 @router.post(
     "/admin/partners/{channel_partner_id}/subsidies",
     status_code=201,
