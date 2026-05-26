@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +15,140 @@ async def _generated_sku_key(**kwargs):
 
 async def _noop_execute(*_args, **_kwargs):
     return None
+
+
+class _DummyTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _PruneFakeDatabase:
+    def __init__(self) -> None:
+        self.products: dict[str, dict] = {}
+        self.skus: dict[str, dict] = {}
+        self.offers: dict[str, dict] = {}
+        self.audit_rows: list[dict] = []
+        self.stale_product_keys: list[str] = []
+        self.stale_sku_keys: list[str] = []
+        self.stale_offer_ids: list[str] = []
+
+    def transaction(self):
+        return _DummyTransaction()
+
+    def add_catalog_tree(self, *, source_domain: str, source_product_id: str) -> tuple[str, str, str]:
+        product_key = module.make_catalog_product_key("merch_shared", "shopify", source_product_id)
+        sku_key = module.make_catalog_sku_key(product_key, f"{source_product_id}_variant")
+        offer_id = module.make_catalog_offer_id(sku_key, "default", "internal_merchant")
+        common = {
+            "merchant_id": "merch_shared",
+            "platform": "shopify",
+            "source_product_id": source_product_id,
+            "source_domain": source_domain,
+            "suppression_reason": None,
+            "suppressed_at": None,
+            "suppression_metadata": None,
+        }
+        self.products[product_key] = {
+            **common,
+            "product_key": product_key,
+            "source_system": "shopify_products_sync",
+        }
+        self.skus[sku_key] = {
+            **common,
+            "sku_key": sku_key,
+            "product_key": product_key,
+        }
+        self.offers[offer_id] = {
+            "offer_id": offer_id,
+            "sku_key": sku_key,
+            "product_key": product_key,
+            "merchant_id": "merch_shared",
+            "source_domain": source_domain,
+            "suppression_reason": None,
+            "suppressed_at": None,
+            "suppression_metadata": None,
+        }
+        return product_key, sku_key, offer_id
+
+    async def execute(self, query, values=None):
+        sql = str(query)
+        params = values or {}
+        if "INSERT INTO writer_audit_log" in sql:
+            self.audit_rows.append(dict(params))
+            return None
+        if "CREATE TEMP TABLE stale_catalog_products" in sql:
+            valid_ids = {str(item) for item in params.get("valid_source_product_ids") or []}
+            prune_all = bool(params.get("prune_all"))
+            self.stale_product_keys = [
+                row["product_key"]
+                for row in self.products.values()
+                if row["merchant_id"] == params["merchant_id"]
+                and row["platform"] == params["platform"]
+                and row["source_system"] == params["source_system"]
+                and row["source_domain"] == params["source_domain"]
+                and (prune_all or row["source_product_id"] not in valid_ids)
+            ]
+            return None
+        if "CREATE TEMP TABLE stale_catalog_skus" in sql:
+            self.stale_sku_keys = [
+                row["sku_key"]
+                for row in self.skus.values()
+                if row["merchant_id"] == params["merchant_id"]
+                and row["platform"] == params["platform"]
+                and row["source_domain"] == params["source_domain"]
+                and row["product_key"] in self.stale_product_keys
+            ]
+            return None
+        if "CREATE TEMP TABLE stale_catalog_offers" in sql:
+            self.stale_offer_ids = [
+                row["offer_id"]
+                for row in self.offers.values()
+                if row["merchant_id"] == params["merchant_id"]
+                and row["source_domain"] == params["source_domain"]
+                and (
+                    row["product_key"] in self.stale_product_keys
+                    or row["sku_key"] in self.stale_sku_keys
+                )
+            ]
+            return None
+        return None
+
+    async def fetch_all(self, query, values=None):
+        sql = str(query)
+        if "FROM stale_catalog_products" in sql and "LIMIT 10" in sql:
+            return [{"product_key": key} for key in sorted(self.stale_product_keys)[:10]]
+        return []
+
+    async def fetch_val(self, query, values=None):
+        sql = str(query)
+        params = values or {}
+        if "SELECT count(*) FROM stale_catalog_products" in sql:
+            return len(self.stale_product_keys)
+        if "UPDATE catalog_products" in sql:
+            return self._tombstone(self.products, set(self.stale_product_keys), "product_key", params)
+        if "UPDATE catalog_skus" in sql:
+            return self._tombstone(self.skus, set(self.stale_sku_keys), "sku_key", params)
+        if "UPDATE catalog_offers" in sql:
+            return self._tombstone(self.offers, set(self.stale_offer_ids), "offer_id", params)
+        return 0
+
+    def _tombstone(self, table: dict[str, dict], keys: set[str], key_name: str, params: dict) -> int:
+        count = 0
+        for row in table.values():
+            if row[key_name] not in keys or row.get("suppressed_at") is not None:
+                continue
+            row["suppression_reason"] = params["suppression_reason"]
+            row["suppressed_at"] = "now"
+            row["suppression_metadata"] = {
+                "sync_run_id": params["sync_run_id"],
+                "pruned_by": params["pruned_by"],
+                "source_domain": params["source_domain"],
+            }
+            count += 1
+        return count
 
 
 def test_catalog_sync_service_utcnow_is_naive_utc() -> None:
@@ -39,6 +174,37 @@ def test_catalog_source_domain_migration_shape() -> None:
         assert "ADD COLUMN IF NOT EXISTS source_domain TEXT NULL" in up_sql
         assert f"ALTER TABLE IF EXISTS {table}" in down_sql
         assert "DROP COLUMN IF EXISTS source_domain" in down_sql
+
+
+def test_catalog_stale_suppression_migration_shape() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    up_sql = (
+        repo_root
+        / "db"
+        / "migrations"
+        / "135_catalog_product_sku_stale_suppression.sql"
+    ).read_text()
+    down_sql = (
+        repo_root
+        / "db"
+        / "migrations"
+        / "down"
+        / "135_catalog_product_sku_stale_suppression_down.sql"
+    ).read_text()
+
+    for table in ("catalog_products", "catalog_skus"):
+        assert f"ALTER TABLE IF EXISTS {table}" in up_sql
+        assert "ADD COLUMN IF NOT EXISTS suppression_reason TEXT NULL" in up_sql
+        assert "ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ NULL" in up_sql
+        assert "ADD COLUMN IF NOT EXISTS suppression_metadata JSONB NULL" in up_sql
+        assert f"ALTER TABLE IF EXISTS {table}" in down_sql
+        assert "DROP COLUMN IF EXISTS suppression_metadata" in down_sql
+        assert "DROP COLUMN IF EXISTS suppressed_at" in down_sql
+        assert "DROP COLUMN IF EXISTS suppression_reason" in down_sql
+
+    assert "ALTER TABLE IF EXISTS catalog_offers" in up_sql
+    assert "ADD COLUMN IF NOT EXISTS suppression_metadata JSONB NULL" in up_sql
+    assert "DROP COLUMN IF EXISTS suppression_metadata" in down_sql
 
 
 @pytest.mark.asyncio
@@ -77,6 +243,117 @@ async def test_resolve_catalog_sku_key_generates_when_source_identity_missing(
     )
 
     assert sku_key == "sku::prod::merch_1::shopify::prod_1::var_1"
+
+
+@pytest.mark.asyncio
+async def test_prune_tombstones_only_dropped_products_for_same_source_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = _PruneFakeDatabase()
+    x1_product, x1_sku, x1_offer = fake_db.add_catalog_tree(
+        source_domain="store-a.myshopify.com",
+        source_product_id="X1",
+    )
+    x2_product, x2_sku, x2_offer = fake_db.add_catalog_tree(
+        source_domain="store-a.myshopify.com",
+        source_product_id="X2",
+    )
+    y1_product, y1_sku, y1_offer = fake_db.add_catalog_tree(
+        source_domain="store-b.myshopify.com",
+        source_product_id="Y1",
+    )
+
+    monkeypatch.setattr(module, "database", fake_db)
+
+    stats = await module.prune_missing_catalog_products_for_source(
+        merchant_id="merch_shared",
+        platform="shopify",
+        valid_source_product_ids=["X1"],
+        source_system="shopify_products_sync",
+        source_domain="store-a.myshopify.com",
+        sync_run_id="sync_store_a_2",
+    )
+
+    assert stats["catalog_products"] == 1
+    assert stats["catalog_skus"] == 1
+    assert stats["catalog_offers"] == 1
+    for key, table in ((x2_product, fake_db.products), (x2_sku, fake_db.skus), (x2_offer, fake_db.offers)):
+        assert table[key]["suppression_reason"] == module.STALE_AFTER_SYNC
+        assert table[key]["suppressed_at"] == "now"
+        assert table[key]["suppression_metadata"]["sync_run_id"] == "sync_store_a_2"
+
+    for key, table in (
+        (x1_product, fake_db.products),
+        (x1_sku, fake_db.skus),
+        (x1_offer, fake_db.offers),
+        (y1_product, fake_db.products),
+        (y1_sku, fake_db.skus),
+        (y1_offer, fake_db.offers),
+    ):
+        assert table[key]["suppressed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_prune_source_domain_scope_isolates_other_store_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = _PruneFakeDatabase()
+    fake_db.add_catalog_tree(source_domain="store-a.myshopify.com", source_product_id="X1")
+    y1_product, y1_sku, y1_offer = fake_db.add_catalog_tree(
+        source_domain="store-b.myshopify.com",
+        source_product_id="Y1",
+    )
+
+    monkeypatch.setattr(module, "database", fake_db)
+
+    await module.prune_missing_catalog_products_for_source(
+        merchant_id="merch_shared",
+        platform="shopify",
+        valid_source_product_ids=["X1"],
+        source_system="shopify_products_sync",
+        source_domain="store-a.myshopify.com",
+        sync_run_id="sync_store_a_1",
+    )
+
+    assert fake_db.products[y1_product]["suppressed_at"] is None
+    assert fake_db.skus[y1_sku]["suppressed_at"] is None
+    assert fake_db.offers[y1_offer]["suppressed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_prune_writes_writer_audit_row_with_sample_product_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = _PruneFakeDatabase()
+    x2_product, _, _ = fake_db.add_catalog_tree(
+        source_domain="store-a.myshopify.com",
+        source_product_id="X2",
+    )
+    x3_product, _, _ = fake_db.add_catalog_tree(
+        source_domain="store-a.myshopify.com",
+        source_product_id="X3",
+    )
+
+    monkeypatch.setattr(module, "database", fake_db)
+
+    await module.prune_missing_catalog_products_for_source(
+        merchant_id="merch_shared",
+        platform="shopify",
+        valid_source_product_ids=[],
+        source_system="shopify_products_sync",
+        source_domain="store-a.myshopify.com",
+        sync_run_id="sync_store_a_full",
+    )
+
+    assert len(fake_db.audit_rows) == 1
+    audit_row = fake_db.audit_rows[0]
+    assert audit_row["writer_name"] == "catalog_sync_service_prune"
+    assert audit_row["batch_id"] == "sync_store_a_full"
+    assert audit_row["applied_rows"] == 0
+    assert audit_row["skipped_rows"] == 2
+    reasons = json.loads(audit_row["reasons"])
+    assert reasons["stale_after_sync"] == 2
+    assert reasons["tombstoned_product_keys_sample"] == sorted([x2_product, x3_product])
 
 
 @pytest.mark.asyncio
@@ -575,6 +852,120 @@ async def test_ingest_standard_products_propagates_source_domain(
     assert writes["catalog_products"][0]["source_domain"] == "source-domain.example"
     assert writes["catalog_skus"][0]["source_domain"] == "source-domain.example"
     assert writes["catalog_offers"][0]["source_domain"] == "source-domain.example"
+
+
+@pytest.mark.asyncio
+async def test_ingest_standard_products_recovers_stale_after_sync_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product_key = module.make_catalog_product_key("merch_recover", "shopify", "X2")
+    sku_key = module.make_catalog_sku_key(product_key, "X2_variant")
+    offer_id = module.make_catalog_offer_id(sku_key, "default", "internal_merchant")
+    tombstone = {
+        "suppression_reason": module.STALE_AFTER_SYNC,
+        "suppressed_at": datetime(2026, 5, 26, 1, 0, 0),
+        "suppression_metadata": {"sync_run_id": "sync_old"},
+    }
+    records = {
+        "catalog_products": {
+            product_key: {
+                "product_key": product_key,
+                **tombstone,
+            }
+        },
+        "catalog_skus": {
+            sku_key: {
+                "sku_key": sku_key,
+                **tombstone,
+            }
+        },
+        "catalog_offers": {
+            offer_id: {
+                "offer_id": offer_id,
+                **tombstone,
+            }
+        },
+    }
+    audit_rows = []
+
+    async def fake_upsert_catalog_merchant(**_kwargs):
+        return None
+
+    async def fake_upsert_by_pk(table, pk_name, values):
+        table_name = getattr(table, "name", None)
+        key = values[pk_name]
+        existing = records.setdefault(table_name, {}).get(key)
+        records[table_name][key] = {**(existing or {}), **dict(values)}
+        return dict(existing) if existing else None
+
+    async def fake_execute(*args, **_kwargs):
+        if len(args) >= 2 and isinstance(args[1], dict) and args[1].get("writer_name"):
+            audit_rows.append(dict(args[1]))
+        return None
+
+    async def fake_upsert_field_fact(*_args, **_kwargs):
+        return None
+
+    async def fake_append_snapshot(*_args, **_kwargs):
+        return None
+
+    async def fake_replace_child_rows_multi(*_args, **_kwargs):
+        return 0
+
+    async def fake_resolve_catalog_sku_key(**_kwargs):
+        return sku_key
+
+    async def fake_fold_category_with_llm_fallback(**_kwargs):
+        return None
+
+    monkeypatch.setattr(module.database, "transaction", lambda: _DummyTransaction())
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "upsert_catalog_merchant", fake_upsert_catalog_merchant)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    monkeypatch.setattr(module, "_append_snapshot", fake_append_snapshot)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", fake_replace_child_rows_multi)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", fake_resolve_catalog_sku_key)
+    monkeypatch.setattr(module, "fold_category_with_llm_fallback", fake_fold_category_with_llm_fallback)
+    monkeypatch.setattr(module, "_schedule_fashion_enrichment", lambda **_kwargs: None)
+
+    stats = await module.ingest_standard_products(
+        merchant_id="merch_recover",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "X2",
+                "product_id": "X2",
+                "merchant_id": "merch_recover",
+                "platform": "shopify",
+                "title": "Recovered Serum",
+                "price": 29.0,
+                "currency": "USD",
+                "variants": [
+                    {
+                        "id": "X2_variant",
+                        "title": "Default",
+                        "price": 29.0,
+                        "inventory_quantity": 3,
+                    },
+                ],
+            }
+        ],
+        source_system="shopify_products_sync",
+        source_ref="sync_recovery",
+        source_domain="store-a.myshopify.com",
+    )
+
+    assert stats["products_recovered_after_stale"] == 1
+    assert records["catalog_products"][product_key]["suppressed_at"] is None
+    assert records["catalog_skus"][sku_key]["suppressed_at"] is None
+    assert records["catalog_offers"][offer_id]["suppressed_at"] is None
+    assert records["catalog_products"][product_key]["suppression_reason"] is None
+    assert records["catalog_skus"][sku_key]["suppression_reason"] is None
+    assert records["catalog_offers"][offer_id]["suppression_reason"] is None
+    assert len(audit_rows) == 1
+    reasons = json.loads(audit_rows[0]["reasons"])
+    assert reasons["recovered_after_stale"] == 1
 
 
 @pytest.mark.asyncio

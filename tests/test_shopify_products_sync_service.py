@@ -204,6 +204,8 @@ async def test_complete_shopify_sync_prunes_missing_catalog_products(
     assert observed["prune"]["merchant_id"] == "merch_1"
     assert observed["prune"]["platform"] == "shopify"
     assert observed["prune"]["source_system"] == "shopify_products_sync"
+    assert observed["prune"]["source_domain"] == "test-shop.myshopify.com"
+    assert observed["prune"]["sync_run_id"] == observed["ingest"]["source_ref"]
     assert set(observed["prune"]["valid_source_product_ids"]) == {"p1", "p2"}
 
 

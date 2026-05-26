@@ -264,13 +264,15 @@ async def sync_shopify_products_for_merchant(
             prune_missing_catalog_products_for_source,
         )
 
+        catalog_sync_run_id = f"shopify_products_sync:{merchant_id}:{datetime.utcnow().isoformat()}"
+        shop_domain = credentials.get("shop_domain")
         catalog_stats = await ingest_standard_products(
             merchant_id=merchant_id,
             platform="shopify",
             product_payloads=catalog_payloads,
             source_system="shopify_products_sync",
-            source_ref=f"shopify_products_sync:{merchant_id}:{datetime.utcnow().isoformat()}",
-            source_domain=credentials.get("shop_domain"),
+            source_ref=catalog_sync_run_id,
+            source_domain=shop_domain,
         )
         if truncated:
             catalog_prune_skipped_reason = truncated_reason or "sync_truncated"
@@ -280,6 +282,8 @@ async def sync_shopify_products_for_merchant(
                 platform="shopify",
                 valid_source_product_ids=list(synced_platform_ids),
                 source_system="shopify_products_sync",
+                source_domain=shop_domain,
+                sync_run_id=catalog_sync_run_id,
             )
         else:
             catalog_prune_skipped_reason = "no_synced_product_ids"

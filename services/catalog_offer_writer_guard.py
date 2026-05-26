@@ -24,7 +24,7 @@ class WriterAuditAccumulator:
     dry_run_report_hash: Optional[str] = None
     applied_rows: int = 0
     skipped_rows: int = 0
-    reasons: Dict[str, int] = field(default_factory=dict)
+    reasons: Dict[str, Any] = field(default_factory=dict)
 
     def record_applied(self, count: int = 1) -> None:
         self.applied_rows += int(count or 0)
