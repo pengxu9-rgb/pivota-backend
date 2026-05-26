@@ -61,6 +61,10 @@ from services.catalog_offer_writer_guard import (
 )
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
+from services.catalog_row_trust_upserter import (
+    upsert_catalog_row_trust,
+    upsert_catalog_row_trust_many,
+)
 from services.strong_identifier import (
     MPN_CAPTURED_AS_BARCODE,
     NO_STRONG_IDENTIFIER,
@@ -1435,6 +1439,10 @@ async def ingest_standard_products(
                     "error": str(exc),
                 })
 
+        # C1 Phase 2: dual-write trust row. Fire-and-forget — a failure here
+        # never breaks ingest; the defensive cron (phase 2d) catches drift.
+        await upsert_catalog_row_trust(db=database, product_key=product_key)
+
     if job_id:
         await _upsert_by_pk(
             catalog_sync_jobs,
@@ -1510,6 +1518,7 @@ async def prune_missing_catalog_products_for_source(
         "catalog_skus": 0,
         "catalog_offers": 0,
     }
+    all_stale_product_keys: List[str] = []
 
     async with database.transaction():
         await database.execute(
@@ -1572,19 +1581,22 @@ async def prune_missing_catalog_products_for_source(
         stale_product_count = int(
             await database.fetch_val("SELECT count(*) FROM stale_catalog_products") or 0
         )
-        sample_rows = await database.fetch_all(
+        # Fetch all stale keys inside the transaction (temp table ON COMMIT DROP).
+        # First 10 go to the audit log; all keys feed the trust-row recompute
+        # after the transaction commits.
+        all_stale_rows = await database.fetch_all(
             """
             SELECT product_key
             FROM stale_catalog_products
             ORDER BY product_key
-            LIMIT 10
             """
         )
-        product_key_sample = [
+        all_stale_product_keys = [
             str(dict(row).get("product_key") or "").strip()
-            for row in sample_rows or []
+            for row in all_stale_rows or []
             if str(dict(row).get("product_key") or "").strip()
         ]
+        product_key_sample = all_stale_product_keys[:10]
 
         tombstone_params = {
             "suppression_reason": STALE_AFTER_SYNC,
@@ -1667,6 +1679,13 @@ async def prune_missing_catalog_products_for_source(
             audit.record_skips({STALE_AFTER_SYNC: stats["catalog_products"]})
             audit.reasons["tombstoned_product_keys_sample"] = product_key_sample
             await write_writer_audit_log(audit, db=database)
+
+    # C1 Phase 2: recompute trust for tombstoned rows so serving_decision flips
+    # to 'blocked' with ROW_TOMBSTONED immediately instead of waiting for cron.
+    if all_stale_product_keys:
+        await upsert_catalog_row_trust_many(
+            db=database, product_keys=all_stale_product_keys
+        )
 
     logger.info(
         "Catalog source prune completed merchant=%s platform=%s source_system=%s source_domain=%s stale_products=%s products_tombstoned=%s offers_tombstoned=%s",
