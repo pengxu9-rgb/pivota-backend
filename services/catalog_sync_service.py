@@ -89,6 +89,9 @@ GUARDED_OFFER_WRITERS = {
     # Wix catalog sync currently routes through routes.universal_product_sync.
     "universal_product_sync",
 }
+STALE_AFTER_SYNC = "stale_after_sync"
+CATALOG_SYNC_PRUNE_WRITER = "catalog_sync_service_prune"
+SUPPRESSION_FIELDS = ("suppression_reason", "suppressed_at", "suppression_metadata")
 
 
 async def _async_fashion_enrich(
@@ -659,6 +662,24 @@ async def _fetch_one_by_pk(table: Any, pk_name: str, pk_value: Any) -> Optional[
     return dict(row) if row else None
 
 
+def _is_stale_after_sync_tombstone(row: Optional[Dict[str, Any]]) -> bool:
+    if not row:
+        return False
+    return bool(row.get("suppressed_at") and row.get("suppression_reason") == STALE_AFTER_SYNC)
+
+
+def _preserve_non_stale_suppression(existing: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> None:
+    if not existing or _is_stale_after_sync_tombstone(existing):
+        return
+    if not any(field in payload for field in SUPPRESSION_FIELDS):
+        return
+    if not existing.get("suppressed_at") and not existing.get("suppression_reason"):
+        return
+    for field in SUPPRESSION_FIELDS:
+        if field in payload:
+            payload[field] = existing.get(field)
+
+
 async def _resolve_catalog_sku_key(
     *,
     merchant_id: str,
@@ -682,16 +703,18 @@ async def _resolve_catalog_sku_key(
     return make_catalog_sku_key(product_key, source_variant_id)
 
 
-async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> None:
+async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     pk_value = values[pk_name]
     existing = await _fetch_one_by_pk(table, pk_name, pk_value)
     payload = dict(values)
+    _preserve_non_stale_suppression(existing, payload)
     payload["updated_at"] = _utcnow()
     if existing:
         await database.execute(table.update().where(getattr(table.c, pk_name) == pk_value).values(**payload))
-        return
+        return existing
     payload.setdefault("created_at", _utcnow())
     await database.execute(table.insert().values(**payload))
+    return None
 
 
 async def _replace_child_rows(table: Any, match_column: str, match_value: Any, rows: Iterable[Dict[str, Any]]) -> int:
@@ -838,6 +861,7 @@ async def ingest_standard_products(
         "offers_ingested": 0,
         "offers_skipped": 0,
         "offer_skip_reasons": {},
+        "products_recovered_after_stale": 0,
         "beauty_profiles_upserted": 0,
         "beauty_ingredient_rows_upserted": 0,
         "beauty_usage_guides_upserted": 0,
@@ -946,7 +970,7 @@ async def ingest_standard_products(
                 "source_system": source_system,
             }
 
-            await _upsert_by_pk(
+            existing_product = await _upsert_by_pk(
                 catalog_products,
                 "product_key",
                 {
@@ -960,6 +984,9 @@ async def ingest_standard_products(
                     "source_system": source_system,
                     "source_ref": source_ref,
                     "source_domain": source_domain_value,
+                    "suppression_reason": None,
+                    "suppressed_at": None,
+                    "suppression_metadata": None,
                     "title": product.title,
                     "description": _description_for_ingest,
                     "brand": brand,
@@ -1032,6 +1059,10 @@ async def ingest_standard_products(
                     },
                 },
             )
+            if _is_stale_after_sync_tombstone(existing_product):
+                stats["products_recovered_after_stale"] += 1
+                if audit is not None:
+                    audit.record_info({"recovered_after_stale": 1})
             stats["products_ingested"] += 1
 
             # Phase O-5b live-ingest enrichment: spawn a fire-and-forget
@@ -1126,6 +1157,9 @@ async def ingest_standard_products(
                         "source_product_id": str(product.product_id or product.id),
                         "source_variant_id": source_variant_id,
                         "source_domain": source_domain_value,
+                        "suppression_reason": None,
+                        "suppressed_at": None,
+                        "suppression_metadata": None,
                         "sku": variant.sku or product.sku,
                         "barcode": strong_identifier.value if strong_identifier else None,
                         "title": variant.title or product.title,
@@ -1166,6 +1200,9 @@ async def ingest_standard_products(
                     "source_system": source_system,
                     "source_ref": source_ref,
                     "source_domain": source_domain_value,
+                    "suppression_reason": None,
+                    "suppressed_at": None,
+                    "suppression_metadata": None,
                     "offer_payload": {
                         "product_id": str(product.product_id or product.id),
                         "variant_id": source_variant_id,
@@ -1440,17 +1477,39 @@ async def prune_missing_catalog_products_for_source(
     platform: str,
     valid_source_product_ids: List[str],
     source_system: str,
+    source_domain: Optional[str] = None,
+    sync_run_id: Optional[str] = None,
 ) -> Dict[str, int]:
-    """Remove catalog rows that are no longer present in a completed source sync.
+    """Tombstone catalog rows that are no longer present in a completed source sync.
 
-    This is intentionally scoped to one merchant/platform/source_system. Shopify
-    refreshes products_cache as the live source of truth, so catalog rows from an
-    older completed sync must not keep surfacing after the upstream product ids
-    disappear.
+    This is scoped to one merchant/platform/source_system/source_domain. Shopify
+    refreshes products_cache as the live source of truth, so catalog rows from
+    the same store's older completed sync must stop surfacing after the upstream
+    product ids disappear. Rows are retained for audit and automatic recovery.
     """
     normalized_ids = [str(item or "").strip() for item in valid_source_product_ids or [] if str(item or "").strip()]
+    source_domain_value = str(source_domain or "").strip() or None
+    if not source_domain_value:
+        logger.warning(
+            "Catalog source prune skipped merchant=%s platform=%s source_system=%s reason=missing_source_domain",
+            merchant_id,
+            platform,
+            source_system,
+        )
+        return {
+            "catalog_products": 0,
+            "catalog_skus": 0,
+            "catalog_offers": 0,
+            "skipped_missing_source_domain": 1,
+        }
+
     prune_all = not normalized_ids
-    stats: Dict[str, int] = {}
+    run_id = sync_run_id or make_batch_id("catalog_sync_prune", source_system)
+    stats: Dict[str, int] = {
+        "catalog_products": 0,
+        "catalog_skus": 0,
+        "catalog_offers": 0,
+    }
 
     async with database.transaction():
         await database.execute(
@@ -1461,6 +1520,7 @@ async def prune_missing_catalog_products_for_source(
             WHERE merchant_id = :merchant_id
               AND platform = :platform
               AND source_system = :source_system
+              AND source_domain = :source_domain
               AND (
                 :prune_all
                 OR source_product_id <> ALL(CAST(:valid_source_product_ids AS text[]))
@@ -1470,6 +1530,7 @@ async def prune_missing_catalog_products_for_source(
                 "merchant_id": merchant_id,
                 "platform": platform,
                 "source_system": source_system,
+                "source_domain": source_domain_value,
                 "prune_all": prune_all,
                 "valid_source_product_ids": normalized_ids,
             },
@@ -1477,130 +1538,145 @@ async def prune_missing_catalog_products_for_source(
         await database.execute(
             """
             CREATE TEMP TABLE stale_catalog_skus ON COMMIT DROP AS
-            SELECT sku_key
+            SELECT sku_key, product_key
             FROM catalog_skus
-            WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
-            """
+            WHERE merchant_id = :merchant_id
+              AND platform = :platform
+              AND source_domain = :source_domain
+              AND product_key IN (SELECT product_key FROM stale_catalog_products)
+            """,
+            {
+                "merchant_id": merchant_id,
+                "platform": platform,
+                "source_domain": source_domain_value,
+            },
         )
         await database.execute(
             """
             CREATE TEMP TABLE stale_catalog_offers ON COMMIT DROP AS
-            SELECT offer_id
+            SELECT offer_id, product_key, sku_key
             FROM catalog_offers
-            WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
-               OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
-            """
+            WHERE merchant_id = :merchant_id
+              AND source_domain = :source_domain
+              AND (
+                product_key IN (SELECT product_key FROM stale_catalog_products)
+                OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+              )
+            """,
+            {
+                "merchant_id": merchant_id,
+                "source_domain": source_domain_value,
+            },
         )
 
-        delete_statements: List[Tuple[str, str]] = [
+        stale_product_count = int(
+            await database.fetch_val("SELECT count(*) FROM stale_catalog_products") or 0
+        )
+        sample_rows = await database.fetch_all(
+            """
+            SELECT product_key
+            FROM stale_catalog_products
+            ORDER BY product_key
+            LIMIT 10
+            """
+        )
+        product_key_sample = [
+            str(dict(row).get("product_key") or "").strip()
+            for row in sample_rows or []
+            if str(dict(row).get("product_key") or "").strip()
+        ]
+
+        tombstone_params = {
+            "suppression_reason": STALE_AFTER_SYNC,
+            "sync_run_id": run_id,
+            "pruned_by": "catalog_sync_service",
+            "source_domain": source_domain_value,
+        }
+        update_statements: List[Tuple[str, str]] = [
             (
-                "catalog_field_facts",
+                "catalog_products",
                 """
-                WITH deleted AS (
-                  DELETE FROM catalog_field_facts
-                  WHERE entity_id IN (SELECT product_key FROM stale_catalog_products)
-                     OR entity_id IN (SELECT sku_key FROM stale_catalog_skus)
-                     OR entity_id IN (SELECT offer_id FROM stale_catalog_offers)
-                  RETURNING 1
-                )
-                SELECT count(*) FROM deleted
-                """,
-            ),
-            (
-                "catalog_inventory_snapshots",
-                """
-                WITH deleted AS (
-                  DELETE FROM catalog_inventory_snapshots
-                  WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)
-                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
-                  RETURNING 1
-                )
-                SELECT count(*) FROM deleted
-                """,
-            ),
-            (
-                "catalog_price_snapshots",
-                """
-                WITH deleted AS (
-                  DELETE FROM catalog_price_snapshots
-                  WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)
-                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
-                  RETURNING 1
-                )
-                SELECT count(*) FROM deleted
-                """,
-            ),
-            (
-                "beauty_sku_ingredients",
-                """
-                WITH deleted AS (
-                  DELETE FROM beauty_sku_ingredients
+                WITH tombstoned AS (
+                  UPDATE catalog_products
+                  SET suppression_reason = :suppression_reason,
+                      suppressed_at = NOW(),
+                      suppression_metadata = jsonb_build_object(
+                        'sync_run_id', :sync_run_id,
+                        'pruned_by', :pruned_by,
+                        'source_domain', :source_domain
+                      ),
+                      updated_at = NOW()
                   WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
-                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
+                    AND suppressed_at IS NULL
                   RETURNING 1
                 )
-                SELECT count(*) FROM deleted
-                """,
-            ),
-            (
-                "beauty_product_profiles",
-                """
-                WITH deleted AS (
-                  DELETE FROM beauty_product_profiles
-                  WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
-                  RETURNING 1
-                )
-                SELECT count(*) FROM deleted
-                """,
-            ),
-            (
-                "catalog_offers",
-                """
-                WITH deleted AS (
-                  DELETE FROM catalog_offers
-                  WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)
-                     OR product_key IN (SELECT product_key FROM stale_catalog_products)
-                     OR sku_key IN (SELECT sku_key FROM stale_catalog_skus)
-                  RETURNING 1
-                )
-                SELECT count(*) FROM deleted
+                SELECT count(*) FROM tombstoned
                 """,
             ),
             (
                 "catalog_skus",
                 """
-                WITH deleted AS (
-                  DELETE FROM catalog_skus
+                WITH tombstoned AS (
+                  UPDATE catalog_skus
+                  SET suppression_reason = :suppression_reason,
+                      suppressed_at = NOW(),
+                      suppression_metadata = jsonb_build_object(
+                        'sync_run_id', :sync_run_id,
+                        'pruned_by', :pruned_by,
+                        'source_domain', :source_domain
+                      ),
+                      updated_at = NOW()
                   WHERE sku_key IN (SELECT sku_key FROM stale_catalog_skus)
-                     OR product_key IN (SELECT product_key FROM stale_catalog_products)
+                    AND suppressed_at IS NULL
                   RETURNING 1
                 )
-                SELECT count(*) FROM deleted
+                SELECT count(*) FROM tombstoned
                 """,
             ),
             (
-                "catalog_products",
+                "catalog_offers",
                 """
-                WITH deleted AS (
-                  DELETE FROM catalog_products
-                  WHERE product_key IN (SELECT product_key FROM stale_catalog_products)
+                WITH tombstoned AS (
+                  UPDATE catalog_offers
+                  SET suppression_reason = :suppression_reason,
+                      suppressed_at = NOW(),
+                      suppression_metadata = jsonb_build_object(
+                        'sync_run_id', :sync_run_id,
+                        'pruned_by', :pruned_by,
+                        'source_domain', :source_domain
+                      ),
+                      updated_at = NOW()
+                  WHERE offer_id IN (SELECT offer_id FROM stale_catalog_offers)
+                    AND suppressed_at IS NULL
                   RETURNING 1
                 )
-                SELECT count(*) FROM deleted
+                SELECT count(*) FROM tombstoned
                 """,
             ),
         ]
 
-        for table_name, sql in delete_statements:
-            deleted = await database.fetch_val(sql)
-            stats[table_name] = int(deleted or 0)
+        for table_name, sql in update_statements:
+            tombstoned = await database.fetch_val(sql, tombstone_params)
+            stats[table_name] = int(tombstoned or 0)
+
+        if stats["catalog_products"] > 0:
+            audit = WriterAuditAccumulator(
+                writer_name=CATALOG_SYNC_PRUNE_WRITER,
+                batch_id=run_id,
+            )
+            audit.record_skips({STALE_AFTER_SYNC: stats["catalog_products"]})
+            audit.reasons["tombstoned_product_keys_sample"] = product_key_sample
+            await write_writer_audit_log(audit, db=database)
 
     logger.info(
-        "Catalog source prune completed merchant=%s platform=%s source_system=%s products_deleted=%s",
+        "Catalog source prune completed merchant=%s platform=%s source_system=%s source_domain=%s stale_products=%s products_tombstoned=%s offers_tombstoned=%s",
         merchant_id,
         platform,
         source_system,
+        source_domain_value,
+        stale_product_count,
         stats.get("catalog_products", 0),
+        stats.get("catalog_offers", 0),
     )
     return stats
 
