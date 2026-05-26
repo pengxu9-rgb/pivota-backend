@@ -104,6 +104,7 @@ from routes.agent_account import router as agent_account_router  # Agent account
 from routes.agent_commerce import router as agent_commerce_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
+from routes.admin_partner_invite_tokens import router as admin_partner_invite_tokens_router
 from routes.admin_partners import router as admin_partners_router
 from routes.merchant_routes import router as merchant_router
 from routes.merchant_onboarding_routes import router as merchant_onboarding_router
@@ -194,6 +195,7 @@ if DEBUG_MODE:
 from routes.shopify_routes import router as shopify_router
 from routes.payment_execution_routes import router as payment_execution_router
 from routes.billing_routes import router as billing_router
+from routes.partner_invite_redeem import router as partner_invite_redeem_router
 from routes.product_routes import router as product_router
 from routes.product_routes_v2 import router as product_router_v2
 from routes.product_sync import router as product_sync_router
@@ -793,6 +795,7 @@ app.include_router(agent_account_router)  # Agent account management (/agent/acc
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_partner_cohort_router)  # Admin channel-partner cohort progress/evaluation
+app.include_router(admin_partner_invite_tokens_router)  # Admin channel-partner invite token issue/list/revoke
 app.include_router(admin_partners_router)  # Admin channel-partner list, subsidies, settlement retry
 app.include_router(admin_reset_employee_router)  # Admin employee password reset
 app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplicate data
@@ -951,6 +954,7 @@ if DEBUG_MODE:
 app.include_router(shopify_router)  # Shopify MCP integration
 app.include_router(payment_execution_router)  # Payment execution (Phase 3)
 app.include_router(billing_router)  # Stripe Billing monetization
+app.include_router(partner_invite_redeem_router)  # Merchant onboarding partner invite redemption
 # Register more specific product routes FIRST to avoid path conflicts
 app.include_router(product_router_v2)  # Product management v2 (cache-based) - MUST be before product_router
 app.include_router(product_sync_router)  # Product sync from platforms (legacy)

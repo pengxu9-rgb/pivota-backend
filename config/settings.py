@@ -246,6 +246,8 @@ class Settings(BaseSettings):
     support_email: str = os.getenv("SUPPORT_EMAIL", "support@pivota.ai")
     # Merchant Portal base URL (used for password reset links)
     merchant_portal_base_url: str = os.getenv("MERCHANT_PORTAL_BASE_URL", "https://merchant.pivota.cc")
+    # Merchant signup URL used by partner invite links.
+    merchant_signup_base_url: str = os.getenv("MERCHANT_SIGNUP_BASE_URL", "https://merchant.pivota.cc/signup")
     # Employee Portal base URL (used for password reset links for employee accounts)
     employee_portal_base_url: str = os.getenv("EMPLOYEE_PORTAL_BASE_URL", "https://employee.pivota.cc")
     # Agent/Developer Portal base URL (used for password reset links)
