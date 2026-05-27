@@ -50,6 +50,7 @@ from db.accounts import (
     shop_browse_history_events,
     normalize_email,
     create_or_get_shop_user,
+    sync_customer_auth_membership,
     record_public_lookup,
     count_recent_public_lookup_by_ip,
     count_recent_public_lookup_by_key,
@@ -278,9 +279,14 @@ async def get_accounts_principal(request: Request) -> AccountsPrincipal:
     except HTTPException:
         raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Invalid or expired session")
 
-    sub = payload.get("sub")
+    sub = (
+        payload.get("customer_user_id")
+        or payload.get("user_id")
+        or payload.get("sub")
+    )
     email = payload.get("email")
     role = payload.get("role", "customer")
+    membership_type = str(payload.get("membership_type") or "").strip().lower()
     amr = payload.get("amr")
     raw_iat = payload.get("iat")
     raw_auth_time = payload.get("auth_time")
@@ -300,6 +306,8 @@ async def get_accounts_principal(request: Request) -> AccountsPrincipal:
             auth_time = int(raw_auth_time.strip())
     except Exception:
         auth_time = None
+    if membership_type and membership_type != "customer":
+        raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Invalid account session")
     if not sub or not email:
         raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Invalid token payload")
 
@@ -762,13 +770,20 @@ def _set_auth_cookies(
     primary_role: str = "customer",
     amr: Optional[str] = None,
     auth_time: Optional[int] = None,
+    identity_id: Optional[str] = None,
 ) -> None:
     """Set access + refresh cookies for accounts API."""
+    subject = identity_id or user_id
     base_payload = {
-        "sub": user_id,
+        "sub": subject,
+        "user_id": user_id,
+        "customer_user_id": user_id,
+        "identity_id": identity_id,
         "email": email,
         "role": primary_role,
         "scope": "accounts",
+        "membership_type": "customer",
+        "aud": "accounts",
     }
     if amr:
         base_payload["amr"] = amr
@@ -810,6 +825,18 @@ def _set_auth_cookies(
         samesite=samesite,
         path="/",
     )
+
+
+def _identity_id_from_membership(membership: Optional[dict]) -> Optional[str]:
+    if not membership:
+        return None
+    identity_id = membership.get("identity_id")
+    if identity_id:
+        return str(identity_id)
+    identity = membership.get("identity")
+    if isinstance(identity, dict) and identity.get("identity_id"):
+        return str(identity["identity_id"])
+    return None
 
 
 def _clear_auth_cookies(response: JSONResponse) -> None:
@@ -2221,6 +2248,7 @@ async def verify_login(body: VerifyRequest, request: Request):
     user_row = await create_or_get_shop_user(email=email, phone=body.phone)
     user_row["is_new_user"] = bool(user_row.get("created_at") and user_row["created_at"] >= now - timedelta(minutes=1))
     await _mark_email_verified_best_effort(user_row.get("id"))
+    customer_membership = await sync_customer_auth_membership(user_row)
 
     session_payload = await _build_user_session(user_row)
     response = JSONResponse(session_payload.dict())
@@ -2231,6 +2259,7 @@ async def verify_login(body: VerifyRequest, request: Request):
         primary_role=user_row.get("primary_role", "customer"),
         amr="otp",
         auth_time=int(datetime.now(timezone.utc).timestamp()),
+        identity_id=_identity_id_from_membership(customer_membership),
     )
     return response
 
@@ -2290,6 +2319,10 @@ async def password_login(body: PasswordLoginRequest, request: Request):
 
     user_dict = dict(user_row)
     await _mark_email_verified_best_effort(user_dict.get("id"))
+    customer_membership = await sync_customer_auth_membership(
+        user_dict,
+        password_hash=pw_row["password_hash"],
+    )
     session_payload = await _build_user_session(user_dict)
     response = JSONResponse(session_payload.dict())
     _set_auth_cookies(
@@ -2299,6 +2332,7 @@ async def password_login(body: PasswordLoginRequest, request: Request):
         primary_role=str(user_dict.get("primary_role") or "customer"),
         amr="password",
         auth_time=int(datetime.now(timezone.utc).timestamp()),
+        identity_id=_identity_id_from_membership(customer_membership),
     )
     return response
 
@@ -2333,6 +2367,7 @@ async def aurora_exchange_login(body: AuroraExchangeRequest):
     user_row = await create_or_get_shop_user(email=aurora_email, phone=None)
     user_dict = dict(user_row)
     await _mark_email_verified_best_effort(user_dict.get("id"))
+    customer_membership = await sync_customer_auth_membership(user_dict)
 
     session_payload = await _build_user_session(user_dict)
     response_payload = session_payload.dict()
@@ -2345,6 +2380,7 @@ async def aurora_exchange_login(body: AuroraExchangeRequest):
         primary_role=str(user_dict.get("primary_role") or "customer"),
         amr="aurora_embed",
         auth_time=int(datetime.now(timezone.utc).timestamp()),
+        identity_id=_identity_id_from_membership(customer_membership),
     )
     return response
 
@@ -2424,6 +2460,7 @@ async def set_password(
                 updated_at=func.now(),
             )
         )
+    await sync_customer_auth_membership(dict(user_row), password_hash=password_hash)
 
     return {"status": "ok"}
 
@@ -2658,7 +2695,14 @@ async def refresh_token(request: Request):
             "Invalid refresh token",
         )
 
-    user_id = payload.get("sub")
+    user_id = (
+        payload.get("customer_user_id")
+        or payload.get("user_id")
+        or payload.get("sub")
+    )
+    identity_id = payload.get("identity_id")
+    if not identity_id and str(payload.get("sub") or "").startswith("identity_"):
+        identity_id = payload.get("sub")
     email = payload.get("email")
     primary_role = payload.get("role", "customer")
     amr = payload.get("amr")
@@ -2686,6 +2730,7 @@ async def refresh_token(request: Request):
         primary_role=primary_role,
         amr=amr,
         auth_time=auth_time,
+        identity_id=identity_id,
     )
     return response
 

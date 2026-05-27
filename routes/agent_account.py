@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import secrets
 import hashlib
 
+from db.auth_identity import upsert_membership
 from db.database import database
 from utils.auth import hash_password, verify_password, create_access_token, get_current_user
 
@@ -20,6 +21,44 @@ def _validate_agent_password(value: str) -> str:
     if len(value) < 8:
         raise ValueError('Password must be at least 8 characters long')
     return value
+
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+async def _sync_agent_auth_membership(
+    *,
+    email: str,
+    agent_id: str,
+    agent_name: Optional[str],
+    password_hash: Optional[str] = None,
+) -> Optional[dict]:
+    try:
+        return await upsert_membership(
+            email=_normalize_email(email),
+            membership_type="agent",
+            role="agent",
+            entity_id=str(agent_id),
+            status="active",
+            full_name=agent_name,
+            password_hash=password_hash,
+            credential_source="agent_account_password" if password_hash else None,
+            source="agent_account_sync",
+        )
+    except Exception:
+        return None
+
+
+def _identity_id_from_membership(membership: Optional[dict], email: str) -> str:
+    if membership:
+        identity_id = membership.get("identity_id")
+        if identity_id:
+            return str(identity_id)
+        identity = membership.get("identity")
+        if isinstance(identity, dict) and identity.get("identity_id"):
+            return str(identity["identity_id"])
+    return f"legacy:{_normalize_email(email)}"
 
 
 async def _resolve_agent_key_table() -> Optional[str]:
@@ -283,12 +322,13 @@ async def register_agent(data: AgentRegisterRequest):
     Simplified to work with actual database schema
     """
     agent_id: Optional[str] = None
+    email = _normalize_email(data.email)
 
     try:
         # 1. Check if user already exists
         existing_user = await database.fetch_one(
-            "SELECT id FROM users WHERE email = :email",
-            {"email": data.email}
+            "SELECT id FROM users WHERE LOWER(email) = LOWER(:email)",
+            {"email": email}
         )
         
         if existing_user:
@@ -303,7 +343,7 @@ async def register_agent(data: AgentRegisterRequest):
             VALUES (:email, :password_hash, :full_name, :role, :active)
             """,
             {
-                "email": data.email,
+                "email": email,
                 "password_hash": password_hash,
                 "full_name": data.agent_name,
                 "role": "agent",
@@ -346,7 +386,7 @@ async def register_agent(data: AgentRegisterRequest):
             {
                 "agent_id": agent_id,
                 "agent_name": data.agent_name,
-                "owner_email": data.email,
+                "owner_email": email,
                 "description": data.description or "",
                 "api_key": api_key,
                 "api_key_hash": api_key_hash,
@@ -359,15 +399,21 @@ async def register_agent(data: AgentRegisterRequest):
             api_key=api_key,
             api_key_hash=api_key_hash,
         )
+        await _sync_agent_auth_membership(
+            email=email,
+            agent_id=agent_id,
+            agent_name=data.agent_name,
+            password_hash=password_hash,
+        )
 
-        print(f"✅ Agent created: {agent_id} for {data.email} (key sync: {key_sync_source})")
+        print(f"✅ Agent created: {agent_id} for {email} (key sync: {key_sync_source})")
         
         return {
             "success": True,
             "message": "Agent account created successfully",
             "agent_id": agent_id,
             "api_key": api_key,
-            "email": data.email,
+            "email": email,
             "important": "Save your API key now! It won't be shown again."
         }
         
@@ -388,7 +434,7 @@ async def register_agent(data: AgentRegisterRequest):
         try:
             await database.execute(
                 "DELETE FROM users WHERE email = :email AND role = 'agent'",
-                {"email": data.email}
+                {"email": email}
             )
             print(f"🧹 Cleaned up user account after failure")
         except:
@@ -407,10 +453,11 @@ async def register_agent(data: AgentRegisterRequest):
 async def login_agent(data: AgentLoginRequest):
     """Agent login"""
     try:
+        email = _normalize_email(data.email)
         # 1. Find user
         user = await database.fetch_one(
-            "SELECT id, email, password_hash, full_name, role, active FROM users WHERE email = :email",
-            {"email": data.email}
+            "SELECT id, email, password_hash, full_name, role, active FROM users WHERE LOWER(email) = LOWER(:email)",
+            {"email": email}
         )
         
         if not user:
@@ -431,9 +478,9 @@ async def login_agent(data: AgentLoginRequest):
             """
             SELECT agent_id, agent_name, owner_email, api_key, agent_type
             FROM agents
-            WHERE owner_email = :email
+            WHERE LOWER(owner_email) = LOWER(:email)
             """,
-            {"email": data.email}
+            {"email": email}
         )
         
         if not agent:
@@ -455,19 +502,31 @@ async def login_agent(data: AgentLoginRequest):
         # 4. Update last login
         await database.execute(
             "UPDATE users SET last_login = :last_login WHERE email = :email",
-            {"last_login": datetime.utcnow(), "email": data.email}
+            {"last_login": datetime.utcnow(), "email": user["email"]}
         )
+        agent_membership = await _sync_agent_auth_membership(
+            email=user["email"],
+            agent_id=agent_dict["agent_id"],
+            agent_name=agent_dict.get("agent_name") or user["full_name"],
+            password_hash=user["password_hash"],
+        )
+        identity_id = _identity_id_from_membership(agent_membership, user["email"])
         
         # 5. Create JWT token
         # Extend agent portal session to reduce unexpected logouts.
         # Other roles keep the default (24h) expiry from utils.auth.
         token = create_access_token(
             {
-                "sub": user["email"],
+                "sub": identity_id,
+                "identity_id": identity_id,
                 "email": user["email"],  # Required by get_current_user
                 "user_id": str(user["id"]),
                 "role": "agent",
                 "agent_id": agent["agent_id"],
+                "membership_type": "agent",
+                "membership_id": agent_membership.get("membership_id") if agent_membership else None,
+                "aud": "agent-portal",
+                "scope": "agent",
             },
             # Agent portal sessions: ~7 days
             expires_delta=timedelta(days=7),

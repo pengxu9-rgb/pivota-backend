@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 # Database
 from db.database import database, metadata, engine
+import db.auth_identity  # noqa: F401  (register canonical auth identity tables in metadata)
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
 import db.canonical_commerce  # noqa: F401  (register canonical commerce tables in metadata)
