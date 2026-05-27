@@ -60,7 +60,14 @@ async def create_merchant_onboarding(merchant_data: Dict[str, Any]) -> str:
     merchant_id = f"merch_{secrets.token_hex(8)}"
     merchant_data["merchant_id"] = merchant_id
     merchant_data["status"] = "pending_verification"
-    
+    # `apm_enabled` is NOT NULL in the DB. The `databases` library does not
+    # honor SQLAlchemy's Python-side `default=` on Column, only `server_default`.
+    # If a caller's payload doesn't include `apm_enabled`, the SQLAlchemy
+    # compile path still binds the column to NULL, violating the NOT NULL
+    # constraint and 500'ing every public signup (broken since PR #494
+    # added the column on 2026-05-13). Force a default here.
+    merchant_data.setdefault("apm_enabled", False)
+
     query = merchant_onboarding.insert().values(**merchant_data)
     await database.execute(query)
     return merchant_id
