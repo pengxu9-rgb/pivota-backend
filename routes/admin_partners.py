@@ -204,6 +204,27 @@ async def upsert_partner_stripe_connect(
     if not existing:
         return JSONResponse(status_code=404, content={"error": "partner_not_found"})
 
+    if normalized is not None:
+        conflict = await database.fetch_one(
+            """
+            SELECT id, legal_name
+            FROM channel_partners
+            WHERE stripe_connect_account_id = :acct
+              AND id <> :id
+            LIMIT 1
+            """,
+            {"acct": normalized, "id": channel_partner_id},
+        )
+        if conflict:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "stripe_account_id_already_used",
+                    "conflicting_partner_id": int(_row_get(conflict, "id")),
+                    "conflicting_partner_name": _row_get(conflict, "legal_name"),
+                },
+            )
+
     await database.execute(
         """
         UPDATE channel_partners
