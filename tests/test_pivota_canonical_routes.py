@@ -124,6 +124,7 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
         "content_quality_score": 91.0,
         "quality_scored_at": datetime(2026, 5, 7, tzinfo=timezone.utc),
         "updated_at": datetime(2026, 5, 7, tzinfo=timezone.utc),
+        "content_changed_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
     }
     base.update(overrides)
     return base
@@ -224,6 +225,16 @@ def test_list_canonical_pdps_returns_only_serving_eligible_rows_with_sig(env):
         assert item["content_key"].startswith("ck_")
         assert item["blocker_code"] is None
         assert item["quality_scored_at"] == "2026-05-07T00:00:00+00:00"
+        assert item["last_modified"] == "2026-05-01T00:00:00+00:00"
+
+
+def test_list_canonical_pdps_last_modified_uses_content_changed_at(env):
+    client = env
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+
+    by_sig = {item["sig_id"]: item for item in res.json()["items"]}
+    assert by_sig["sig_abc"]["last_modified"] == "2026-05-01T00:00:00+00:00"
 
 
 def test_list_canonical_pdps_pagination_bounds(env):
@@ -253,7 +264,7 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
     sql = "\n".join(pcr.database.compiled_sql)
     assert "JOIN index_pipeline_state" in sql
     assert "serving_eligible IS true" in sql
-    assert "ORDER BY catalog_products.updated_at DESC" in sql
+    assert "ORDER BY catalog_products.content_changed_at DESC" in sql
     assert "catalog_products.pivota_signature_id ASC" in sql
     assert "catalog_products.content_key ASC" in sql
     assert "catalog_products.product_key ASC" in sql

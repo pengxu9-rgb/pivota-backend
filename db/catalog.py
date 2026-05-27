@@ -137,6 +137,7 @@ catalog_products = Table(
     Column("size_guide", JSONB_TYPE, nullable=True),
     Column("size_guide_source", String(32), nullable=True),
     Column("size_guide_confidence", Float, nullable=True),
+    Column("content_changed_at", DateTime, server_default=func.now(), nullable=False),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index(
