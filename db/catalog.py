@@ -25,6 +25,7 @@ catalog_merchants = Table(
     Column("merchant_name", String(255), nullable=True),
     Column("primary_platform", String(64), nullable=True),
     Column("status", String(32), nullable=False, server_default="active"),
+    Column("indexable", Boolean, nullable=False, server_default="true"),
     Column("source_system", String(64), nullable=True),
     Column("source_ref", String(255), nullable=True),
     Column("metadata_json", JSONB_TYPE, nullable=True),

@@ -45,6 +45,8 @@ class FakeDb:
                 r.get("pivota_signature_id") == sig
                 and r.get("content_key")
                 and r.get("serving_eligible") is True
+                and r.get("merchant_indexable", True) is True
+                and r.get("merchant_status", "active") == "active"
             ):
                 return r
         return None
@@ -68,6 +70,8 @@ class FakeDb:
             if r.get("pivota_signature_id")
             and r.get("content_key")
             and r.get("serving_eligible") is True
+            and r.get("merchant_indexable", True) is True
+            and r.get("merchant_status", "active") == "active"
         ]
         return with_sig[off : off + lim]
 
@@ -85,6 +89,8 @@ class FakeDb:
                 if r.get("pivota_signature_id")
                 and r.get("content_key")
                 and r.get("serving_eligible") is True
+                and r.get("merchant_indexable", True) is True
+                and r.get("merchant_status", "active") == "active"
             ]
         )
 
@@ -107,6 +113,8 @@ def _row(sig_suffix: str, **overrides) -> Dict[str, Any]:
     base = {
         "product_key": f"prod::merch_a::shopify::{sig_suffix}",
         "merchant_id": "merch_a",
+        "merchant_indexable": True,
+        "merchant_status": "active",
         "platform": "shopify",
         "source_product_id": sig_suffix,
         "title": f"Product {sig_suffix}",
@@ -145,6 +153,13 @@ def env(monkeypatch: pytest.MonkeyPatch):
             "pivota_signature_id": None,
             "pivota_canonical_url": None,
         },
+        # Otherwise-eligible row whose merchant is gated to non-indexable
+        # (catalog_merchants.indexable = FALSE). Must be excluded from
+        # both the list endpoint and the single-sig resolver.
+        _row("hidden", merchant_id="merch_test", merchant_indexable=False),
+        # Otherwise-eligible row whose merchant is inactive
+        # (catalog_merchants.status != 'active'). Same exclusion contract.
+        _row("inactive", merchant_id="merch_off", merchant_status="inactive"),
     ]
     monkeypatch.setattr(pcr, "database", FakeDb(rows))
 
@@ -202,6 +217,13 @@ def test_get_canonical_pdp_404_for_blocked_sig(env):
     assert res.json()["detail"]["sig_id"] == "sig_xyz"
 
 
+def test_get_canonical_pdp_returns_404_for_non_indexable_merchant(env):
+    client = env
+    res = client.get("/api/canonical/products/sig_hidden")
+    assert res.status_code == 404
+    assert res.json()["detail"]["sig_id"] == "sig_hidden"
+
+
 # ---------------------------------------------------------------------------
 # /api/canonical/products (list)
 # ---------------------------------------------------------------------------
@@ -226,6 +248,28 @@ def test_list_canonical_pdps_returns_only_serving_eligible_rows_with_sig(env):
         assert item["blocker_code"] is None
         assert item["quality_scored_at"] == "2026-05-07T00:00:00+00:00"
         assert item["last_modified"] == "2026-05-01T00:00:00+00:00"
+
+
+def test_list_canonical_pdps_excludes_non_indexable_merchant(env):
+    client = env
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+
+    body = res.json()
+    sigs = [item["sig_id"] for item in body["items"]]
+    assert "sig_hidden" not in sigs
+    assert body["total"] == 3
+
+
+def test_list_canonical_pdps_excludes_inactive_merchant(env):
+    client = env
+    res = client.get("/api/canonical/products")
+    assert res.status_code == 200
+
+    body = res.json()
+    sigs = [item["sig_id"] for item in body["items"]]
+    assert "sig_inactive" not in sigs
+    assert body["total"] == 3
 
 
 def test_list_canonical_pdps_last_modified_uses_content_changed_at(env):
@@ -263,7 +307,10 @@ def test_list_canonical_pdps_uses_index_pipeline_state_join(env):
 
     sql = "\n".join(pcr.database.compiled_sql)
     assert "JOIN index_pipeline_state" in sql
+    assert "JOIN catalog_merchants" in sql
     assert "serving_eligible IS true" in sql
+    assert "catalog_merchants.indexable IS true" in sql
+    assert "catalog_merchants.status = 'active'" in sql
     assert "ORDER BY catalog_products.content_changed_at DESC" in sql
     assert "catalog_products.pivota_signature_id ASC" in sql
     assert "catalog_products.content_key ASC" in sql

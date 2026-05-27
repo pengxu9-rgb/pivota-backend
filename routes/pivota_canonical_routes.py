@@ -39,7 +39,7 @@ from typing import Any, Awaitable, Dict, TypeVar
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import Boolean, DateTime, Float, String, Text, and_, column, func, select, table
 
-from db.catalog import catalog_products
+from db.catalog import catalog_merchants, catalog_products
 from db.database import database
 from utils.logger import logger
 
@@ -190,6 +190,9 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
             catalog_products.join(
                 index_pipeline_state,
                 catalog_products.c.content_key == index_pipeline_state.c.content_key,
+            ).join(
+                catalog_merchants,
+                catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
             )
         )
         .where(
@@ -197,6 +200,8 @@ async def get_canonical_pdp_by_signature(sig_id: str) -> Dict[str, Any]:
                 catalog_products.c.pivota_signature_id == sig,
                 catalog_products.c.content_key.isnot(None),
                 index_pipeline_state.c.serving_eligible.is_(True),
+                catalog_merchants.c.indexable.is_(True),
+                catalog_merchants.c.status == "active",
             )
         )
         .limit(1)
@@ -238,10 +243,15 @@ async def list_canonical_pdp_signatures(
         catalog_products.c.pivota_signature_id.like("sig_%"),
         catalog_products.c.content_key.isnot(None),
         index_pipeline_state.c.serving_eligible.is_(True),
+        catalog_merchants.c.indexable.is_(True),
+        catalog_merchants.c.status == "active",
     )
     serving_join = catalog_products.join(
         index_pipeline_state,
         catalog_products.c.content_key == index_pipeline_state.c.content_key,
+    ).join(
+        catalog_merchants,
+        catalog_products.c.merchant_id == catalog_merchants.c.merchant_id,
     )
 
     total_q = (
