@@ -3,7 +3,7 @@
 Pure function: (inputs) -> catalog_row_trust shape.
 
 This is the Python parity port of PIVOTA-Agent/src/services/catalogTrustPolicy.js
-(POLICY_VERSION ``c1.v0.2``). Producer dual-write call sites in pivota-backend
+(POLICY_VERSION ``c1.v0.3``). Producer dual-write call sites in pivota-backend
 (catalog_sync_service, source_quarantine helpers) invoke ``derive_trust`` to
 populate ``catalog_row_trust`` so the reader contract stays live between
 periodic backfills.
@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
-POLICY_VERSION = "c1.v0.2"
+POLICY_VERSION = "c1.v0.3"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
 #
@@ -40,10 +40,19 @@ POLICY_VERSION = "c1.v0.2"
 #   IDENTITY_REVIEW_REQUIRED_LIVE_READ — pdp_identity_listing.identity_status=
 #     'review_required'. Audit counted ~60 of these among external mirror rows.
 #   IDENTITY_CONFIDENCE_NULL — IPS serving_eligible=true but no identity row
-#     or identity_confidence IS NULL. Audit counted ~504 external mirror rows.
+#     or identity_confidence IS NULL. Only emitted for non-first-party sources
+#     (i.e., external_seed). For first-party merchants the corresponding
+#     advisory is IDENTITY_NOT_APPLICABLE_FIRST_PARTY (see below).
 #   IDENTITY_LIVE_READ_DISABLED — identity_status='approved' but
-#     live_read_enabled=false.
+#     live_read_enabled=false. First-party sources are exempt.
 #   FRESHNESS_UNVERIFIED — never observed a verification timestamp.
+#
+# Advisory (does not flip decision):
+#   IDENTITY_NOT_APPLICABLE_FIRST_PARTY — c1.v0.3+. Marks rows where the
+#     merchant IS the source of truth, so the identity-pipeline gates (which
+#     exist to verify scraped third-party content) don't apply. Emitted for
+#     ``product.merchant_id != 'external_seed'`` when identity is missing or
+#     low-info.
 #
 # Blocked (no public surface):
 #   SOURCE_QUARANTINED               — catalog_source_quarantine active match.
@@ -62,6 +71,7 @@ class _ReasonCodes:
     IDENTITY_REVIEW_REQUIRED_LIVE_READ = "IDENTITY_REVIEW_REQUIRED_LIVE_READ"
     IDENTITY_CONFIDENCE_NULL = "IDENTITY_CONFIDENCE_NULL"
     IDENTITY_LIVE_READ_DISABLED = "IDENTITY_LIVE_READ_DISABLED"
+    IDENTITY_NOT_APPLICABLE_FIRST_PARTY = "IDENTITY_NOT_APPLICABLE_FIRST_PARTY"
     FRESHNESS_UNVERIFIED = "FRESHNESS_UNVERIFIED"
 
     SOURCE_QUARANTINED = "SOURCE_QUARANTINED"
@@ -512,20 +522,40 @@ def _derive_serving_decision(
 
     # Shadow conditions — would have served under legacy gates, but the
     # contract gates them out of public reads.
+    #
+    # c1.v0.3: first-party sources (any merchant_id other than 'external_seed')
+    # are exempt from the identity-pipeline shadow gates. For internal Shopify/
+    # Wix/etc. merchants, the merchant IS the source of truth — the identity
+    # pipeline exists to verify scraped third-party content. review_required
+    # and IDENTITY_CONFLICT still apply (those are explicit moderation/data-
+    # quality signals, not identity-coverage gaps).
+    is_first_party = product is not None and _get(product, "merchant_id") != "external_seed"
+
     if identity_decision["status"] == "review_required":
         reasons.append(REASON_CODES.IDENTITY_REVIEW_REQUIRED_LIVE_READ)
-    if identity_decision["status"] == "unknown" and identity_decision["confidence"] is None:
-        reasons.append(REASON_CODES.IDENTITY_CONFIDENCE_NULL)
-    if identity_decision["status"] == "approved" and identity_decision["confidence"] is None:
-        reasons.append(REASON_CODES.IDENTITY_CONFIDENCE_NULL)
-    if identity_decision["status"] == "approved" and identity_decision["live_read"] is False:
-        reasons.append(REASON_CODES.IDENTITY_LIVE_READ_DISABLED)
 
-    if (
-        identity_decision["status"] in ("review_required", "unknown")
+    missing_confidence = (
+        identity_decision["status"] in ("unknown", "approved")
+        and identity_decision["confidence"] is None
+    )
+    if missing_confidence:
+        if is_first_party:
+            reasons.append(REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY)
+        else:
+            reasons.append(REASON_CODES.IDENTITY_CONFIDENCE_NULL)
+
+    if identity_decision["status"] == "approved" and identity_decision["live_read"] is False:
+        if not is_first_party:
+            reasons.append(REASON_CODES.IDENTITY_LIVE_READ_DISABLED)
+
+    shadow = (
+        identity_decision["status"] == "review_required"
         or REASON_CODES.IDENTITY_CONFIDENCE_NULL in reasons
         or REASON_CODES.IDENTITY_LIVE_READ_DISABLED in reasons
-    ):
+        or (identity_decision["status"] == "unknown" and not is_first_party)
+    )
+
+    if shadow:
         return {"decision": "shadow"}
 
     reasons.append(REASON_CODES.PUBLIC_PASSTHROUGH)
