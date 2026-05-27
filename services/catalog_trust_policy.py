@@ -3,7 +3,7 @@
 Pure function: (inputs) -> catalog_row_trust shape.
 
 This is the Python parity port of PIVOTA-Agent/src/services/catalogTrustPolicy.js
-(POLICY_VERSION ``c1.v0.3``). Producer dual-write call sites in pivota-backend
+(POLICY_VERSION ``c1.v0.4``). Producer dual-write call sites in pivota-backend
 (catalog_sync_service, source_quarantine helpers) invoke ``derive_trust`` to
 populate ``catalog_row_trust`` so the reader contract stays live between
 periodic backfills.
@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
-POLICY_VERSION = "c1.v0.3"
+POLICY_VERSION = "c1.v0.4"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
 #
@@ -511,7 +511,20 @@ def _derive_serving_decision(
     # Index pipeline gate. All public readers honor this today; the contract
     # makes it explicit. sync_status='live' is the equivalent for catalog rows
     # before they reach IPS — see migration 084.
+    #
+    # c1.v0.4: for non-first-party (external_seed) catalog rows, a missing IPS
+    # row is treated as INDEX_NOT_SERVING_ELIGIBLE. Pre-c1.v0.4 the policy let
+    # ips=None pass on the assumption "no IPS opinion = no reason to block",
+    # but Phase 3c parity found 80 external_seed catalog products with public
+    # trust + no IPS row — i.e., shipping content the index pipeline hasn't
+    # quality-gated yet. First-party rows (MOYU/GR/PawStyle/etc.) keep the
+    # legacy behavior since first-party merchants are the source of truth and
+    # IPS coverage there is sparse by design.
     if product is not None:
+        is_first_party_catalog = _get(product, "merchant_id") != "external_seed"
+        if not is_first_party_catalog and ips is None:
+            reasons.append(REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE)
+            return {"decision": "blocked"}
         if ips is not None and _get(ips, "serving_eligible") is not True:
             reasons.append(REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE)
             return {"decision": "blocked"}

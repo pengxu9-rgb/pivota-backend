@@ -303,6 +303,47 @@ def test_external_seed_approved_with_review_required_flag_set_degrades_to_shadow
     assert trust["identity_status"] == "review_required"
 
 
+# ---- IPS-NULL EXTERNAL_SEED BLOCK (c1.v0.4) ---------------------------------
+#
+# Phase 3c parity surfaced 80 external_seed catalog rows with public trust but
+# no index_pipeline_state row. c1.v0.4 closes this: external_seed catalogs
+# require IPS to opine (existence + serving_eligible=True). First-party rows
+# keep the legacy "ips=None means OK" behavior because IPS doesn't process
+# them by design.
+
+
+def test_external_seed_no_ips_row_is_blocked_with_index_not_serving_eligible():
+    trust = call_external_seed(ips=None)
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+
+
+def test_external_seed_ips_present_and_eligible_remains_public():
+    trust = call_external_seed()
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.PUBLIC_PASSTHROUGH in trust["serving_reason_codes"]
+
+
+def test_external_seed_ips_present_but_not_eligible_still_blocks():
+    trust = call_external_seed(ips=eligible_ips(serving_eligible=False))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+
+
+def test_first_party_no_ips_row_remains_public_under_c1_v0_4():
+    # MOYU/GR/PawStyle case — IPS coverage is sparse for first-party merchants
+    # by design. c1.v0.4 only tightens the IPS gate for external_seed.
+    trust = call(ips=None)
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE not in trust["serving_reason_codes"]
+
+
+def test_first_party_ips_not_eligible_still_blocks_unchanged():
+    trust = call(ips=eligible_ips(serving_eligible=False))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in trust["serving_reason_codes"]
+
+
 # ---- FIRST-PARTY CARVE-OUT (c1.v0.3) ----------------------------------------
 #
 # Internal merchants (anything that's not external_seed) are the source of
