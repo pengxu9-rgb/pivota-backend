@@ -49,6 +49,15 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
         },
     ),
     RequiredTableColumns(
+        table="catalog_merchants",
+        columns={
+            # Merchant-wide public discovery gate — see migration 139.
+            # Public crawler-facing surfaces require this TRUE plus the
+            # per-content-key index_pipeline_state.serving_eligible gate.
+            "indexable",
+        },
+    ),
+    RequiredTableColumns(
         table="catalog_products",
         columns={
             # Pivota canonical PDP — see migration 071. The canonical
@@ -443,6 +452,14 @@ async def ensure_required_schema_light() -> None:
             # these in production. Mirrors what's already in db.catalog
             # (the SQLAlchemy model) — schema_guard is the runtime
             # safety net.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_merchants
+                      ADD COLUMN IF NOT EXISTS indexable BOOLEAN NOT NULL DEFAULT TRUE;
+                    """
+                )
+            )
             await database.execute(
                 text(
                     """
