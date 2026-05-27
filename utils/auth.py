@@ -88,7 +88,12 @@ def decode_token(token: str) -> Dict[str, Any]:
         HTTPException: If token is invalid or expired
     """
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_aud": False},
+        )
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(
@@ -277,10 +282,24 @@ async def get_current_employee(current_user: Dict[str, Any] = Depends(get_curren
     Raises:
         HTTPException: If user is not an employee
     """
+    membership_type = str(current_user.get("membership_type") or "").strip().lower()
+    if membership_type and membership_type != "employee":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Employee access required"
+        )
+
     if current_user.get("role") not in ["super_admin", "admin", "employee", "outsourced"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Employee access required"
+        )
+    if membership_type == "employee" and not (
+        current_user.get("employee_id") or current_user.get("employeeId")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Employee identity required"
         )
     return current_user
 
@@ -489,15 +508,18 @@ def require_employee_permissions(required_permissions: Iterable[str]):
     ) -> Dict[str, Any]:
         # NOTE: FastAPI injects Request only when the annotation is exactly Request.
         role = (current_user.get("role") or "").strip().lower()
+        membership_type = str(current_user.get("membership_type") or "").strip().lower()
+        if membership_type and membership_type != "employee":
+            raise HTTPException(status_code=403, detail="EMPLOYEE_REQUIRED")
         if role not in {r.lower() for r in EMPLOYEE_ROLES}:
             raise HTTPException(status_code=403, detail="EMPLOYEE_REQUIRED")
 
         employee_id = (
             current_user.get("employee_id")
             or current_user.get("employeeId")
-            or current_user.get("user_id")
-            or current_user.get("sub")
         )
+        if not employee_id and not membership_type:
+            employee_id = current_user.get("user_id") or current_user.get("sub")
         if not employee_id:
             raise HTTPException(status_code=403, detail="EMPLOYEE_ID_REQUIRED")
 

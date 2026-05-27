@@ -24,6 +24,7 @@ from db.merchant_onboarding import (
     merchant_onboarding  # Table object for direct queries
 )
 from db.payment_router import register_merchant_psp_route
+from db.auth_identity import upsert_membership
 from db.database import database
 from readiness.summary import build_readiness_summary
 from utils.auth import ADMIN_ROLES, get_current_user, require_admin
@@ -172,6 +173,30 @@ async def get_user_auth_binding(contact_email: str) -> Optional[Dict[str, Any]]:
     return dict(record) if record else None
 
 
+async def sync_merchant_auth_membership(
+    *,
+    contact_email: str,
+    business_name: str,
+    merchant_id: str,
+    password_hash: Optional[str] = None,
+    credential_source: Optional[str] = None,
+) -> None:
+    try:
+        await upsert_membership(
+            email=contact_email,
+            membership_type="merchant",
+            role="merchant",
+            entity_id=merchant_id,
+            status="active",
+            full_name=business_name,
+            password_hash=password_hash,
+            credential_source=credential_source,
+            source="merchant_onboarding_sync",
+        )
+    except Exception as exc:
+        print(f"⚠️ Merchant canonical auth membership sync skipped: {type(exc).__name__}: {exc}")
+
+
 async def sync_merchant_auth_user(
     *,
     contact_email: str,
@@ -205,6 +230,13 @@ async def sync_merchant_auth_user(
                 "user_id": existing_user["id"],
             },
         )
+        await sync_merchant_auth_membership(
+            contact_email=contact_email,
+            business_name=business_name,
+            merchant_id=merchant_id,
+            password_hash=password_hash,
+            credential_source="merchant_sync" if password_hash else None,
+        )
         return
 
     if not password:
@@ -222,6 +254,13 @@ async def sync_merchant_auth_user(
             "active": True,
             "merchant_id": merchant_id,
         },
+    )
+    await sync_merchant_auth_membership(
+        contact_email=contact_email,
+        business_name=business_name,
+        merchant_id=merchant_id,
+        password_hash=password_hash,
+        credential_source="merchant_sync",
     )
 
 async def resolve_public_merchant_identity_merge(

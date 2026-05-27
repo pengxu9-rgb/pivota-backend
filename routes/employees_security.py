@@ -7,6 +7,7 @@ from typing import Optional, List
 from datetime import datetime, timedelta
 from textwrap import dedent
 import logging
+from db.auth_identity import upsert_membership
 from utils.auth import get_current_user, hash_password as hash_user_password
 from db.database import database
 from config.settings import settings
@@ -173,6 +174,7 @@ async def create_employee(
         raise HTTPException(status_code=403, detail="Only admins can create employees")
     
     try:
+        normalized_email = (request.email or "").strip().lower()
         # Validate role
         if request.role not in MANAGED_EMPLOYEE_ROLES:
             raise HTTPException(
@@ -181,8 +183,8 @@ async def create_employee(
             )
         
         # Check if employee exists
-        check_query = "SELECT employee_id FROM employees WHERE email = :email"
-        existing = await database.fetch_one(check_query, {"email": request.email})
+        check_query = "SELECT employee_id FROM employees WHERE LOWER(email) = LOWER(:email)"
+        existing = await database.fetch_one(check_query, {"email": normalized_email})
         
         if existing:
             raise HTTPException(status_code=400, detail="Employee with this email already exists")
@@ -205,7 +207,7 @@ async def create_employee(
         await database.execute(insert_query, {
             "employee_id": employee_id,
             "name": request.name,
-            "email": request.email,
+            "email": normalized_email,
             "password": hashed_password,
             "role": request.role,
             "department": request.department,
@@ -217,18 +219,19 @@ async def create_employee(
         try:
             users_insert = """
                 INSERT INTO users (
-                    email, password_hash, full_name, role, active
+                    email, password_hash, full_name, role, active, merchant_id
                 ) VALUES (
-                    :email, :password_hash, :full_name, :role, :active
+                    :email, :password_hash, :full_name, :role, :active, NULL
                 )
                 ON CONFLICT (email) DO UPDATE SET
                     password_hash = EXCLUDED.password_hash,
                     full_name = EXCLUDED.full_name,
                     role = EXCLUDED.role,
-                    active = EXCLUDED.active
+                    active = EXCLUDED.active,
+                    merchant_id = NULL
             """
             await database.execute(users_insert, {
-                "email": request.email,
+                "email": normalized_email,
                 "password_hash": user_password_hash,
                 "full_name": request.name,
                 "role": request.role,
@@ -237,8 +240,24 @@ async def create_employee(
         except Exception as exc:
             logger.error("[Employees] Failed to sync users table: %s", exc)
 
+        try:
+            await upsert_membership(
+                email=normalized_email,
+                membership_type="employee",
+                role=request.role,
+                entity_id=employee_id,
+                status="active",
+                permissions=[],
+                full_name=request.name,
+                password_hash=user_password_hash,
+                credential_source="employee_create",
+                source="employees_create",
+            )
+        except Exception as exc:
+            logger.error("[Employees] Failed to sync auth membership: %s", exc)
+
         email_status = _send_employee_welcome_email(
-            request.email,
+            normalized_email,
             request.name,
             temp_password,
         )
@@ -320,10 +339,16 @@ async def update_employee(
         # Best-effort: keep canonical users table in sync for /api/auth/login.
         try:
             employee_row = await database.fetch_one(
-                "SELECT email FROM employees WHERE employee_id = :employee_id",
+                "SELECT employee_id, name, email, role, status FROM employees WHERE employee_id = :employee_id",
                 {"employee_id": employee_id},
             )
+            if not employee_row:
+                employee_row = await database.fetch_one(
+                    "SELECT email FROM employees WHERE employee_id = :employee_id",
+                    {"employee_id": employee_id},
+                )
             if employee_row:
+                employee_row = dict(employee_row)
                 employee_email = employee_row["email"]
                 user_updates = []
                 user_params = {"email": employee_email}
@@ -343,6 +368,19 @@ async def update_employee(
                         f"UPDATE users SET {', '.join(user_updates)} WHERE email = :email",
                         user_params,
                     )
+                if all(employee_row.get(key) for key in ("employee_id", "role")):
+                    await upsert_membership(
+                        email=employee_email,
+                        membership_type="employee",
+                        role=employee_row["role"],
+                        entity_id=employee_row["employee_id"],
+                        status=employee_row.get("status") or "active",
+                        permissions=[],
+                        full_name=employee_row.get("name"),
+                        source="employees_update",
+                    )
+                else:
+                    logger.info("[Employees] Skipping canonical membership update; employee row missing role/id")
         except Exception as exc:
             logger.error("[Employees] Failed to sync users table on update: %s", exc)
 
@@ -377,14 +415,33 @@ async def delete_employee(
         # Best-effort: deactivate corresponding users account for /api/auth/login.
         try:
             employee_row = await database.fetch_one(
-                "SELECT email FROM employees WHERE employee_id = :employee_id",
+                "SELECT employee_id, name, email, role, status FROM employees WHERE employee_id = :employee_id",
                 {"employee_id": employee_id},
             )
+            if not employee_row:
+                employee_row = await database.fetch_one(
+                    "SELECT email FROM employees WHERE employee_id = :employee_id",
+                    {"employee_id": employee_id},
+                )
             if employee_row:
+                employee_row = dict(employee_row)
                 await database.execute(
                     "UPDATE users SET active = :active WHERE email = :email",
                     {"active": False, "email": employee_row["email"]},
                 )
+                if all(employee_row.get(key) for key in ("employee_id", "role")):
+                    await upsert_membership(
+                        email=employee_row["email"],
+                        membership_type="employee",
+                        role=employee_row["role"],
+                        entity_id=employee_row["employee_id"],
+                        status="inactive",
+                        permissions=[],
+                        full_name=employee_row.get("name"),
+                        source="employees_delete",
+                    )
+                else:
+                    logger.info("[Employees] Skipping canonical membership deactivate; employee row missing role/id")
         except Exception as exc:
             logger.error("[Employees] Failed to sync users table on delete: %s", exc)
 
@@ -549,4 +606,3 @@ async def update_security_settings(
             "max_login_attempts": max_login_attempts
         }
     }
-

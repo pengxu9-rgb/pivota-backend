@@ -6,6 +6,7 @@ powers employee / merchant / agent logins, to avoid coupling and migration
 complexity. They are used by the Accounts & Orders API (auth + orders).
 """
 
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -23,7 +24,11 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 
+from db.auth_identity import upsert_membership
 from db.database import metadata, database
+
+
+logger = logging.getLogger("accounts")
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +129,39 @@ def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
+async def sync_customer_auth_membership(
+    user_row: dict,
+    *,
+    password_hash: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Link a shop user to the canonical identity graph.
+
+    This is best-effort during the transition so accounts auth does not go down
+    if the additive auth_identity migration has not been applied yet.
+    """
+    try:
+        user = dict(user_row or {})
+        user_id = str(user.get("id") or "").strip()
+        email = normalize_email(str(user.get("email") or user.get("email_normalized") or ""))
+        if not user_id or not email:
+            return None
+        return await upsert_membership(
+            email=email,
+            membership_type="customer",
+            role=str(user.get("primary_role") or "customer"),
+            entity_id=user_id,
+            status="inactive" if bool(user.get("is_guest")) else "active",
+            full_name=None,
+            password_hash=password_hash,
+            credential_source="accounts_password" if password_hash else None,
+            source="accounts_shop_user_sync",
+        )
+    except Exception as exc:
+        logger.warning("[Accounts] Canonical customer membership sync skipped: %s", exc)
+        return None
+
+
 async def create_or_get_shop_user(email: str, phone: Optional[str] = None) -> dict:
     """
     Idempotently create a shop user for the given email.
@@ -135,7 +173,9 @@ async def create_or_get_shop_user(email: str, phone: Optional[str] = None) -> di
         shop_users.select().where(shop_users.c.email_normalized == norm)
     )
     if existing:
-        return dict(existing)
+        existing_dict = dict(existing)
+        await sync_customer_auth_membership(existing_dict)
+        return existing_dict
 
     import secrets
 
@@ -158,7 +198,7 @@ async def create_or_get_shop_user(email: str, phone: Optional[str] = None) -> di
     created = await database.fetch_one(
         shop_users.select().where(shop_users.c.id == user_id)
     )
-    return dict(created) if created else {
+    user_dict = dict(created) if created else {
         "id": user_id,
         "email": email,
         "email_normalized": norm,
@@ -166,6 +206,8 @@ async def create_or_get_shop_user(email: str, phone: Optional[str] = None) -> di
         "primary_role": "customer",
         "is_guest": False,
     }
+    await sync_customer_auth_membership(user_dict)
+    return user_dict
 
 
 async def record_public_lookup(ip: str, email_norm: str, order_id: str) -> None:
