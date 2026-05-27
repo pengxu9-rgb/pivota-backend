@@ -96,6 +96,24 @@ def active_external_seed(**overrides):
     return base
 
 
+def external_seed_product(**overrides):
+    # Catalog row that mirrors an external_seed source (third-party scrape).
+    # Identity gates apply to these because the merchant is NOT the source of
+    # truth — see c1.v0.3 first-party carve-out for the contrast.
+    base = active_merchant_product(
+        product_key="pk_seed_1",
+        content_key="ck_seed_1",
+        merchant_id="external_seed",
+        platform="external_seed",
+        source_system="external_product_seeds",
+        source_ref="ext_4242",
+        source_product_id="ext_4242",
+        source_domain="theordinary.com",
+    )
+    base.update(overrides)
+    return base
+
+
 def call(**overrides):
     inputs = {
         "subject_type": "product",
@@ -104,6 +122,20 @@ def call(**overrides):
         "identity": approved_identity(),
         "ips": eligible_ips(),
         "merchant_store": active_merchant_store(),
+        "now": NOW,
+    }
+    inputs.update(overrides)
+    return derive_trust(inputs)
+
+
+def call_external_seed(**overrides):
+    inputs = {
+        "subject_type": "product",
+        "subject_key": "pk_seed_1",
+        "product": external_seed_product(),
+        "identity": approved_identity(source_listing_ref="external_seed:ext_4242"),
+        "ips": eligible_ips(),
+        "external_seed": active_external_seed(),
         "now": NOW,
     }
     inputs.update(overrides)
@@ -221,21 +253,22 @@ def test_suppressed_offer_blocks():
     assert REASON_CODES.OFFER_SUPPRESSED in trust["serving_reason_codes"]
 
 
-# ---- SHADOW (the 580-violation gate) ----------------------------------------
+# ---- SHADOW (the 580-violation gate, external_seed cohort) ------------------
 
 
-def test_no_identity_row_shadows_with_identity_confidence_null():
+def test_external_seed_no_identity_row_shadows_with_identity_confidence_null():
     # 504 of audit's 580 — IPS-eligible external mirror rows without identity row.
-    trust = call(identity=None)
+    trust = call_external_seed(identity=None)
     assert trust["serving_decision"] == "shadow"
     assert trust["identity_status"] == "unknown"
     assert REASON_CODES.IDENTITY_CONFIDENCE_NULL in trust["serving_reason_codes"]
 
 
-def test_review_required_with_live_read_shadows():
+def test_external_seed_review_required_with_live_read_shadows():
     # The 60 cases.
-    trust = call(
+    trust = call_external_seed(
         identity=approved_identity(
+            source_listing_ref="external_seed:ext_4242",
             identity_status="review_required",
             live_read_enabled=True,
             review_required=True,
@@ -246,28 +279,100 @@ def test_review_required_with_live_read_shadows():
     assert REASON_CODES.IDENTITY_REVIEW_REQUIRED_LIVE_READ in trust["serving_reason_codes"]
 
 
-def test_approved_with_live_read_disabled_shadows():
-    trust = call(
-        identity=approved_identity(live_read_enabled=False),
+def test_external_seed_approved_with_live_read_disabled_shadows():
+    trust = call_external_seed(
+        identity=approved_identity(source_listing_ref="external_seed:ext_4242", live_read_enabled=False),
     )
     assert trust["serving_decision"] == "shadow"
     assert REASON_CODES.IDENTITY_LIVE_READ_DISABLED in trust["serving_reason_codes"]
 
 
-def test_approved_with_null_confidence_shadows():
-    trust = call(
-        identity=approved_identity(identity_confidence=None),
+def test_external_seed_approved_with_null_confidence_shadows():
+    trust = call_external_seed(
+        identity=approved_identity(source_listing_ref="external_seed:ext_4242", identity_confidence=None),
     )
     assert trust["serving_decision"] == "shadow"
     assert REASON_CODES.IDENTITY_CONFIDENCE_NULL in trust["serving_reason_codes"]
 
 
-def test_approved_with_review_required_flag_set_degrades_to_shadow():
-    trust = call(
-        identity=approved_identity(review_required=True),
+def test_external_seed_approved_with_review_required_flag_set_degrades_to_shadow():
+    trust = call_external_seed(
+        identity=approved_identity(source_listing_ref="external_seed:ext_4242", review_required=True),
     )
     assert trust["serving_decision"] == "shadow"
     assert trust["identity_status"] == "review_required"
+
+
+# ---- FIRST-PARTY CARVE-OUT (c1.v0.3) ----------------------------------------
+#
+# Internal merchants (anything that's not external_seed) are the source of
+# truth for their own products. The identity pipeline exists to verify scraped
+# third-party content; first-party merchants get a separate, looser gate.
+
+
+def test_first_party_no_identity_row_is_public_with_first_party_advisory():
+    # Reproduces the MOYU/GR test-merchant case: no pdp_identity_listing row,
+    # IPS eligible, sync_status=live. Legacy gates shadowed these; c1.v0.3
+    # serves them.
+    trust = call(identity=None)
+    assert trust["serving_decision"] == "public"
+    assert trust["identity_status"] == "unknown"
+    assert REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY in trust["serving_reason_codes"]
+    assert REASON_CODES.IDENTITY_CONFIDENCE_NULL not in trust["serving_reason_codes"]
+
+
+def test_first_party_approved_with_null_confidence_is_public():
+    trust = call(identity=approved_identity(identity_confidence=None))
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY in trust["serving_reason_codes"]
+    assert REASON_CODES.IDENTITY_CONFIDENCE_NULL not in trust["serving_reason_codes"]
+
+
+def test_first_party_approved_with_live_read_disabled_is_public():
+    trust = call(identity=approved_identity(live_read_enabled=False))
+    assert trust["serving_decision"] == "public"
+    assert REASON_CODES.IDENTITY_LIVE_READ_DISABLED not in trust["serving_reason_codes"]
+
+
+def test_first_party_review_required_still_gates_to_shadow():
+    trust = call(
+        identity=approved_identity(
+            identity_status="review_required",
+            live_read_enabled=True,
+            review_required=True,
+        ),
+    )
+    assert trust["serving_decision"] == "shadow"
+    assert REASON_CODES.IDENTITY_REVIEW_REQUIRED_LIVE_READ in trust["serving_reason_codes"]
+
+
+def test_first_party_identity_conflict_still_blocks():
+    trust = call(identity=approved_identity(identity_status="conflict"))
+    assert trust["serving_decision"] == "blocked"
+    assert REASON_CODES.IDENTITY_CONFLICT in trust["serving_reason_codes"]
+
+
+def test_first_party_hard_gates_still_block_regardless_of_identity():
+    tombstoned = call(
+        product=active_merchant_product(suppression_reason="manual_takedown"),
+        identity=None,
+    )
+    assert tombstoned["serving_decision"] == "blocked"
+    assert REASON_CODES.ROW_TOMBSTONED in tombstoned["serving_reason_codes"]
+
+    ips_blocked = call(
+        identity=None,
+        ips=eligible_ips(serving_eligible=False),
+    )
+    assert ips_blocked["serving_decision"] == "blocked"
+    assert REASON_CODES.INDEX_NOT_SERVING_ELIGIBLE in ips_blocked["serving_reason_codes"]
+
+    archived = call(
+        product=active_merchant_product(sync_status="archived"),
+        identity=None,
+    )
+    assert archived["serving_decision"] == "blocked"
+    assert REASON_CODES.PUBLISH_STATE_NOT_PUBLIC in archived["serving_reason_codes"]
 
 
 # ---- OVERRIDES --------------------------------------------------------------
