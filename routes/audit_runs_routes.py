@@ -30,12 +30,15 @@ Idempotency:
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from db.database import database
 from db.merchant_audit_runs import (
     ACTIVE_STAGES,
     STAGE_QUEUED,
@@ -45,7 +48,14 @@ from db.merchant_audit_runs import (
     find_in_flight_by_idempotency_key,
     recent_runs_for_merchant,
 )
+from routes.merchant_audit_routes import _check_audit_rate_limit
 from services.idempotency import compute_audit_idempotency_key
+from services.merchant_credit_balance_service import (
+    InsufficientCreditsError,
+    credit,
+    debit,
+    get_balance,
+)
 from utils.auth import get_current_merchant
 
 logger = logging.getLogger(__name__)
@@ -91,6 +101,35 @@ class CreateAuditRequest(BaseModel):
             "always enqueues a new run."
         ),
     )
+    prompts_per_sku: int = Field(
+        40,
+        ge=1,
+        le=200,
+        description="Prompt fan-out estimate used for credit preview.",
+    )
+    custom_prompts: Optional[List[str]] = Field(
+        default=None,
+        max_length=10,
+        description="Merchant-input prompt slots; each consumes prompt credits.",
+    )
+    providers: Optional[List[str]] = Field(
+        default=None,
+        max_length=4,
+        description="LLM providers requested for the audit.",
+    )
+
+
+class AuditPreviewScope(BaseModel):
+    sku_keys: Optional[List[str]] = Field(default=None, max_length=50)
+    select_top_n_by_revenue: Optional[int] = Field(default=None, ge=1, le=50)
+
+
+class AuditPreviewRequest(BaseModel):
+    merchant_id: str
+    scope: AuditPreviewScope
+    prompts_per_sku: int = Field(default=40, ge=1, le=200)
+    custom_prompts: Optional[List[str]] = Field(default=None, max_length=10)
+    providers: Optional[List[str]] = Field(default=None, max_length=4)
 
 
 class AuditRunCreated(BaseModel):
@@ -164,6 +203,234 @@ async def _missing_product_keys_for_merchant(
 # =====================================================================
 
 
+_PREVIEW_CACHE_TTL_SECONDS = 60
+_PREVIEW_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _normalize_nonempty(values: Optional[List[str]]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for raw in values or []:
+        value = str(raw or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _normalize_providers(values: Optional[List[str]]) -> List[str]:
+    providers = _normalize_nonempty(values)
+    return providers or ["gemini"]
+
+
+def _credit_requirements(
+    *, sku_count: int, custom_prompts: Optional[List[str]] = None,
+) -> Dict[str, int]:
+    return {
+        "audit": int(sku_count),
+        "prompt": len(_normalize_nonempty(custom_prompts)),
+        "execution": 0,
+    }
+
+
+def _balance_public_shape(balance: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "audit_credits": int(balance.get("audit_credits") or 0),
+        "prompt_credits": int(balance.get("prompt_credits") or 0),
+        "execution_credits": int(balance.get("execution_credits") or 0),
+        "plan_tier": str(balance.get("plan_tier") or "free"),
+    }
+
+
+def _credit_gaps(
+    *, requirements: Dict[str, int], balance: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    gaps: List[Dict[str, Any]] = []
+    for kind, required in requirements.items():
+        available = int(balance.get(f"{kind}_credits") or 0)
+        if int(required) > available:
+            gaps.append({
+                "kind": kind,
+                "required": int(required),
+                "available": available,
+                "short": int(required) - available,
+            })
+    return gaps
+
+
+def _preview_cache_key(
+    *,
+    merchant_id: str,
+    sku_keys: List[str],
+    prompts_per_sku: int,
+    providers: List[str],
+    custom_prompts: Optional[List[str]],
+) -> str:
+    raw = {
+        "merchant_id": merchant_id,
+        "sku_keys": sorted(sku_keys),
+        "prompts_per_sku": int(prompts_per_sku),
+        "providers": sorted(providers),
+        "custom_prompts": _normalize_nonempty(custom_prompts),
+    }
+    return hashlib.sha256(repr(raw).encode("utf-8")).hexdigest()
+
+
+async def _resolve_preview_sku_keys(
+    *, merchant_id: str, scope: AuditPreviewScope,
+) -> List[str]:
+    requested = _normalize_nonempty(scope.sku_keys)
+    top_n = scope.select_top_n_by_revenue
+    if bool(requested) == bool(top_n):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "scope must include exactly one of sku_keys or "
+                "select_top_n_by_revenue"
+            ),
+        )
+    if requested:
+        rows = await database.fetch_all(
+            """
+            SELECT sku_key
+              FROM catalog_skus
+             WHERE merchant_id = :merchant_id
+               AND sku_key = ANY(:sku_keys)
+            """,
+            {"merchant_id": merchant_id, "sku_keys": requested},
+        )
+        found = {str(dict(row).get("sku_key") or "") for row in rows or []}
+        missing = [key for key in requested if key not in found]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "message": (
+                        f"{len(missing)} SKU(s) not found for this merchant."
+                    ),
+                    "missing_sku_keys": missing,
+                },
+            )
+        return requested
+
+    rows = await database.fetch_all(
+        """
+        SELECT s.sku_key
+          FROM catalog_skus s
+          LEFT JOIN catalog_offers o ON o.sku_key = s.sku_key
+         WHERE s.merchant_id = :merchant_id
+         GROUP BY s.sku_key, s.updated_at
+         ORDER BY MAX(COALESCE(
+                    o.merchant_effective_price,
+                    o.estimated_best_price,
+                    o.list_price,
+                    0
+                  )) DESC,
+                  s.updated_at DESC NULLS LAST,
+                  s.sku_key ASC
+         LIMIT :limit
+        """,
+        {"merchant_id": merchant_id, "limit": int(top_n or 0)},
+    )
+    resolved = [
+        str(dict(row).get("sku_key") or "").strip()
+        for row in rows or []
+        if str(dict(row).get("sku_key") or "").strip()
+    ]
+    if not resolved:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No SKUs found for this merchant.",
+        )
+    return resolved
+
+
+async def _build_preview(
+    *,
+    merchant_id: str,
+    sku_keys: List[str],
+    prompts_per_sku: int,
+    custom_prompts: Optional[List[str]],
+    providers: List[str],
+) -> Dict[str, Any]:
+    cache_key = _preview_cache_key(
+        merchant_id=merchant_id,
+        sku_keys=sku_keys,
+        prompts_per_sku=prompts_per_sku,
+        providers=providers,
+        custom_prompts=custom_prompts,
+    )
+    now = time.time()
+    cached = _PREVIEW_CACHE.get(cache_key)
+    if cached and now - cached[0] <= _PREVIEW_CACHE_TTL_SECONDS:
+        cost_part = dict(cached[1])
+    else:
+        sku_count = len(sku_keys)
+        total_prompts = sku_count * int(prompts_per_sku)
+        prompts_cached = int(total_prompts * 0.2)
+        cache_hit_rate = (
+            round(prompts_cached / total_prompts, 4)
+            if total_prompts else 0.0
+        )
+        cost_part = {
+            "audit_run_id_preview": f"preview_{cache_key[:16]}",
+            "sku_count": sku_count,
+            "prompts_per_sku": int(prompts_per_sku),
+            "total_prompts": total_prompts,
+            "custom_prompt_slots_used": len(_normalize_nonempty(custom_prompts)),
+            "estimated_cache_savings": {
+                "prompts_cached": prompts_cached,
+                "cache_hit_rate": cache_hit_rate,
+            },
+            "providers": providers,
+            "estimated_audit_credits": sku_count,
+            "estimated_prompt_credits": len(_normalize_nonempty(custom_prompts)),
+            "estimated_execution_credits": 0,
+        }
+        _PREVIEW_CACHE[cache_key] = (now, cost_part)
+
+    balance = await get_balance(merchant_id)
+    requirements = _credit_requirements(
+        sku_count=int(cost_part["sku_count"]),
+        custom_prompts=custom_prompts,
+    )
+    gaps = _credit_gaps(requirements=requirements, balance=balance)
+    return {
+        **cost_part,
+        "merchant_id": merchant_id,
+        "current_balance": _balance_public_shape(balance),
+        "sufficient": not gaps,
+        "gaps": gaps,
+    }
+
+
+@router.post("/preview")
+async def preview_audit_run(
+    body: AuditPreviewRequest,
+    auth_merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Pure pre-flight cost/credit preview for SKU audit v3."""
+    if body.merchant_id != auth_merchant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "merchant_id in body must match the authenticated "
+                "merchant."
+            ),
+        )
+    sku_keys = await _resolve_preview_sku_keys(
+        merchant_id=body.merchant_id,
+        scope=body.scope,
+    )
+    return await _build_preview(
+        merchant_id=body.merchant_id,
+        sku_keys=sku_keys,
+        prompts_per_sku=body.prompts_per_sku,
+        custom_prompts=body.custom_prompts,
+        providers=_normalize_providers(body.providers),
+    )
+
+
 @router.post(
     "",
     status_code=status.HTTP_202_ACCEPTED,
@@ -226,6 +493,7 @@ async def create_audit_run(
         )
 
     # Idempotency dedupe (unless force=true).
+    debit_idempotency_key: Optional[str]
     if not body.force:
         idempotency_key = compute_audit_idempotency_key(
             merchant_id=body.merchant_id,
@@ -245,22 +513,117 @@ async def create_audit_run(
                 stage=STAGE_QUEUED,  # safe default; GET returns truth
                 idempotent_replay=True,
             )
+        debit_idempotency_key = idempotency_key
     else:
         idempotency_key = None
+        debit_idempotency_key = compute_audit_idempotency_key(
+            merchant_id=body.merchant_id,
+            product_keys=body.product_keys,
+            subject_type=body.subject_type,
+        )
 
-    # enqueue_audit_run_with_replay returns (run_id, was_existing).
-    # was_existing=True means INSERT ... ON CONFLICT DO NOTHING fired
-    # against the partial unique idempotency index — a concurrent
-    # POST won the race; we hand back the winning run_id and signal
-    # idempotent_replay so the client knows it wasn't a fresh enqueue.
-    run_id, was_existing = await enqueue_audit_run_with_replay(
-        merchant_id=body.merchant_id,
-        product_keys=body.product_keys,
-        subject_type=body.subject_type,
-        idempotency_key=idempotency_key,
-        requested_by_user_id=auth_merchant_id,
+    requirements = _credit_requirements(
+        sku_count=len(_normalize_nonempty(body.product_keys)),
+        custom_prompts=body.custom_prompts,
     )
+    balance = await get_balance(body.merchant_id)
+    gaps = _credit_gaps(requirements=requirements, balance=balance)
+    if gaps:
+        gap = gaps[0]
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "insufficient_credits",
+                "kind": gap["kind"],
+                "required": gap["required"],
+                "available": gap["available"],
+                "preview_url": "/api/audits/preview",
+            },
+        )
+
+    # Preview-only quota remains active for free-tier balances. Paid tiers
+    # are credit-gated only.
+    if str(balance.get("plan_tier") or "free") == "free":
+        await _check_audit_rate_limit(body.merchant_id)
+
+    debited: List[Tuple[str, int, bool]] = []
+    try:
+        audit_required = int(requirements["audit"])
+        if audit_required:
+            audit_debit = await debit(
+                body.merchant_id,
+                "audit",
+                audit_required,
+                idempotency_key=debit_idempotency_key,
+            )
+            debited.append((
+                "audit",
+                audit_required,
+                bool(audit_debit.get("replay")),
+            ))
+        prompt_required = int(requirements["prompt"])
+        if prompt_required:
+            prompt_debit = await debit(
+                body.merchant_id,
+                "prompt",
+                prompt_required,
+                idempotency_key=debit_idempotency_key,
+            )
+            debited.append((
+                "prompt",
+                prompt_required,
+                bool(prompt_debit.get("replay")),
+            ))
+
+        # Use origin/main's race-safe enqueue (returns run_id +
+        # was_existing for idempotent-replay signalling) inside Brief 3's
+        # credit-gated try block, so a concurrent POST that wins the race
+        # is reported as idempotent_replay without double-charging.
+        run_id, was_existing = await enqueue_audit_run_with_replay(
+            merchant_id=body.merchant_id,
+            product_keys=body.product_keys,
+            subject_type=body.subject_type,
+            idempotency_key=idempotency_key,
+            requested_by_user_id=auth_merchant_id,
+        )
+    except InsufficientCreditsError as exc:
+        for kind, amount, replay in reversed(debited):
+            if not replay:
+                await credit(
+                    body.merchant_id,
+                    kind,  # type: ignore[arg-type]
+                    amount,
+                    source_event_id=f"refund:{debit_idempotency_key}",
+                )
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "insufficient_credits",
+                "kind": exc.kind,
+                "required": exc.required,
+                "available": exc.available,
+                "preview_url": "/api/audits/preview",
+            },
+        ) from exc
+    except Exception:
+        for kind, amount, replay in reversed(debited):
+            if not replay:
+                await credit(
+                    body.merchant_id,
+                    kind,  # type: ignore[arg-type]
+                    amount,
+                    source_event_id=f"refund:{debit_idempotency_key}",
+                )
+        raise
     if not run_id:
+        for kind, amount, replay in reversed(debited):
+            if not replay:
+                await credit(
+                    body.merchant_id,
+                    kind,  # type: ignore[arg-type]
+                    amount,
+                    source_event_id=f"refund:{debit_idempotency_key}",
+                )
         # Persistence layer rejected the insert. Most likely cause is
         # the DB being unavailable; surface a 503 so callers retry.
         raise HTTPException(

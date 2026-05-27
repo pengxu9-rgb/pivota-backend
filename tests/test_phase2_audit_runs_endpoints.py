@@ -31,6 +31,10 @@ class _AccessorStub:
         self.enqueued: List[Dict[str, Any]] = []
         self.cancelled: List[str] = []
         self.idem_lookups: List[str] = []
+        self.debits: List[Dict[str, Any]] = []
+        self.credits: List[Dict[str, Any]] = []
+        self.rate_limit_checks: List[str] = []
+        self.preview_resolves: List[Dict[str, Any]] = []
 
         # Configurable returns — tests set these before requests.
         self.enqueue_returns: Optional[str] = "run-new-1"
@@ -42,6 +46,15 @@ class _AccessorStub:
         # (no keys are missing). Tests that exercise the validation
         # path set missing_keys_returns explicitly.
         self.missing_keys_returns: List[str] = []
+        self.balance: Dict[str, Any] = {
+            "audit_credits": 100,
+            "prompt_credits": 100,
+            "execution_credits": 0,
+            "plan_tier": "starter",
+            "updated_at": None,
+            "version": 0,
+        }
+        self.preview_sku_keys: List[str] = ["sku-1", "sku-2"]
 
     async def enqueue(self, **kwargs):
         self.enqueued.append(kwargs)
@@ -69,6 +82,51 @@ class _AccessorStub:
 
     async def missing_keys(self, *, merchant_id, product_keys):
         return list(self.missing_keys_returns)
+    async def get_balance(self, merchant_id):
+        return dict(self.balance)
+
+    async def debit(self, merchant_id, kind, amount, idempotency_key, **kwargs):
+        self.debits.append({
+            "merchant_id": merchant_id,
+            "kind": kind,
+            "amount": amount,
+            "idempotency_key": idempotency_key,
+        })
+        column = f"{kind}_credits"
+        available = int(self.balance.get(column) or 0)
+        if available < int(amount):
+            from services.merchant_credit_balance_service import (
+                InsufficientCreditsError,
+            )
+            raise InsufficientCreditsError(
+                merchant_id, kind, int(amount), available,
+            )
+        self.balance[column] = available - int(amount)
+        self.balance["version"] = int(self.balance.get("version") or 0) + 1
+        return {**self.balance, "replay": False}
+
+    async def credit(self, merchant_id, kind, amount, source_event_id, **kwargs):
+        self.credits.append({
+            "merchant_id": merchant_id,
+            "kind": kind,
+            "amount": amount,
+            "source_event_id": source_event_id,
+        })
+        column = f"{kind}_credits"
+        self.balance[column] = int(self.balance.get(column) or 0) + int(amount)
+        self.balance["version"] = int(self.balance.get("version") or 0) + 1
+        return {**self.balance, "replay": False}
+
+    async def rate_limit(self, merchant_id):
+        self.rate_limit_checks.append(merchant_id)
+        return 1
+
+    async def resolve_preview(self, *, merchant_id, scope):
+        self.preview_resolves.append({
+            "merchant_id": merchant_id,
+            "scope": scope,
+        })
+        return list(self.preview_sku_keys)
 
 
 @pytest.fixture
@@ -103,6 +161,22 @@ def client(stub, monkeypatch):
         audit_runs_routes,
         "_missing_product_keys_for_merchant", stub.missing_keys,
     )
+    monkeypatch.setattr(
+        audit_runs_routes, "get_balance", stub.get_balance,
+    )
+    monkeypatch.setattr(
+        audit_runs_routes, "debit", stub.debit,
+    )
+    monkeypatch.setattr(
+        audit_runs_routes, "credit", stub.credit,
+    )
+    monkeypatch.setattr(
+        audit_runs_routes, "_check_audit_rate_limit", stub.rate_limit,
+    )
+    monkeypatch.setattr(
+        audit_runs_routes, "_resolve_preview_sku_keys", stub.resolve_preview,
+    )
+    audit_runs_routes._PREVIEW_CACHE.clear()
 
     app = FastAPI()
     app.include_router(audit_runs_routes.router)
@@ -137,6 +211,10 @@ def test_post_enqueues_and_returns_202(client, stub):
     assert stub.enqueued[0]["product_keys"] == ["pk-1", "pk-2"]
     # Idempotency lookup happened (default force=False).
     assert len(stub.idem_lookups) == 1
+    assert stub.balance["audit_credits"] == 98
+    assert len(stub.debits) == 1
+    assert stub.debits[0]["kind"] == "audit"
+    assert stub.debits[0]["amount"] == 2
 
 
 def test_post_returns_existing_run_on_idempotent_replay(client, stub):
@@ -154,6 +232,7 @@ def test_post_returns_existing_run_on_idempotent_replay(client, stub):
     assert body["idempotent_replay"] is True
     # Worker did NOT enqueue — replayed instead.
     assert stub.enqueued == []
+    assert stub.debits == []
 
 
 def test_post_force_skips_idempotency_dedupe(client, stub):
@@ -174,6 +253,7 @@ def test_post_force_skips_idempotency_dedupe(client, stub):
     # Worker enqueued with idempotency_key=None.
     assert len(stub.enqueued) == 1
     assert stub.enqueued[0]["idempotency_key"] is None
+    assert len(stub.debits) == 1
 
 
 def test_post_rejects_cross_tenant_merchant_id(client, stub):
@@ -222,6 +302,188 @@ def test_post_returns_503_on_persistence_failure(client, stub):
         },
     )
     assert res.status_code == 503
+    assert stub.balance["audit_credits"] == 100
+    assert stub.credits[0]["kind"] == "audit"
+
+
+def test_post_returns_402_when_audit_credits_insufficient(client, stub):
+    stub.balance["audit_credits"] = 1
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1", "pk-2"],
+        },
+    )
+    assert res.status_code == 402
+    detail = res.json()["detail"]
+    assert detail == {
+        "error": "insufficient_credits",
+        "kind": "audit",
+        "required": 2,
+        "available": 1,
+        "preview_url": "/api/audits/preview",
+    }
+    assert stub.balance["audit_credits"] == 1
+    assert stub.debits == []
+
+
+def test_post_debits_prompt_credits_for_custom_prompts(client, stub):
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+            "custom_prompts": ["compare with refill packs", "is it oily?"],
+        },
+    )
+    assert res.status_code == 202
+    assert stub.balance["audit_credits"] == 99
+    assert stub.balance["prompt_credits"] == 98
+    assert [d["kind"] for d in stub.debits] == ["audit", "prompt"]
+
+
+def test_post_prompt_credit_gap_returns_402_before_any_debit(client, stub):
+    stub.balance["prompt_credits"] = 0
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+            "custom_prompts": ["extra merchant prompt"],
+        },
+    )
+    assert res.status_code == 402
+    assert stub.balance["audit_credits"] == 100
+    assert stub.debits == []
+    assert stub.credits == []
+    assert stub.enqueued == []
+
+
+def test_post_free_tier_applies_rate_limit_and_credits(client, stub):
+    stub.balance["plan_tier"] = "free"
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+        },
+    )
+    assert res.status_code == 202
+    assert stub.rate_limit_checks == ["merch-A"]
+    assert stub.balance["audit_credits"] == 99
+
+
+def test_post_paid_tier_skips_rate_limit(client, stub):
+    stub.balance["plan_tier"] = "growth"
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+        },
+    )
+    assert res.status_code == 202
+    assert stub.rate_limit_checks == []
+
+
+def test_post_relaunch_existing_run_does_not_double_debit(client, stub):
+    stub.idem_returns = "run-already-running"
+    stub.balance["audit_credits"] = 0
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+        },
+    )
+    assert res.status_code == 202
+    assert res.json()["run_id"] == "run-already-running"
+    assert stub.debits == []
+
+
+# =====================================================================
+# POST /api/audits/preview
+# =====================================================================
+
+
+def test_preview_returns_cost_balance_and_sufficiency(client, stub):
+    stub.preview_sku_keys = [f"sku-{i}" for i in range(10)]
+    stub.balance.update({
+        "audit_credits": 25,
+        "prompt_credits": 50,
+        "execution_credits": 0,
+        "plan_tier": "growth",
+    })
+    res = client.post(
+        "/api/audits/preview",
+        json={
+            "merchant_id": "merch-A",
+            "scope": {"select_top_n_by_revenue": 10},
+            "providers": ["gemini", "deepseek"],
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["audit_run_id_preview"].startswith("preview_")
+    assert body["merchant_id"] == "merch-A"
+    assert body["sku_count"] == 10
+    assert body["prompts_per_sku"] == 40
+    assert body["total_prompts"] == 400
+    assert body["estimated_cache_savings"] == {
+        "prompts_cached": 80,
+        "cache_hit_rate": 0.2,
+    }
+    assert body["providers"] == ["gemini", "deepseek"]
+    assert body["estimated_audit_credits"] == 10
+    assert body["estimated_prompt_credits"] == 0
+    assert body["estimated_execution_credits"] == 0
+    assert body["current_balance"] == {
+        "audit_credits": 25,
+        "prompt_credits": 50,
+        "execution_credits": 0,
+        "plan_tier": "growth",
+    }
+    assert body["sufficient"] is True
+    assert body["gaps"] == []
+    assert stub.debits == []
+
+
+def test_preview_reports_credit_gaps(client, stub):
+    stub.preview_sku_keys = ["sku-1", "sku-2", "sku-3"]
+    stub.balance.update({"audit_credits": 1, "prompt_credits": 0})
+    res = client.post(
+        "/api/audits/preview",
+        json={
+            "merchant_id": "merch-A",
+            "scope": {"sku_keys": ["sku-1", "sku-2", "sku-3"]},
+            "custom_prompts": ["one"],
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["sufficient"] is False
+    assert body["gaps"] == [
+        {"kind": "audit", "required": 3, "available": 1, "short": 2},
+        {"kind": "prompt", "required": 1, "available": 0, "short": 1},
+    ]
+
+
+def test_preview_dedups_cost_computation_for_same_scope(client, stub):
+    stub.preview_sku_keys = ["sku-1", "sku-2"]
+    payload = {
+        "merchant_id": "merch-A",
+        "scope": {"sku_keys": ["sku-2", "sku-1"]},
+        "prompts_per_sku": 40,
+        "providers": ["gemini"],
+    }
+    first = client.post("/api/audits/preview", json=payload)
+    second = client.post("/api/audits/preview", json=payload)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["audit_run_id_preview"] == (
+        second.json()["audit_run_id_preview"]
+    )
 
 
 def test_post_422_when_any_product_key_missing(client, stub):
