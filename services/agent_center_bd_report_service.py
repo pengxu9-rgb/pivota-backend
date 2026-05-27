@@ -23,8 +23,11 @@ results passed in by the caller.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
+import json
+import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -1326,6 +1329,1730 @@ def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Per-SKU v3 scorecard builders (Brief 2, spec sections A-D)
+# ---------------------------------------------------------------------------
+
+
+_SKU_CONTEXT_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
+def reset_sku_context_cache() -> None:
+    """Test hook and audit-run boundary helper."""
+    _SKU_CONTEXT_CACHE.clear()
+
+
+def _row_dict(row: Any) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        return None
+
+
+def _json_obj(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _json_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        return list(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return [value] if value.strip() else []
+        if isinstance(parsed, list):
+            return parsed
+        return [parsed] if parsed is not None else []
+    return [value]
+
+
+def _nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return True
+
+
+def _as_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(n):
+        return None
+    return n
+
+
+def _normalize_percent(value: Any) -> Optional[float]:
+    n = _as_number(value)
+    if n is None:
+        return None
+    if 0 <= n <= 1:
+        n *= 100.0
+    return max(0.0, min(100.0, n))
+
+
+def _points_from_percent(value: Any, max_points: int) -> int:
+    pct = _normalize_percent(value)
+    if pct is None:
+        return 0
+    return int(round(max_points * (pct / 100.0)))
+
+
+def _norm_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _norm_identity_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _norm_text(value)).strip()
+
+
+def _get_product(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    product = sku_ctx.get("product")
+    return product if isinstance(product, dict) else sku_ctx
+
+
+def _get_sku(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    sku = sku_ctx.get("sku")
+    return sku if isinstance(sku, dict) else sku_ctx
+
+
+def _get_index_state(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    state = sku_ctx.get("index_pipeline_state")
+    return state if isinstance(state, dict) else {}
+
+
+def _get_enrichment(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    enrichment = sku_ctx.get("product_enrichment") or sku_ctx.get("enrichment")
+    return enrichment if isinstance(enrichment, dict) else {}
+
+
+def _get_quality(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    quality = sku_ctx.get("product_quality_snapshot") or sku_ctx.get("quality_snapshot")
+    return quality if isinstance(quality, dict) else {}
+
+
+def _get_offers(sku_ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        row for row in _json_list(sku_ctx.get("offers") or sku_ctx.get("catalog_offers"))
+        if isinstance(row, dict)
+    ]
+
+
+def _get_all_skus(sku_ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    all_skus = [
+        row for row in _json_list(sku_ctx.get("all_skus") or sku_ctx.get("catalog_skus"))
+        if isinstance(row, dict)
+    ]
+    if all_skus:
+        return all_skus
+    sku = _get_sku(sku_ctx)
+    return [sku] if sku else []
+
+
+def _add_bucket(
+    breakdown: Dict[str, Any],
+    missing_inputs: List[str],
+    name: str,
+    points: int,
+    max_points: int,
+    reason: str,
+    *,
+    missing: Optional[List[str]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    safe_points = max(0, min(max_points, int(round(points))))
+    bucket = {"points": safe_points, "max": max_points, "reason": reason}
+    if extra:
+        bucket.update(extra)
+    breakdown[name] = bucket
+    for item in missing or []:
+        if item not in missing_inputs:
+            missing_inputs.append(item)
+
+
+def _finish_breakdown(
+    breakdown: Dict[str, Any],
+    missing_inputs: List[str],
+) -> Tuple[int, Dict[str, Any]]:
+    total = sum(
+        int(v.get("points") or 0)
+        for k, v in breakdown.items()
+        if isinstance(v, dict) and k not in {"total", "missing_inputs"}
+    )
+    total = max(0, min(100, int(round(total))))
+    breakdown["total"] = total
+    if missing_inputs:
+        breakdown["missing_inputs"] = missing_inputs
+    return total, breakdown
+
+
+def _category_text(product: Dict[str, Any]) -> str:
+    return " ".join(
+        str(product.get(k) or "")
+        for k in ("product_type", "category", "category_path")
+    ).lower()
+
+
+def _vertical_for(product: Dict[str, Any]) -> str:
+    text = _category_text(product)
+    if any(x in text for x in ("beauty", "skin", "cosmetic", "makeup", "wellness", "supplement", "vitamin")):
+        return "beauty"
+    if any(x in text for x in ("fashion", "apparel", "clothing", "sleepwear", "shirt", "dress", "shoe")):
+        return "fashion"
+    if any(x in text for x in ("electronics", "device", "laptop", "phone", "camera", "headphone", "speaker")):
+        return "electronics"
+    return "other"
+
+
+def _confidence_ok(value: Any) -> bool:
+    n = _as_number(value)
+    return n is None or n >= 0.6
+
+
+def _freshness_current(value: Any) -> bool:
+    data = _json_obj(value)
+    if not data:
+        return False
+    for key in ("current", "is_current", "fresh"):
+        if data.get(key) is True:
+            return True
+    status = _norm_text(data.get("status") or data.get("state"))
+    if status in {"current", "fresh", "valid", "ok"}:
+        return True
+    for key in ("fresh_until", "expires_at", "valid_until"):
+        raw = data.get(key)
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt >= datetime.now(timezone.utc):
+            return True
+    return False
+
+
+def _has_blocking_safety_flag(flags: Any) -> bool:
+    for flag in _json_list(flags):
+        if isinstance(flag, dict):
+            text = " ".join(str(flag.get(k) or "") for k in ("severity", "level", "code", "message")).lower()
+        else:
+            text = str(flag or "").lower()
+        if any(marker in text for marker in ("blocking", "blocker", "unsafe", "unsupported_claim")):
+            return True
+    return False
+
+
+def _has_claims(product: Dict[str, Any], sku_ctx: Dict[str, Any]) -> bool:
+    text = " ".join(
+        str(x or "")
+        for x in (
+            product.get("description"),
+            product.get("title"),
+            product.get("product_type"),
+            product.get("category"),
+            _json_obj(product.get("product_payload")).get("claims"),
+            _json_obj(sku_ctx.get("beauty_product_profile") or {}).get("claims_json"),
+        )
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "claim", "clinical", "clinically", "treat", "heals", "cure",
+            "anti-aging", "anti aging", "immune", "inflammation", "acne",
+            "spf", "fda", "gmp",
+        )
+    )
+
+
+def _has_substantiation(product: Dict[str, Any], sku_ctx: Dict[str, Any]) -> bool:
+    payload = _json_obj(product.get("product_payload"))
+    intel = _json_obj(payload.get("product_intel") or {}).get("product_intel_core")
+    if isinstance(intel, dict) and _nonempty(intel.get("source_coverage")):
+        return True
+    if _nonempty(payload.get("substantiation")) or _nonempty(payload.get("watchouts")):
+        return True
+    profile = _json_obj(sku_ctx.get("beauty_product_profile") or {})
+    return _nonempty(profile.get("claims_json")) or _nonempty(profile.get("benefits_json"))
+
+
+def compute_identity_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    """Spec A.1 identity score. Pure: reads only the normalized SKU context."""
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    state = _get_index_state(sku_ctx or {})
+    breakdown: Dict[str, Any] = {}
+    missing: List[str] = []
+
+    content_key = product.get("content_key") or sku_ctx.get("content_key")
+    _add_bucket(
+        breakdown, missing, "content_key",
+        20 if _nonempty(content_key) else 0,
+        20,
+        "content_key present" if _nonempty(content_key) else "data unavailable",
+        missing=None if _nonempty(content_key) else ["catalog_products.content_key"],
+    )
+
+    sig = product.get("pivota_signature_id") or sku_ctx.get("pivota_signature_id")
+    pivota_url = product.get("pivota_canonical_url") or sku_ctx.get("pivota_canonical_url")
+    has_sig = _nonempty(sig) and _nonempty(pivota_url)
+    _add_bucket(
+        breakdown, missing, "pivota_signature",
+        15 if has_sig else 0,
+        15,
+        "signature and canonical URL present" if has_sig else "data unavailable",
+        missing=None if has_sig else ["catalog_products.pivota_signature_id", "catalog_products.pivota_canonical_url"],
+    )
+
+    group_members = [
+        row for row in _json_list(sku_ctx.get("product_group_members"))
+        if isinstance(row, dict) and _nonempty(row.get("product_group_id"))
+    ]
+    identity_resolved = bool(state.get("identity_resolved")) or bool(group_members) or _nonempty(state.get("product_group_id"))
+    _add_bucket(
+        breakdown, missing, "identity_resolution",
+        20 if identity_resolved else 0,
+        20,
+        "identity resolved" if identity_resolved else "data unavailable",
+        missing=None if identity_resolved else ["index_pipeline_state.identity_resolved", "product_group_members.product_group_id"],
+    )
+
+    all_skus = _get_all_skus(sku_ctx or {})
+    if not all_skus:
+        variant_points = 0
+        variant_reason = "data unavailable"
+        variant_missing = ["catalog_skus"]
+    else:
+        def _has_variant_identity(row: Dict[str, Any]) -> bool:
+            return (
+                _nonempty(row.get("barcode"))
+                or _nonempty(row.get("sku"))
+                or _nonempty(row.get("visible_option_labels"))
+            )
+        if all(_has_variant_identity(row) for row in all_skus):
+            variant_points = 15
+            variant_reason = "variant identity present on every active SKU"
+            variant_missing = None
+        elif _nonempty(product.get("product_key")) or _nonempty(product.get("source_product_id")) or _nonempty(product.get("title")):
+            variant_points = 8
+            variant_reason = "only product-level identity present"
+            variant_missing = ["catalog_skus.barcode", "catalog_skus.sku", "catalog_skus.visible_option_labels"]
+        else:
+            variant_points = 0
+            variant_reason = "data unavailable"
+            variant_missing = ["catalog_skus.barcode", "catalog_skus.sku", "catalog_skus.visible_option_labels"]
+    _add_bucket(breakdown, missing, "variant_identity", variant_points, 15, variant_reason, missing=variant_missing)
+
+    title = str(product.get("title") or "")
+    title_len_ok = 12 <= len(title.strip()) <= 120
+    has_brand = _nonempty(product.get("brand"))
+    has_category = _nonempty(product.get("product_type")) or _nonempty(product.get("category"))
+    disambig_signals = sum([bool(title.strip()), has_brand, has_category, title_len_ok])
+    if title.strip() and has_brand and has_category and title_len_ok:
+        disambig_points = 15
+        disambig_reason = "title, brand, and category are disambiguated"
+        disambig_missing = None
+    elif disambig_signals >= 2:
+        disambig_points = 8
+        disambig_reason = "partial title/brand/category disambiguation"
+        disambig_missing = [
+            field for field, ok in (
+                ("catalog_products.title", bool(title.strip()) and title_len_ok),
+                ("catalog_products.brand", has_brand),
+                ("catalog_products.product_type_or_category", has_category),
+            )
+            if not ok
+        ]
+    else:
+        disambig_points = 0
+        disambig_reason = "data unavailable"
+        disambig_missing = ["catalog_products.title", "catalog_products.brand", "catalog_products.product_type_or_category"]
+    _add_bucket(breakdown, missing, "title_brand_category", disambig_points, 15, disambig_reason, missing=disambig_missing)
+
+    peers_key_present = "content_key_peers" in sku_ctx or "collision_audit" in sku_ctx
+    peers = [
+        row for row in _json_list(sku_ctx.get("content_key_peers") or sku_ctx.get("collision_audit"))
+        if isinstance(row, dict)
+    ]
+    if not _nonempty(content_key):
+        collision_points = 0
+        collision_reason = "data unavailable"
+        collision_missing = ["catalog_products.content_key"]
+    elif not peers_key_present:
+        collision_points = 0
+        collision_reason = "data unavailable"
+        collision_missing = ["catalog_products rows sharing content_key"]
+    else:
+        base_brand = _norm_identity_text(product.get("brand"))
+        base_title = _norm_identity_text(product.get("title"))
+        base_group = state.get("product_group_id") or (group_members[0].get("product_group_id") if group_members else None)
+        divergent = []
+        for peer in peers:
+            if peer.get("product_key") == product.get("product_key"):
+                continue
+            peer_group = peer.get("product_group_id")
+            intentionally_grouped = _nonempty(base_group) and base_group == peer_group
+            peer_brand = _norm_identity_text(peer.get("brand"))
+            peer_title = _norm_identity_text(peer.get("title"))
+            agrees = (not peer_brand or peer_brand == base_brand) and (not peer_title or peer_title == base_title)
+            if not intentionally_grouped and not agrees:
+                divergent.append(peer.get("product_key") or peer.get("title") or "unknown")
+        collision_points = 0 if divergent else 15
+        collision_reason = "divergent content_key collision" if divergent else "no divergent content_key collisions"
+        collision_missing = None
+    _add_bucket(
+        breakdown, missing, "collision_audit",
+        collision_points, 15, collision_reason,
+        missing=collision_missing,
+    )
+    return _finish_breakdown(breakdown, missing)
+
+
+def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    """Spec A.2 content-richness score. Pure: reads normalized SKU context."""
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    enrichment = _get_enrichment(sku_ctx or {})
+    quality = _get_quality(sku_ctx or {})
+    breakdown: Dict[str, Any] = {}
+    missing: List[str] = []
+
+    quality_value = quality.get("content_quality_score", sku_ctx.get("content_quality_score"))
+    quality_points = _points_from_percent(quality_value, 25)
+    _add_bucket(
+        breakdown, missing, "product_quality_score",
+        quality_points, 25,
+        f"content quality normalized to {quality_points}/25" if quality_value is not None else "data unavailable",
+        missing=None if quality_value is not None else ["product_quality_snapshot.content_quality_score"],
+    )
+
+    bullets = _json_list(enrichment.get("bullet_points") or product.get("bullet_points"))
+    coverage_checks = [
+        ("summary_short", _nonempty(enrichment.get("summary_short"))),
+        ("bullet_points", len([b for b in bullets if _nonempty(b)]) >= 3),
+        ("usage_scenarios", _nonempty(enrichment.get("usage_scenarios") or product.get("usage_scenarios"))),
+        ("audience_tags", _nonempty(enrichment.get("audience_tags") or product.get("audience_tags"))),
+    ]
+    coverage_points = 5 * sum(1 for _, ok in coverage_checks if ok)
+    _add_bucket(
+        breakdown, missing, "enrichment_coverage",
+        coverage_points, 20,
+        f"{coverage_points // 5}/4 enrichment elements present",
+        missing=[f"product_enrichment.{name}" for name, ok in coverage_checks if not ok] or None,
+    )
+
+    vertical = _vertical_for(product)
+    payload = _json_obj(product.get("product_payload"))
+    field_facts = [
+        row for row in _json_list(sku_ctx.get("catalog_field_facts"))
+        if isinstance(row, dict)
+    ]
+    if vertical == "beauty":
+        has_ingredients = _nonempty(sku_ctx.get("beauty_sku_ingredients") or _json_list(sku.get("ingredient_ids")) or payload.get("ingredients"))
+        has_usage = _nonempty(sku_ctx.get("beauty_usage_guides") or payload.get("usage") or enrichment.get("usage_scenarios"))
+        has_compat = _nonempty(sku_ctx.get("beauty_compatibility_rules") or payload.get("watchouts") or payload.get("compatibility"))
+        vertical_points = (7 if has_ingredients else 0) + (7 if has_usage else 0) + (6 if has_compat else 0)
+        vertical_missing = []
+        if not has_ingredients:
+            vertical_missing.append("beauty_sku_ingredients")
+        if not has_usage:
+            vertical_missing.append("beauty_usage_guides")
+        if not has_compat:
+            vertical_missing.append("beauty_compatibility_rules")
+    elif vertical == "fashion":
+        fashion = _json_obj(payload.get("fashion_meta") or {})
+        has_material = _nonempty(product.get("material") or fashion.get("material")) and _confidence_ok(product.get("material_confidence") or fashion.get("material_confidence"))
+        has_care = _nonempty(product.get("care") or fashion.get("care")) and _confidence_ok(product.get("care_confidence") or fashion.get("care_confidence"))
+        has_size = _nonempty(product.get("size_guide") or fashion.get("size_guide")) and _confidence_ok(product.get("size_guide_confidence") or fashion.get("size_guide_confidence"))
+        vertical_points = (7 if has_material else 0) + (7 if has_care else 0) + (6 if has_size else 0)
+        vertical_missing = []
+        if not has_material:
+            vertical_missing.append("catalog_products.material")
+        if not has_care:
+            vertical_missing.append("catalog_products.care")
+        if not has_size:
+            vertical_missing.append("catalog_products.size_guide")
+    elif vertical == "electronics":
+        electronics = _json_obj(payload.get("electronics_meta") or {})
+        checks = [
+            ("spec_groups", _nonempty(electronics.get("spec_groups")), 6),
+            ("in_box", _nonempty(electronics.get("in_box")), 4),
+            ("pro_reviews", _nonempty(electronics.get("pro_reviews")), 4),
+            ("compare_or_configurator", _nonempty(electronics.get("compare_with") or electronics.get("configurator_groups") or electronics.get("protection_plans")), 6),
+        ]
+        vertical_points = sum(points for _, ok, points in checks if ok)
+        vertical_missing = [f"electronics_meta.{name}" for name, ok, _ in checks if not ok]
+    else:
+        reviewed_facts = [
+            row for row in field_facts
+            if str(row.get("review_state") or "").lower() in {"reviewed", "approved", "verified"}
+        ]
+        has_payload_facts = _nonempty(payload.get("facts") or payload.get("structured_facts") or payload.get("product_intel"))
+        vertical_points = (10 if has_payload_facts else 0) + (10 if reviewed_facts else 0)
+        vertical_missing = []
+        if not has_payload_facts:
+            vertical_missing.append("catalog_products.product_payload.facts")
+        if not reviewed_facts:
+            vertical_missing.append("catalog_field_facts.reviewed")
+    _add_bucket(
+        breakdown, missing, "vertical_structure",
+        vertical_points, 20,
+        f"{vertical} structure coverage" if vertical_points else "data unavailable",
+        missing=vertical_missing or None,
+        extra={"vertical": vertical},
+    )
+
+    readiness_value = quality.get("model_readiness_score", sku_ctx.get("model_readiness_score"))
+    readiness_points = _points_from_percent(readiness_value, 15)
+    _add_bucket(
+        breakdown, missing, "model_readiness",
+        readiness_points, 15,
+        f"model readiness normalized to {readiness_points}/15" if readiness_value is not None else "data unavailable",
+        missing=None if readiness_value is not None else ["product_quality_snapshot.model_readiness_score"],
+    )
+
+    blocking_flags = _has_blocking_safety_flag(enrichment.get("llm_safety_flags"))
+    claims_present = _has_claims(product, sku_ctx or {})
+    substantiated = _has_substantiation(product, sku_ctx or {})
+    if blocking_flags:
+        safety_points = 0
+        safety_reason = "blocking safety flag present"
+        safety_missing = None
+    elif claims_present and not substantiated:
+        safety_points = 5
+        safety_reason = "claims present without substantiation/watchouts"
+        safety_missing = ["claim_substantiation_or_watchouts"]
+    else:
+        safety_points = 10
+        safety_reason = "no blocking safety flags; claims substantiated or absent"
+        safety_missing = None
+    _add_bucket(breakdown, missing, "safety_claims", safety_points, 10, safety_reason, missing=safety_missing)
+
+    description = str(product.get("description") or enrichment.get("description_markdown") or "")
+    has_description = len(description.strip()) >= 120
+    has_image = _nonempty(product.get("image_url") or sku_ctx.get("image_url"))
+    has_freshness = _freshness_current(product.get("freshness_json"))
+    readiness_tier = str(product.get("readiness_tier") or "").strip()
+    readiness_ok = readiness_tier in {"knowledge_ready", "vertical_ready", "commerce_ready"}
+    freshness_points = (3 if has_description else 0) + (3 if has_image else 0) + (2 if has_freshness else 0) + (2 if readiness_ok else 0)
+    freshness_missing = []
+    if not has_description:
+        freshness_missing.append("catalog_products.description")
+    if not has_image:
+        freshness_missing.append("catalog_products.image_url")
+    if not has_freshness:
+        freshness_missing.append("catalog_products.freshness_json")
+    if not readiness_ok:
+        freshness_missing.append("catalog_products.readiness_tier")
+    _add_bucket(
+        breakdown, missing, "freshness_raw_pdp",
+        freshness_points, 10,
+        "raw PDP completeness and freshness signals" if freshness_points else "data unavailable",
+        missing=freshness_missing or None,
+    )
+    return _finish_breakdown(breakdown, missing)
+
+
+def compute_routability_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    """Spec A.3 routability/transactability score."""
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    state = _get_index_state(sku_ctx or {})
+    offers = _get_offers(sku_ctx or {})
+    breakdown: Dict[str, Any] = {}
+    missing: List[str] = []
+
+    if state.get("serving_eligible") is True:
+        serving_points = 30
+        serving_reason = "serving eligible"
+        serving_missing = None
+    else:
+        stage = str(state.get("pipeline_stage") or product.get("pdp_lifecycle_stage") or "").strip()
+        stage_points = {
+            "public_indexed": 25,
+            "shadow_indexed": 22,
+            "quality_gated": 15,
+            "extracted": 10,
+            "crawled": 5,
+            "discovered": 0,
+        }
+        serving_points = stage_points.get(stage, 0)
+        serving_reason = f"partial by pipeline stage {stage}" if stage else "data unavailable"
+        serving_missing = None if stage else ["index_pipeline_state.serving_eligible", "index_pipeline_state.pipeline_stage"]
+    _add_bucket(breakdown, missing, "serving_eligibility", serving_points, 30, serving_reason, missing=serving_missing)
+
+    if not offers:
+        order_points = 0
+        order_reason = "data unavailable"
+        order_missing = ["catalog_offers"]
+    else:
+        best = 0
+        for offer in offers:
+            availability_ok = str(offer.get("availability") or "").lower() in {"in_stock", "available", "unknown"}
+            inventory = offer.get("inventory_quantity")
+            inventory_ok = inventory is None or (_as_number(inventory) or 0) > 0
+            mode_ok = (offer.get("offer_mode") or "") == "merchant_checkout"
+            price_ok = (_as_number(offer.get("list_price")) or 0) > 0
+            linked_ok = _nonempty(offer.get("offer_id")) and offer.get("sku_key") == sku.get("sku_key")
+            best = max(
+                best,
+                (5 if linked_ok else 0)
+                + (8 if availability_ok and inventory_ok else 0)
+                + (7 if mode_ok else 0)
+                + (5 if price_ok else 0),
+            )
+        order_points = best
+        order_reason = "orderable merchant-checkout offer" if best == 25 else "partial offer orderability"
+        order_missing = None if best == 25 else ["catalog_offers.availability", "catalog_offers.inventory_quantity", "catalog_offers.offer_mode", "catalog_offers.list_price"]
+    _add_bucket(breakdown, missing, "offer_orderability", order_points, 25, order_reason, missing=order_missing, extra={"offer_count": len(offers)})
+
+    if not offers:
+        price_points = 0
+        price_reason = "data unavailable"
+        price_missing = ["catalog_offers"]
+    else:
+        best_price_points = 0
+        for offer in offers:
+            has_currency = _nonempty(offer.get("currency"))
+            has_price = _as_number(offer.get("merchant_effective_price")) is not None or _as_number(offer.get("estimated_best_price")) is not None
+            confidence = _as_number(offer.get("price_confidence"))
+            confidence_ok = confidence is not None and confidence >= 0.8
+            best_price_points = max(best_price_points, (5 if has_currency else 0) + (5 if has_price else 0) + (5 if confidence_ok else 0))
+        price_points = best_price_points
+        price_reason = "price, currency, and confidence present" if price_points == 15 else "partial price/currency confidence"
+        price_missing = None if price_points == 15 else ["catalog_offers.currency", "catalog_offers.merchant_effective_price", "catalog_offers.price_confidence"]
+    _add_bucket(breakdown, missing, "price_currency_confidence", price_points, 15, price_reason, missing=price_missing)
+
+    commerce = sku_ctx.get("merchant_commerce_readiness_state") or sku_ctx.get("commerce_readiness") or {}
+    merchant = sku_ctx.get("merchant") or {}
+    offer_truth_ok = any((o.get("truth_tier") or "") == "primary" for o in offers) if offers else False
+    product_truth_ok = (product.get("truth_tier") or "") == "primary"
+    verification = str(merchant.get("verification_status") or commerce.get("verification_status") or "").lower()
+    merchant_ok = verification in {"verified", "active"} or bool(commerce.get("active_psp"))
+    sync_ok = str(product.get("sync_status") or "live").lower() not in {"stale", "archived", "blocked"}
+    trust_points = (3 if product_truth_ok else 0) + (3 if offer_truth_ok else 0) + (2 if merchant_ok else 0) + (2 if sync_ok else 0)
+    trust_missing = []
+    if not product_truth_ok:
+        trust_missing.append("catalog_products.truth_tier")
+    if not offer_truth_ok:
+        trust_missing.append("catalog_offers.truth_tier")
+    if not merchant_ok:
+        trust_missing.append("merchants.verification_status")
+    if not sync_ok:
+        trust_missing.append("catalog_products.sync_status")
+    _add_bucket(
+        breakdown, missing, "merchant_trust_state",
+        trust_points, 10,
+        "primary trust tier and merchant state ready" if trust_points == 10 else "partial merchant/trust state",
+        missing=trust_missing or None,
+    )
+
+    policies = [p for p in _json_list(sku_ctx.get("pcs_shop_policies") or sku_ctx.get("policies")) if isinstance(p, dict)]
+    policy_types = {str(p.get("policy_type") or "").lower() for p in policies}
+    offer_payloads = [_json_obj(o.get("offer_payload")) for o in offers]
+    merchant_payload = _json_obj(merchant.get("metadata_json") or merchant.get("payload") or {})
+    country = merchant.get("country") or merchant_payload.get("country")
+    has_shipping = "shipping" in policy_types or any(_nonempty(p.get("shipping")) for p in offer_payloads) or _nonempty(merchant_payload.get("shipping_policy"))
+    has_refund = "refund" in policy_types or "returns" in policy_types or _nonempty(merchant_payload.get("refund_policy"))
+    has_terms = "terms" in policy_types or _nonempty(merchant_payload.get("terms_url"))
+    ship_market = any(_nonempty(p.get("ship_to_market") or p.get("ship_to_countries") or p.get("markets")) for p in offer_payloads)
+    jurisdiction_points = (2 if _nonempty(country) else 0) + (2 if has_shipping else 0) + (2 if has_refund else 0) + (2 if has_terms else 0) + (2 if ship_market or _nonempty(country) else 0)
+    jurisdiction_missing = []
+    if not _nonempty(country):
+        jurisdiction_missing.append("merchants.country")
+    if not has_shipping:
+        jurisdiction_missing.append("pcs_shop_policies.shipping")
+    if not has_refund:
+        jurisdiction_missing.append("pcs_shop_policies.refund")
+    if not has_terms:
+        jurisdiction_missing.append("pcs_shop_policies.terms")
+    if not (ship_market or _nonempty(country)):
+        jurisdiction_missing.append("catalog_offers.offer_payload.ship_to_market")
+    _add_bucket(
+        breakdown, missing, "policy_jurisdiction",
+        jurisdiction_points, 10,
+        "policy and jurisdiction signals present" if jurisdiction_points == 10 else "partial policy/jurisdiction readiness",
+        missing=jurisdiction_missing or None,
+    )
+
+    linked_offer = any(o.get("sku_key") == sku.get("sku_key") and _nonempty(o.get("offer_id")) for o in offers)
+    visible_labels = _json_list(sku.get("visible_option_labels"))
+    visible_attrs = _json_obj(sku.get("visible_attributes"))
+    required_options = _json_list(sku_ctx.get("required_visible_options") or sku.get("required_visible_options"))
+    options_ok = True
+    if required_options:
+        available = {str(x).lower() for x in visible_labels}
+        available.update(str(k).lower() for k, v in visible_attrs.items() if _nonempty(v))
+        options_ok = all(str(opt).lower() in available for opt in required_options)
+    elif not visible_labels and not visible_attrs and len(_get_all_skus(sku_ctx or {})) > 1:
+        options_ok = False
+    route_points = (6 if linked_offer else 0) + (4 if options_ok else 0)
+    route_missing = []
+    if not linked_offer:
+        route_missing.append("catalog_offers.sku_key")
+    if not options_ok:
+        route_missing.append("catalog_skus.visible_option_labels")
+    _add_bucket(
+        breakdown, missing, "variant_route_integrity",
+        route_points, 10,
+        "selected SKU maps to a specific offer and options are complete" if route_points == 10 else "partial variant route integrity",
+        missing=route_missing or None,
+    )
+    return _finish_breakdown(breakdown, missing)
+
+
+def _flatten_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for probe in _json_list(per_sku_probe_runs):
+        if not isinstance(probe, dict):
+            continue
+        raw_runs = probe.get("raw_runs")
+        if isinstance(raw_runs, list):
+            probe_run_id = (
+                probe.get("probe_run_id")
+                or probe.get("run_id")
+                or probe.get("id")
+                or probe.get("scan_target_id")
+            )
+            for idx, run in enumerate(raw_runs):
+                if not isinstance(run, dict):
+                    continue
+                row = dict(run)
+                row.setdefault("_provider", probe.get("provider"))
+                row.setdefault("_probe_run_id", probe_run_id or f"{probe.get('provider') or 'probe'}:{idx}")
+                out.append(row)
+        elif "query" in probe:
+            row = dict(probe)
+            row.setdefault("_probe_run_id", probe.get("probe_run_id") or probe.get("run_id") or probe.get("id"))
+            out.append(row)
+    return out
+
+
+def _source_urls(run: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+    for source in run.get("grounding_sources") or []:
+        if isinstance(source, dict) and _nonempty(source.get("uri")):
+            urls.append(str(source.get("uri")))
+    for item in run.get("grounding_chunks") or []:
+        if isinstance(item, str) and item:
+            urls.append(item)
+    return urls
+
+
+def _url_in_sources(run: Dict[str, Any], targets: List[str]) -> bool:
+    normalized_targets = [t.strip().lower().rstrip("/") for t in targets if isinstance(t, str) and t.strip()]
+    if not normalized_targets:
+        return False
+    for url in _source_urls(run):
+        u = url.lower().rstrip("/")
+        if any(target in u or u in target for target in normalized_targets):
+            return True
+    return False
+
+
+def _run_text(run: Dict[str, Any]) -> str:
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+    return " ".join(
+        str(x or "")
+        for x in (
+            run.get("raw"),
+            run.get("evidence_excerpt"),
+            parsed.get("evidence_excerpt"),
+            parsed.get("evidence_text"),
+            parsed.get("answer"),
+        )
+    )
+
+
+def _text_mentions_any(text: str, values: List[Any]) -> bool:
+    haystack = _norm_text(text)
+    for value in values:
+        needle = _norm_text(value)
+        if needle and len(needle) >= 4 and needle in haystack:
+            return True
+    return False
+
+
+def _is_first_party_host(host: Optional[str], sku_ctx: Dict[str, Any]) -> bool:
+    if not host:
+        return False
+    product = _get_product(sku_ctx or {})
+    first_party_hosts = {
+        normalize_host(product.get("canonical_url") or ""),
+        normalize_host(product.get("pivota_canonical_url") or ""),
+        normalize_host(sku_ctx.get("canonical_url") or ""),
+        normalize_host(sku_ctx.get("pivota_canonical_url") or ""),
+    }
+    first_party_hosts.discard(None)
+    return host in first_party_hosts
+
+
+def compute_citation_score(
+    sku_ctx: Dict[str, Any],
+    per_sku_probe_runs: Any,
+) -> Tuple[int, Dict[str, Any]]:
+    """Spec A.4 citation score from Brief 1 per_sku_audit raw_runs."""
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    runs = _flatten_probe_runs(per_sku_probe_runs)
+    breakdown: Dict[str, Any] = {}
+    missing: List[str] = []
+    denominator = len(runs)
+    if denominator <= 0:
+        for name, max_points in (
+            ("first_party_rate", 45),
+            ("sku_mention_rate", 25),
+            ("authority_near_variant_rate", 20),
+            ("answer_quality_rate", 10),
+        ):
+            _add_bucket(
+                breakdown, missing, name, 0, max_points,
+                "data unavailable",
+                missing=["per_sku_audit.raw_runs"],
+                extra={"numerator": 0, "denominator": 0, "rate": 0.0},
+            )
+        return _finish_breakdown(breakdown, missing)
+
+    canonical_url = product.get("canonical_url") or sku_ctx.get("canonical_url")
+    pivota_url = product.get("pivota_canonical_url") or sku_ctx.get("pivota_canonical_url")
+    title = product.get("title") or sku.get("title")
+    sku_title = sku.get("title") or title
+    variant_name = sku.get("sku") or sku.get("source_variant_id")
+
+    first_party_hits = 0
+    sku_mentions = 0
+    authority_hits = 0
+    quality_hits = 0
+    for run in runs:
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+        url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+        llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
+        if bool(url_match.get("in_grounding")) or _url_in_sources(run, [canonical_url, pivota_url]):
+            first_party_hits += 1
+
+        text = _run_text(run)
+        if (
+            parsed.get("sku_mentioned") is True
+            or parsed.get("correct_sku") is True
+            or llm_report.get("sku_mentioned") is True
+            or llm_report.get("correct_sku") is True
+            or _text_mentions_any(text, [title, sku_title, variant_name])
+        ):
+            sku_mentions += 1
+
+        source_hosts = [normalize_host(url) for url in _source_urls(run)]
+        external_source_present = any(host and not _is_first_party_host(host, sku_ctx or {}) for host in source_hosts)
+        if parsed.get("authority_near_variant_found") is True or llm_report.get("authority_near_variant_found") is True or (
+            external_source_present
+            and (
+                parsed.get("correct_sku") is True
+                or llm_report.get("correct_sku") is True
+                or parsed.get("product_visible") is True
+                or llm_report.get("product_visible") is True
+                or _text_mentions_any(text, [title, sku_title, product.get("content_key"), sku_ctx.get("product_group_id")])
+            )
+        ):
+            authority_hits += 1
+
+        correct_sku = parsed.get("correct_sku") if parsed.get("correct_sku") is not None else llm_report.get("correct_sku")
+        product_visible = parsed.get("product_visible") if parsed.get("product_visible") is not None else llm_report.get("product_visible")
+        if correct_sku is True or (
+            correct_sku is not False
+            and product_visible is True
+            and (run.get("grounding_sources") or run.get("grounding_chunks"))
+        ):
+            quality_hits += 1
+
+    def _rate_bucket(name: str, numerator: int, max_points: int) -> None:
+        rate = numerator / denominator if denominator else 0.0
+        points = int(round(max_points * rate))
+        _add_bucket(
+            breakdown, missing, name, points, max_points,
+            f"{numerator}/{denominator} prompts matched",
+            extra={"numerator": numerator, "denominator": denominator, "rate": round(rate, 4)},
+        )
+
+    _rate_bucket("first_party_rate", first_party_hits, 45)
+    _rate_bucket("sku_mention_rate", sku_mentions, 25)
+    _rate_bucket("authority_near_variant_rate", authority_hits, 20)
+    _rate_bucket("answer_quality_rate", quality_hits, 10)
+    total = int(round(
+        45 * (first_party_hits / denominator)
+        + 25 * (sku_mentions / denominator)
+        + 20 * (authority_hits / denominator)
+        + 10 * (quality_hits / denominator)
+    ))
+    total = max(0, min(100, total))
+    breakdown["total"] = total
+    if missing:
+        breakdown["missing_inputs"] = missing
+    return total, breakdown
+
+
+async def _fetch_one_dict(query: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    from db.database import database
+    try:
+        row = await database.fetch_one(query, values)
+    except Exception:
+        return None
+    return _row_dict(row)
+
+
+async def _fetch_all_dicts(query: str, values: Dict[str, Any]) -> List[Dict[str, Any]]:
+    from db.database import database
+    try:
+        rows = await database.fetch_all(query, values)
+    except Exception:
+        return []
+    return [d for d in (_row_dict(row) for row in rows or []) if d is not None]
+
+
+async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
+    """Read-only SKU-context loader for spec A.1-A.3 catalog signals."""
+    cache_key = (str(sku_key or ""), str(merchant_id or ""))
+    if cache_key in _SKU_CONTEXT_CACHE:
+        return _SKU_CONTEXT_CACHE[cache_key]
+    if not cache_key[0] or not cache_key[1]:
+        return {"sku_key": sku_key, "merchant_id": merchant_id, "missing_inputs": ["sku_key", "merchant_id"]}
+
+    sku = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM catalog_skus
+         WHERE sku_key = :sku_key
+           AND merchant_id = :merchant_id
+         LIMIT 1
+        """,
+        {"sku_key": sku_key, "merchant_id": merchant_id},
+    )
+    if not sku:
+        ctx = {"sku_key": sku_key, "merchant_id": merchant_id, "missing_inputs": ["catalog_skus"]}
+        _SKU_CONTEXT_CACHE[cache_key] = ctx
+        return ctx
+
+    product_key = sku.get("product_key")
+    product = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM catalog_products
+         WHERE product_key = :product_key
+           AND merchant_id = :merchant_id
+         LIMIT 1
+        """,
+        {"product_key": product_key, "merchant_id": merchant_id},
+    ) or {}
+    platform = product.get("platform") or sku.get("platform")
+    source_product_id = product.get("source_product_id") or sku.get("source_product_id")
+
+    all_skus = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM catalog_skus
+         WHERE product_key = :product_key
+           AND merchant_id = :merchant_id
+        """,
+        {"product_key": product_key, "merchant_id": merchant_id},
+    )
+    offers = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM catalog_offers
+         WHERE merchant_id = :merchant_id
+           AND (sku_key = :sku_key OR product_key = :product_key)
+        """,
+        {"merchant_id": merchant_id, "sku_key": sku_key, "product_key": product_key},
+    )
+    product_group_members = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM product_group_members
+         WHERE merchant_id = :merchant_id
+           AND platform_product_id = :platform_product_id
+        """,
+        {"merchant_id": merchant_id, "platform_product_id": source_product_id},
+    )
+    group_id = product_group_members[0].get("product_group_id") if product_group_members else None
+    index_state = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM index_pipeline_state
+         WHERE product_key = :product_key
+            OR (merchant_id = :merchant_id AND product_group_id = :product_group_id)
+         LIMIT 1
+        """,
+        {"product_key": product_key, "merchant_id": merchant_id, "product_group_id": group_id},
+    ) or {}
+    enrichment = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM product_enrichment
+         WHERE merchant_id = :merchant_id
+           AND platform = :platform
+           AND platform_product_id = :platform_product_id
+         ORDER BY CASE WHEN geo_code = 'default' THEN 0 ELSE 1 END
+         LIMIT 1
+        """,
+        {"merchant_id": merchant_id, "platform": platform, "platform_product_id": source_product_id},
+    ) or {}
+    quality = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM product_quality_snapshot
+         WHERE merchant_id = :merchant_id
+           AND platform = :platform
+           AND platform_product_id = :platform_product_id
+         ORDER BY snapshot_date DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT 1
+        """,
+        {"merchant_id": merchant_id, "platform": platform, "platform_product_id": source_product_id},
+    ) or {}
+    field_facts = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM catalog_field_facts
+         WHERE (entity_id = :product_key OR entity_id = :sku_key)
+         ORDER BY observed_at DESC NULLS LAST
+         LIMIT 50
+        """,
+        {"product_key": product_key, "sku_key": sku_key},
+    )
+    beauty_profile = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM beauty_product_profiles
+         WHERE product_key = :product_key
+           AND merchant_id = :merchant_id
+         LIMIT 1
+        """,
+        {"product_key": product_key, "merchant_id": merchant_id},
+    ) or {}
+    beauty_ingredients = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM beauty_sku_ingredients
+         WHERE sku_key = :sku_key
+           AND merchant_id = :merchant_id
+        """,
+        {"sku_key": sku_key, "merchant_id": merchant_id},
+    )
+    beauty_usage_guides = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM beauty_usage_guides
+         WHERE merchant_id = :merchant_id
+           AND (sku_key = :sku_key OR product_key = :product_key)
+        """,
+        {"sku_key": sku_key, "product_key": product_key, "merchant_id": merchant_id},
+    )
+    beauty_compatibility = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM beauty_compatibility_rules
+         WHERE merchant_id = :merchant_id
+           AND (sku_key = :sku_key OR product_key = :product_key)
+        """,
+        {"sku_key": sku_key, "product_key": product_key, "merchant_id": merchant_id},
+    )
+    commerce = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM merchant_commerce_readiness_state
+         WHERE merchant_id = :merchant_id
+         LIMIT 1
+        """,
+        {"merchant_id": merchant_id},
+    ) or {}
+    policies = await _fetch_all_dicts(
+        """
+        SELECT *
+          FROM pcs_shop_policies
+         WHERE merchant_id = :merchant_id
+        """,
+        {"merchant_id": merchant_id},
+    )
+    merchant = await _fetch_one_dict(
+        """
+        SELECT *
+          FROM merchants
+         WHERE merchant_id = :merchant_id
+         LIMIT 1
+        """,
+        {"merchant_id": merchant_id},
+    ) or {}
+    content_key = product.get("content_key")
+    peers = []
+    if content_key:
+        peers = await _fetch_all_dicts(
+            """
+            SELECT cp.product_key, cp.brand, cp.title, cp.content_key,
+                   pgm.product_group_id
+              FROM catalog_products cp
+              LEFT JOIN product_group_members pgm
+                ON pgm.merchant_id = cp.merchant_id
+               AND pgm.platform = cp.platform
+               AND pgm.platform_product_id = cp.source_product_id
+             WHERE cp.content_key = :content_key
+             LIMIT 25
+            """,
+            {"content_key": content_key},
+        )
+
+    ctx = {
+        "sku_key": sku_key,
+        "merchant_id": merchant_id,
+        "product_key": product_key,
+        "content_key": content_key,
+        "product": product,
+        "sku": sku,
+        "all_skus": all_skus,
+        "offers": offers,
+        "product_group_members": product_group_members,
+        "index_pipeline_state": index_state,
+        "product_enrichment": enrichment,
+        "product_quality_snapshot": quality,
+        "catalog_field_facts": field_facts,
+        "beauty_product_profile": beauty_profile,
+        "beauty_sku_ingredients": beauty_ingredients,
+        "beauty_usage_guides": beauty_usage_guides,
+        "beauty_compatibility_rules": beauty_compatibility,
+        "merchant_commerce_readiness_state": commerce,
+        "pcs_shop_policies": policies,
+        "merchant": merchant,
+        "content_key_peers": peers,
+    }
+    _SKU_CONTEXT_CACHE[cache_key] = ctx
+    return ctx
+
+
+def _matches_sku_run(run: Dict[str, Any], sku_key: str) -> bool:
+    meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+    return not sku_key or (meta.get("sku_key") == sku_key)
+
+
+def _extract_probe_result_candidates(doc: Any, sku_key: str) -> List[Dict[str, Any]]:
+    found: List[Dict[str, Any]] = []
+    if isinstance(doc, list):
+        for item in doc:
+            found.extend(_extract_probe_result_candidates(item, sku_key))
+        return found
+    if not isinstance(doc, dict):
+        return found
+
+    for key in ("per_sku_probe_runs", "probe_runs_by_sku", "raw_runs_by_sku"):
+        mapping = doc.get(key)
+        if isinstance(mapping, dict):
+            value = mapping.get(sku_key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        found.append(item)
+            elif isinstance(value, dict):
+                found.append(value)
+
+    raw_runs = doc.get("raw_runs")
+    if isinstance(raw_runs, list) and (
+        doc.get("scan_mode") == "per_sku_audit"
+        or any(isinstance(r, dict) and _matches_sku_run(r, sku_key) for r in raw_runs)
+    ):
+        filtered = [r for r in raw_runs if isinstance(r, dict) and _matches_sku_run(r, sku_key)]
+        if filtered:
+            copy = dict(doc)
+            copy["raw_runs"] = filtered
+            found.append(copy)
+
+    for value in doc.values():
+        if isinstance(value, (dict, list)):
+            found.extend(_extract_probe_result_candidates(value, sku_key))
+    return found
+
+
+async def load_per_sku_probe_runs(
+    sku_key: str,
+    merchant_id: str,
+    audit_run_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Best-effort read of persisted per_sku_audit probe payloads."""
+    if not audit_run_id:
+        return []
+    row = await _fetch_one_dict(
+        """
+        SELECT report_jsonb, partial_result_jsonb, cost_summary_jsonb
+          FROM merchant_audit_runs
+         WHERE run_id = :audit_run_id
+           AND merchant_id = :merchant_id
+         LIMIT 1
+        """,
+        {"audit_run_id": audit_run_id, "merchant_id": merchant_id},
+    )
+    if not row:
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for key in ("report_jsonb", "partial_result_jsonb"):
+        candidates.extend(_extract_probe_result_candidates(row.get(key), sku_key))
+    # De-dupe by probe_run_id/provider/raw query tuple.
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for candidate in candidates:
+        raw = candidate.get("raw_runs") if isinstance(candidate, dict) else None
+        queries = tuple((r.get("query") or "") for r in raw or [] if isinstance(r, dict))
+        key = (candidate.get("probe_run_id") or candidate.get("run_id") or candidate.get("provider"), queries)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
+    counts: Counter = Counter()
+    for run in _flatten_probe_runs(probe_runs):
+        meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+        axis = str(meta.get("axis") or "unknown").strip() or "unknown"
+        counts[axis] += 1
+    return dict(counts)
+
+
+def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
+    evidence: List[Dict[str, Any]] = []
+    for run in _flatten_probe_runs(probe_runs):
+        sources = run.get("grounding_sources") or []
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+        excerpt = (
+            run.get("evidence_excerpt")
+            or parsed.get("evidence_excerpt")
+            or parsed.get("evidence_text")
+        )
+        if not sources and not excerpt:
+            continue
+        evidence.append({
+            "probe_run_id": run.get("_probe_run_id"),
+            "query": run.get("query"),
+            "axis_metadata": run.get("axis_metadata"),
+            "grounding_sources": sources,
+            "evidence_excerpt": excerpt or None,
+        })
+        if len(evidence) >= cap:
+            break
+    return evidence
+
+
+def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for run in _flatten_probe_runs(probe_runs):
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+        url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+        llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
+        ok = bool(
+            parsed.get("correct_sku") is True
+            or parsed.get("sku_mentioned") is True
+            or llm_report.get("correct_sku") is True
+            or llm_report.get("sku_mentioned") is True
+            or url_match.get("in_grounding") is True
+            or run.get("product_visible") is True
+        )
+        if ok:
+            continue
+        out.append({
+            "query": run.get("query"),
+            "axis": (run.get("axis_metadata") or {}).get("axis") if isinstance(run.get("axis_metadata"), dict) else None,
+            "reason": "no first-party or correct-SKU grounded citation",
+            "evidence_run_id": run.get("_probe_run_id"),
+            "grounding_sources": run.get("grounding_sources") or [],
+            "competitors_named": parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or [],
+        })
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _primary_gaps(scores: Dict[str, Any], cap: int = 3) -> List[Dict[str, Any]]:
+    gaps: List[Dict[str, Any]] = []
+    for dimension, payload in scores.items():
+        breakdown = (payload or {}).get("breakdown") or {}
+        for bucket, detail in breakdown.items():
+            if bucket in {"total", "missing_inputs"} or not isinstance(detail, dict):
+                continue
+            max_points = int(detail.get("max") or 0)
+            points = int(detail.get("points") or 0)
+            gap = max(0, max_points - points)
+            if gap <= 0:
+                continue
+            gaps.append({
+                "dimension": dimension,
+                "bucket": bucket,
+                "points": points,
+                "max": max_points,
+                "gap": gap,
+                "reason": detail.get("reason"),
+            })
+    gaps.sort(key=lambda g: (-g["gap"], g["dimension"], g["bucket"]))
+    return gaps[:cap]
+
+
+def _band_for_score(score: Optional[int]) -> str:
+    if score is None:
+        return "blocked"
+    if score < 40:
+        return "blocked"
+    if score < 70:
+        return "partial"
+    if score < 85:
+        return "ready"
+    return "agent_ready"
+
+
+def _sku_band(scores: Dict[str, Any]) -> str:
+    values = [
+        payload.get("score")
+        for payload in scores.values()
+        if isinstance(payload, dict) and payload.get("score") is not None
+    ]
+    return _band_for_score(min(values) if values else None)
+
+
+def _impact_proxy_from_context(sku_ctx: Dict[str, Any]) -> float:
+    offers = _get_offers(sku_ctx or {})
+    prices = [
+        _as_number(o.get("merchant_effective_price")) or _as_number(o.get("estimated_best_price")) or _as_number(o.get("list_price"))
+        for o in offers
+    ]
+    prices = [p for p in prices if p is not None and p > 0]
+    price = prices[0] if prices else 1.0
+    return round(float(price) * math.log(1 + max(1, len(offers))), 4)
+
+
+async def build_per_sku_report(
+    sku_key: str,
+    merchant_id: str,
+    audit_run_id: Optional[str],
+) -> Dict[str, Any]:
+    sku_ctx = await load_sku_context(sku_key, merchant_id)
+    probe_runs = await load_per_sku_probe_runs(sku_key, merchant_id, audit_run_id)
+    product = _get_product(sku_ctx)
+
+    if sku_ctx.get("missing_inputs") and not product.get("product_key"):
+        null_breakdown = {
+            "total": None,
+            "missing_inputs": list(sku_ctx.get("missing_inputs") or []),
+            "reason": "entire SKU unaudited",
+        }
+        scores = {
+            dim: {"score": None, "breakdown": dict(null_breakdown)}
+            for dim in ("identity", "content_richness", "routability", "citation")
+        }
+    else:
+        identity_score, identity_breakdown = compute_identity_score(sku_ctx)
+        content_score, content_breakdown = compute_content_richness_score(sku_ctx)
+        routing_score, routing_breakdown = compute_routability_score(sku_ctx)
+        citation_score, citation_breakdown = compute_citation_score(sku_ctx, probe_runs)
+        scores = {
+            "identity": {"score": identity_score, "breakdown": identity_breakdown},
+            "content_richness": {"score": content_score, "breakdown": content_breakdown},
+            "routability": {"score": routing_score, "breakdown": routing_breakdown},
+            "citation": {"score": citation_score, "breakdown": citation_breakdown},
+        }
+
+    report = {
+        "sku_key": sku_key,
+        "product_key": sku_ctx.get("product_key") or product.get("product_key"),
+        "content_key": sku_ctx.get("content_key") or product.get("content_key"),
+        "sku_title": (_get_sku(sku_ctx).get("title") or product.get("title")),
+        "scores": scores,
+        "band": _sku_band(scores),
+        "primary_gaps": _primary_gaps(scores),
+        "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
+        "axis_coverage": _axis_coverage(probe_runs),
+        "failing_prompts": _failing_prompts(probe_runs),
+        "impact_proxy": _impact_proxy_from_context(sku_ctx),
+    }
+    return report
+
+
+def _percentile(values: List[int], pct: float) -> Optional[int]:
+    nums = sorted(int(v) for v in values if v is not None)
+    if not nums:
+        return None
+    if len(nums) == 1:
+        return nums[0]
+    pos = (len(nums) - 1) * pct
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return nums[int(pos)]
+    interpolated = nums[lo] + (nums[hi] - nums[lo]) * (pos - lo)
+    return int(round(interpolated))
+
+
+def _dimension_distribution(per_sku_reports: List[Dict[str, Any]], dimension: str) -> Dict[str, Optional[int]]:
+    values = [
+        int((r.get("scores") or {}).get(dimension, {}).get("score"))
+        for r in per_sku_reports
+        if (r.get("scores") or {}).get(dimension, {}).get("score") is not None
+    ]
+    return {
+        "median": _percentile(values, 0.5),
+        "p25": _percentile(values, 0.25),
+        "p75": _percentile(values, 0.75),
+    }
+
+
+def _overall_score(report: Dict[str, Any]) -> int:
+    values = [
+        int(payload.get("score"))
+        for payload in (report.get("scores") or {}).values()
+        if isinstance(payload, dict) and payload.get("score") is not None
+    ]
+    return min(values) if values else 0
+
+
+def _fixability_for(dimension: str, bucket: Optional[str] = None) -> float:
+    if dimension in {"identity", "content_richness", "routability"}:
+        return 1.0
+    if bucket == "authority_near_variant_rate":
+        return 0.2
+    if bucket in {"answer_quality_rate", "sku_mention_rate", "first_party_rate"}:
+        return 0.5
+    return 0.5
+
+
+def build_brand_rollup(
+    per_sku_reports: List[Dict[str, Any]],
+    merchant_id: str,
+) -> Dict[str, Any]:
+    dimensions = {
+        dim: _dimension_distribution(per_sku_reports, dim)
+        for dim in ("identity", "content_richness", "routability", "citation")
+    }
+    top_by_citation = sorted(
+        per_sku_reports,
+        key=lambda r: ((r.get("scores") or {}).get("citation", {}).get("score") or -1),
+        reverse=True,
+    )[:5]
+    band_rank = {"agent_ready": 3, "ready": 2, "partial": 1, "blocked": 0}
+    top_by_band = sorted(
+        per_sku_reports,
+        key=lambda r: (band_rank.get(r.get("band"), -1), _overall_score(r)),
+        reverse=True,
+    )[:5]
+    blocked = []
+    for report in per_sku_reports:
+        scores = report.get("scores") or {}
+        identity = (scores.get("identity") or {}).get("score")
+        routing = (scores.get("routability") or {}).get("score")
+        citation = (scores.get("citation") or {}).get("score")
+        if (identity is not None and identity < 40) or (routing is not None and routing < 40) or citation == 0:
+            blocked.append({
+                "sku_key": report.get("sku_key"),
+                "product_key": report.get("product_key"),
+                "identity": identity,
+                "routability": routing,
+                "citation": citation,
+            })
+
+    priority_queue: List[Dict[str, Any]] = []
+    for report in per_sku_reports:
+        impact = _as_number(report.get("impact_proxy")) or 1.0
+        for gap in report.get("primary_gaps") or []:
+            dimension = gap.get("dimension")
+            score = ((report.get("scores") or {}).get(dimension or "") or {}).get("score")
+            if score is None:
+                continue
+            score_gap = max(0, 100 - int(score))
+            fixability = _fixability_for(str(dimension), gap.get("bucket"))
+            priority = round(float(impact) * score_gap * fixability, 4)
+            priority_queue.append({
+                "sku_key": report.get("sku_key"),
+                "product_key": report.get("product_key"),
+                "dimension": dimension,
+                "bucket": gap.get("bucket"),
+                "dimension_score": score,
+                "impact": impact,
+                "gap": score_gap,
+                "fixability": fixability,
+                "priority_score": priority,
+                "reason": gap.get("reason"),
+            })
+    priority_queue.sort(key=lambda row: row.get("priority_score") or 0, reverse=True)
+
+    return {
+        "merchant_id": merchant_id,
+        "skus_audited": len(per_sku_reports),
+        "dimensions": dimensions,
+        "winning_skus_by_citation": [
+            {
+                "sku_key": r.get("sku_key"),
+                "product_key": r.get("product_key"),
+                "citation_score": (r.get("scores") or {}).get("citation", {}).get("score"),
+                "band": r.get("band"),
+            }
+            for r in top_by_citation
+        ],
+        "winning_skus_by_band": [
+            {
+                "sku_key": r.get("sku_key"),
+                "product_key": r.get("product_key"),
+                "overall_score": _overall_score(r),
+                "band": r.get("band"),
+            }
+            for r in top_by_band
+        ],
+        "blocked_skus": blocked,
+        "priority_queue": priority_queue[:25],
+    }
+
+
+def _classify_authority_host(host: Optional[str]) -> str:
+    h = (host or "").strip().lower()
+    if not h:
+        return "unclassified"
+    if h == "reddit.com" or h.endswith(".reddit.com"):
+        return "reddit"
+    classified = classify_host(h)
+    host_type = (classified.get("type") or "unclassified").lower()
+    subtype = (classified.get("subtype") or "").lower()
+    if host_type == "editorial":
+        return "trade" if "trade" in subtype else "editorial"
+    if host_type in {"retailer", "marketplace", "brand"}:
+        return "retailer"
+    if host_type == "video":
+        return "creator"
+    return "unclassified"
+
+
+def _reddit_subreddit_from_url(url: str) -> Optional[str]:
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    parts = [p for p in (parsed.path or "").split("/") if p]
+    for i, part in enumerate(parts):
+        if part.lower() == "r" and i + 1 < len(parts):
+            return f"r/{parts[i + 1]}"
+    return None
+
+
+def build_authority_map(
+    per_sku_reports: List[Dict[str, Any]],
+    probe_runs_by_sku: Dict[str, Any],
+) -> Dict[str, Any]:
+    sku_entries: List[Dict[str, Any]] = []
+    host_matrix: Dict[str, Dict[str, Any]] = {}
+    for report in per_sku_reports or []:
+        sku_key = report.get("sku_key")
+        probe_runs = probe_runs_by_sku.get(sku_key) if isinstance(probe_runs_by_sku, dict) else []
+        host_rows: Dict[str, Dict[str, Any]] = {}
+        reddit_threads: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for run in _flatten_probe_runs(probe_runs):
+            parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+            url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+            llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
+            competitors = parsed.get("competitors_listed") or parsed.get("competitors_appearing") or run.get("competitors_listed") or []
+            exact = (
+                parsed.get("correct_sku") is True
+                or parsed.get("sku_mentioned") is True
+                or llm_report.get("correct_sku") is True
+                or llm_report.get("sku_mentioned") is True
+            )
+            near = parsed.get("authority_near_variant_found") is True or llm_report.get("authority_near_variant_found") is True
+            excerpt = run.get("evidence_excerpt") or parsed.get("evidence_excerpt") or parsed.get("evidence_text")
+            for source in run.get("grounding_sources") or []:
+                if not isinstance(source, dict):
+                    continue
+                uri = source.get("uri") or ""
+                host = normalize_host(uri)
+                if not host:
+                    continue
+                host_type = _classify_authority_host(host)
+                row = host_rows.setdefault(host, {
+                    "host": host,
+                    "host_type": host_type,
+                    "cites_exact_sku": False,
+                    "cites_near_variant": False,
+                    "cites_category_not_sku": False,
+                    "prompts_cited_count": 0,
+                    "evidence_urls": [],
+                    "evidence_excerpt": None,
+                    "competitors_named": [],
+                    "_queries": set(),
+                })
+                row["cites_exact_sku"] = bool(row["cites_exact_sku"] or exact)
+                row["cites_near_variant"] = bool(row["cites_near_variant"] or near)
+                row["cites_category_not_sku"] = bool(row["cites_category_not_sku"] or (not exact and not near))
+                query = run.get("query") or ""
+                if query not in row["_queries"]:
+                    row["_queries"].add(query)
+                    row["prompts_cited_count"] += 1
+                if uri and uri not in row["evidence_urls"]:
+                    row["evidence_urls"].append(uri)
+                if excerpt and not row.get("evidence_excerpt"):
+                    row["evidence_excerpt"] = str(excerpt)[:280]
+                for competitor in competitors or []:
+                    if competitor and competitor not in row["competitors_named"]:
+                        row["competitors_named"].append(competitor)
+
+                matrix = host_matrix.setdefault(host, {
+                    "host": host,
+                    "host_type": host_type,
+                    "skus": set(),
+                    "prompts_cited_count": 0,
+                })
+                matrix["skus"].add(sku_key)
+                matrix["prompts_cited_count"] += 1
+
+                if host_type == "reddit":
+                    subreddit = _reddit_subreddit_from_url(uri) or "r/unknown"
+                    reddit_threads[subreddit].append({
+                        "url": uri,
+                        "title": source.get("title") or "",
+                        "sentiment": None,
+                        "matched_sku": bool(exact or near),
+                    })
+
+        authority_hosts = []
+        for row in host_rows.values():
+            row.pop("_queries", None)
+            authority_hosts.append(row)
+        authority_hosts.sort(key=lambda r: r.get("prompts_cited_count") or 0, reverse=True)
+        reddit_subreddits = [
+            {
+                "name": name,
+                "threads": threads,
+                "sentiment_proxy": None,
+                "recurring_objections": [],
+            }
+            for name, threads in sorted(reddit_threads.items())
+        ]
+        sku_entries.append({
+            "sku_key": sku_key,
+            "product_key": report.get("product_key"),
+            "content_key": report.get("content_key"),
+            "authority_hosts": authority_hosts,
+            "reddit": {"subreddits": reddit_subreddits},
+        })
+
+    matrix_rows = []
+    for row in host_matrix.values():
+        matrix_rows.append({
+            "host": row["host"],
+            "host_type": row["host_type"],
+            "skus": sorted(s for s in row["skus"] if s),
+            "prompts_cited_count": row["prompts_cited_count"],
+        })
+    matrix_rows.sort(key=lambda r: r["prompts_cited_count"], reverse=True)
+    return {"skus": sku_entries, "hosts": matrix_rows}
+
+
+async def _sku_keys_for_per_sku_mode(
+    products: List[Dict[str, Any]],
+    merchant_id: str,
+) -> List[str]:
+    keys: List[str] = []
+    product_keys: List[str] = []
+    for product in products or []:
+        sku_key = (product.get("sku_key") or "").strip()
+        if sku_key and sku_key not in keys:
+            keys.append(sku_key)
+        product_key = (product.get("product_key") or "").strip()
+        if product_key:
+            product_keys.append(product_key)
+    if keys or not product_keys or not merchant_id:
+        return keys
+    placeholders = ", ".join(f":pk{i}" for i, _ in enumerate(product_keys))
+    values = {"merchant_id": merchant_id, **{f"pk{i}": pk for i, pk in enumerate(product_keys)}}
+    rows = await _fetch_all_dicts(
+        f"""
+        SELECT sku_key
+          FROM catalog_skus
+         WHERE merchant_id = :merchant_id
+           AND product_key IN ({placeholders})
+         ORDER BY product_key, sku_key
+        """,
+        values,
+    )
+    for row in rows:
+        sku_key = row.get("sku_key")
+        if sku_key and sku_key not in keys:
+            keys.append(sku_key)
+    return keys
+
+
+def _legacy_verdict_from_report(legacy_report: Dict[str, Any]) -> Optional[str]:
+    aggregate = legacy_report.get("aggregate") or {}
+    return aggregate.get("brand_verdict_label") or legacy_report.get("verdict_label")
+
+
+async def _cost_summary_for_per_sku_audit(
+    audit_run_id: Optional[str],
+    probe_runs_by_sku: Dict[str, Any],
+) -> Dict[str, Any]:
+    if audit_run_id:
+        try:
+            from db.llm_probe_runs import aggregate_cost_for_run
+            recorded = await aggregate_cost_for_run(audit_run_id=audit_run_id)
+        except Exception:
+            recorded = None
+        if recorded:
+            return {
+                "prompts": int(recorded.get("llm_calls") or 0),
+                "providers": [
+                    p.get("provider")
+                    for p in recorded.get("providers") or []
+                    if p.get("provider")
+                ],
+                **recorded,
+            }
+
+    providers = set()
+    prompts = 0
+    input_tokens = 0
+    output_tokens = 0
+    estimated_cost = 0.0
+    for probe_runs in (probe_runs_by_sku or {}).values():
+        for probe in _json_list(probe_runs):
+            if not isinstance(probe, dict):
+                continue
+            if probe.get("provider"):
+                providers.add(probe.get("provider"))
+            prompts += len(probe.get("raw_runs") or [])
+            usage = probe.get("usage") or {}
+            input_tokens += int(usage.get("input_tokens") or usage.get("tokens_in") or 0)
+            output_tokens += int(usage.get("output_tokens") or usage.get("tokens_out") or 0)
+            estimated_cost += float(usage.get("estimated_cost_usd") or usage.get("cost_usd") or 0)
+    return {
+        "prompts": prompts,
+        "providers": sorted(providers),
+        "llm_calls": prompts,
+        "total_input_tokens": input_tokens,
+        "total_output_tokens": output_tokens,
+        "estimated_cost_usd": round(estimated_cost, 6),
+        "_telemetry_source": "per_sku_probe_payload",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Brand-level multi-product BD report (Phase 2b)
 #
 # Merchants pitch their brand, not a single SKU. The brand report runs
@@ -1355,6 +3082,9 @@ async def run_brand_report(
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     integration_state: Optional[Dict[str, Any]] = None,
     include_social_intelligence: bool = False,
+    audit_mode: str = "legacy",
+    merchant_id: Optional[str] = None,
+    audit_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run BD probes against up to 5 products of one merchant and
     aggregate into a brand-level report.
@@ -1378,6 +3108,55 @@ async def run_brand_report(
         raise ValueError("merchant_name is required")
     if not products:
         raise ValueError("products is required (at least 1)")
+    if audit_mode not in {"legacy", "per_sku"}:
+        raise ValueError("audit_mode must be 'legacy' or 'per_sku'")
+
+    if audit_mode == "per_sku":
+        if not merchant_id or not str(merchant_id).strip():
+            raise ValueError("merchant_id is required for audit_mode='per_sku'")
+        reset_sku_context_cache()
+        sku_keys = await _sku_keys_for_per_sku_mode(products, str(merchant_id))
+        if not sku_keys:
+            raise ValueError("per_sku audit requires products with sku_key or product_key")
+        per_sku_reports: List[Dict[str, Any]] = []
+        probe_runs_by_sku: Dict[str, Any] = {}
+        for sku_key in sku_keys:
+            probe_runs_by_sku[sku_key] = await load_per_sku_probe_runs(
+                sku_key, str(merchant_id), audit_run_id,
+            )
+            per_sku_reports.append(
+                await build_per_sku_report(
+                    sku_key, str(merchant_id), audit_run_id,
+                )
+            )
+        brand_rollup = build_brand_rollup(per_sku_reports, str(merchant_id))
+        authority_map = build_authority_map(per_sku_reports, probe_runs_by_sku)
+        median_citation = (
+            (brand_rollup.get("dimensions") or {})
+            .get("citation", {})
+            .get("median")
+        )
+        legacy_label, _legacy_explanation = verdict_for(
+            int(median_citation or 0),
+            int(median_citation or 0),
+        )
+        cost_summary = await _cost_summary_for_per_sku_audit(
+            audit_run_id, probe_runs_by_sku,
+        )
+        return {
+            "audit_run_id": audit_run_id,
+            "merchant_id": str(merchant_id),
+            "merchant_name": merchant_name,
+            "merchant_domain": (merchant_domain or "").strip() or None,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "audit_mode": "per_sku",
+            "per_sku_reports": per_sku_reports,
+            "brand_rollup": brand_rollup,
+            "authority_map": authority_map,
+            "legacy_verdict": legacy_label,
+            "cost_summary": cost_summary,
+        }
+
     if len(products) > _BRAND_REPORT_MAX_PRODUCTS:
         raise ValueError(
             f"products capped at {_BRAND_REPORT_MAX_PRODUCTS} per brand "
