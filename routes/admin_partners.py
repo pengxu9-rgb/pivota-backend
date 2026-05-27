@@ -23,6 +23,10 @@ class PartnerSubsidyIssueRequest(BaseModel):
     notes: str | None = None
 
 
+class StripeConnectUpsertRequest(BaseModel):
+    stripe_connect_account_id: str | None = None
+
+
 @router.get("/admin/partners")
 async def list_admin_partners(
     current_admin: dict = Depends(require_admin),
@@ -164,6 +168,52 @@ async def get_admin_partner(
         "ytd_gmv_cents": int(_row_get(row, "ytd_gmv_cents") or 0),
         "cohort_progress": cohort_progress,
     }
+
+
+@router.put(
+    "/admin/partners/{channel_partner_id}/stripe-connect",
+    response_model=None,
+)
+async def upsert_partner_stripe_connect(
+    channel_partner_id: int,
+    body: StripeConnectUpsertRequest,
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any] | JSONResponse:
+    """Set or clear the partner's Stripe Connect account id.
+
+    Pass `stripe_connect_account_id: null` to clear. Otherwise the value must
+    look like a Stripe account id (`acct_...`).
+    """
+
+    raw = body.stripe_connect_account_id
+    normalized: str | None
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        normalized = None
+    else:
+        normalized = raw.strip()
+        if not normalized.startswith("acct_") or len(normalized) < 8:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_stripe_account_id"},
+            )
+
+    existing = await database.fetch_one(
+        "SELECT id FROM channel_partners WHERE id = :id LIMIT 1",
+        {"id": channel_partner_id},
+    )
+    if not existing:
+        return JSONResponse(status_code=404, content={"error": "partner_not_found"})
+
+    await database.execute(
+        """
+        UPDATE channel_partners
+        SET stripe_connect_account_id = :acct
+        WHERE id = :id
+        """,
+        {"acct": normalized, "id": channel_partner_id},
+    )
+
+    return await get_admin_partner(channel_partner_id, current_admin)
 
 
 @router.post(
