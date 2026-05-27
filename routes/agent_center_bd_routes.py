@@ -34,6 +34,7 @@ risk that took backend down already).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -399,6 +400,11 @@ class BdColdStartAuditRequest(BaseModel):
     # to read results.
     audit_competitors: bool = Field(False)
     cohort_size: int = Field(3, ge=1, le=5)
+    # Full cold-start audits can exceed browser/proxy request timeouts
+    # because they fan out to many grounded LLM probes. When True,
+    # the route returns a run id immediately and the UI polls the
+    # status endpoint until report_jsonb is ready.
+    background: bool = Field(False)
 
     @validator("url")
     def _url_looks_like_url(cls, v: str) -> str:
@@ -414,17 +420,35 @@ class BdColdStartAuditRequest(BaseModel):
         return v
 
 
-@router.post("/cold-start-audit")
-async def cold_start_audit(
-    body: BdColdStartAuditRequest,
-    current_user: Dict[str, Any] = Depends(get_current_employee),
-) -> Dict[str, Any]:
-    """URL-only BD audit. Auto-discovers brand + products, runs
-    full brand report.
+def _cold_start_integration_state() -> Dict[str, Any]:
+    """Synthetic integration state for non-onboarded BD prospects."""
+    return {
+        "store_platform_integrated": False,
+        "psp_integrated": False,
+        "gsc_integrated": False,
+        "fully_integrated": False,
+        "missing_pieces": ["store_platform", "psp"],
+        "integration_completed_at": None,
+        "store_platform_name": None,
+        "psp_provider": None,
+        "store_connected_at": None,
+    }
 
-    Returns 422 with diagnostic when discovery fails entirely — BD
-    operator falls back to /brand-report manual entry.
-    """
+
+def _http_exception_message(exc: HTTPException) -> str:
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("code") or detail)
+    return str(detail)
+
+
+async def _run_cold_start_audit_pipeline(
+    body: BdColdStartAuditRequest,
+    *,
+    precreated_run_id: Optional[str] = None,
+    precreated_prospect_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Shared cold-start implementation for sync and background runs."""
     from services.bd_cold_start_service import (
         BrandDiscoveryError,
         discover_products_for_audit,
@@ -477,6 +501,17 @@ async def cold_start_audit(
             },
         )
 
+    from db.merchant_audit_runs import merge_audit_run_partial
+    discovery_block = _build_discovery_block(discovered)
+    if precreated_run_id:
+        await merge_audit_run_partial(
+            run_id=precreated_run_id,
+            patch={
+                "stage": "discovered",
+                "discovery": discovery_block,
+            },
+        )
+
     # Dry-run short-circuit: return discovery + diagnostics without
     # running the LLM audit. catalog-extract-audit skill pattern —
     # operator inspects extraction quality before committing to a
@@ -495,7 +530,7 @@ async def cold_start_audit(
         return {
             "status": "ok",
             "dry_run": True,
-            "discovery": _build_discovery_block(discovered),
+            "discovery": discovery_block,
         }
 
     # Cold-start targets are by definition NOT Pivota merchants —
@@ -507,17 +542,7 @@ async def cold_start_audit(
     # the audit's merchant_view.actions falls back to legacy
     # strategic-tier templates only and BD operators don't see the
     # most important CTA.
-    cold_start_integration_state: Dict[str, Any] = {
-        "store_platform_integrated": False,
-        "psp_integrated": False,
-        "gsc_integrated": False,
-        "fully_integrated": False,
-        "missing_pieces": ["store_platform", "psp"],
-        "integration_completed_at": None,
-        "store_platform_name": None,
-        "psp_provider": None,
-        "store_connected_at": None,
-    }
+    cold_start_integration_state = _cold_start_integration_state()
 
     # PR-1a (APM): persist cold-start audit to merchant_audit_runs
     # under a synthetic prospect id so a BD operator can re-audit
@@ -529,17 +554,24 @@ async def cold_start_audit(
         record_audit_run_completed,
         recent_runs_for_merchant,
     )
-    synthetic_merchant_id = _prospect_merchant_id(
+    synthetic_merchant_id = precreated_prospect_id or _prospect_merchant_id(
         discovered.get("merchant_domain") or body.url,
     )
     product_keys = [
         p.get("pdp_url") for p in (discovered.get("products") or [])
         if p.get("pdp_url")
     ]
-    run_id = await record_audit_run_started(
-        merchant_id=synthetic_merchant_id,
-        product_keys=product_keys,
-    )
+    run_id = precreated_run_id
+    if not run_id:
+        run_id = await record_audit_run_started(
+            merchant_id=synthetic_merchant_id,
+            product_keys=product_keys,
+        )
+    elif product_keys:
+        await merge_audit_run_partial(
+            run_id=run_id,
+            patch={"product_keys": product_keys},
+        )
     prior_runs = await recent_runs_for_merchant(
         merchant_id=synthetic_merchant_id, limit=5,
     )
@@ -700,9 +732,9 @@ async def cold_start_audit(
                 synthetic_merchant_id, run_id, exc,
             )
 
-    return {
+    response = {
         "status": "ok",
-        "discovery": _build_discovery_block(discovered),
+        "discovery": discovery_block,
         "brand_report": out,
         "cohort": cohort_status,
         # PR-6/UI-3: synthetic merchant_id BD frontend uses to query
@@ -715,6 +747,186 @@ async def cold_start_audit(
         "tasks": tasks_summary,
         "executors": executor_summary,
     }
+    if run_id:
+        await merge_audit_run_partial(
+            run_id=run_id,
+            patch={
+                "stage": "completed",
+                "discovery": discovery_block,
+                "cohort": cohort_status,
+                "prospect_id": synthetic_merchant_id,
+                "tasks": tasks_summary,
+                "executors": executor_summary,
+            },
+        )
+    return response
+
+
+async def _run_cold_start_audit_background(
+    body: BdColdStartAuditRequest,
+    *,
+    run_id: str,
+    prospect_id: str,
+) -> None:
+    """Fire-and-poll wrapper for long cold-start reports."""
+    from db.merchant_audit_runs import (
+        merge_audit_run_partial,
+        record_audit_run_completed,
+    )
+
+    await merge_audit_run_partial(
+        run_id=run_id,
+        patch={"stage": "running", "prospect_id": prospect_id},
+    )
+    try:
+        await _run_cold_start_audit_pipeline(
+            body,
+            precreated_run_id=run_id,
+            precreated_prospect_id=prospect_id,
+        )
+    except HTTPException as exc:
+        message = _http_exception_message(exc)
+        await record_audit_run_completed(
+            run_id=run_id,
+            status="failed",
+            error_message=message,
+        )
+        await merge_audit_run_partial(
+            run_id=run_id,
+            patch={
+                "stage": "failed",
+                "error": {
+                    "status_code": exc.status_code,
+                    "message": message,
+                },
+            },
+        )
+        logger.warning(
+            "BD cold-start background audit failed: run_id=%s url=%s: %s",
+            run_id, body.url, message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "BD cold-start background audit crashed: run_id=%s url=%s",
+            run_id, body.url,
+        )
+        await record_audit_run_completed(
+            run_id=run_id,
+            status="failed",
+            error_message=str(exc)[:2000],
+        )
+        await merge_audit_run_partial(
+            run_id=run_id,
+            patch={
+                "stage": "failed",
+                "error": {"message": str(exc)[:2000]},
+            },
+        )
+
+
+@router.post("/cold-start-audit")
+async def cold_start_audit(
+    body: BdColdStartAuditRequest,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """URL-only BD audit. Auto-discovers brand + products.
+
+    By default this remains backward-compatible and returns the full
+    report synchronously. The employee portal sends background=True
+    for full runs so the browser can poll beyond the old 240s cap.
+    """
+    if body.background and not body.dry_run:
+        from db.merchant_audit_runs import (
+            merge_audit_run_partial,
+            record_audit_run_started,
+        )
+
+        prospect_id = _prospect_merchant_id(body.url)
+        run_id = await record_audit_run_started(
+            merchant_id=prospect_id,
+            product_keys=[body.url],
+        )
+        if not run_id:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "audit_queue_unavailable",
+                    "message": "Unable to create background audit run.",
+                },
+            )
+        await merge_audit_run_partial(
+            run_id=run_id,
+            patch={
+                "stage": "queued",
+                "prospect_id": prospect_id,
+                "url": body.url,
+                "market": body.market,
+            },
+        )
+        queued_body = (
+            body.model_copy(deep=True)
+            if hasattr(body, "model_copy")
+            else body.copy(deep=True)
+        )
+        asyncio.create_task(
+            _run_cold_start_audit_background(
+                queued_body,
+                run_id=run_id,
+                prospect_id=prospect_id,
+            ),
+            name=f"bd-cold-start-{run_id}",
+        )
+        return {
+            "status": "queued",
+            "background": True,
+            "audit_run_id": run_id,
+            "prospect_id": prospect_id,
+            "poll_url": f"/api/agent-center/bd/cold-start-audit/runs/{run_id}",
+        }
+
+    return await _run_cold_start_audit_pipeline(body)
+
+
+@router.get("/cold-start-audit/runs/{audit_run_id}")
+async def get_cold_start_audit_run(
+    audit_run_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Poll a background cold-start audit run."""
+    from db.merchant_audit_runs import fetch_audit_run_by_id
+
+    row = await fetch_audit_run_by_id(run_id=audit_run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="audit_run_not_found")
+
+    partial_raw = row.get("partial_result_jsonb")
+    partial: Dict[str, Any] = partial_raw if isinstance(partial_raw, dict) else {}
+    status_value = row.get("status") or "running"
+    base: Dict[str, Any] = {
+        "status": status_value,
+        "audit_run_id": audit_run_id,
+        "prospect_id": partial.get("prospect_id") or row.get("merchant_id"),
+        "stage": partial.get("stage") or (
+            "completed" if status_value == "succeeded"
+            else "failed" if status_value == "failed"
+            else "running"
+        ),
+        "requested_at": row.get("requested_at"),
+        "completed_at": row.get("completed_at"),
+        "discovery": partial.get("discovery"),
+        "cohort": partial.get("cohort"),
+        "tasks": partial.get("tasks"),
+        "executors": partial.get("executors"),
+    }
+
+    if status_value == "succeeded":
+        base["brand_report"] = row.get("report_jsonb")
+    elif status_value == "failed":
+        error = partial.get("error")
+        if not isinstance(error, dict):
+            error = {"message": row.get("error_message") or "Cold-start audit failed"}
+        base["error"] = error
+    return base
 
 
 def _extract_parent_modal_product_type(

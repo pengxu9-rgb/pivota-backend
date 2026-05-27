@@ -324,6 +324,47 @@ async def record_audit_run_completed(
         )
 
 
+async def merge_audit_run_partial(
+    *,
+    run_id: Optional[str],
+    patch: Dict[str, Any],
+) -> None:
+    """Best-effort shallow merge into partial_result_jsonb.
+
+    Unlike record_partial_result(), this helper is intentionally not
+    worker-lease guarded. Synchronous HTTP routes that spawn their own
+    background task use it to expose progress metadata for polling UIs.
+    """
+    if not run_id or not patch:
+        return
+    await ensure_merchant_audit_runs_table()
+    try:
+        row = await database.fetch_one(
+            merchant_audit_runs.select().where(
+                merchant_audit_runs.c.run_id == run_id,
+            )
+        )
+        existing: Dict[str, Any] = {}
+        if row is not None:
+            raw = dict(row).get("partial_result_jsonb")
+            if isinstance(raw, dict):
+                existing = dict(raw)
+        existing.update(_json_safe(patch or {}))
+        await database.execute(
+            merchant_audit_runs.update()
+            .where(merchant_audit_runs.c.run_id == run_id)
+            .values(
+                partial_result_jsonb=existing,
+                stage_updated_at=_now_utc(),
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "merge_audit_run_partial failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+
+
 async def count_runs_in_window(
     *,
     merchant_id: str,
