@@ -259,7 +259,7 @@ async def list_canonical_pdp_signatures(
             catalog_products.c.pivota_signature_id,
             catalog_products.c.content_key,
             catalog_products.c.pivota_canonical_url,
-            catalog_products.c.updated_at,
+            catalog_products.c.content_changed_at,
             index_pipeline_state.c.serving_eligible,
             index_pipeline_state.c.blocker_code,
             index_pipeline_state.c.blocker_detail,
@@ -269,7 +269,7 @@ async def list_canonical_pdp_signatures(
         .select_from(serving_join)
         .where(eligibility_filter)
         .order_by(
-            catalog_products.c.updated_at.desc(),
+            catalog_products.c.content_changed_at.desc(),
             catalog_products.c.pivota_signature_id.asc(),
             catalog_products.c.content_key.asc(),
             catalog_products.c.product_key.asc(),
@@ -294,8 +294,8 @@ async def list_canonical_pdp_signatures(
                 else None
             ),
             "last_modified": (
-                r["updated_at"].isoformat()
-                if isinstance(r["updated_at"], datetime)
+                r["content_changed_at"].isoformat()
+                if isinstance(r["content_changed_at"], datetime)
                 else None
             ),
         }

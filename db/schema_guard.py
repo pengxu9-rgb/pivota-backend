@@ -101,6 +101,10 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "size_guide",
             "size_guide_source",
             "size_guide_confidence",
+            # Sitemap freshness signal - see migration 138. Separate
+            # from updated_at so internal row touches do not leak into
+            # public sitemap lastmod values.
+            "content_changed_at",
             # Source-level provenance — see migration 133. Lets new
             # ingests distinguish stores under the same merchant/platform.
             "source_domain",
@@ -455,6 +459,17 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS category_confidence REAL,
                       ADD COLUMN IF NOT EXISTS category_label_source VARCHAR(32),
                       ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
+                    """
+                )
+            )
+            # Sitemap freshness signal (migration 138). The canonical
+            # products sitemap list orders by and returns this column,
+            # while updated_at keeps its internal row-touched meaning.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS catalog_products
+                      ADD COLUMN IF NOT EXISTS content_changed_at TIMESTAMP NOT NULL DEFAULT NOW();
                     """
                 )
             )
