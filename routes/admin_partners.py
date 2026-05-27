@@ -103,7 +103,7 @@ async def get_admin_partner(
           cp.status,
           cp.term_start_date,
           cp.term_months,
-          cp.auto_renew,
+          cp.term_auto_renew AS auto_renew,
           cp.per_brand_tail_months,
           cp.churn_clawback_days,
           cp.nonpayment_clawback_days,
