@@ -384,6 +384,8 @@ async def enqueue_executor_run(
     run_id = str(uuid.uuid4())
     now = _now_utc()
     try:
+        # TODO(brief-future): wire execution-credit debit to executor_runs
+        # writes when execution layer ships.
         await database.execute(
             executor_runs.insert().values(
                 run_id=run_id,

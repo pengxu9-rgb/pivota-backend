@@ -22,6 +22,7 @@ from config.settings import settings
 from db.database import IS_POSTGRES, database
 from routes.payment_execution_routes import verify_merchant_api_key
 from services.billing import monthly_brand_statements_service
+from utils.auth import get_current_merchant
 from utils.logger import logger
 
 
@@ -37,6 +38,14 @@ class CheckoutSessionRequest(BaseModel):
     price_id: str
     success_url: str
     cancel_url: str
+
+
+class CreditTopUpRequest(BaseModel):
+    """Manual direct/self-serve credit top-up request."""
+
+    merchant_id: str
+    pack_credits: int
+    idempotency_key: Optional[str] = None
 
 
 async def require_approved_merchant(
@@ -140,6 +149,10 @@ async def handle_stripe_billing_webhook(
         await _handle_invoice_paid(event, database)
     elif event_type == "invoice.payment_failed":
         await _handle_invoice_payment_failed(event, database)
+    elif event_type == "payment_intent.succeeded":
+        payment_intent_result = await _handle_payment_intent_succeeded(event, database)
+        if payment_intent_result == "ignored":
+            return JSONResponse({"status": "ignored"}, status_code=200)
     else:
         await _mark_event_ignored(event_id, database)
         return JSONResponse({"status": "ignored"}, status_code=200)
@@ -270,6 +283,51 @@ async def create_billing_checkout_session(
         raise HTTPException(status_code=502, detail="Stripe Checkout Session returned no URL")
 
     return {"session_url": session_url, "session_id": session_id}
+
+
+@router.post("/api/credits/topup")
+async def create_credit_topup(
+    body: CreditTopUpRequest,
+    auth_merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Create a manual direct-credit top-up PaymentIntent on the verified card."""
+
+    _require_platform_stripe_key()
+    merchant_id = _as_text(body.merchant_id)
+    if not merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+    if merchant_id != auth_merchant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="merchant_id in body must match the authenticated merchant.",
+        )
+    if int(body.pack_credits or 0) <= 0:
+        raise HTTPException(status_code=422, detail="pack_credits must be > 0")
+
+    from services.merchant_credit_balance_service import (
+        MissingVerifiedPaymentMethodError,
+        create_credit_topup_payment_intent,
+    )
+
+    try:
+        return await create_credit_topup_payment_intent(
+            merchant_id=merchant_id,
+            pack_credits=int(body.pack_credits),
+            idempotency_key=body.idempotency_key,
+        )
+    except MissingVerifiedPaymentMethodError as exc:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": exc.code,
+                "message": (
+                    "Manual credit top-ups require a verified Stripe card."
+                ),
+                "reason": exc.reason,
+            },
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database) -> None:
@@ -635,6 +693,33 @@ async def _handle_invoice_payment_failed(event: Dict[str, Any], db: Database) ->
         await _mark_event_processed(event_id, db)
     except Exception as exc:
         await _handle_billing_handler_error(event_id, exc, db)
+
+
+async def _handle_payment_intent_succeeded(event: Dict[str, Any], db: Database) -> str:
+    event_id = _event_id(event)
+    try:
+        payment_intent = _event_object(event)
+        metadata = _coerce_dict(payment_intent.get("metadata"))
+        if _as_text(metadata.get("pivota_purpose")) != "direct_credit_topup":
+            await _mark_event_ignored(event_id, db)
+            return "ignored"
+
+        from services.merchant_credit_balance_service import (
+            apply_credit_topup_payment_intent_succeeded,
+        )
+
+        result = await apply_credit_topup_payment_intent_succeeded(
+            payment_intent,
+            conn=db,
+        )
+        if result.get("ignored"):
+            await _mark_event_ignored(event_id, db)
+            return "ignored"
+        await _mark_event_processed(event_id, db)
+        return "processed"
+    except Exception as exc:
+        await _handle_billing_handler_error(event_id, exc, db)
+        return "failed"
 
 
 async def _insert_stripe_event(

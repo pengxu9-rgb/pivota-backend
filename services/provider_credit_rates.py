@@ -1,0 +1,130 @@
+"""Provider credit metering for SKU-audit probes.
+
+Rates are loaded from config/provider_credit_rates.json so model and
+provider-price drift can be handled by config review rather than code edits.
+"""
+
+from __future__ import annotations
+
+import json
+from decimal import Decimal, ROUND_HALF_UP
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, Mapping
+
+
+_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "config"
+    / "provider_credit_rates.json"
+)
+
+
+def _decimal(value: Any) -> Decimal:
+    return Decimal(str(value))
+
+
+@lru_cache(maxsize=1)
+def load_provider_credit_config() -> Dict[str, Any]:
+    with _CONFIG_PATH.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("provider credit config must be a JSON object")
+    return data
+
+
+def _provider_entries() -> Mapping[str, Mapping[str, Any]]:
+    data = load_provider_credit_config().get("provider_credit_rates") or {}
+    if not isinstance(data, dict):
+        raise ValueError("provider_credit_rates must be a JSON object")
+    return data
+
+
+def provider_rate_entry(provider: str) -> Mapping[str, Any]:
+    key = str(provider or "").strip().lower()
+    entries = _provider_entries()
+    if key in entries:
+        return entries[key]
+    for entry in entries.values():
+        aliases = entry.get("aliases") or []
+        if key in {str(alias).strip().lower() for alias in aliases}:
+            return entry
+    raise ValueError(f"unsupported provider credit rate: {provider}")
+
+
+def provider_prompt_fraction(provider: str) -> Decimal:
+    entry = provider_rate_entry(provider)
+    return _decimal(entry.get("prompt_fraction", 1))
+
+
+def provider_default_grounded(provider: str) -> bool:
+    entry = provider_rate_entry(provider)
+    return bool(entry.get("default_grounded", False))
+
+
+def provider_probe_cost_usd(
+    provider: str,
+    *,
+    grounded: bool,
+    input_tokens: int = 2000,
+    output_tokens: int = 500,
+) -> Decimal:
+    """Return provider COGS for one representative probe."""
+    if int(input_tokens) < 0 or int(output_tokens) < 0:
+        raise ValueError("token counts must be >= 0")
+
+    config = load_provider_credit_config()
+    rep = config.get("representative_probe") or {}
+    entry = provider_rate_entry(provider)
+    input_cost = (
+        _decimal(input_tokens)
+        / Decimal("1000000")
+        * _decimal(entry.get("input_cost_usd_per_1m_tokens", 0))
+    )
+    output_cost = (
+        _decimal(output_tokens)
+        / Decimal("1000000")
+        * _decimal(entry.get("output_cost_usd_per_1m_tokens", 0))
+    )
+    grounding_calls = (
+        _decimal(rep.get("grounded_search_calls", 1))
+        if grounded else Decimal("0")
+    )
+    grounding_cost = (
+        grounding_calls
+        * _decimal(entry.get("grounding_cost_usd_per_call", 0))
+    )
+    return input_cost + output_cost + grounding_cost
+
+
+def credits_for_probe(
+    provider: str,
+    *,
+    grounded: bool,
+    input_tokens: int = 2000,
+    output_tokens: int = 500,
+) -> float:
+    """Convert a provider probe's COGS into abstract Pivota credits.
+
+    Formula from the committed pricing model:
+    credits_per_probe = provider_cost_usd / (credit_to_usd *
+    provider_cost_fraction). Both conversion constants come from config.
+    """
+    config = load_provider_credit_config()
+    denominator = (
+        _decimal(config.get("credit_to_usd"))
+        * _decimal(config.get("provider_cost_fraction"))
+    )
+    if denominator <= 0:
+        raise ValueError("credit conversion denominator must be > 0")
+
+    credits = provider_probe_cost_usd(
+        provider,
+        grounded=grounded,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    ) / denominator
+    places = int(config.get("rounding_decimal_places", 1))
+    quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
+    rounded = credits.quantize(quant, rounding=ROUND_HALF_UP)
+    return float(rounded)

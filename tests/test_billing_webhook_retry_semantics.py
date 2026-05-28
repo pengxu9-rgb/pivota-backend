@@ -195,3 +195,117 @@ def test_stale_pending_threshold_is_reasonable() -> None:
     # Guard the constant: too short → false reclaims of in-flight handlers;
     # too long → failed events sit unrecovered for hours.
     assert 60 <= billing_routes.STALE_PENDING_SECONDS <= 1800
+
+
+@pytest.mark.asyncio
+async def test_payment_intent_succeeded_hooks_direct_topup_webhook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import merchant_credit_balance_service as credit_service
+
+    db = FakeDB()
+    calls: List[Dict[str, Any]] = []
+
+    async def fake_apply_topup(payment_intent: Dict[str, Any], *, conn: Any):
+        calls.append({"payment_intent": payment_intent, "conn": conn})
+        return {"credits": 2000, "replay": False}
+
+    monkeypatch.setattr(
+        credit_service,
+        "apply_credit_topup_payment_intent_succeeded",
+        fake_apply_topup,
+    )
+    event = {
+        "id": "evt_topup_pi",
+        "type": "payment_intent.succeeded",
+        "data": {
+            "object": {
+                "id": "pi_topup_1",
+                "metadata": {
+                    "pivota_purpose": "direct_credit_topup",
+                    "merchant_id": "merch-A",
+                    "pack_credits": "2000",
+                },
+            }
+        },
+    }
+
+    await billing_routes._handle_payment_intent_succeeded(event, db)
+
+    assert calls == [{
+        "payment_intent": event["data"]["object"],
+        "conn": db,
+    }]
+    assert any("status = 'processed'" in sql for sql, _ in db.executes)
+
+
+@pytest.mark.asyncio
+async def test_payment_intent_succeeded_ignores_non_topup_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import merchant_credit_balance_service as credit_service
+
+    db = FakeDB()
+
+    async def should_not_apply(*_args: Any, **_kwargs: Any):
+        raise AssertionError("non-topup payment_intent.succeeded must be ignored")
+
+    monkeypatch.setattr(
+        credit_service,
+        "apply_credit_topup_payment_intent_succeeded",
+        should_not_apply,
+    )
+    event = {
+        "id": "evt_other_pi",
+        "type": "payment_intent.succeeded",
+        "data": {"object": {"id": "pi_other", "metadata": {}}},
+    }
+
+    await billing_routes._handle_payment_intent_succeeded(event, db)
+
+    assert any("status = 'ignored'" in sql for sql, _ in db.executes)
+
+
+@pytest.mark.asyncio
+async def test_create_credit_topup_route_delegates_to_direct_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import merchant_credit_balance_service as credit_service
+
+    calls: List[Dict[str, Any]] = []
+
+    def noop_require_key() -> None:
+        return None
+
+    async def fake_create_topup(**kwargs: Any) -> Dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "payment_intent_id": "pi_topup_route",
+            "status": "succeeded",
+            "pack_credits": 2000,
+            "amount": {"currency": "usd", "total": "20.00"},
+        }
+
+    monkeypatch.setattr(billing_routes, "_require_platform_stripe_key", noop_require_key)
+    monkeypatch.setattr(
+        credit_service,
+        "create_credit_topup_payment_intent",
+        fake_create_topup,
+    )
+
+    result = await billing_routes.create_credit_topup(
+        billing_routes.CreditTopUpRequest(
+            merchant_id="merch-A",
+            pack_credits=2000,
+            idempotency_key="manual-1",
+        ),
+        auth_merchant_id="merch-A",
+    )
+
+    assert result["payment_intent_id"] == "pi_topup_route"
+    assert result["amount"] == {"currency": "usd", "total": "20.00"}
+    assert calls == [{
+        "merchant_id": "merch-A",
+        "pack_credits": 2000,
+        "idempotency_key": "manual-1",
+    }]

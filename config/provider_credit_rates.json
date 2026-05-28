@@ -1,0 +1,33 @@
+{
+  "credit_to_usd": 0.01,
+  "provider_cost_fraction": 0.65,
+  "rounding_decimal_places": 1,
+  "representative_probe": {
+    "input_tokens": 2000,
+    "output_tokens": 500,
+    "grounded_search_calls": 1,
+    "deepseek_verify_prompt_fraction": 0.25
+  },
+  "provider_credit_rates": {
+    "gemini": {
+      "aliases": ["google_gemini_2_5_flash"],
+      "model": "gemini-2.5-flash",
+      "grounding": "google_search_grounding",
+      "default_grounded": true,
+      "prompt_fraction": 1.0,
+      "input_cost_usd_per_1m_tokens": 0.30,
+      "output_cost_usd_per_1m_tokens": 2.50,
+      "grounding_cost_usd_per_call": 0.0350
+    },
+    "deepseek": {
+      "aliases": ["deepseek_verify"],
+      "model": "deepseek-v4-flash",
+      "grounding": "none_hosted",
+      "default_grounded": false,
+      "prompt_fraction": 0.25,
+      "input_cost_usd_per_1m_tokens": 0.14,
+      "output_cost_usd_per_1m_tokens": 0.28,
+      "grounding_cost_usd_per_call": 0.0
+    }
+  }
+}
