@@ -23,6 +23,11 @@ class FakeCreditConn:
         credits: int = 0,
         purchased_credits: int = 0,
         allowance_credits: int = 0,
+        overage_pending_credits: int = 0,
+        overage_charged_credits: int = 0,
+        overage_blocked_until_payment: bool = False,
+        overage_last_payment_intent_id: Optional[str] = None,
+        overage_last_failed_at: Optional[datetime] = None,
         allowance_period_start: Optional[datetime] = None,
         usd_cogs_internal: Decimal = Decimal("0"),
         plan_tier: str = "free",
@@ -32,6 +37,11 @@ class FakeCreditConn:
             "credits": credits,
             "purchased_credits": purchased_credits,
             "allowance_credits": allowance_credits,
+            "overage_pending_credits": overage_pending_credits,
+            "overage_charged_credits": overage_charged_credits,
+            "overage_blocked_until_payment": overage_blocked_until_payment,
+            "overage_last_payment_intent_id": overage_last_payment_intent_id,
+            "overage_last_failed_at": overage_last_failed_at,
             "allowance_period_start": allowance_period_start,
             "usd_cogs_internal": usd_cogs_internal,
             "plan_tier": plan_tier,
@@ -104,7 +114,7 @@ class FakeCreditConn:
         if "merchant_credit_balance:debit_update" in sql:
             return self._update_balance(
                 values,
-                delta=-int(values["amount"]),
+                delta=-int(values.get("balance_debit", values["amount"])),
                 usd_cogs_delta=Decimal(str(values["usd_cogs"])),
             )
         if "merchant_credit_balance:credit_update" in sql:
@@ -113,6 +123,33 @@ class FakeCreditConn:
                 delta=int(values["amount"]),
                 usd_cogs_delta=-Decimal(str(values["usd_cogs"])),
             )
+        if "merchant_credit_balance:topup_credit_update" in sql:
+            merchant_id = str(values["merchant_id"])
+            row = self.balances[merchant_id]
+            row["credits"] = int(row.get("credits") or 0) + int(values["pack_credits"])
+            row["purchased_credits"] = (
+                int(row.get("purchased_credits") or 0) + int(values["pack_credits"])
+            )
+            row["overage_blocked_until_payment"] = False
+            row["overage_last_payment_intent_id"] = values["payment_intent_id"]
+            row["overage_last_failed_at"] = None
+            row["version"] = int(row["version"]) + 1
+            row["updated_at"] = datetime.now(timezone.utc)
+            return dict(row)
+        if "merchant_credit_balance:pending_overage_charge_update" in sql:
+            merchant_id = str(values["merchant_id"])
+            row = self.balances[merchant_id]
+            charge = int(values["charge_credits"])
+            if int(row.get("overage_pending_credits") or 0) < charge:
+                return None
+            row["overage_pending_credits"] = int(row["overage_pending_credits"]) - charge
+            row["overage_charged_credits"] = int(row["overage_charged_credits"]) + charge
+            row["overage_blocked_until_payment"] = False
+            row["overage_last_payment_intent_id"] = values["payment_intent_id"]
+            row["overage_last_failed_at"] = None
+            row["version"] = int(row["version"]) + 1
+            row["updated_at"] = datetime.now(timezone.utc)
+            return dict(row)
         raise AssertionError(f"unexpected fetch_one SQL: {sql}")
 
     async def execute(self, query: str, values: Optional[Dict[str, Any]] = None):
@@ -125,7 +162,18 @@ class FakeCreditConn:
             return None
         if "merchant_credit_balance:store_usage_post_balance" in sql:
             key = str(values["idempotency_key"])
-            self.events[key]["payload"] = json.loads(values["payload"])
+            self.events[key]["payload"].update(json.loads(values["payload"]))
+            return None
+        if "merchant_credit_balance:set_overage_blocked" in sql:
+            merchant_id = str(values["merchant_id"])
+            row = self.balances[merchant_id]
+            row["overage_blocked_until_payment"] = True
+            row["overage_last_payment_intent_id"] = (
+                values.get("payment_intent_id") or row.get("overage_last_payment_intent_id")
+            )
+            row["overage_last_failed_at"] = datetime.now(timezone.utc)
+            row["version"] = int(row["version"]) + 1
+            row["updated_at"] = datetime.now(timezone.utc)
             return None
         raise AssertionError(f"unexpected execute SQL: {sql}")
 
@@ -155,6 +203,25 @@ class FakeCreditConn:
             int(row.get("purchased_credits") or 0)
             + (purchased_delta if delta >= 0 else -purchased_delta)
         )
+        if delta < 0:
+            overage_pending_delta = int(values.get("overage_pending_credits") or 0)
+            overage_charge = int(values.get("overage_charge_credits") or 0)
+            if int(row.get("overage_pending_credits") or 0) + overage_pending_delta < overage_charge:
+                return None
+            row["overage_pending_credits"] = (
+                int(row.get("overage_pending_credits") or 0)
+                + overage_pending_delta
+                - overage_charge
+            )
+            row["overage_charged_credits"] = (
+                int(row.get("overage_charged_credits") or 0) + overage_charge
+            )
+            if overage_charge:
+                row["overage_blocked_until_payment"] = False
+                row["overage_last_payment_intent_id"] = values.get(
+                    "overage_payment_intent_id"
+                )
+                row["overage_last_failed_at"] = None
         row["usd_cogs_internal"] = max(
             Decimal("0"),
             Decimal(str(row["usd_cogs_internal"])) + usd_cogs_delta,
@@ -456,6 +523,214 @@ async def test_purchased_topup_credits_survive_reset_after_allowance_spend(monke
     assert balance["credits"] == 4500
     assert balance["purchased_credits"] == 500
     assert balance["allowance_credits"] == 4000
+
+
+@pytest.mark.asyncio
+async def test_paid_debit_past_zero_charges_overage_increment(monkeypatch):
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed(
+        "merch-A",
+        credits=100,
+        overage_pending_credits=1900,
+        plan_tier="growth",
+    )
+    payment_intents = []
+
+    async def fake_create_payment_intent(**kwargs):
+        payment_intents.append(kwargs)
+        return {"id": "pi_overage_1", "status": "succeeded"}
+
+    monkeypatch.setattr(svc, "_create_direct_payment_intent", fake_create_payment_intent)
+
+    balance = await svc.debit(
+        "merch-A",
+        "audit",
+        200,
+        "run-overage-1",
+        usd_cogs=Decimal("0.5000"),
+        conn=fake,
+    )
+
+    assert balance["credits"] == 0
+    assert balance["overage_pending_credits"] == 0
+    assert balance["overage_charged_credits"] == 2000
+    assert balance["overage_credits_accrued"] == 100
+    assert payment_intents[0]["amount_cents"] == 2000
+    assert payment_intents[0]["idempotency_key"] == (
+        "direct_overage_payment_intent:"
+        "direct_overage:merch-A:000000000001-000000002000"
+    )
+
+    overage_events = [
+        event for event in fake.events.values()
+        if event["event_type"] == "credit_overage_charge"
+    ]
+    assert len(overage_events) == 1
+    payload = overage_events[0]["payload"]
+    assert payload["payment_intent_id"] == "pi_overage_1"
+    assert payload["overage_increment_id"] == (
+        "direct_overage:merch-A:000000000001-000000002000"
+    )
+    assert payload["amount_cents"] == 2000
+    assert payload["usd_cogs_internal"] == "13.0000"
+
+
+@pytest.mark.asyncio
+async def test_paid_overage_idempotency_replays_without_double_charge(monkeypatch):
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed(
+        "merch-A",
+        credits=100,
+        overage_pending_credits=1900,
+        plan_tier="growth",
+    )
+    payment_intents = []
+
+    async def fake_create_payment_intent(**kwargs):
+        payment_intents.append(kwargs)
+        return {"id": "pi_overage_1", "status": "succeeded"}
+
+    monkeypatch.setattr(svc, "_create_direct_payment_intent", fake_create_payment_intent)
+
+    first = await svc.debit("merch-A", "audit", 200, "run-overage-1", conn=fake)
+    second = await svc.debit("merch-A", "audit", 200, "run-overage-1", conn=fake)
+
+    assert first["replay"] is False
+    assert second["replay"] is True
+    assert len(payment_intents) == 1
+    assert fake.balances["merch-A"]["overage_charged_credits"] == 2000
+    assert len([
+        event for event in fake.events.values()
+        if event["event_type"] == "credit_overage_charge"
+    ]) == 1
+
+
+@pytest.mark.asyncio
+async def test_overage_failure_sets_hard_stop_and_topup_clears(monkeypatch):
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed(
+        "merch-A",
+        credits=0,
+        overage_pending_credits=2000,
+        plan_tier="growth",
+    )
+
+    async def declined_payment_intent(**_kwargs):
+        raise RuntimeError("card_declined")
+
+    monkeypatch.setattr(svc, "_create_direct_payment_intent", declined_payment_intent)
+
+    with pytest.raises(svc.OveragePaymentFailedError) as err:
+        await svc.debit("merch-A", "audit", 1, "run-fail-1", conn=fake)
+
+    assert err.value.code == "overage_payment_failed"
+    assert fake.balances["merch-A"]["overage_blocked_until_payment"] is True
+
+    with pytest.raises(svc.OveragePaymentBlockedError):
+        await svc.debit("merch-A", "audit", 1, "run-blocked-1", conn=fake)
+
+    result = await svc.apply_credit_topup_payment_intent_succeeded(
+        {
+            "id": "pi_topup_clear",
+            "amount": 5000,
+            "metadata": {
+                "pivota_purpose": svc.DIRECT_TOPUP_PURPOSE,
+                "merchant_id": "merch-A",
+                "pack_credits": "5000",
+            },
+        },
+        conn=fake,
+    )
+
+    assert result["credits"] == 5000
+    assert result["purchased_credits"] == 5000
+    assert result["overage_blocked_until_payment"] is False
+
+
+@pytest.mark.asyncio
+async def test_topup_webhook_replay_does_not_double_credit():
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed("merch-A", credits=0, plan_tier="growth")
+    payment_intent = {
+        "id": "pi_topup_1",
+        "amount": 2000,
+        "metadata": {
+            "pivota_purpose": svc.DIRECT_TOPUP_PURPOSE,
+            "merchant_id": "merch-A",
+            "pack_credits": "2000",
+        },
+    }
+
+    first = await svc.apply_credit_topup_payment_intent_succeeded(
+        payment_intent,
+        conn=fake,
+    )
+    second = await svc.apply_credit_topup_payment_intent_succeeded(
+        payment_intent,
+        conn=fake,
+    )
+
+    assert first["credits"] == 2000
+    assert second["credits"] == 2000
+    assert second["replay"] is True
+    assert fake.balances["merch-A"]["credits"] == 2000
+    assert fake.balances["merch-A"]["purchased_credits"] == 2000
+    assert len([
+        event for event in fake.events.values()
+        if event["event_type"] == "credit_topup"
+    ]) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_credit_topup_payment_intent_uses_customer_total_not_rate(monkeypatch):
+    from services import merchant_credit_balance_service as svc
+
+    payment_intents = []
+
+    async def fake_create_payment_intent(**kwargs):
+        payment_intents.append(kwargs)
+        return {"id": "pi_topup_create", "status": "succeeded"}
+
+    monkeypatch.setattr(svc, "_create_direct_payment_intent", fake_create_payment_intent)
+
+    result = await svc.create_credit_topup_payment_intent(
+        merchant_id="merch-A",
+        pack_credits=2000,
+        idempotency_key="manual-1",
+    )
+
+    assert result == {
+        "payment_intent_id": "pi_topup_create",
+        "status": "succeeded",
+        "pack_credits": 2000,
+        "amount": {"currency": "usd", "total": "20.00"},
+    }
+    assert payment_intents[0]["amount_cents"] == 2000
+    assert payment_intents[0]["metadata"]["pack_credits"] == "2000"
+
+
+@pytest.mark.asyncio
+async def test_free_tier_insufficient_balance_does_not_attempt_overage(monkeypatch):
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed("merch-A", credits=1, plan_tier="free")
+
+    async def should_not_charge(**_kwargs):
+        raise AssertionError("free tier must not attempt an overage charge")
+
+    monkeypatch.setattr(svc, "_create_direct_payment_intent", should_not_charge)
+
+    with pytest.raises(svc.InsufficientCreditsError):
+        await svc.debit("merch-A", "audit", 2, "run-free-1", conn=fake)
 
 
 @pytest.mark.asyncio

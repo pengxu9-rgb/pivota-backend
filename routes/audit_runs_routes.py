@@ -55,6 +55,8 @@ from services.idempotency import compute_audit_idempotency_key
 from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
     MissingVerifiedPaymentMethodError,
+    OveragePaymentBlockedError,
+    OveragePaymentFailedError,
     credit,
     debit,
     get_balance,
@@ -617,7 +619,20 @@ async def create_audit_run(
         "execution": 0,
     }
     balance = await get_balance(body.merchant_id)
-    if str(balance.get("plan_tier") or "free") != "free":
+    plan_tier = str(balance.get("plan_tier") or "free").lower()
+    paid_tier = plan_tier != "free"
+    if balance.get("overage_blocked_until_payment"):
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "overage_payment_failed",
+                "message": (
+                    "A prior overage charge failed. Update payment or "
+                    "complete a successful top-up before launching more audits."
+                ),
+            },
+        )
+    if paid_tier:
         try:
             await require_verified_payment_method(body.merchant_id)
         except MissingVerifiedPaymentMethodError as exc:
@@ -633,7 +648,7 @@ async def create_audit_run(
                 },
             ) from exc
     gaps = _credit_gaps(requirements=requirements, balance=balance)
-    if gaps:
+    if gaps and not paid_tier:
         gap = gaps[0]
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -648,7 +663,7 @@ async def create_audit_run(
 
     # Preview-only quota remains active for free-tier balances. Paid tiers
     # are credit-gated only.
-    if str(balance.get("plan_tier") or "free") == "free":
+    if not paid_tier:
         await _check_audit_rate_limit(body.merchant_id)
 
     debited: List[Tuple[str, int, bool, Decimal, int]] = []
@@ -717,6 +732,31 @@ async def create_audit_run(
                 "available": exc.available,
                 "preview_url": "/api/audits/preview",
             },
+        ) from exc
+    except (OveragePaymentBlockedError, OveragePaymentFailedError) as exc:
+        for kind, amount, replay, usd_cogs, purchased_credits in reversed(debited):
+            if not replay:
+                await credit(
+                    body.merchant_id,
+                    kind,  # type: ignore[arg-type]
+                    amount,
+                    source_event_id=f"refund:{debit_idempotency_key}",
+                    usd_cogs=usd_cogs,
+                    purchased_credits=purchased_credits,
+                )
+        detail: Dict[str, Any] = {
+            "error": "overage_payment_failed",
+            "message": (
+                "Overage payment failed. Update payment or complete a "
+                "successful top-up before launching more audits."
+            ),
+        }
+        reason = getattr(exc, "reason", None)
+        if reason:
+            detail["reason"] = reason
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=detail,
         ) from exc
     except Exception:
         for kind, amount, replay, usd_cogs, purchased_credits in reversed(debited):

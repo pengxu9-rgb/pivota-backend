@@ -53,6 +53,9 @@ class _AccessorStub:
         self.balance: Dict[str, Any] = {
             "credits": 10_000,
             "allowance_credits": 18_000,
+            "overage_pending_credits": 0,
+            "overage_charged_credits": 0,
+            "overage_blocked_until_payment": False,
             "usd_cogs_internal": Decimal("12.3456"),
             "plan_tier": "starter",
             "purchased_credits": 0,
@@ -100,6 +103,26 @@ class _AccessorStub:
         })
         available = int(self.balance.get("credits") or 0)
         if available < int(amount):
+            if str(self.balance.get("plan_tier") or "free") != "free":
+                shortfall = int(amount) - available
+                self.balance["credits"] = 0
+                self.balance["overage_pending_credits"] = (
+                    int(self.balance.get("overage_pending_credits") or 0)
+                    + shortfall
+                )
+                self.balance["usd_cogs_internal"] = (
+                    Decimal(str(self.balance.get("usd_cogs_internal") or 0))
+                    + Decimal(str(kwargs.get("usd_cogs") or 0))
+                )
+                self.balance["version"] = int(self.balance.get("version") or 0) + 1
+                return {
+                    **self.balance,
+                    "replay": False,
+                    "purchased_credits_debited": int(
+                        self.balance.get("purchased_credits") or 0
+                    ),
+                    "overage_credits_accrued": shortfall,
+                }
             from services.merchant_credit_balance_service import (
                 InsufficientCreditsError,
             )
@@ -355,6 +378,7 @@ def test_post_returns_503_on_persistence_failure(client, stub):
 
 
 def test_post_returns_402_when_credits_insufficient(client, stub):
+    stub.balance["plan_tier"] = "free"
     stub.balance["credits"] = 100
     res = client.post(
         "/api/audits",
@@ -392,6 +416,7 @@ def test_post_debits_prompt_credits_for_custom_prompts(client, stub):
 
 
 def test_post_total_credit_gap_returns_402_before_any_debit(client, stub):
+    stub.balance["plan_tier"] = "free"
     stub.balance["credits"] = 228
     res = client.post(
         "/api/audits",
@@ -478,6 +503,42 @@ def test_post_paid_tier_with_verified_payment_method_is_allowed(client, stub):
     assert res.status_code == 202
     assert stub.payment_method_checks == ["merch-A"]
     assert len(stub.debits) == 1
+
+
+def test_post_paid_tier_overage_is_allowed_after_verified_card(client, stub):
+    stub.balance["plan_tier"] = "growth"
+    stub.balance["credits"] = 100
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1", "pk-2"],
+        },
+    )
+    assert res.status_code == 202
+    assert stub.payment_method_checks == ["merch-A"]
+    assert stub.balance["credits"] == 0
+    assert stub.balance["overage_pending_credits"] == 356
+    assert len(stub.debits) == 1
+    assert len(stub.enqueued) == 1
+
+
+def test_post_overage_blocked_merchant_gets_402(client, stub):
+    stub.balance["plan_tier"] = "growth"
+    stub.balance["overage_blocked_until_payment"] = True
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+        },
+    )
+    assert res.status_code == 402
+    detail = res.json()["detail"]
+    assert detail["error"] == "overage_payment_failed"
+    assert stub.payment_method_checks == []
+    assert stub.debits == []
+    assert stub.enqueued == []
 
 
 def test_post_free_tier_is_exempt_from_verified_payment_method(client, stub):

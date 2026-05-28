@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -31,6 +32,11 @@ CreditCategory = Literal["audit", "prompt", "execution"]
 
 _VALID_CATEGORIES = {"audit", "prompt", "execution"}
 _MAX_OPTIMISTIC_RETRIES = 3
+CREDIT_TO_USD = Decimal("0.01")
+DEFAULT_OVERAGE_CHARGE_CREDITS = 2_000
+INTERNAL_COGS_RATIO = Decimal("0.65")
+DIRECT_TOPUP_PURPOSE = "direct_credit_topup"
+DIRECT_OVERAGE_PURPOSE = "direct_credit_overage"
 
 
 class InsufficientCreditsError(Exception):
@@ -66,6 +72,38 @@ class MissingVerifiedPaymentMethodError(Exception):
         )
 
 
+class OveragePaymentBlockedError(Exception):
+    """Raised when a prior direct overage charge failed for this merchant."""
+
+    def __init__(self, merchant_id: str) -> None:
+        self.merchant_id = merchant_id
+        self.code = "overage_payment_failed"
+        super().__init__(
+            f"merchant {merchant_id} is blocked until the failed overage payment is resolved"
+        )
+
+
+class OveragePaymentFailedError(Exception):
+    """Raised when a direct overage PaymentIntent cannot be collected."""
+
+    def __init__(
+        self,
+        merchant_id: str,
+        reason: str,
+        *,
+        payment_intent_id: str = "",
+        overage_increment_id: str = "",
+    ) -> None:
+        self.merchant_id = merchant_id
+        self.reason = reason
+        self.payment_intent_id = payment_intent_id
+        self.overage_increment_id = overage_increment_id
+        self.code = "overage_payment_failed"
+        super().__init__(
+            f"merchant {merchant_id} overage payment failed: {reason}"
+        )
+
+
 def _decimal(value: Any) -> Decimal:
     if value is None:
         return Decimal("0")
@@ -77,6 +115,11 @@ def _zero_balance() -> Dict[str, Any]:
         "credits": 0,
         "purchased_credits": 0,
         "allowance_credits": 0,
+        "overage_pending_credits": 0,
+        "overage_charged_credits": 0,
+        "overage_blocked_until_payment": False,
+        "overage_last_payment_intent_id": None,
+        "overage_last_failed_at": None,
         "allowance_period_start": None,
         "plan_tier": "free",
         "updated_at": None,
@@ -101,8 +144,20 @@ def _balance_from_row(row: Any) -> Dict[str, Any]:
     if not data:
         return _zero_balance()
     out = _zero_balance()
-    for key in ("credits", "purchased_credits", "allowance_credits", "version"):
+    for key in (
+        "credits",
+        "purchased_credits",
+        "allowance_credits",
+        "overage_pending_credits",
+        "overage_charged_credits",
+        "version",
+    ):
         out[key] = int(data.get(key) or 0)
+    out["overage_blocked_until_payment"] = bool(
+        data.get("overage_blocked_until_payment") or False
+    )
+    out["overage_last_payment_intent_id"] = data.get("overage_last_payment_intent_id")
+    out["overage_last_failed_at"] = data.get("overage_last_failed_at")
     out["allowance_period_start"] = data.get("allowance_period_start")
     out["plan_tier"] = str(data.get("plan_tier") or "free")
     out["updated_at"] = data.get("updated_at")
@@ -128,6 +183,35 @@ def _decode_payload(raw: Any) -> Dict[str, Any]:
 
 def _json_payload(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, default=str, sort_keys=True)
+
+
+def _is_paid_tier(plan_tier: Any) -> bool:
+    return str(plan_tier or "free").strip().lower() != "free"
+
+
+def _credits_to_amount_cents(credits: int) -> int:
+    return int(credits)
+
+
+def _credits_to_usd_total(credits: int) -> str:
+    return f"{(Decimal(int(credits)) * CREDIT_TO_USD):.2f}"
+
+
+def _internal_cogs_for_customer_credits(credits: int) -> Decimal:
+    return (
+        Decimal(int(credits)) * CREDIT_TO_USD * INTERNAL_COGS_RATIO
+    ).quantize(Decimal("0.0001"))
+
+
+def _overage_increment_id(
+    *,
+    merchant_id: str,
+    charged_before_credits: int,
+    charge_credits: int,
+) -> str:
+    start = int(charged_before_credits) + 1
+    end = int(charged_before_credits) + int(charge_credits)
+    return f"direct_overage:{merchant_id}:{start:012d}-{end:012d}"
 
 
 def _validate_category_amount(category: str, amount: int) -> CreditCategory:
@@ -251,6 +335,10 @@ async def apply_subscription_allowance(
                    )
                )
             RETURNING credits, purchased_credits, allowance_credits,
+                      overage_pending_credits, overage_charged_credits,
+                      overage_blocked_until_payment,
+                      overage_last_payment_intent_id,
+                      overage_last_failed_at,
                       allowance_period_start, usd_cogs_internal,
                       plan_tier, updated_at, version
             """,
@@ -276,6 +364,9 @@ async def _get_balance_with_conn(merchant_id: str, conn: Any) -> Dict[str, Any]:
         """
         -- merchant_credit_balance:get_balance
         SELECT credits, purchased_credits, allowance_credits,
+               overage_pending_credits, overage_charged_credits,
+               overage_blocked_until_payment,
+               overage_last_payment_intent_id, overage_last_failed_at,
                allowance_period_start, usd_cogs_internal,
                plan_tier, updated_at, version
           FROM merchant_credit_balance
@@ -339,7 +430,20 @@ async def _claim_operation(
     event_type: str,
     source_key: str,
     purchased_credits: int,
+    payload_extra: Optional[Dict[str, Any]] = None,
 ) -> bool:
+    payload = {
+        "operation": operation,
+        "category": category,
+        "amount_credits": int(amount),
+        "purchased_credits": int(purchased_credits),
+        "usd_cogs_internal": str(usd_cogs),
+        "source_idempotency_key": source_key,
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+        "post_balance": None,
+    }
+    if payload_extra:
+        payload.update(payload_extra)
     row = await conn.fetch_one(
         """
         -- merchant_credit_balance:claim_usage_operation
@@ -366,16 +470,7 @@ async def _claim_operation(
             "billing_mode": operation,
             "billing_status": "applied",
             "quantity": int(amount),
-            "payload": _json_payload({
-                "operation": operation,
-                "category": category,
-                "amount_credits": int(amount),
-                "purchased_credits": int(purchased_credits),
-                "usd_cogs_internal": str(usd_cogs),
-                "source_idempotency_key": source_key,
-                "claimed_at": datetime.now(timezone.utc).isoformat(),
-                "post_balance": None,
-            }),
+            "payload": _json_payload(payload),
         },
     )
     return row is not None
@@ -391,7 +486,7 @@ async def _store_post_balance(
         """
         -- merchant_credit_balance:store_usage_post_balance
         UPDATE agent_center_usage_events
-           SET payload = CAST(:payload AS JSONB)
+           SET payload = COALESCE(payload, '{}'::jsonb) || CAST(:payload AS JSONB)
          WHERE idempotency_key = :idempotency_key
         """,
         {
@@ -399,6 +494,134 @@ async def _store_post_balance(
             "payload": _json_payload({"post_balance": post_balance}),
         },
     )
+
+
+async def _record_overage_charge_ledger(
+    *,
+    conn: Any,
+    merchant_id: str,
+    charge: Dict[str, Any],
+) -> None:
+    charge_credits = int(charge["charge_credits"])
+    await _claim_operation(
+        conn=conn,
+        operation_key=(
+            "merchant_credit_balance:overage_charge:"
+            f"{merchant_id}:{charge['overage_increment_id']}"
+        ),
+        merchant_id=merchant_id,
+        category="overage",
+        amount=charge_credits,
+        usd_cogs=_internal_cogs_for_customer_credits(charge_credits),
+        operation="debit",
+        event_type="credit_overage_charge",
+        source_key=str(charge["overage_increment_id"]),
+        purchased_credits=0,
+        payload_extra={
+            "payment_intent_id": charge["payment_intent_id"],
+            "stripe_payment_intent_id": charge["payment_intent_id"],
+            "overage_increment_id": charge["overage_increment_id"],
+            "charge_credits": charge_credits,
+            "amount_cents": int(charge["amount_cents"]),
+            "amount_total": charge["amount_total"],
+            "currency": "usd",
+            "customer_facing": (
+                f"{charge_credits:,} credits overage - "
+                f"${charge['amount_total']}"
+            ),
+        },
+    )
+
+
+async def _set_overage_blocked(
+    merchant_id: str,
+    *,
+    payment_intent_id: str = "",
+    conn: Any = None,
+) -> None:
+    target = conn or database
+    await target.execute(
+        """
+        -- merchant_credit_balance:set_overage_blocked
+        UPDATE merchant_credit_balance
+           SET overage_blocked_until_payment = TRUE,
+               overage_last_payment_intent_id = COALESCE(
+                   NULLIF(:payment_intent_id, ''),
+                   overage_last_payment_intent_id
+               ),
+               overage_last_failed_at = NOW(),
+               updated_at = NOW(),
+               version = version + 1
+         WHERE merchant_id = :merchant_id
+        """,
+        {
+            "merchant_id": merchant_id,
+            "payment_intent_id": payment_intent_id,
+        },
+    )
+
+
+async def _charge_direct_overage_increment(
+    merchant_id: str,
+    *,
+    charged_before_credits: int,
+    charge_credits: int,
+) -> Dict[str, Any]:
+    increment_id = _overage_increment_id(
+        merchant_id=merchant_id,
+        charged_before_credits=charged_before_credits,
+        charge_credits=charge_credits,
+    )
+    amount_cents = _credits_to_amount_cents(charge_credits)
+    try:
+        payment_intent = await _create_direct_payment_intent(
+            merchant_id=merchant_id,
+            purpose=DIRECT_OVERAGE_PURPOSE,
+            amount_cents=amount_cents,
+            idempotency_key=f"direct_overage_payment_intent:{increment_id}",
+            metadata={
+                "merchant_id": merchant_id,
+                "pivota_purpose": DIRECT_OVERAGE_PURPOSE,
+                "overage_increment_id": increment_id,
+                "charge_credits": str(int(charge_credits)),
+                "amount_cents": str(amount_cents),
+            },
+            description=(
+                f"Pivota direct overage: {charge_credits:,} credits - "
+                f"${_credits_to_usd_total(charge_credits)}"
+            ),
+        )
+    except MissingVerifiedPaymentMethodError:
+        raise
+    except Exception as exc:
+        raise OveragePaymentFailedError(
+            merchant_id,
+            str(exc),
+            overage_increment_id=increment_id,
+        ) from exc
+
+    payment_intent_id = _stripe_id(payment_intent)
+    payment_intent_data = _stripe_object_to_dict(payment_intent)
+    status = _billing_as_text(
+        payment_intent_data.get("status")
+        if isinstance(payment_intent_data, dict)
+        else getattr(payment_intent, "status", "")
+    )
+    if status and status != "succeeded":
+        raise OveragePaymentFailedError(
+            merchant_id,
+            status,
+            payment_intent_id=payment_intent_id,
+            overage_increment_id=increment_id,
+        )
+    return {
+        "payment_intent_id": payment_intent_id,
+        "status": status or "succeeded",
+        "overage_increment_id": increment_id,
+        "charge_credits": int(charge_credits),
+        "amount_cents": amount_cents,
+        "amount_total": _credits_to_usd_total(charge_credits),
+    }
 
 
 async def _apply_delta(
@@ -426,6 +649,10 @@ async def _apply_delta(
         if replay is not None:
             return replay
 
+        await ensure_row(merchant_id, conn=tx)
+        if operation == "debit":
+            await apply_subscription_allowance(merchant_id, conn=tx)
+
         claimed = await _claim_operation(
             conn=tx,
             operation_key=operation_key,
@@ -444,16 +671,17 @@ async def _apply_delta(
                 return replay
             raise RuntimeError("credit operation replay row was not readable")
 
-        await ensure_row(merchant_id, conn=tx)
-        if operation == "debit":
-            await apply_subscription_allowance(merchant_id, conn=tx)
         for _attempt in range(_MAX_OPTIMISTIC_RETRIES):
             balance = await _get_balance_with_conn(merchant_id, tx)
             available = int(balance["credits"])
-            if operation == "debit" and available < int(amount):
-                raise InsufficientCreditsError(
-                    merchant_id, category, int(amount), available,
-                )
+            paid_tier = _is_paid_tier(balance.get("plan_tier"))
+            if operation == "debit":
+                if balance.get("overage_blocked_until_payment"):
+                    raise OveragePaymentBlockedError(merchant_id)
+                if available < int(amount) and not paid_tier:
+                    raise InsufficientCreditsError(
+                        merchant_id, category, int(amount), available,
+                    )
             purchased_available = int(balance.get("purchased_credits") or 0)
             allowance_available = max(0, available - purchased_available)
             purchased_debit = min(
@@ -462,23 +690,74 @@ async def _apply_delta(
             )
 
             if operation == "debit":
+                balance_debit = min(available, int(amount))
+                overage_shortfall = max(0, int(amount) - available)
+                pending_before = int(balance.get("overage_pending_credits") or 0)
+                pending_after = pending_before + overage_shortfall
+                overage_charge_credits = (
+                    (pending_after // DEFAULT_OVERAGE_CHARGE_CREDITS)
+                    * DEFAULT_OVERAGE_CHARGE_CREDITS
+                    if paid_tier
+                    else 0
+                )
+                overage_charge: Optional[Dict[str, Any]] = None
+                if overage_charge_credits:
+                    overage_charge = await _charge_direct_overage_increment(
+                        merchant_id,
+                        charged_before_credits=int(
+                            balance.get("overage_charged_credits") or 0
+                        ),
+                        charge_credits=overage_charge_credits,
+                    )
                 sql = """
                 -- merchant_credit_balance:debit_update
                 UPDATE merchant_credit_balance
-                   SET credits = credits - :amount,
+                   SET credits = credits - :balance_debit,
                        purchased_credits = purchased_credits - :purchased_credits,
+                       overage_pending_credits = (
+                           overage_pending_credits
+                           + :overage_pending_credits
+                           - :overage_charge_credits
+                       ),
+                       overage_charged_credits = (
+                           overage_charged_credits + :overage_charge_credits
+                       ),
+                       overage_blocked_until_payment = CASE
+                           WHEN :overage_charge_credits > 0 THEN FALSE
+                           ELSE overage_blocked_until_payment
+                       END,
+                       overage_last_payment_intent_id = COALESCE(
+                           :overage_payment_intent_id,
+                           overage_last_payment_intent_id
+                       ),
+                       overage_last_failed_at = CASE
+                           WHEN :overage_charge_credits > 0 THEN NULL
+                           ELSE overage_last_failed_at
+                       END,
                        usd_cogs_internal = usd_cogs_internal + :usd_cogs,
                        updated_at = NOW(),
                        version = version + 1
                  WHERE merchant_id = :merchant_id
                    AND version = :version
-                   AND credits >= :amount
+                   AND credits >= :balance_debit
                    AND purchased_credits >= :purchased_credits
+                   AND (
+                       overage_pending_credits + :overage_pending_credits
+                   ) >= :overage_charge_credits
                 RETURNING credits, allowance_credits, usd_cogs_internal,
-                          purchased_credits, allowance_period_start,
+                          purchased_credits,
+                          overage_pending_credits, overage_charged_credits,
+                          overage_blocked_until_payment,
+                          overage_last_payment_intent_id,
+                          overage_last_failed_at,
+                          allowance_period_start,
                           plan_tier, updated_at, version
                 """
             else:
+                balance_debit = 0
+                overage_shortfall = 0
+                overage_charge_credits = 0
+                overage_charge = None
                 sql = """
                 -- merchant_credit_balance:credit_update
                 UPDATE merchant_credit_balance
@@ -493,27 +772,54 @@ async def _apply_delta(
                  WHERE merchant_id = :merchant_id
                    AND version = :version
                 RETURNING credits, allowance_credits, usd_cogs_internal,
-                          purchased_credits, allowance_period_start,
+                          purchased_credits,
+                          overage_pending_credits, overage_charged_credits,
+                          overage_blocked_until_payment,
+                          overage_last_payment_intent_id,
+                          overage_last_failed_at,
+                          allowance_period_start,
                           plan_tier, updated_at, version
                 """
+            params = {
+                "merchant_id": merchant_id,
+                "amount": int(amount),
+                "purchased_credits": (
+                    purchased_debit
+                    if operation == "debit"
+                    else purchased_credit_amount
+                ),
+                "usd_cogs": usd_cogs,
+                "version": int(balance["version"]),
+            }
+            if operation == "debit":
+                params.update(
+                    {
+                        "balance_debit": balance_debit,
+                        "overage_pending_credits": overage_shortfall,
+                        "overage_charge_credits": overage_charge_credits,
+                        "overage_payment_intent_id": (
+                            overage_charge.get("payment_intent_id")
+                            if overage_charge
+                            else None
+                        ),
+                    }
+                )
             row = await tx.fetch_one(
                 sql,
-                {
-                    "merchant_id": merchant_id,
-                    "amount": int(amount),
-                    "purchased_credits": (
-                        purchased_debit
-                        if operation == "debit"
-                        else purchased_credit_amount
-                    ),
-                    "usd_cogs": usd_cogs,
-                    "version": int(balance["version"]),
-                },
+                params,
             )
             if row is not None:
                 post_balance = _balance_from_row(row)
                 if operation == "debit":
                     post_balance["purchased_credits_debited"] = purchased_debit
+                    post_balance["overage_credits_accrued"] = overage_shortfall
+                    if overage_charge:
+                        post_balance["overage_charge"] = overage_charge
+                        await _record_overage_charge_ledger(
+                            conn=tx,
+                            merchant_id=merchant_id,
+                            charge=overage_charge,
+                        )
                 else:
                     post_balance["purchased_credits_credited"] = purchased_credit_amount
                 await _store_post_balance(
@@ -548,17 +854,25 @@ async def debit(
         category=category,
         caller_key=idempotency_key,
     )
-    return await _apply_delta(
-        merchant_id=merchant_id,
-        category=category,
-        amount=int(amount_credits),
-        usd_cogs=_decimal(usd_cogs),
-        operation_key=operation_key,
-        operation="debit",
-        event_type=f"credit_debit_{category}",
-        source_key=idempotency_key,
-        conn=conn,
-    )
+    try:
+        return await _apply_delta(
+            merchant_id=merchant_id,
+            category=category,
+            amount=int(amount_credits),
+            usd_cogs=_decimal(usd_cogs),
+            operation_key=operation_key,
+            operation="debit",
+            event_type=f"credit_debit_{category}",
+            source_key=idempotency_key,
+            conn=conn,
+        )
+    except OveragePaymentFailedError as exc:
+        await _set_overage_blocked(
+            merchant_id,
+            payment_intent_id=exc.payment_intent_id,
+            conn=conn,
+        )
+        raise
 
 
 async def credit(
@@ -633,11 +947,16 @@ def _is_verified_default_payment_method(value: Any, *, stripe_customer_id: str) 
 
 async def require_verified_payment_method(merchant_id: str) -> None:
     """Require a chargeable default Stripe card for paid direct audits."""
+    await _verified_default_payment_method_for_direct_merchant(merchant_id)
+
+
+async def _verified_default_payment_method_for_direct_merchant(
+    merchant_id: str,
+) -> tuple[str, str]:
+    """Return (stripe_customer_id, default_payment_method_id) after validation."""
     stripe_customer_id = await _stripe_customer_id_for_direct_merchant(merchant_id)
     if not stripe_customer_id:
         raise MissingVerifiedPaymentMethodError(merchant_id, "missing_stripe_customer")
-
-    import asyncio
 
     customer = await asyncio.to_thread(
         stripe_client.v1.customers.retrieve,
@@ -674,3 +993,363 @@ async def require_verified_payment_method(merchant_id: str) -> None:
             merchant_id,
             "default_payment_method_not_verified_card",
         )
+    payment_method_id = _stripe_id(payment_method)
+    if not payment_method_id:
+        raise MissingVerifiedPaymentMethodError(
+            merchant_id,
+            "missing_default_payment_method",
+        )
+    return stripe_customer_id, payment_method_id
+
+
+async def _create_direct_payment_intent(
+    *,
+    merchant_id: str,
+    purpose: str,
+    amount_cents: int,
+    idempotency_key: str,
+    metadata: Dict[str, str],
+    description: str,
+) -> Any:
+    stripe_customer_id, payment_method_id = (
+        await _verified_default_payment_method_for_direct_merchant(merchant_id)
+    )
+    payload = {
+        "amount": int(amount_cents),
+        "currency": "usd",
+        "customer": stripe_customer_id,
+        "payment_method": payment_method_id,
+        "off_session": True,
+        "confirm": True,
+        "metadata": {
+            **{str(k): str(v) for k, v in metadata.items()},
+            "merchant_id": merchant_id,
+            "pivota_purpose": purpose,
+        },
+        "description": description,
+    }
+    return await asyncio.to_thread(
+        stripe_client.v1.payment_intents.create,
+        payload,
+        {"idempotency_key": idempotency_key},
+    )
+
+
+async def create_credit_topup_payment_intent(
+    *,
+    merchant_id: str,
+    pack_credits: int,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create and confirm a manual direct-credit top-up PaymentIntent.
+
+    Credits are only added by the Stripe billing webhook after
+    `payment_intent.succeeded`; this function intentionally does not mutate the
+    balance.
+    """
+    credits = int(pack_credits)
+    if credits <= 0:
+        raise ValueError("pack_credits must be > 0")
+    amount_cents = _credits_to_amount_cents(credits)
+    caller_key = (
+        str(idempotency_key).strip()
+        if idempotency_key and str(idempotency_key).strip()
+        else f"{merchant_id}:{credits}:{uuid.uuid4().hex}"
+    )
+    payment_intent = await _create_direct_payment_intent(
+        merchant_id=merchant_id,
+        purpose=DIRECT_TOPUP_PURPOSE,
+        amount_cents=amount_cents,
+        idempotency_key=f"direct_credit_topup_payment_intent:{caller_key}",
+        metadata={
+            "merchant_id": merchant_id,
+            "pivota_purpose": DIRECT_TOPUP_PURPOSE,
+            "pack_credits": str(credits),
+            "amount_cents": str(amount_cents),
+        },
+        description=(
+            f"Pivota direct credit top-up: {credits:,} credits - "
+            f"${_credits_to_usd_total(credits)}"
+        ),
+    )
+    data = _stripe_object_to_dict(payment_intent)
+    status = _billing_as_text(data.get("status") if isinstance(data, dict) else "")
+    return {
+        "payment_intent_id": _stripe_id(payment_intent),
+        "status": status or "created",
+        "pack_credits": credits,
+        "amount": {
+            "currency": "usd",
+            "total": _credits_to_usd_total(credits),
+        },
+    }
+
+
+async def apply_credit_topup_payment_intent_succeeded(
+    payment_intent: Any,
+    *,
+    conn: Any = None,
+) -> Dict[str, Any]:
+    data = _stripe_object_to_dict(payment_intent)
+    if not isinstance(data, dict):
+        return {"ignored": True, "reason": "invalid_payment_intent"}
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    if _billing_as_text(metadata.get("pivota_purpose")) != DIRECT_TOPUP_PURPOSE:
+        return {"ignored": True, "reason": "not_direct_credit_topup"}
+
+    payment_intent_id = _billing_as_text(data.get("id"))
+    merchant_id = _billing_as_text(metadata.get("merchant_id"))
+    pack_credits_raw = _billing_as_text(metadata.get("pack_credits"))
+    if not payment_intent_id or not merchant_id or not pack_credits_raw:
+        raise ValueError("direct credit top-up PaymentIntent metadata is incomplete")
+    return await _apply_credit_topup(
+        merchant_id=merchant_id,
+        pack_credits=int(pack_credits_raw),
+        payment_intent_id=payment_intent_id,
+        amount_cents=int(data.get("amount") or _credits_to_amount_cents(int(pack_credits_raw))),
+        conn=conn,
+    )
+
+
+async def _apply_credit_topup(
+    *,
+    merchant_id: str,
+    pack_credits: int,
+    payment_intent_id: str,
+    amount_cents: int,
+    conn: Any = None,
+) -> Dict[str, Any]:
+    credits = int(pack_credits)
+    if credits <= 0:
+        raise ValueError("pack_credits must be > 0")
+    operation_key = (
+        f"merchant_credit_balance:credit_topup:{merchant_id}:{payment_intent_id}"
+    )
+    async with _transaction(conn) as tx:
+        replay = await _fetch_replay(conn=tx, operation_key=operation_key)
+        if replay is not None:
+            return replay
+
+        claimed = await _claim_operation(
+            conn=tx,
+            operation_key=operation_key,
+            merchant_id=merchant_id,
+            category="topup",
+            amount=credits,
+            usd_cogs=Decimal("0"),
+            operation="credit",
+            event_type="credit_topup",
+            source_key=payment_intent_id,
+            purchased_credits=credits,
+            payload_extra={
+                "payment_intent_id": payment_intent_id,
+                "stripe_payment_intent_id": payment_intent_id,
+                "pack_credits": credits,
+                "amount_cents": int(amount_cents),
+                "amount_total": _credits_to_usd_total(credits),
+                "currency": "usd",
+            },
+        )
+        if not claimed:
+            replay = await _fetch_replay(conn=tx, operation_key=operation_key)
+            if replay is not None:
+                return replay
+            raise RuntimeError("credit top-up replay row was not readable")
+
+        await ensure_row(merchant_id, conn=tx)
+        row = await tx.fetch_one(
+            """
+            -- merchant_credit_balance:topup_credit_update
+            UPDATE merchant_credit_balance
+               SET credits = credits + :pack_credits,
+                   purchased_credits = purchased_credits + :pack_credits,
+                   overage_blocked_until_payment = FALSE,
+                   overage_last_payment_intent_id = :payment_intent_id,
+                   overage_last_failed_at = NULL,
+                   updated_at = NOW(),
+                   version = version + 1
+             WHERE merchant_id = :merchant_id
+            RETURNING credits, allowance_credits, usd_cogs_internal,
+                      purchased_credits,
+                      overage_pending_credits, overage_charged_credits,
+                      overage_blocked_until_payment,
+                      overage_last_payment_intent_id,
+                      overage_last_failed_at,
+                      allowance_period_start,
+                      plan_tier, updated_at, version
+            """,
+            {
+                "merchant_id": merchant_id,
+                "pack_credits": credits,
+                "payment_intent_id": payment_intent_id,
+            },
+        )
+        if row is None:
+            raise RuntimeError("credit top-up update did not return a balance row")
+        post_balance = _balance_from_row(row)
+        post_balance["purchased_credits_credited"] = credits
+        await _store_post_balance(
+            conn=tx,
+            operation_key=operation_key,
+            post_balance=post_balance,
+        )
+        post_balance["replay"] = False
+        return post_balance
+
+
+async def charge_pending_overage_for_merchant(
+    merchant_id: str,
+    *,
+    force: bool = False,
+    retry_blocked: bool = False,
+    conn: Any = None,
+) -> Dict[str, Any]:
+    """Charge pending direct overage.
+
+    `force=True` is the daily-sweep mode: collect the current pending amount
+    even if it is below the normal $20 threshold. This function is intentionally
+    cron-callable; it does not schedule itself.
+    """
+    try:
+        return await _charge_pending_overage_for_merchant(
+            merchant_id,
+            force=force,
+            retry_blocked=retry_blocked,
+            conn=conn,
+        )
+    except OveragePaymentFailedError as exc:
+        await _set_overage_blocked(
+            merchant_id,
+            payment_intent_id=exc.payment_intent_id,
+            conn=conn,
+        )
+        raise
+
+
+async def _charge_pending_overage_for_merchant(
+    merchant_id: str,
+    *,
+    force: bool,
+    retry_blocked: bool,
+    conn: Any = None,
+) -> Dict[str, Any]:
+    async with _transaction(conn) as tx:
+        balance = await _get_balance_with_conn(merchant_id, tx)
+        if not balance:
+            return {"charged": False, "reason": "missing_balance"}
+        if balance.get("overage_blocked_until_payment") and not retry_blocked:
+            raise OveragePaymentBlockedError(merchant_id)
+        pending = int(balance.get("overage_pending_credits") or 0)
+        if pending <= 0:
+            return {"charged": False, "reason": "no_pending_overage"}
+        if force:
+            charge_credits = pending
+        else:
+            charge_credits = (
+                pending // DEFAULT_OVERAGE_CHARGE_CREDITS
+            ) * DEFAULT_OVERAGE_CHARGE_CREDITS
+        if charge_credits <= 0:
+            return {"charged": False, "reason": "below_threshold"}
+
+        charge = await _charge_direct_overage_increment(
+            merchant_id,
+            charged_before_credits=int(balance.get("overage_charged_credits") or 0),
+            charge_credits=charge_credits,
+        )
+        row = await tx.fetch_one(
+            """
+            -- merchant_credit_balance:pending_overage_charge_update
+            UPDATE merchant_credit_balance
+               SET overage_pending_credits = overage_pending_credits - :charge_credits,
+                   overage_charged_credits = overage_charged_credits + :charge_credits,
+                   overage_blocked_until_payment = FALSE,
+                   overage_last_payment_intent_id = :payment_intent_id,
+                   overage_last_failed_at = NULL,
+                   updated_at = NOW(),
+                   version = version + 1
+             WHERE merchant_id = :merchant_id
+               AND overage_pending_credits >= :charge_credits
+            RETURNING credits, allowance_credits, usd_cogs_internal,
+                      purchased_credits,
+                      overage_pending_credits, overage_charged_credits,
+                      overage_blocked_until_payment,
+                      overage_last_payment_intent_id,
+                      overage_last_failed_at,
+                      allowance_period_start,
+                      plan_tier, updated_at, version
+            """,
+            {
+                "merchant_id": merchant_id,
+                "charge_credits": charge_credits,
+                "payment_intent_id": charge["payment_intent_id"],
+            },
+        )
+        if row is None:
+            raise RuntimeError("pending overage charge update did not converge")
+        await _record_overage_charge_ledger(
+            conn=tx,
+            merchant_id=merchant_id,
+            charge=charge,
+        )
+        return {
+            "charged": True,
+            "balance": _balance_from_row(row),
+            "overage_charge": charge,
+        }
+
+
+async def sweep_pending_overage_charges(
+    *,
+    limit: int = 100,
+    force: bool = True,
+    conn: Any = None,
+) -> Dict[str, Any]:
+    """Cron-callable daily sweep for direct overage balances."""
+    target = conn or database
+    rows = await target.fetch_all(
+        """
+        -- merchant_credit_balance:sweep_pending_overage_candidates
+        SELECT merchant_id
+          FROM merchant_credit_balance
+         WHERE plan_tier <> 'free'
+           AND overage_pending_credits > 0
+           AND overage_blocked_until_payment = FALSE
+         ORDER BY updated_at ASC
+         LIMIT :limit
+        """,
+        {"limit": int(limit)},
+    )
+    charged = 0
+    failed = 0
+    skipped = 0
+    results = []
+    for row in rows or []:
+        merchant_id = _billing_as_text(_row_to_dict(row).get("merchant_id"))
+        if not merchant_id:
+            continue
+        try:
+            result = await charge_pending_overage_for_merchant(
+                merchant_id,
+                force=force,
+                conn=conn,
+            )
+            results.append({"merchant_id": merchant_id, **result})
+            if result.get("charged"):
+                charged += 1
+            else:
+                skipped += 1
+        except OveragePaymentFailedError as exc:
+            failed += 1
+            results.append({
+                "merchant_id": merchant_id,
+                "charged": False,
+                "error": exc.code,
+                "reason": exc.reason,
+            })
+    return {
+        "checked": len(rows or []),
+        "charged": charged,
+        "failed": failed,
+        "skipped": skipped,
+        "results": results,
+    }

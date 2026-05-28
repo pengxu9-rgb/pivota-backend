@@ -133,6 +133,17 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "source_domain",
         },
     ),
+    RequiredTableColumns(
+        table="merchant_credit_balance",
+        columns={
+            "purchased_credits",
+            "overage_pending_credits",
+            "overage_charged_credits",
+            "overage_blocked_until_payment",
+            "overage_last_payment_intent_id",
+            "overage_last_failed_at",
+        },
+    ),
 )
 
 
@@ -696,6 +707,22 @@ async def ensure_required_schema_light() -> None:
                     ALTER TABLE IF EXISTS settlement_snapshots
                       ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ,
                       ADD COLUMN IF NOT EXISTS settled_via_file_id BIGINT;
+                    """
+                )
+            )
+            # Direct/self-serve merchant credit wallet top-ups and overage
+            # state (migrations 141/142). The direct audit launch path reads
+            # these columns before it can safely decide hard-stop vs overage.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_credit_balance
+                      ADD COLUMN IF NOT EXISTS purchased_credits BIGINT NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS overage_pending_credits BIGINT NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS overage_charged_credits BIGINT NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS overage_blocked_until_payment BOOLEAN NOT NULL DEFAULT FALSE,
+                      ADD COLUMN IF NOT EXISTS overage_last_payment_intent_id TEXT,
+                      ADD COLUMN IF NOT EXISTS overage_last_failed_at TIMESTAMPTZ;
                     """
                 )
             )
