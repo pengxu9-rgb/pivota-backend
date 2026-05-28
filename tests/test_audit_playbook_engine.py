@@ -660,3 +660,112 @@ def test_editorial_dedup_severity_is_max_of_group():
         f"strongest of the group {per_host_severities!r}"
     )
     assert consolidated["evidence"]["host_count"] == 2
+
+
+# ---------------------------------------------------------------------
+# 8. Content revision lever — per-SKU evidence-bound actions
+# ---------------------------------------------------------------------
+
+
+def _per_sku_report_for_content_revision():
+    return {
+        "sku_key": "sku-1",
+        "product_key": "prod-1",
+        "sku_title": "Bright Skin Serum 30ml",
+        "impact_proxy": 12,
+        "scores": {
+            "identity": {"score": 88, "breakdown": {}},
+            "content_richness": {
+                "score": 42,
+                "breakdown": {
+                    "enrichment_coverage": {"points": 5, "max": 20, "reason": "missing answer blocks"},
+                    "total": 42,
+                },
+            },
+            "routability": {"score": 90, "breakdown": {}},
+            "citation": {"score": 30, "breakdown": {}},
+        },
+        "primary_gaps": [
+            {
+                "dimension": "content_richness",
+                "bucket": "answer_shaped_modules",
+                "reason": "FAQ answers missing",
+            }
+        ],
+        "failing_prompts": [
+            {
+                "query": "best serum for dull sensitive skin",
+                "axis": "concern",
+                "evidence_run_id": "probe-run-1",
+                "competitors_named": ["GlowCo"],
+            },
+            {
+                "query": "Bright Skin Serum vs GlowCo",
+                "axis": "comparison",
+                "evidence_run_id": "probe-run-2",
+                "competitors_named": ["GlowCo"],
+            },
+        ],
+    }
+
+
+def test_content_revision_lever_selected_for_low_content_score():
+    from services.audit_playbook_engine import select_playbooks
+
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[_per_sku_report_for_content_revision()],
+        authority_map={
+            "skus": [
+                {
+                    "sku_key": "sku-1",
+                    "authority_hosts": [
+                        {"host": "forbes.com", "competitors_named": ["GlowCo"]}
+                    ],
+                }
+            ]
+        },
+    )
+    content_actions = [a for a in actions if a.get("lever") == "content_revision"]
+    assert content_actions
+    assert content_actions[0]["playbook_step_id"] == "content_revision_faq_block"
+    assert content_actions[0]["target_sku_key"] == "sku-1"
+
+
+def test_content_revision_template_uses_prompts_and_competitor_evidence():
+    from services.audit_playbook_engine import select_playbooks
+
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[_per_sku_report_for_content_revision()],
+        authority_map={
+            "skus": [
+                {
+                    "sku_key": "sku-1",
+                    "authority_hosts": [
+                        {"host": "forbes.com", "competitors_named": ["GlowCo"]}
+                    ],
+                }
+            ]
+        },
+    )
+    action = [a for a in actions if a.get("playbook_step_id") == "content_revision_faq_block"][0]
+    assert "Bright Skin Serum 30ml" in action["title"]
+    assert "best serum for dull sensitive skin" in action["body"]
+    assert "forbes.com cited GlowCo" in action["body"]
+
+
+def test_content_revision_actions_always_have_evidence_run_ids():
+    from services.audit_playbook_engine import select_playbooks
+
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[_per_sku_report_for_content_revision()],
+    )
+    content_actions = [a for a in actions if a.get("lever") == "content_revision"]
+    assert content_actions
+    for action in content_actions:
+        assert action["evidence_run_ids"], action

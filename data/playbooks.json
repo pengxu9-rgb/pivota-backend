@@ -1,7 +1,7 @@
 {
   "_meta": {
     "schema_version": 2,
-    "purpose": "BD-curated per-cited-host action playbooks. Each playbook matches one host_type (and optionally host_subtype) and produces a templated action item the merchant can execute. PR-G wires playbook selection into the merchant audit's action_items list.",
+    "purpose": "BD-curated per-cited-host and per-SKU action playbooks. Host playbooks match one host_type (and optionally host_subtype); content_revision playbooks match per-SKU failing dimensions and buckets.",
     "owner": "BD team for content; engineering reviews schema only.",
     "schema_per_playbook": {
       "applies_when": "match criteria: host_type required, host_subtype optional",
@@ -9,7 +9,7 @@
       "body_template": "string with placeholders: {host} {coverage_note} {outreach_hint} {example_query} {competitors_phrase} {timeline_low} {timeline_high}",
       "concrete_next_step": "1-sentence 'this week' task — what the merchant should DO first, with specifics (URLs, contact methods, sample sizes). Distinct from body_template (which describes the strategic rationale).",
       "severity": "critical | high | medium | low — applied uniformly across all instances of this playbook",
-      "lever": "editorial_outreach | wholesale_onboarding | creator_partnership | marketplace_listing | research",
+      "lever": "editorial_outreach | wholesale_onboarding | creator_partnership | marketplace_listing | research | content_revision",
       "expected_timeline_weeks": "[low, high] integer pair"
     },
     "matching_priority": "When multiple playbooks could match a host, the more specific match wins (subtype > type). Unknown hosts (type='unclassified') match the catch-all generic_unclassified playbook.",
@@ -193,6 +193,81 @@
       "severity": "medium",
       "lever": "marketplace_listing",
       "expected_timeline_weeks": [2, 8]
+    },
+    "content_revision_faq_block": {
+      "playbook_id": "content_revision_faq_block",
+      "lever": "content_revision",
+      "triggers": {"failing_dimension": "content_richness", "failing_bucket": "answer_shaped_modules"},
+      "owner": "pivota",
+      "estimated_days": [3, 7],
+      "severity": "high",
+      "concrete_next_step": "Pivota drafts copy from audit evidence; merchant compliance reviews; Pivota publishes to product_enrichment fields.",
+      "template": {
+        "title": "Add FAQ answer-block to {{sku_title}} PDP",
+        "what": "Generate Q+A pairs for {{top_failing_prompts}} and emit FAQPage JSON-LD into product_enrichment.bullet_points + description_markdown.",
+        "evidence": "{{failing_prompt_list}} returned no first-party grounded SKU answer; competitors or external sources cited on these queries: {{competitor_evidence}}.",
+        "concrete_next_step": "Pivota drafts copy from audit evidence; merchant compliance reviews; Pivota publishes to product_enrichment fields."
+      }
+    },
+    "content_revision_comparison_block": {
+      "playbook_id": "content_revision_comparison_block",
+      "lever": "content_revision",
+      "triggers": {"failing_dimension": "content_richness", "failing_bucket": "comparison_block"},
+      "owner": "pivota",
+      "estimated_days": [4, 8],
+      "severity": "high",
+      "concrete_next_step": "Pivota prepares a comparison table with cited audit evidence; merchant confirms differentiator claims before publish.",
+      "template": {
+        "title": "Add competitor comparison block for {{sku_title}}",
+        "what": "Draft a concise comparison module that answers the failed vs/alternative prompts using only verified SKU facts and merchant-approved differentiators.",
+        "evidence": "Comparison prompts missed the SKU: {{failing_prompt_list}}. Competitor evidence: {{competitor_evidence}}.",
+        "concrete_next_step": "Pivota prepares a comparison table with cited audit evidence; merchant confirms differentiator claims before publish."
+      }
+    },
+    "content_revision_schema_markup": {
+      "playbook_id": "content_revision_schema_markup",
+      "lever": "content_revision",
+      "triggers": {"failing_dimension": "content_richness", "failing_bucket": "schema_markup"},
+      "owner": "pivota",
+      "estimated_days": [2, 5],
+      "severity": "medium",
+      "concrete_next_step": "Pivota generates JSON-LD from catalog/offers plus audited FAQ copy, validates it, and publishes through the enrichment layer.",
+      "template": {
+        "title": "Add Product + Offer + FAQPage schema for {{sku_title}}",
+        "what": "Emit schema.org Product, Offer, BreadcrumbList, and FAQPage JSON-LD from existing catalog, offer, and FAQ evidence so grounded retrievers can parse the SKU.",
+        "evidence": "Structured-answer gaps appeared on: {{failing_prompt_list}}. External citation context: {{competitor_evidence}}.",
+        "concrete_next_step": "Pivota generates JSON-LD from catalog/offers plus audited FAQ copy, validates it, and publishes through the enrichment layer."
+      }
+    },
+    "content_revision_ingredient_dose_module": {
+      "playbook_id": "content_revision_ingredient_dose_module",
+      "lever": "content_revision",
+      "triggers": {"failing_dimension": "content_richness", "failing_bucket": "ingredient_dose_module"},
+      "owner": "pivota",
+      "estimated_days": [5, 10],
+      "severity": "high",
+      "concrete_next_step": "Pivota drafts the module from audit evidence; merchant provides or approves INCI, dosage, warnings, and substantiation before publish.",
+      "template": {
+        "title": "Add ingredient and dose answer module for {{sku_title}}",
+        "what": "Create an ingredient/dose/use module from reviewed formulation, usage-guide, and compatibility evidence; route unsubstantiated claims to merchant compliance.",
+        "evidence": "Beauty/wellness prompts lacked grounded SKU-specific proof: {{failing_prompt_list}}. Competitor evidence: {{competitor_evidence}}.",
+        "concrete_next_step": "Pivota drafts the module from audit evidence; merchant provides or approves INCI, dosage, warnings, and substantiation before publish."
+      }
+    },
+    "content_revision_intent_header": {
+      "playbook_id": "content_revision_intent_header",
+      "lever": "content_revision",
+      "triggers": {"failing_dimension": "content_richness", "failing_bucket": "intent_header"},
+      "owner": "pivota",
+      "estimated_days": [2, 4],
+      "severity": "medium",
+      "concrete_next_step": "Pivota drafts a header/summary rewrite from failing prompts; merchant approves brand voice; Pivota publishes to title_override and summary_short.",
+      "template": {
+        "title": "Rewrite PDP header for intent-shaped queries on {{sku_title}}",
+        "what": "Rewrite the PDP title, summary, and first answer block so the page states who the SKU is for, the use case it solves, and the exact variant in natural buyer language.",
+        "evidence": "Intent/persona prompts failed: {{failing_prompt_list}}. Citation context: {{competitor_evidence}}.",
+        "concrete_next_step": "Pivota drafts a header/summary rewrite from failing prompts; merchant approves brand voice; Pivota publishes to title_override and summary_short."
+      }
     },
     "generic_unclassified": {
       "applies_when": {"type": "unclassified"},

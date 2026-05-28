@@ -34,6 +34,7 @@ low) then by `times_cited` descending, and capped at `cap` entries
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -134,7 +135,23 @@ def _render_template(template: str, ctx: Dict[str, Any]) -> str:
         def __missing__(self, key):  # type: ignore[override]
             return ""
 
-    rendered = template.format_map(_DefaultDict(ctx))
+    def _stringify(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value if v is not None)
+        return str(value)
+
+    if "{{" in (template or ""):
+        rendered = re.sub(
+            r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}",
+            lambda m: _stringify(ctx.get(m.group(1), "")),
+            template,
+        )
+    else:
+        rendered = template.format_map(_DefaultDict({
+            k: _stringify(v) for k, v in (ctx or {}).items()
+        }))
     # Collapse repeated whitespace introduced by empty fields.
     while "  " in rendered:
         rendered = rendered.replace("  ", " ")
@@ -277,6 +294,287 @@ def _build_pitch_draft(
 _DEFAULT_MIN_TIMES_CITED = 2
 
 
+def _content_revision_playbooks() -> List[Tuple[str, Dict[str, Any]]]:
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    for pid, pb in _load_playbooks().items():
+        if (pb.get("lever") or "") != "content_revision":
+            continue
+        triggers = pb.get("triggers") or {}
+        if triggers.get("failing_dimension") and triggers.get("failing_bucket"):
+            out.append((pid, pb))
+    return out
+
+
+def _score_for_dimension(per_sku_report: Dict[str, Any], dimension: str) -> Optional[int]:
+    score = ((per_sku_report.get("scores") or {}).get(dimension) or {}).get("score")
+    try:
+        return int(score) if score is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _content_gap_candidates(per_sku_report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return failing-dimension/bucket candidates for content_revision.
+
+    Exact `primary_gaps` from the report win. We also map the scorecard
+    bucket vocabulary to playbook trigger vocabulary so the scorer can
+    stay faithful to spec A while the playbooks stay phrased around
+    concrete content modules merchants can understand.
+    """
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
+
+    def _add(dimension: str, bucket: str, reason: Optional[str] = None) -> None:
+        key = (dimension, bucket)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append({
+            "dimension": dimension,
+            "bucket": bucket,
+            "reason": reason,
+        })
+
+    for gap in per_sku_report.get("primary_gaps") or []:
+        dimension = gap.get("dimension")
+        bucket = gap.get("bucket")
+        if dimension and bucket:
+            _add(str(dimension), str(bucket), gap.get("reason"))
+
+    content_score = _score_for_dimension(per_sku_report, "content_richness")
+    if content_score is None or content_score >= 70:
+        return candidates
+
+    prompt_axes = {
+        (p.get("axis") or "").strip()
+        for p in per_sku_report.get("failing_prompts") or []
+        if isinstance(p, dict)
+    }
+    _add("content_richness", "answer_shaped_modules", "content score below ready threshold")
+    if "comparison" in prompt_axes:
+        _add("content_richness", "comparison_block", "comparison prompts failed")
+    if prompt_axes & {"intent", "persona", "concern", "use_case"}:
+        _add("content_richness", "intent_header", "intent-shaped prompts failed")
+
+    breakdown = ((per_sku_report.get("scores") or {}).get("content_richness") or {}).get("breakdown") or {}
+    if any(
+        isinstance(detail, dict)
+        and int(detail.get("points") or 0) < int(detail.get("max") or 0)
+        for name, detail in breakdown.items()
+        if name in {"vertical_structure", "safety_claims"}
+    ):
+        _add("content_richness", "ingredient_dose_module", "vertical structure or claims evidence is incomplete")
+    if any(
+        isinstance(detail, dict)
+        and int(detail.get("points") or 0) < int(detail.get("max") or 0)
+        for name, detail in breakdown.items()
+        if name in {"freshness_raw_pdp", "model_readiness", "enrichment_coverage"}
+    ):
+        _add("content_richness", "schema_markup", "structured answer/readiness signals are incomplete")
+    return candidates
+
+
+def _authority_by_sku(authority_map: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for entry in (authority_map or {}).get("skus") or []:
+        if isinstance(entry, dict) and entry.get("sku_key"):
+            out[str(entry["sku_key"])] = entry
+    return out
+
+
+def _sku_title(sku_ctx: Dict[str, Any], per_sku_report: Dict[str, Any]) -> str:
+    product = sku_ctx.get("product") if isinstance(sku_ctx.get("product"), dict) else {}
+    sku = sku_ctx.get("sku") if isinstance(sku_ctx.get("sku"), dict) else {}
+    return (
+        per_sku_report.get("sku_title")
+        or sku.get("title")
+        or product.get("title")
+        or per_sku_report.get("product_key")
+        or per_sku_report.get("sku_key")
+        or "this SKU"
+    )
+
+
+def _failing_prompt_rows(per_sku_report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = [
+        row for row in per_sku_report.get("failing_prompts") or []
+        if isinstance(row, dict) and (row.get("query") or "").strip()
+    ]
+    if rows:
+        return rows
+    # Fallback for tests or older reports: derive a prompt-ish row
+    # from grounding evidence, but only if it carries a run id.
+    out: List[Dict[str, Any]] = []
+    for ev in per_sku_report.get("verbatim_grounding_evidence") or []:
+        if not isinstance(ev, dict) or not ev.get("probe_run_id"):
+            continue
+        q = (ev.get("query") or "").strip()
+        if q:
+            out.append({
+                "query": q,
+                "evidence_run_id": ev.get("probe_run_id"),
+                "grounding_sources": ev.get("grounding_sources") or [],
+            })
+    return out
+
+
+def _evidence_run_ids(per_sku_report: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+    for row in _failing_prompt_rows(per_sku_report):
+        rid = row.get("evidence_run_id") or row.get("probe_run_id")
+        if rid and str(rid) not in ids:
+            ids.append(str(rid))
+    for ev in per_sku_report.get("verbatim_grounding_evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        rid = ev.get("probe_run_id") or ev.get("evidence_run_id")
+        if rid and str(rid) not in ids:
+            ids.append(str(rid))
+    for rid in per_sku_report.get("evidence_run_ids") or []:
+        if rid and str(rid) not in ids:
+            ids.append(str(rid))
+    return ids
+
+
+def _competitor_evidence(per_sku_report: Dict[str, Any]) -> str:
+    authority_hosts = per_sku_report.get("authority_hosts") or []
+    phrases: List[str] = []
+    for host in authority_hosts:
+        if not isinstance(host, dict):
+            continue
+        competitors = [
+            c for c in host.get("competitors_named") or []
+            if isinstance(c, str) and c.strip()
+        ]
+        if competitors:
+            phrases.append(f"{host.get('host')} cited {', '.join(competitors[:3])}")
+        elif host.get("host"):
+            phrases.append(f"{host.get('host')} was cited")
+        if len(phrases) >= 3:
+            break
+    if phrases:
+        return "; ".join(phrases)
+
+    competitors_seen: List[str] = []
+    for row in _failing_prompt_rows(per_sku_report):
+        for name in row.get("competitors_named") or []:
+            if isinstance(name, str) and name.strip() and name not in competitors_seen:
+                competitors_seen.append(name)
+    return ", ".join(competitors_seen[:5]) if competitors_seen else "no competitor evidence captured"
+
+
+def _priority_for_content_action(per_sku_report: Dict[str, Any], bucket: str) -> float:
+    for item in per_sku_report.get("priority_queue") or []:
+        if item.get("bucket") == bucket:
+            try:
+                return float(item.get("priority_score") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    content_score = _score_for_dimension(per_sku_report, "content_richness")
+    impact = per_sku_report.get("impact_proxy") or 1.0
+    try:
+        return float(impact) * max(0, 100 - int(content_score or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def render_content_revision_action(
+    playbook: Dict[str, Any],
+    sku_ctx: Dict[str, Any],
+    per_sku_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Render a merchant-safe content_revision action with evidence ids."""
+    template = playbook.get("template") or {}
+    failing_rows = _failing_prompt_rows(per_sku_report)
+    prompt_texts = [row.get("query") for row in failing_rows if row.get("query")]
+    evidence_run_ids = _evidence_run_ids(per_sku_report)
+    ctx = {
+        "sku_title": _sku_title(sku_ctx or {}, per_sku_report or {}),
+        "sku_key": per_sku_report.get("sku_key") or (sku_ctx or {}).get("sku_key") or "",
+        "top_failing_prompts": "; ".join(prompt_texts[:3]),
+        "failing_prompt_list": "; ".join(prompt_texts[:8]),
+        "competitor_evidence": _competitor_evidence(per_sku_report),
+    }
+    title = _render_template(template.get("title") or playbook.get("title_template") or "", ctx)
+    what = _render_template(template.get("what") or playbook.get("body_template") or "", ctx)
+    evidence = _render_template(template.get("evidence") or "", ctx)
+    concrete_next_step = _render_template(
+        template.get("concrete_next_step") or playbook.get("concrete_next_step") or "",
+        ctx,
+    )
+    body = what
+    if evidence:
+        body = f"{body} Evidence: {evidence}" if body else evidence
+    return {
+        "severity": playbook.get("severity") or "high",
+        "title": title,
+        "body": body,
+        "concrete_next_step": concrete_next_step or None,
+        "evidence": {
+            "sku_key": per_sku_report.get("sku_key"),
+            "failing_prompts": prompt_texts[:8],
+            "competitor_evidence": ctx["competitor_evidence"],
+        },
+        "playbook_step_id": playbook.get("playbook_id") or playbook.get("_playbook_id"),
+        "target_sku_key": per_sku_report.get("sku_key"),
+        "lever": "content_revision",
+        "owner": playbook.get("owner") or "pivota",
+        "expected_timeline_days": playbook.get("estimated_days") or [3, 7],
+        "evidence_run_ids": evidence_run_ids,
+    }
+
+
+def _select_content_revision_actions(
+    *,
+    per_sku_reports: Optional[List[Dict[str, Any]]],
+    authority_map: Optional[Dict[str, Any]],
+    sku_contexts_by_sku: Optional[Dict[str, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if not per_sku_reports:
+        return []
+    playbooks = _content_revision_playbooks()
+    if not playbooks:
+        return []
+    authority_lookup = _authority_by_sku(authority_map)
+    actions: List[Dict[str, Any]] = []
+    for report in per_sku_reports:
+        if not isinstance(report, dict):
+            continue
+        sku_key = str(report.get("sku_key") or "")
+        enriched_report = dict(report)
+        if sku_key in authority_lookup:
+            enriched_report["authority_hosts"] = authority_lookup[sku_key].get("authority_hosts") or []
+        sku_ctx = (sku_contexts_by_sku or {}).get(sku_key, {})
+        candidates = _content_gap_candidates(enriched_report)
+        for dimension, bucket, reason in (
+            (c.get("dimension"), c.get("bucket"), c.get("reason"))
+            for c in candidates
+        ):
+            for pid, pb in playbooks:
+                triggers = pb.get("triggers") or {}
+                if (
+                    triggers.get("failing_dimension") != dimension
+                    or triggers.get("failing_bucket") != bucket
+                ):
+                    continue
+                render_pb = dict(pb)
+                render_pb["_playbook_id"] = pid
+                render_pb.setdefault("playbook_id", pid)
+                action = render_content_revision_action(render_pb, sku_ctx, enriched_report)
+                # Hard lesson: no merchant-facing content-revision
+                # recommendation without a traceable probe evidence id.
+                if not action.get("evidence_run_ids"):
+                    continue
+                action["failing_dimension"] = dimension
+                action["failing_bucket"] = bucket
+                action["priority_score"] = _priority_for_content_action(enriched_report, str(bucket))
+                if reason:
+                    action["evidence"]["gap_reason"] = reason
+                actions.append(action)
+    actions.sort(key=lambda a: a.get("priority_score") or 0, reverse=True)
+    return actions
+
+
 def select_playbooks(
     *,
     cited_hosts_detailed: List[Dict[str, Any]],
@@ -287,6 +585,9 @@ def select_playbooks(
     category_score: Optional[int] = None,
     cap: int = 5,
     min_times_cited: int = _DEFAULT_MIN_TIMES_CITED,
+    per_sku_reports: Optional[List[Dict[str, Any]]] = None,
+    authority_map: Optional[Dict[str, Any]] = None,
+    sku_contexts_by_sku: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Produce per-host playbook actions for the merchant audit's
     `merchant_view.actions` extension. Skips hosts where
@@ -310,6 +611,11 @@ def select_playbooks(
                                   has `pitch_template` and the host
                                   has at least an outreach destination
                                   (`email` or `submission_url`).
+
+    When `per_sku_reports` is supplied, also emits `content_revision`
+    actions keyed by failing dimension + bucket. Those actions are
+    sorted by their SKU priority score and always carry
+    `evidence_run_ids`.
     """
     actions: List[Dict[str, Any]] = []
     # Guard against a caller passing 0 / negative — treat anything
@@ -463,14 +769,22 @@ def select_playbooks(
     # Consolidate editorial pitches into one action before sort + cap.
     actions = _consolidate_editorial_actions(actions, merchant_category)
 
-    # Sort: severity ascending (critical first) then times_cited descending.
+    # Sort host actions: severity ascending (critical first) then
+    # times_cited descending. Per-SKU content_revision actions are
+    # appended after the cap below (new per-SKU audit callers only).
+
     actions.sort(
         key=lambda a: (
             _SEVERITY_RANK.get((a.get("severity") or "low"), 99),
             -(a.get("evidence", {}) or {}).get("times_cited", 0),
         )
     )
-    return actions[:cap]
+    content_actions = _select_content_revision_actions(
+        per_sku_reports=per_sku_reports,
+        authority_map=authority_map,
+        sku_contexts_by_sku=sku_contexts_by_sku,
+    )
+    return actions[:cap] + content_actions[:cap]
 
 
 # Editorial-pitch playbooks all carry lever="editorial_outreach". A
