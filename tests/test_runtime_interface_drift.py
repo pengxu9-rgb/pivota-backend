@@ -40,6 +40,22 @@ def test_backend_mutating_routes_source_use_governance_compat_helper() -> None:
     assert "agent_governance.validate_request(" not in agent_v2_source
 
 
+def test_backend_health_timeout_env_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import _health_timeout_seconds
+
+    monkeypatch.delenv("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", raising=False)
+    assert _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0) == 5.0
+
+    monkeypatch.setenv("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", "0.1")
+    assert _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0) == 0.5
+
+    monkeypatch.setenv("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", "120")
+    assert _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0) == 30.0
+
+    monkeypatch.setenv("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", "not-a-number")
+    assert _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0) == 5.0
+
+
 def test_backend_health_surfaces_runtime_drift_contract() -> None:
     with TestClient(app) as client:
         resp = client.get("/health")

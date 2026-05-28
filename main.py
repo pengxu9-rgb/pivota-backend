@@ -1730,6 +1730,16 @@ async def root():
         "health": "OK"
     }
 
+
+def _health_timeout_seconds(name: str, default: float, *, min_value: float = 0.5, max_value: float = 30.0) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
 @app.get("/health")
 async def health_check():
     """
@@ -1743,9 +1753,15 @@ async def health_check():
     db_ok = False
     missing: dict[str, list[str]] = {}
     db_error = None
+    connect_timeout = _health_timeout_seconds("DB_HEALTH_CONNECT_TIMEOUT_SECONDS", 5.0)
+    probe_timeout = _health_timeout_seconds("DB_HEALTH_PROBE_TIMEOUT_SECONDS", 3.0)
+    schema_timeout = _health_timeout_seconds("DB_HEALTH_SCHEMA_TIMEOUT_SECONDS", 5.0)
 
     try:
-        await ensure_database_ready(connect_timeout_seconds=2.0, probe_timeout_seconds=2.0)
+        await ensure_database_ready(
+            connect_timeout_seconds=connect_timeout,
+            probe_timeout_seconds=probe_timeout,
+        )
         db_ok = True
     except DatabaseUnavailableError as e:
         db_error = e.error_type
@@ -1754,7 +1770,7 @@ async def health_check():
         try:
             from db.schema_guard import check_required_schema
 
-            missing = await asyncio.wait_for(check_required_schema(), timeout=2)
+            missing = await asyncio.wait_for(check_required_schema(), timeout=schema_timeout)
         except Exception as e:
             db_ok = False
             db_error = type(e).__name__
