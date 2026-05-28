@@ -859,14 +859,19 @@ def test_aggregate_brand_competitors_sums_across_products() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_brand_report_caps_at_5_products(monkeypatch: "pytest.MonkeyPatch") -> None:
-    """Cost guard: hard cap on per-call product count."""
+async def test_run_brand_report_caps_at_50_products(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """Cost guard: hard cap on per-call product count.
+
+    Spec §I — cap raised from 5 → 50 SKUs since credit pre-flight
+    (POST /api/audits/preview) is now the authoritative cost gate.
+    The hard cap stays as a defense-in-depth ceiling.
+    """
     from services.agent_center_bd_report_service import run_brand_report
     products = [
         {"title": f"P{i}", "pdp_url": f"https://x.com/p/{i}", "product_type": "thing"}
-        for i in range(6)
+        for i in range(51)
     ]
-    with pytest.raises(ValueError, match="capped at 5"):
+    with pytest.raises(ValueError, match="capped at 50"):
         await run_brand_report(
             merchant_name="X",
             merchant_domain=None,

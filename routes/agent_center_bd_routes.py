@@ -251,7 +251,13 @@ async def external_merchant_report(
 # ---------------------------------------------------------------------------
 
 
-_BRAND_REPORT_HARD_MAX_PRODUCTS = 5
+# Spec §I — launch cap raised from 5 → 50 SKUs because the
+# credit-balance pre-flight (POST /api/audits/preview) is now the
+# authoritative cost gate. Larger audits debit proportionally more
+# audit_credits at launch via merchant_credit_balance_service.debit().
+# The pre-flight surfaces estimated credits + sufficient/gaps so the
+# merchant decides whether to launch.
+_BRAND_REPORT_HARD_MAX_PRODUCTS = 50
 
 
 class BdBrandReportProduct(BaseModel):

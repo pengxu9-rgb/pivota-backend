@@ -8,7 +8,7 @@ portal — no BD/ops handoff needed.
 
 Surface:
   - POST /api/merchant-center/audit/ai-commerce-readiness
-    body:    { product_keys: List[str] (1-5), max_runs?: int = 3 }
+    body:    { product_keys: List[str] (1-50), max_runs?: int = 3 }
     auth:    merchant JWT (Bearer); token must carry role="merchant" and
              merchant_id claim
     returns: { brand_report: <run_brand_report output>,
@@ -16,14 +16,17 @@ Surface:
     errors:
       401 — no/invalid token (handled by get_current_user upstream)
       403 — token's role isn't "merchant"
-      422 — product_keys empty or > 5 (Pydantic validation)
+      422 — product_keys empty or > 50 (Pydantic validation)
+      402 — insufficient credits (post-preview gate, spec §I)
       404 — any product_key in the list isn't owned by this merchant
-      429 — per-merchant audit budget exhausted (2 / 24h)
+      429 — per-merchant audit budget exhausted (2 / 24h, free tier only)
 
-Cost guard. Multi-SKU audits cost ~9 grounded Gemini calls per product
-× up to 5 products = up to 45 calls per audit. Per-merchant rate limit
-caps at 2 audits / 24h → 90 calls/day worst case. Bounded enough for
-MVP; replace with a per-tier quota table when billing tiers exist.
+Cost guard. Spec §I — credit-balance pre-flight (POST /api/audits/preview)
+is the authoritative cost gate. Legacy 9-probes-per-product mode is
+capped at 50 SKUs → up to 450 grounded Gemini calls; v3 per-SKU mode
+runs ~40 prompts per SKU × 50 SKUs → up to 2,000 calls per audit. Free
+tier keeps the 2-audits-per-24h rate limit alongside the credit gate;
+paid tiers bypass the rate limit and use credits only.
 
 Cross-tenant guard. The catalog lookup is `WHERE merchant_id = current
 AND product_key IN (...)`. A product_key that exists globally but is

@@ -3068,7 +3068,12 @@ async def _cost_summary_for_per_sku_audit(
 # ---------------------------------------------------------------------------
 
 
-_BRAND_REPORT_MAX_PRODUCTS = 5
+# Spec §I — service-layer cap matches the route-layer cap. Lifted from
+# 5 → 50 because credit pre-flight is now the authoritative cost gate.
+# The per-product synchronous fan-out (~9-call probe burst per product
+# in legacy mode, ~40 in per-SKU mode) is still bounded by the
+# per-tenant concurrency gate in the probe engine.
+_BRAND_REPORT_MAX_PRODUCTS = 50
 
 
 async def run_brand_report(
