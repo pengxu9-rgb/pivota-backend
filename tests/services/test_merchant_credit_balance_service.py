@@ -718,6 +718,102 @@ async def test_create_credit_topup_payment_intent_uses_customer_total_not_rate(m
 
 
 @pytest.mark.asyncio
+async def test_create_credit_topup_payment_intent_window_idempotency_dedupes_grants(
+    monkeypatch,
+):
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed("merch-A", credits=0, plan_tier="growth")
+    bucket = {"value": 1000}
+    created_payment_intents: Dict[str, Dict[str, Any]] = {}
+
+    async def fake_create_payment_intent(**kwargs):
+        key = kwargs["idempotency_key"]
+        if key not in created_payment_intents:
+            created_payment_intents[key] = {
+                "id": f"pi_topup_{len(created_payment_intents) + 1}",
+                "status": "succeeded",
+                "amount": kwargs["amount_cents"],
+                "metadata": dict(kwargs["metadata"]),
+            }
+        return created_payment_intents[key]
+
+    monkeypatch.setattr(svc, "_topup_idempotency_bucket", lambda: bucket["value"])
+    monkeypatch.setattr(svc, "_create_direct_payment_intent", fake_create_payment_intent)
+
+    first = await svc.create_credit_topup_payment_intent(
+        merchant_id="merch-A",
+        pack_credits=2000,
+    )
+    second = await svc.create_credit_topup_payment_intent(
+        merchant_id="merch-A",
+        pack_credits=2000,
+    )
+
+    derived_key = "topup:merch-A:2000:1000"
+    assert first["payment_intent_id"] == second["payment_intent_id"]
+    assert list(created_payment_intents) == [derived_key]
+    assert created_payment_intents[derived_key]["metadata"]["idempotency_key"] == derived_key
+
+    first_grant = await svc.apply_credit_topup_payment_intent_succeeded(
+        created_payment_intents[derived_key],
+        conn=fake,
+    )
+    replay_grant = await svc.apply_credit_topup_payment_intent_succeeded(
+        created_payment_intents[derived_key],
+        conn=fake,
+    )
+    assert first_grant["credits"] == 2000
+    assert replay_grant["replay"] is True
+    assert fake.balances["merch-A"]["credits"] == 2000
+
+    bucket["value"] = 1001
+    later = await svc.create_credit_topup_payment_intent(
+        merchant_id="merch-A",
+        pack_credits=2000,
+    )
+    later_key = "topup:merch-A:2000:1001"
+    assert later["payment_intent_id"] != first["payment_intent_id"]
+    assert later_key in created_payment_intents
+
+    await svc.apply_credit_topup_payment_intent_succeeded(
+        created_payment_intents[later_key],
+        conn=fake,
+    )
+    assert fake.balances["merch-A"]["credits"] == 4000
+
+    explicit_first = await svc.create_credit_topup_payment_intent(
+        merchant_id="merch-A",
+        pack_credits=1000,
+        idempotency_key="manual-dedupe",
+    )
+    bucket["value"] = 1002
+    explicit_second = await svc.create_credit_topup_payment_intent(
+        merchant_id="merch-A",
+        pack_credits=1000,
+        idempotency_key="manual-dedupe",
+    )
+
+    assert explicit_first["payment_intent_id"] == explicit_second["payment_intent_id"]
+    assert "manual-dedupe" in created_payment_intents
+    await svc.apply_credit_topup_payment_intent_succeeded(
+        created_payment_intents["manual-dedupe"],
+        conn=fake,
+    )
+    await svc.apply_credit_topup_payment_intent_succeeded(
+        created_payment_intents["manual-dedupe"],
+        conn=fake,
+    )
+
+    assert fake.balances["merch-A"]["credits"] == 5000
+    assert len([
+        event for event in fake.events.values()
+        if event["event_type"] == "credit_topup"
+    ]) == 3
+
+
+@pytest.mark.asyncio
 async def test_free_tier_insufficient_balance_does_not_attempt_overage(monkeypatch):
     from services import merchant_credit_balance_service as svc
 

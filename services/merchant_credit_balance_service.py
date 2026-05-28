@@ -37,6 +37,7 @@ DEFAULT_OVERAGE_CHARGE_CREDITS = 2_000
 INTERNAL_COGS_RATIO = Decimal("0.65")
 DIRECT_TOPUP_PURPOSE = "direct_credit_topup"
 DIRECT_OVERAGE_PURPOSE = "direct_credit_overage"
+TOPUP_IDEMPOTENCY_WINDOW_SECONDS = 60
 
 
 class InsufficientCreditsError(Exception):
@@ -237,6 +238,35 @@ def _normalize_purchased_credit_amount(
 def _current_month_start() -> datetime:
     now = datetime.now(timezone.utc)
     return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+
+def _topup_idempotency_bucket(now: Optional[datetime] = None) -> int:
+    instant = now or datetime.now(timezone.utc)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return int(instant.timestamp()) // TOPUP_IDEMPOTENCY_WINDOW_SECONDS
+
+
+def _topup_idempotency_key(*, merchant_id: str, pack_credits: int) -> str:
+    return (
+        f"topup:{merchant_id}:{int(pack_credits)}:"
+        f"{_topup_idempotency_bucket()}"
+    )
+
+
+def _resolve_topup_idempotency_key(
+    *,
+    merchant_id: str,
+    pack_credits: int,
+    caller_key: Optional[str],
+) -> str:
+    explicit_key = str(caller_key).strip() if caller_key and str(caller_key).strip() else ""
+    if explicit_key:
+        return explicit_key
+    return _topup_idempotency_key(
+        merchant_id=merchant_id,
+        pack_credits=int(pack_credits),
+    )
 
 
 def _operation_idempotency_key(
@@ -1051,19 +1081,20 @@ async def create_credit_topup_payment_intent(
     if credits <= 0:
         raise ValueError("pack_credits must be > 0")
     amount_cents = _credits_to_amount_cents(credits)
-    caller_key = (
-        str(idempotency_key).strip()
-        if idempotency_key and str(idempotency_key).strip()
-        else f"{merchant_id}:{credits}:{uuid.uuid4().hex}"
+    caller_key = _resolve_topup_idempotency_key(
+        merchant_id=merchant_id,
+        pack_credits=credits,
+        caller_key=idempotency_key,
     )
     payment_intent = await _create_direct_payment_intent(
         merchant_id=merchant_id,
         purpose=DIRECT_TOPUP_PURPOSE,
         amount_cents=amount_cents,
-        idempotency_key=f"direct_credit_topup_payment_intent:{caller_key}",
+        idempotency_key=caller_key,
         metadata={
             "merchant_id": merchant_id,
             "pivota_purpose": DIRECT_TOPUP_PURPOSE,
+            "idempotency_key": caller_key,
             "pack_credits": str(credits),
             "amount_cents": str(amount_cents),
         },
@@ -1100,6 +1131,7 @@ async def apply_credit_topup_payment_intent_succeeded(
     payment_intent_id = _billing_as_text(data.get("id"))
     merchant_id = _billing_as_text(metadata.get("merchant_id"))
     pack_credits_raw = _billing_as_text(metadata.get("pack_credits"))
+    ledger_idempotency_key = _billing_as_text(metadata.get("idempotency_key"))
     if not payment_intent_id or not merchant_id or not pack_credits_raw:
         raise ValueError("direct credit top-up PaymentIntent metadata is incomplete")
     return await _apply_credit_topup(
@@ -1107,6 +1139,7 @@ async def apply_credit_topup_payment_intent_succeeded(
         pack_credits=int(pack_credits_raw),
         payment_intent_id=payment_intent_id,
         amount_cents=int(data.get("amount") or _credits_to_amount_cents(int(pack_credits_raw))),
+        ledger_idempotency_key=ledger_idempotency_key or payment_intent_id,
         conn=conn,
     )
 
@@ -1117,13 +1150,19 @@ async def _apply_credit_topup(
     pack_credits: int,
     payment_intent_id: str,
     amount_cents: int,
+    ledger_idempotency_key: Optional[str] = None,
     conn: Any = None,
 ) -> Dict[str, Any]:
     credits = int(pack_credits)
     if credits <= 0:
         raise ValueError("pack_credits must be > 0")
+    source_key = (
+        str(ledger_idempotency_key).strip()
+        if ledger_idempotency_key and str(ledger_idempotency_key).strip()
+        else payment_intent_id
+    )
     operation_key = (
-        f"merchant_credit_balance:credit_topup:{merchant_id}:{payment_intent_id}"
+        f"merchant_credit_balance:credit_topup:{merchant_id}:{source_key}"
     )
     async with _transaction(conn) as tx:
         replay = await _fetch_replay(conn=tx, operation_key=operation_key)
@@ -1139,9 +1178,10 @@ async def _apply_credit_topup(
             usd_cogs=Decimal("0"),
             operation="credit",
             event_type="credit_topup",
-            source_key=payment_intent_id,
+            source_key=source_key,
             purchased_credits=credits,
             payload_extra={
+                "topup_idempotency_key": source_key,
                 "payment_intent_id": payment_intent_id,
                 "stripe_payment_intent_id": payment_intent_id,
                 "pack_credits": credits,
