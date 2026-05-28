@@ -45,6 +45,9 @@ async def log_product_events(rows: List[Dict[str, Any]]) -> None:
     """
     Best-effort batch insert for product events.
 
+    Deprecated legacy event sink; decision-layer billing attribution writes to
+    services.agent_decision_event_store.
+
     Each row may contain:
       - agent_id, session_id, event_type, endpoint, query
       - merchant_id, platform, platform_product_id
@@ -89,4 +92,3 @@ async def log_product_events(rows: List[Dict[str, Any]]) -> None:
             len(clean_rows),
             exc_info=True,
         )
-
