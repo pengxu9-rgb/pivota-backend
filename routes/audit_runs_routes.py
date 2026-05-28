@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import time
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -55,6 +57,12 @@ from services.merchant_credit_balance_service import (
     credit,
     debit,
     get_balance,
+)
+from services.provider_credit_rates import (
+    credits_for_probe,
+    provider_default_grounded,
+    provider_probe_cost_usd,
+    provider_prompt_fraction,
 )
 from utils.auth import get_current_merchant
 
@@ -219,25 +227,62 @@ def _normalize_nonempty(values: Optional[List[str]]) -> List[str]:
 
 
 def _normalize_providers(values: Optional[List[str]]) -> List[str]:
-    providers = _normalize_nonempty(values)
+    providers = [
+        value.lower() for value in _normalize_nonempty(values)
+    ]
     return providers or ["gemini"]
 
 
 def _credit_requirements(
-    *, sku_count: int, custom_prompts: Optional[List[str]] = None,
+    *,
+    sku_count: int,
+    prompts_per_sku: int,
+    providers: List[str],
+    custom_prompts: Optional[List[str]] = None,
 ) -> Dict[str, int]:
+    audit_required, _usd_cogs = _audit_metering(
+        sku_count=sku_count,
+        prompts_per_sku=prompts_per_sku,
+        providers=providers,
+    )
     return {
-        "audit": int(sku_count),
+        "audit": int(audit_required),
         "prompt": len(_normalize_nonempty(custom_prompts)),
         "execution": 0,
     }
 
 
+def _audit_metering(
+    *,
+    sku_count: int,
+    prompts_per_sku: int,
+    providers: List[str],
+) -> Tuple[int, Decimal]:
+    total_prompts = int(sku_count) * int(prompts_per_sku)
+    credits_total = Decimal("0")
+    usd_cogs_total = Decimal("0")
+    for provider in providers:
+        fraction = provider_prompt_fraction(provider)
+        probe_count = int(math.ceil(float(Decimal(total_prompts) * fraction)))
+        if probe_count <= 0:
+            continue
+        grounded = provider_default_grounded(provider)
+        per_probe_credits = Decimal(str(credits_for_probe(
+            provider,
+            grounded=grounded,
+        )))
+        credits_total += per_probe_credits * probe_count
+        usd_cogs_total += (
+            provider_probe_cost_usd(provider, grounded=grounded)
+            * Decimal(probe_count)
+        )
+    return int(math.ceil(float(credits_total))), usd_cogs_total
+
+
 def _balance_public_shape(balance: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "audit_credits": int(balance.get("audit_credits") or 0),
-        "prompt_credits": int(balance.get("prompt_credits") or 0),
-        "execution_credits": int(balance.get("execution_credits") or 0),
+        "credits": int(balance.get("credits") or 0),
+        "allowance_credits": int(balance.get("allowance_credits") or 0),
         "plan_tier": str(balance.get("plan_tier") or "free"),
     }
 
@@ -245,17 +290,34 @@ def _balance_public_shape(balance: Dict[str, Any]) -> Dict[str, Any]:
 def _credit_gaps(
     *, requirements: Dict[str, int], balance: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    gaps: List[Dict[str, Any]] = []
-    for kind, required in requirements.items():
-        available = int(balance.get(f"{kind}_credits") or 0)
-        if int(required) > available:
-            gaps.append({
-                "kind": kind,
-                "required": int(required),
-                "available": available,
-                "short": int(required) - available,
-            })
-    return gaps
+    required = sum(int(value) for value in requirements.values())
+    available = int(balance.get("credits") or 0)
+    if required <= available:
+        return []
+    return [{
+        "kind": "credits",
+        "required": required,
+        "available": available,
+        "short": required - available,
+    }]
+
+
+def _strip_brand_facing_internal_money(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_strip_brand_facing_internal_money(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out: Dict[str, Any] = {}
+    for key, item in value.items():
+        key_str = str(key)
+        key_lower = key_str.lower()
+        if (
+            "usd" in key_lower
+            or key_str in {"credit_to_usd", "provider_cost_fraction"}
+        ):
+            continue
+        out[key] = _strip_brand_facing_internal_money(item)
+    return out
 
 
 def _preview_cache_key(
@@ -367,6 +429,11 @@ async def _build_preview(
     else:
         sku_count = len(sku_keys)
         total_prompts = sku_count * int(prompts_per_sku)
+        estimated_audit_credits, _usd_cogs = _audit_metering(
+            sku_count=sku_count,
+            prompts_per_sku=prompts_per_sku,
+            providers=providers,
+        )
         prompts_cached = int(total_prompts * 0.2)
         cache_hit_rate = (
             round(prompts_cached / total_prompts, 4)
@@ -383,7 +450,7 @@ async def _build_preview(
                 "cache_hit_rate": cache_hit_rate,
             },
             "providers": providers,
-            "estimated_audit_credits": sku_count,
+            "estimated_audit_credits": estimated_audit_credits,
             "estimated_prompt_credits": len(_normalize_nonempty(custom_prompts)),
             "estimated_execution_credits": 0,
         }
@@ -392,6 +459,8 @@ async def _build_preview(
     balance = await get_balance(merchant_id)
     requirements = _credit_requirements(
         sku_count=int(cost_part["sku_count"]),
+        prompts_per_sku=int(cost_part["prompts_per_sku"]),
+        providers=list(cost_part["providers"]),
         custom_prompts=custom_prompts,
     )
     gaps = _credit_gaps(requirements=requirements, balance=balance)
@@ -422,13 +491,19 @@ async def preview_audit_run(
         merchant_id=body.merchant_id,
         scope=body.scope,
     )
-    return await _build_preview(
-        merchant_id=body.merchant_id,
-        sku_keys=sku_keys,
-        prompts_per_sku=body.prompts_per_sku,
-        custom_prompts=body.custom_prompts,
-        providers=_normalize_providers(body.providers),
-    )
+    try:
+        return await _build_preview(
+            merchant_id=body.merchant_id,
+            sku_keys=sku_keys,
+            prompts_per_sku=body.prompts_per_sku,
+            custom_prompts=body.custom_prompts,
+            providers=_normalize_providers(body.providers),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 @router.post(
@@ -522,10 +597,23 @@ async def create_audit_run(
             subject_type=body.subject_type,
         )
 
-    requirements = _credit_requirements(
-        sku_count=len(_normalize_nonempty(body.product_keys)),
-        custom_prompts=body.custom_prompts,
-    )
+    providers = _normalize_providers(body.providers)
+    try:
+        audit_required, audit_usd_cogs = _audit_metering(
+            sku_count=len(_normalize_nonempty(body.product_keys)),
+            prompts_per_sku=body.prompts_per_sku,
+            providers=providers,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    requirements = {
+        "audit": audit_required,
+        "prompt": len(_normalize_nonempty(body.custom_prompts)),
+        "execution": 0,
+    }
     balance = await get_balance(body.merchant_id)
     gaps = _credit_gaps(requirements=requirements, balance=balance)
     if gaps:
@@ -546,7 +634,7 @@ async def create_audit_run(
     if str(balance.get("plan_tier") or "free") == "free":
         await _check_audit_rate_limit(body.merchant_id)
 
-    debited: List[Tuple[str, int, bool]] = []
+    debited: List[Tuple[str, int, bool, Decimal]] = []
     try:
         audit_required = int(requirements["audit"])
         if audit_required:
@@ -555,11 +643,13 @@ async def create_audit_run(
                 "audit",
                 audit_required,
                 idempotency_key=debit_idempotency_key,
+                usd_cogs=audit_usd_cogs,
             )
             debited.append((
                 "audit",
                 audit_required,
                 bool(audit_debit.get("replay")),
+                audit_usd_cogs,
             ))
         prompt_required = int(requirements["prompt"])
         if prompt_required:
@@ -568,11 +658,13 @@ async def create_audit_run(
                 "prompt",
                 prompt_required,
                 idempotency_key=debit_idempotency_key,
+                usd_cogs=0,
             )
             debited.append((
                 "prompt",
                 prompt_required,
                 bool(prompt_debit.get("replay")),
+                Decimal("0"),
             ))
 
         # Use origin/main's race-safe enqueue (returns run_id +
@@ -587,13 +679,14 @@ async def create_audit_run(
             requested_by_user_id=auth_merchant_id,
         )
     except InsufficientCreditsError as exc:
-        for kind, amount, replay in reversed(debited):
+        for kind, amount, replay, usd_cogs in reversed(debited):
             if not replay:
                 await credit(
                     body.merchant_id,
                     kind,  # type: ignore[arg-type]
                     amount,
                     source_event_id=f"refund:{debit_idempotency_key}",
+                    usd_cogs=usd_cogs,
                 )
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -606,23 +699,25 @@ async def create_audit_run(
             },
         ) from exc
     except Exception:
-        for kind, amount, replay in reversed(debited):
+        for kind, amount, replay, usd_cogs in reversed(debited):
             if not replay:
                 await credit(
                     body.merchant_id,
                     kind,  # type: ignore[arg-type]
                     amount,
                     source_event_id=f"refund:{debit_idempotency_key}",
+                    usd_cogs=usd_cogs,
                 )
         raise
     if not run_id:
-        for kind, amount, replay in reversed(debited):
+        for kind, amount, replay, usd_cogs in reversed(debited):
             if not replay:
                 await credit(
                     body.merchant_id,
                     kind,  # type: ignore[arg-type]
                     amount,
                     source_event_id=f"refund:{debit_idempotency_key}",
+                    usd_cogs=usd_cogs,
                 )
         # Persistence layer rejected the insert. Most likely cause is
         # the DB being unavailable; surface a 503 so callers retry.
@@ -732,9 +827,9 @@ async def get_audit_run(
                     ),
                 },
             )
-        return proj.get("payload_jsonb")
+        return _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
 
-    return AuditRunDetail(**row)
+    return AuditRunDetail(**_strip_brand_facing_internal_money(dict(row)))
 
 
 @router.post(
@@ -796,6 +891,7 @@ async def list_audit_runs(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="limit must be between 1 and 100",
         )
-    return await recent_runs_for_merchant(
+    rows = await recent_runs_for_merchant(
         merchant_id=auth_merchant_id, limit=limit,
     )
+    return _strip_brand_facing_internal_money(rows)

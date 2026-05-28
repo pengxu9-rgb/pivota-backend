@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Optional
 
 import pytest
@@ -12,23 +13,22 @@ class FakeCreditConn:
         self.balances: Dict[str, Dict[str, Any]] = {}
         self.events: Dict[str, Dict[str, Any]] = {}
         self.version_conflict_once = False
-        self.conflict_kind = "audit"
         self.conflict_amount = 0
 
     def seed(
         self,
         merchant_id: str,
         *,
-        audit: int = 0,
-        prompt: int = 0,
-        execution: int = 0,
+        credits: int = 0,
+        allowance_credits: int = 0,
+        usd_cogs_internal: Decimal = Decimal("0"),
         plan_tier: str = "free",
     ) -> None:
         self.balances[merchant_id] = {
             "merchant_id": merchant_id,
-            "audit_credits": audit,
-            "prompt_credits": prompt,
-            "execution_credits": execution,
+            "credits": credits,
+            "allowance_credits": allowance_credits,
+            "usd_cogs_internal": usd_cogs_internal,
             "plan_tier": plan_tier,
             "updated_at": datetime.now(timezone.utc),
             "version": 0,
@@ -58,9 +58,17 @@ class FakeCreditConn:
             }
             return {"idempotency_key": key, "payload": payload}
         if "merchant_credit_balance:debit_update" in sql:
-            return self._update_balance(values, delta=-int(values["amount"]))
+            return self._update_balance(
+                values,
+                delta=-int(values["amount"]),
+                usd_cogs_delta=Decimal(str(values["usd_cogs"])),
+            )
         if "merchant_credit_balance:credit_update" in sql:
-            return self._update_balance(values, delta=int(values["amount"]))
+            return self._update_balance(
+                values,
+                delta=int(values["amount"]),
+                usd_cogs_delta=-Decimal(str(values["usd_cogs"])),
+            )
         raise AssertionError(f"unexpected fetch_one SQL: {sql}")
 
     async def execute(self, query: str, values: Optional[Dict[str, Any]] = None):
@@ -77,38 +85,32 @@ class FakeCreditConn:
             return None
         raise AssertionError(f"unexpected execute SQL: {sql}")
 
-    def _update_balance(self, values: Dict[str, Any], *, delta: int):
+    def _update_balance(
+        self,
+        values: Dict[str, Any],
+        *,
+        delta: int,
+        usd_cogs_delta: Decimal,
+    ):
         merchant_id = str(values["merchant_id"])
         row = self.balances[merchant_id]
-        column = self._column_from_kind(self._kind_from_update(delta))
         if self.version_conflict_once:
             self.version_conflict_once = False
-            if self.conflict_amount:
-                conflict_col = self._column_from_kind(self.conflict_kind)
-                row[conflict_col] += int(self.conflict_amount)
-                row["version"] += 1
+            row["credits"] += int(self.conflict_amount)
+            row["version"] += 1
             return None
         if int(row["version"]) != int(values["version"]):
             return None
-        if delta < 0 and int(row[column]) < abs(delta):
+        if delta < 0 and int(row["credits"]) < abs(delta):
             return None
-        row[column] += delta
+        row["credits"] += delta
+        row["usd_cogs_internal"] = max(
+            Decimal("0"),
+            Decimal(str(row["usd_cogs_internal"])) + usd_cogs_delta,
+        )
         row["version"] += 1
         row["updated_at"] = datetime.now(timezone.utc)
         return dict(row)
-
-    def _kind_from_update(self, delta: int) -> str:
-        # The service sends one update at a time. Tests set this before
-        # calling when the target is prompt/execution.
-        return getattr(self, "active_kind", "audit")
-
-    @staticmethod
-    def _column_from_kind(kind: str) -> str:
-        return {
-            "audit": "audit_credits",
-            "prompt": "prompt_credits",
-            "execution": "execution_credits",
-        }[kind]
 
 
 @pytest.mark.asyncio
@@ -120,11 +122,11 @@ async def test_get_balance_missing_row_returns_zero(monkeypatch):
 
     balance = await svc.get_balance("merch-missing")
 
-    assert balance["audit_credits"] == 0
-    assert balance["prompt_credits"] == 0
-    assert balance["execution_credits"] == 0
+    assert balance["credits"] == 0
+    assert balance["allowance_credits"] == 0
     assert balance["plan_tier"] == "free"
     assert balance["version"] == 0
+    assert balance["usd_cogs_internal"] == Decimal("0")
 
 
 @pytest.mark.asyncio
@@ -136,21 +138,33 @@ async def test_ensure_row_is_idempotent():
     await svc.ensure_row("merch-A", conn=fake)
 
     assert list(fake.balances) == ["merch-A"]
-    assert fake.balances["merch-A"]["audit_credits"] == 0
+    assert fake.balances["merch-A"]["credits"] == 0
 
 
 @pytest.mark.asyncio
-async def test_debit_deducts_amount_and_bumps_version():
+async def test_debit_deducts_single_balance_tags_category_and_accrues_cogs():
     from services import merchant_credit_balance_service as svc
 
     fake = FakeCreditConn()
-    fake.seed("merch-A", audit=5)
+    fake.seed("merch-A", credits=5)
 
-    balance = await svc.debit("merch-A", "audit", 2, "run-1", conn=fake)
+    balance = await svc.debit(
+        "merch-A",
+        "audit",
+        2,
+        "run-1",
+        usd_cogs=Decimal("0.0737"),
+        conn=fake,
+    )
 
-    assert balance["audit_credits"] == 3
+    assert balance["credits"] == 3
+    assert balance["usd_cogs_internal"] == Decimal("0.0737")
     assert balance["version"] == 1
     assert balance["replay"] is False
+    event = next(iter(fake.events.values()))
+    assert event["event_type"] == "credit_debit_audit"
+    assert event["billing_mode"] == "debit"
+    assert event["quantity"] == 2
 
 
 @pytest.mark.asyncio
@@ -158,7 +172,7 @@ async def test_debit_insufficient_balance_raises():
     from services import merchant_credit_balance_service as svc
 
     fake = FakeCreditConn()
-    fake.seed("merch-A", audit=1)
+    fake.seed("merch-A", credits=1)
 
     with pytest.raises(svc.InsufficientCreditsError) as err:
         await svc.debit("merch-A", "audit", 2, "run-1", conn=fake)
@@ -169,50 +183,81 @@ async def test_debit_insufficient_balance_raises():
 
 
 @pytest.mark.asyncio
-async def test_debit_idempotency_replays_same_post_balance():
+async def test_debit_idempotency_replays_same_post_balance_without_cogs_dup():
     from services import merchant_credit_balance_service as svc
 
     fake = FakeCreditConn()
-    fake.seed("merch-A", audit=5)
+    fake.seed("merch-A", credits=5)
 
-    first = await svc.debit("merch-A", "audit", 2, "run-1", conn=fake)
-    second = await svc.debit("merch-A", "audit", 2, "run-1", conn=fake)
+    first = await svc.debit(
+        "merch-A",
+        "audit",
+        2,
+        "run-1",
+        usd_cogs=Decimal("0.0737"),
+        conn=fake,
+    )
+    second = await svc.debit(
+        "merch-A",
+        "audit",
+        2,
+        "run-1",
+        usd_cogs=Decimal("0.0737"),
+        conn=fake,
+    )
 
-    assert first["audit_credits"] == 3
-    assert second["audit_credits"] == 3
+    assert first["credits"] == 3
+    assert second["credits"] == 3
+    assert second["usd_cogs_internal"] == Decimal("0.0737")
+    assert second["replay"] is True
+    assert fake.balances["merch-A"]["usd_cogs_internal"] == Decimal("0.0737")
+    assert len(fake.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_credit_adds_amount_reverses_optional_cogs_and_is_idempotent():
+    from services import merchant_credit_balance_service as svc
+
+    fake = FakeCreditConn()
+    fake.seed("merch-A", credits=1, usd_cogs_internal=Decimal("0.0500"))
+
+    first = await svc.credit(
+        "merch-A",
+        "prompt",
+        4,
+        "refund-1",
+        usd_cogs=Decimal("0.0200"),
+        conn=fake,
+    )
+    second = await svc.credit(
+        "merch-A",
+        "prompt",
+        4,
+        "refund-1",
+        usd_cogs=Decimal("0.0200"),
+        conn=fake,
+    )
+
+    assert first["credits"] == 5
+    assert first["usd_cogs_internal"] == Decimal("0.0300")
+    assert second["credits"] == 5
     assert second["replay"] is True
     assert len(fake.events) == 1
 
 
 @pytest.mark.asyncio
-async def test_credit_adds_amount_and_is_idempotent():
+async def test_execution_debit_path_is_category_tag_only():
     from services import merchant_credit_balance_service as svc
 
     fake = FakeCreditConn()
-    fake.seed("merch-A", prompt=1)
-    fake.active_kind = "prompt"
-
-    first = await svc.credit("merch-A", "prompt", 4, "stripe_evt_1", conn=fake)
-    second = await svc.credit("merch-A", "prompt", 4, "stripe_evt_1", conn=fake)
-
-    assert first["prompt_credits"] == 5
-    assert second["prompt_credits"] == 5
-    assert second["replay"] is True
-    assert len(fake.events) == 1
-
-
-@pytest.mark.asyncio
-async def test_execution_debit_path_is_defined():
-    from services import merchant_credit_balance_service as svc
-
-    fake = FakeCreditConn()
-    fake.seed("merch-A", execution=2)
-    fake.active_kind = "execution"
+    fake.seed("merch-A", credits=2)
 
     balance = await svc.debit("merch-A", "execution", 1, "exec-1", conn=fake)
 
-    assert balance["execution_credits"] == 1
+    assert balance["credits"] == 1
     assert balance["version"] == 1
+    event = next(iter(fake.events.values()))
+    assert event["event_type"] == "credit_debit_execution"
 
 
 @pytest.mark.asyncio
@@ -220,13 +265,19 @@ async def test_debit_retries_version_mismatch_then_raises_if_spent():
     from services import merchant_credit_balance_service as svc
 
     fake = FakeCreditConn()
-    fake.seed("merch-A", audit=5)
+    fake.seed("merch-A", credits=5)
     fake.version_conflict_once = True
-    fake.conflict_kind = "audit"
     fake.conflict_amount = -3
 
     with pytest.raises(svc.InsufficientCreditsError) as err:
         await svc.debit("merch-A", "audit", 4, "run-1", conn=fake)
 
     assert err.value.available == 2
-    assert fake.balances["merch-A"]["audit_credits"] == 2
+    assert fake.balances["merch-A"]["credits"] == 2
+
+
+def test_credits_for_probe_uses_seeded_provider_config():
+    from services.provider_credit_rates import credits_for_probe
+
+    assert credits_for_probe("gemini", grounded=True) == pytest.approx(5.7)
+    assert credits_for_probe("deepseek", grounded=False) == pytest.approx(0.1)

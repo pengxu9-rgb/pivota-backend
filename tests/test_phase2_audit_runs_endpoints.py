@@ -9,6 +9,8 @@ guard) without touching Postgres.
 from __future__ import annotations
 
 import os
+import json
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -47,9 +49,9 @@ class _AccessorStub:
         # path set missing_keys_returns explicitly.
         self.missing_keys_returns: List[str] = []
         self.balance: Dict[str, Any] = {
-            "audit_credits": 100,
-            "prompt_credits": 100,
-            "execution_credits": 0,
+            "credits": 10_000,
+            "allowance_credits": 18_000,
+            "usd_cogs_internal": Decimal("12.3456"),
             "plan_tier": "starter",
             "updated_at": None,
             "version": 0,
@@ -91,9 +93,9 @@ class _AccessorStub:
             "kind": kind,
             "amount": amount,
             "idempotency_key": idempotency_key,
+            "usd_cogs": kwargs.get("usd_cogs"),
         })
-        column = f"{kind}_credits"
-        available = int(self.balance.get(column) or 0)
+        available = int(self.balance.get("credits") or 0)
         if available < int(amount):
             from services.merchant_credit_balance_service import (
                 InsufficientCreditsError,
@@ -101,7 +103,11 @@ class _AccessorStub:
             raise InsufficientCreditsError(
                 merchant_id, kind, int(amount), available,
             )
-        self.balance[column] = available - int(amount)
+        self.balance["credits"] = available - int(amount)
+        self.balance["usd_cogs_internal"] = (
+            Decimal(str(self.balance.get("usd_cogs_internal") or 0))
+            + Decimal(str(kwargs.get("usd_cogs") or 0))
+        )
         self.balance["version"] = int(self.balance.get("version") or 0) + 1
         return {**self.balance, "replay": False}
 
@@ -111,9 +117,14 @@ class _AccessorStub:
             "kind": kind,
             "amount": amount,
             "source_event_id": source_event_id,
+            "usd_cogs": kwargs.get("usd_cogs"),
         })
-        column = f"{kind}_credits"
-        self.balance[column] = int(self.balance.get(column) or 0) + int(amount)
+        self.balance["credits"] = int(self.balance.get("credits") or 0) + int(amount)
+        self.balance["usd_cogs_internal"] = max(
+            Decimal("0"),
+            Decimal(str(self.balance.get("usd_cogs_internal") or 0))
+            - Decimal(str(kwargs.get("usd_cogs") or 0)),
+        )
         self.balance["version"] = int(self.balance.get("version") or 0) + 1
         return {**self.balance, "replay": False}
 
@@ -193,6 +204,10 @@ def client(stub, monkeypatch):
 # =====================================================================
 
 
+def json_dumps_lower(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str).lower()
+
+
 def test_post_enqueues_and_returns_202(client, stub):
     res = client.post(
         "/api/audits",
@@ -211,10 +226,10 @@ def test_post_enqueues_and_returns_202(client, stub):
     assert stub.enqueued[0]["product_keys"] == ["pk-1", "pk-2"]
     # Idempotency lookup happened (default force=False).
     assert len(stub.idem_lookups) == 1
-    assert stub.balance["audit_credits"] == 98
+    assert stub.balance["credits"] == 9544
     assert len(stub.debits) == 1
     assert stub.debits[0]["kind"] == "audit"
-    assert stub.debits[0]["amount"] == 2
+    assert stub.debits[0]["amount"] == 456
 
 
 def test_post_returns_existing_run_on_idempotent_replay(client, stub):
@@ -302,12 +317,12 @@ def test_post_returns_503_on_persistence_failure(client, stub):
         },
     )
     assert res.status_code == 503
-    assert stub.balance["audit_credits"] == 100
+    assert stub.balance["credits"] == 10_000
     assert stub.credits[0]["kind"] == "audit"
 
 
-def test_post_returns_402_when_audit_credits_insufficient(client, stub):
-    stub.balance["audit_credits"] = 1
+def test_post_returns_402_when_credits_insufficient(client, stub):
+    stub.balance["credits"] = 100
     res = client.post(
         "/api/audits",
         json={
@@ -319,12 +334,12 @@ def test_post_returns_402_when_audit_credits_insufficient(client, stub):
     detail = res.json()["detail"]
     assert detail == {
         "error": "insufficient_credits",
-        "kind": "audit",
-        "required": 2,
-        "available": 1,
+        "kind": "credits",
+        "required": 456,
+        "available": 100,
         "preview_url": "/api/audits/preview",
     }
-    assert stub.balance["audit_credits"] == 1
+    assert stub.balance["credits"] == 100
     assert stub.debits == []
 
 
@@ -338,13 +353,13 @@ def test_post_debits_prompt_credits_for_custom_prompts(client, stub):
         },
     )
     assert res.status_code == 202
-    assert stub.balance["audit_credits"] == 99
-    assert stub.balance["prompt_credits"] == 98
+    assert stub.balance["credits"] == 9770
     assert [d["kind"] for d in stub.debits] == ["audit", "prompt"]
+    assert [d["amount"] for d in stub.debits] == [228, 2]
 
 
-def test_post_prompt_credit_gap_returns_402_before_any_debit(client, stub):
-    stub.balance["prompt_credits"] = 0
+def test_post_total_credit_gap_returns_402_before_any_debit(client, stub):
+    stub.balance["credits"] = 228
     res = client.post(
         "/api/audits",
         json={
@@ -354,7 +369,11 @@ def test_post_prompt_credit_gap_returns_402_before_any_debit(client, stub):
         },
     )
     assert res.status_code == 402
-    assert stub.balance["audit_credits"] == 100
+    detail = res.json()["detail"]
+    assert detail["kind"] == "credits"
+    assert detail["required"] == 229
+    assert detail["available"] == 228
+    assert stub.balance["credits"] == 228
     assert stub.debits == []
     assert stub.credits == []
     assert stub.enqueued == []
@@ -371,7 +390,7 @@ def test_post_free_tier_applies_rate_limit_and_credits(client, stub):
     )
     assert res.status_code == 202
     assert stub.rate_limit_checks == ["merch-A"]
-    assert stub.balance["audit_credits"] == 99
+    assert stub.balance["credits"] == 9772
 
 
 def test_post_paid_tier_skips_rate_limit(client, stub):
@@ -389,7 +408,7 @@ def test_post_paid_tier_skips_rate_limit(client, stub):
 
 def test_post_relaunch_existing_run_does_not_double_debit(client, stub):
     stub.idem_returns = "run-already-running"
-    stub.balance["audit_credits"] = 0
+    stub.balance["credits"] = 0
     res = client.post(
         "/api/audits",
         json={
@@ -410,9 +429,9 @@ def test_post_relaunch_existing_run_does_not_double_debit(client, stub):
 def test_preview_returns_cost_balance_and_sufficiency(client, stub):
     stub.preview_sku_keys = [f"sku-{i}" for i in range(10)]
     stub.balance.update({
-        "audit_credits": 25,
-        "prompt_credits": 50,
-        "execution_credits": 0,
+        "credits": 2500,
+        "allowance_credits": 18_000,
+        "usd_cogs_internal": Decimal("99.9900"),
         "plan_tier": "growth",
     })
     res = client.post(
@@ -435,13 +454,12 @@ def test_preview_returns_cost_balance_and_sufficiency(client, stub):
         "cache_hit_rate": 0.2,
     }
     assert body["providers"] == ["gemini", "deepseek"]
-    assert body["estimated_audit_credits"] == 10
+    assert body["estimated_audit_credits"] == 2290
     assert body["estimated_prompt_credits"] == 0
     assert body["estimated_execution_credits"] == 0
     assert body["current_balance"] == {
-        "audit_credits": 25,
-        "prompt_credits": 50,
-        "execution_credits": 0,
+        "credits": 2500,
+        "allowance_credits": 18_000,
         "plan_tier": "growth",
     }
     assert body["sufficient"] is True
@@ -451,7 +469,7 @@ def test_preview_returns_cost_balance_and_sufficiency(client, stub):
 
 def test_preview_reports_credit_gaps(client, stub):
     stub.preview_sku_keys = ["sku-1", "sku-2", "sku-3"]
-    stub.balance.update({"audit_credits": 1, "prompt_credits": 0})
+    stub.balance.update({"credits": 100})
     res = client.post(
         "/api/audits/preview",
         json={
@@ -464,8 +482,7 @@ def test_preview_reports_credit_gaps(client, stub):
     body = res.json()
     assert body["sufficient"] is False
     assert body["gaps"] == [
-        {"kind": "audit", "required": 3, "available": 1, "short": 2},
-        {"kind": "prompt", "required": 1, "available": 0, "short": 1},
+        {"kind": "credits", "required": 685, "available": 100, "short": 585},
     ]
 
 
@@ -484,6 +501,39 @@ def test_preview_dedups_cost_computation_for_same_scope(client, stub):
     assert first.json()["audit_run_id_preview"] == (
         second.json()["audit_run_id_preview"]
     )
+
+
+def test_brand_facing_routes_do_not_expose_internal_usd(client, stub):
+    preview = client.post(
+        "/api/audits/preview",
+        json={
+            "merchant_id": "merch-A",
+            "scope": {"sku_keys": ["sku-1"]},
+            "providers": ["gemini", "deepseek"],
+        },
+    )
+    assert preview.status_code == 200
+    preview_text = json_dumps_lower(preview.json())
+    assert "usd" not in preview_text
+    assert "credit_to_usd" not in preview_text
+    assert "provider_cost_fraction" not in preview_text
+
+    row = _detail_row()
+    row["cost_summary_jsonb"] = {
+        "estimated_cost_usd": 1.23,
+        "providers": [{"provider": "gemini", "cost_usd": 1.23}],
+        "credit_to_usd": 0.01,
+        "provider_cost_fraction": 0.65,
+        "total_input_tokens": 2000,
+    }
+    row["report_jsonb"] = {"merchant_name": "Test", "usd_cogs_internal": 99}
+    stub.fetch_returns = row
+    detail = client.get("/api/audits/r-1")
+    assert detail.status_code == 200
+    detail_text = json_dumps_lower(detail.json())
+    assert "usd" not in detail_text
+    assert "credit_to_usd" not in detail_text
+    assert "provider_cost_fraction" not in detail_text
 
 
 def test_post_422_when_any_product_key_missing(client, stub):

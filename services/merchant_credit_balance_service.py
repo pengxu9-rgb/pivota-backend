@@ -1,9 +1,13 @@
-"""Merchant credit-balance adapter for SKU audit v3 (spec §I).
+"""Merchant credit-balance adapter for SKU audit v3.
 
 The balance source is the dedicated `merchant_credit_balance` table. Credit
 and debit operations also write an idempotency/meters row to
 `agent_center_usage_events` so replays can return the original post-operation
 balance without applying a second mutation.
+
+Credits are one abstract customer-facing balance. Audit/prompt/execution are
+ledger categories only; internal USD COGS is never suitable for brand-facing
+serialization.
 """
 
 from __future__ import annotations
@@ -12,17 +16,14 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
 from db.database import database
 
-CreditKind = Literal["audit", "prompt", "execution"]
+CreditCategory = Literal["audit", "prompt", "execution"]
 
-_CREDIT_COLUMNS: Dict[str, str] = {
-    "audit": "audit_credits",
-    "prompt": "prompt_credits",
-    "execution": "execution_credits",
-}
+_VALID_CATEGORIES = {"audit", "prompt", "execution"}
 _MAX_OPTIMISTIC_RETRIES = 3
 
 
@@ -32,28 +33,35 @@ class InsufficientCreditsError(Exception):
     def __init__(
         self,
         merchant_id: str,
-        kind: CreditKind,
+        category: CreditCategory,
         required: int,
         available: int,
     ) -> None:
         self.merchant_id = merchant_id
-        self.kind = kind
+        self.kind = category
+        self.category = category
         self.required = int(required)
         self.available = int(available)
         super().__init__(
-            f"insufficient {kind} credits for merchant {merchant_id}: "
-            f"required={required} available={available}"
+            f"insufficient credits for merchant {merchant_id}: "
+            f"category={category} required={required} available={available}"
         )
+
+
+def _decimal(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    return Decimal(str(value))
 
 
 def _zero_balance() -> Dict[str, Any]:
     return {
-        "audit_credits": 0,
-        "prompt_credits": 0,
-        "execution_credits": 0,
+        "credits": 0,
+        "allowance_credits": 0,
         "plan_tier": "free",
         "updated_at": None,
         "version": 0,
+        "usd_cogs_internal": Decimal("0"),
     }
 
 
@@ -73,15 +81,11 @@ def _balance_from_row(row: Any) -> Dict[str, Any]:
     if not data:
         return _zero_balance()
     out = _zero_balance()
-    for key in (
-        "audit_credits",
-        "prompt_credits",
-        "execution_credits",
-        "version",
-    ):
+    for key in ("credits", "allowance_credits", "version"):
         out[key] = int(data.get(key) or 0)
     out["plan_tier"] = str(data.get("plan_tier") or "free")
     out["updated_at"] = data.get("updated_at")
+    out["usd_cogs_internal"] = _decimal(data.get("usd_cogs_internal"))
     return out
 
 
@@ -105,26 +109,26 @@ def _json_payload(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, default=str, sort_keys=True)
 
 
-def _validate_kind_amount(kind: str, amount: int) -> str:
-    if kind not in _CREDIT_COLUMNS:
-        raise ValueError(f"unsupported credit kind: {kind}")
+def _validate_category_amount(category: str, amount: int) -> CreditCategory:
+    if category not in _VALID_CATEGORIES:
+        raise ValueError(f"unsupported credit category: {category}")
     if int(amount) < 0:
         raise ValueError("credit amount must be >= 0")
-    return _CREDIT_COLUMNS[kind]
+    return category  # type: ignore[return-value]
 
 
 def _operation_idempotency_key(
     *,
     operation: str,
     merchant_id: str,
-    kind: str,
+    category: str,
     caller_key: str,
 ) -> str:
     if not caller_key or not str(caller_key).strip():
         raise ValueError("idempotency key is required")
     return (
         f"merchant_credit_balance:{operation}:"
-        f"{merchant_id}:{kind}:{str(caller_key).strip()}"
+        f"{merchant_id}:{category}:{str(caller_key).strip()}"
     )
 
 
@@ -138,11 +142,11 @@ async def _transaction(conn: Any = None):
 
 
 async def get_balance(merchant_id: str) -> Dict[str, Any]:
-    """Return the merchant's balance, or a zero-balance dict if missing."""
+    """Return the merchant's internal balance, or zero balance if missing."""
     row = await database.fetch_one(
         """
         -- merchant_credit_balance:get_balance
-        SELECT audit_credits, prompt_credits, execution_credits,
+        SELECT credits, allowance_credits, usd_cogs_internal,
                plan_tier, updated_at, version
           FROM merchant_credit_balance
          WHERE merchant_id = :merchant_id
@@ -156,7 +160,7 @@ async def _get_balance_with_conn(merchant_id: str, conn: Any) -> Dict[str, Any]:
     row = await conn.fetch_one(
         """
         -- merchant_credit_balance:get_balance
-        SELECT audit_credits, prompt_credits, execution_credits,
+        SELECT credits, allowance_credits, usd_cogs_internal,
                plan_tier, updated_at, version
           FROM merchant_credit_balance
          WHERE merchant_id = :merchant_id
@@ -212,8 +216,9 @@ async def _claim_operation(
     conn: Any,
     operation_key: str,
     merchant_id: str,
-    kind: str,
+    category: str,
     amount: int,
+    usd_cogs: Decimal,
     operation: str,
     event_type: str,
     source_key: str,
@@ -246,8 +251,9 @@ async def _claim_operation(
             "quantity": int(amount),
             "payload": _json_payload({
                 "operation": operation,
-                "kind": kind,
-                "amount": int(amount),
+                "category": category,
+                "amount_credits": int(amount),
+                "usd_cogs_internal": str(usd_cogs),
                 "source_idempotency_key": source_key,
                 "claimed_at": datetime.now(timezone.utc).isoformat(),
                 "post_balance": None,
@@ -280,15 +286,18 @@ async def _store_post_balance(
 async def _apply_delta(
     *,
     merchant_id: str,
-    kind: CreditKind,
+    category: CreditCategory,
     amount: int,
+    usd_cogs: Decimal,
     operation_key: str,
     operation: Literal["debit", "credit"],
     event_type: str,
     source_key: str,
     conn: Any = None,
 ) -> Dict[str, Any]:
-    column = _validate_kind_amount(kind, amount)
+    category = _validate_category_amount(category, amount)
+    if usd_cogs < 0:
+        raise ValueError("usd_cogs must be >= 0")
     async with _transaction(conn) as tx:
         replay = await _fetch_replay(conn=tx, operation_key=operation_key)
         if replay is not None:
@@ -298,8 +307,9 @@ async def _apply_delta(
             conn=tx,
             operation_key=operation_key,
             merchant_id=merchant_id,
-            kind=kind,
+            category=category,
             amount=amount,
+            usd_cogs=usd_cogs,
             operation=operation,
             event_type=event_type,
             source_key=source_key,
@@ -313,35 +323,40 @@ async def _apply_delta(
         await ensure_row(merchant_id, conn=tx)
         for _attempt in range(_MAX_OPTIMISTIC_RETRIES):
             balance = await _get_balance_with_conn(merchant_id, tx)
-            available = int(balance[column])
+            available = int(balance["credits"])
             if operation == "debit" and available < int(amount):
                 raise InsufficientCreditsError(
-                    merchant_id, kind, int(amount), available,
+                    merchant_id, category, int(amount), available,
                 )
 
             if operation == "debit":
-                sql = f"""
+                sql = """
                 -- merchant_credit_balance:debit_update
                 UPDATE merchant_credit_balance
-                   SET {column} = {column} - :amount,
+                   SET credits = credits - :amount,
+                       usd_cogs_internal = usd_cogs_internal + :usd_cogs,
                        updated_at = NOW(),
                        version = version + 1
                  WHERE merchant_id = :merchant_id
                    AND version = :version
-                   AND {column} >= :amount
-                RETURNING audit_credits, prompt_credits, execution_credits,
+                   AND credits >= :amount
+                RETURNING credits, allowance_credits, usd_cogs_internal,
                           plan_tier, updated_at, version
                 """
             else:
-                sql = f"""
+                sql = """
                 -- merchant_credit_balance:credit_update
                 UPDATE merchant_credit_balance
-                   SET {column} = {column} + :amount,
+                   SET credits = credits + :amount,
+                       usd_cogs_internal = GREATEST(
+                           usd_cogs_internal - :usd_cogs,
+                           0
+                       ),
                        updated_at = NOW(),
                        version = version + 1
                  WHERE merchant_id = :merchant_id
                    AND version = :version
-                RETURNING audit_credits, prompt_credits, execution_credits,
+                RETURNING credits, allowance_credits, usd_cogs_internal,
                           plan_tier, updated_at, version
                 """
             row = await tx.fetch_one(
@@ -349,6 +364,7 @@ async def _apply_delta(
                 {
                     "merchant_id": merchant_id,
                     "amount": int(amount),
+                    "usd_cogs": usd_cogs,
                     "version": int(balance["version"]),
                 },
             )
@@ -365,33 +381,35 @@ async def _apply_delta(
         latest = await _get_balance_with_conn(merchant_id, tx)
         if operation == "debit":
             raise InsufficientCreditsError(
-                merchant_id, kind, int(amount), int(latest[column]),
+                merchant_id, category, int(amount), int(latest["credits"]),
             )
         raise RuntimeError("credit balance optimistic update did not converge")
 
 
 async def debit(
     merchant_id: str,
-    kind: CreditKind,
-    amount: int,
+    category: CreditCategory,
+    amount_credits: int,
     idempotency_key: str,
     *,
+    usd_cogs: Any = 0,
     conn: Any = None,
 ) -> Dict[str, Any]:
-    """Atomically debit one credit bucket with idempotent replay."""
+    """Atomically debit abstract credits with idempotent replay."""
     operation_key = _operation_idempotency_key(
         operation="debit",
         merchant_id=merchant_id,
-        kind=kind,
+        category=category,
         caller_key=idempotency_key,
     )
     return await _apply_delta(
         merchant_id=merchant_id,
-        kind=kind,
-        amount=amount,
+        category=category,
+        amount=int(amount_credits),
+        usd_cogs=_decimal(usd_cogs),
         operation_key=operation_key,
         operation="debit",
-        event_type=f"credit_debit_{kind}",
+        event_type=f"credit_debit_{category}",
         source_key=idempotency_key,
         conn=conn,
     )
@@ -399,26 +417,28 @@ async def debit(
 
 async def credit(
     merchant_id: str,
-    kind: CreditKind,
-    amount: int,
+    category: CreditCategory,
+    amount_credits: int,
     source_event_id: str,
     *,
+    usd_cogs: Any = 0,
     conn: Any = None,
 ) -> Dict[str, Any]:
     """Add credits for a purchase, grant, or refund with idempotency."""
     operation_key = _operation_idempotency_key(
         operation="credit",
         merchant_id=merchant_id,
-        kind=kind,
+        category=category,
         caller_key=source_event_id,
     )
     return await _apply_delta(
         merchant_id=merchant_id,
-        kind=kind,
-        amount=amount,
+        category=category,
+        amount=int(amount_credits),
+        usd_cogs=_decimal(usd_cogs),
         operation_key=operation_key,
         operation="credit",
-        event_type=f"credit_grant_{kind}",
+        event_type=f"credit_grant_{category}",
         source_key=source_event_id,
         conn=conn,
     )
