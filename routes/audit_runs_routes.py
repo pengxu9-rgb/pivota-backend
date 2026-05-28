@@ -54,9 +54,11 @@ from routes.merchant_audit_routes import _check_audit_rate_limit
 from services.idempotency import compute_audit_idempotency_key
 from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
+    MissingVerifiedPaymentMethodError,
     credit,
     debit,
     get_balance,
+    require_verified_payment_method,
 )
 from services.provider_credit_rates import (
     credits_for_probe,
@@ -615,6 +617,21 @@ async def create_audit_run(
         "execution": 0,
     }
     balance = await get_balance(body.merchant_id)
+    if str(balance.get("plan_tier") or "free") != "free":
+        try:
+            await require_verified_payment_method(body.merchant_id)
+        except MissingVerifiedPaymentMethodError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "error": exc.code,
+                    "message": (
+                        "Paid-tier audits require a verified Stripe card "
+                        "before launch."
+                    ),
+                    "reason": exc.reason,
+                },
+            ) from exc
     gaps = _credit_gaps(requirements=requirements, balance=balance)
     if gaps:
         gap = gaps[0]
@@ -634,7 +651,7 @@ async def create_audit_run(
     if str(balance.get("plan_tier") or "free") == "free":
         await _check_audit_rate_limit(body.merchant_id)
 
-    debited: List[Tuple[str, int, bool, Decimal]] = []
+    debited: List[Tuple[str, int, bool, Decimal, int]] = []
     try:
         audit_required = int(requirements["audit"])
         if audit_required:
@@ -650,6 +667,7 @@ async def create_audit_run(
                 audit_required,
                 bool(audit_debit.get("replay")),
                 audit_usd_cogs,
+                int(audit_debit.get("purchased_credits_debited") or 0),
             ))
         prompt_required = int(requirements["prompt"])
         if prompt_required:
@@ -665,6 +683,7 @@ async def create_audit_run(
                 prompt_required,
                 bool(prompt_debit.get("replay")),
                 Decimal("0"),
+                int(prompt_debit.get("purchased_credits_debited") or 0),
             ))
 
         # Use origin/main's race-safe enqueue (returns run_id +
@@ -679,7 +698,7 @@ async def create_audit_run(
             requested_by_user_id=auth_merchant_id,
         )
     except InsufficientCreditsError as exc:
-        for kind, amount, replay, usd_cogs in reversed(debited):
+        for kind, amount, replay, usd_cogs, purchased_credits in reversed(debited):
             if not replay:
                 await credit(
                     body.merchant_id,
@@ -687,6 +706,7 @@ async def create_audit_run(
                     amount,
                     source_event_id=f"refund:{debit_idempotency_key}",
                     usd_cogs=usd_cogs,
+                    purchased_credits=purchased_credits,
                 )
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -699,7 +719,7 @@ async def create_audit_run(
             },
         ) from exc
     except Exception:
-        for kind, amount, replay, usd_cogs in reversed(debited):
+        for kind, amount, replay, usd_cogs, purchased_credits in reversed(debited):
             if not replay:
                 await credit(
                     body.merchant_id,
@@ -707,10 +727,11 @@ async def create_audit_run(
                     amount,
                     source_event_id=f"refund:{debit_idempotency_key}",
                     usd_cogs=usd_cogs,
+                    purchased_credits=purchased_credits,
                 )
         raise
     if not run_id:
-        for kind, amount, replay, usd_cogs in reversed(debited):
+        for kind, amount, replay, usd_cogs, purchased_credits in reversed(debited):
             if not replay:
                 await credit(
                     body.merchant_id,
@@ -718,6 +739,7 @@ async def create_audit_run(
                     amount,
                     source_event_id=f"refund:{debit_idempotency_key}",
                     usd_cogs=usd_cogs,
+                    purchased_credits=purchased_credits,
                 )
         # Persistence layer rejected the insert. Most likely cause is
         # the DB being unavailable; surface a 503 so callers retry.

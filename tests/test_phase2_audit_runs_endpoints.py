@@ -36,6 +36,8 @@ class _AccessorStub:
         self.debits: List[Dict[str, Any]] = []
         self.credits: List[Dict[str, Any]] = []
         self.rate_limit_checks: List[str] = []
+        self.payment_method_checks: List[str] = []
+        self.payment_method_error: Optional[Exception] = None
         self.preview_resolves: List[Dict[str, Any]] = []
 
         # Configurable returns — tests set these before requests.
@@ -53,6 +55,7 @@ class _AccessorStub:
             "allowance_credits": 18_000,
             "usd_cogs_internal": Decimal("12.3456"),
             "plan_tier": "starter",
+            "purchased_credits": 0,
             "updated_at": None,
             "version": 0,
         }
@@ -103,23 +106,43 @@ class _AccessorStub:
             raise InsufficientCreditsError(
                 merchant_id, kind, int(amount), available,
             )
+        purchased_available = int(self.balance.get("purchased_credits") or 0)
+        allowance_available = max(0, available - purchased_available)
+        purchased_debited = min(
+            purchased_available,
+            max(0, int(amount) - allowance_available),
+        )
         self.balance["credits"] = available - int(amount)
+        self.balance["purchased_credits"] = purchased_available - purchased_debited
         self.balance["usd_cogs_internal"] = (
             Decimal(str(self.balance.get("usd_cogs_internal") or 0))
             + Decimal(str(kwargs.get("usd_cogs") or 0))
         )
         self.balance["version"] = int(self.balance.get("version") or 0) + 1
-        return {**self.balance, "replay": False}
+        return {
+            **self.balance,
+            "replay": False,
+            "purchased_credits_debited": purchased_debited,
+        }
 
     async def credit(self, merchant_id, kind, amount, source_event_id, **kwargs):
+        purchased_credits = int(
+            kwargs.get("purchased_credits")
+            if kwargs.get("purchased_credits") is not None
+            else amount
+        )
         self.credits.append({
             "merchant_id": merchant_id,
             "kind": kind,
             "amount": amount,
             "source_event_id": source_event_id,
             "usd_cogs": kwargs.get("usd_cogs"),
+            "purchased_credits": purchased_credits,
         })
         self.balance["credits"] = int(self.balance.get("credits") or 0) + int(amount)
+        self.balance["purchased_credits"] = (
+            int(self.balance.get("purchased_credits") or 0) + purchased_credits
+        )
         self.balance["usd_cogs_internal"] = max(
             Decimal("0"),
             Decimal(str(self.balance.get("usd_cogs_internal") or 0))
@@ -131,6 +154,11 @@ class _AccessorStub:
     async def rate_limit(self, merchant_id):
         self.rate_limit_checks.append(merchant_id)
         return 1
+
+    async def require_payment_method(self, merchant_id):
+        self.payment_method_checks.append(merchant_id)
+        if self.payment_method_error is not None:
+            raise self.payment_method_error
 
     async def resolve_preview(self, *, merchant_id, scope):
         self.preview_resolves.append({
@@ -183,6 +211,11 @@ def client(stub, monkeypatch):
     )
     monkeypatch.setattr(
         audit_runs_routes, "_check_audit_rate_limit", stub.rate_limit,
+    )
+    monkeypatch.setattr(
+        audit_runs_routes,
+        "require_verified_payment_method",
+        stub.require_payment_method,
     )
     monkeypatch.setattr(
         audit_runs_routes, "_resolve_preview_sku_keys", stub.resolve_preview,
@@ -404,6 +437,69 @@ def test_post_paid_tier_skips_rate_limit(client, stub):
     )
     assert res.status_code == 202
     assert stub.rate_limit_checks == []
+    assert stub.payment_method_checks == ["merch-A"]
+
+
+def test_post_paid_tier_without_verified_payment_method_is_blocked(client, stub):
+    from services.merchant_credit_balance_service import (
+        MissingVerifiedPaymentMethodError,
+    )
+
+    stub.balance["plan_tier"] = "growth"
+    stub.payment_method_error = MissingVerifiedPaymentMethodError(
+        "merch-A",
+        "missing_default_payment_method",
+    )
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+        },
+    )
+    assert res.status_code == 402
+    detail = res.json()["detail"]
+    assert detail["error"] == "missing_verified_payment_method"
+    assert detail["reason"] == "missing_default_payment_method"
+    assert stub.payment_method_checks == ["merch-A"]
+    assert stub.debits == []
+    assert stub.enqueued == []
+
+
+def test_post_paid_tier_with_verified_payment_method_is_allowed(client, stub):
+    stub.balance["plan_tier"] = "growth"
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+        },
+    )
+    assert res.status_code == 202
+    assert stub.payment_method_checks == ["merch-A"]
+    assert len(stub.debits) == 1
+
+
+def test_post_free_tier_is_exempt_from_verified_payment_method(client, stub):
+    from services.merchant_credit_balance_service import (
+        MissingVerifiedPaymentMethodError,
+    )
+
+    stub.balance["plan_tier"] = "free"
+    stub.payment_method_error = MissingVerifiedPaymentMethodError(
+        "merch-A",
+        "missing_default_payment_method",
+    )
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+        },
+    )
+    assert res.status_code == 202
+    assert stub.payment_method_checks == []
+    assert stub.rate_limit_checks == ["merch-A"]
 
 
 def test_post_relaunch_existing_run_does_not_double_debit(client, stub):
