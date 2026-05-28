@@ -52,3 +52,25 @@ END $$;
 ALTER TABLE merchant_credit_balance DROP COLUMN IF EXISTS audit_credits;
 ALTER TABLE merchant_credit_balance DROP COLUMN IF EXISTS prompt_credits;
 ALTER TABLE merchant_credit_balance DROP COLUMN IF EXISTS execution_credits;
+
+-- Fix plan_tier allow-list: migration 089 omitted 'scale', but the committed
+-- Markato model is Starter / Growth / Scale / Enterprise ($99/$299/$999/custom).
+-- A Scale-tier merchant could not be inserted under the 089 CHECK. Drop any
+-- existing plan_tier CHECK (by definition, name-robust) and re-add the correct
+-- superset. Idempotent; superset means existing rows still pass.
+DO $$
+DECLARE c text;
+BEGIN
+    FOR c IN
+        SELECT conname FROM pg_constraint
+         WHERE conrelid = 'merchant_credit_balance'::regclass
+           AND contype = 'c'
+           AND pg_get_constraintdef(oid) ILIKE '%plan_tier%'
+    LOOP
+        EXECUTE format('ALTER TABLE merchant_credit_balance DROP CONSTRAINT %I', c);
+    END LOOP;
+END $$;
+
+ALTER TABLE merchant_credit_balance
+    ADD CONSTRAINT merchant_credit_balance_plan_tier_check
+    CHECK (plan_tier IN ('free','starter','growth','scale','enterprise','custom'));
