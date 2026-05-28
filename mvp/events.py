@@ -181,6 +181,8 @@ class PostgresEventSink:
             idk = event.idempotency_key or event.event_id
             chash = chain_hash(prev, event.payload_sha256, idk, occurred_iso)
 
+            # Deprecated legacy event sink; decision-layer billing attribution
+            # writes to services.agent_decision_event_store.
             await db.execute(
                 """
                 INSERT INTO mvp_events

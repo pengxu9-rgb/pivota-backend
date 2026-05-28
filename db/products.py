@@ -445,9 +445,10 @@ async def log_api_call(
     # PR-5: also persist a funnel_events row so stage-level analytics
     # populate automatically. Best-effort — failure here doesn't undo
     # the api_call_events insert above.
+    funnel_event_ids = []
     try:
         from services.funnel_recorder import record_from_api_call_event
-        await record_from_api_call_event(
+        funnel_event_ids = await record_from_api_call_event(
             merchant_id=merchant_id,
             event_type=event_type,
             endpoint=endpoint,
@@ -456,6 +457,7 @@ async def log_api_call(
         )
     except Exception:
         pass
+    return funnel_event_ids
 
 
 def _event_currency_from_metadata(metadata: Optional[Dict]) -> Optional[str]:
@@ -515,9 +517,10 @@ async def log_order_event(
     # PR-5: also persist a funnel_events row. Order events almost
     # always map to conversion stage; channel inferred from metadata
     # utm_source / source when present. Best-effort.
+    funnel_event_ids = []
     try:
         from services.funnel_recorder import record_from_order_event
-        await record_from_order_event(
+        funnel_event_ids = await record_from_order_event(
             merchant_id=merchant_id,
             event_type=event_type,
             order_id=order_id,
@@ -526,6 +529,7 @@ async def log_order_event(
         )
     except Exception:
         pass
+    return funnel_event_ids
 
 
 # ============================================================================

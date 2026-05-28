@@ -52,6 +52,9 @@ async def log_ranking_batch(
     """
     Persist a batch of ranking feature snapshots for later LTR / reranker training.
 
+    Deprecated legacy event sink; decision-layer billing attribution writes to
+    services.agent_decision_event_store.
+
     - `products` are the already-ranked products returned to the caller.
     - Each product is expected to optionally contain:
       - `ranking_score`
@@ -98,4 +101,3 @@ async def log_ranking_batch(
 
     query_obj = agent_ranking_log.insert()
     await database.execute_many(query_obj, rows)
-

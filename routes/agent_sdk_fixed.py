@@ -16,6 +16,7 @@ import re
 import os
 import time
 import asyncio
+import uuid
 
 from services.agent_ranking_service import (
     AgentRankingFeatures,
@@ -1055,7 +1056,63 @@ async def search_products(
         metadata.setdefault("catalog_surface", normalized_catalog_surface)
         metadata["source"] = "agent_sdk_fixed_delegate"
         metadata["latency_ms"] = int((time.perf_counter() - started) * 1000)
+        decision_id = str(uuid.uuid4())
+        metadata["decision_id"] = decision_id
+        metadata["decision_layer"] = {
+            "decision_id": decision_id,
+            "correlation_source": "agent_sdk_fixed.products.search",
+        }
         result["metadata"] = metadata
+        try:
+            from services.agent_decision_event_store import (
+                record_decision_candidates,
+                record_decision_event,
+                record_exposure_events,
+            )
+
+            raw_products = [p for p in (result.get("products") or []) if isinstance(p, dict)]
+            rows = []
+            for idx, product in enumerate(raw_products):
+                rows.append(
+                    {
+                        "content_key": product.get("content_key") or product.get("product_key"),
+                        "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
+                        "position": idx,
+                        "eligibility_flags": {
+                            "merchant_id": product.get("merchant_id"),
+                            "in_stock": product.get("in_stock"),
+                            "source": product.get("source"),
+                            "ranking_score": product.get("ranking_score") or product.get("score"),
+                        },
+                        "slot": "search_result",
+                    }
+                )
+            async def _record_search_decision() -> None:
+                try:
+                    await record_decision_event(
+                        decision_id=decision_id,
+                        merchant_id=merchant_id,
+                        surface="agent_sdk_fixed.products.search",
+                        channel=None,
+                        agent_context={
+                            "agent_id": getattr(context, "agent_id", None),
+                            "session_id": getattr(context, "session_id", None),
+                            "query": query,
+                            "category": category,
+                            "merchant_ids": merchant_ids,
+                            "search_all_merchants": search_all_merchants,
+                            "limit": limit,
+                            "offset": offset,
+                        },
+                    )
+                    await record_decision_candidates(decision_id, rows)
+                    await record_exposure_events(decision_id, rows)
+                except Exception:
+                    logger.debug("agent_sdk_fixed decision event enqueue failed", exc_info=True)
+
+            asyncio.create_task(_record_search_decision())
+        except Exception:
+            logger.debug("agent_sdk_fixed decision event scheduling failed", exc_info=True)
     return result
 
 

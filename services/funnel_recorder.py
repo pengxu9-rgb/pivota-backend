@@ -126,7 +126,7 @@ async def record_from_api_call_event(
     endpoint: Optional[str] = None,
     request_params: Optional[Dict[str, Any]] = None,
     product_ids: Optional[List[str]] = None,
-) -> None:
+) -> List[str]:
     """Hook called from db.products.log_api_call_event after that
     function writes its existing row. Derives funnel signal +
     persists one event per surfaced product (or one brand-level
@@ -136,7 +136,8 @@ async def record_from_api_call_event(
     writer's success isn't undone by funnel persistence issues.
     """
     if not merchant_id:
-        return
+        return []
+    event_ids: List[str] = []
     try:
         from db.funnel_events import record_funnel_event
 
@@ -172,28 +173,33 @@ async def record_from_api_call_event(
             for pid in product_ids[:50]:  # safety cap
                 if not pid:
                     continue
-                await record_funnel_event(
+                event_id = await record_funnel_event(
                     merchant_id=merchant_id,
                     source_channel=channel,
                     stage=stage,
                     product_key=pid,
                     attribution=attribution,
                 )
+                if event_id:
+                    event_ids.append(event_id)
         else:
             # Brand-level event (no specific product) — surface as
             # one row with product_key=None.
-            await record_funnel_event(
+            event_id = await record_funnel_event(
                 merchant_id=merchant_id,
                 source_channel=channel,
                 stage=stage,
                 product_key=None,
                 attribution=attribution,
             )
+            if event_id:
+                event_ids.append(event_id)
     except Exception as exc:  # noqa: BLE001
         logger.info(
             "funnel_recorder.record_from_api_call_event failed: %s",
             str(exc)[:200],
         )
+    return event_ids
 
 
 async def record_from_order_event(
@@ -203,14 +209,15 @@ async def record_from_order_event(
     order_id: Optional[str] = None,
     product_ids: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> List[str]:
     """Hook called from db.products.log_order_event. Order events are
     almost always conversion-stage; channel is inferred from order
     metadata when present (utm_source / source).
 
     Best-effort: any failure swallowed."""
     if not merchant_id:
-        return
+        return []
+    event_ids: List[str] = []
     try:
         from db.funnel_events import record_funnel_event
         meta = metadata or {}
@@ -235,23 +242,28 @@ async def record_from_order_event(
             for pid in product_ids[:50]:
                 if not pid:
                     continue
-                await record_funnel_event(
+                event_id = await record_funnel_event(
                     merchant_id=merchant_id,
                     source_channel=channel,
                     stage=stage,
                     product_key=pid,
                     attribution=attribution,
                 )
+                if event_id:
+                    event_ids.append(event_id)
         else:
-            await record_funnel_event(
+            event_id = await record_funnel_event(
                 merchant_id=merchant_id,
                 source_channel=channel,
                 stage=stage,
                 product_key=None,
                 attribution=attribution,
             )
+            if event_id:
+                event_ids.append(event_id)
     except Exception as exc:  # noqa: BLE001
         logger.info(
             "funnel_recorder.record_from_order_event failed: %s",
             str(exc)[:200],
         )
+    return event_ids

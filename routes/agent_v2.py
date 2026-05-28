@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -37,6 +39,7 @@ from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_tra
 
 
 router = APIRouter(prefix="/agent/v2", tags=["agent-v2"])
+logger = logging.getLogger(__name__)
 
 
 class RequestContext(BaseModel):
@@ -721,11 +724,72 @@ async def search_products_v2(
         for product in (result.get("products") or [])
         if isinstance(product, dict)
     ]
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    metadata = dict(metadata or {})
+    decision_id = str(uuid.uuid4())
+    metadata["decision_id"] = decision_id
+    metadata["decision_layer"] = {
+        "decision_id": decision_id,
+        "correlation_source": "agent_v2.products.search",
+    }
+    try:
+        from services.agent_decision_event_store import (
+            record_decision_candidates,
+            record_decision_event,
+            record_exposure_events,
+        )
+
+        raw_products = [p for p in (result.get("products") or []) if isinstance(p, dict)]
+        rows = []
+        for idx, product in enumerate(raw_products):
+            rows.append(
+                {
+                    "content_key": product.get("content_key") or product.get("product_key"),
+                    "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
+                    "position": idx,
+                    "eligibility_flags": {
+                        "merchant_id": product.get("merchant_id"),
+                        "in_stock": product.get("in_stock"),
+                        "source": product.get("source"),
+                        "ranking_score": product.get("ranking_score") or product.get("score"),
+                    },
+                    "slot": "search_result",
+                }
+            )
+        async def _record_search_decision() -> None:
+            try:
+                await record_decision_event(
+                    decision_id=decision_id,
+                    merchant_id=body.merchant_id,
+                    surface="agent_v2.products.search",
+                    channel=body.request_context.channel if body.request_context else None,
+                    agent_context={
+                        "agent_id": getattr(context, "agent_id", None),
+                        "session_id": getattr(context, "session_id", None),
+                        "query": body.query,
+                        "category": body.category,
+                        "merchant_ids": body.merchant_ids,
+                        "search_all_merchants": search_all_merchants,
+                        "limit": body.limit,
+                        "offset": body.offset,
+                        "request_context": body.request_context.model_dump(exclude_none=True)
+                        if body.request_context
+                        else None,
+                    },
+                )
+                await record_decision_candidates(decision_id, rows)
+                await record_exposure_events(decision_id, rows)
+            except Exception:
+                logger.debug("agent_v2 decision event enqueue failed", exc_info=True)
+
+        asyncio.create_task(_record_search_decision())
+    except Exception:
+        logger.debug("agent_v2 decision event scheduling failed", exc_info=True)
     return {
         "status": str(result.get("status") or "success"),
         "products": products,
         "pagination": result.get("pagination") or {},
-        "metadata": result.get("metadata") or {},
+        "metadata": metadata,
         "request_context": body.request_context.model_dump(exclude_none=True)
         if body.request_context
         else None,

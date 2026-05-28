@@ -118,6 +118,57 @@ _ORDER_EVENT_ORDER_TOTAL_TYPES = {
     "shopify_order_webhook",
 }
 
+
+def _decision_layer_dict(metadata: Any) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    node = metadata.get("decision_layer")
+    return node if isinstance(node, dict) else {}
+
+
+def _first_nonempty_string(*values: Any) -> Optional[str]:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _extract_decision_id_from_metadata(metadata: Any) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+    node = _decision_layer_dict(metadata)
+    request_context = metadata.get("request_context") if isinstance(metadata.get("request_context"), dict) else {}
+    agent_v2 = metadata.get("agent_v2") if isinstance(metadata.get("agent_v2"), dict) else {}
+    return _first_nonempty_string(
+        node.get("decision_id"),
+        node.get("agent_decision_id"),
+        metadata.get("decision_id"),
+        metadata.get("agent_decision_id"),
+        request_context.get("decision_id"),
+        agent_v2.get("decision_id"),
+    )
+
+
+def _extract_checkout_decision_id_from_metadata(metadata: Any) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+    node = _decision_layer_dict(metadata)
+    return _first_nonempty_string(node.get("checkout_decision_id"), metadata.get("checkout_decision_id"))
+
+
+def _extract_decision_product_refs(metadata: Any) -> Dict[str, Optional[str]]:
+    if not isinstance(metadata, dict):
+        return {"content_key": None, "catalog_offer_id": None}
+    node = _decision_layer_dict(metadata)
+    content_key = _first_nonempty_string(node.get("content_key"), metadata.get("content_key"))
+    catalog_offer_id = _first_nonempty_string(
+        node.get("catalog_offer_id"),
+        metadata.get("catalog_offer_id"),
+        metadata.get("offer_id"),
+    )
+    return {"content_key": content_key, "catalog_offer_id": catalog_offer_id}
+
 EXTERNAL_SEED_MERCHANT_ID = "external_seed"
 DEFAULT_EXTERNAL_SEED_MARKET = "US"
 
@@ -7765,6 +7816,8 @@ async def agent_create_order(
     
     start_time = time.time()
     success = False
+    decision_layer_decision_id: Optional[str] = None
+    decision_layer_checkout_decision_id: Optional[str] = None
     
     try:
         # 验证商户访问权限
@@ -8057,6 +8110,16 @@ async def agent_create_order(
             order_request.metadata.setdefault("execution_policy_version", commerce_policy.execution_policy_version)
             order_request.metadata.setdefault("validation_authority", commerce_policy.validation_authority)
             order_request.metadata.setdefault("legacy_or_fallback", commerce_policy.legacy_or_fallback)
+            decision_layer_decision_id = _extract_decision_id_from_metadata(order_request.metadata)
+            decision_layer_checkout_decision_id = (
+                _extract_checkout_decision_id_from_metadata(order_request.metadata)
+                or str(uuid.uuid4())
+            )
+            decision_layer_meta = _decision_layer_dict(order_request.metadata)
+            decision_layer_meta["checkout_decision_id"] = decision_layer_checkout_decision_id
+            if decision_layer_decision_id:
+                decision_layer_meta["decision_id"] = decision_layer_decision_id
+            order_request.metadata["decision_layer"] = decision_layer_meta
 
         # Checkout token: if present, hydrate identity/context fields into order metadata.
         # This prevents footguns where callers forget to pass buyer_ref/job_id while still
@@ -8487,6 +8550,46 @@ async def agent_create_order(
         except Exception:
             # Best-effort: do not break order creation if quote metadata read fails.
             pass
+
+        try:
+            from services.agent_decision_event_store import record_checkout_decision
+
+            refs = _extract_decision_product_refs(order_request.metadata)
+            pricing_quote = (
+                order_request.metadata.get("pricing_quote")
+                if isinstance(order_request.metadata, dict)
+                and isinstance(order_request.metadata.get("pricing_quote"), dict)
+                else {}
+            )
+
+            async def _record_checkout_decision() -> None:
+                try:
+                    await record_checkout_decision(
+                        checkout_decision_id=decision_layer_checkout_decision_id,
+                        decision_id=decision_layer_decision_id,
+                        order_id=str(order_response.order_id),
+                        merchant_id=str(order_request.merchant_id),
+                        content_key=refs.get("content_key"),
+                        catalog_offer_id=refs.get("catalog_offer_id"),
+                        purchase_route=commerce_policy.commerce_path,
+                        quote_context={
+                            "quote_id": getattr(order_request, "quote_id", None),
+                            "quote_hash_sha256": pricing_quote.get("quote_hash_sha256"),
+                            "currency": pricing_quote.get("currency") or order_response.currency,
+                            "total": float(order_response.total),
+                        },
+                        psp_context={
+                            "psp": psp_type,
+                            "payment_intent_id": order_response.payment_intent_id,
+                            "selected_payment_offer_id": getattr(order_request, "selected_payment_offer_id", None),
+                        },
+                    )
+                except Exception:
+                    logger.debug("checkout decision event enqueue failed", exc_info=True)
+
+            asyncio.create_task(_record_checkout_decision())
+        except Exception:
+            logger.debug("checkout decision event scheduling failed", exc_info=True)
 
         # Store idempotency record (best-effort).
         await _cache_agent_order_create_response_best_effort(
@@ -8933,8 +9036,9 @@ async def agent_confirm_payment(
         # needed here.
 
         # 记录支付成功事件（best-effort; do not fail confirm if event logging hits DB busy）
+        funnel_event_ids = []
         try:
-            await log_order_event(
+            funnel_event_ids = await log_order_event(
                 event_type="payment_succeeded",
                 order_id=order_id,
                 merchant_id=order["merchant_id"],
@@ -8949,6 +9053,32 @@ async def agent_confirm_payment(
             )
         except Exception:
             pass
+
+        try:
+            from services.agent_decision_event_store import record_funnel_link
+
+            order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+            decision_id = _extract_decision_id_from_metadata(order_metadata)
+            checkout_decision_id = _extract_checkout_decision_id_from_metadata(order_metadata)
+            refs = _extract_decision_product_refs(order_metadata)
+            for funnel_event_id in funnel_event_ids or []:
+                async def _record_funnel_link(fid: str) -> None:
+                    try:
+                        await record_funnel_link(
+                            decision_id=decision_id,
+                            funnel_event_id=fid,
+                            checkout_decision_id=checkout_decision_id,
+                            content_key=refs.get("content_key"),
+                            catalog_offer_id=refs.get("catalog_offer_id"),
+                            commerce_attribution_edge_id=None,
+                            merchant_id=str(order.get("merchant_id") or ""),
+                        )
+                    except Exception:
+                        logger.debug("decision funnel link enqueue failed", exc_info=True)
+
+                asyncio.create_task(_record_funnel_link(str(funnel_event_id)))
+        except Exception:
+            logger.debug("decision funnel link scheduling failed", exc_info=True)
 
         if can_shopify_sync:
             background_tasks.add_task(create_shopify_order, order_id)
