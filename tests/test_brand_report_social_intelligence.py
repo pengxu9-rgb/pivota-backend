@@ -102,6 +102,7 @@ async def test_social_intelligence_off_by_default(stubbed_probes):
             merchant_name="Beauty of Joseon",
             merchant_domain="beautyofjoseon.com",
             products=_example_products(),
+            provider="gemini",
         )
         mock_fn.assert_not_called()
     assert result["social_intelligence"] is None
@@ -143,6 +144,7 @@ async def test_social_intelligence_on_populates_field(stubbed_probes):
             merchant_name="Beauty of Joseon",
             merchant_domain="beautyofjoseon.com",
             products=_example_products(),
+            provider="gemini",
             include_social_intelligence=True,
         )
         mock_fn.assert_awaited_once()
@@ -186,6 +188,7 @@ async def test_social_intelligence_threads_peers_named_as_competitors(
             merchant_name="Beauty of Joseon",
             merchant_domain="beautyofjoseon.com",
             products=_example_products(),
+            provider="gemini",
             include_social_intelligence=True,
         )
     mock_fn.assert_awaited_once()
@@ -219,6 +222,7 @@ async def test_social_intelligence_skipped_when_merchant_domain_empty(stubbed_pr
             merchant_name="Beauty of Joseon",
             merchant_domain=None,
             products=_example_products(),
+            provider="gemini",
             include_social_intelligence=True,
         )
         mock_fn.assert_not_called()
@@ -239,6 +243,7 @@ async def test_social_intelligence_exception_does_not_block_audit(stubbed_probes
             merchant_name="Beauty of Joseon",
             merchant_domain="beautyofjoseon.com",
             products=_example_products(),
+            provider="gemini",
             include_social_intelligence=True,
         )
     # Audit completes; the report is valid; social_intelligence is null.

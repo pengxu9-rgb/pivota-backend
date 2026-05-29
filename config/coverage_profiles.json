@@ -1,0 +1,22 @@
+{
+  "default_profile": "us_shopper",
+  "engine_supported_providers": ["mock", "gemini", "chatgpt", "claude"],
+  "profiles": {
+    "us_shopper": {
+      "label": "US Shopper",
+      "providers": ["gemini", "chatgpt"],
+      "verify_providers": ["deepseek"],
+      "notes": "Default shopper-fidelity profile. DeepSeek verify is configured as desired policy but pending Agent-engine provider support."
+    },
+    "full": {
+      "label": "Full Coverage",
+      "providers": ["gemini", "chatgpt", "claude", "perplexity"],
+      "notes": "Perplexity remains pending Agent-engine support and is filtered out until wired."
+    },
+    "asia": {
+      "label": "Asia Expansion",
+      "providers": ["gemini", "chatgpt", "doubao"],
+      "notes": "Doubao remains pending Agent-engine support and is filtered out until wired."
+    }
+  }
+}

@@ -78,6 +78,10 @@ async def process_one_audit_run() -> bool:
     merchant_id = claimed["merchant_id"]
     product_keys: List[str] = claimed.get("product_keys") or []
     starting_stage = claimed.get("stage") or mar.STAGE_QUEUED
+    launch_options = (
+        (claimed.get("partial_result_jsonb") or {}).get("launch") or {}
+        if isinstance(claimed.get("partial_result_jsonb"), dict) else {}
+    )
 
     logger.info(
         "audit_run_worker: claimed run_id=%s merchant=%s "
@@ -113,6 +117,7 @@ async def process_one_audit_run() -> bool:
             merchant_name=merchant_name,
             merchant_domain=merchant_domain,
             integration_state=integration_state,
+            launch_options=launch_options,
         )
 
 
@@ -128,12 +133,14 @@ async def _process_one_audit_run_inner(
     merchant_name: str,
     merchant_domain: Optional[str],
     integration_state: Optional[Dict[str, Any]],
+    launch_options: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """The actual stage-driving body, scoped inside an
     audit_telemetry() context manager so probe call sites can read
     audit_run_id + merchant_id via contextvars.
     """
     from db import merchant_audit_runs as mar
+    launch_options = launch_options or {}
 
     # ----- P0-2 resume rehydrate -----
     # claim_next_pending_run will hand the worker a row at ANY active
@@ -356,7 +363,11 @@ async def _process_one_audit_run_inner(
                     merchant_name=str(merchant_name),
                     merchant_domain=merchant_domain,
                     products=products,
-                    provider="gemini",
+                    coverage_profile=(
+                        launch_options.get("coverage_profile")
+                        or "us_shopper"
+                    ),
+                    providers=launch_options.get("providers"),
                     max_runs=3,
                     integration_state=integration_state,
                 )
@@ -1012,8 +1023,18 @@ def _placeholder_cost_summary(
     if not brand_report:
         return None
     aggregate = brand_report.get("aggregate") or {}
+    providers = list(brand_report.get("providers") or [])
+    if not providers:
+        seen = set()
+        for item in brand_report.get("per_product") or []:
+            if not isinstance(item, dict):
+                continue
+            for provider in item.get("providers") or []:
+                if provider and provider not in seen:
+                    seen.add(provider)
+                    providers.append(provider)
     return {
-        "providers": [],
+        "providers": providers,
         "total_input_tokens": None,
         "total_output_tokens": None,
         "estimated_cost_usd": None,

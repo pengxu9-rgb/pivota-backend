@@ -186,14 +186,17 @@ async def test_probe_local_mock_fires_only_with_explicit_opt_in(monkeypatch):
     assert result["provider"] == "local_mock_no_internal_key"
 
 
-def test_classify_provider_marks_real_only_for_gemini():
+def test_classify_provider_marks_real_engine_providers():
     """End-to-end sanity: services.agent_center_bd_report_service
-    `_classify_provider` returns is_real=True only for the gemini
-    provider. Any other provider — including the three known mock
-    fallbacks — yields is_real=False, which the guard then catches."""
+    `_classify_provider` returns is_real=True for engine-backed real
+    providers. Mock fallbacks still yield is_real=False, which the
+    guard then catches."""
     from services.agent_center_bd_report_service import _classify_provider
 
     assert _classify_provider("gemini")["is_real"] is True
+    assert _classify_provider("chatgpt")["is_real"] is True
+    assert _classify_provider("claude")["is_real"] is True
+    assert _classify_provider("gemini,chatgpt")["is_real"] is True
     assert _classify_provider("local_mock_no_internal_key")["is_real"] is False
     assert _classify_provider("mock_fallback_no_gemini_key")["is_real"] is False
     assert _classify_provider("mock")["is_real"] is False

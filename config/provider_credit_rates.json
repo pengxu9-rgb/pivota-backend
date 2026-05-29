@@ -19,6 +19,27 @@
       "output_cost_usd_per_1m_tokens": 2.50,
       "grounding_cost_usd_per_call": 0.0350
     },
+    "chatgpt": {
+      "aliases": ["openai_gpt_5_5_grounded", "gpt-5.5-grounded"],
+      "model": "gpt-5.5",
+      "grounding": "web_search_preview",
+      "default_grounded": true,
+      "prompt_fraction": 1.0,
+      "input_cost_usd_per_1m_tokens": 5.00,
+      "output_cost_usd_per_1m_tokens": 20.00,
+      "grounding_cost_usd_per_call": 0.0150,
+      "notes": "Conservative list-based interactive audit rate: ~5.4 credits/probe. Future shared-system-prompt caching plus batch/flex can drop this toward ~3.0 credits/probe once implemented."
+    },
+    "claude": {
+      "aliases": ["anthropic_claude_sonnet_grounded"],
+      "model": "claude-sonnet-4",
+      "grounding": "web_search",
+      "default_grounded": true,
+      "prompt_fraction": 1.0,
+      "input_cost_usd_per_1m_tokens": 3.00,
+      "output_cost_usd_per_1m_tokens": 15.00,
+      "grounding_cost_usd_per_call": 0.0100
+    },
     "deepseek": {
       "aliases": ["deepseek_verify"],
       "model": "deepseek-v4-flash",
