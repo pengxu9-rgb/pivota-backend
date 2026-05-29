@@ -960,19 +960,49 @@ def _stripe_id(value: Any) -> str:
     return _billing_as_text(getattr(value, "id", None))
 
 
-def _is_verified_default_payment_method(value: Any, *, stripe_customer_id: str) -> bool:
+def _is_stripe_error(exc: Exception) -> bool:
+    cls = exc.__class__
+    return (
+        cls.__name__.endswith("StripeError")
+        or str(getattr(cls, "__module__", "")).split(".", 1)[0] == "stripe"
+    )
+
+
+def _default_payment_method_rejection_reason(
+    value: Any,
+    *,
+    stripe_customer_id: str,
+) -> Optional[str]:
     data = _stripe_object_to_dict(value)
     if not isinstance(data, dict):
-        return False
+        return "default_payment_method_not_verified_card"
     payment_method_id = _billing_as_text(data.get("id"))
     if not payment_method_id:
-        return False
+        return "default_payment_method_not_verified_card"
     if _billing_as_text(data.get("type")) != "card":
-        return False
+        return "default_payment_method_not_verified_card"
     customer = data.get("customer")
     if customer and _stripe_id(customer) != stripe_customer_id:
-        return False
-    return True
+        return "default_payment_method_not_verified_card"
+    card = data.get("card") if isinstance(data.get("card"), dict) else {}
+    try:
+        exp_year = int(card.get("exp_year"))
+        exp_month = int(card.get("exp_month"))
+    except (TypeError, ValueError):
+        return "default_payment_method_not_verified_card"
+    today = datetime.now(timezone.utc)
+    if exp_year < today.year or (
+        exp_year == today.year and exp_month < today.month
+    ):
+        return "card_expired"
+    return None
+
+
+def _is_verified_default_payment_method(value: Any, *, stripe_customer_id: str) -> bool:
+    return _default_payment_method_rejection_reason(
+        value,
+        stripe_customer_id=stripe_customer_id,
+    ) is None
 
 
 async def require_verified_payment_method(merchant_id: str) -> None:
@@ -988,10 +1018,17 @@ async def _verified_default_payment_method_for_direct_merchant(
     if not stripe_customer_id:
         raise MissingVerifiedPaymentMethodError(merchant_id, "missing_stripe_customer")
 
-    customer = await asyncio.to_thread(
-        stripe_client.v1.customers.retrieve,
-        stripe_customer_id,
-    )
+    try:
+        customer = await asyncio.to_thread(
+            stripe_client.v1.customers.retrieve,
+            stripe_customer_id,
+        )
+    except Exception as exc:
+        if _is_stripe_error(exc):
+            raise MissingVerifiedPaymentMethodError(
+                merchant_id, "stripe_unavailable",
+            ) from exc
+        raise
     customer_data = _stripe_object_to_dict(customer)
     invoice_settings = (
         customer_data.get("invoice_settings")
@@ -1006,28 +1043,36 @@ async def _verified_default_payment_method_for_direct_merchant(
     if not default_payment_method:
         raise MissingVerifiedPaymentMethodError(
             merchant_id,
-            "missing_default_payment_method",
+            "no_default_pm",
         )
 
     payment_method = default_payment_method
     if isinstance(default_payment_method, str):
-        payment_method = await asyncio.to_thread(
-            stripe_client.v1.payment_methods.retrieve,
-            default_payment_method,
-        )
-    if not _is_verified_default_payment_method(
+        try:
+            payment_method = await asyncio.to_thread(
+                stripe_client.v1.payment_methods.retrieve,
+                default_payment_method,
+            )
+        except Exception as exc:
+            if _is_stripe_error(exc):
+                raise MissingVerifiedPaymentMethodError(
+                    merchant_id, "stripe_unavailable",
+                ) from exc
+            raise
+    rejection_reason = _default_payment_method_rejection_reason(
         payment_method,
         stripe_customer_id=stripe_customer_id,
-    ):
+    )
+    if rejection_reason:
         raise MissingVerifiedPaymentMethodError(
             merchant_id,
-            "default_payment_method_not_verified_card",
+            rejection_reason,
         )
     payment_method_id = _stripe_id(payment_method)
     if not payment_method_id:
         raise MissingVerifiedPaymentMethodError(
             merchant_id,
-            "missing_default_payment_method",
+            "no_default_pm",
         )
     return stripe_customer_id, payment_method_id
 
