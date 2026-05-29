@@ -55,6 +55,9 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
+ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
+
+
 # Match the issue-type taxonomy the Gemini probe + downstream scorers
 # expect. Keeping this constant in lockstep with PIVOTA-Agent's
 # PRIMARY_ISSUE_TYPE_BY_SCAN_MODE means the backend's report builder
@@ -78,6 +81,7 @@ def _build_query_strings(
     product_title: Optional[str] = None,
     product_type: Optional[str] = None,
     merchant_brand: Optional[str] = None,
+    verify_query: Optional[str] = None,
     max_runs: int,
 ) -> List[str]:
     """Generate the query set per scan mode, mirroring how PIVOTA-Agent
@@ -113,6 +117,9 @@ def _build_query_strings(
             f"top {cat} this year",
             f"best {cat} under $50",
         ]
+    elif scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE:
+        query = (verify_query or pt or "answer quality verification").strip()
+        templates = [query] if query else []
     else:
         return []
     return [t for t in templates if t.strip()][:max_runs]
@@ -161,6 +168,21 @@ def _build_system_prompt(scan_mode: str) -> str:
             "300 characters). Do not include any text outside the "
             "JSON object."
         )
+    if scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE:
+        return (
+            "You are an ungrounded answer-quality verifier. You do not "
+            "fetch URLs and you must not judge whether citation URLs "
+            "exist. Read only the supplied grounded answer text, evidence "
+            "excerpt, SKU title, and shopper intent. Respond ONLY with a "
+            "JSON object of this exact shape: "
+            '{"supports_recommendation": <bool>, "misstates_facts": '
+            '<bool>, "note": "<short reason under 200 characters>"}. '
+            "Set supports_recommendation=true only when the supplied "
+            "answer substantively supports recommending the named SKU for "
+            "the intent. Set misstates_facts=true when the answer "
+            "contradicts or invents a core fact about the SKU. Do not "
+            "include any text outside the JSON object."
+        )
     return "Respond with a JSON object describing the user's query."
 
 
@@ -170,9 +192,28 @@ def _build_user_message(
     query: str,
     merchant_brand: Optional[str] = None,
     merchant_pdp_url: Optional[str] = None,
+    product_title: Optional[str] = None,
+    verify_answer_text: Optional[str] = None,
+    verify_evidence_excerpt: Optional[str] = None,
+    verify_intent: Optional[str] = None,
 ) -> str:
     """Per-scan-mode user-message text. Embeds the brand/URL the
     scorer needs to match against."""
+    if scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE:
+        sku_title = (product_title or "").strip()
+        intent = (verify_intent or query or "").strip()
+        answer_text = (verify_answer_text or "").strip()
+        evidence = (verify_evidence_excerpt or "").strip()
+        return (
+            f"SKU title: {sku_title}\n"
+            f"Shopper intent/query: {intent}\n\n"
+            "Grounded answer text from the citation provider:\n"
+            f"{answer_text[:4000]}\n\n"
+            "Evidence excerpt/chunks already supplied by that provider:\n"
+            f"{evidence[:2000]}\n\n"
+            "Judge answer quality and consistency only. Do not verify URL "
+            "existence or perform external lookup."
+        )
     if scan_mode == "merchant_store_attribution_test" and merchant_pdp_url:
         return (
             f"{query}. Please indicate whether {merchant_pdp_url} "
@@ -416,8 +457,12 @@ async def _run_single_query(
     model: str,
     scan_mode: str,
     query: str,
+    product_title: Optional[str],
     merchant_brand: Optional[str],
     merchant_pdp_url: Optional[str],
+    verify_answer_text: Optional[str],
+    verify_evidence_excerpt: Optional[str],
+    verify_intent: Optional[str],
     timeout_s: float,
 ) -> Dict[str, Any]:
     """Probe one query. Returns the per-run shape downstream scorers
@@ -433,6 +478,10 @@ async def _run_single_query(
         query=query,
         merchant_brand=merchant_brand,
         merchant_pdp_url=merchant_pdp_url,
+        product_title=product_title,
+        verify_answer_text=verify_answer_text,
+        verify_evidence_excerpt=verify_evidence_excerpt,
+        verify_intent=verify_intent,
     )
     try:
         api_response = await _call_deepseek_chat(
@@ -442,6 +491,7 @@ async def _run_single_query(
             system_prompt=system_prompt,
             user_message=user_message,
             timeout_s=timeout_s,
+            enable_web_search=scan_mode != ANSWER_QUALITY_VERIFY_SCAN_MODE,
         )
     except DeepseekProbeError as exc:
         logger.warning(
@@ -485,6 +535,7 @@ async def _run_single_query(
         "grounding_chunks": grounding_chunks,
         "grounding_sources": grounding_sources,
         "url_match": url_match,
+        **({"provider": "deepseek", "role": "verify"} if scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE else {}),
         # Per-run usage so the outer probe_one_scan_mode can sum.
         # None values when Deepseek omits the block (rare but possible
         # on rate-limit / partial responses).
@@ -538,10 +589,19 @@ def _compute_scores_from_runs(
             1 for r in scoreable
             if (r.get("parsed") or {}).get("brand_appears")
         )
+    elif scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE:
+        positive = sum(
+            1 for r in scoreable
+            if (r.get("parsed") or {}).get("supports_recommendation") is True
+            and (r.get("parsed") or {}).get("misstates_facts") is not True
+        )
     else:
         positive = 0
     score = round((positive / len(scoreable)) * 100)
-    return {"visibility_score": score, "attribution_echo_rate": 0}
+    scores = {"visibility_score": score, "attribution_echo_rate": 0}
+    if scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE:
+        scores["supports_recommendation_rate"] = score
+    return scores
 
 
 def _build_findings(
@@ -574,6 +634,10 @@ async def probe_one_scan_mode(
     product_type: Optional[str] = None,
     merchant_brand: Optional[str] = None,
     merchant_pdp_url: Optional[str] = None,
+    verify_query: Optional[str] = None,
+    verify_answer_text: Optional[str] = None,
+    verify_evidence_excerpt: Optional[str] = None,
+    verify_intent: Optional[str] = None,
     max_runs: int = 3,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -600,6 +664,7 @@ async def probe_one_scan_mode(
         product_title=product_title,
         product_type=product_type,
         merchant_brand=merchant_brand,
+        verify_query=verify_query,
         max_runs=max_runs,
     )
     if not queries:
@@ -615,6 +680,7 @@ async def probe_one_scan_mode(
         return {
             "scan_mode": scan_mode,
             "provider": "deepseek",
+            **({"role": "verify"} if scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE else {}),
             "runs_count": 0,
             "scores": {"visibility_score": 0, "attribution_echo_rate": 0},
             "findings": [],
@@ -629,8 +695,12 @@ async def probe_one_scan_mode(
             model=model,
             scan_mode=scan_mode,
             query=query,
+            product_title=product_title,
             merchant_brand=merchant_brand,
             merchant_pdp_url=merchant_pdp_url,
+            verify_answer_text=verify_answer_text,
+            verify_evidence_excerpt=verify_evidence_excerpt,
+            verify_intent=verify_intent,
             timeout_s=timeout_s,
         )
         raw_runs.append(run_result)
@@ -674,6 +744,7 @@ async def probe_one_scan_mode(
     return {
         "scan_mode": scan_mode,
         "provider": "deepseek",
+        **({"role": "verify"} if scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE else {}),
         "runs_count": len(raw_runs),
         "scores": scores,
         "findings": findings,

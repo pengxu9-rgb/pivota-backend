@@ -965,7 +965,8 @@ async def test_run_brand_report_us_shopper_fans_out_to_gemini_and_chatgpt(
         ("chatgpt", "merchant_store_attribution_test"),
     ]
     assert out["providers"] == ["gemini", "chatgpt"]
-    assert out["pending_engine_support"] == ["deepseek"]
+    assert out["verify_providers"] == ["deepseek"]
+    assert out["pending_engine_support"] == []
     assert out["per_product"][0]["citation_by_provider"].keys() == {
         "gemini", "chatgpt",
     }

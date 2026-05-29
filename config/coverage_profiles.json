@@ -1,6 +1,11 @@
 {
   "default_profile": "us_shopper",
   "engine_supported_providers": ["mock", "gemini", "chatgpt", "claude"],
+  "verify_supported_providers": ["deepseek"],
+  "default_verify_sample": {
+    "positive_fraction": 0.25,
+    "max_per_sku": null
+  },
   "provider_default_models": {
     "chatgpt": "chat-latest"
   },
@@ -9,7 +14,7 @@
       "label": "US Shopper",
       "providers": ["gemini", "chatgpt"],
       "verify_providers": ["deepseek"],
-      "notes": "Default shopper-fidelity profile. DeepSeek verify is configured as desired policy but pending Agent-engine provider support."
+      "notes": "Default shopper-fidelity profile. DeepSeek verify runs backend-direct as an ungrounded answer-quality second opinion."
     },
     "full": {
       "label": "Full Coverage",

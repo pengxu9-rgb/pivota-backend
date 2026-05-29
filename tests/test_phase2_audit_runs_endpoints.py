@@ -282,16 +282,17 @@ def test_post_enqueues_and_returns_202(client, stub):
     assert stub.enqueued[0]["product_keys"] == ["pk-1", "pk-2"]
     # Idempotency lookup happened (default force=False).
     assert len(stub.idem_lookups) == 1
-    assert stub.balance["credits"] == 9112
+    assert stub.balance["credits"] == 9110
     assert len(stub.debits) == 1
     assert stub.debits[0]["kind"] == "audit"
-    assert stub.debits[0]["amount"] == 888
+    assert stub.debits[0]["amount"] == 890
     launch = stub.enqueued[0]["request_options_jsonb"]["launch"]
     assert launch["coverage_profile"] == "us_shopper"
     assert launch["providers"] == ["gemini", "chatgpt"]
     assert launch["provider_models"]["chatgpt"]["model"] == "chat-latest"
     assert launch["provider_models"]["chatgpt"]["model_is_override"] is False
-    assert launch["pending_engine_support"] == ["deepseek"]
+    assert launch["verify_providers"] == ["deepseek"]
+    assert launch["pending_engine_support"] == []
 
 
 def test_post_returns_existing_run_on_idempotent_replay(client, stub):
@@ -367,7 +368,7 @@ def test_post_accepts_chatgpt_model_override(client, stub):
     }
     assert launch["model_overrides"] == {"chatgpt": "gpt-5.5-mini"}
     # Provider-level credit metering stays unchanged by model overrides.
-    assert stub.debits[0]["amount"] == 444
+    assert stub.debits[0]["amount"] == 445
 
 
 def test_post_rejects_cross_tenant_merchant_id(client, stub):
@@ -435,7 +436,7 @@ def test_post_returns_402_when_credits_insufficient(client, stub):
     assert detail == {
         "error": "insufficient_credits",
         "kind": "credits",
-        "required": 888,
+        "required": 890,
         "available": 100,
         "preview_url": "/api/audits/preview",
     }
@@ -453,9 +454,9 @@ def test_post_debits_prompt_credits_for_custom_prompts(client, stub):
         },
     )
     assert res.status_code == 202
-    assert stub.balance["credits"] == 9554
+    assert stub.balance["credits"] == 9553
     assert [d["kind"] for d in stub.debits] == ["audit", "prompt"]
-    assert [d["amount"] for d in stub.debits] == [444, 2]
+    assert [d["amount"] for d in stub.debits] == [445, 2]
 
 
 def test_post_total_credit_gap_returns_402_before_any_debit(client, stub):
@@ -472,7 +473,7 @@ def test_post_total_credit_gap_returns_402_before_any_debit(client, stub):
     assert res.status_code == 402
     detail = res.json()["detail"]
     assert detail["kind"] == "credits"
-    assert detail["required"] == 445
+    assert detail["required"] == 446
     assert detail["available"] == 444
     assert stub.balance["credits"] == 444
     assert stub.debits == []
@@ -491,7 +492,7 @@ def test_post_free_tier_applies_rate_limit_and_credits(client, stub):
     )
     assert res.status_code == 202
     assert stub.rate_limit_checks == ["merch-A"]
-    assert stub.balance["credits"] == 9556
+    assert stub.balance["credits"] == 9555
 
 
 def test_post_paid_tier_skips_rate_limit(client, stub):
@@ -561,7 +562,7 @@ def test_post_paid_tier_overage_is_allowed_after_verified_card(client, stub):
     assert res.status_code == 202
     assert stub.payment_method_checks == ["merch-A"]
     assert stub.balance["credits"] == 0
-    assert stub.balance["overage_pending_credits"] == 788
+    assert stub.balance["overage_pending_credits"] == 790
     assert len(stub.debits) == 1
     assert len(stub.enqueued) == 1
 
@@ -655,8 +656,9 @@ def test_preview_returns_cost_balance_and_sufficiency(client, stub):
     assert body["coverage_profile"] == "us_shopper"
     assert body["providers"] == ["gemini", "chatgpt"]
     assert body["requested_providers"] == ["gemini", "chatgpt"]
-    assert body["pending_engine_support"] == ["deepseek"]
-    assert body["estimated_audit_credits"] == 4440
+    assert body["verify_providers"] == ["deepseek"]
+    assert body["pending_engine_support"] == []
+    assert body["estimated_audit_credits"] == 4450
     assert body["estimated_prompt_credits"] == 0
     assert body["estimated_execution_credits"] == 0
     assert body["current_balance"] == {
@@ -684,7 +686,7 @@ def test_preview_reports_credit_gaps(client, stub):
     body = res.json()
     assert body["sufficient"] is False
     assert body["gaps"] == [
-        {"kind": "credits", "required": 1333, "available": 100, "short": 1233},
+        {"kind": "credits", "required": 1336, "available": 100, "short": 1236},
     ]
 
 
@@ -702,7 +704,7 @@ def test_preview_us_shopper_sums_gemini_and_chatgpt_per_prompt(client, stub):
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["providers"] == ["gemini", "chatgpt"]
-    assert body["estimated_audit_credits"] == 444
+    assert body["estimated_audit_credits"] == 445
 
 
 def test_preview_dedups_cost_computation_for_same_scope(client, stub):

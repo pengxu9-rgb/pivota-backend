@@ -41,6 +41,18 @@ from services.coverage_profiles import (
 from services.pivota_indexing_arc import compute_indexing_arc_state
 
 
+_ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
+_ANSWER_QUALITY_VERIFY_PROVIDER = "deepseek"
+_ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
+    "Verified citation-positive prompts keep their deterministic "
+    "answer_quality hit unless DeepSeek returns "
+    "supports_recommendation=false or misstates_facts=true; flagged "
+    "verified prompts contribute 0 to answer_quality_rate. "
+    "Deterministic first_party, sku_mention, and authority buckets are "
+    "unchanged."
+)
+
+
 # ---------------------------------------------------------------------------
 # Probe orchestration — both CLI and route call this so the BD test
 # definition stays consistent.
@@ -2182,9 +2194,390 @@ def _is_first_party_host(host: Optional[str], sku_ctx: Dict[str, Any]) -> bool:
     return host in first_party_hosts
 
 
+def _answer_quality_positive(run: Dict[str, Any]) -> bool:
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+    url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+    llm_report = (
+        url_match.get("llm_self_report")
+        if isinstance(url_match.get("llm_self_report"), dict)
+        else {}
+    )
+    correct_sku = (
+        parsed.get("correct_sku")
+        if parsed.get("correct_sku") is not None
+        else llm_report.get("correct_sku")
+    )
+    product_visible = (
+        parsed.get("product_visible")
+        if parsed.get("product_visible") is not None
+        else llm_report.get("product_visible")
+    )
+    return bool(
+        correct_sku is True
+        or (
+            correct_sku is not False
+            and product_visible is True
+            and (run.get("grounding_sources") or run.get("grounding_chunks"))
+        )
+    )
+
+
+def _verify_output_flagged(output: Mapping[str, Any]) -> bool:
+    verdict = output.get("verdict") if isinstance(output.get("verdict"), Mapping) else {}
+    return (
+        verdict.get("supports_recommendation") is False
+        or verdict.get("misstates_facts") is True
+    )
+
+
+def _verify_outputs_by_prompt_key(
+    verify_outputs: Optional[Any],
+) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for item in _json_list(verify_outputs):
+        if not isinstance(item, dict):
+            continue
+        key_raw = item.get("target_prompt_key")
+        if isinstance(key_raw, (list, tuple)) and len(key_raw) == 3:
+            key = (
+                str(key_raw[0] or "").strip(),
+                str(key_raw[1] or "").strip(),
+                str(key_raw[2] or "").strip().lower(),
+            )
+        else:
+            key = (
+                str(item.get("sku_key") or "").strip(),
+                str(item.get("axis") or "").strip(),
+                str(item.get("query") or "").strip().lower(),
+            )
+        verdict = item.get("verdict")
+        if key[2] and isinstance(verdict, Mapping):
+            out[key] = item
+    return out
+
+
+def _extract_verify_verdict(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for run in result.get("raw_runs") or []:
+        if not isinstance(run, dict):
+            continue
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else None
+        if not isinstance(parsed, dict):
+            continue
+        supports = parsed.get("supports_recommendation")
+        misstates = parsed.get("misstates_facts")
+        if not isinstance(supports, bool) or not isinstance(misstates, bool):
+            return None
+        note = str(parsed.get("note") or "").strip()
+        return {
+            "supports_recommendation": supports,
+            "misstates_facts": misstates,
+            "note": note[:300],
+        }
+    return None
+
+
+def _verify_evidence_excerpt(run: Dict[str, Any]) -> str:
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+    lines: List[str] = []
+    excerpt = (
+        run.get("evidence_excerpt")
+        or parsed.get("evidence_excerpt")
+        or parsed.get("evidence_text")
+    )
+    if excerpt:
+        lines.append(f"excerpt: {str(excerpt)[:1000]}")
+    for source in (run.get("grounding_sources") or [])[:5]:
+        if not isinstance(source, dict):
+            continue
+        uri = str(source.get("uri") or "").strip()
+        title = str(source.get("title") or "").strip()
+        if uri or title:
+            lines.append(f"source: {title} {uri}".strip())
+    chunks = [
+        str(chunk)
+        for chunk in (run.get("grounding_chunks") or [])[:5]
+        if isinstance(chunk, (str, int, float)) and str(chunk).strip()
+    ]
+    if chunks:
+        lines.append("chunks: " + " | ".join(chunks)[:1000])
+    return "\n".join(lines)
+
+
+def _verify_sample_cap(
+    *,
+    positives_count: int,
+    prompts_per_sku: Optional[int],
+    verify_sample: Optional[Mapping[str, Any]],
+    observed_prompt_count: int,
+) -> int:
+    if positives_count <= 0:
+        return 0
+    sample = verify_sample or {}
+    try:
+        fraction = float(sample.get("positive_fraction", 0.25))
+    except (TypeError, ValueError):
+        fraction = 0.25
+    fraction = max(0.0, min(1.0, fraction))
+    try:
+        prompt_base = int(prompts_per_sku or 0)
+    except (TypeError, ValueError):
+        prompt_base = 0
+    if prompt_base <= 0:
+        prompt_base = max(int(observed_prompt_count or 0), positives_count)
+    fraction_cap = int(math.ceil(prompt_base * fraction))
+    if fraction > 0:
+        fraction_cap = max(1, fraction_cap)
+    max_per_sku_raw = sample.get("max_per_sku")
+    if max_per_sku_raw is not None:
+        try:
+            fraction_cap = min(fraction_cap, max(0, int(max_per_sku_raw)))
+        except (TypeError, ValueError):
+            pass
+    return min(positives_count, max(0, fraction_cap))
+
+
+def _citation_positive_verify_candidates(
+    sku_ctx: Dict[str, Any],
+    probe_runs: Any,
+) -> List[Dict[str, Any]]:
+    del sku_ctx  # reserved for future stricter candidate filters.
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
+    for run in _flatten_probe_runs(_any_provider_probe_runs(probe_runs)):
+        if not _answer_quality_positive(run):
+            continue
+        key = _citation_prompt_key(run)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(run)
+    return candidates
+
+
+def _verify_skipped_summary(
+    *,
+    reason: str,
+    positives_count: int = 0,
+    sample_cap: int = 0,
+    verify_sample: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    sample = verify_sample or {}
+    return {
+        "status": "skipped",
+        "reason": reason,
+        "provider": _ANSWER_QUALITY_VERIFY_PROVIDER,
+        "role": "verify",
+        "verified": 0,
+        "flagged": 0,
+        "not_verified": max(0, positives_count),
+        "citation_positive_candidates": max(0, positives_count),
+        "sample_cap": max(0, sample_cap),
+        "sample_fraction": sample.get("positive_fraction", 0.25),
+        "flagged_probes": [],
+        "deweight_rule": _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE,
+    }
+
+
+async def _run_deepseek_verify_pass(
+    *,
+    sku_ctx: Dict[str, Any],
+    probe_runs: Any,
+    merchant_id: str,
+    audit_run_id: Optional[str],
+    verify_providers: Optional[List[str]],
+    verify_sample: Optional[Mapping[str, Any]],
+    prompts_per_sku: Optional[int],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    providers = [
+        str(provider or "").strip().lower()
+        for provider in (verify_providers or [])
+        if str(provider or "").strip()
+    ]
+    candidates = _citation_positive_verify_candidates(sku_ctx, probe_runs)
+    observed_prompt_count = len(_flatten_probe_runs(_any_provider_probe_runs(probe_runs)))
+    sample_cap = _verify_sample_cap(
+        positives_count=len(candidates),
+        prompts_per_sku=prompts_per_sku,
+        verify_sample=verify_sample,
+        observed_prompt_count=observed_prompt_count,
+    )
+    if not providers:
+        return (
+            _verify_skipped_summary(
+                reason="no_verify_providers_resolved",
+                positives_count=len(candidates),
+                sample_cap=sample_cap,
+                verify_sample=verify_sample,
+            ),
+            [],
+        )
+    if _ANSWER_QUALITY_VERIFY_PROVIDER not in providers:
+        return (
+            _verify_skipped_summary(
+                reason="deepseek_not_resolved_for_verify",
+                positives_count=len(candidates),
+                sample_cap=sample_cap,
+                verify_sample=verify_sample,
+            ),
+            [],
+        )
+    from config.settings import settings as app_settings
+    if not (app_settings.deepseek_api_key or "").strip():
+        return (
+            _verify_skipped_summary(
+                reason="missing_deepseek_api_key",
+                positives_count=len(candidates),
+                sample_cap=sample_cap,
+                verify_sample=verify_sample,
+            ),
+            [],
+        )
+    if not candidates:
+        return (
+            _verify_skipped_summary(
+                reason="no_citation_positive_probes",
+                positives_count=0,
+                sample_cap=0,
+                verify_sample=verify_sample,
+            ),
+            [],
+        )
+    if sample_cap <= 0:
+        return (
+            _verify_skipped_summary(
+                reason="verify_sample_cap_zero",
+                positives_count=len(candidates),
+                sample_cap=0,
+                verify_sample=verify_sample,
+            ),
+            [],
+        )
+
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    sku_title = (
+        sku.get("title")
+        or product.get("title")
+        or sku_ctx.get("sku_title")
+        or sku_ctx.get("sku_key")
+        or "SKU"
+    )
+    merchant_brand = product.get("brand") or product.get("vendor")
+    merchant_url = (
+        product.get("canonical_url")
+        or product.get("pivota_canonical_url")
+        or sku_ctx.get("canonical_url")
+        or sku_ctx.get("pivota_canonical_url")
+    )
+
+    outputs: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for idx, run in enumerate(candidates[:sample_cap]):
+        query = str(run.get("query") or "").strip()
+        prompt_key = _citation_prompt_key(run)
+        output_base = {
+            "provider": _ANSWER_QUALITY_VERIFY_PROVIDER,
+            "role": "verify",
+            "scan_mode": _ANSWER_QUALITY_VERIFY_SCAN_MODE,
+            "sku_key": sku_ctx.get("sku_key"),
+            "target_prompt_key": list(prompt_key),
+            "target_probe_run_id": run.get("_probe_run_id"),
+            "target_provider": _run_provider(run),
+            "query": query,
+            "axis": prompt_key[1],
+            "axis_metadata": (
+                run.get("axis_metadata")
+                if isinstance(run.get("axis_metadata"), dict)
+                else {}
+            ),
+        }
+        try:
+            result = await llm_client.probe(
+                scan_mode=_ANSWER_QUALITY_VERIFY_SCAN_MODE,
+                scan_target_id=(
+                    f"verify-{audit_run_id or 'adhoc'}-"
+                    f"{sku_ctx.get('sku_key') or 'sku'}-{idx}"
+                ),
+                merchant_id=merchant_id,
+                store_id=f"{merchant_id}_verify",
+                context={
+                    "product_title": str(sku_title),
+                    "product_type": product.get("product_type") or product.get("category"),
+                    "merchant_brand": merchant_brand,
+                    "merchant_pdp_url": merchant_url,
+                    "verify_query": query,
+                    "verify_intent": query,
+                    "verify_answer_text": _run_text(run),
+                    "verify_evidence_excerpt": _verify_evidence_excerpt(run),
+                },
+                provider=_ANSWER_QUALITY_VERIFY_PROVIDER,
+                max_runs=1,
+            )
+            verdict = _extract_verify_verdict(result)
+            output = {
+                **output_base,
+                "verdict": verdict,
+                "usage": result.get("usage") or {},
+                "raw_runs": result.get("raw_runs") or [],
+            }
+            outputs.append(output)
+            if verdict is None:
+                errors.append({
+                    "query": query,
+                    "error": "unparseable_verify_verdict",
+                })
+        except Exception as exc:  # noqa: BLE001 - verifier must not fail audit
+            errors.append({"query": query, "error": str(exc)[:200]})
+            outputs.append({
+                **output_base,
+                "verdict": None,
+                "error": str(exc)[:200],
+            })
+
+    valid_outputs = [
+        output for output in outputs
+        if isinstance(output.get("verdict"), Mapping)
+    ]
+    flagged_outputs = [
+        output for output in valid_outputs
+        if _verify_output_flagged(output)
+    ]
+    summary = {
+        "status": "completed" if not errors else "partial",
+        "provider": _ANSWER_QUALITY_VERIFY_PROVIDER,
+        "role": "verify",
+        "verified": len(valid_outputs),
+        "flagged": len(flagged_outputs),
+        "not_verified": max(0, len(candidates) - len(valid_outputs)),
+        "citation_positive_candidates": len(candidates),
+        "sample_cap": sample_cap,
+        "sample_fraction": (verify_sample or {}).get("positive_fraction", 0.25),
+        "flagged_probes": [
+            {
+                "query": output.get("query"),
+                "target_probe_run_id": output.get("target_probe_run_id"),
+                "target_provider": output.get("target_provider"),
+                "note": ((output.get("verdict") or {}).get("note") or ""),
+                "supports_recommendation": (
+                    (output.get("verdict") or {}).get("supports_recommendation")
+                ),
+                "misstates_facts": (
+                    (output.get("verdict") or {}).get("misstates_facts")
+                ),
+            }
+            for output in flagged_outputs
+        ],
+        "deweight_rule": _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE,
+    }
+    if errors:
+        summary["errors"] = errors[:5]
+    return summary, outputs
+
+
 def compute_citation_score(
     sku_ctx: Dict[str, Any],
     per_sku_probe_runs: Any,
+    verify_outputs: Optional[Any] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """Spec A.4 citation score from Brief 1 per_sku_audit raw_runs."""
     product = _get_product(sku_ctx or {})
@@ -2218,6 +2611,9 @@ def compute_citation_score(
     sku_mentions = 0
     authority_hits = 0
     quality_hits = 0
+    adjusted_quality_hits = 0
+    verify_deweighted = 0
+    verify_by_key = _verify_outputs_by_prompt_key(verify_outputs)
     for run in runs:
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
@@ -2249,14 +2645,13 @@ def compute_citation_score(
         ):
             authority_hits += 1
 
-        correct_sku = parsed.get("correct_sku") if parsed.get("correct_sku") is not None else llm_report.get("correct_sku")
-        product_visible = parsed.get("product_visible") if parsed.get("product_visible") is not None else llm_report.get("product_visible")
-        if correct_sku is True or (
-            correct_sku is not False
-            and product_visible is True
-            and (run.get("grounding_sources") or run.get("grounding_chunks"))
-        ):
+        if _answer_quality_positive(run):
             quality_hits += 1
+            verify_output = verify_by_key.get(_citation_prompt_key(run))
+            if verify_output and _verify_output_flagged(verify_output):
+                verify_deweighted += 1
+            else:
+                adjusted_quality_hits += 1
 
     def _rate_bucket(name: str, numerator: int, max_points: int) -> None:
         rate = numerator / denominator if denominator else 0.0
@@ -2270,12 +2665,17 @@ def compute_citation_score(
     _rate_bucket("first_party_rate", first_party_hits, 45)
     _rate_bucket("sku_mention_rate", sku_mentions, 25)
     _rate_bucket("authority_near_variant_rate", authority_hits, 20)
-    _rate_bucket("answer_quality_rate", quality_hits, 10)
+    _rate_bucket("answer_quality_rate", adjusted_quality_hits, 10)
+    breakdown["answer_quality_rate"]["deterministic_numerator"] = quality_hits
+    breakdown["answer_quality_rate"]["verify_deweighted"] = verify_deweighted
+    breakdown["answer_quality_rate"]["verify_rule"] = (
+        _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE
+    )
     total = int(round(
         45 * (first_party_hits / denominator)
         + 25 * (sku_mentions / denominator)
         + 20 * (authority_hits / denominator)
-        + 10 * (quality_hits / denominator)
+        + 10 * (adjusted_quality_hits / denominator)
     ))
     total = max(0, min(100, total))
     breakdown["total"] = total
@@ -2407,10 +2807,13 @@ def _any_provider_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
 def build_citation_by_provider(
     sku_ctx: Dict[str, Any],
     per_sku_probe_runs: Any,
+    verify_outputs: Optional[Any] = None,
 ) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for provider, probes in sorted(_group_probe_runs_by_provider(per_sku_probe_runs).items()):
-        score, breakdown = compute_citation_score(sku_ctx, probes)
+        score, breakdown = compute_citation_score(
+            sku_ctx, probes, verify_outputs=verify_outputs,
+        )
         out[provider] = {
             "score": score,
             "breakdown": breakdown,
@@ -2856,6 +3259,8 @@ async def build_per_sku_report(
     merchant_id: str,
     audit_run_id: Optional[str],
     provider_model_metadata: Optional[Mapping[str, Any]] = None,
+    verify_outputs: Optional[List[Dict[str, Any]]] = None,
+    verify_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sku_ctx = await load_sku_context(sku_key, merchant_id)
     probe_runs = await load_per_sku_probe_runs(sku_key, merchant_id, audit_run_id)
@@ -2879,9 +3284,13 @@ async def build_per_sku_report(
         identity_score, identity_breakdown = compute_identity_score(sku_ctx)
         content_score, content_breakdown = compute_content_richness_score(sku_ctx)
         routing_score, routing_breakdown = compute_routability_score(sku_ctx)
-        citation_by_provider = build_citation_by_provider(sku_ctx, probe_runs)
+        citation_by_provider = build_citation_by_provider(
+            sku_ctx, probe_runs, verify_outputs=verify_outputs,
+        )
         citation_score, citation_breakdown = compute_citation_score(
-            sku_ctx, _any_provider_probe_runs(probe_runs),
+            sku_ctx,
+            _any_provider_probe_runs(probe_runs),
+            verify_outputs=verify_outputs,
         )
         citation_breakdown["aggregation_rule"] = (
             "any_profile_provider: a prompt is treated as cited when any "
@@ -2916,6 +3325,12 @@ async def build_per_sku_report(
         "impact_proxy": _impact_proxy_from_context(sku_ctx),
         "provider_models": provider_models,
         "model_is_override": _any_model_override(provider_models),
+        "verify_summary": verify_summary or _verify_skipped_summary(
+            reason="not_run",
+            positives_count=len(_citation_positive_verify_candidates(sku_ctx, probe_runs)),
+            verify_sample=None,
+        ),
+        "verify_outputs": verify_outputs or [],
     }
     return report
 
@@ -3465,6 +3880,7 @@ async def run_brand_report(
     coverage_profile: str = "us_shopper",
     providers: Optional[List[str]] = None,
     model_overrides: Optional[Mapping[str, Any]] = None,
+    prompts_per_sku: Optional[int] = None,
     max_runs: int = 3,
     include_category_visibility: bool = True,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
@@ -3504,6 +3920,8 @@ async def run_brand_report(
         providers=providers,
     )
     profile_providers = list(coverage.get("providers") or [])
+    verify_providers = list(coverage.get("verify_providers") or [])
+    verify_sample = coverage.get("verify_sample") or {}
     provider_model_metadata = resolve_provider_models(
         profile_providers,
         model_overrides=model_overrides,
@@ -3527,12 +3945,24 @@ async def run_brand_report(
             probe_runs_by_sku[sku_key] = await load_per_sku_probe_runs(
                 sku_key, str(merchant_id), audit_run_id,
             )
+            sku_ctx = await load_sku_context(sku_key, str(merchant_id))
+            verify_summary, verify_outputs = await _run_deepseek_verify_pass(
+                sku_ctx=sku_ctx,
+                probe_runs=probe_runs_by_sku[sku_key],
+                merchant_id=str(merchant_id),
+                audit_run_id=audit_run_id,
+                verify_providers=verify_providers,
+                verify_sample=verify_sample,
+                prompts_per_sku=prompts_per_sku,
+            )
             per_sku_reports.append(
                 await build_per_sku_report(
                     sku_key,
                     str(merchant_id),
                     audit_run_id,
                     provider_model_metadata,
+                    verify_outputs=verify_outputs,
+                    verify_summary=verify_summary,
                 )
             )
         brand_rollup = build_brand_rollup(per_sku_reports, str(merchant_id))
@@ -3560,7 +3990,9 @@ async def run_brand_report(
             "audit_mode": "per_sku",
             "coverage_profile": coverage.get("profile"),
             "providers": profile_providers,
+            "verify_providers": verify_providers,
             "pending_engine_support": coverage.get("pending_engine_support") or [],
+            "verify_sample": verify_sample,
             "provider_models": provider_model_metadata,
             "model_is_override": _any_model_override(provider_model_metadata),
             "per_sku_reports": per_sku_reports,
@@ -3637,12 +4069,14 @@ async def run_brand_report(
             )
             structured["coverage_profile"] = coverage.get("profile")
             structured["providers"] = profile_providers
+            structured["verify_providers"] = verify_providers
             structured["requested_providers"] = (
                 coverage.get("requested_providers") or profile_providers
             )
             structured["pending_engine_support"] = (
                 coverage.get("pending_engine_support") or []
             )
+            structured["verify_sample"] = verify_sample
             structured["provider_models"] = provider_model_metadata
             structured["model_is_override"] = _any_model_override(
                 provider_model_metadata
@@ -3745,8 +4179,10 @@ async def run_brand_report(
         "provider": provider_label,
         "coverage_profile": coverage.get("profile"),
         "providers": profile_providers,
+        "verify_providers": verify_providers,
         "requested_providers": coverage.get("requested_providers") or profile_providers,
         "pending_engine_support": coverage.get("pending_engine_support") or [],
+        "verify_sample": verify_sample,
         "provider_models": provider_model_metadata,
         "model_is_override": _any_model_override(provider_model_metadata),
         "per_product": per_product,

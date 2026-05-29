@@ -55,6 +55,39 @@ def engine_supported_providers() -> List[str]:
     return providers
 
 
+def verify_supported_providers() -> List[str]:
+    """Providers the backend client can route for verifier-only passes."""
+    data = load_coverage_profile_config()
+    providers = _normalize_nonempty(data.get("verify_supported_providers") or [])
+    return providers
+
+
+def default_verify_sample() -> Dict[str, Any]:
+    data = load_coverage_profile_config()
+    raw = data.get("default_verify_sample") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("coverage profile config default_verify_sample must be an object")
+    fraction = raw.get("positive_fraction", 0.25)
+    try:
+        positive_fraction = float(fraction)
+    except (TypeError, ValueError):
+        positive_fraction = 0.25
+    positive_fraction = max(0.0, min(1.0, positive_fraction))
+    max_per_sku_raw = raw.get("max_per_sku")
+    max_per_sku: Optional[int]
+    if max_per_sku_raw is None:
+        max_per_sku = None
+    else:
+        try:
+            max_per_sku = max(0, int(max_per_sku_raw))
+        except (TypeError, ValueError):
+            max_per_sku = None
+    return {
+        "positive_fraction": positive_fraction,
+        "max_per_sku": max_per_sku,
+    }
+
+
 def provider_default_models() -> Dict[str, str]:
     """Return configured provider default models keyed by provider id."""
     data = load_coverage_profile_config()
@@ -143,6 +176,7 @@ def resolve_coverage_profile(
     and filtered to the providers the Agent engine currently accepts.
     """
     supported = set(engine_supported_providers())
+    verify_supported = set(verify_supported_providers())
     default_models = provider_default_models()
 
     single = str(provider or "").strip().lower()
@@ -162,6 +196,8 @@ def resolve_coverage_profile(
             "provider_default_models": {
                 p: default_models[p] for p in requested if p in default_models
             },
+            "verify_providers": [],
+            "verify_sample": default_verify_sample(),
             "pending_engine_support": [],
             "notes": "Legacy provider override.",
             "explicit_provider_override": True,
@@ -183,6 +219,8 @@ def resolve_coverage_profile(
             "provider_default_models": {
                 p: default_models[p] for p in explicit if p in default_models
             },
+            "verify_providers": [],
+            "verify_sample": default_verify_sample(),
             "pending_engine_support": [],
             "notes": "Legacy providers list override.",
             "explicit_provider_override": True,
@@ -202,11 +240,36 @@ def resolve_coverage_profile(
     requested = _normalize_nonempty(profile.get("providers") or [])
     verify_requested = _normalize_nonempty(profile.get("verify_providers") or [])
     providers_out = [p for p in requested if p in supported]
-    pending = [p for p in requested + verify_requested if p not in supported]
+    verify_out = [p for p in verify_requested if p in verify_supported]
+    pending = (
+        [p for p in requested if p not in supported]
+        + [p for p in verify_requested if p not in verify_supported]
+    )
     if not providers_out:
         raise ValueError(
             f"coverage_profile {profile_key!r} has no Agent-supported providers"
         )
+    verify_sample = default_verify_sample()
+    if isinstance(profile.get("verify_sample"), dict):
+        merged_sample = dict(verify_sample)
+        merged_sample.update(profile.get("verify_sample") or {})
+        try:
+            fraction = float(merged_sample.get("positive_fraction", 0.25))
+        except (TypeError, ValueError):
+            fraction = 0.25
+        fraction = max(0.0, min(1.0, fraction))
+        max_per_sku_raw = merged_sample.get("max_per_sku")
+        if max_per_sku_raw is None:
+            max_per_sku = None
+        else:
+            try:
+                max_per_sku = max(0, int(max_per_sku_raw))
+            except (TypeError, ValueError):
+                max_per_sku = None
+        verify_sample = {
+            "positive_fraction": fraction,
+            "max_per_sku": max_per_sku,
+        }
 
     return {
         "profile": profile_key,
@@ -216,7 +279,9 @@ def resolve_coverage_profile(
         "provider_default_models": {
             p: default_models[p] for p in providers_out if p in default_models
         },
-        "verify_providers": [p for p in verify_requested if p in supported],
+        "verify_providers": verify_out,
+        "requested_verify_providers": verify_requested,
+        "verify_sample": verify_sample,
         "pending_engine_support": pending,
         "notes": profile.get("notes"),
         "explicit_provider_override": False,
