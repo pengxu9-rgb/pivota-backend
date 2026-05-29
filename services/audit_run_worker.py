@@ -368,6 +368,7 @@ async def _process_one_audit_run_inner(
                         or "us_shopper"
                     ),
                     providers=launch_options.get("providers"),
+                    model_overrides=launch_options.get("model_overrides"),
                     max_runs=3,
                     integration_state=integration_state,
                 )
@@ -1040,6 +1041,8 @@ def _placeholder_cost_summary(
         "estimated_cost_usd": None,
         "products_probed": aggregate.get("products_succeeded"),
         "products_failed": aggregate.get("products_failed"),
+        "provider_models": brand_report.get("provider_models") or {},
+        "model_is_override": bool(brand_report.get("model_is_override")),
         "_telemetry_source": "placeholder_no_probe_runs_recorded",
     }
 
@@ -1069,6 +1072,10 @@ async def _aggregate_cost_summary_for_run(
         from db.llm_probe_runs import aggregate_cost_for_run
         rollup = await aggregate_cost_for_run(audit_run_id=run_id)
         if rollup is not None:
+            rollup["provider_models"] = (brand_report or {}).get("provider_models") or {}
+            rollup["model_is_override"] = bool(
+                (brand_report or {}).get("model_is_override")
+            )
             return rollup
     except Exception as exc:  # noqa: BLE001
         logger.warning(

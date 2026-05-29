@@ -65,6 +65,7 @@ from services.merchant_credit_balance_service import (
 from services.coverage_profiles import (
     default_coverage_profile,
     resolve_coverage_profile,
+    resolve_provider_models,
 )
 from services.provider_credit_rates import (
     credits_for_probe,
@@ -138,6 +139,14 @@ class CreateAuditRequest(BaseModel):
         max_length=4,
         description=(
             "Legacy explicit provider override. Prefer coverage_profile."
+        ),
+    )
+    model_overrides: Optional[Dict[str, str]] = Field(
+        default=None,
+        max_length=4,
+        description=(
+            "Optional per-provider model override, e.g. "
+            "{\"chatgpt\": \"gpt-5.5-mini\"}. Absent uses profile defaults."
         ),
     )
 
@@ -256,6 +265,17 @@ def _resolve_audit_coverage(
     )
 
 
+def _resolve_audit_provider_models(
+    *,
+    providers: List[str],
+    model_overrides: Optional[Dict[str, str]],
+) -> Dict[str, Dict[str, Any]]:
+    return resolve_provider_models(
+        providers,
+        model_overrides=model_overrides,
+    )
+
+
 def _credit_requirements(
     *,
     sku_count: int,
@@ -290,6 +310,10 @@ def _audit_metering(
         if probe_count <= 0:
             continue
         grounded = provider_default_grounded(provider)
+        # Model overrides intentionally do not alter audit credits yet.
+        # ChatGPT stays on the single conservative provider rate (~5.4
+        # credits/probe) until per-model rate mapping becomes a separate
+        # productized follow-up.
         per_probe_credits = Decimal(str(credits_for_probe(
             provider,
             grounded=grounded,
@@ -638,6 +662,10 @@ async def create_audit_run(
             providers=body.providers,
         )
         providers = list(coverage.get("providers") or [])
+        provider_models = _resolve_audit_provider_models(
+            providers=providers,
+            model_overrides=body.model_overrides,
+        )
         audit_required, audit_usd_cogs = _audit_metering(
             sku_count=len(_normalize_nonempty(body.product_keys)),
             prompts_per_sku=body.prompts_per_sku,
@@ -757,6 +785,12 @@ async def create_audit_run(
                     "pending_engine_support": (
                         coverage.get("pending_engine_support") or []
                     ),
+                    "provider_models": provider_models,
+                    "model_overrides": {
+                        provider: payload.get("model")
+                        for provider, payload in provider_models.items()
+                        if payload.get("model_is_override")
+                    },
                     "prompts_per_sku": int(body.prompts_per_sku),
                 }
             },

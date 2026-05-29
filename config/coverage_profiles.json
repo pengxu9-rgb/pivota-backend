@@ -1,6 +1,9 @@
 {
   "default_profile": "us_shopper",
   "engine_supported_providers": ["mock", "gemini", "chatgpt", "claude"],
+  "provider_default_models": {
+    "chatgpt": "chat-latest"
+  },
   "profiles": {
     "us_shopper": {
       "label": "US Shopper",

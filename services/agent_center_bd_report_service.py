@@ -28,13 +28,16 @@ from datetime import datetime, timezone
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
 from services.audit_playbook_engine import select_playbooks
 from services.cited_host_classifier import classify_cited_hosts, classify_host
-from services.coverage_profiles import resolve_coverage_profile
+from services.coverage_profiles import (
+    resolve_coverage_profile,
+    resolve_provider_models,
+)
 from services.pivota_indexing_arc import compute_indexing_arc_state
 
 
@@ -60,6 +63,8 @@ async def run_bd_probes(
     product_type: Optional[str] = None,
     provider: str = "gemini",
     max_runs: int = 3,
+    model: Optional[str] = None,
+    model_is_override: bool = False,
     include_category_visibility: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Run the BD-relevant scan modes against the merchant's product.
@@ -110,6 +115,8 @@ async def run_bd_probes(
             context=base_context,
             provider=provider,
             max_runs=max_runs,
+            model=model,
+            model_is_override=model_is_override,
         )
 
     visibility = await _one("open_product_visibility_test")
@@ -2062,6 +2069,60 @@ def _flatten_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _copy_provider_model_metadata(
+    provider_model_metadata: Optional[Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for provider, payload in (provider_model_metadata or {}).items():
+        provider_id = str(provider or "").strip().lower()
+        if not provider_id or not isinstance(payload, Mapping):
+            continue
+        model = str(payload.get("model") or "").strip()
+        if not model:
+            continue
+        item: Dict[str, Any] = {
+            "model": model,
+            "model_is_override": bool(payload.get("model_is_override")),
+        }
+        default_model = str(payload.get("default_model") or "").strip()
+        if default_model:
+            item["default_model"] = default_model
+        out[provider_id] = item
+    return out
+
+
+def _probe_run_provider_model_metadata(
+    probe_runs: Any,
+    *,
+    fallback: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    out = _copy_provider_model_metadata(fallback)
+    for probe in _json_list(probe_runs):
+        if not isinstance(probe, dict):
+            continue
+        provider = str(probe.get("provider") or "").strip().lower()
+        model = str(probe.get("model") or probe.get("llm_model") or "").strip()
+        if not provider or not model:
+            continue
+        item: Dict[str, Any] = {
+            "model": model,
+            "model_is_override": bool(probe.get("model_is_override")),
+        }
+        default_model = str(probe.get("default_model") or "").strip()
+        if default_model:
+            item["default_model"] = default_model
+        out[provider] = item
+    return out
+
+
+def _any_model_override(provider_models: Mapping[str, Any]) -> bool:
+    return any(
+        bool(payload.get("model_is_override"))
+        for payload in provider_models.values()
+        if isinstance(payload, Mapping)
+    )
+
+
 def _source_urls(run: Dict[str, Any]) -> List[str]:
     urls: List[str] = []
     for source in run.get("grounding_sources") or []:
@@ -2794,10 +2855,15 @@ async def build_per_sku_report(
     sku_key: str,
     merchant_id: str,
     audit_run_id: Optional[str],
+    provider_model_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     sku_ctx = await load_sku_context(sku_key, merchant_id)
     probe_runs = await load_per_sku_probe_runs(sku_key, merchant_id, audit_run_id)
     product = _get_product(sku_ctx)
+    provider_models = _probe_run_provider_model_metadata(
+        probe_runs,
+        fallback=provider_model_metadata,
+    )
 
     if sku_ctx.get("missing_inputs") and not product.get("product_key"):
         null_breakdown = {
@@ -2848,6 +2914,8 @@ async def build_per_sku_report(
         "axis_coverage": _axis_coverage(probe_runs),
         "failing_prompts": _failing_prompts(probe_runs),
         "impact_proxy": _impact_proxy_from_context(sku_ctx),
+        "provider_models": provider_models,
+        "model_is_override": _any_model_override(provider_models),
     }
     return report
 
@@ -3182,7 +3250,11 @@ def _legacy_verdict_from_report(legacy_report: Dict[str, Any]) -> Optional[str]:
 async def _cost_summary_for_per_sku_audit(
     audit_run_id: Optional[str],
     probe_runs_by_sku: Dict[str, Any],
+    provider_model_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    provider_models = _copy_provider_model_metadata(provider_model_metadata)
+    for probe_runs in (probe_runs_by_sku or {}).values():
+        provider_models.update(_probe_run_provider_model_metadata(probe_runs))
     if audit_run_id:
         try:
             from db.llm_probe_runs import aggregate_cost_for_run
@@ -3198,6 +3270,8 @@ async def _cost_summary_for_per_sku_audit(
                     if p.get("provider")
                 ],
                 **recorded,
+                "provider_models": provider_models,
+                "model_is_override": _any_model_override(provider_models),
             }
 
     providers = set()
@@ -3223,6 +3297,8 @@ async def _cost_summary_for_per_sku_audit(
         "total_input_tokens": input_tokens,
         "total_output_tokens": output_tokens,
         "estimated_cost_usd": round(estimated_cost, 6),
+        "provider_models": provider_models,
+        "model_is_override": _any_model_override(provider_models),
         "_telemetry_source": "per_sku_probe_payload",
     }
 
@@ -3388,6 +3464,7 @@ async def run_brand_report(
     provider: Optional[str] = None,
     coverage_profile: str = "us_shopper",
     providers: Optional[List[str]] = None,
+    model_overrides: Optional[Mapping[str, Any]] = None,
     max_runs: int = 3,
     include_category_visibility: bool = True,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
@@ -3427,6 +3504,10 @@ async def run_brand_report(
         providers=providers,
     )
     profile_providers = list(coverage.get("providers") or [])
+    provider_model_metadata = resolve_provider_models(
+        profile_providers,
+        model_overrides=model_overrides,
+    )
     provider_label = (
         profile_providers[0]
         if len(profile_providers) == 1
@@ -3448,7 +3529,10 @@ async def run_brand_report(
             )
             per_sku_reports.append(
                 await build_per_sku_report(
-                    sku_key, str(merchant_id), audit_run_id,
+                    sku_key,
+                    str(merchant_id),
+                    audit_run_id,
+                    provider_model_metadata,
                 )
             )
         brand_rollup = build_brand_rollup(per_sku_reports, str(merchant_id))
@@ -3463,7 +3547,9 @@ async def run_brand_report(
             int(median_citation or 0),
         )
         cost_summary = await _cost_summary_for_per_sku_audit(
-            audit_run_id, probe_runs_by_sku,
+            audit_run_id,
+            probe_runs_by_sku,
+            provider_model_metadata,
         )
         return {
             "audit_run_id": audit_run_id,
@@ -3475,6 +3561,8 @@ async def run_brand_report(
             "coverage_profile": coverage.get("profile"),
             "providers": profile_providers,
             "pending_engine_support": coverage.get("pending_engine_support") or [],
+            "provider_models": provider_model_metadata,
+            "model_is_override": _any_model_override(provider_model_metadata),
             "per_sku_reports": per_sku_reports,
             "brand_rollup": brand_rollup,
             "authority_map": authority_map,
@@ -3503,6 +3591,7 @@ async def run_brand_report(
         try:
             probes_by_provider: Dict[str, Dict[str, Dict[str, Any]]] = {}
             for provider_id in profile_providers:
+                model_info = provider_model_metadata.get(provider_id) or {}
                 probes_by_provider[provider_id] = await run_bd_probes(
                     merchant_name=merchant_name,
                     merchant_pdp_url=pdp_url,
@@ -3511,6 +3600,8 @@ async def run_brand_report(
                     product_type=p.get("product_type"),
                     provider=provider_id,
                     max_runs=max_runs,
+                    model=model_info.get("model"),
+                    model_is_override=bool(model_info.get("model_is_override")),
                     include_category_visibility=include_category_visibility,
                 )
             probes = _combine_bd_probes_for_profile(probes_by_provider)
@@ -3551,6 +3642,10 @@ async def run_brand_report(
             )
             structured["pending_engine_support"] = (
                 coverage.get("pending_engine_support") or []
+            )
+            structured["provider_models"] = provider_model_metadata
+            structured["model_is_override"] = _any_model_override(
+                provider_model_metadata
             )
             structured["citation_aggregation_rule"] = (
                 "any_profile_provider: headline attribution/citation "
@@ -3652,6 +3747,8 @@ async def run_brand_report(
         "providers": profile_providers,
         "requested_providers": coverage.get("requested_providers") or profile_providers,
         "pending_engine_support": coverage.get("pending_engine_support") or [],
+        "provider_models": provider_model_metadata,
+        "model_is_override": _any_model_override(provider_model_metadata),
         "per_product": per_product,
         "aggregate": aggregate,
         "cross_product_competitors": cross_competitors,

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
 _CONFIG_PATH = (
@@ -55,6 +55,80 @@ def engine_supported_providers() -> List[str]:
     return providers
 
 
+def provider_default_models() -> Dict[str, str]:
+    """Return configured provider default models keyed by provider id."""
+    data = load_coverage_profile_config()
+    raw = data.get("provider_default_models") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("coverage profile config provider_default_models must be an object")
+    out: Dict[str, str] = {}
+    for provider, model in raw.items():
+        provider_id = str(provider or "").strip().lower()
+        model_id = str(model or "").strip()
+        if provider_id and model_id:
+            out[provider_id] = model_id
+    return out
+
+
+def normalize_model_overrides(
+    model_overrides: Optional[Mapping[str, Any]],
+) -> Dict[str, str]:
+    """Normalize optional per-provider model overrides from audit callers."""
+    if model_overrides is None:
+        return {}
+    if not isinstance(model_overrides, Mapping):
+        raise ValueError("model_overrides must be an object keyed by provider")
+    out: Dict[str, str] = {}
+    for provider, model in model_overrides.items():
+        provider_id = str(provider or "").strip().lower()
+        if not provider_id:
+            raise ValueError("model_overrides provider keys must be non-empty")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(
+                f"model_overrides[{provider_id}] must be a non-empty string"
+            )
+        out[provider_id] = model.strip()
+    return out
+
+
+def resolve_provider_models(
+    providers: Iterable[str],
+    *,
+    model_overrides: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Resolve provider model metadata from config plus optional overrides."""
+    provider_list = _normalize_nonempty(providers)
+    provider_set = set(provider_list)
+    defaults = provider_default_models()
+    overrides = normalize_model_overrides(model_overrides)
+    unknown_overrides = [p for p in overrides if p not in provider_set]
+    if unknown_overrides:
+        raise ValueError(
+            "model_overrides provider(s) are not in the resolved audit providers: "
+            f"{', '.join(sorted(unknown_overrides))}"
+        )
+    unconfigured_overrides = [p for p in overrides if p not in defaults]
+    if unconfigured_overrides:
+        raise ValueError(
+            "model_overrides provider(s) have no configured default model: "
+            f"{', '.join(sorted(unconfigured_overrides))}"
+        )
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for provider in provider_list:
+        default_model = defaults.get(provider)
+        override_model = overrides.get(provider)
+        model = override_model or default_model
+        if not model:
+            continue
+        resolved[provider] = {
+            "model": model,
+            "default_model": default_model,
+            "model_is_override": provider in overrides,
+        }
+    return resolved
+
+
 def resolve_coverage_profile(
     *,
     coverage_profile: Optional[str] = None,
@@ -69,6 +143,7 @@ def resolve_coverage_profile(
     and filtered to the providers the Agent engine currently accepts.
     """
     supported = set(engine_supported_providers())
+    default_models = provider_default_models()
 
     single = str(provider or "").strip().lower()
     if single:
@@ -84,6 +159,9 @@ def resolve_coverage_profile(
             "label": f"Single provider: {single}",
             "providers": requested,
             "requested_providers": requested,
+            "provider_default_models": {
+                p: default_models[p] for p in requested if p in default_models
+            },
             "pending_engine_support": [],
             "notes": "Legacy provider override.",
             "explicit_provider_override": True,
@@ -102,6 +180,9 @@ def resolve_coverage_profile(
             "label": "Explicit provider list",
             "providers": explicit,
             "requested_providers": explicit,
+            "provider_default_models": {
+                p: default_models[p] for p in explicit if p in default_models
+            },
             "pending_engine_support": [],
             "notes": "Legacy providers list override.",
             "explicit_provider_override": True,
@@ -132,6 +213,9 @@ def resolve_coverage_profile(
         "label": profile.get("label") or profile_key,
         "providers": providers_out,
         "requested_providers": requested,
+        "provider_default_models": {
+            p: default_models[p] for p in providers_out if p in default_models
+        },
         "verify_providers": [p for p in verify_requested if p in supported],
         "pending_engine_support": pending,
         "notes": profile.get("notes"),

@@ -289,6 +289,8 @@ def test_post_enqueues_and_returns_202(client, stub):
     launch = stub.enqueued[0]["request_options_jsonb"]["launch"]
     assert launch["coverage_profile"] == "us_shopper"
     assert launch["providers"] == ["gemini", "chatgpt"]
+    assert launch["provider_models"]["chatgpt"]["model"] == "chat-latest"
+    assert launch["provider_models"]["chatgpt"]["model_is_override"] is False
     assert launch["pending_engine_support"] == ["deepseek"]
 
 
@@ -345,6 +347,27 @@ def test_post_legacy_explicit_provider_uses_single_provider_profile(client, stub
     launch = stub.enqueued[0]["request_options_jsonb"]["launch"]
     assert launch["coverage_profile"] == "explicit"
     assert launch["providers"] == ["gemini"]
+
+
+def test_post_accepts_chatgpt_model_override(client, stub):
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+            "model_overrides": {"chatgpt": "gpt-5.5-mini"},
+        },
+    )
+    assert res.status_code == 202
+    launch = stub.enqueued[0]["request_options_jsonb"]["launch"]
+    assert launch["provider_models"]["chatgpt"] == {
+        "model": "gpt-5.5-mini",
+        "default_model": "chat-latest",
+        "model_is_override": True,
+    }
+    assert launch["model_overrides"] == {"chatgpt": "gpt-5.5-mini"}
+    # Provider-level credit metering stays unchanged by model overrides.
+    assert stub.debits[0]["amount"] == 444
 
 
 def test_post_rejects_cross_tenant_merchant_id(client, stub):

@@ -972,6 +972,75 @@ async def test_run_brand_report_us_shopper_fans_out_to_gemini_and_chatgpt(
 
 
 @pytest.mark.asyncio
+async def test_run_brand_report_passes_default_and_override_chatgpt_models(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    from services import agent_center_bd_report_service as bd
+
+    calls = []
+
+    async def _fake_probe(**kwargs):
+        calls.append({
+            "provider": kwargs.get("provider"),
+            "scan_mode": kwargs.get("scan_mode"),
+            "model": kwargs.get("model"),
+            "model_is_override": kwargs.get("model_is_override"),
+        })
+        return {
+            "scan_mode": kwargs.get("scan_mode"),
+            "provider": kwargs.get("provider"),
+            "model": kwargs.get("model"),
+            "model_is_override": kwargs.get("model_is_override", False),
+            "scores": {"visibility_score": 50},
+            "raw_runs": [],
+            "findings": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    default_out = await bd.run_brand_report(
+        merchant_name="Brand X",
+        merchant_domain="brandx.com",
+        products=[
+            {"title": "P1", "pdp_url": "https://x.com/p/1", "product_type": "thing"},
+        ],
+        coverage_profile="us_shopper",
+        include_category_visibility=False,
+    )
+
+    default_chatgpt = [c for c in calls if c["provider"] == "chatgpt"]
+    assert {c["model"] for c in default_chatgpt} == {"chat-latest"}
+    assert {c["model_is_override"] for c in default_chatgpt} == {False}
+    assert default_out["provider_models"]["chatgpt"]["model"] == "chat-latest"
+    assert default_out["model_is_override"] is False
+    assert default_out["per_product"][0]["model_is_override"] is False
+
+    calls.clear()
+    override_out = await bd.run_brand_report(
+        merchant_name="Brand X",
+        merchant_domain="brandx.com",
+        products=[
+            {"title": "P1", "pdp_url": "https://x.com/p/1", "product_type": "thing"},
+        ],
+        coverage_profile="us_shopper",
+        model_overrides={"chatgpt": "gpt-5.5-mini"},
+        include_category_visibility=False,
+    )
+
+    override_chatgpt = [c for c in calls if c["provider"] == "chatgpt"]
+    assert {c["model"] for c in override_chatgpt} == {"gpt-5.5-mini"}
+    assert {c["model_is_override"] for c in override_chatgpt} == {True}
+    assert override_out["provider_models"]["chatgpt"] == {
+        "model": "gpt-5.5-mini",
+        "default_model": "chat-latest",
+        "model_is_override": True,
+    }
+    assert override_out["model_is_override"] is True
+    assert override_out["per_product"][0]["model_is_override"] is True
+
+
+@pytest.mark.asyncio
 async def test_run_brand_report_aggregate_competitor_view(
     monkeypatch: "pytest.MonkeyPatch",
 ) -> None:

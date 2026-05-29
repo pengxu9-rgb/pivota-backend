@@ -327,6 +327,8 @@ async def probe(
     context: Optional[Mapping[str, Any]] = None,
     provider: str,
     max_runs: int = 3,
+    model: Optional[str] = None,
+    model_is_override: bool = False,
     timeout_s: Optional[float] = None,
     allow_local_mock: bool = False,
 ) -> Dict[str, Any]:
@@ -390,6 +392,8 @@ async def probe(
             context=context,
             provider=chosen_provider,
             max_runs=max_runs,
+            model=model,
+            model_is_override=model_is_override,
             timeout_s=timeout_s,
             allow_local_mock=allow_local_mock,
         )
@@ -412,6 +416,9 @@ async def probe(
         "context": dict(context or {}),
         "options": {"provider": provider, "max_runs": int(max_runs)},
     }
+    resolved_model = str(model or "").strip() or None
+    if resolved_model:
+        body["options"]["model"] = resolved_model
     api_key = (settings.pivota_agent_internal_api_key or "").strip()
     if not api_key:
         if not allow_local_mock:
@@ -452,7 +459,11 @@ async def probe(
             )
         except Exception:  # noqa: BLE001
             pass
-        return _local_mock_result(scan_mode, max_runs)
+        result = _local_mock_result(scan_mode, max_runs)
+        if resolved_model:
+            result["model"] = resolved_model
+            result["model_is_override"] = bool(model_is_override)
+        return result
 
     url = _resolve_endpoint_url()
     timeout = float(timeout_s if timeout_s is not None else settings.agent_center_llm_probe_timeout_s)
@@ -510,6 +521,7 @@ async def probe(
         await _record_probe_telemetry(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
+            model=resolved_model,
             error_message=(
                 f"transport_failed: "
                 f"{type(last_exc).__name__ if last_exc else 'unknown'}"
@@ -524,6 +536,7 @@ async def probe(
         await _record_probe_telemetry(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
+            model=resolved_model,
             error_message=f"upstream_5xx_{response.status_code}",
         )
         raise AgentCenterLlmClientError(
@@ -536,6 +549,7 @@ async def probe(
         await _record_probe_telemetry(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
+            model=resolved_model,
             error_message=f"upstream_4xx_{response.status_code}",
         )
         raise ValueError(
@@ -549,6 +563,7 @@ async def probe(
         await _record_probe_telemetry(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
+            model=resolved_model,
             error_message=f"non_json_response: {exc}",
         )
         raise AgentCenterLlmClientError(f"llm probe non-JSON response: {exc}") from exc
@@ -557,6 +572,7 @@ async def probe(
         await _record_probe_telemetry(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
+            model=resolved_model,
             error_message="response_not_ok",
         )
         raise AgentCenterLlmClientError(
@@ -568,14 +584,20 @@ async def probe(
         await _record_probe_telemetry(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
+            model=resolved_model,
             error_message="missing_result_object",
         )
         raise AgentCenterLlmClientError("llm probe response missing `result` object")
+
+    if resolved_model:
+        result.setdefault("model", resolved_model)
+        result.setdefault("model_is_override", bool(model_is_override))
 
     # Success — record cost/usage telemetry then return.
     await _record_probe_telemetry(
         provider=provider, scan_mode=scan_mode, status="succeeded",
         started_at_perf=_telemetry_started_at,
         result=result,
+        model=resolved_model,
     )
     return result
