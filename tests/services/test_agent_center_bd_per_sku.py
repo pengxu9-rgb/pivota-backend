@@ -148,6 +148,43 @@ def _probe_runs() -> List[Dict[str, Any]]:
     ]
 
 
+def _multi_provider_probe_runs() -> List[Dict[str, Any]]:
+    runs = _probe_runs()
+    runs.append(
+        {
+            "provider": "chatgpt",
+            "probe_run_id": "probe-2",
+            "raw_runs": [
+                {
+                    "query": "where can I buy Bright Skin Serum",
+                    "parsed": {"product_visible": False},
+                    "grounding_sources": [],
+                    "grounding_chunks": [],
+                    "url_match": {"in_grounding": False},
+                    "axis_metadata": {"axis": "intent", "source": "auto_generated", "sku_key": "sku-1"},
+                },
+                {
+                    "query": "best serum for dullness",
+                    "parsed": {
+                        "product_visible": True,
+                        "sku_mentioned": True,
+                        "correct_sku": True,
+                        "authority_near_variant_found": True,
+                    },
+                    "evidence_excerpt": "TestBrand Bright Skin Serum is cited by ChatGPT.",
+                    "grounding_sources": [
+                        {"uri": "https://merchant.test/products/serum", "title": "Bright Skin Serum"}
+                    ],
+                    "grounding_chunks": ["https://merchant.test/products/serum"],
+                    "url_match": {"in_grounding": True},
+                    "axis_metadata": {"axis": "concern", "source": "auto_generated", "sku_key": "sku-1"},
+                },
+            ],
+        }
+    )
+    return runs
+
+
 def test_identity_score_good_and_missing_data():
     from services.agent_center_bd_report_service import compute_identity_score
 
@@ -230,7 +267,7 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
         return ctx
 
     async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
-        return _probe_runs()
+        return _multi_provider_probe_runs()
 
     monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
     monkeypatch.setattr(bd, "load_per_sku_probe_runs", fake_load_runs)
@@ -238,7 +275,12 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     report = await bd.build_per_sku_report("sku-1", "m-1", "audit-1")
     assert report["sku_key"] == "sku-1"
     assert set(report["scores"]) == {"identity", "content_richness", "routability", "citation"}
-    assert report["axis_coverage"] == {"intent": 1, "concern": 1}
+    assert report["scores"]["citation"]["score"] == 100
+    assert report["scores"]["citation"]["breakdown"]["aggregation_rule"].startswith("any_profile_provider")
+    assert set(report["citation_by_provider"]) == {"gemini", "chatgpt"}
+    assert report["citation_by_provider"]["gemini"]["score"] == 50
+    assert report["citation_by_provider"]["chatgpt"]["score"] == 50
+    assert report["axis_coverage"] == {"intent": 2, "concern": 2}
     assert report["verbatim_grounding_evidence"][0]["probe_run_id"] == "probe-1"
     assert report["failing_prompts"][0]["evidence_run_id"] == "probe-1"
 
@@ -285,12 +327,17 @@ def test_build_authority_map_classification_and_reddit_shape():
     from services.agent_center_bd_report_service import build_authority_map
 
     per_sku_reports = [{"sku_key": "sku-1", "product_key": "prod-1", "content_key": "ck_abc"}]
-    authority_map = build_authority_map(per_sku_reports, {"sku-1": _probe_runs()})
+    authority_map = build_authority_map(per_sku_reports, {"sku-1": _multi_provider_probe_runs()})
     sku_entry = authority_map["skus"][0]
     host_types = {h["host"]: h["host_type"] for h in sku_entry["authority_hosts"]}
+    hosts = {h["host"]: h for h in sku_entry["authority_hosts"]}
     assert host_types["forbes.com"] == "editorial"
     assert host_types["reddit.com"] == "reddit"
+    assert hosts["forbes.com"]["providers"] == ["gemini"]
+    assert hosts["merchant.test"]["providers"] == ["chatgpt", "gemini"]
     reddit = sku_entry["reddit"]["subreddits"][0]
     assert reddit["name"] == "r/SkincareAddiction"
+    assert reddit["threads"][0]["provider"] == "gemini"
     assert reddit["threads"][0]["sentiment"] is None
     assert reddit["sentiment_proxy"] is None
+    assert "chatgpt" in authority_map["hosts"][0]["providers"]

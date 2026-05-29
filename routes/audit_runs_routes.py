@@ -62,6 +62,10 @@ from services.merchant_credit_balance_service import (
     get_balance,
     require_verified_payment_method,
 )
+from services.coverage_profiles import (
+    default_coverage_profile,
+    resolve_coverage_profile,
+)
 from services.provider_credit_rates import (
     credits_for_probe,
     provider_default_grounded,
@@ -124,10 +128,17 @@ class CreateAuditRequest(BaseModel):
         max_length=10,
         description="Merchant-input prompt slots; each consumes prompt credits.",
     )
+    coverage_profile: str = Field(
+        default_factory=default_coverage_profile,
+        max_length=64,
+        description="Configured provider coverage profile for this audit.",
+    )
     providers: Optional[List[str]] = Field(
         default=None,
         max_length=4,
-        description="LLM providers requested for the audit.",
+        description=(
+            "Legacy explicit provider override. Prefer coverage_profile."
+        ),
     )
 
 
@@ -141,6 +152,10 @@ class AuditPreviewRequest(BaseModel):
     scope: AuditPreviewScope
     prompts_per_sku: int = Field(default=40, ge=1, le=200)
     custom_prompts: Optional[List[str]] = Field(default=None, max_length=10)
+    coverage_profile: str = Field(
+        default_factory=default_coverage_profile,
+        max_length=64,
+    )
     providers: Optional[List[str]] = Field(default=None, max_length=4)
 
 
@@ -230,11 +245,15 @@ def _normalize_nonempty(values: Optional[List[str]]) -> List[str]:
     return out
 
 
-def _normalize_providers(values: Optional[List[str]]) -> List[str]:
-    providers = [
-        value.lower() for value in _normalize_nonempty(values)
-    ]
-    return providers or ["gemini"]
+def _resolve_audit_coverage(
+    *,
+    coverage_profile: Optional[str],
+    providers: Optional[List[str]],
+) -> Dict[str, Any]:
+    return resolve_coverage_profile(
+        coverage_profile=coverage_profile,
+        providers=providers,
+    )
 
 
 def _credit_requirements(
@@ -329,6 +348,7 @@ def _preview_cache_key(
     merchant_id: str,
     sku_keys: List[str],
     prompts_per_sku: int,
+    coverage_profile: str,
     providers: List[str],
     custom_prompts: Optional[List[str]],
 ) -> str:
@@ -336,6 +356,7 @@ def _preview_cache_key(
         "merchant_id": merchant_id,
         "sku_keys": sorted(sku_keys),
         "prompts_per_sku": int(prompts_per_sku),
+        "coverage_profile": coverage_profile,
         "providers": sorted(providers),
         "custom_prompts": _normalize_nonempty(custom_prompts),
     }
@@ -417,12 +438,14 @@ async def _build_preview(
     sku_keys: List[str],
     prompts_per_sku: int,
     custom_prompts: Optional[List[str]],
-    providers: List[str],
+    coverage: Dict[str, Any],
 ) -> Dict[str, Any]:
+    providers = list(coverage.get("providers") or [])
     cache_key = _preview_cache_key(
         merchant_id=merchant_id,
         sku_keys=sku_keys,
         prompts_per_sku=prompts_per_sku,
+        coverage_profile=str(coverage.get("profile") or ""),
         providers=providers,
         custom_prompts=custom_prompts,
     )
@@ -453,7 +476,11 @@ async def _build_preview(
                 "prompts_cached": prompts_cached,
                 "cache_hit_rate": cache_hit_rate,
             },
+            "coverage_profile": coverage.get("profile"),
+            "coverage_profile_label": coverage.get("label"),
             "providers": providers,
+            "requested_providers": coverage.get("requested_providers") or providers,
+            "pending_engine_support": coverage.get("pending_engine_support") or [],
             "estimated_audit_credits": estimated_audit_credits,
             "estimated_prompt_credits": len(_normalize_nonempty(custom_prompts)),
             "estimated_execution_credits": 0,
@@ -496,12 +523,16 @@ async def preview_audit_run(
         scope=body.scope,
     )
     try:
+        coverage = _resolve_audit_coverage(
+            coverage_profile=body.coverage_profile,
+            providers=body.providers,
+        )
         return await _build_preview(
             merchant_id=body.merchant_id,
             sku_keys=sku_keys,
             prompts_per_sku=body.prompts_per_sku,
             custom_prompts=body.custom_prompts,
-            providers=_normalize_providers(body.providers),
+            coverage=coverage,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -601,8 +632,12 @@ async def create_audit_run(
             subject_type=body.subject_type,
         )
 
-    providers = _normalize_providers(body.providers)
     try:
+        coverage = _resolve_audit_coverage(
+            coverage_profile=body.coverage_profile,
+            providers=body.providers,
+        )
+        providers = list(coverage.get("providers") or [])
         audit_required, audit_usd_cogs = _audit_metering(
             sku_count=len(_normalize_nonempty(body.product_keys)),
             prompts_per_sku=body.prompts_per_sku,
@@ -711,6 +746,20 @@ async def create_audit_run(
             subject_type=body.subject_type,
             idempotency_key=idempotency_key,
             requested_by_user_id=auth_merchant_id,
+            request_options_jsonb={
+                "launch": {
+                    "coverage_profile": coverage.get("profile"),
+                    "coverage_profile_label": coverage.get("label"),
+                    "providers": providers,
+                    "requested_providers": (
+                        coverage.get("requested_providers") or providers
+                    ),
+                    "pending_engine_support": (
+                        coverage.get("pending_engine_support") or []
+                    ),
+                    "prompts_per_sku": int(body.prompts_per_sku),
+                }
+            },
         )
     except InsufficientCreditsError as exc:
         for kind, amount, replay, usd_cogs, purchased_credits in reversed(debited):

@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 from services import agent_center_llm_client as llm_client
 from services.audit_playbook_engine import select_playbooks
 from services.cited_host_classifier import classify_cited_hosts, classify_host
+from services.coverage_profiles import resolve_coverage_profile
 from services.pivota_indexing_arc import compute_indexing_arc_state
 
 
@@ -1266,7 +1267,7 @@ def calibrate_thresholds_from_baseline(
 # ---------------------------------------------------------------------------
 
 
-_REAL_PROVIDERS = {"gemini"}
+_REAL_PROVIDERS = {"gemini", "chatgpt", "claude"}
 
 
 def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
@@ -1279,6 +1280,13 @@ def _classify_provider(upstream_provider: str) -> Dict[str, Any]:
         fallback happened. None when is_real.
     """
     p = (upstream_provider or "").strip()
+    parts = [
+        item.strip()
+        for item in re.split(r"[,+]", p)
+        if item.strip()
+    ]
+    if parts and all(part in _REAL_PROVIDERS for part in parts):
+        return {"is_real": True, "reason": None}
     if p in _REAL_PROVIDERS:
         return {"is_real": True, "reason": None}
     if p == "local_mock_no_internal_key":
@@ -2215,6 +2223,141 @@ def compute_citation_score(
     return total, breakdown
 
 
+def _probe_provider(probe: Dict[str, Any]) -> str:
+    provider = str(
+        probe.get("provider")
+        or probe.get("_provider")
+        or "unknown"
+    ).strip().lower()
+    return provider or "unknown"
+
+
+def _run_provider(run: Dict[str, Any]) -> str:
+    provider = str(
+        run.get("_provider")
+        or run.get("provider")
+        or "unknown"
+    ).strip().lower()
+    return provider or "unknown"
+
+
+def _group_probe_runs_by_provider(
+    per_sku_probe_runs: Any,
+) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for probe in _json_list(per_sku_probe_runs):
+        if not isinstance(probe, dict):
+            continue
+        grouped[_probe_provider(probe)].append(probe)
+    return dict(grouped)
+
+
+def _citation_prompt_key(run: Dict[str, Any]) -> Tuple[str, str, str]:
+    meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+    return (
+        str(meta.get("sku_key") or "").strip(),
+        str(meta.get("axis") or "").strip(),
+        str(run.get("query") or "").strip().lower(),
+    )
+
+
+def _merge_runs_for_any_provider(
+    runs: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged = dict(runs[0]) if runs else {}
+    parsed_out: Dict[str, Any] = {}
+    url_match_out: Dict[str, Any] = {}
+    sources: List[Dict[str, Any]] = []
+    chunks: List[Any] = []
+    providers: List[str] = []
+    excerpts: List[str] = []
+
+    for run in runs:
+        provider = _run_provider(run)
+        if provider not in providers:
+            providers.append(provider)
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+        url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+        llm_report = (
+            url_match.get("llm_self_report")
+            if isinstance(url_match.get("llm_self_report"), dict)
+            else {}
+        )
+
+        for key in (
+            "product_visible",
+            "sku_mentioned",
+            "correct_sku",
+            "authority_near_variant_found",
+            "merchant_url_found",
+        ):
+            if parsed.get(key) is True or llm_report.get(key) is True:
+                parsed_out[key] = True
+            elif key not in parsed_out and parsed.get(key) is not None:
+                parsed_out[key] = parsed.get(key)
+
+        if url_match.get("in_grounding") is True:
+            url_match_out["in_grounding"] = True
+        elif "in_grounding" not in url_match_out and url_match.get("in_grounding") is not None:
+            url_match_out["in_grounding"] = url_match.get("in_grounding")
+
+        for source in run.get("grounding_sources") or []:
+            if isinstance(source, dict) and source not in sources:
+                copy = dict(source)
+                copy.setdefault("provider", provider)
+                sources.append(copy)
+        for chunk in run.get("grounding_chunks") or []:
+            if chunk not in chunks:
+                chunks.append(chunk)
+        excerpt = (
+            run.get("evidence_excerpt")
+            or parsed.get("evidence_excerpt")
+            or parsed.get("evidence_text")
+        )
+        if excerpt:
+            excerpts.append(str(excerpt))
+
+    merged["parsed"] = {**(merged.get("parsed") or {}), **parsed_out}
+    merged["url_match"] = {**(merged.get("url_match") or {}), **url_match_out}
+    merged["grounding_sources"] = sources
+    merged["grounding_chunks"] = chunks
+    merged["_provider"] = ",".join(providers)
+    merged["_providers"] = providers
+    if excerpts:
+        merged["evidence_excerpt"] = excerpts[0]
+    return merged
+
+
+def _any_provider_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
+    grouped_runs: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for run in _flatten_probe_runs(per_sku_probe_runs):
+        grouped_runs[_citation_prompt_key(run)].append(run)
+    merged_runs = [
+        _merge_runs_for_any_provider(runs)
+        for _key, runs in sorted(grouped_runs.items())
+        if runs
+    ]
+    return [{
+        "provider": "coverage_profile_any",
+        "raw_runs": merged_runs,
+    }] if merged_runs else []
+
+
+def build_citation_by_provider(
+    sku_ctx: Dict[str, Any],
+    per_sku_probe_runs: Any,
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for provider, probes in sorted(_group_probe_runs_by_provider(per_sku_probe_runs).items()):
+        score, breakdown = compute_citation_score(sku_ctx, probes)
+        out[provider] = {
+            "score": score,
+            "breakdown": breakdown,
+            "prompts": len(_flatten_probe_runs(probes)),
+        }
+    return out
+
+
 async def _fetch_one_dict(query: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     from db.database import database
     try:
@@ -2670,7 +2813,17 @@ async def build_per_sku_report(
         identity_score, identity_breakdown = compute_identity_score(sku_ctx)
         content_score, content_breakdown = compute_content_richness_score(sku_ctx)
         routing_score, routing_breakdown = compute_routability_score(sku_ctx)
-        citation_score, citation_breakdown = compute_citation_score(sku_ctx, probe_runs)
+        citation_by_provider = build_citation_by_provider(sku_ctx, probe_runs)
+        citation_score, citation_breakdown = compute_citation_score(
+            sku_ctx, _any_provider_probe_runs(probe_runs),
+        )
+        citation_breakdown["aggregation_rule"] = (
+            "any_profile_provider: a prompt is treated as cited when any "
+            "provider in the resolved coverage profile produces the "
+            "citation signal; per-provider details remain in "
+            "citation_by_provider."
+        )
+        citation_breakdown["providers"] = sorted(citation_by_provider)
         scores = {
             "identity": {"score": identity_score, "breakdown": identity_breakdown},
             "content_richness": {"score": content_score, "breakdown": content_breakdown},
@@ -2684,6 +2837,11 @@ async def build_per_sku_report(
         "content_key": sku_ctx.get("content_key") or product.get("content_key"),
         "sku_title": (_get_sku(sku_ctx).get("title") or product.get("title")),
         "scores": scores,
+        "citation_by_provider": (
+            citation_by_provider
+            if not (sku_ctx.get("missing_inputs") and not product.get("product_key"))
+            else {}
+        ),
         "band": _sku_band(scores),
         "primary_gaps": _primary_gaps(scores),
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
@@ -2866,6 +3024,7 @@ def build_authority_map(
         host_rows: Dict[str, Dict[str, Any]] = {}
         reddit_threads: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for run in _flatten_probe_runs(probe_runs):
+            provider = _run_provider(run)
             parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
             url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
             llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
@@ -2893,6 +3052,8 @@ def build_authority_map(
                     "cites_near_variant": False,
                     "cites_category_not_sku": False,
                     "prompts_cited_count": 0,
+                    "providers": [],
+                    "provider_counts": {},
                     "evidence_urls": [],
                     "evidence_excerpt": None,
                     "competitors_named": [],
@@ -2905,6 +3066,11 @@ def build_authority_map(
                 if query not in row["_queries"]:
                     row["_queries"].add(query)
                     row["prompts_cited_count"] += 1
+                if provider not in row["providers"]:
+                    row["providers"].append(provider)
+                row["provider_counts"][provider] = (
+                    int(row["provider_counts"].get(provider) or 0) + 1
+                )
                 if uri and uri not in row["evidence_urls"]:
                     row["evidence_urls"].append(uri)
                 if excerpt and not row.get("evidence_excerpt"):
@@ -2918,15 +3084,20 @@ def build_authority_map(
                     "host_type": host_type,
                     "skus": set(),
                     "prompts_cited_count": 0,
+                    "providers": set(),
+                    "provider_counts": defaultdict(int),
                 })
                 matrix["skus"].add(sku_key)
                 matrix["prompts_cited_count"] += 1
+                matrix["providers"].add(provider)
+                matrix["provider_counts"][provider] += 1
 
                 if host_type == "reddit":
                     subreddit = _reddit_subreddit_from_url(uri) or "r/unknown"
                     reddit_threads[subreddit].append({
                         "url": uri,
                         "title": source.get("title") or "",
+                        "provider": provider,
                         "sentiment": None,
                         "matched_sku": bool(exact or near),
                     })
@@ -2934,6 +3105,8 @@ def build_authority_map(
         authority_hosts = []
         for row in host_rows.values():
             row.pop("_queries", None)
+            row["providers"] = sorted(row.get("providers") or [])
+            row["provider_counts"] = dict(sorted((row.get("provider_counts") or {}).items()))
             authority_hosts.append(row)
         authority_hosts.sort(key=lambda r: r.get("prompts_cited_count") or 0, reverse=True)
         reddit_subreddits = [
@@ -2960,6 +3133,8 @@ def build_authority_map(
             "host_type": row["host_type"],
             "skus": sorted(s for s in row["skus"] if s),
             "prompts_cited_count": row["prompts_cited_count"],
+            "providers": sorted(row.get("providers") or []),
+            "provider_counts": dict(sorted((row.get("provider_counts") or {}).items())),
         })
     matrix_rows.sort(key=lambda r: r["prompts_cited_count"], reverse=True)
     return {"skus": sku_entries, "hosts": matrix_rows}
@@ -3052,6 +3227,135 @@ async def _cost_summary_for_per_sku_audit(
     }
 
 
+def _combine_scan_results_for_profile(
+    scan_mode: str,
+    provider_results: Dict[str, Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    results = [
+        payload
+        for payload in provider_results.values()
+        if isinstance(payload, dict)
+    ]
+    if not results:
+        return None
+
+    raw_runs: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = []
+    providers_actual: List[str] = []
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_usd": 0.0,
+    }
+    score_values: List[int] = []
+
+    for requested_provider, result in provider_results.items():
+        actual_provider = str(
+            result.get("provider") or requested_provider
+        ).strip().lower()
+        if actual_provider and actual_provider not in providers_actual:
+            providers_actual.append(actual_provider)
+        scores = result.get("scores") if isinstance(result.get("scores"), dict) else {}
+        if scores.get("visibility_score") is not None:
+            score_values.append(int(scores.get("visibility_score") or 0))
+        for run in result.get("raw_runs") or []:
+            if not isinstance(run, dict):
+                continue
+            row = dict(run)
+            row.setdefault("_provider", actual_provider or requested_provider)
+            raw_runs.append(row)
+        for finding in result.get("findings") or []:
+            if isinstance(finding, dict):
+                copy = dict(finding)
+                copy.setdefault("provider", actual_provider or requested_provider)
+                findings.append(copy)
+        result_usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        usage["input_tokens"] += int(
+            result_usage.get("input_tokens") or result_usage.get("tokens_in") or 0
+        )
+        usage["output_tokens"] += int(
+            result_usage.get("output_tokens") or result_usage.get("tokens_out") or 0
+        )
+        usage["estimated_cost_usd"] += float(
+            result_usage.get("estimated_cost_usd")
+            or result_usage.get("cost_usd")
+            or 0.0
+        )
+
+    return {
+        "scan_mode": scan_mode,
+        "provider": ",".join(providers_actual),
+        "providers": providers_actual,
+        "scores": {
+            "visibility_score": max(score_values) if score_values else 0,
+            "aggregation_rule": "any_profile_provider_max_score",
+        },
+        "findings": findings,
+        "usage": {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "estimated_cost_usd": round(usage["estimated_cost_usd"], 6),
+        },
+        "raw_runs": raw_runs,
+        "provider_results": provider_results,
+    }
+
+
+def _combine_bd_probes_for_profile(
+    probes_by_provider: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    scan_modes: List[str] = []
+    for probes in probes_by_provider.values():
+        for scan_mode in probes.keys():
+            if scan_mode not in scan_modes:
+                scan_modes.append(scan_mode)
+    combined: Dict[str, Dict[str, Any]] = {}
+    for scan_mode in scan_modes:
+        per_provider = {
+            provider: probes[scan_mode]
+            for provider, probes in probes_by_provider.items()
+            if isinstance(probes, dict) and isinstance(probes.get(scan_mode), dict)
+        }
+        merged = _combine_scan_results_for_profile(scan_mode, per_provider)
+        if merged is not None:
+            combined[scan_mode] = merged
+    return combined
+
+
+def _legacy_citation_by_provider(
+    *,
+    probes_by_provider: Dict[str, Dict[str, Dict[str, Any]]],
+    merchant_host: Optional[str],
+    merchant_brand: Optional[str],
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for provider, probes in sorted(probes_by_provider.items()):
+        attribution = probes.get("attribution") if isinstance(probes, dict) else None
+        if not isinstance(attribution, dict):
+            continue
+        raw_runs = attribution.get("raw_runs") or []
+        competitors, merchant_cited_runs, runs_with_any_citation = (
+            extract_cited_hosts(
+                raw_runs,
+                merchant_host=merchant_host,
+                merchant_brand=merchant_brand,
+            )
+        )
+        out[provider] = {
+            "runs": len(raw_runs),
+            "merchant_cited_runs": merchant_cited_runs,
+            "runs_with_any_citation": runs_with_any_citation,
+            "attribution_score": (
+                (attribution.get("scores") or {}).get("visibility_score", 0)
+            ),
+            "competitor_hosts": [
+                {"host": host, "times_cited": count}
+                for host, count in competitors.most_common(15)
+            ],
+        }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Brand-level multi-product BD report (Phase 2b)
 #
@@ -3081,7 +3385,9 @@ async def run_brand_report(
     merchant_name: str,
     merchant_domain: Optional[str],
     products: List[Dict[str, Any]],
-    provider: str = "gemini",
+    provider: Optional[str] = None,
+    coverage_profile: str = "us_shopper",
+    providers: Optional[List[str]] = None,
     max_runs: int = 3,
     include_category_visibility: bool = True,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
@@ -3098,7 +3404,7 @@ async def run_brand_report(
 
     Returns:
       {
-        merchant_name, merchant_domain, timestamp, provider,
+        merchant_name, merchant_domain, timestamp, provider/providers,
         per_product: [<structured BD report>, ...],
         aggregate: {
           avg_visibility, avg_attribution, avg_category_visibility,
@@ -3115,6 +3421,17 @@ async def run_brand_report(
         raise ValueError("products is required (at least 1)")
     if audit_mode not in {"legacy", "per_sku"}:
         raise ValueError("audit_mode must be 'legacy' or 'per_sku'")
+    coverage = resolve_coverage_profile(
+        coverage_profile=coverage_profile,
+        provider=provider,
+        providers=providers,
+    )
+    profile_providers = list(coverage.get("providers") or [])
+    provider_label = (
+        profile_providers[0]
+        if len(profile_providers) == 1
+        else ",".join(profile_providers)
+    )
 
     if audit_mode == "per_sku":
         if not merchant_id or not str(merchant_id).strip():
@@ -3155,6 +3472,9 @@ async def run_brand_report(
             "merchant_domain": (merchant_domain or "").strip() or None,
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "audit_mode": "per_sku",
+            "coverage_profile": coverage.get("profile"),
+            "providers": profile_providers,
+            "pending_engine_support": coverage.get("pending_engine_support") or [],
             "per_sku_reports": per_sku_reports,
             "brand_rollup": brand_rollup,
             "authority_map": authority_map,
@@ -3181,16 +3501,19 @@ async def run_brand_report(
             })
             continue
         try:
-            probes = await run_bd_probes(
-                merchant_name=merchant_name,
-                merchant_pdp_url=pdp_url,
-                product_title=title,
-                product_vendor=p.get("vendor"),
-                product_type=p.get("product_type"),
-                provider=provider,
-                max_runs=max_runs,
-                include_category_visibility=include_category_visibility,
-            )
+            probes_by_provider: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            for provider_id in profile_providers:
+                probes_by_provider[provider_id] = await run_bd_probes(
+                    merchant_name=merchant_name,
+                    merchant_pdp_url=pdp_url,
+                    product_title=title,
+                    product_vendor=p.get("vendor"),
+                    product_type=p.get("product_type"),
+                    provider=provider_id,
+                    max_runs=max_runs,
+                    include_category_visibility=include_category_visibility,
+                )
+            probes = _combine_bd_probes_for_profile(probes_by_provider)
             structured = build_structured_report(
                 merchant_name=merchant_name,
                 merchant_pdp_url=pdp_url,
@@ -3200,7 +3523,7 @@ async def run_brand_report(
                 visibility_result=probes["visibility"],
                 attribution_result=probes["attribution"],
                 category_visibility_result=probes.get("category_visibility"),
-                provider=provider,
+                provider=provider_label,
                 # Per-product url_source threads through from the
                 # merchant audit route's 3-tier fallback chain so the
                 # `merchant_view.headline.audited_via_pivota_canonical`
@@ -3220,6 +3543,25 @@ async def run_brand_report(
                 # every product report so the integration action
                 # consistently fires (or stays absent) across products.
                 integration_state=integration_state,
+            )
+            structured["coverage_profile"] = coverage.get("profile")
+            structured["providers"] = profile_providers
+            structured["requested_providers"] = (
+                coverage.get("requested_providers") or profile_providers
+            )
+            structured["pending_engine_support"] = (
+                coverage.get("pending_engine_support") or []
+            )
+            structured["citation_aggregation_rule"] = (
+                "any_profile_provider: headline attribution/citation "
+                "presence uses the strongest provider result in the "
+                "resolved profile; citation_by_provider preserves the "
+                "drill-down."
+            )
+            structured["citation_by_provider"] = _legacy_citation_by_provider(
+                probes_by_provider=probes_by_provider,
+                merchant_host=normalize_host(pdp_url),
+                merchant_brand=(p.get("vendor") or merchant_name or "").strip() or None,
             )
             per_product.append(structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
@@ -3305,7 +3647,11 @@ async def run_brand_report(
         "merchant_name": merchant_name,
         "merchant_domain": (merchant_domain or "").strip() or None,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "provider": provider,
+        "provider": provider_label,
+        "coverage_profile": coverage.get("profile"),
+        "providers": profile_providers,
+        "requested_providers": coverage.get("requested_providers") or profile_providers,
+        "pending_engine_support": coverage.get("pending_engine_support") or [],
         "per_product": per_product,
         "aggregate": aggregate,
         "cross_product_competitors": cross_competitors,

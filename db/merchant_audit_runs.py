@@ -451,6 +451,7 @@ async def enqueue_audit_run(
     subject_type: str = "merchant",
     idempotency_key: Optional[str] = None,
     requested_by_user_id: Optional[str] = None,
+    request_options_jsonb: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Insert a row in `stage='queued'` for the worker to pick up.
 
@@ -467,6 +468,7 @@ async def enqueue_audit_run(
         subject_type=subject_type,
         idempotency_key=idempotency_key,
         requested_by_user_id=requested_by_user_id,
+        request_options_jsonb=request_options_jsonb,
     )
     return run_id
 
@@ -478,6 +480,7 @@ async def enqueue_audit_run_with_replay(
     subject_type: str = "merchant",
     idempotency_key: Optional[str] = None,
     requested_by_user_id: Optional[str] = None,
+    request_options_jsonb: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], bool]:
     """Insert + DB-enforced idempotency dedupe (P0-3).
 
@@ -498,6 +501,10 @@ async def enqueue_audit_run_with_replay(
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
     now = _now_utc()
+    partial_result_jsonb = (
+        _json_safe(request_options_jsonb)
+        if isinstance(request_options_jsonb, dict) else None
+    )
 
     # If no idempotency_key, fall through to the original behavior —
     # no dedupe possible.
@@ -515,6 +522,7 @@ async def enqueue_audit_run_with_replay(
                     subject_type=subject_type,
                     idempotency_key=None,
                     requested_by_user_id=requested_by_user_id,
+                    partial_result_jsonb=partial_result_jsonb,
                 )
             )
             return run_id, False
@@ -536,11 +544,13 @@ async def enqueue_audit_run_with_replay(
             INSERT INTO merchant_audit_runs (
                 run_id, merchant_id, requested_at, status,
                 stage, stage_updated_at, product_keys,
-                subject_type, idempotency_key, requested_by_user_id
+                subject_type, idempotency_key, requested_by_user_id,
+                partial_result_jsonb
             ) VALUES (
                 :run_id, :merchant_id, :now, 'running',
                 :stage_queued, :now, CAST(:product_keys AS TEXT[]),
-                :subject_type, :idempotency_key, :requested_by_user_id
+                :subject_type, :idempotency_key, :requested_by_user_id,
+                CAST(:partial_result_jsonb AS JSONB)
             )
             ON CONFLICT ON CONSTRAINT uniq_merchant_audit_runs_active_idempotency_key
             DO NOTHING
@@ -555,6 +565,7 @@ async def enqueue_audit_run_with_replay(
                 "subject_type": subject_type,
                 "idempotency_key": idempotency_key,
                 "requested_by_user_id": requested_by_user_id,
+                "partial_result_jsonb": json.dumps(partial_result_jsonb or {}),
             },
         )
     except Exception as exc:
@@ -582,6 +593,7 @@ async def enqueue_audit_run_with_replay(
                     subject_type=subject_type,
                     idempotency_key=idempotency_key,
                     requested_by_user_id=requested_by_user_id,
+                    partial_result_jsonb=partial_result_jsonb,
                 )
             )
             return run_id, False

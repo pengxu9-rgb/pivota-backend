@@ -282,10 +282,14 @@ def test_post_enqueues_and_returns_202(client, stub):
     assert stub.enqueued[0]["product_keys"] == ["pk-1", "pk-2"]
     # Idempotency lookup happened (default force=False).
     assert len(stub.idem_lookups) == 1
-    assert stub.balance["credits"] == 9544
+    assert stub.balance["credits"] == 9112
     assert len(stub.debits) == 1
     assert stub.debits[0]["kind"] == "audit"
-    assert stub.debits[0]["amount"] == 456
+    assert stub.debits[0]["amount"] == 888
+    launch = stub.enqueued[0]["request_options_jsonb"]["launch"]
+    assert launch["coverage_profile"] == "us_shopper"
+    assert launch["providers"] == ["gemini", "chatgpt"]
+    assert launch["pending_engine_support"] == ["deepseek"]
 
 
 def test_post_returns_existing_run_on_idempotent_replay(client, stub):
@@ -325,6 +329,22 @@ def test_post_force_skips_idempotency_dedupe(client, stub):
     assert len(stub.enqueued) == 1
     assert stub.enqueued[0]["idempotency_key"] is None
     assert len(stub.debits) == 1
+
+
+def test_post_legacy_explicit_provider_uses_single_provider_profile(client, stub):
+    res = client.post(
+        "/api/audits",
+        json={
+            "merchant_id": "merch-A",
+            "product_keys": ["pk-1"],
+            "providers": ["gemini"],
+        },
+    )
+    assert res.status_code == 202
+    assert stub.debits[0]["amount"] == 228
+    launch = stub.enqueued[0]["request_options_jsonb"]["launch"]
+    assert launch["coverage_profile"] == "explicit"
+    assert launch["providers"] == ["gemini"]
 
 
 def test_post_rejects_cross_tenant_merchant_id(client, stub):
@@ -392,7 +412,7 @@ def test_post_returns_402_when_credits_insufficient(client, stub):
     assert detail == {
         "error": "insufficient_credits",
         "kind": "credits",
-        "required": 456,
+        "required": 888,
         "available": 100,
         "preview_url": "/api/audits/preview",
     }
@@ -410,14 +430,14 @@ def test_post_debits_prompt_credits_for_custom_prompts(client, stub):
         },
     )
     assert res.status_code == 202
-    assert stub.balance["credits"] == 9770
+    assert stub.balance["credits"] == 9554
     assert [d["kind"] for d in stub.debits] == ["audit", "prompt"]
-    assert [d["amount"] for d in stub.debits] == [228, 2]
+    assert [d["amount"] for d in stub.debits] == [444, 2]
 
 
 def test_post_total_credit_gap_returns_402_before_any_debit(client, stub):
     stub.balance["plan_tier"] = "free"
-    stub.balance["credits"] = 228
+    stub.balance["credits"] = 444
     res = client.post(
         "/api/audits",
         json={
@@ -429,9 +449,9 @@ def test_post_total_credit_gap_returns_402_before_any_debit(client, stub):
     assert res.status_code == 402
     detail = res.json()["detail"]
     assert detail["kind"] == "credits"
-    assert detail["required"] == 229
-    assert detail["available"] == 228
-    assert stub.balance["credits"] == 228
+    assert detail["required"] == 445
+    assert detail["available"] == 444
+    assert stub.balance["credits"] == 444
     assert stub.debits == []
     assert stub.credits == []
     assert stub.enqueued == []
@@ -448,7 +468,7 @@ def test_post_free_tier_applies_rate_limit_and_credits(client, stub):
     )
     assert res.status_code == 202
     assert stub.rate_limit_checks == ["merch-A"]
-    assert stub.balance["credits"] == 9772
+    assert stub.balance["credits"] == 9556
 
 
 def test_post_paid_tier_skips_rate_limit(client, stub):
@@ -518,7 +538,7 @@ def test_post_paid_tier_overage_is_allowed_after_verified_card(client, stub):
     assert res.status_code == 202
     assert stub.payment_method_checks == ["merch-A"]
     assert stub.balance["credits"] == 0
-    assert stub.balance["overage_pending_credits"] == 356
+    assert stub.balance["overage_pending_credits"] == 788
     assert len(stub.debits) == 1
     assert len(stub.enqueued) == 1
 
@@ -586,7 +606,7 @@ def test_post_relaunch_existing_run_does_not_double_debit(client, stub):
 def test_preview_returns_cost_balance_and_sufficiency(client, stub):
     stub.preview_sku_keys = [f"sku-{i}" for i in range(10)]
     stub.balance.update({
-        "credits": 2500,
+        "credits": 5000,
         "allowance_credits": 18_000,
         "usd_cogs_internal": Decimal("99.9900"),
         "plan_tier": "growth",
@@ -596,7 +616,6 @@ def test_preview_returns_cost_balance_and_sufficiency(client, stub):
         json={
             "merchant_id": "merch-A",
             "scope": {"select_top_n_by_revenue": 10},
-            "providers": ["gemini", "deepseek"],
         },
     )
     assert res.status_code == 200, res.text
@@ -610,12 +629,15 @@ def test_preview_returns_cost_balance_and_sufficiency(client, stub):
         "prompts_cached": 80,
         "cache_hit_rate": 0.2,
     }
-    assert body["providers"] == ["gemini", "deepseek"]
-    assert body["estimated_audit_credits"] == 2290
+    assert body["coverage_profile"] == "us_shopper"
+    assert body["providers"] == ["gemini", "chatgpt"]
+    assert body["requested_providers"] == ["gemini", "chatgpt"]
+    assert body["pending_engine_support"] == ["deepseek"]
+    assert body["estimated_audit_credits"] == 4440
     assert body["estimated_prompt_credits"] == 0
     assert body["estimated_execution_credits"] == 0
     assert body["current_balance"] == {
-        "credits": 2500,
+        "credits": 5000,
         "allowance_credits": 18_000,
         "plan_tier": "growth",
     }
@@ -639,8 +661,25 @@ def test_preview_reports_credit_gaps(client, stub):
     body = res.json()
     assert body["sufficient"] is False
     assert body["gaps"] == [
-        {"kind": "credits", "required": 685, "available": 100, "short": 585},
+        {"kind": "credits", "required": 1333, "available": 100, "short": 1233},
     ]
+
+
+def test_preview_us_shopper_sums_gemini_and_chatgpt_per_prompt(client, stub):
+    stub.preview_sku_keys = ["sku-1"]
+    res = client.post(
+        "/api/audits/preview",
+        json={
+            "merchant_id": "merch-A",
+            "scope": {"sku_keys": ["sku-1"]},
+            "prompts_per_sku": 40,
+            "coverage_profile": "us_shopper",
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["providers"] == ["gemini", "chatgpt"]
+    assert body["estimated_audit_credits"] == 444
 
 
 def test_preview_dedups_cost_computation_for_same_scope(client, stub):
@@ -666,7 +705,6 @@ def test_brand_facing_routes_do_not_expose_internal_usd(client, stub):
         json={
             "merchant_id": "merch-A",
             "scope": {"sku_keys": ["sku-1"]},
-            "providers": ["gemini", "deepseek"],
         },
     )
     assert preview.status_code == 200

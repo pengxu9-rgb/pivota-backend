@@ -915,6 +915,7 @@ async def test_run_brand_report_isolates_per_product_failures(
             {"title": "P2", "pdp_url": "https://x.com/p/2", "product_type": "thing"},
             {"title": "P3", "pdp_url": "https://x.com/p/3", "product_type": "thing"},
         ],
+        provider="gemini",
         include_category_visibility=False,  # 2 calls per product instead of 3
     )
     # Product 2 should be in failed[], products 1+3 in per_product
@@ -924,6 +925,50 @@ async def test_run_brand_report_isolates_per_product_failures(
     assert len(out["per_product"]) == 2
     assert out["failed"][0]["title"] == "P2"
     assert "upstream timeout" in out["failed"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_brand_report_us_shopper_fans_out_to_gemini_and_chatgpt(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    from services import agent_center_bd_report_service as bd
+
+    calls = []
+
+    async def _fake_probe(**kwargs):
+        calls.append((kwargs.get("provider"), kwargs.get("scan_mode")))
+        return {
+            "scan_mode": kwargs.get("scan_mode"),
+            "provider": kwargs.get("provider"),
+            "scores": {"visibility_score": 50},
+            "raw_runs": [],
+            "findings": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    out = await bd.run_brand_report(
+        merchant_name="Brand X",
+        merchant_domain="brandx.com",
+        products=[
+            {"title": "P1", "pdp_url": "https://x.com/p/1", "product_type": "thing"},
+        ],
+        coverage_profile="us_shopper",
+        include_category_visibility=False,
+    )
+
+    assert calls == [
+        ("gemini", "open_product_visibility_test"),
+        ("gemini", "merchant_store_attribution_test"),
+        ("chatgpt", "open_product_visibility_test"),
+        ("chatgpt", "merchant_store_attribution_test"),
+    ]
+    assert out["providers"] == ["gemini", "chatgpt"]
+    assert out["pending_engine_support"] == ["deepseek"]
+    assert out["per_product"][0]["citation_by_provider"].keys() == {
+        "gemini", "chatgpt",
+    }
 
 
 @pytest.mark.asyncio
@@ -970,6 +1015,7 @@ async def test_run_brand_report_aggregate_competitor_view(
             {"title": "P1", "pdp_url": "https://x.com/p/1", "product_type": "thing"},
             {"title": "P2", "pdp_url": "https://x.com/p/2", "product_type": "thing"},
         ],
+        provider="gemini",
         include_category_visibility=False,
     )
     # Sephora is cited 1× on each of 2 products = 2 total brand-wide.
