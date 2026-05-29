@@ -12,12 +12,12 @@ migration 083 was non-unique, so both inserts succeeded. Result: 2
 audits enqueued, 2× LLM cost for one customer ask.
 
 Fix:
-  - Migration 091 adds `uniq_merchant_audit_runs_active_idempotency_key`
-    — a partial UNIQUE index on (idempotency_key) WHERE active-stage.
+  - Migration 144 adds `uniq_merchant_audit_runs_active_idempotency_key`
+    — a partial UNIQUE index on (merchant_id, idempotency_key) WHERE active-stage.
     db/schema_guard.py self-heals it on startup so deploys that
     skip db/migrations/ still get the protection.
   - New `enqueue_audit_run_with_replay` uses
-    INSERT ... ON CONFLICT ON CONSTRAINT ... DO NOTHING RETURNING.
+    INSERT ... ON CONFLICT (...) WHERE ... DO NOTHING RETURNING.
     On conflict (rowcount=0 returned), it fetches the existing
     run_id and returns (run_id, was_existing=True).
   - POST /api/audits route uses the new function and surfaces
@@ -41,7 +41,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/tes
 @pytest.mark.asyncio
 async def test_enqueue_with_replay_uses_on_conflict_when_idempotency_key_set(monkeypatch):
     """When idempotency_key is set, the enqueue must hit the
-    ON CONFLICT path against the named partial unique constraint —
+    ON CONFLICT path against the active-stage partial unique index —
     not a plain INSERT."""
     from db import merchant_audit_runs as mar
 
@@ -83,8 +83,15 @@ async def test_enqueue_with_replay_uses_on_conflict_when_idempotency_key_set(mon
         "Idempotency-key INSERT must use ON CONFLICT — without it the "
         "race that motivated this fix is still open"
     )
-    assert "uniq_merchant_audit_runs_active_idempotency_key" in sql, (
-        "ON CONFLICT must target the named partial unique constraint"
+    assert "on conflict (merchant_id, idempotency_key)" in sql, (
+        "ON CONFLICT must infer the same columns as the partial "
+        "unique index"
+    )
+    assert "on constraint" not in sql, (
+        "Partial unique indexes are not valid ON CONSTRAINT targets"
+    )
+    assert "stage = any(array[" in sql, (
+        "ON CONFLICT inference must include the active-stage predicate"
     )
     assert "do nothing" in sql, (
         "ON CONFLICT must be DO NOTHING (not DO UPDATE) so we don't "
@@ -150,9 +157,7 @@ async def test_enqueue_with_replay_no_idempotency_key_skips_on_conflict(monkeypa
 
     class DummyDB:
         async def execute(self, query):
-            captured.append(str(query.compile(
-                compile_kwargs={"literal_binds": True},
-            )))
+            captured.append(str(query))
             return 1
 
         async def fetch_one(self, query, params=None):
@@ -202,8 +207,8 @@ async def test_enqueue_audit_run_backcompat_shim_returns_str(monkeypatch):
 
 def test_schema_guard_self_heals_unique_idempotency_index():
     """Sentinel: schema_guard must self-heal the partial unique
-    idempotency constraint so the P0-3 protection survives a deploy
-    that skipped migration 091."""
+    idempotency index so the P0-3 protection survives a deploy
+    that skipped migration 144."""
     from pathlib import Path
     repo_root = Path(__file__).resolve().parents[1]
     guard_text = (repo_root / "db" / "schema_guard.py").read_text()
@@ -217,26 +222,27 @@ def test_schema_guard_self_heals_unique_idempotency_index():
     )
 
 
-def test_migration_091_exists_and_matches_guard():
-    """Sentinel: migration 091 sql and the schema_guard inline block
+def test_migration_144_exists_and_matches_guard():
+    """Sentinel: migration 144 sql and the schema_guard inline block
     must reference the same constraint name + same active-stage
     predicate. A drift between the two re-introduces the gap."""
     from pathlib import Path
     repo_root = Path(__file__).resolve().parents[1]
     migration = (
         repo_root / "db" / "migrations"
-        / "091_audit_runs_unique_idempotency.sql"
+        / "144_audit_runs_unique_idempotency.sql"
     )
     assert migration.exists(), (
-        "Migration 091 must exist as the canonical SQL — schema_guard "
+        "Migration 144 must exist as the canonical SQL — schema_guard "
         "is the runtime safety net, not the source of truth"
     )
     sql = migration.read_text()
     for token in (
         "uniq_merchant_audit_runs_active_idempotency_key",
         "CREATE UNIQUE INDEX",
+        "merchant_id, idempotency_key",
         "WHERE idempotency_key IS NOT NULL",
         "queued",
         "verifying",
     ):
-        assert token in sql, f"Migration 091 missing token {token!r}"
+        assert token in sql, f"Migration 144 missing token {token!r}"
