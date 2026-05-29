@@ -790,6 +790,49 @@ async def test_probe_one_scan_mode_end_to_end_with_mocked_http(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_answer_quality_verify_mode_is_ungrounded_and_tagged(monkeypatch):
+    from services.llm_providers import deepseek_probe
+
+    calls = []
+
+    async def fake_call(**kwargs):
+        calls.append(kwargs)
+        return {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "supports_recommendation": True,
+                        "misstates_facts": False,
+                        "note": "Answer supports the SKU without core errors.",
+                    }),
+                },
+            }],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 8},
+        }
+
+    monkeypatch.setattr(deepseek_probe, "_call_deepseek_chat", fake_call)
+
+    result = await deepseek_probe.probe_one_scan_mode(
+        scan_mode=deepseek_probe.ANSWER_QUALITY_VERIFY_SCAN_MODE,
+        product_title="Bright Skin Serum 30ml",
+        verify_query="where can I buy Bright Skin Serum",
+        verify_answer_text="The answer recommends Bright Skin Serum.",
+        verify_evidence_excerpt="Grounded excerpt names Bright Skin Serum.",
+        verify_intent="where can I buy Bright Skin Serum",
+        max_runs=1,
+        api_key="test-key",
+    )
+
+    assert calls[0]["enable_web_search"] is False
+    assert "Do not verify URL existence" in calls[0]["user_message"]
+    assert result["provider"] == "deepseek"
+    assert result["role"] == "verify"
+    assert result["raw_runs"][0]["role"] == "verify"
+    assert result["raw_runs"][0]["parsed"]["supports_recommendation"] is True
+    assert result["raw_runs"][0]["grounding_sources"] == []
+
+
+@pytest.mark.asyncio
 async def test_probe_one_scan_mode_with_unparseable_response(monkeypatch):
     """When Deepseek returns garbage, the run is recorded as
     upstream-failed (parsed=None) so the scorer excludes it from

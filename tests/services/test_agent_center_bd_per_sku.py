@@ -187,6 +187,53 @@ def _multi_provider_probe_runs() -> List[Dict[str, Any]]:
     return runs
 
 
+def _positive_probe_runs(count: int = 4) -> List[Dict[str, Any]]:
+    raw_runs: List[Dict[str, Any]] = []
+    for idx in range(count):
+        raw_runs.append({
+            "query": f"where can I buy Bright Skin Serum query {idx}",
+            "parsed": {
+                "product_visible": True,
+                "sku_mentioned": True,
+                "correct_sku": True,
+                "authority_near_variant_found": True,
+            },
+            "raw": "TestBrand Bright Skin Serum is recommended for dull skin.",
+            "evidence_excerpt": "TestBrand Bright Skin Serum is available from the brand.",
+            "grounding_sources": [
+                {
+                    "uri": "https://merchant.test/products/serum",
+                    "title": "Bright Skin Serum",
+                }
+            ],
+            "grounding_chunks": ["https://merchant.test/products/serum"],
+            "url_match": {"in_grounding": True},
+            "axis_metadata": {
+                "axis": "intent",
+                "source": "auto_generated",
+                "sku_key": "sku-1",
+            },
+        })
+    return [{
+        "provider": "gemini",
+        "probe_run_id": "probe-positive",
+        "raw_runs": raw_runs,
+    }]
+
+
+def test_us_shopper_resolves_deepseek_verify_provider():
+    from services.coverage_profiles import (
+        load_coverage_profile_config,
+        resolve_coverage_profile,
+    )
+
+    load_coverage_profile_config.cache_clear()
+    coverage = resolve_coverage_profile(coverage_profile="us_shopper")
+    assert coverage["providers"] == ["gemini", "chatgpt"]
+    assert coverage["verify_providers"] == ["deepseek"]
+    assert coverage["pending_engine_support"] == []
+
+
 def test_identity_score_good_and_missing_data():
     from services.agent_center_bd_report_service import compute_identity_score
 
@@ -258,6 +305,41 @@ def test_citation_score_weighted_formula_and_missing_runs():
     assert breakdown["first_party_rate"]["reason"] == "data unavailable"
 
 
+def test_deepseek_verify_deweights_only_answer_quality():
+    from services.agent_center_bd_report_service import compute_citation_score
+
+    verify_outputs = [{
+        "provider": "deepseek",
+        "role": "verify",
+        "scan_mode": "answer_quality_verify",
+        "sku_key": "sku-1",
+        "target_prompt_key": [
+            "sku-1",
+            "intent",
+            "where can i buy bright skin serum",
+        ],
+        "verdict": {
+            "supports_recommendation": False,
+            "misstates_facts": True,
+            "note": "The answer overstates the SKU fit.",
+        },
+    }]
+
+    score, breakdown = compute_citation_score(
+        _base_sku_ctx(),
+        _probe_runs(),
+        verify_outputs=verify_outputs,
+    )
+
+    assert score == 45
+    assert breakdown["first_party_rate"]["numerator"] == 1
+    assert breakdown["sku_mention_rate"]["numerator"] == 1
+    assert breakdown["authority_near_variant_rate"]["numerator"] == 1
+    assert breakdown["answer_quality_rate"]["numerator"] == 0
+    assert breakdown["answer_quality_rate"]["deterministic_numerator"] == 1
+    assert breakdown["answer_quality_rate"]["verify_deweighted"] == 1
+
+
 @pytest.mark.asyncio
 async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     from services import agent_center_bd_report_service as bd
@@ -290,6 +372,119 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
         "model_is_override": False,
     }
     assert report["model_is_override"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_brand_report_per_sku_runs_bounded_deepseek_verify(monkeypatch):
+    from config import settings as settings_module
+    from services import agent_center_bd_report_service as bd
+
+    monkeypatch.setattr(settings_module.settings, "deepseek_api_key", "test-key")
+
+    calls: List[Dict[str, Any]] = []
+
+    async def fake_load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
+        ctx = _base_sku_ctx()
+        ctx["sku_key"] = sku_key
+        ctx["merchant_id"] = merchant_id
+        return ctx
+
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+        return _positive_probe_runs(count=4)
+
+    async def fake_probe(**kwargs):
+        calls.append(kwargs)
+        return {
+            "scan_mode": kwargs["scan_mode"],
+            "provider": "deepseek",
+            "role": "verify",
+            "raw_runs": [{
+                "provider": "deepseek",
+                "role": "verify",
+                "query": (kwargs.get("context") or {}).get("verify_query"),
+                "parsed": {
+                    "supports_recommendation": False,
+                    "misstates_facts": True,
+                    "note": "Answer does not support this SKU.",
+                },
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "scores": {"visibility_score": 0},
+        }
+
+    monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
+    monkeypatch.setattr(bd, "load_per_sku_probe_runs", fake_load_runs)
+    monkeypatch.setattr(bd.llm_client, "probe", fake_probe)
+
+    report = await bd.run_brand_report(
+        merchant_name="TestBrand",
+        merchant_domain="merchant.test",
+        products=[{"sku_key": "sku-1", "product_key": "prod-1"}],
+        coverage_profile="us_shopper",
+        audit_mode="per_sku",
+        merchant_id="m-1",
+        audit_run_id="audit-1",
+        prompts_per_sku=4,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["provider"] == "deepseek"
+    assert calls[0]["scan_mode"] == "answer_quality_verify"
+    sku_report = report["per_sku_reports"][0]
+    assert sku_report["verify_summary"]["verified"] == 1
+    assert sku_report["verify_summary"]["flagged"] == 1
+    assert sku_report["verify_summary"]["not_verified"] == 3
+    assert sku_report["verify_summary"]["sample_cap"] == 1
+    assert sku_report["verify_outputs"][0]["provider"] == "deepseek"
+    assert sku_report["verify_outputs"][0]["role"] == "verify"
+    assert set(sku_report["citation_by_provider"]) == {"gemini"}
+    citation = sku_report["scores"]["citation"]
+    assert citation["breakdown"]["first_party_rate"]["points"] == 45
+    assert citation["breakdown"]["sku_mention_rate"]["points"] == 25
+    assert citation["breakdown"]["authority_near_variant_rate"]["points"] == 20
+    assert citation["breakdown"]["answer_quality_rate"]["points"] == 8
+
+
+@pytest.mark.asyncio
+async def test_run_brand_report_skips_verify_when_deepseek_key_missing(monkeypatch):
+    from config import settings as settings_module
+    from services import agent_center_bd_report_service as bd
+
+    monkeypatch.setattr(settings_module.settings, "deepseek_api_key", None)
+
+    async def fake_load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
+        ctx = _base_sku_ctx()
+        ctx["sku_key"] = sku_key
+        ctx["merchant_id"] = merchant_id
+        return ctx
+
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+        return _positive_probe_runs(count=2)
+
+    async def fail_probe(**kwargs):
+        raise AssertionError("DeepSeek verify should be skipped without API key")
+
+    monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
+    monkeypatch.setattr(bd, "load_per_sku_probe_runs", fake_load_runs)
+    monkeypatch.setattr(bd.llm_client, "probe", fail_probe)
+
+    report = await bd.run_brand_report(
+        merchant_name="TestBrand",
+        merchant_domain="merchant.test",
+        products=[{"sku_key": "sku-1", "product_key": "prod-1"}],
+        coverage_profile="us_shopper",
+        audit_mode="per_sku",
+        merchant_id="m-1",
+        audit_run_id="audit-1",
+        prompts_per_sku=4,
+    )
+
+    sku_report = report["per_sku_reports"][0]
+    assert sku_report["verify_summary"]["status"] == "skipped"
+    assert sku_report["verify_summary"]["reason"] == "missing_deepseek_api_key"
+    assert sku_report["verify_summary"]["not_verified"] == 2
+    assert sku_report["verify_outputs"] == []
+    assert sku_report["scores"]["citation"]["score"] == 100
 
 
 @pytest.mark.asyncio

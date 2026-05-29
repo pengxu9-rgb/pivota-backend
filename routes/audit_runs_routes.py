@@ -281,12 +281,16 @@ def _credit_requirements(
     sku_count: int,
     prompts_per_sku: int,
     providers: List[str],
+    verify_providers: Optional[List[str]] = None,
+    verify_sample: Optional[Dict[str, Any]] = None,
     custom_prompts: Optional[List[str]] = None,
 ) -> Dict[str, int]:
     audit_required, _usd_cogs = _audit_metering(
         sku_count=sku_count,
         prompts_per_sku=prompts_per_sku,
         providers=providers,
+        verify_providers=verify_providers,
+        verify_sample=verify_sample,
     )
     return {
         "audit": int(audit_required),
@@ -295,11 +299,36 @@ def _credit_requirements(
     }
 
 
+def _verify_probe_count_per_sku(
+    *,
+    prompts_per_sku: int,
+    verify_sample: Optional[Dict[str, Any]],
+) -> int:
+    sample = verify_sample or {}
+    try:
+        fraction = float(sample.get("positive_fraction", 0.25))
+    except (TypeError, ValueError):
+        fraction = 0.25
+    fraction = max(0.0, min(1.0, fraction))
+    cap = int(math.ceil(max(0, int(prompts_per_sku)) * fraction))
+    if fraction > 0 and int(prompts_per_sku) > 0:
+        cap = max(1, cap)
+    max_per_sku_raw = sample.get("max_per_sku")
+    if max_per_sku_raw is not None:
+        try:
+            cap = min(cap, max(0, int(max_per_sku_raw)))
+        except (TypeError, ValueError):
+            pass
+    return max(0, cap)
+
+
 def _audit_metering(
     *,
     sku_count: int,
     prompts_per_sku: int,
     providers: List[str],
+    verify_providers: Optional[List[str]] = None,
+    verify_sample: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, Decimal]:
     total_prompts = int(sku_count) * int(prompts_per_sku)
     credits_total = Decimal("0")
@@ -322,6 +351,24 @@ def _audit_metering(
         usd_cogs_total += (
             provider_probe_cost_usd(provider, grounded=grounded)
             * Decimal(probe_count)
+        )
+    verify_count_per_sku = _verify_probe_count_per_sku(
+        prompts_per_sku=prompts_per_sku,
+        verify_sample=verify_sample,
+    )
+    verify_probe_count = int(sku_count) * verify_count_per_sku
+    for provider in _normalize_nonempty(verify_providers):
+        if verify_probe_count <= 0:
+            continue
+        grounded = provider_default_grounded(provider)
+        per_probe_credits = Decimal(str(credits_for_probe(
+            provider,
+            grounded=grounded,
+        )))
+        credits_total += per_probe_credits * verify_probe_count
+        usd_cogs_total += (
+            provider_probe_cost_usd(provider, grounded=grounded)
+            * Decimal(verify_probe_count)
         )
     return int(math.ceil(float(credits_total))), usd_cogs_total
 
@@ -374,6 +421,8 @@ def _preview_cache_key(
     prompts_per_sku: int,
     coverage_profile: str,
     providers: List[str],
+    verify_providers: Optional[List[str]],
+    verify_sample: Optional[Dict[str, Any]],
     custom_prompts: Optional[List[str]],
 ) -> str:
     raw = {
@@ -382,6 +431,8 @@ def _preview_cache_key(
         "prompts_per_sku": int(prompts_per_sku),
         "coverage_profile": coverage_profile,
         "providers": sorted(providers),
+        "verify_providers": sorted(_normalize_nonempty(verify_providers)),
+        "verify_sample": verify_sample or {},
         "custom_prompts": _normalize_nonempty(custom_prompts),
     }
     return hashlib.sha256(repr(raw).encode("utf-8")).hexdigest()
@@ -465,12 +516,16 @@ async def _build_preview(
     coverage: Dict[str, Any],
 ) -> Dict[str, Any]:
     providers = list(coverage.get("providers") or [])
+    verify_providers = list(coverage.get("verify_providers") or [])
+    verify_sample = coverage.get("verify_sample") or {}
     cache_key = _preview_cache_key(
         merchant_id=merchant_id,
         sku_keys=sku_keys,
         prompts_per_sku=prompts_per_sku,
         coverage_profile=str(coverage.get("profile") or ""),
         providers=providers,
+        verify_providers=verify_providers,
+        verify_sample=verify_sample,
         custom_prompts=custom_prompts,
     )
     now = time.time()
@@ -484,6 +539,8 @@ async def _build_preview(
             sku_count=sku_count,
             prompts_per_sku=prompts_per_sku,
             providers=providers,
+            verify_providers=verify_providers,
+            verify_sample=verify_sample,
         )
         prompts_cached = int(total_prompts * 0.2)
         cache_hit_rate = (
@@ -503,7 +560,12 @@ async def _build_preview(
             "coverage_profile": coverage.get("profile"),
             "coverage_profile_label": coverage.get("label"),
             "providers": providers,
+            "verify_providers": verify_providers,
+            "verify_sample": verify_sample,
             "requested_providers": coverage.get("requested_providers") or providers,
+            "requested_verify_providers": (
+                coverage.get("requested_verify_providers") or verify_providers
+            ),
             "pending_engine_support": coverage.get("pending_engine_support") or [],
             "estimated_audit_credits": estimated_audit_credits,
             "estimated_prompt_credits": len(_normalize_nonempty(custom_prompts)),
@@ -516,6 +578,8 @@ async def _build_preview(
         sku_count=int(cost_part["sku_count"]),
         prompts_per_sku=int(cost_part["prompts_per_sku"]),
         providers=list(cost_part["providers"]),
+        verify_providers=list(cost_part.get("verify_providers") or []),
+        verify_sample=cost_part.get("verify_sample") or {},
         custom_prompts=custom_prompts,
     )
     gaps = _credit_gaps(requirements=requirements, balance=balance)
@@ -662,6 +726,8 @@ async def create_audit_run(
             providers=body.providers,
         )
         providers = list(coverage.get("providers") or [])
+        verify_providers = list(coverage.get("verify_providers") or [])
+        verify_sample = coverage.get("verify_sample") or {}
         provider_models = _resolve_audit_provider_models(
             providers=providers,
             model_overrides=body.model_overrides,
@@ -670,6 +736,8 @@ async def create_audit_run(
             sku_count=len(_normalize_nonempty(body.product_keys)),
             prompts_per_sku=body.prompts_per_sku,
             providers=providers,
+            verify_providers=verify_providers,
+            verify_sample=verify_sample,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -779,8 +847,14 @@ async def create_audit_run(
                     "coverage_profile": coverage.get("profile"),
                     "coverage_profile_label": coverage.get("label"),
                     "providers": providers,
+                    "verify_providers": verify_providers,
+                    "verify_sample": verify_sample,
                     "requested_providers": (
                         coverage.get("requested_providers") or providers
+                    ),
+                    "requested_verify_providers": (
+                        coverage.get("requested_verify_providers")
+                        or verify_providers
                     ),
                     "pending_engine_support": (
                         coverage.get("pending_engine_support") or []

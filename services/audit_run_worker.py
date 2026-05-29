@@ -369,6 +369,7 @@ async def _process_one_audit_run_inner(
                     ),
                     providers=launch_options.get("providers"),
                     model_overrides=launch_options.get("model_overrides"),
+                    prompts_per_sku=launch_options.get("prompts_per_sku"),
                     max_runs=3,
                     integration_state=integration_state,
                 )
