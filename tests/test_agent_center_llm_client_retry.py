@@ -227,3 +227,46 @@ async def test_probe_succeeds_first_try_no_retry_overhead(
 
     assert call_count["n"] == 1
     assert result["provider"] == "gemini"
+
+
+@pytest.mark.asyncio
+async def test_probe_sends_request_level_model_and_stamps_result(
+    configured_api_key: None,
+) -> None:
+    from services import agent_center_llm_client as llm_client
+
+    captured: Dict[str, Any] = {}
+
+    async def _post(self, url, **kwargs):
+        captured.update(kwargs.get("json") or {})
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "result": {
+                    "scan_mode": "open_product_visibility_test",
+                    "provider": "chatgpt",
+                    "runs_count": 1,
+                    "scores": {"visibility_score": 50},
+                    "findings": [],
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "raw_runs": [],
+                },
+            },
+        )
+
+    with patch.object(httpx.AsyncClient, "post", _post):
+        result = await llm_client.probe(
+            scan_mode="open_product_visibility_test",
+            scan_target_id="t1",
+            merchant_id="m1",
+            store_id="s1",
+            provider="chatgpt",
+            max_runs=1,
+            model="gpt-5.5-mini",
+            model_is_override=True,
+        )
+
+    assert captured["options"]["model"] == "gpt-5.5-mini"
+    assert result["model"] == "gpt-5.5-mini"
+    assert result["model_is_override"] is True

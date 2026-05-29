@@ -153,6 +153,8 @@ def _multi_provider_probe_runs() -> List[Dict[str, Any]]:
     runs.append(
         {
             "provider": "chatgpt",
+            "model": "chat-latest",
+            "model_is_override": False,
             "probe_run_id": "probe-2",
             "raw_runs": [
                 {
@@ -283,6 +285,51 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     assert report["axis_coverage"] == {"intent": 2, "concern": 2}
     assert report["verbatim_grounding_evidence"][0]["probe_run_id"] == "probe-1"
     assert report["failing_prompts"][0]["evidence_run_id"] == "probe-1"
+    assert report["provider_models"]["chatgpt"] == {
+        "model": "chat-latest",
+        "model_is_override": False,
+    }
+    assert report["model_is_override"] is False
+
+
+@pytest.mark.asyncio
+async def test_per_sku_report_and_cost_summary_stamp_model_override(monkeypatch):
+    from services import agent_center_bd_report_service as bd
+
+    async def fake_load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
+        ctx = _base_sku_ctx()
+        ctx["sku_key"] = sku_key
+        ctx["merchant_id"] = merchant_id
+        return ctx
+
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+        runs = _multi_provider_probe_runs()
+        runs[1]["model"] = "gpt-5.5-mini"
+        runs[1]["model_is_override"] = True
+        runs[1]["default_model"] = "chat-latest"
+        return runs
+
+    monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
+    monkeypatch.setattr(bd, "load_per_sku_probe_runs", fake_load_runs)
+
+    report = await bd.build_per_sku_report("sku-1", "m-1", "audit-1")
+    assert report["provider_models"]["chatgpt"] == {
+        "model": "gpt-5.5-mini",
+        "model_is_override": True,
+        "default_model": "chat-latest",
+    }
+    assert report["model_is_override"] is True
+
+    cost_summary = await bd._cost_summary_for_per_sku_audit(
+        None,
+        {"sku-1": await fake_load_runs("sku-1", "m-1", "audit-1")},
+    )
+    assert cost_summary["provider_models"]["chatgpt"] == {
+        "model": "gpt-5.5-mini",
+        "model_is_override": True,
+        "default_model": "chat-latest",
+    }
+    assert cost_summary["model_is_override"] is True
 
 
 def test_build_brand_rollup_priority_queue_ordering():
