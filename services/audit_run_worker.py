@@ -262,6 +262,13 @@ async def _process_one_audit_run_inner(
             to_stage=mar.STAGE_CANCELLED,
             worker_id=WORKER_ID,
         )
+        if ok and _should_refund_cancelled_launch(row, at_stage=at_stage):
+            await _refund_launch_debits(
+                merchant_id=merchant_id,
+                run_id=run_id,
+                launch_options=launch_options,
+                reason=f"cancelled_{at_stage}",
+            )
         logger.info(
             "audit_run_worker: cancellation detected at stage=%s "
             "run_id=%s finalized=%s",
@@ -337,6 +344,7 @@ async def _process_one_audit_run_inner(
             )
             from services.agent_center_bd_report_service import (
                 run_brand_report,
+                run_per_sku_audit_probe_fanout,
             )
             # P5.8.6c: lease-heartbeat task. Original code called
             # extend_lease ONCE at the start of probing (15min
@@ -359,29 +367,110 @@ async def _process_one_audit_run_inner(
                 name=f"audit-lease-heartbeat-{run_id[:8]}",
             )
             try:
-                brand_report = await run_brand_report(
-                    merchant_name=str(merchant_name),
-                    merchant_domain=merchant_domain,
-                    products=products,
-                    coverage_profile=(
-                        launch_options.get("coverage_profile")
-                        or "us_shopper"
-                    ),
-                    providers=launch_options.get("providers"),
-                    model_overrides=launch_options.get("model_overrides"),
-                    prompts_per_sku=launch_options.get("prompts_per_sku"),
-                    max_runs=3,
-                    integration_state=integration_state,
+                audit_mode = _launch_audit_mode(launch_options)
+                coverage_profile = (
+                    launch_options.get("coverage_profile")
+                    or "us_shopper"
                 )
+                prompts_per_sku = _launch_prompts_per_sku(launch_options)
+                if audit_mode == "per_sku":
+                    probe_runs_by_sku = await run_per_sku_audit_probe_fanout(
+                        merchant_id=merchant_id,
+                        audit_run_id=run_id,
+                        products=products,
+                        coverage_profile=coverage_profile,
+                        providers=launch_options.get("providers"),
+                        model_overrides=launch_options.get("model_overrides"),
+                        prompts_per_sku=prompts_per_sku,
+                    )
+                    await mar.record_partial_result(
+                        run_id=run_id,
+                        worker_id=WORKER_ID,
+                        partial_result_jsonb={
+                            "per_sku_probe_runs": probe_runs_by_sku,
+                            "probing": {
+                                "audit_mode": "per_sku",
+                                "prompts_per_sku": prompts_per_sku,
+                                "per_sku_probe_payloads_persisted": sum(
+                                    len(v) for v in probe_runs_by_sku.values()
+                                ),
+                                "sku_count": len(probe_runs_by_sku),
+                            },
+                        },
+                    )
+                    brand_report = await run_brand_report(
+                        merchant_name=str(merchant_name),
+                        merchant_domain=merchant_domain,
+                        products=products,
+                        coverage_profile=coverage_profile,
+                        providers=launch_options.get("providers"),
+                        model_overrides=launch_options.get("model_overrides"),
+                        prompts_per_sku=prompts_per_sku,
+                        max_runs=prompts_per_sku,
+                        integration_state=integration_state,
+                        audit_mode="per_sku",
+                        merchant_id=merchant_id,
+                        audit_run_id=run_id,
+                        verify_providers=launch_options.get("verify_providers"),
+                    )
+                else:
+                    brand_report = await run_brand_report(
+                        merchant_name=str(merchant_name),
+                        merchant_domain=merchant_domain,
+                        products=products,
+                        coverage_profile=coverage_profile,
+                        providers=launch_options.get("providers"),
+                        model_overrides=launch_options.get("model_overrides"),
+                        prompts_per_sku=launch_options.get("prompts_per_sku"),
+                        max_runs=3,
+                        integration_state=integration_state,
+                    )
             finally:
                 heartbeat_task.cancel()
                 # Don't await — fire-and-forget cancellation.
                 # The task's cleanup is best-effort.
+
+            mock_reports = _detect_mock_audit_output(brand_report or {})
+            if mock_reports:
+                first_reason = (
+                    (mock_reports[0].get("upstream_status") or {}).get("reason")
+                    or "Upstream returned mock data."
+                )
+                await mar.transition_stage(
+                    run_id=run_id,
+                    from_stage=mar.STAGE_PROBING,
+                    to_stage=mar.STAGE_FAILED,
+                    worker_id=WORKER_ID,
+                    error_jsonb={
+                        "code": "upstream_mock_fallback",
+                        "stage": "probing",
+                        "message": (
+                            "Audit pipeline upstream returned synthetic "
+                            "fallback data; refusing to persist a completed "
+                            "merchant audit."
+                        ),
+                        "reason": first_reason,
+                        "mock_reports_count": len(mock_reports),
+                    },
+                )
+                await _refund_launch_debits(
+                    merchant_id=merchant_id,
+                    run_id=run_id,
+                    launch_options=launch_options,
+                    reason="upstream_mock_fallback",
+                )
+                logger.error(
+                    "audit_run_worker: refusing mock-derived audit "
+                    "run_id=%s merchant=%s mock_reports=%d reason=%s",
+                    run_id, merchant_id, len(mock_reports), first_reason,
+                )
+                return True
             aggregate = brand_report.get("aggregate") or {}
             await mar.record_partial_result(
                 run_id=run_id, worker_id=WORKER_ID,
                 partial_result_jsonb={
                     "probing": {
+                        "audit_mode": brand_report.get("audit_mode") or "legacy",
                         "products_succeeded": aggregate.get("products_succeeded"),
                         "products_failed": aggregate.get("products_failed"),
                         "avg_visibility": aggregate.get("avg_visibility"),
@@ -749,6 +838,184 @@ async def run_stale_lease_reaper_tick() -> None:
 # =====================================================================
 
 
+def _launch_audit_mode(launch_options: Dict[str, Any]) -> str:
+    mode = str((launch_options or {}).get("audit_mode") or "legacy").strip().lower()
+    return "per_sku" if mode == "per_sku" else "legacy"
+
+
+def _launch_prompts_per_sku(launch_options: Dict[str, Any]) -> int:
+    try:
+        return max(1, int((launch_options or {}).get("prompts_per_sku") or 40))
+    except (TypeError, ValueError):
+        return 40
+
+
+def _launch_debit_items(launch_options: Dict[str, Any]) -> List[Dict[str, Any]]:
+    launch = launch_options or {}
+    debited = launch.get("debited")
+    if isinstance(debited, list) and debited:
+        return [item for item in debited if isinstance(item, dict)]
+    fallback: List[Dict[str, Any]] = []
+    for kind, key in (
+        ("audit", "estimated_audit_credits"),
+        ("prompt", "estimated_prompt_credits"),
+        ("execution", "estimated_execution_credits"),
+    ):
+        try:
+            amount = int(launch.get(key) or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        if amount > 0:
+            fallback.append({
+                "kind": kind,
+                "amount": amount,
+                "replay": False,
+                "purchased_credits": 0,
+            })
+    return fallback
+
+
+async def _refund_launch_debits(
+    *,
+    merchant_id: str,
+    run_id: str,
+    launch_options: Dict[str, Any],
+    reason: str,
+) -> None:
+    items = _launch_debit_items(launch_options)
+    if not items:
+        logger.info(
+            "audit_run_worker: no launch debit metadata to refund "
+            "run_id=%s reason=%s",
+            run_id, reason,
+        )
+        return
+    from services.merchant_credit_balance_service import credit
+    for item in reversed(items):
+        if item.get("replay"):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        try:
+            amount = int(item.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        if not kind or amount <= 0:
+            continue
+        try:
+            purchased_credits = int(item.get("purchased_credits") or 0)
+        except (TypeError, ValueError):
+            purchased_credits = 0
+        await credit(
+            merchant_id,
+            kind,  # type: ignore[arg-type]
+            amount,
+            source_event_id=f"refund:audit_run:{run_id}:{reason}:{kind}",
+            usd_cogs=0,
+            purchased_credits=purchased_credits,
+        )
+
+
+def _has_recorded_probe_payloads(partial_result_jsonb: Any) -> bool:
+    if not isinstance(partial_result_jsonb, dict):
+        return False
+    payload = partial_result_jsonb.get("per_sku_probe_runs")
+    if isinstance(payload, dict) and any(payload.values()):
+        return True
+    probing = partial_result_jsonb.get("probing")
+    if isinstance(probing, dict):
+        try:
+            return int(probing.get("per_sku_probe_payloads_persisted") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _should_refund_cancelled_launch(
+    row: Dict[str, Any],
+    *,
+    at_stage: str,
+) -> bool:
+    if at_stage in {"queued", "discovering"}:
+        return True
+    if at_stage == "probing":
+        return not _has_recorded_probe_payloads(
+            (row or {}).get("partial_result_jsonb")
+        )
+    return False
+
+
+def _mock_provider_reason(provider: Any) -> Optional[str]:
+    value = str(provider or "").strip().lower()
+    if not value:
+        return None
+    if value == "mock" or value.startswith("mock_"):
+        return value
+    if value.startswith("local_mock"):
+        return value
+    return None
+
+
+def _detect_mock_provider_markers(value: Any) -> List[Dict[str, Any]]:
+    found: List[Dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_reason = _mock_provider_reason(key)
+            if key_reason:
+                found.append({
+                    "upstream_status": {
+                        "is_real": False,
+                        "reason": key_reason,
+                        "provider": key,
+                    },
+                })
+            if key in {
+                "provider",
+                "_provider",
+                "visibility_provider",
+                "attribution_provider",
+            }:
+                reason = _mock_provider_reason(item)
+                if reason:
+                    found.append({
+                        "upstream_status": {
+                            "is_real": False,
+                            "reason": reason,
+                            "provider": item,
+                        },
+                    })
+            if isinstance(item, (dict, list)):
+                found.extend(_detect_mock_provider_markers(item))
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, (dict, list)):
+                found.extend(_detect_mock_provider_markers(item))
+    return found
+
+
+def _detect_mock_audit_output(brand_report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Detect explicit mock fallback output on legacy and v3 report shapes."""
+    detected: List[Dict[str, Any]] = []
+    try:
+        from routes.merchant_audit_routes import _detect_mock_per_product
+        detected.extend(_detect_mock_per_product(brand_report or {}))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "audit_run_worker: legacy mock detector failed: %s",
+            str(exc)[:200],
+        )
+    detected.extend(_detect_mock_provider_markers(brand_report or {}))
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in detected:
+        status = item.get("upstream_status") if isinstance(item, dict) else {}
+        reason = (status or {}).get("reason") or str(item)[:200]
+        if reason in seen:
+            continue
+        seen.add(reason)
+        out.append(item)
+    return out
+
+
 async def _resolve_merchant_and_products(
     *, merchant_id: str, product_keys: List[str],
 ) -> tuple:
@@ -831,6 +1098,8 @@ async def _resolve_merchant_and_products(
             url_source = "pivota_canonical_pdp"
             pivota_url_used.append(r["product_key"])
         products.append({
+            "product_key": r["product_key"],
+            "sku_key": r["product_key"],
             "title": r["title"],
             "vendor": r["brand"],
             "product_type": r["product_type"],
