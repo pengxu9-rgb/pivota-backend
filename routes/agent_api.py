@@ -89,6 +89,7 @@ from services.payment_offer_evidence_service import (
     stable_payment_offer_hash,
 )
 from services.refund_observability import build_order_refund_tracking_payload
+from services.order_confirmation_email_service import order_confirmation_email_enabled
 from services.store_discount_evidence_service import enrich_product_cards_with_store_discounts
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
@@ -178,6 +179,64 @@ _TERMINAL_CONFIRM_PAYMENT_STATUSES = {
     "refunded",
     "partially_refunded",
 }
+
+
+def _report_order_confirmation_email_exception(exc: Exception, *, order_id: str, operation: str) -> None:
+    try:
+        from config.sentry_config import capture_exception
+
+        capture_exception(
+            exc,
+            {
+                "component": "agent_confirm_payment",
+                "operation": operation,
+                "order_id": order_id,
+            },
+        )
+    except Exception:
+        logger.debug("order confirmation email reporting failed", exc_info=True)
+
+
+async def _send_order_confirmation_email_background(order_id: str) -> None:
+    try:
+        from services.order_confirmation_email_service import send_order_confirmation_email_once
+
+        await send_order_confirmation_email_once(order_id)
+    except Exception as exc:
+        logger.warning(
+            "order_confirmation_email.background_failed order_id=%s error=%s",
+            order_id,
+            type(exc).__name__,
+        )
+        _report_order_confirmation_email_exception(exc, order_id=order_id, operation="background_send")
+
+
+def _maybe_enqueue_order_confirmation_email(
+    *,
+    background_tasks: BackgroundTasks,
+    order: Dict[str, Any],
+) -> None:
+    try:
+        if not order_confirmation_email_enabled():
+            return
+
+        order_id = str(order.get("order_id") or "").strip()
+        if not order_id or not str(order.get("customer_email") or "").strip():
+            return
+
+        metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+        if str(metadata.get("order_confirmation_email_sent_at") or "").strip():
+            return
+
+        background_tasks.add_task(_send_order_confirmation_email_background, order_id)
+    except Exception as exc:
+        oid = str(order.get("order_id") or "").strip() if isinstance(order, dict) else ""
+        logger.warning(
+            "order_confirmation_email.enqueue_failed order_id=%s error=%s",
+            oid,
+            type(exc).__name__,
+        )
+        _report_order_confirmation_email_exception(exc, order_id=oid, operation="enqueue")
 
 
 def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[Dict[str, Any]]) -> None:
@@ -8889,7 +8948,7 @@ async def agent_confirm_payment(
                     merchant_id=order["merchant_id"],
                     order_id=order_id,
                 )
-                return {
+                response = {
                     "status": "success",
                     "message": "Payment authorized, merchant order created, and payment captured",
                     "order_id": order_id,
@@ -8899,6 +8958,8 @@ async def agent_confirm_payment(
                     "shopify_sync": "completed",
                     "linked_merchant_order": auth_result.get("linked_merchant_order"),
                 }
+                _maybe_enqueue_order_confirmation_email(background_tasks=background_tasks, order=order)
+                return response
             if auth_status.startswith("merchant_order_failed") or auth_status == "payment_capture_failed":
                 raise HTTPException(
                     status_code=409,
@@ -8964,13 +9025,15 @@ async def agent_confirm_payment(
                     order_id=order_id,
                 )
 
-                return {
+                response = {
                     "status": "success",
                     "message": "Order already paid; Shopify sync initiated",
                     "order_id": order_id,
                     "payment_intent_id": order.get("payment_intent_id"),
                     "shopify_sync": "initiated",
                 }
+                _maybe_enqueue_order_confirmation_email(background_tasks=background_tasks, order=order)
+                return response
 
             background_tasks.add_task(
                 log_agent_request,
@@ -8980,7 +9043,7 @@ async def agent_confirm_payment(
                 order_id=order_id,
             )
 
-            return {
+            response = {
                 "status": "success",
                 "message": "Order already paid",
                 "order_id": order_id,
@@ -8988,6 +9051,8 @@ async def agent_confirm_payment(
                 "shopify_sync": "already_linked" if order.get("shopify_order_id") else ("not_configured" if not can_shopify_sync else "missing_shopify_order_id"),
                 "shopify_order_id": order.get("shopify_order_id"),
             }
+            _maybe_enqueue_order_confirmation_email(background_tasks=background_tasks, order=order)
+            return response
 
         payment_verified, psp_status, psp_error = await verify_order_payment_succeeded(order)
         if not payment_verified:
@@ -9110,13 +9175,15 @@ async def agent_confirm_payment(
             order_id=order_id
         )
         
-        return {
+        response = {
             "status": "success",
             "message": "Payment confirmed, Shopify order creation initiated" if can_shopify_sync else "Payment confirmed",
             "order_id": order_id,
             "payment_intent_id": order.get("payment_intent_id"),
             "shopify_sync": "initiated" if can_shopify_sync else "not_configured",
         }
+        _maybe_enqueue_order_confirmation_email(background_tasks=background_tasks, order=order)
+        return response
         
     except HTTPException:
         raise

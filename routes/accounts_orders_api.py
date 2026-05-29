@@ -58,6 +58,7 @@ from db.accounts import (
 from db.orders import orders as orders_table
 from db.products import products_cache
 from utils.auth import create_access_token, decode_token, hash_password, verify_password
+from utils.order_track_token import verify_order_track_token
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from services.ugc_capabilities_service import (
     UgcSubject,
@@ -1082,16 +1083,9 @@ async def _load_public_order_for_customer(
     order_id: str,
     email: EmailStr,
 ) -> Dict[str, Any]:
-    ip = _get_client_ip(request)
+    ip = await _enforce_public_lookup_ip_limit(request)
     norm_email = normalize_email(str(email))
 
-    ip_count = await count_recent_public_lookup_by_ip(ip)
-    if ip_count > PUBLIC_LOOKUP_IP_LIMIT_PER_MINUTE:
-        raise _error(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Too many requests from this IP. Please try again later.",
-        )
     pair_count = await count_recent_public_lookup_by_key(norm_email, order_id)
     if pair_count > PUBLIC_LOOKUP_PAIR_LIMIT_PER_MINUTE:
         raise _error(
@@ -1100,25 +1094,60 @@ async def _load_public_order_for_customer(
             "Too many requests for this order. Please try again later.",
         )
 
+    order_data = await _load_public_order_by_id(order_id)
+    if normalize_email(order_data.get("customer_email", "")) != norm_email:
+        raise _public_order_not_found()
+
+    await record_public_lookup(ip, norm_email, order_id)
+    return order_data
+
+
+def _public_order_not_found() -> HTTPException:
+    return _error(
+        status.HTTP_404_NOT_FOUND,
+        "NOT_FOUND",
+        "Order not found or email mismatch",
+    )
+
+
+async def _enforce_public_lookup_ip_limit(request: Request) -> str:
+    ip = _get_client_ip(request)
+    ip_count = await count_recent_public_lookup_by_ip(ip)
+    if ip_count > PUBLIC_LOOKUP_IP_LIMIT_PER_MINUTE:
+        raise _error(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Too many requests from this IP. Please try again later.",
+        )
+    return ip
+
+
+async def _load_public_order_by_id(order_id: str) -> Dict[str, Any]:
     order = await database.fetch_one(
         orders_table.select().where(orders_table.c.order_id == order_id)
     )
     if not order:
-        raise _error(
-            status.HTTP_404_NOT_FOUND,
-            "NOT_FOUND",
-            "Order not found or email mismatch",
-        )
+        raise _public_order_not_found()
 
-    order_data = dict(order)
-    if normalize_email(order_data.get("customer_email", "")) != norm_email:
-        raise _error(
-            status.HTTP_404_NOT_FOUND,
-            "NOT_FOUND",
-            "Order not found or email mismatch",
-        )
+    return dict(order)
 
-    await record_public_lookup(ip, norm_email, order_id)
+
+async def _load_public_order_for_track_token(
+    request: Request,
+    *,
+    token: str,
+) -> Dict[str, Any]:
+    ip = await _enforce_public_lookup_ip_limit(request)
+    order_id = verify_order_track_token(token)
+    if not order_id:
+        raise _public_order_not_found()
+
+    order_data = await _load_public_order_by_id(order_id)
+    await record_public_lookup(
+        ip,
+        normalize_email(order_data.get("customer_email", "")),
+        order_id,
+    )
     return order_data
 
 
@@ -3907,7 +3936,22 @@ async def public_track(
         order_id=order_id,
         email=email,
     )
+    return _build_public_track_response(order_data)
 
+
+@router.get("/public/track-by-token", response_model=PublicTrackResponse)
+async def public_track_by_token(
+    request: Request,
+    token: str = Query(...),
+):
+    order_data = await _load_public_order_for_track_token(
+        request,
+        token=token,
+    )
+    return _build_public_track_response(order_data)
+
+
+def _build_public_track_response(order_data: Dict[str, Any]) -> PublicTrackResponse:
     payment_status_mapped = _map_payment_status(order_data.get("payment_status"))
     fulfillment_status_mapped = _map_fulfillment_status(
         order_data.get("fulfillment_status")
@@ -3958,7 +4002,7 @@ async def public_track(
         )
 
     return PublicTrackResponse(
-        order_id=order_id,
+        order_id=str(order_data.get("order_id") or ""),
         delivery_status=delivery_status,
         timeline=timeline,
     )
