@@ -239,6 +239,7 @@ async def test_agent_confirm_payment_backend_owned_still_marks_paid(
     async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
         return {"platform": "shopify", "api_key": "shp_key"}
 
+    monkeypatch.delenv("ORDER_CONFIRMATION_EMAIL_ENABLED", raising=False)
     monkeypatch.setattr(agent_api, "validate_request_compat", fake_validate_request)
     monkeypatch.setattr(order_routes_module, "get_order", fake_get_order)
     monkeypatch.setattr(order_routes_module, "mark_order_paid", fake_mark_order_paid)
@@ -277,6 +278,7 @@ async def test_agent_confirm_payment_backend_owned_still_marks_paid(
     assert "fake_create_shopify_order" in queued_task_names
     assert "log_agent_request" in queued_task_names
     assert "emit_agent_webhook_event" in queued_task_names
+    assert "_send_order_confirmation_email_background" not in queued_task_names
 
 
 @pytest.mark.asyncio
