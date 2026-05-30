@@ -81,7 +81,7 @@ def _patch_downstream(monkeypatch, mp, *, decision="pass", published=True,
     monkeypatch.setattr(mp, "parse_product_key", lambda pk: tuple(pk.split("|")))
 
 
-def _url(merchant_owns=True):
+def _url():
     return f"/merchant/pdps/product/{PLATFORM}/{PRODUCT_ID}/approve"
 
 

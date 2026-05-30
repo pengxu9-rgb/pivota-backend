@@ -5360,6 +5360,10 @@ _OVERLAY_PROVENANCE_BY_ACTOR = {
     REVIEW_ACTOR_HUMAN: "ops_approved",
 }
 
+# Retry budget for the overlay supersede+insert pair vs the active unique index
+# under concurrent publishes (see materialize_overlay_from_module).
+_OVERLAY_MATERIALIZE_MAX_ATTEMPTS = 3
+
 
 def _overlay_copy_description(payload: Dict[str, Any]) -> Optional[str]:
     """Extract the description body from a published 'copy' module payload."""
@@ -5406,40 +5410,49 @@ async def materialize_overlay_from_module(
         value = extractor(payload)
         if value is None:
             continue
-        # Supersede prior active overlay + insert the new one atomically. The
-        # partial unique index uq_merchant_product_overlay_active enforces at most
-        # one active row per (product_key, module_key, field_key); the transaction
-        # keeps concurrent publishes from both superseding then double-inserting
-        # (which would raise on the unique index and leave the module diverged from
-        # the active overlay). A serialized supersede->insert is correct here.
-        async with database.transaction():
-            await database.execute(
-                merchant_product_overlay.update()
-                .where(
-                    (merchant_product_overlay.c.product_key == product_key)
-                    & (merchant_product_overlay.c.module_key == module_key)
-                    & (merchant_product_overlay.c.field_key == field_key)
-                    & (merchant_product_overlay.c.approval_status == "active")
-                )
-                .values(approval_status="superseded", updated_at=now)
-            )
-            await database.execute(
-                merchant_product_overlay.insert().values(
-                    overlay_id=f"ovl_{uuid.uuid4().hex}",
-                    product_key=product_key,
-                    content_key=None,
-                    module_key=module_key,
-                    field_key=field_key,
-                    value_jsonb=value,
-                    provenance=provenance,
-                    source_version_id=published_version_id,
-                    approval_status="active",
-                    approved_by=actor_id,
-                    approved_at=now,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
+        # Supersede prior active overlay + insert the new one. The partial unique
+        # index uq_merchant_product_overlay_active enforces at most one active row
+        # per (product_key, module_key, field_key). The transaction makes each
+        # supersede+insert atomic; the retry handles the residual race where two
+        # concurrent publishers both supersede then both insert -> the loser hits
+        # the unique index, retries (re-supersedes the winner's row, inserts its
+        # own), and the table converges to exactly one active row.
+        for attempt in range(_OVERLAY_MATERIALIZE_MAX_ATTEMPTS):
+            try:
+                async with database.transaction():
+                    await database.execute(
+                        merchant_product_overlay.update()
+                        .where(
+                            (merchant_product_overlay.c.product_key == product_key)
+                            & (merchant_product_overlay.c.module_key == module_key)
+                            & (merchant_product_overlay.c.field_key == field_key)
+                            & (merchant_product_overlay.c.approval_status == "active")
+                        )
+                        .values(approval_status="superseded", updated_at=now)
+                    )
+                    await database.execute(
+                        merchant_product_overlay.insert().values(
+                            overlay_id=f"ovl_{uuid.uuid4().hex}",
+                            product_key=product_key,
+                            content_key=None,
+                            module_key=module_key,
+                            field_key=field_key,
+                            value_jsonb=value,
+                            provenance=provenance,
+                            source_version_id=published_version_id,
+                            approval_status="active",
+                            approved_by=actor_id,
+                            approved_at=now,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                break
+            except Exception:
+                if attempt + 1 >= _OVERLAY_MATERIALIZE_MAX_ATTEMPTS:
+                    raise
+                # lost the race on the active unique index; retry the pair
+                continue
         written += 1
     return written
 

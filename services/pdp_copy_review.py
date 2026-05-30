@@ -56,14 +56,20 @@ _COST_PER_1K_OUTPUT_USD = 0.00028
 
 def _resolve_deepseek_rates(model_id: str) -> Tuple[float, float]:
     """(input_per_1k, output_per_1k) for the configured DeepSeek model.
-    Falls back to the headline deepseek-chat rates if the registry is unavailable."""
+
+    provider_registry.rate_for_model() returns a dict
+    {"input_per_1k": float, "output_per_1k": float}; normalize it to a numeric
+    tuple. Falls back to the headline deepseek-chat rates if the registry is
+    unavailable or returns a malformed shape (never raises)."""
     try:
         from services.llm_providers.provider_registry import get_provider
 
         provider = get_provider(_PROBE_PROVIDER)
         if provider is not None:
-            return provider.rate_for_model(model_id)
-    except Exception:
+            rates = provider.rate_for_model(model_id)
+            if isinstance(rates, dict):
+                return float(rates["input_per_1k"]), float(rates["output_per_1k"])
+    except Exception:  # registry missing / malformed shape -> safe fallback
         pass
     return _COST_PER_1K_INPUT_USD, _COST_PER_1K_OUTPUT_USD
 
