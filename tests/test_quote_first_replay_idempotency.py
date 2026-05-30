@@ -237,7 +237,6 @@ async def test_agent_create_order_replay_returns_cached_response(monkeypatch: py
         monkeypatch.setattr(agent_api_module, "log_agent_request", noop_log_agent_request)
 
         # Use an in-memory idempotency store behind the Postgres interface.
-        import mvp.idempotency as idempotency_module
         from mvp.idempotency import InMemoryIdempotencyStore
 
         shared_store = InMemoryIdempotencyStore()
@@ -249,7 +248,7 @@ async def test_agent_create_order_replay_returns_cached_response(monkeypatch: py
             async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
                 return await shared_store.put(scope=scope, key=key, value=value)
 
-        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+        monkeypatch.setattr(agent_api_module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
 
         # Ensure the underlying order creation is only executed once; the second call must replay.
         import routes.order_routes as order_routes_module
@@ -341,7 +340,6 @@ async def test_agent_create_order_replays_existing_order_before_recreating(monke
     app.dependency_overrides[get_agent_context] = _override_get_agent_context
     try:
         import mvp.events as mvp_events
-        import mvp.idempotency as idempotency_module
         import mvp.ledger_events as ledger_events
         import services.agent_governance as governance_module
         import services.agent_webhook_service as agent_webhook_service
@@ -387,7 +385,7 @@ async def test_agent_create_order_replays_existing_order_before_recreating(monke
             async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
                 return None
 
-        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+        monkeypatch.setattr(agent_api_module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
 
         expected = {
             "status": "success",
@@ -461,7 +459,6 @@ async def test_agent_create_order_busy_replays_existing_order_without_second_cre
     app.dependency_overrides[get_agent_context] = _override_get_agent_context
     try:
         import mvp.events as mvp_events
-        import mvp.idempotency as idempotency_module
         import mvp.ledger_events as ledger_events
         import services.agent_governance as governance_module
         import services.agent_webhook_service as agent_webhook_service
@@ -503,7 +500,7 @@ async def test_agent_create_order_busy_replays_existing_order_without_second_cre
             async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
                 return None
 
-        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+        monkeypatch.setattr(agent_api_module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
 
         replay_checks = {"count": 0}
         expected = {
@@ -586,7 +583,6 @@ async def test_agent_create_order_busy_retries_once_when_no_existing_order(monke
     app.dependency_overrides[get_agent_context] = _override_get_agent_context
     try:
         import mvp.events as mvp_events
-        import mvp.idempotency as idempotency_module
         import mvp.ledger_events as ledger_events
         import services.agent_governance as governance_module
         import services.agent_webhook_service as agent_webhook_service
@@ -633,7 +629,7 @@ async def test_agent_create_order_busy_retries_once_when_no_existing_order(monke
             async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
                 return None
 
-        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+        monkeypatch.setattr(agent_api_module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
 
         async def fake_load_replayable_agent_order_create_response(order_request: Any):
             return None
@@ -726,7 +722,6 @@ async def test_agent_create_order_success_ignores_usage_logging_busy_error(monke
     app.dependency_overrides[get_agent_context] = _override_get_agent_context
     try:
         import mvp.events as mvp_events
-        import mvp.idempotency as idempotency_module
         import mvp.ledger_events as ledger_events
         import services.agent_governance as governance_module
         import services.agent_webhook_service as agent_webhook_service
@@ -769,7 +764,7 @@ async def test_agent_create_order_success_ignores_usage_logging_busy_error(monke
             async def put(self, *, scope: str, key: str, value: Dict[str, Any]):
                 return None
 
-        monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+        monkeypatch.setattr(agent_api_module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
 
         async def fake_get_primary_store(merchant_id: str):
             return {"platform": "shopify", "store_id": "store_test"}

@@ -143,7 +143,6 @@ def _install_agent_create_order_harness(
     import db.agent_product_events as product_events_module
     import db.orders as orders_module
     import mvp.events as mvp_events
-    import mvp.idempotency as idempotency_module
     import mvp.ledger_events as ledger_events
     import routes.agent_api as module
     import routes.order_routes as order_routes_module
@@ -262,7 +261,7 @@ def _install_agent_create_order_harness(
     )
     monkeypatch.setattr(quote_service.QuoteService, "load_active_quote_or_raise", fake_quote_load)
     monkeypatch.setattr(shopify_policy_service, "get_latest_policy_hashes", fake_get_latest_policy_hashes)
-    monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+    monkeypatch.setattr(module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
     monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_kwargs: None)
     monkeypatch.setattr(ledger_events, "emit_ledger_event_best_effort", lambda **_kwargs: None)
 
