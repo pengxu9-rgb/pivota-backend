@@ -621,7 +621,7 @@ async def test_load_sku_context_falls_back_to_catalog_product_title(monkeypatch)
 
     assert ctx["product"]["title"] == "Triple Shine Grape"
     assert specs
-    assert all("Triple Shine Grape" in query or "supplement" in query for query, _axis in specs)
+    assert any("Triple Shine Grape" in query for query, _axis in specs)
     assert not any("ts_test_ownist_001_p1" in query for query, _axis in specs)
 
 
@@ -661,3 +661,55 @@ async def test_run_per_sku_audit_skips_when_real_title_missing(monkeypatch):
     assert skipped["missing_inputs"] == ["catalog_products.title"]
     assert skipped["runs_count"] == 0
     assert skipped["raw_runs"] == []
+
+
+def test_build_per_sku_audit_query_specs_uses_discovery_axes_without_padding():
+    from services import agent_center_bd_report_service as bd
+
+    sku_ctx = {
+        "sku_key": "ts_test_ownist_001_p1",
+        "sku": {},
+        "product": {
+            "title": "Triple Shine Grape",
+            "brand": "Ownist",
+            "category": "supplement",
+            "origin_country": "Korea",
+        },
+        "product_enrichment": {
+            "audience_tags": ["k-beauty enthusiasts"],
+            "bullet_points": ["marine collagen"],
+        },
+    }
+
+    specs = bd._build_per_sku_audit_query_specs(sku_ctx, 40)
+    queries = [query for query, _axis in specs]
+    discovery = [query for query, axis in specs if axis == "discovery"]
+
+    assert len(discovery) >= 3
+    assert "best supplement" in queries
+    assert "best supplement for k-beauty enthusiasts" in queries
+    assert "marine collagen supplement" in queries
+    padding_marker = "shopper" + " question"
+    assert not any(padding_marker in query for query in queries)
+
+
+def test_build_per_sku_audit_query_specs_sparse_catalog_not_padded():
+    from services import agent_center_bd_report_service as bd
+
+    sku_ctx = {
+        "sku_key": "sku-real-title",
+        "sku": {},
+        "product": {
+            "title": "Triple Shine Grape",
+            "brand": "Ownist",
+        },
+        "product_enrichment": {},
+    }
+
+    specs = bd._build_per_sku_audit_query_specs(sku_ctx, 40)
+    queries = [query for query, _axis in specs]
+
+    assert 0 < len(specs) < 20
+    assert len(specs) != 40
+    padding_marker = "shopper" + " question"
+    assert not any(padding_marker in query for query in queries)

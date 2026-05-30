@@ -46,6 +46,7 @@ _ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
 _ANSWER_QUALITY_VERIFY_PROVIDER = "deepseek"
 _PER_SKU_AUDIT_PROBE_SCAN_MODE = "open_product_visibility_test"
 _PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 8
+_PER_SKU_AUDIT_DISCOVERY_FLOOR = 8
 logger = logging.getLogger(__name__)
 _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
     "Verified citation-positive prompts keep their deterministic "
@@ -54,6 +55,30 @@ _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
     "verified prompts contribute 0 to answer_quality_rate. "
     "Deterministic first_party, sku_mention, and authority buckets are "
     "unchanged."
+)
+
+DISCOVERY_TEMPLATES: Tuple[Tuple[str, str], ...] = (
+    ("best {category}", "discovery"),
+    ("top {category} brands", "discovery"),
+    ("new {category} brands", "discovery"),
+    ("{category} brands comparison", "discovery"),
+    ("what {category} should I buy", "discovery"),
+    ("best {category} for {audience}", "discovery"),
+    ("{category} for {use_case}", "discovery"),
+    ("best {country} {category}", "origin"),
+    ("{country} {category} brands", "origin"),
+    ("{format} {category}", "format"),
+    ("where to buy {format} {category} online", "format"),
+    ("{ingredient} {category}", "ingredient"),
+    ("best {ingredient} {category}", "ingredient"),
+    ("is {brand} a good brand", "comparison"),
+    ("{brand} vs competitors", "comparison"),
+    ("{brand} reviews reddit", "review"),
+    ("{brand} {category}", "brand"),
+    ("buy {brand} {category} online", "brand"),
+    ("buy {title} online", "intent"),
+    ("{title} reviews", "review"),
+    ("is {title} worth it", "review"),
 )
 
 
@@ -3799,6 +3824,61 @@ def _resolve_audit_title(
     return None
 
 
+def _clean_slot(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return re.sub(r"\s+", " ", value.strip())
+    return None
+
+
+def _slot_list(value: Any, *, limit: int = 6) -> List[str]:
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, tuple):
+        raw_items = list(value)
+    else:
+        raw_items = []
+    out: List[str] = []
+    seen = set()
+    for item in raw_items:
+        cleaned = _clean_slot(item)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _product_format(product: Dict[str, Any]) -> Optional[str]:
+    payload = product.get("product_payload")
+    payload = payload if isinstance(payload, dict) else {}
+    for key in ("format", "product_format", "form_factor"):
+        cleaned = _clean_slot(product.get(key) or payload.get(key))
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _required_template_slots(template: str) -> List[str]:
+    return re.findall(r"{([a-z_]+)}", template)
+
+
+def _render_discovery_template(template: str, slots: Dict[str, str]) -> Optional[str]:
+    required = _required_template_slots(template)
+    if any(not slots.get(slot) for slot in required):
+        return None
+    try:
+        return template.format(**slots)
+    except KeyError:
+        return None
+
+
 def _build_per_sku_audit_query_specs(
     sku_ctx: Dict[str, Any],
     prompts_per_sku: int,
@@ -3808,79 +3888,66 @@ def _build_per_sku_audit_query_specs(
     title = _resolve_audit_title(sku_ctx or {}, sku, product)
     if title is None:
         return []
-    brand = product.get("brand") or product.get("vendor") or ""
-    product_type = (
-        product.get("product_type")
-        or product.get("category")
-        or "product"
+    enrichment = _get_enrichment(sku_ctx or {})
+    category = _clean_slot(product.get("category") or product.get("product_type"))
+    brand = _clean_slot(product.get("brand") or product.get("vendor"))
+    country = _clean_slot(product.get("origin_country"))
+    product_format = _product_format(product)
+    audiences = _slot_list(enrichment.get("audience_tags"), limit=6)
+    use_cases = _slot_list(
+        enrichment.get("usage_scenarios") or enrichment.get("use_case_tags"),
+        limit=6,
     )
-    variant = sku.get("sku") or sku.get("source_variant_id") or ""
-    enrichment = (
-        sku_ctx.get("product_enrichment")
-        if isinstance(sku_ctx.get("product_enrichment"), dict)
-        else {}
-    )
-    topics = [
-        str(item).strip()
-        for item in (
-            enrichment.get("topic_tags")
-            or enrichment.get("audience_tags")
-            or enrichment.get("usage_scenarios")
-            or []
-        )
-        if str(item).strip()
-    ][:6]
-    bullets = [
-        str(item).strip()
-        for item in enrichment.get("bullet_points") or []
-        if str(item).strip()
-    ][:6]
+    ingredients = _slot_list(enrichment.get("bullet_points"), limit=6)
 
-    specs: List[Tuple[str, str]] = [
-        (f"where can I buy {title}", "intent"),
-        (f"shop {title} online", "intent"),
-        (f"{title} for sale", "intent"),
-        (f"best price for {title}", "price"),
-        (f"{title} discount", "price"),
-        (f"{title} reviews", "review"),
-        (f"is {title} worth it", "review"),
-        (f"{title} alternatives", "comparison"),
-        (f"{title} vs competitors", "comparison"),
-        (f"best {product_type} for shoppers considering {title}", "category"),
-        (f"top {product_type} like {title}", "category"),
-        (f"what is the best {product_type} to buy online", "category"),
-    ]
-    if brand:
-        specs.extend([
-            (f"{brand} {title}", "brand"),
-            (f"buy {brand} {product_type} online", "brand"),
-            (f"best {product_type} from {brand}", "brand"),
-        ])
-    if variant:
-        specs.extend([
-            (f"{title} {variant}", "identity"),
-            (f"buy {variant} online", "identity"),
-        ])
-    for topic in topics:
-        specs.extend([
-            (f"best {product_type} for {topic}", "category"),
-            (f"{title} for {topic}", "intent"),
-        ])
-    for bullet in bullets:
-        specs.append((f"{title} {bullet}", "content"))
+    specs: List[Tuple[str, str]] = []
+    for template, axis in DISCOVERY_TEMPLATES:
+        required = set(_required_template_slots(template))
+        if "audience" in required:
+            for audience in audiences:
+                query = _render_discovery_template(template, {
+                    "category": category or "",
+                    "audience": audience,
+                })
+                if query:
+                    specs.append((query, axis))
+            continue
+        if "use_case" in required:
+            for use_case in use_cases:
+                query = _render_discovery_template(template, {
+                    "category": category or "",
+                    "use_case": use_case,
+                })
+                if query:
+                    specs.append((query, axis))
+            continue
+        if "ingredient" in required:
+            for ingredient in ingredients:
+                query = _render_discovery_template(template, {
+                    "category": category or "",
+                    "ingredient": ingredient,
+                })
+                if query:
+                    specs.append((query, axis))
+            continue
+        query = _render_discovery_template(template, {
+            "title": title,
+            "brand": brand or "",
+            "category": category or "",
+            "country": country or "",
+            "format": product_format or "",
+        })
+        if query:
+            specs.append((query, axis))
 
     specs = _dedupe_query_specs(specs)
+    if len(specs) < _PER_SKU_AUDIT_DISCOVERY_FLOOR:
+        logger.warning(
+            "per_sku_audit sparse discovery query set sku_key=%s prompts=%s",
+            sku_ctx.get("sku_key"),
+            len(specs),
+        )
     target = max(1, int(prompts_per_sku or 0))
-    if len(specs) >= target:
-        return specs[:target]
-
-    axes = ("intent", "review", "comparison", "price", "category")
-    idx = 1
-    while len(specs) < target:
-        axis = axes[(idx - 1) % len(axes)]
-        specs.append((f"{title} shopper question {idx}", axis))
-        specs = _dedupe_query_specs(specs)
-        idx += 1
     return specs[:target]
 
 
