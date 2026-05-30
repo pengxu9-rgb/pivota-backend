@@ -118,7 +118,11 @@ def _parse_rubric(content: str) -> Optional[Dict[str, Any]]:
     }
 
 
-async def _call_deepseek_review(*, copy_text: str) -> Optional[str]:
+async def _call_deepseek_review(
+    *, copy_text: str,
+) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+    """Return (content, input_tokens, output_tokens) or None on no-key.
+    Raises on transport/HTTP errors (caller catches + records failure)."""
     api_key = (settings.deepseek_api_key or "").strip()
     if not api_key:
         return None
@@ -146,7 +150,9 @@ async def _call_deepseek_review(*, copy_text: str) -> Optional[str]:
         )
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage") or {}
+        return content, usage.get("prompt_tokens"), usage.get("completion_tokens")
 
 
 async def generate_copy_review_rubric(
@@ -155,17 +161,66 @@ async def generate_copy_review_rubric(
     payload: Dict[str, Any],
     source_refs: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return a validated rubric dict, or None on any failure (never raises)."""
+    """Return a validated rubric dict, or None on any failure (never raises).
+
+    Enforces the per-merchant daily cost cap before calling, and records a
+    probe-run telemetry row (succeeded/failed/cost_capped) after.
+    """
     copy_text = _extract_copy_text(payload)
     if not copy_text:
         return None
+
+    # Per-merchant daily cap (fail closed when already over budget).
     try:
-        content = await _call_deepseek_review(copy_text=copy_text)
-    except Exception:  # transport / HTTP / unexpected -> fail closed
+        spent_today = await cost_today_for_merchant(merchant_id=merchant_id)
+    except Exception:  # telemetry degraded -> fail open on the *check* only
+        spent_today = Decimal("0")
+    if float(spent_today) >= _DAILY_COST_CAP_USD:
+        logger.info(
+            "pdp_copy_review cost-capped for merchant_id=%s (spent=%s cap=%s)",
+            merchant_id, spent_today, _DAILY_COST_CAP_USD,
+        )
+        await record_probe_run(
+            provider=_PROBE_PROVIDER,
+            scan_mode=_PROBE_SCAN_MODE,
+            status=STATUS_COST_CAPPED,
+            merchant_id=merchant_id,
+            cost_usd=Decimal("0"),
+        )
+        return None
+
+    try:
+        result = await _call_deepseek_review(copy_text=copy_text)
+    except Exception as exc:  # transport / HTTP / unexpected -> fail closed
         logger.warning("pdp_copy_review deepseek call failed", exc_info=True)
+        await record_probe_run(
+            provider=_PROBE_PROVIDER,
+            scan_mode=_PROBE_SCAN_MODE,
+            status=STATUS_FAILED,
+            merchant_id=merchant_id,
+            error_message=str(exc),
+        )
         return None
-    if content is None:
+    if result is None:  # no API key -> nothing ran, nothing to meter
         return None
+
+    content, input_tokens, output_tokens = result
+    cost_usd = compute_cost_usd(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_per_1k_input_tokens_usd=_COST_PER_1K_INPUT_USD,
+        cost_per_1k_output_tokens_usd=_COST_PER_1K_OUTPUT_USD,
+    )
+    await record_probe_run(
+        provider=_PROBE_PROVIDER,
+        scan_mode=_PROBE_SCAN_MODE,
+        status=STATUS_SUCCEEDED,
+        merchant_id=merchant_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=cost_usd,
+    )
+
     rubric = _parse_rubric(content)
     if rubric is None:
         logger.info("pdp_copy_review produced unusable rubric; failing closed")
