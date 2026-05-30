@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from config.settings import settings
 from db.database import database
 from db.merchant_audit_runs import (
     ACTIVE_STAGES,
@@ -101,8 +102,8 @@ class CreateAuditRequest(BaseModel):
         ),
     )
     product_keys: List[str] = Field(
-        ..., min_length=1, max_length=5,
-        description="1–5 product_key values from catalog_products.",
+        ..., min_length=1, max_length=50,
+        description="1–50 product_key values from catalog_products.",
     )
     subject_type: str = Field(
         "merchant",
@@ -252,6 +253,31 @@ def _normalize_nonempty(values: Optional[List[str]]) -> List[str]:
             seen.add(value)
             out.append(value)
     return out
+
+
+def _runnable_verify_providers(
+    verify_providers: Optional[List[str]],
+) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Return verify providers that can actually run in this process.
+
+    Billing rule: we only debit for work that will run. DeepSeek verify is
+    backend-direct, so a missing key is knowable at pre-flight time; when it
+    is absent, remove it from the billable/run context and stamp the skip.
+    """
+    runnable: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    for provider in _normalize_nonempty(verify_providers):
+        provider_id = provider.strip().lower()
+        if provider_id == "deepseek" and not (
+            settings.deepseek_api_key or ""
+        ).strip():
+            skipped.append({
+                "provider": provider_id,
+                "reason": "missing_deepseek_api_key",
+            })
+            continue
+        runnable.append(provider_id)
+    return runnable, skipped
 
 
 def _resolve_audit_coverage(
@@ -516,7 +542,9 @@ async def _build_preview(
     coverage: Dict[str, Any],
 ) -> Dict[str, Any]:
     providers = list(coverage.get("providers") or [])
-    verify_providers = list(coverage.get("verify_providers") or [])
+    verify_providers, verify_skipped = _runnable_verify_providers(
+        list(coverage.get("verify_providers") or []),
+    )
     verify_sample = coverage.get("verify_sample") or {}
     cache_key = _preview_cache_key(
         merchant_id=merchant_id,
@@ -561,6 +589,7 @@ async def _build_preview(
             "coverage_profile_label": coverage.get("label"),
             "providers": providers,
             "verify_providers": verify_providers,
+            "verify_skipped": verify_skipped,
             "verify_sample": verify_sample,
             "requested_providers": coverage.get("requested_providers") or providers,
             "requested_verify_providers": (
@@ -726,7 +755,9 @@ async def create_audit_run(
             providers=body.providers,
         )
         providers = list(coverage.get("providers") or [])
-        verify_providers = list(coverage.get("verify_providers") or [])
+        verify_providers, verify_skipped = _runnable_verify_providers(
+            list(coverage.get("verify_providers") or []),
+        )
         verify_sample = coverage.get("verify_sample") or {}
         provider_models = _resolve_audit_provider_models(
             providers=providers,
@@ -844,10 +875,12 @@ async def create_audit_run(
             requested_by_user_id=auth_merchant_id,
             request_options_jsonb={
                 "launch": {
+                    "audit_mode": "per_sku",
                     "coverage_profile": coverage.get("profile"),
                     "coverage_profile_label": coverage.get("label"),
                     "providers": providers,
                     "verify_providers": verify_providers,
+                    "verify_skipped": verify_skipped,
                     "verify_sample": verify_sample,
                     "requested_providers": (
                         coverage.get("requested_providers") or providers
@@ -866,6 +899,24 @@ async def create_audit_run(
                         if payload.get("model_is_override")
                     },
                     "prompts_per_sku": int(body.prompts_per_sku),
+                    "estimated_audit_credits": int(audit_required),
+                    "estimated_prompt_credits": int(prompt_required),
+                    "debited": [
+                        {
+                            "kind": kind,
+                            "amount": int(amount),
+                            "replay": bool(replay),
+                            "purchased_credits": int(purchased_credits),
+                        }
+                        for (
+                            kind,
+                            amount,
+                            replay,
+                            _usd_cogs,
+                            purchased_credits,
+                        ) in debited
+                    ],
+                    "debit_idempotency_key": debit_idempotency_key,
                 }
             },
         )

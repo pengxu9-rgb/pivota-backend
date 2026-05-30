@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -43,6 +44,9 @@ from services.pivota_indexing_arc import compute_indexing_arc_state
 
 _ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
 _ANSWER_QUALITY_VERIFY_PROVIDER = "deepseek"
+_PER_SKU_AUDIT_PROBE_SCAN_MODE = "open_product_visibility_test"
+_PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 8
+logger = logging.getLogger(__name__)
 _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
     "Verified citation-positive prompts keep their deterministic "
     "answer_quality hit unless DeepSeek returns "
@@ -2811,6 +2815,24 @@ def build_citation_by_provider(
 ) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for provider, probes in sorted(_group_probe_runs_by_provider(per_sku_probe_runs).items()):
+        failed_probe = next(
+            (
+                probe for probe in _json_list(probes)
+                if isinstance(probe, dict)
+                and probe.get("status") == "probe_failed"
+            ),
+            None,
+        )
+        if failed_probe is not None:
+            score, breakdown = compute_citation_score(sku_ctx, [], verify_outputs=verify_outputs)
+            out[provider] = {
+                "status": "probe_failed",
+                "error": str(failed_probe.get("error") or "")[:500],
+                "score": score,
+                "breakdown": breakdown,
+                "prompts": 0,
+            }
+            continue
         score, breakdown = compute_citation_score(
             sku_ctx, probes, verify_outputs=verify_outputs,
         )
@@ -3468,6 +3490,60 @@ def build_brand_rollup(
     }
 
 
+def _rollup_verify_summaries(
+    per_sku_reports: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    summaries = [
+        report.get("verify_summary")
+        for report in per_sku_reports or []
+        if isinstance(report.get("verify_summary"), Mapping)
+    ]
+    if not summaries:
+        return _verify_skipped_summary(reason="no_skus_audited")
+    statuses = {
+        str(summary.get("status") or "").strip().lower()
+        for summary in summaries
+        if summary.get("status")
+    }
+    if statuses == {"completed"}:
+        status = "completed"
+    elif statuses == {"skipped"}:
+        status = "skipped"
+    else:
+        status = "partial"
+    reasons = sorted({
+        str(summary.get("reason"))
+        for summary in summaries
+        if summary.get("reason")
+    })
+    return {
+        "status": status,
+        "provider": _ANSWER_QUALITY_VERIFY_PROVIDER,
+        "role": "verify",
+        "skus": len(summaries),
+        "verified": sum(int(summary.get("verified") or 0) for summary in summaries),
+        "flagged": sum(int(summary.get("flagged") or 0) for summary in summaries),
+        "not_verified": sum(
+            int(summary.get("not_verified") or 0) for summary in summaries
+        ),
+        "citation_positive_candidates": sum(
+            int(summary.get("citation_positive_candidates") or 0)
+            for summary in summaries
+        ),
+        "sample_cap": sum(
+            int(summary.get("sample_cap") or 0) for summary in summaries
+        ),
+        "reasons": reasons,
+        "flagged_probes": [
+            probe
+            for summary in summaries
+            for probe in (summary.get("flagged_probes") or [])
+            if isinstance(probe, dict)
+        ][:25],
+        "deweight_rule": _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE,
+    }
+
+
 def _classify_authority_host(host: Optional[str]) -> str:
     h = (host or "").strip().lower()
     if not h:
@@ -3655,6 +3731,350 @@ async def _sku_keys_for_per_sku_mode(
         if sku_key and sku_key not in keys:
             keys.append(sku_key)
     return keys
+
+
+def _dedupe_query_specs(specs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for query, axis in specs:
+        q = str(query or "").strip()
+        if not q:
+            continue
+        key = q.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((q, str(axis or "intent").strip() or "intent"))
+    return out
+
+
+def _build_per_sku_audit_query_specs(
+    sku_ctx: Dict[str, Any],
+    prompts_per_sku: int,
+) -> List[Tuple[str, str]]:
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    title = (
+        sku.get("title")
+        or product.get("title")
+        or sku_ctx.get("sku_title")
+        or sku_ctx.get("sku_key")
+        or "this product"
+    )
+    brand = product.get("brand") or product.get("vendor") or ""
+    product_type = (
+        product.get("product_type")
+        or product.get("category")
+        or "product"
+    )
+    variant = sku.get("sku") or sku.get("source_variant_id") or ""
+    enrichment = (
+        sku_ctx.get("product_enrichment")
+        if isinstance(sku_ctx.get("product_enrichment"), dict)
+        else {}
+    )
+    topics = [
+        str(item).strip()
+        for item in (
+            enrichment.get("topic_tags")
+            or enrichment.get("audience_tags")
+            or enrichment.get("usage_scenarios")
+            or []
+        )
+        if str(item).strip()
+    ][:6]
+    bullets = [
+        str(item).strip()
+        for item in enrichment.get("bullet_points") or []
+        if str(item).strip()
+    ][:6]
+
+    specs: List[Tuple[str, str]] = [
+        (f"where can I buy {title}", "intent"),
+        (f"shop {title} online", "intent"),
+        (f"{title} for sale", "intent"),
+        (f"best price for {title}", "price"),
+        (f"{title} discount", "price"),
+        (f"{title} reviews", "review"),
+        (f"is {title} worth it", "review"),
+        (f"{title} alternatives", "comparison"),
+        (f"{title} vs competitors", "comparison"),
+        (f"best {product_type} for shoppers considering {title}", "category"),
+        (f"top {product_type} like {title}", "category"),
+        (f"what is the best {product_type} to buy online", "category"),
+    ]
+    if brand:
+        specs.extend([
+            (f"{brand} {title}", "brand"),
+            (f"buy {brand} {product_type} online", "brand"),
+            (f"best {product_type} from {brand}", "brand"),
+        ])
+    if variant:
+        specs.extend([
+            (f"{title} {variant}", "identity"),
+            (f"buy {variant} online", "identity"),
+        ])
+    for topic in topics:
+        specs.extend([
+            (f"best {product_type} for {topic}", "category"),
+            (f"{title} for {topic}", "intent"),
+        ])
+    for bullet in bullets:
+        specs.append((f"{title} {bullet}", "content"))
+
+    specs = _dedupe_query_specs(specs)
+    target = max(1, int(prompts_per_sku or 0))
+    if len(specs) >= target:
+        return specs[:target]
+
+    axes = ("intent", "review", "comparison", "price", "category")
+    idx = 1
+    while len(specs) < target:
+        axis = axes[(idx - 1) % len(axes)]
+        specs.append((f"{title} shopper question {idx}", axis))
+        specs = _dedupe_query_specs(specs)
+        idx += 1
+    return specs[:target]
+
+
+def _chunk_query_specs(
+    specs: List[Tuple[str, str]],
+    chunk_size: int = _PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE,
+) -> List[List[Tuple[str, str]]]:
+    size = max(1, int(chunk_size))
+    return [specs[i:i + size] for i in range(0, len(specs), size)]
+
+
+def _per_sku_probe_context(
+    sku_ctx: Dict[str, Any],
+    query_specs: List[Tuple[str, str]],
+) -> Dict[str, Any]:
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    title = (
+        sku.get("title")
+        or product.get("title")
+        or sku_ctx.get("sku_title")
+        or sku_ctx.get("sku_key")
+        or "SKU"
+    )
+    merchant_url = (
+        product.get("canonical_url")
+        or product.get("pivota_canonical_url")
+        or sku_ctx.get("canonical_url")
+        or sku_ctx.get("pivota_canonical_url")
+        or ""
+    )
+    return {
+        "queries": [query for query, _axis in query_specs],
+        "product": {
+            "title": str(title),
+            "vendor": (
+                product.get("brand")
+                or product.get("vendor")
+                or ""
+            ),
+            "product_type": (
+                product.get("product_type")
+                or product.get("category")
+                or ""
+            ),
+        },
+        "merchant_pdp_url": merchant_url,
+        "product_entity_id": sku_ctx.get("sku_key"),
+    }
+
+
+def _normalize_per_sku_probe_payload(
+    *,
+    result: Dict[str, Any],
+    requested_provider: str,
+    sku_key: str,
+    sku_ctx: Dict[str, Any],
+    query_specs: List[Tuple[str, str]],
+    probe_run_id: str,
+    model_info: Mapping[str, Any],
+) -> Dict[str, Any]:
+    payload = dict(result or {})
+    actual_provider = str(
+        payload.get("provider") or requested_provider
+    ).strip().lower()
+    axis_by_query = {query.strip().lower(): axis for query, axis in query_specs}
+    product = _get_product(sku_ctx or {})
+    canonical_url = product.get("canonical_url") or sku_ctx.get("canonical_url")
+    pivota_url = (
+        product.get("pivota_canonical_url")
+        or sku_ctx.get("pivota_canonical_url")
+    )
+    normalized_runs: List[Dict[str, Any]] = []
+    for run in payload.get("raw_runs") or []:
+        if not isinstance(run, dict):
+            continue
+        row = dict(run)
+        query = str(row.get("query") or "").strip()
+        row["provider"] = actual_provider
+        row["_provider"] = actual_provider
+        row["_probe_run_id"] = probe_run_id
+        meta = (
+            dict(row.get("axis_metadata"))
+            if isinstance(row.get("axis_metadata"), dict)
+            else {}
+        )
+        meta.update({
+            "sku_key": sku_key,
+            "product_key": sku_ctx.get("product_key") or product.get("product_key"),
+            "axis": axis_by_query.get(query.lower(), meta.get("axis") or "intent"),
+            "source": "v3_per_sku_audit",
+            "upstream_scan_mode": payload.get("scan_mode"),
+        })
+        row["axis_metadata"] = meta
+        if not isinstance(row.get("url_match"), dict):
+            row["url_match"] = {
+                "target_url": canonical_url or pivota_url,
+                "in_grounding": _url_in_sources(row, [canonical_url, pivota_url]),
+                "llm_self_report": {},
+            }
+        normalized_runs.append(row)
+
+    return {
+        "probe_run_id": probe_run_id,
+        "scan_mode": "per_sku_audit",
+        "upstream_scan_mode": payload.get("scan_mode"),
+        "provider": actual_provider,
+        "requested_provider": requested_provider,
+        "sku_key": sku_key,
+        "product_key": sku_ctx.get("product_key") or product.get("product_key"),
+        "model": payload.get("model") or model_info.get("model"),
+        "model_is_override": bool(
+            payload.get("model_is_override")
+            or model_info.get("model_is_override")
+        ),
+        **(
+            {"default_model": model_info.get("default_model")}
+            if model_info.get("default_model") else {}
+        ),
+        "runs_count": len(normalized_runs),
+        "scores": payload.get("scores") or {},
+        "findings": payload.get("findings") or [],
+        "usage": payload.get("usage") or {},
+        "raw_runs": normalized_runs,
+    }
+
+
+def _failed_per_sku_probe_payload(
+    *,
+    provider: str,
+    sku_key: str,
+    sku_ctx: Dict[str, Any],
+    probe_run_id: str,
+    error: str,
+    model_info: Mapping[str, Any],
+) -> Dict[str, Any]:
+    product = _get_product(sku_ctx or {})
+    return {
+        "probe_run_id": probe_run_id,
+        "scan_mode": "per_sku_audit",
+        "upstream_scan_mode": _PER_SKU_AUDIT_PROBE_SCAN_MODE,
+        "provider": provider,
+        "requested_provider": provider,
+        "sku_key": sku_key,
+        "product_key": sku_ctx.get("product_key") or product.get("product_key"),
+        "status": "probe_failed",
+        "error": str(error or "")[:500],
+        "model": model_info.get("model"),
+        "model_is_override": bool(model_info.get("model_is_override")),
+        **(
+            {"default_model": model_info.get("default_model")}
+            if model_info.get("default_model") else {}
+        ),
+        "runs_count": 0,
+        "scores": {"visibility_score": 0},
+        "findings": [],
+        "usage": {},
+        "raw_runs": [],
+    }
+
+
+async def run_per_sku_audit_probe_fanout(
+    *,
+    merchant_id: str,
+    audit_run_id: Optional[str],
+    products: List[Dict[str, Any]],
+    coverage_profile: str,
+    providers: Optional[List[str]] = None,
+    model_overrides: Optional[Mapping[str, Any]] = None,
+    prompts_per_sku: Optional[int] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Run and shape v3 per-SKU citation probes before report assembly.
+
+    PIVOTA-Agent caps one probe request at eight runs. The v3 contract is
+    `prompts_per_sku` per provider, so this producer chunks the deterministic
+    prompt set into upstream-safe batches and returns the normalized
+    `per_sku_audit` payload that `load_per_sku_probe_runs` already reads.
+    """
+    if not merchant_id or not str(merchant_id).strip():
+        raise ValueError("merchant_id is required for per-SKU probe fan-out")
+    coverage = resolve_coverage_profile(
+        coverage_profile=coverage_profile,
+        providers=providers,
+    )
+    profile_providers = list(coverage.get("providers") or [])
+    provider_model_metadata = resolve_provider_models(
+        profile_providers,
+        model_overrides=model_overrides,
+    )
+    sku_keys = await _sku_keys_for_per_sku_mode(products, str(merchant_id))
+    target_prompts = max(1, int(prompts_per_sku or 40))
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for sku_key in sku_keys:
+        sku_ctx = await load_sku_context(sku_key, str(merchant_id))
+        query_specs = _build_per_sku_audit_query_specs(sku_ctx, target_prompts)
+        out[sku_key] = []
+        for provider_id in profile_providers:
+            model_info = provider_model_metadata.get(provider_id) or {}
+            for chunk_idx, chunk in enumerate(_chunk_query_specs(query_specs), start=1):
+                probe_run_id = (
+                    f"{audit_run_id or 'adhoc'}:{sku_key}:"
+                    f"{provider_id}:per_sku:{chunk_idx}"
+                )
+                try:
+                    result = await llm_client.probe(
+                        scan_mode=_PER_SKU_AUDIT_PROBE_SCAN_MODE,
+                        scan_target_id=probe_run_id,
+                        merchant_id=str(merchant_id),
+                        store_id=f"{merchant_id}_audit",
+                        context=_per_sku_probe_context(sku_ctx, chunk),
+                        provider=provider_id,
+                        max_runs=len(chunk),
+                        model=model_info.get("model"),
+                        model_is_override=bool(
+                            model_info.get("model_is_override")
+                        ),
+                    )
+                    out[sku_key].append(
+                        _normalize_per_sku_probe_payload(
+                            result=result,
+                            requested_provider=provider_id,
+                            sku_key=sku_key,
+                            sku_ctx=sku_ctx,
+                            query_specs=chunk,
+                            probe_run_id=probe_run_id,
+                            model_info=model_info,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
+                    out[sku_key].append(
+                        _failed_per_sku_probe_payload(
+                            provider=provider_id,
+                            sku_key=sku_key,
+                            sku_ctx=sku_ctx,
+                            probe_run_id=probe_run_id,
+                            error=str(exc),
+                            model_info=model_info,
+                        )
+                    )
+                    break
+    return out
 
 
 def _legacy_verdict_from_report(legacy_report: Dict[str, Any]) -> Optional[str]:
@@ -3889,6 +4309,7 @@ async def run_brand_report(
     audit_mode: str = "legacy",
     merchant_id: Optional[str] = None,
     audit_run_id: Optional[str] = None,
+    verify_providers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run BD probes against up to 5 products of one merchant and
     aggregate into a brand-level report.
@@ -3920,7 +4341,13 @@ async def run_brand_report(
         providers=providers,
     )
     profile_providers = list(coverage.get("providers") or [])
-    verify_providers = list(coverage.get("verify_providers") or [])
+    resolved_verify_providers = list(coverage.get("verify_providers") or [])
+    if verify_providers is not None:
+        resolved_verify_providers = [
+            str(provider or "").strip().lower()
+            for provider in verify_providers
+            if str(provider or "").strip()
+        ]
     verify_sample = coverage.get("verify_sample") or {}
     provider_model_metadata = resolve_provider_models(
         profile_providers,
@@ -3951,7 +4378,7 @@ async def run_brand_report(
                 probe_runs=probe_runs_by_sku[sku_key],
                 merchant_id=str(merchant_id),
                 audit_run_id=audit_run_id,
-                verify_providers=verify_providers,
+                verify_providers=resolved_verify_providers,
                 verify_sample=verify_sample,
                 prompts_per_sku=prompts_per_sku,
             )
@@ -3990,13 +4417,14 @@ async def run_brand_report(
             "audit_mode": "per_sku",
             "coverage_profile": coverage.get("profile"),
             "providers": profile_providers,
-            "verify_providers": verify_providers,
+            "verify_providers": resolved_verify_providers,
             "pending_engine_support": coverage.get("pending_engine_support") or [],
             "verify_sample": verify_sample,
             "provider_models": provider_model_metadata,
             "model_is_override": _any_model_override(provider_model_metadata),
             "per_sku_reports": per_sku_reports,
             "brand_rollup": brand_rollup,
+            "verify_summary": _rollup_verify_summaries(per_sku_reports),
             "authority_map": authority_map,
             "legacy_verdict": legacy_label,
             "cost_summary": cost_summary,
@@ -4022,19 +4450,36 @@ async def run_brand_report(
             continue
         try:
             probes_by_provider: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            provider_failures: Dict[str, Dict[str, Any]] = {}
             for provider_id in profile_providers:
                 model_info = provider_model_metadata.get(provider_id) or {}
-                probes_by_provider[provider_id] = await run_bd_probes(
-                    merchant_name=merchant_name,
-                    merchant_pdp_url=pdp_url,
-                    product_title=title,
-                    product_vendor=p.get("vendor"),
-                    product_type=p.get("product_type"),
-                    provider=provider_id,
-                    max_runs=max_runs,
-                    model=model_info.get("model"),
-                    model_is_override=bool(model_info.get("model_is_override")),
-                    include_category_visibility=include_category_visibility,
+                try:
+                    probes_by_provider[provider_id] = await run_bd_probes(
+                        merchant_name=merchant_name,
+                        merchant_pdp_url=pdp_url,
+                        product_title=title,
+                        product_vendor=p.get("vendor"),
+                        product_type=p.get("product_type"),
+                        provider=provider_id,
+                        max_runs=max_runs,
+                        model=model_info.get("model"),
+                        model_is_override=bool(model_info.get("model_is_override")),
+                        include_category_visibility=include_category_visibility,
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate providers
+                    provider_failures[provider_id] = {
+                        "status": "probe_failed",
+                        "error": str(exc)[:500],
+                    }
+                    logger.warning(
+                        "run_brand_report provider probe failed "
+                        "provider=%s product=%s: %s",
+                        provider_id, title, str(exc)[:200],
+                    )
+            if not probes_by_provider:
+                raise RuntimeError(
+                    "all resolved providers failed for product "
+                    f"{title!r}: {provider_failures}"
                 )
             probes = _combine_bd_probes_for_profile(probes_by_provider)
             structured = build_structured_report(
@@ -4069,7 +4514,7 @@ async def run_brand_report(
             )
             structured["coverage_profile"] = coverage.get("profile")
             structured["providers"] = profile_providers
-            structured["verify_providers"] = verify_providers
+            structured["verify_providers"] = resolved_verify_providers
             structured["requested_providers"] = (
                 coverage.get("requested_providers") or profile_providers
             )
@@ -4087,11 +4532,16 @@ async def run_brand_report(
                 "resolved profile; citation_by_provider preserves the "
                 "drill-down."
             )
-            structured["citation_by_provider"] = _legacy_citation_by_provider(
+            citation_by_provider = _legacy_citation_by_provider(
                 probes_by_provider=probes_by_provider,
                 merchant_host=normalize_host(pdp_url),
                 merchant_brand=(p.get("vendor") or merchant_name or "").strip() or None,
             )
+            for failed_provider, failure in provider_failures.items():
+                citation_by_provider[failed_provider] = dict(failure)
+            structured["citation_by_provider"] = citation_by_provider
+            if provider_failures:
+                structured["provider_failures"] = provider_failures
             per_product.append(structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
             failed.append({
@@ -4179,7 +4629,7 @@ async def run_brand_report(
         "provider": provider_label,
         "coverage_profile": coverage.get("profile"),
         "providers": profile_providers,
-        "verify_providers": verify_providers,
+        "verify_providers": resolved_verify_providers,
         "requested_providers": coverage.get("requested_providers") or profile_providers,
         "pending_engine_support": coverage.get("pending_engine_support") or [],
         "verify_sample": verify_sample,

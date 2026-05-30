@@ -534,10 +534,9 @@ async def enqueue_audit_run_with_replay(
             return None, False
 
     # idempotency_key present — use INSERT ... ON CONFLICT DO NOTHING
-    # against the partial unique index. ON CONFLICT requires raw SQL
-    # since SQLAlchemy core's `insert().on_conflict_do_nothing()` is a
-    # postgres dialect call that's awkward in our databases-wrapped
-    # path; raw SQL is also faster + more explicit at this hot path.
+    # against the partial unique index. Partial unique indexes are not
+    # named constraints in Postgres, so this must use conflict
+    # inference with the same columns + predicate as migration 144.
     try:
         inserted = await database.fetch_one(
             """
@@ -552,7 +551,12 @@ async def enqueue_audit_run_with_replay(
                 :subject_type, :idempotency_key, :requested_by_user_id,
                 CAST(:partial_result_jsonb AS JSONB)
             )
-            ON CONFLICT ON CONSTRAINT uniq_merchant_audit_runs_active_idempotency_key
+            ON CONFLICT (merchant_id, idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+              AND stage = ANY(ARRAY[
+                'queued'::text, 'discovering'::text, 'probing'::text,
+                'scoring'::text, 'materializing'::text, 'verifying'::text
+              ])
             DO NOTHING
             RETURNING run_id
             """,
@@ -568,42 +572,14 @@ async def enqueue_audit_run_with_replay(
                 "partial_result_jsonb": json.dumps(partial_result_jsonb or {}),
             },
         )
-    except Exception as exc:
-        # Fallback for environments where the unique constraint
-        # hasn't been applied yet (mid-deploy window between this
-        # PR and its migration). Behavior matches the old code:
-        # plain insert, no DB-enforced dedupe. Logged so ops sees
-        # the gap.
-        logger.warning(
-            "enqueue_audit_run on-conflict path raised "
-            "(constraint maybe not applied yet?) — falling back to "
-            "plain insert. merchant_id=%s: %s",
-            merchant_id, str(exc)[:200],
+    except Exception:
+        logger.exception(
+            "enqueue_audit_run on-conflict path failed; refusing "
+            "plain INSERT because that silently disables audit "
+            "idempotency. merchant_id=%s",
+            merchant_id,
         )
-        try:
-            await database.execute(
-                merchant_audit_runs.insert().values(
-                    run_id=run_id,
-                    merchant_id=merchant_id,
-                    requested_at=now,
-                    status="running",
-                    stage=STAGE_QUEUED,
-                    stage_updated_at=now,
-                    product_keys=list(product_keys or []),
-                    subject_type=subject_type,
-                    idempotency_key=idempotency_key,
-                    requested_by_user_id=requested_by_user_id,
-                    partial_result_jsonb=partial_result_jsonb,
-                )
-            )
-            return run_id, False
-        except Exception as inner_exc:
-            logger.warning(
-                "enqueue_audit_run fallback insert failed for "
-                "merchant_id=%s: %s",
-                merchant_id, str(inner_exc)[:200],
-            )
-            return None, False
+        raise
 
     if inserted is not None:
         return str(inserted["run_id"]), False

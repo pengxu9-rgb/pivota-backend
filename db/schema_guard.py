@@ -382,22 +382,40 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            # P0-3: DB-enforced audit idempotency (migration 091).
+            # P0-3: DB-enforced audit idempotency (migration 144).
             # Partial UNIQUE index scoped to active stages closes the
-            # check-then-insert race in POST /api/audits. The index
-            # name doubles as a CONSTRAINT reference for the enqueue
-            # path's `ON CONFLICT ON CONSTRAINT ...` syntax.
+            # check-then-insert race in POST /api/audits. The enqueue
+            # path uses conflict inference because partial unique
+            # indexes are not valid ON CONSTRAINT targets.
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF EXISTS (
+                        SELECT 1
+                          FROM pg_indexes
+                         WHERE schemaname = 'public'
+                           AND indexname = 'uniq_merchant_audit_runs_active_idempotency_key'
+                           AND indexdef NOT ILIKE '%(merchant_id, idempotency_key)%'
+                      ) THEN
+                        DROP INDEX uniq_merchant_audit_runs_active_idempotency_key;
+                      END IF;
+                    END $$;
+                    """
+                )
+            )
             await database.execute(
                 text(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS
                       uniq_merchant_audit_runs_active_idempotency_key
-                      ON merchant_audit_runs (idempotency_key)
+                      ON merchant_audit_runs (merchant_id, idempotency_key)
                       WHERE idempotency_key IS NOT NULL
-                        AND stage IN (
-                          'queued', 'discovering', 'probing', 'scoring',
-                          'materializing', 'verifying'
-                        );
+                        AND stage = ANY(ARRAY[
+                          'queued'::text, 'discovering'::text, 'probing'::text,
+                          'scoring'::text, 'materializing'::text, 'verifying'::text
+                        ]);
                     """
                 )
             )
