@@ -141,7 +141,9 @@ def _install_create_new_order_harness(
     )
     monkeypatch.setattr(module, "ensure_database_ready", noop_async)
     monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
-    monkeypatch.setattr(module, "check_inventory_availability", fake_check_inventory_availability)
+    monkeypatch.setattr(
+        module, "check_inventory_availability", fake_check_inventory_availability
+    )
     monkeypatch.setattr(module.PaymentRoutingService, "select_psp", fake_select_psp)
     monkeypatch.setattr(module, "_resolve_active_order_psp", fake_resolve_active_order_psp)
     monkeypatch.setattr(module, "create_order", fake_create_order)
@@ -344,11 +346,17 @@ async def test_create_new_order_checkout_ui_requires_quote_id_even_when_global_q
     async def fake_get_merchant_onboarding(_merchant_id: str):
         return {"merchant_id": _merchant_id, "psp_connected": True}
 
+    async def fake_check_inventory_availability(_merchant_id: str, _items):
+        return True, {"items": []}
+
     async def noop_async(*args, **kwargs):
         return None
 
     monkeypatch.setattr(module, "ensure_database_ready", noop_async)
     monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(
+        module, "check_inventory_availability", fake_check_inventory_availability
+    )
 
     with pytest.raises(module.HTTPException) as exc_info:
         await module.create_new_order(req, BackgroundTasks(), current_user={})

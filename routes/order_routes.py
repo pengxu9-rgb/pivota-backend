@@ -3321,14 +3321,22 @@ async def create_new_order(
             order_id,
         )
 
-        # 1. 验证商户
-        _t = time.perf_counter()
-        merchant = await get_merchant_onboarding(order_request.merchant_id)
+        # WS11: parallelize merchant lookup and inventory availability. Quote
+        # loading stays below because load_active_quote_or_raise can expire quotes.
+        _parallel_started = time.perf_counter()
+        merchant, inventory_result = await asyncio.gather(
+            get_merchant_onboarding(order_request.merchant_id),
+            check_inventory_availability(order_request.merchant_id, order_request.items),
+            return_exceptions=True,
+        )
         logger.info(
-            "[OrderRoutes][PERF] step=get_merchant_onboarding duration_ms=%d order=%s",
-            int((time.perf_counter() - _t) * 1000),
+            "[OrderRoutes][PERF] step=parallel_early_reads duration_ms=%d order=%s",
+            int((time.perf_counter() - _parallel_started) * 1000),
             order_id,
         )
+
+        if isinstance(merchant, BaseException):
+            raise merchant
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
 
@@ -3370,16 +3378,9 @@ async def create_new_order(
             )
 
         # 2. 检查库存（如果商户连接了 Shopify）
-        _t = time.perf_counter()
-        has_inventory, inventory_info = await check_inventory_availability(
-            order_request.merchant_id,
-            order_request.items
-        )
-        logger.info(
-            "[OrderRoutes][PERF] step=check_inventory_availability duration_ms=%d order=%s",
-            int((time.perf_counter() - _t) * 1000),
-            order_id,
-        )
+        if isinstance(inventory_result, BaseException):
+            raise inventory_result
+        has_inventory, inventory_info = inventory_result
         if not has_inventory:
             raise HTTPException(
                 status_code=400,
