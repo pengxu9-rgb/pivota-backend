@@ -16,6 +16,12 @@
       "verify_providers": ["deepseek"],
       "notes": "Default shopper-fidelity profile. DeepSeek verify runs backend-direct as an ungrounded answer-quality second opinion."
     },
+    "pilot_gemini": {
+      "label": "Pilot — Gemini citation + DeepSeek verify",
+      "providers": ["gemini"],
+      "verify_providers": ["deepseek"],
+      "notes": "Phased pilot profile: isolate Gemini citation + DeepSeek answer-quality verify; ChatGPT added later via us_shopper once this phase validates."
+    },
     "full": {
       "label": "Full Coverage",
       "providers": ["gemini", "chatgpt", "claude", "perplexity"],
