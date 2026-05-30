@@ -50,9 +50,9 @@ async def test_generate_copy_review_rubric_includes_source_text(monkeypatch):
                 _deepseek_payload({
                     "decision": "pass",
                     "checks": {
-                        "source_grounded": True,
-                        "seller_entity_checkout_not_confused": True,
-                        "variant_market_consistent": True,
+                        "copy_is_topical_to_product": True,
+                        "no_cross_seller_or_checkout_mention": True,
+                        "internally_consistent_variants_and_market": True,
                         "no_medical_regulated_promo_or_fake_review_claim": True,
                         "machine_publish_allowed_module": True,
                     },
@@ -116,9 +116,9 @@ async def test_generate_copy_review_rubric_source_prompt_defaults_false_without_
                 _deepseek_payload({
                     "decision": "needs_human_review",
                     "checks": {
-                        "source_grounded": False,
-                        "seller_entity_checkout_not_confused": True,
-                        "variant_market_consistent": True,
+                        "copy_is_topical_to_product": False,
+                        "no_cross_seller_or_checkout_mention": True,
+                        "internally_consistent_variants_and_market": True,
                         "no_medical_regulated_promo_or_fake_review_claim": True,
                         "machine_publish_allowed_module": False,
                     },
@@ -151,6 +151,6 @@ async def test_generate_copy_review_rubric_source_prompt_defaults_false_without_
     )
 
     system_prompt = captured["request"]["messages"][0]["content"]
-    assert "When SOURCE TEXT is not provided, set source_grounded=false" in system_prompt
+    assert "When SOURCE TEXT is not provided, set copy_is_topical_to_product=false" in system_prompt
     assert rubric is not None
-    assert rubric["checks"]["source_grounded"] is False
+    assert rubric["checks"]["copy_is_topical_to_product"] is False

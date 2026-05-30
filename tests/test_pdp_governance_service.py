@@ -1,6 +1,5 @@
 from services.pdp_governance_service import (
-    GPT55_REVIEW_MODEL,
-    REVIEW_ACTOR_GPT55,
+    REVIEW_ACTOR_LOCAL_POLICY_GATE,
     build_codex_gpt55_quality_gate_result,
     make_pdp_id,
     module_requires_human_review,
@@ -101,9 +100,11 @@ def test_gpt55_quality_gate_passes_source_grounded_low_risk_copy() -> None:
         source_refs=[{"type": "product_key", "id": "merchant|shopify|sku-1"}],
     )
 
-    assert result["review_actor_type"] == REVIEW_ACTOR_GPT55
-    assert result["review_model"] == GPT55_REVIEW_MODEL
+    assert result["review_actor_type"] == REVIEW_ACTOR_LOCAL_POLICY_GATE
+    assert result["review_model"] == "local_policy_gate_v1"
     assert result["decision"] == "pass"
+    assert result["checks"]["copy_is_topical_to_product"] is True
+    assert result["checks"]["source_grounded"] is True
 
 
 def test_gpt55_quality_gate_rejects_unsupported_and_regulated_claims() -> None:
@@ -171,9 +172,11 @@ def test_codex_gpt55_pass_with_failed_required_check_stays_human_review() -> Non
     )
 
     assert result["decision"] == "needs_human_review"
-    assert "codex_pass_failed_checks:source_grounded" in result["reasons"]
+    assert "codex_pass_failed_checks:copy_is_topical_to_product" in result["reasons"]
     assert result["codex_gpt55_artifact"]["decision"] == "pass"
-    assert result["codex_gpt55_artifact"]["publish_blockers"] == ["codex_pass_failed_checks:source_grounded"]
+    assert result["codex_gpt55_artifact"]["publish_blockers"] == [
+        "codex_pass_failed_checks:copy_is_topical_to_product"
+    ]
 
 
 def test_codex_gpt55_pass_without_evidence_refs_stays_human_review() -> None:
@@ -199,3 +202,61 @@ def test_codex_gpt55_pass_without_evidence_refs_stays_human_review() -> None:
 
     assert result["decision"] == "needs_human_review"
     assert "codex_pass_missing_evidence_refs" in result["reasons"]
+
+
+def test_rubric_artifact_emits_old_and_new_check_names() -> None:
+    result = build_codex_gpt55_quality_gate_result(
+        module_key="copy",
+        payload={"title": "Plain Cotton Tee", "description": "Soft everyday shirt."},
+        source_refs=[{"type": "external_seed", "id": "seed-1"}],
+        external_rubric={
+            "decision": "pass",
+            "confidence": 0.94,
+            "reasons": [],
+            "checks": {
+                "copy_is_topical_to_product": True,
+                "no_cross_seller_or_checkout_mention": True,
+                "internally_consistent_variants_and_market": True,
+                "no_medical_regulated_promo_or_fake_review_claim": True,
+                "machine_publish_allowed_module": True,
+            },
+            "evidence_refs": ["external_seed:seed-1"],
+            "reviewed_in": "codex_external_window",
+            "model": "deepseek-chat",
+        },
+    )
+
+    checks = result["checks"]
+    assert checks["source_grounded"] is True
+    assert checks["copy_is_topical_to_product"] is True
+    assert checks["seller_entity_checkout_not_confused"] is True
+    assert checks["no_cross_seller_or_checkout_mention"] is True
+    assert result["review_model"] == "deepseek-chat"
+    assert result["_checks_deprecation_note"]["emit_both_names_until"] == "2026-08-01"
+
+
+def test_historical_old_only_rubric_names_parse_back() -> None:
+    result = build_codex_gpt55_quality_gate_result(
+        module_key="copy",
+        payload={"title": "Plain Cotton Tee", "description": "Soft everyday shirt."},
+        source_refs=[{"type": "external_seed", "id": "seed-1"}],
+        external_rubric={
+            "decision": "pass",
+            "confidence": 0.94,
+            "reasons": [],
+            "checks": {
+                "source_grounded": True,
+                "seller_entity_checkout_not_confused": True,
+                "variant_market_consistent": True,
+                "no_medical_regulated_promo_or_fake_review_claim": True,
+                "machine_publish_allowed_module": True,
+            },
+            "evidence_refs": ["external_seed:seed-1"],
+            "reviewed_in": "codex_external_window",
+        },
+    )
+
+    assert result["decision"] == "pass"
+    assert result["checks"]["copy_is_topical_to_product"] is True
+    assert result["checks"]["source_grounded"] is True
+    assert result["review_model"] == "deepseek-chat"

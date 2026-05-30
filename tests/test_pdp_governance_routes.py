@@ -1186,8 +1186,8 @@ def test_gpt55_gate_can_publish_low_risk_llm_candidate_after_review():
         body = reviewed.json()
         assert body["decision"] == "pass"
         assert body["published"] is True
-        assert body["module"]["review_actor_type"] == "gpt55_quality_gate"
-        assert body["module"]["review_model"] == "gpt-5.5"
+        assert body["module"]["review_actor_type"] == "local_policy_gate"
+        assert body["module"]["review_model"] == "deepseek-chat"
 
         detail = client.get(f"/employee/pdps/{pdp_id}").json()
         assert detail["published_payload"]["copy"]["title"] == "Plain Cotton Tee"
@@ -1238,7 +1238,7 @@ def test_gpt55_gate_does_not_publish_codex_pass_with_failed_check():
         body = reviewed.json()
         assert body["decision"] == "needs_human_review"
         assert body["published"] is False
-        assert "codex_pass_failed_checks:source_grounded" in body["rubric"]["reasons"]
+        assert "codex_pass_failed_checks:copy_is_topical_to_product" in body["rubric"]["reasons"]
 
 
 def test_gpt55_gate_requires_codex_rubric_artifact_for_low_risk_publish():

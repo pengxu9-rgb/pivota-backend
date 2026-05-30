@@ -49,6 +49,7 @@ REQUIRED_MODULE_FIELDS = (
 )
 
 HIGH_RISK_MODULES = {"gallery", "reviews"}
+LOCAL_POLICY_GATE_ACTORS = {"local_policy_gate", "gpt55_quality_gate"}
 LOW_RISK_MACHINE_PUBLISH_MODULES = {
     "copy",
     "identity",
@@ -184,9 +185,9 @@ def _validate_projection(
         if (
             module_key in HIGH_RISK_MODULES
             and module.get("status") == "published"
-            and module.get("review_actor_type") == "gpt55_quality_gate"
+            and module.get("review_actor_type") in LOCAL_POLICY_GATE_ACTORS
         ):
-            failures.append(f"{label} high-risk module {module_key} was GPT-only published")
+            failures.append(f"{label} high-risk module {module_key} was policy-gate-only published")
 
     print(
         json.dumps(
@@ -242,7 +243,7 @@ def _check_gpt55_gate_sample(
     candidate_ids = list(dict.fromkeys(candidate_ids))
 
     if not candidate_ids:
-        failures.append("no GPT-5.5 quality-gate PDP sample found")
+        failures.append("no local-policy quality-gate PDP sample found")
         return
 
     for pdp_id in candidate_ids:
@@ -251,7 +252,8 @@ def _check_gpt55_gate_sample(
         machine_published = [
             key
             for key, module in modules.items()
-            if module.get("status") == "published" and module.get("review_actor_type") == "gpt55_quality_gate"
+            if module.get("status") == "published"
+            and module.get("review_actor_type") in LOCAL_POLICY_GATE_ACTORS
         ]
         if any(key in LOW_RISK_MACHINE_PUBLISH_MODULES for key in machine_published):
             print(

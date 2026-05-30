@@ -25,7 +25,7 @@ SOURCE_GROUNDING_TIMEOUT_S = 5.0
 from db.database import database
 from services.pdp_governance_service import (
     DEFAULT_MARKET,
-    REVIEW_ACTOR_GPT55,
+    REVIEW_ACTOR_LOCAL_POLICY_GATE,
     create_merchant_contribution,
     ensure_pdp_governance_tables,
     get_pdp_projection,
@@ -334,7 +334,7 @@ async def approve_product_pdp_module(
             pdp_id=pdp_id,
             module_key=body.module_key,
             version_id=version_id,
-            actor_type=REVIEW_ACTOR_GPT55,
+            actor_type=REVIEW_ACTOR_LOCAL_POLICY_GATE,
             actor_id=f"merchant:{merchant_id}",
             external_rubric=rubric,
         )

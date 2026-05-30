@@ -75,12 +75,17 @@ def _resolve_deepseek_rates(model_id: str) -> Tuple[float, float]:
 
 # Must match GPT55_RUBRIC_REQUIRED_CHECKS in services/pdp_governance_service.py.
 REQUIRED_CHECKS = (
-    "source_grounded",
-    "seller_entity_checkout_not_confused",
-    "variant_market_consistent",
+    "copy_is_topical_to_product",
+    "no_cross_seller_or_checkout_mention",
+    "internally_consistent_variants_and_market",
     "no_medical_regulated_promo_or_fake_review_claim",
     "machine_publish_allowed_module",
 )
+CHECK_ALIASES = {
+    "source_grounded": "copy_is_topical_to_product",
+    "seller_entity_checkout_not_confused": "no_cross_seller_or_checkout_mention",
+    "variant_market_consistent": "internally_consistent_variants_and_market",
+}
 
 COPY_REVIEW_MAX_OUTPUT_TOKENS = 400
 COPY_REVIEW_TIMEOUT_S = 15.0
@@ -92,16 +97,16 @@ _SYSTEM_PROMPT = (
     "return STRICT JSON only, no prose. Each check is true only if the copy "
     "clearly satisfies it; default to false when unsure.\n\n"
     "Checks:\n"
-    "- source_grounded: claims are about THIS product, not invented marketing.\n"
-    "- seller_entity_checkout_not_confused: no mention of a different seller/store/checkout.\n"
-    "- variant_market_consistent: no contradictory size/shade/market claims.\n"
+    "- copy_is_topical_to_product: claims are about THIS product, not invented marketing.\n"
+    "- no_cross_seller_or_checkout_mention: no mention of a different seller/store/checkout.\n"
+    "- internally_consistent_variants_and_market: no contradictory size/shade/market claims.\n"
     "- no_medical_regulated_promo_or_fake_review_claim: no medical/efficacy/regulated"
     " claims, no fake-review or unverifiable promotional language.\n"
     "- machine_publish_allowed_module: copy is self-contained and safe to publish"
     " without human co-review.\n\n"
     'Return JSON: {"decision":"pass|reject|needs_human_review","checks":'
-    '{"source_grounded":bool,"seller_entity_checkout_not_confused":bool,'
-    '"variant_market_consistent":bool,'
+    '{"copy_is_topical_to_product":bool,"no_cross_seller_or_checkout_mention":bool,'
+    '"internally_consistent_variants_and_market":bool,'
     '"no_medical_regulated_promo_or_fake_review_claim":bool,'
     '"machine_publish_allowed_module":bool},"confidence":0..1,'
     '"evidence_refs":["short quote from the copy"],'
@@ -115,22 +120,22 @@ _SOURCE_GROUNDED_SYSTEM_PROMPT = (
     "that is eligible for machine publishing. Evaluate it against each check and "
     "return STRICT JSON only, no prose. Each check is true only if the copy "
     "clearly satisfies it; default to false when unsure. When SOURCE TEXT is "
-    "provided, source_grounded requires that the description's factual claims "
+    "provided, copy_is_topical_to_product requires that the description's factual claims "
     "(ingredients, origin, format, brand) are supported by the source text or "
     "merchant catalog reference. When SOURCE TEXT is not provided, set "
-    "source_grounded=false unless the description is clearly self-evident.\n\n"
+    "copy_is_topical_to_product=false unless the description is clearly self-evident.\n\n"
     "Checks:\n"
-    "- source_grounded: claims are about THIS product and supported by source text"
+    "- copy_is_topical_to_product: claims are about THIS product and supported by source text"
     " or the merchant catalog reference when available.\n"
-    "- seller_entity_checkout_not_confused: no mention of a different seller/store/checkout.\n"
-    "- variant_market_consistent: no contradictory size/shade/market claims.\n"
+    "- no_cross_seller_or_checkout_mention: no mention of a different seller/store/checkout.\n"
+    "- internally_consistent_variants_and_market: no contradictory size/shade/market claims.\n"
     "- no_medical_regulated_promo_or_fake_review_claim: no medical/efficacy/regulated"
     " claims, no fake-review or unverifiable promotional language.\n"
     "- machine_publish_allowed_module: copy is self-contained and safe to publish"
     " without human co-review.\n\n"
     'Return JSON: {"decision":"pass|reject|needs_human_review","checks":'
-    '{"source_grounded":bool,"seller_entity_checkout_not_confused":bool,'
-    '"variant_market_consistent":bool,'
+    '{"copy_is_topical_to_product":bool,"no_cross_seller_or_checkout_mention":bool,'
+    '"internally_consistent_variants_and_market":bool,'
     '"no_medical_regulated_promo_or_fake_review_claim":bool,'
     '"machine_publish_allowed_module":bool},"confidence":0..1,'
     '"evidence_refs":["short quote from the copy"],'
@@ -190,14 +195,17 @@ def _parse_rubric(content: str) -> Optional[Dict[str, Any]]:
     checks = obj.get("checks")
     if not isinstance(checks, dict):
         return None
+    canonical_checks: Dict[str, Any] = {}
+    for key, value in checks.items():
+        canonical_checks[CHECK_ALIASES.get(str(key), str(key))] = value
     # All required checks must be present AND be LITERAL booleans. We must not
     # coerce here -- bool("false") is True, which would turn a malformed/evasive
     # rubric into a passing one. Fail closed on any non-bool check value.
-    if any(c not in checks for c in REQUIRED_CHECKS):
+    if any(c not in canonical_checks for c in REQUIRED_CHECKS):
         return None
-    if any(not isinstance(checks.get(c), bool) for c in REQUIRED_CHECKS):
+    if any(not isinstance(canonical_checks.get(c), bool) for c in REQUIRED_CHECKS):
         return None
-    normalized = {c: checks[c] for c in REQUIRED_CHECKS}
+    normalized = {c: canonical_checks[c] for c in REQUIRED_CHECKS}
     # A 'pass' is only honored by the gate with non-empty evidence_refs; require
     # them here too so a 'pass' without evidence fails closed rather than
     # silently degrading downstream.
@@ -371,4 +379,7 @@ async def generate_copy_review_rubric(
     rubric = _parse_rubric(content)
     if rubric is None:
         logger.info("pdp_copy_review produced unusable rubric; failing closed")
+    else:
+        rubric["model"] = model
+        rubric["provider_model"] = model
     return rubric

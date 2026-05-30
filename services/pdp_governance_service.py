@@ -27,10 +27,10 @@ from db.products import products_cache
 
 
 DEFAULT_MARKET = "US"
-GPT55_REVIEW_MODEL = "gpt-5.5"
 
 REVIEW_ACTOR_HUMAN = "human_employee"
-REVIEW_ACTOR_GPT55 = "gpt55_quality_gate"
+REVIEW_ACTOR_LOCAL_POLICY_GATE = "local_policy_gate"
+LEGACY_REVIEW_ACTOR_GPT55 = "gpt55_quality_gate"
 REVIEW_ACTOR_SYSTEM = "system_policy"
 
 PDP_MODULE_KEYS: Tuple[str, ...] = (
@@ -55,13 +55,20 @@ MACHINE_PUBLISH_MODULES = {
     "quality",
 }
 
-GPT55_RUBRIC_REQUIRED_CHECKS = {
-    "source_grounded",
-    "seller_entity_checkout_not_confused",
-    "variant_market_consistent",
+CHECK_ALIASES = {
+    "source_grounded": "copy_is_topical_to_product",
+    "seller_entity_checkout_not_confused": "no_cross_seller_or_checkout_mention",
+    "variant_market_consistent": "internally_consistent_variants_and_market",
+}
+CHECK_DEPRECATION_NOTE = {"emit_both_names_until": "2026-08-01"}
+
+GPT55_RUBRIC_REQUIRED_CHECKS = frozenset({
+    "copy_is_topical_to_product",
+    "no_cross_seller_or_checkout_mention",
+    "internally_consistent_variants_and_market",
     "no_medical_regulated_promo_or_fake_review_claim",
     "machine_publish_allowed_module",
-}
+})
 
 HUMAN_CO_REVIEW_MODULES = {
     "gallery",
@@ -92,6 +99,49 @@ PDP_REVIEW_QUEUE_TABS = {
     "published_monitor",
     "identity_audit",
 }
+
+
+def _is_local_policy_gate_actor(actor_type: Optional[str]) -> bool:
+    if actor_type == LEGACY_REVIEW_ACTOR_GPT55:
+        logger.warning(
+            "Deprecated review actor %s accepted; emitting %s",
+            LEGACY_REVIEW_ACTOR_GPT55,
+            REVIEW_ACTOR_LOCAL_POLICY_GATE,
+        )
+        return True
+    return actor_type == REVIEW_ACTOR_LOCAL_POLICY_GATE
+
+
+def _canonicalize_checks(checks: Dict[str, Any]) -> Dict[str, bool]:
+    checks = checks if isinstance(checks, dict) else {}
+    canonical: Dict[str, bool] = {}
+    for key, value in checks.items():
+        canonical_key = CHECK_ALIASES.get(str(key), str(key))
+        bool_value = bool(value)
+        if canonical_key in canonical:
+            canonical[canonical_key] = canonical[canonical_key] and bool_value
+        else:
+            canonical[canonical_key] = bool_value
+    return canonical
+
+
+def _checks_with_deprecated_aliases(checks: Dict[str, Any]) -> Dict[str, bool]:
+    canonical = _canonicalize_checks(checks)
+    out: Dict[str, bool] = {key: bool(value) for key, value in canonical.items()}
+    for old_name, new_name in CHECK_ALIASES.items():
+        if new_name in canonical:
+            out[old_name] = bool(canonical[new_name])
+    return out
+
+
+def _resolve_review_model_label(rubric: Optional[Dict[str, Any]]) -> str:
+    if rubric and rubric.get("review_model"):
+        return str(rubric["review_model"])
+    if rubric and rubric.get("model"):
+        return str(rubric["model"])
+    if rubric and rubric.get("reviewed_in") == "codex_external_window":
+        return str(rubric.get("provider_model") or rubric.get("model") or "deepseek-chat")
+    return "local_policy_gate_v1"
 
 HIGH_RISK_PAYLOAD_KEYS = {
     "third_party_rights",
@@ -3631,6 +3681,13 @@ async def list_pdp_review_queue(
         )
     )
     items = all_items[safe_offset : safe_offset + safe_limit]
+    local_policy_reviewed = sum(
+        1 for item in all_items
+        if item.get("review_actor_type") in {
+            REVIEW_ACTOR_LOCAL_POLICY_GATE,
+            LEGACY_REVIEW_ACTOR_GPT55,
+        }
+    )
     summary = {
         "tasks": len(all_items),
         "needs_review": sum(1 for item in all_items if item.get("status") in {"needs_review", "assigned"}),
@@ -3639,7 +3696,8 @@ async def list_pdp_review_queue(
         "escalated": sum(1 for item in all_items if item.get("status") == "escalated"),
         "identity_audit": sum(1 for item in all_items if item.get("module_key") == "identity" and "pdp_identity_audit" in ((item.get("source_summary") or {}).get("by_type") or {})),
         "qa_sample": sum(1 for item in all_items if item.get("qa_sample")),
-        "gpt55_reviewed": sum(1 for item in all_items if item.get("review_actor_type") == REVIEW_ACTOR_GPT55),
+        "local_policy_reviewed": local_policy_reviewed,
+        "gpt55_reviewed": local_policy_reviewed,
     }
     return {
         "status": "success",
@@ -4978,9 +5036,9 @@ def run_gpt55_quality_gate(
     source_refs = source_refs if isinstance(source_refs, list) else []
     reasons: List[str] = []
     checks: Dict[str, Any] = {
-        "source_grounded": bool(source_refs),
-        "seller_entity_checkout_not_confused": True,
-        "variant_market_consistent": True,
+        "copy_is_topical_to_product": bool(source_refs),
+        "no_cross_seller_or_checkout_mention": True,
+        "internally_consistent_variants_and_market": True,
         "no_medical_regulated_promo_or_fake_review_claim": True,
         "machine_publish_allowed_module": module_key in MACHINE_PUBLISH_MODULES,
     }
@@ -4991,7 +5049,7 @@ def run_gpt55_quality_gate(
             reasons.append(reason)
             checks["no_medical_regulated_promo_or_fake_review_claim"] = False
 
-    if not checks["source_grounded"]:
+    if not checks["copy_is_topical_to_product"]:
         reasons.append("missing_source_refs")
 
     if module_requires_human_review(module_key, payload):
@@ -5014,12 +5072,13 @@ def run_gpt55_quality_gate(
         confidence = 0.91
 
     return {
-        "review_actor_type": REVIEW_ACTOR_GPT55,
-        "review_model": GPT55_REVIEW_MODEL,
+        "review_actor_type": REVIEW_ACTOR_LOCAL_POLICY_GATE,
+        "review_model": _resolve_review_model_label(None),
         "decision": decision,
         "confidence": confidence,
         "reasons": reasons,
-        "checks": checks,
+        "checks": _checks_with_deprecated_aliases(checks),
+        "_checks_deprecation_note": CHECK_DEPRECATION_NOTE,
         "evidence_refs": source_refs,
     }
 
@@ -5058,7 +5117,8 @@ def _normalize_codex_gpt55_rubric(rubric: Dict[str, Any]) -> Dict[str, Any]:
     checks = rubric.get("checks") or {}
     if not isinstance(checks, dict):
         raise ValueError("GPT55_RUBRIC_CHECKS_MUST_BE_OBJECT")
-    missing = sorted(GPT55_RUBRIC_REQUIRED_CHECKS - set(checks.keys()))
+    canonical_checks = _canonicalize_checks(checks)
+    missing = sorted(GPT55_RUBRIC_REQUIRED_CHECKS - set(canonical_checks.keys()))
     if missing:
         raise ValueError(f"GPT55_RUBRIC_MISSING_CHECKS:{','.join(missing)}")
 
@@ -5070,10 +5130,13 @@ def _normalize_codex_gpt55_rubric(rubric: Dict[str, Any]) -> Dict[str, Any]:
         "decision": decision,
         "confidence": confidence,
         "reasons": [str(reason) for reason in reasons],
-        "checks": {key: bool(value) for key, value in checks.items()},
+        "checks": _checks_with_deprecated_aliases(canonical_checks),
+        "_checks_deprecation_note": CHECK_DEPRECATION_NOTE,
         "evidence_refs": evidence_refs,
         "review_notes": rubric.get("review_notes"),
         "reviewed_in": rubric.get("reviewed_in") or "codex_external_window",
+        "model": rubric.get("model"),
+        "provider_model": rubric.get("provider_model"),
     }
 
 
@@ -5081,7 +5144,10 @@ def _codex_gpt55_pass_blockers(codex_rubric: Dict[str, Any]) -> List[str]:
     if codex_rubric.get("decision") != "pass":
         return []
 
-    checks = codex_rubric.get("checks") if isinstance(codex_rubric.get("checks"), dict) else {}
+    checks = _canonicalize_checks(
+        codex_rubric.get("checks")
+        if isinstance(codex_rubric.get("checks"), dict) else {}
+    )
     failed = sorted(key for key in GPT55_RUBRIC_REQUIRED_CHECKS if checks.get(key) is not True)
     blockers: List[str] = []
     if failed:
@@ -5108,11 +5174,18 @@ def _merge_codex_rubric_with_local_gate(local: Dict[str, Any], codex_rubric: Dic
         stricter_decision = "needs_human_review"
     reasons = list(dict.fromkeys([*local_reasons, *codex_reasons, *pass_blockers]))
 
-    local_checks = local.get("checks") if isinstance(local.get("checks"), dict) else {}
-    codex_checks = codex_rubric.get("checks") if isinstance(codex_rubric.get("checks"), dict) else {}
+    local_checks = _canonicalize_checks(
+        local.get("checks") if isinstance(local.get("checks"), dict) else {}
+    )
+    codex_checks = _canonicalize_checks(
+        codex_rubric.get("checks") if isinstance(codex_rubric.get("checks"), dict) else {}
+    )
     checks = {**codex_checks}
     for key, value in local_checks.items():
         checks[key] = bool(checks.get(key, True)) and bool(value)
+    checks_with_aliases = _checks_with_deprecated_aliases(checks)
+    codex_checks_with_aliases = _checks_with_deprecated_aliases(codex_checks)
+    review_model = _resolve_review_model_label(codex_rubric)
 
     if stricter_decision == local_decision and local_decision != codex_decision:
         confidence = float(local.get("confidence") or 0.0)
@@ -5122,21 +5195,25 @@ def _merge_codex_rubric_with_local_gate(local: Dict[str, Any], codex_rubric: Dic
             float(codex_rubric.get("confidence") or local.get("confidence") or 0.0),
         ) or float(codex_rubric.get("confidence") or local.get("confidence") or 0.0)
     return {
-        "review_actor_type": REVIEW_ACTOR_GPT55,
-        "review_model": GPT55_REVIEW_MODEL,
+        "review_actor_type": REVIEW_ACTOR_LOCAL_POLICY_GATE,
+        "review_model": review_model,
         "decision": stricter_decision,
         "confidence": confidence,
         "reasons": reasons,
-        "checks": checks,
+        "checks": checks_with_aliases,
+        "_checks_deprecation_note": CHECK_DEPRECATION_NOTE,
         "evidence_refs": codex_rubric.get("evidence_refs") or local.get("evidence_refs") or [],
         "codex_gpt55_artifact": {
             "decision": codex_decision,
             "confidence": codex_rubric.get("confidence"),
             "reasons": codex_reasons,
-            "checks": codex_checks,
+            "checks": codex_checks_with_aliases,
+            "_checks_deprecation_note": CHECK_DEPRECATION_NOTE,
             "publish_blockers": pass_blockers,
             "review_notes": codex_rubric.get("review_notes"),
             "reviewed_in": codex_rubric.get("reviewed_in"),
+            "model": codex_rubric.get("model"),
+            "provider_model": codex_rubric.get("provider_model"),
         },
         "local_policy_artifact": local,
     }
@@ -5213,7 +5290,8 @@ async def review_module_version(
     payload = _json_dict(version.get("payload"))
     source_refs = _json_list(version.get("source_refs"))
 
-    if actor_type == REVIEW_ACTOR_GPT55:
+    if _is_local_policy_gate_actor(actor_type):
+        actor_type = REVIEW_ACTOR_LOCAL_POLICY_GATE
         rubric = build_codex_gpt55_quality_gate_result(
             module_key=module_key,
             payload=payload,
@@ -5222,8 +5300,8 @@ async def review_module_version(
         )
         review_decision = rubric["decision"]
         confidence = rubric["confidence"]
-        actor_id = actor_id or GPT55_REVIEW_MODEL
-        review_model = GPT55_REVIEW_MODEL
+        review_model = _resolve_review_model_label(rubric)
+        actor_id = actor_id or review_model
     else:
         review_decision = decision or "needs_human_review"
         confidence = 1.0 if review_decision == "pass" else None
@@ -5313,7 +5391,7 @@ async def review_module_version(
     can_publish = review_decision == "pass" and (
         actor_type == REVIEW_ACTOR_HUMAN
         or (
-            actor_type == REVIEW_ACTOR_GPT55
+            _is_local_policy_gate_actor(actor_type)
             and module_key in MACHINE_PUBLISH_MODULES
             and not module_requires_human_review(module_key, payload)
         )
@@ -5471,7 +5549,9 @@ async def publish_module_version(
     version = await _fetch_module_version(pdp_id, module_key, version_id)
     payload = _json_dict(version.get("payload"))
     source_refs = _json_list(version.get("source_refs"))
-    if actor_type == REVIEW_ACTOR_GPT55 and module_requires_human_review(module_key, payload):
+    if _is_local_policy_gate_actor(actor_type):
+        actor_type = REVIEW_ACTOR_LOCAL_POLICY_GATE
+    if actor_type == REVIEW_ACTOR_LOCAL_POLICY_GATE and module_requires_human_review(module_key, payload):
         raise PermissionError("PDP_MODULE_REQUIRES_HUMAN_REVIEW")
 
     now = _now()

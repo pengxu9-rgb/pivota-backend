@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field
 
 from services.pdp_governance_service import (
     DEFAULT_MARKET,
-    REVIEW_ACTOR_GPT55,
     REVIEW_ACTOR_HUMAN,
+    REVIEW_ACTOR_LOCAL_POLICY_GATE,
     audit_pdp_identity_groups,
     apply_pdp_identity_review_action,
     assign_pdp_review_task,
@@ -541,8 +541,8 @@ async def run_gpt55_review(
             pdp_id=pdp_id,
             module_key=module_key,
             version_id=body.version_id,
-            actor_type=REVIEW_ACTOR_GPT55,
-            actor_id="gpt-5.5",
+            actor_type=REVIEW_ACTOR_LOCAL_POLICY_GATE,
+            actor_id=None,
             notes=body.notes,
             external_rubric=body.rubric,
         )
