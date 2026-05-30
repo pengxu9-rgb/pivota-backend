@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -14,20 +15,19 @@ def _install_summary_stubs(
     preview_rows: List[Dict[str, Any]],
     preview_media_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    fetch_one_rows = iter(
-        [
-            {"total": 3, "media_count": 2, "avg_rating": 4.5},  # merchant row
-            {"total": 0, "media_count": 0},  # global row
-            {"total": 3, "rated_total": 3, "avg_rating": 4.5},  # scope row
-        ]
-    )
     captured: Dict[str, Any] = {"preview_query": None}
 
+    # Key the stub on query content (like real Postgres), not call order — the head
+    # reads (merchant/global aggregates) now run concurrently via asyncio.gather, so a
+    # call-order iterator would be brittle. scope row has `rated_total`; the merchant
+    # aggregate has `AVG(rating)`; the global aggregate has neither.
     async def fake_fetch_one(query: Any, values: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-        try:
-            return next(fetch_one_rows)
-        except StopIteration:
-            return None
+        q = str(query)
+        if "rated_total" in q:
+            return {"total": 3, "rated_total": 3, "avg_rating": 4.5}  # scope row
+        if "AVG(rating)" in q:
+            return {"total": 3, "media_count": 2, "avg_rating": 4.5}  # merchant aggregate
+        return {"total": 0, "media_count": 0}  # global aggregate
 
     async def fake_fetch_all(query: Any, values: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
         q = str(query)
@@ -204,3 +204,55 @@ async def test_get_review_summary_preview_items_text_snippet_falls_back_to_title
     item = summary["preview_items"][0]
     assert item["title"] == "Title fallback only"
     assert item["text_snippet"] == "Title fallback only"
+
+
+@pytest.mark.asyncio
+async def test_get_review_summary_runs_independent_reads_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: the head reads (membership/merchant/global) and the scope
+    reads (scope/distribution/preview) must be dispatched concurrently via
+    asyncio.gather. Tracks max in-flight DB calls; a sequential implementation would
+    never exceed 1. Deterministic (uses asyncio.sleep(0) yields), not timing-based."""
+    active = 0
+    max_active = 0
+
+    async def _yield_and_track():
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)  # let any other in-flight gather() coroutines start
+        active -= 1
+
+    async def fake_fetch_one(query: Any, values: Dict[str, Any] | None = None):
+        await _yield_and_track()
+        q = str(query)
+        if "rated_total" in q:
+            return {"total": 0, "rated_total": 0, "avg_rating": 0.0}
+        if "AVG(rating)" in q:
+            return {"total": 0, "media_count": 0, "avg_rating": 0.0}
+        return {"total": 0, "media_count": 0}
+
+    async def fake_fetch_all(query: Any, values: Dict[str, Any] | None = None):
+        await _yield_and_track()
+        return []
+
+    async def fake_group_membership(*_args: Any, **_kwargs: Any):
+        await _yield_and_track()
+        return None
+
+    monkeypatch.setattr(
+        reviews_service, "get_active_group_membership_for_product_key", fake_group_membership
+    )
+    monkeypatch.setattr(reviews_service.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(reviews_service.database, "fetch_all", fake_fetch_all)
+
+    await reviews_service.get_review_summary_for_sku(
+        merchant_id="m_demo",
+        platform="shopify",
+        platform_product_id="p_demo",
+        variant_id=None,
+    )
+
+    # Head wave gathers 3 coroutines; scope wave gathers 3. Sequential code => max 1.
+    assert max_active >= 2, f"expected concurrent DB reads, max in-flight was {max_active}"
