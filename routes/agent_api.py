@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from collections import OrderedDict
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -7818,12 +7819,22 @@ async def agent_create_order(
     自动添加 Agent 追踪信息
     集成 Agent Governance 治理检查
     """
+    _agent_order_started = time.perf_counter()
+    _agent_order_id_for_perf = None
     if order_request.merchant_id == EXTERNAL_SEED_MERCHANT_ID:
         raise HTTPException(status_code=400, detail="EXTERNAL_PRODUCT_CHECKOUT_DISABLED")
 
     # STEP 1: Governance validation (before main logic)
     from services.agent_governance import agent_governance
-    await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
+    _t = time.perf_counter()
+    try:
+        await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
+    finally:
+        logger.info(
+            "[AgentAPI][PERF] step=validate_request_compat duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            _agent_order_id_for_perf,
+        )
 
     # MVP measurement scaffolding: record checkout attempt (order creation stage).
     try:
@@ -7887,7 +7898,13 @@ async def agent_create_order(
         # discovery-only and cannot create an order or PSP surface without a live quote.
         from services.quote_first_enforcement import should_require_quote_for_order_create
 
+        _t = time.perf_counter()
         require_quote, require_ctx = await should_require_quote_for_order_create(merchant_id=order_request.merchant_id)
+        logger.info(
+            "[AgentAPI][PERF] step=should_require_quote_for_order_create duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            _agent_order_id_for_perf,
+        )
         agent_quote_required_ctx = {
             **(require_ctx or {}),
             "agent_purchase_path": True,
@@ -7939,7 +7956,13 @@ async def agent_create_order(
         store_info_for_policy = None
         platform_for_policy = None
         try:
+            _t = time.perf_counter()
             store_info_for_policy = await get_primary_store(order_request.merchant_id)
+            logger.info(
+                "[AgentAPI][PERF] step=get_primary_store.policy duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                _agent_order_id_for_perf,
+            )
             platform_for_policy = str((store_info_for_policy or {}).get("platform") or "").strip().lower() or None
         except Exception:
             store_info_for_policy = None
@@ -7949,7 +7972,13 @@ async def agent_create_order(
             try:
                 from services.quote_service import QuoteService
 
+                _t = time.perf_counter()
                 quote_for_policy = await QuoteService().load_active_quote_or_raise(quote_id=order_request.quote_id)
+                logger.info(
+                    "[AgentAPI][PERF] step=quote_service.load_active_quote_or_raise.policy duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    _agent_order_id_for_perf,
+                )
                 snap_for_policy = quote_for_policy.snapshot_json if isinstance(quote_for_policy.snapshot_json, dict) else {}
                 platform_for_policy = str(
                     snap_for_policy.get("platform")
@@ -7999,18 +8028,32 @@ async def agent_create_order(
                 from mvp.idempotency import PostgresIdempotencyStore
 
                 idem = PostgresIdempotencyStore()
+                _t = time.perf_counter()
                 existing = await idem.get(scope="order_create", key=order_request.idempotency_key)
+                logger.info(
+                    "[AgentAPI][PERF] step=idempotency.get duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    _agent_order_id_for_perf,
+                )
                 if existing and isinstance(existing.value, dict):
                     if (
                         existing.value.get("status") == "success"
                         and existing.value.get("order_id")
                         and (existing.value.get("merchant_id") in (None, order_request.merchant_id))
                     ):
+                        _agent_order_id_for_perf = existing.value.get("order_id")
                         return existing.value
             except Exception:
                 pass
+        _t = time.perf_counter()
         replay_response = await _load_replayable_agent_order_create_response(order_request)
+        logger.info(
+            "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            _agent_order_id_for_perf,
+        )
         if replay_response:
+            _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
             return replay_response
 
         # OfferObject + PreFlight (best-effort, additive): compute canonical offer(s) from quote snapshot and
@@ -8024,7 +8067,13 @@ async def agent_create_order(
                 from services.quote_service import QuoteService
                 from services.shopify_policy_service import get_latest_policy_hashes
 
+                _t = time.perf_counter()
                 qs = await QuoteService().load_active_quote_or_raise(quote_id=order_request.quote_id)
+                logger.info(
+                    "[AgentAPI][PERF] step=quote_service.load_active_quote_or_raise.preflight duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    _agent_order_id_for_perf,
+                )
                 if qs.merchant_id != order_request.merchant_id:
                     raise HTTPException(
                         status_code=400,
@@ -8051,7 +8100,13 @@ async def agent_create_order(
                 except Exception:
                     pass
 
+                _t = time.perf_counter()
                 policies = await get_latest_policy_hashes(order_request.merchant_id)
+                logger.info(
+                    "[AgentAPI][PERF] step=get_latest_policy_hashes duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    _agent_order_id_for_perf,
+                )
                 policy_hashes_available = bool(policies)
 
                 try:
@@ -8253,7 +8308,13 @@ async def agent_create_order(
         store_info = store_info_for_policy
         if store_info is None:
             try:
+                _t = time.perf_counter()
                 store_info = await get_primary_store(order_request.merchant_id)
+                logger.info(
+                    "[AgentAPI][PERF] step=get_primary_store.variant_safety duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    _agent_order_id_for_perf,
+                )
             except Exception:
                 store_info = None
         if str((store_info or {}).get("platform") or "").lower() == "shopify":
@@ -8271,31 +8332,82 @@ async def agent_create_order(
                     },
                 )
 
+        create_new_order_kwargs: Dict[str, Any] = {}
+        try:
+            if "precomputed_quote_requirement" in inspect.signature(
+                order_routes_module.create_new_order
+            ).parameters:
+                create_new_order_kwargs["precomputed_quote_requirement"] = (require_quote, require_ctx)
+        except (TypeError, ValueError):
+            create_new_order_kwargs["precomputed_quote_requirement"] = (require_quote, require_ctx)
+
         # 调用标准订单创建 (serialize per-merchant to avoid concurrent order creation hazards)
         async with _get_order_create_lock(order_request.merchant_id):
             try:
-                order_response = await order_routes_module.create_new_order(order_request, background_tasks)
+                _t = time.perf_counter()
+                order_response = await order_routes_module.create_new_order(
+                    order_request,
+                    background_tasks,
+                    **create_new_order_kwargs,
+                )
+                _agent_order_id_for_perf = getattr(order_response, "order_id", None)
+                logger.info(
+                    "[AgentAPI][PERF] step=create_new_order duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    _agent_order_id_for_perf,
+                )
             except Exception as e:
                 # `create_new_order` persists the order row before PSP creation.
                 # On a transient DB-busy failure, first try to replay that persisted
                 # order. Only if no order exists yet do we retry the full create.
                 if is_asyncpg_busy_error(e):
+                    _t = time.perf_counter()
                     replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
+                    logger.info(
+                        "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response_with_backoff.initial duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        _agent_order_id_for_perf,
+                    )
                     if replay_response:
+                        _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
                         return replay_response
                     try:
                         logger.warning(
                             "[agent_orders_create] transient asyncpg state; no replayable order found, retrying once"
                         )
+                        _t = time.perf_counter()
                         await asyncio.sleep(0.05)
+                        logger.info(
+                            "[AgentAPI][PERF] step=asyncio.sleep.retry_backoff duration_ms=%d order=%s",
+                            int((time.perf_counter() - _t) * 1000),
+                            _agent_order_id_for_perf,
+                        )
                     except Exception:
                         pass
                     try:
-                        order_response = await order_routes_module.create_new_order(order_request, background_tasks)
+                        _t = time.perf_counter()
+                        order_response = await order_routes_module.create_new_order(
+                            order_request,
+                            background_tasks,
+                            **create_new_order_kwargs,
+                        )
+                        _agent_order_id_for_perf = getattr(order_response, "order_id", None)
+                        logger.info(
+                            "[AgentAPI][PERF] step=create_new_order.retry duration_ms=%d order=%s",
+                            int((time.perf_counter() - _t) * 1000),
+                            _agent_order_id_for_perf,
+                        )
                     except Exception as e2:
                         if is_asyncpg_busy_error(e2):
+                            _t = time.perf_counter()
                             replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
+                            logger.info(
+                                "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response_with_backoff.retry duration_ms=%d order=%s",
+                                int((time.perf_counter() - _t) * 1000),
+                                _agent_order_id_for_perf,
+                            )
                             if replay_response:
+                                _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
                                 return replay_response
                             raise db_busy_http_exception()
                         raise
@@ -8841,6 +8953,11 @@ async def agent_create_order(
             logger.warning(f"[agent_orders_create] usage logging failed for order create exception: {log_error}")
         raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
     finally:
+        logger.info(
+            "[AgentAPI][PERF] step=agent_create_order_total duration_ms=%d order=%s",
+            int((time.perf_counter() - _agent_order_started) * 1000),
+            _agent_order_id_for_perf,
+        )
         # STEP 3: Record governance metrics (always executed)
         latency_ms = int((time.time() - start_time) * 1000)
         await agent_governance.record_response(
