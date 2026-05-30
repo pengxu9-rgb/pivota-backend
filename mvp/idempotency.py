@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,8 +34,8 @@ class InMemoryIdempotencyStore:
 
 
 class PostgresIdempotencyStore:
-    def __init__(self):
-        self._ready = False
+    _table_ensured: bool = False
+    _ensure_lock: Optional[asyncio.Lock] = None
 
     def _try_get_db(self):
         try:
@@ -45,24 +46,29 @@ class PostgresIdempotencyStore:
             return None
 
     async def _ensure_table(self, db) -> None:
-        if self._ready:
+        if PostgresIdempotencyStore._table_ensured:
             return
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mvp_idempotency_keys (
-              id BIGSERIAL PRIMARY KEY,
-              scope TEXT NOT NULL,
-              idem_key TEXT NOT NULL,
-              value_json JSONB NOT NULL,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              UNIQUE (scope, idem_key)
-            );
-            """
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mvp_idem_scope_time ON mvp_idempotency_keys(scope, created_at DESC);"
-        )
-        self._ready = True
+        if PostgresIdempotencyStore._ensure_lock is None:
+            PostgresIdempotencyStore._ensure_lock = asyncio.Lock()
+        async with PostgresIdempotencyStore._ensure_lock:
+            if PostgresIdempotencyStore._table_ensured:
+                return
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mvp_idempotency_keys (
+                  id BIGSERIAL PRIMARY KEY,
+                  scope TEXT NOT NULL,
+                  idem_key TEXT NOT NULL,
+                  value_json JSONB NOT NULL,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  UNIQUE (scope, idem_key)
+                );
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mvp_idem_scope_time ON mvp_idempotency_keys(scope, created_at DESC);"
+            )
+            PostgresIdempotencyStore._table_ensured = True
 
     async def get(self, *, scope: str, key: str) -> Optional[IdempotencyRecord]:
         db = self._try_get_db()

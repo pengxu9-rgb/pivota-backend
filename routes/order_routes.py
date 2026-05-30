@@ -3363,6 +3363,7 @@ async def create_new_order(
     current_user: dict = Depends(require_admin),  # Agent 需要管理员权限
     precomputed_quote_requirement: Optional[Tuple[bool, Optional[Dict[str, Any]]]] = Depends(lambda: None),
     precomputed_loaded_quote: Optional[QuoteSnapshot] = Depends(lambda: None),
+    precomputed_store_info: Optional[Dict[str, Any]] = Depends(lambda: None),
 ):
     """
     **创建新订单（Agent → Pivota）**
@@ -3385,6 +3386,8 @@ async def create_new_order(
         precomputed_quote_requirement = None
     if precomputed_loaded_quote is not None and not hasattr(precomputed_loaded_quote, "quote_id"):
         precomputed_loaded_quote = None
+    if precomputed_store_info is not None and not isinstance(precomputed_store_info, dict):
+        precomputed_store_info = None
     try:
         _t = time.perf_counter()
         await ensure_database_ready()
@@ -3931,11 +3934,17 @@ async def create_new_order(
         primary_store: Optional[Dict[str, Any]] = None
         try:
             _t = time.perf_counter()
-            primary_store = await get_primary_store(order_request.merchant_id)
+            if precomputed_store_info is not None:
+                primary_store = precomputed_store_info
+                store_source = "precomputed"
+            else:
+                primary_store = await get_primary_store(order_request.merchant_id)
+                store_source = "fresh"
             logger.info(
-                "[OrderRoutes][PERF] step=get_primary_store duration_ms=%d order=%s",
-                int((time.perf_counter() - _t) * 1000),
+                "[OrderRoutes][PERF] step=get_primary_store duration_ms=%d order=%s source=%s",
+                0 if store_source == "precomputed" else int((time.perf_counter() - _t) * 1000),
                 order_id,
+                store_source,
             )
             if primary_store and primary_store.get("store_id"):
                 store_id_value = str(primary_store.get("store_id"))

@@ -336,6 +336,53 @@ async def test_default_loaded_quote_calls_inner_load_once(
 
 
 @pytest.mark.asyncio
+async def test_precomputed_store_info_skips_inner_primary_store_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.setenv("FRESH_QUOTE_VALIDATE_SKIP_SECONDS", "0")
+    _install_order_create_harness(monkeypatch, module)
+    get_primary_store_mock = AsyncMock(return_value={"platform": "shopify", "store_id": "fresh_store"})
+    monkeypatch.setattr(module, "get_primary_store", get_primary_store_mock)
+
+    response = await module.create_new_order(
+        _build_order_request(),
+        BackgroundTasks(),
+        current_user={"user_id": "test"},
+        precomputed_quote_requirement=(False, None),
+        precomputed_store_info={"platform": "shopify", "store_id": "precomputed_store"},
+    )
+    await _drain_background_tasks()
+
+    assert response.order_id == "ORD_WS12"
+    get_primary_store_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_default_store_info_calls_inner_primary_store_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.setenv("FRESH_QUOTE_VALIDATE_SKIP_SECONDS", "0")
+    _install_order_create_harness(monkeypatch, module)
+    get_primary_store_mock = AsyncMock(return_value={"platform": "shopify", "store_id": "fresh_store"})
+    monkeypatch.setattr(module, "get_primary_store", get_primary_store_mock)
+
+    response = await module.create_new_order(
+        _build_order_request(),
+        BackgroundTasks(),
+        current_user={"user_id": "test"},
+        precomputed_quote_requirement=(False, None),
+    )
+    await _drain_background_tasks()
+
+    assert response.order_id == "ORD_WS12"
+    get_primary_store_mock.assert_awaited_once_with("merch_ws12")
+
+
+@pytest.mark.asyncio
 async def test_fresh_unchanged_quote_skips_live_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -166,7 +166,6 @@ def _install_agent_create_order_harness(
     import db.orders as orders_module
     import mvp.events as mvp_events
     import mvp.governance as governance_module
-    import mvp.idempotency as idempotency_module
     import mvp.ledger_events as ledger_events
     import mvp.offer as offer_module
     import routes.agent_api as module
@@ -288,7 +287,7 @@ def _install_agent_create_order_harness(
     )
     monkeypatch.setattr(quote_service.QuoteService, "load_active_quote_or_raise", fake_quote_load)
     monkeypatch.setattr(shopify_policy_service, "get_latest_policy_hashes", fake_get_latest_policy_hashes)
-    monkeypatch.setattr(idempotency_module, "PostgresIdempotencyStore", FakePostgresIdempotencyStore)
+    monkeypatch.setattr(module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
     monkeypatch.setattr(
         offer_module,
         "build_offers_from_quote",
@@ -329,6 +328,10 @@ async def test_agent_create_order_parallel_pre_create_reads_success(monkeypatch:
     assert calls["idempotency_get"] == {"scope": "order_create", "key": "idem_ws14"}
     assert calls["replay_idempotency_key"] == "idem_ws14"
     assert "create_new_order" in calls["steps"]
+    assert calls["create_new_order_kwargs"]["precomputed_store_info"] == {
+        "platform": "shopify",
+        "store_id": "store_ws14",
+    }
 
 
 @pytest.mark.asyncio

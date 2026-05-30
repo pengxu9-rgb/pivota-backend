@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from models.order import CreateOrderRequest, OrderResponse, RecordPaymentOfferEvidenceRequest
 from models.catalog import PivotPaymentContext
 from models.standard_product import StandardProduct
+from mvp.idempotency import PostgresIdempotencyStore
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from db.orders import (
@@ -109,6 +110,7 @@ from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
 
+_AGENT_ORDER_IDEMPOTENCY_STORE = PostgresIdempotencyStore()
 _ORDER_CREATE_LOCKS: Dict[str, asyncio.Lock] = {}
 _ORDER_EVENT_ORDER_TOTAL_TYPES = {
     "order_created",
@@ -481,10 +483,7 @@ async def _cache_agent_order_create_response_best_effort(
     if not idempotency_key:
         return
     try:
-        from mvp.idempotency import PostgresIdempotencyStore
-
-        idem = PostgresIdempotencyStore()
-        await idem.put(scope="order_create", key=idempotency_key, value=response)
+        await _AGENT_ORDER_IDEMPOTENCY_STORE.put(scope="order_create", key=idempotency_key, value=response)
     except Exception:
         pass
 
@@ -492,7 +491,9 @@ async def _cache_agent_order_create_response_best_effort(
 async def _load_replayable_agent_order_create_response(
     order_request: CreateOrderRequest,
 ) -> Optional[Dict[str, Any]]:
+    replay_perf_order = getattr(order_request, "order_id", None)
     try:
+        _t = time.perf_counter()
         existing_order = await find_replayable_order_for_create(
             merchant_id=order_request.merchant_id,
             idempotency_key=getattr(order_request, "idempotency_key", None),
@@ -500,11 +501,31 @@ async def _load_replayable_agent_order_create_response(
             agent_session_id=getattr(order_request, "agent_session_id", None),
             preferred_psp=getattr(order_request, "preferred_psp", None),
         )
-    except Exception:
+        logger.info(
+            "[AgentAPI][PERF] step=_load_replayable.find_replayable_order_for_create "
+            "duration_ms=%d order=%s hit=%s",
+            int((time.perf_counter() - _t) * 1000),
+            replay_perf_order,
+            bool(existing_order),
+        )
+    except Exception as exc:
+        logger.info(
+            "[AgentAPI][PERF] step=_load_replayable.find_replayable_order_for_create "
+            "duration_ms=%d order=%s error=%s",
+            int((time.perf_counter() - _t) * 1000),
+            replay_perf_order,
+            type(exc).__name__,
+        )
         return None
     if not existing_order:
         return None
+    _t = time.perf_counter()
     response = await _build_agent_order_create_response_from_order(existing_order)
+    logger.info(
+        "[AgentAPI][PERF] step=_load_replayable.build_response duration_ms=%d order=%s",
+        int((time.perf_counter() - _t) * 1000),
+        response.get("order_id") if isinstance(response, dict) else replay_perf_order,
+    )
     return response
 
 
@@ -8006,11 +8027,11 @@ async def agent_create_order(
         async def _timed_idempotency_get() -> Any:
             if not order_create_idempotency_key:
                 return None
-            from mvp.idempotency import PostgresIdempotencyStore
-
-            idem = PostgresIdempotencyStore()
             _t = time.perf_counter()
-            existing = await idem.get(scope="order_create", key=order_create_idempotency_key)
+            existing = await _AGENT_ORDER_IDEMPOTENCY_STORE.get(
+                scope="order_create",
+                key=order_create_idempotency_key,
+            )
             logger.info(
                 "[AgentAPI][PERF] step=idempotency.get duration_ms=%d order=%s",
                 int((time.perf_counter() - _t) * 1000),
@@ -8401,21 +8422,31 @@ async def agent_create_order(
 
         create_new_order_kwargs: Dict[str, Any] = {}
         try:
-            if "precomputed_quote_requirement" in inspect.signature(
-                order_routes_module.create_new_order
-            ).parameters:
+            create_new_order_params = inspect.signature(order_routes_module.create_new_order).parameters
+            create_new_order_accepts_kwargs = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in create_new_order_params.values()
+            )
+            if (
+                "precomputed_quote_requirement" in create_new_order_params
+                or create_new_order_accepts_kwargs
+            ):
                 create_new_order_kwargs["precomputed_quote_requirement"] = (require_quote, require_ctx)
             if (
                 precomputed_loaded_quote is not None
-                and "precomputed_loaded_quote" in inspect.signature(
-                    order_routes_module.create_new_order
-                ).parameters
+                and (
+                    "precomputed_loaded_quote" in create_new_order_params
+                    or create_new_order_accepts_kwargs
+                )
             ):
                 create_new_order_kwargs["precomputed_loaded_quote"] = precomputed_loaded_quote
+            if "precomputed_store_info" in create_new_order_params or create_new_order_accepts_kwargs:
+                create_new_order_kwargs["precomputed_store_info"] = store_info_for_policy
         except (TypeError, ValueError):
             create_new_order_kwargs["precomputed_quote_requirement"] = (require_quote, require_ctx)
             if precomputed_loaded_quote is not None:
                 create_new_order_kwargs["precomputed_loaded_quote"] = precomputed_loaded_quote
+            create_new_order_kwargs["precomputed_store_info"] = store_info_for_policy
 
         # 调用标准订单创建 (serialize per-merchant to avoid concurrent order creation hazards)
         async with _get_order_create_lock(order_request.merchant_id):
