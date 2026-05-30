@@ -583,3 +583,81 @@ def test_build_authority_map_classification_and_reddit_shape():
     assert reddit["threads"][0]["sentiment"] is None
     assert reddit["sentiment_proxy"] is None
     assert "chatgpt" in authority_map["hosts"][0]["providers"]
+
+
+@pytest.mark.asyncio
+async def test_load_sku_context_falls_back_to_catalog_product_title(monkeypatch):
+    from services import agent_center_bd_report_service as bd
+
+    product_row = {
+        "product_key": "ts_test_ownist_001_p1",
+        "merchant_id": "merch_test_ownist_001",
+        "platform": "shopify",
+        "source_product_id": "7508774715575",
+        "title": "Triple Shine Grape",
+        "brand": "Ownist",
+        "category": "supplement",
+    }
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        if "FROM catalog_skus" in query:
+            return None
+        if "FROM catalog_products" in query:
+            return product_row
+        return {}
+
+    async def fake_fetch_all(query: str, values: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return []
+
+    bd._SKU_CONTEXT_CACHE.clear()
+    monkeypatch.setattr(bd, "_fetch_one_dict", fake_fetch_one)
+    monkeypatch.setattr(bd, "_fetch_all_dicts", fake_fetch_all)
+
+    ctx = await bd.load_sku_context(
+        "ts_test_ownist_001_p1",
+        "merch_test_ownist_001",
+    )
+    specs = bd._build_per_sku_audit_query_specs(ctx, 40)
+
+    assert ctx["product"]["title"] == "Triple Shine Grape"
+    assert specs
+    assert all("Triple Shine Grape" in query or "supplement" in query for query, _axis in specs)
+    assert not any("ts_test_ownist_001_p1" in query for query, _axis in specs)
+
+
+@pytest.mark.asyncio
+async def test_run_per_sku_audit_skips_when_real_title_missing(monkeypatch):
+    from services import agent_center_bd_report_service as bd
+
+    calls: List[Dict[str, Any]] = []
+
+    async def fake_load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
+        return {
+            "sku_key": sku_key,
+            "merchant_id": merchant_id,
+            "missing_inputs": ["catalog_skus", "catalog_products"],
+        }
+
+    async def fail_probe(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("llm probe should be skipped without a real title")
+
+    monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
+    monkeypatch.setattr(bd.llm_client, "probe", fail_probe)
+
+    result = await bd.run_per_sku_audit_probe_fanout(
+        merchant_id="merch_test_ownist_001",
+        audit_run_id="audit-1",
+        products=[{"sku_key": "ts_test_ownist_001_p1"}],
+        coverage_profile="us_shopper",
+        providers=["gemini"],
+        prompts_per_sku=40,
+    )
+
+    assert calls == []
+    skipped = result["ts_test_ownist_001_p1"][0]
+    assert skipped["status"] == "skipped"
+    assert skipped["skip_reason"] == "missing_real_title"
+    assert skipped["missing_inputs"] == ["catalog_products.title"]
+    assert skipped["runs_count"] == 0
+    assert skipped["raw_runs"] == []

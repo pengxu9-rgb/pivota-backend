@@ -2881,21 +2881,59 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         {"sku_key": sku_key, "merchant_id": merchant_id},
     )
     if not sku:
-        ctx = {"sku_key": sku_key, "merchant_id": merchant_id, "missing_inputs": ["catalog_skus"]}
-        _SKU_CONTEXT_CACHE[cache_key] = ctx
-        return ctx
+        product = await _fetch_one_dict(
+            """
+            SELECT *
+              FROM catalog_products
+             WHERE product_key = :key
+               AND merchant_id = :merchant_id
+             LIMIT 1
+            """,
+            {"key": sku_key, "merchant_id": merchant_id},
+        )
+        if not product and "|" in str(sku_key or ""):
+            parts = str(sku_key).split("|", 2)
+            if len(parts) == 3:
+                parsed_merchant_id, platform, source_product_id = parts
+                if parsed_merchant_id == merchant_id:
+                    product = await _fetch_one_dict(
+                        """
+                        SELECT *
+                          FROM catalog_products
+                         WHERE merchant_id = :merchant_id
+                           AND platform = :platform
+                           AND source_product_id = :source_product_id
+                         LIMIT 1
+                        """,
+                        {
+                            "merchant_id": merchant_id,
+                            "platform": platform,
+                            "source_product_id": source_product_id,
+                        },
+                    )
+        if not product:
+            ctx = {
+                "sku_key": sku_key,
+                "merchant_id": merchant_id,
+                "missing_inputs": ["catalog_skus", "catalog_products"],
+            }
+            _SKU_CONTEXT_CACHE[cache_key] = ctx
+            return ctx
+        sku = {}
+        product_key = product.get("product_key")
+    else:
+        product_key = sku.get("product_key")
+        product = await _fetch_one_dict(
+            """
+            SELECT *
+              FROM catalog_products
+             WHERE product_key = :product_key
+               AND merchant_id = :merchant_id
+             LIMIT 1
+            """,
+            {"product_key": product_key, "merchant_id": merchant_id},
+        ) or {}
 
-    product_key = sku.get("product_key")
-    product = await _fetch_one_dict(
-        """
-        SELECT *
-          FROM catalog_products
-         WHERE product_key = :product_key
-           AND merchant_id = :merchant_id
-         LIMIT 1
-        """,
-        {"product_key": product_key, "merchant_id": merchant_id},
-    ) or {}
     platform = product.get("platform") or sku.get("platform")
     source_product_id = product.get("source_product_id") or sku.get("source_product_id")
 
@@ -3748,19 +3786,28 @@ def _dedupe_query_specs(specs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return out
 
 
+def _resolve_audit_title(
+    sku_ctx: Dict[str, Any],
+    sku: Dict[str, Any],
+    product: Dict[str, Any],
+) -> Optional[str]:
+    """Return a real product title, never the internal SKU key."""
+    sku_key = str((sku_ctx or {}).get("sku_key") or "").strip()
+    for src in (sku.get("title"), product.get("title"), sku_ctx.get("sku_title")):
+        if isinstance(src, str) and src.strip() and src.strip() != sku_key:
+            return src.strip()
+    return None
+
+
 def _build_per_sku_audit_query_specs(
     sku_ctx: Dict[str, Any],
     prompts_per_sku: int,
 ) -> List[Tuple[str, str]]:
     product = _get_product(sku_ctx or {})
     sku = _get_sku(sku_ctx or {})
-    title = (
-        sku.get("title")
-        or product.get("title")
-        or sku_ctx.get("sku_title")
-        or sku_ctx.get("sku_key")
-        or "this product"
-    )
+    title = _resolve_audit_title(sku_ctx or {}, sku, product)
+    if title is None:
+        return []
     brand = product.get("brand") or product.get("vendor") or ""
     product_type = (
         product.get("product_type")
@@ -3851,13 +3898,7 @@ def _per_sku_probe_context(
 ) -> Dict[str, Any]:
     product = _get_product(sku_ctx or {})
     sku = _get_sku(sku_ctx or {})
-    title = (
-        sku.get("title")
-        or product.get("title")
-        or sku_ctx.get("sku_title")
-        or sku_ctx.get("sku_key")
-        or "SKU"
-    )
+    title = _resolve_audit_title(sku_ctx or {}, sku, product) or "product"
     merchant_url = (
         product.get("canonical_url")
         or product.get("pivota_canonical_url")
@@ -3995,6 +4036,40 @@ def _failed_per_sku_probe_payload(
     }
 
 
+def _skipped_per_sku_probe_payload(
+    *,
+    provider: str,
+    sku_key: str,
+    sku_ctx: Dict[str, Any],
+    probe_run_id: str,
+    model_info: Mapping[str, Any],
+) -> Dict[str, Any]:
+    product = _get_product(sku_ctx or {})
+    return {
+        "probe_run_id": probe_run_id,
+        "scan_mode": "per_sku_audit",
+        "upstream_scan_mode": _PER_SKU_AUDIT_PROBE_SCAN_MODE,
+        "provider": provider,
+        "requested_provider": provider,
+        "sku_key": sku_key,
+        "product_key": sku_ctx.get("product_key") or product.get("product_key"),
+        "status": "skipped",
+        "skip_reason": "missing_real_title",
+        "missing_inputs": ["catalog_products.title"],
+        "model": model_info.get("model"),
+        "model_is_override": bool(model_info.get("model_is_override")),
+        **(
+            {"default_model": model_info.get("default_model")}
+            if model_info.get("default_model") else {}
+        ),
+        "runs_count": 0,
+        "scores": {"visibility_score": 0},
+        "findings": [],
+        "usage": {},
+        "raw_runs": [],
+    }
+
+
 async def run_per_sku_audit_probe_fanout(
     *,
     merchant_id: str,
@@ -4030,6 +4105,23 @@ async def run_per_sku_audit_probe_fanout(
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
         query_specs = _build_per_sku_audit_query_specs(sku_ctx, target_prompts)
         out[sku_key] = []
+        if not query_specs:
+            for provider_id in profile_providers:
+                model_info = provider_model_metadata.get(provider_id) or {}
+                probe_run_id = (
+                    f"{audit_run_id or 'adhoc'}:{sku_key}:"
+                    f"{provider_id}:per_sku:skipped"
+                )
+                out[sku_key].append(
+                    _skipped_per_sku_probe_payload(
+                        provider=provider_id,
+                        sku_key=sku_key,
+                        sku_ctx=sku_ctx,
+                        probe_run_id=probe_run_id,
+                        model_info=model_info,
+                    )
+                )
+            continue
         for provider_id in profile_providers:
             model_info = provider_model_metadata.get(provider_id) or {}
             for chunk_idx, chunk in enumerate(_chunk_query_specs(query_specs), start=1):
