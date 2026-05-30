@@ -8612,6 +8612,7 @@ async def agent_create_order(
 
         try:
             from services.agent_decision_event_store import record_checkout_decision
+            from services.protocols import DEFAULT_PROTOCOL
 
             refs = _extract_decision_product_refs(order_request.metadata)
             pricing_quote = (
@@ -8642,6 +8643,7 @@ async def agent_create_order(
                             "payment_intent_id": order_response.payment_intent_id,
                             "selected_payment_offer_id": getattr(order_request, "selected_payment_offer_id", None),
                         },
+                        protocol=DEFAULT_PROTOCOL,
                     )
                 except Exception:
                     logger.debug("checkout decision event enqueue failed", exc_info=True)
@@ -9121,6 +9123,7 @@ async def agent_confirm_payment(
 
         try:
             from services.agent_decision_event_store import record_funnel_link
+            from services.protocols import DEFAULT_PROTOCOL
 
             order_metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
             decision_id = _extract_decision_id_from_metadata(order_metadata)
@@ -9137,6 +9140,7 @@ async def agent_confirm_payment(
                             catalog_offer_id=refs.get("catalog_offer_id"),
                             commerce_attribution_edge_id=None,
                             merchant_id=str(order.get("merchant_id") or ""),
+                            protocol=DEFAULT_PROTOCOL,
                         )
                     except Exception:
                         logger.debug("decision funnel link enqueue failed", exc_info=True)
