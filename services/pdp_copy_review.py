@@ -173,8 +173,8 @@ def _parse_rubric(content: str) -> Optional[Dict[str, Any]]:
 
 async def _call_deepseek_review(
     *, copy_text: str,
-) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
-    """Return (content, input_tokens, output_tokens) or None on no-key.
+) -> Optional[Tuple[str, Optional[int], Optional[int], Dict[str, Any], Dict[str, Any], str]]:
+    """Return content, usage, request, response, model; or None on no-key.
     Raises on transport/HTTP errors (caller catches + records failure)."""
     api_key = (settings.deepseek_api_key or "").strip()
     if not api_key:
@@ -205,7 +205,14 @@ async def _call_deepseek_review(
         data = response.json()
         content = data["choices"][0]["message"]["content"]
         usage = data.get("usage") or {}
-        return content, usage.get("prompt_tokens"), usage.get("completion_tokens")
+        return (
+            content,
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
+            payload,
+            data,
+            settings.deepseek_model,
+        )
 
 
 async def generate_copy_review_rubric(
@@ -257,7 +264,7 @@ async def generate_copy_review_rubric(
     if result is None:  # no API key -> nothing ran, nothing to meter
         return None
 
-    content, input_tokens, output_tokens = result
+    content, input_tokens, output_tokens, request_payload, response_payload, model = result
     rate_in, rate_out = _resolve_deepseek_rates(settings.deepseek_model)
     cost_usd = compute_cost_usd(
         input_tokens=input_tokens,
@@ -273,6 +280,9 @@ async def generate_copy_review_rubric(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cost_usd=cost_usd,
+        request_payload_jsonb=request_payload,
+        response_jsonb=response_payload,
+        model=model,
     )
 
     rubric = _parse_rubric(content)

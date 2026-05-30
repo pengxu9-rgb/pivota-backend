@@ -41,6 +41,8 @@ async def _record_probe_telemetry(
     result: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
     model: Optional[str] = None,
+    request_payload_jsonb: Optional[Dict[str, Any]] = None,
+    response_jsonb: Optional[Dict[str, Any]] = None,
 ) -> None:
     """P2.5b: best-effort telemetry record after every probe call.
     Pulls audit_run_id + merchant_id from the audit_telemetry context
@@ -100,6 +102,9 @@ async def _record_probe_telemetry(
             output_tokens=output_tokens,
             cost_usd=cost_usd,
             error_message=error_message,
+            request_payload_jsonb=request_payload_jsonb,
+            response_jsonb=response_jsonb,
+            model=model,
         )
     except Exception as exc:  # noqa: BLE001 — telemetry never fails calls
         logger.debug(
@@ -526,6 +531,7 @@ async def probe(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
             model=resolved_model,
+            request_payload_jsonb=body,
             error_message=(
                 f"transport_failed: "
                 f"{type(last_exc).__name__ if last_exc else 'unknown'}"
@@ -541,6 +547,8 @@ async def probe(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
             model=resolved_model,
+            request_payload_jsonb=body,
+            response_jsonb={"status_code": response.status_code, "text": response.text[:2000]},
             error_message=f"upstream_5xx_{response.status_code}",
         )
         raise AgentCenterLlmClientError(
@@ -554,6 +562,8 @@ async def probe(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
             model=resolved_model,
+            request_payload_jsonb=body,
+            response_jsonb={"status_code": response.status_code, "text": response.text[:2000]},
             error_message=f"upstream_4xx_{response.status_code}",
         )
         raise ValueError(
@@ -568,6 +578,8 @@ async def probe(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
             model=resolved_model,
+            request_payload_jsonb=body,
+            response_jsonb={"status_code": response.status_code, "text": response.text[:2000]},
             error_message=f"non_json_response: {exc}",
         )
         raise AgentCenterLlmClientError(f"llm probe non-JSON response: {exc}") from exc
@@ -577,6 +589,8 @@ async def probe(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
             model=resolved_model,
+            request_payload_jsonb=body,
+            response_jsonb=payload if isinstance(payload, dict) else {"payload": str(payload)[:2000]},
             error_message="response_not_ok",
         )
         raise AgentCenterLlmClientError(
@@ -589,6 +603,8 @@ async def probe(
             provider=provider, scan_mode=scan_mode, status="failed",
             started_at_perf=_telemetry_started_at,
             model=resolved_model,
+            request_payload_jsonb=body,
+            response_jsonb=payload,
             error_message="missing_result_object",
         )
         raise AgentCenterLlmClientError("llm probe response missing `result` object")
@@ -603,5 +619,7 @@ async def probe(
         started_at_perf=_telemetry_started_at,
         result=result,
         model=resolved_model,
+        request_payload_jsonb=body,
+        response_jsonb=payload,
     )
     return result

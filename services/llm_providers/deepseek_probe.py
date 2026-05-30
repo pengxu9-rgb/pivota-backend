@@ -447,7 +447,10 @@ async def _call_deepseek_chat(
             f"Deepseek API client error {response.status_code}: "
             f"{response.text[:200]}"
         )
-    return response.json()
+    payload = response.json()
+    if isinstance(payload, dict):
+        payload["_request_payload_jsonb"] = body
+    return payload
 
 
 async def _run_single_query(
@@ -510,6 +513,7 @@ async def _run_single_query(
             "_usage": {"input_tokens": None, "output_tokens": None},
         }
     choices = api_response.get("choices") or []
+    request_payload = api_response.pop("_request_payload_jsonb", None)
     raw_text = ""
     if choices and isinstance(choices[0], dict):
         message = choices[0].get("message") or {}
@@ -536,6 +540,8 @@ async def _run_single_query(
         "grounding_sources": grounding_sources,
         "url_match": url_match,
         **({"provider": "deepseek", "role": "verify"} if scan_mode == ANSWER_QUALITY_VERIFY_SCAN_MODE else {}),
+        "_request_payload_jsonb": request_payload,
+        "_response_jsonb": api_response,
         # Per-run usage so the outer probe_one_scan_mode can sum.
         # None values when Deepseek omits the block (rare but possible
         # on rate-limit / partial responses).
@@ -740,6 +746,20 @@ async def probe_one_scan_mode(
             else "all_runs_returned_upstream_failed_shape"
         ),
         model=model,
+        request_payload_jsonb={
+            "runs": [
+                r.get("_request_payload_jsonb")
+                for r in raw_runs
+                if r.get("_request_payload_jsonb") is not None
+            ],
+        },
+        response_jsonb={
+            "runs": [
+                r.get("_response_jsonb")
+                for r in raw_runs
+                if r.get("_response_jsonb") is not None
+            ],
+        },
     )
     return {
         "scan_mode": scan_mode,
@@ -765,6 +785,8 @@ async def _record_deepseek_telemetry(
     output_tokens: Optional[int],
     error_message: Optional[str] = None,
     model: Optional[str] = None,
+    request_payload_jsonb: Optional[Dict[str, Any]] = None,
+    response_jsonb: Optional[Dict[str, Any]] = None,
 ) -> None:
     """P2.5b: best-effort telemetry record for one Deepseek probe
     call. Pulls audit_run_id + merchant_id from the audit_telemetry
@@ -811,6 +833,9 @@ async def _record_deepseek_telemetry(
             output_tokens=output_tokens,
             cost_usd=cost_usd,
             error_message=error_message,
+            request_payload_jsonb=request_payload_jsonb,
+            response_jsonb=response_jsonb,
+            model=model,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(

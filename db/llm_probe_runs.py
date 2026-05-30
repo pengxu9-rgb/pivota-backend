@@ -36,7 +36,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID
 
-from db.database import database, metadata
+from db._jsonb_safe import _json_safe
+from db.database import IS_POSTGRES, JSONB_TYPE, database, metadata
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,9 @@ llm_probe_runs = Table(
     Column("cost_usd", Numeric(10, 6), nullable=True),
     Column("status", Text, nullable=False),
     Column("error_message", Text, nullable=True),
+    Column("request_payload_jsonb", JSONB_TYPE, nullable=True),
+    Column("response_jsonb", JSONB_TYPE, nullable=True),
+    Column("model", Text, nullable=True),
     Column("completed_at", DateTime(timezone=True), nullable=False),
     Index(
         "idx_llm_probe_runs_audit_run", "audit_run_id",
@@ -85,6 +89,24 @@ llm_probe_runs = Table(
 
 _DDL_READY = False
 _DDL_LOCK = asyncio.Lock()
+_DDL_JSON_TYPE = "JSONB" if IS_POSTGRES else "JSON"
+_DDL_TIME_DEFAULT = "NOW()" if IS_POSTGRES else "CURRENT_TIMESTAMP"
+_DDL_ADD_RAW_IO_COLUMNS = (
+    [
+        """
+        ALTER TABLE llm_probe_runs
+          ADD COLUMN IF NOT EXISTS request_payload_jsonb JSONB,
+          ADD COLUMN IF NOT EXISTS response_jsonb JSONB,
+          ADD COLUMN IF NOT EXISTS model TEXT;
+        """
+    ]
+    if IS_POSTGRES
+    else [
+        "ALTER TABLE llm_probe_runs ADD COLUMN request_payload_jsonb JSON;",
+        "ALTER TABLE llm_probe_runs ADD COLUMN response_jsonb JSON;",
+        "ALTER TABLE llm_probe_runs ADD COLUMN model TEXT;",
+    ]
+)
 
 
 _DDL_STATEMENTS = [
@@ -92,7 +114,7 @@ _DDL_STATEMENTS = [
     # the column types it doesn't recognize (NUMERIC works as REAL,
     # UUID as TEXT). The ensure-table helper tolerates per-statement
     # failures, so partial failures don't poison the whole batch.
-    """
+    f"""
     CREATE TABLE IF NOT EXISTS llm_probe_runs (
         probe_run_id        UUID PRIMARY KEY,
         provider            TEXT NOT NULL,
@@ -105,9 +127,13 @@ _DDL_STATEMENTS = [
         cost_usd            NUMERIC(10, 6) NULL,
         status              TEXT NOT NULL,
         error_message       TEXT NULL,
-        completed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        request_payload_jsonb {_DDL_JSON_TYPE} NULL,
+        response_jsonb      {_DDL_JSON_TYPE} NULL,
+        model               TEXT NULL,
+        completed_at        TIMESTAMPTZ NOT NULL DEFAULT {_DDL_TIME_DEFAULT}
     );
     """,
+    *_DDL_ADD_RAW_IO_COLUMNS,
     "CREATE INDEX IF NOT EXISTS idx_llm_probe_runs_audit_run "
     "ON llm_probe_runs (audit_run_id) WHERE audit_run_id IS NOT NULL;",
     "CREATE INDEX IF NOT EXISTS idx_llm_probe_runs_merchant_day "
@@ -144,6 +170,48 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_SECRET_KEY_PARTS = (
+    "authorization",
+    "api_key",
+    "apikey",
+    "password",
+)
+_SAFE_HEADER_KEYS = {
+    "accept",
+    "content-type",
+}
+
+
+def _redact_probe_payload(value: Any, *, _under_headers: bool = False) -> Any:
+    """Return a JSON-safe probe payload with obvious secrets removed.
+
+    Raw LLM I/O is useful only if it is safe to persist. This keeps normal
+    request/response structure intact for audit replay while stripping
+    credentials from nested dicts and header blocks.
+    """
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_str = str(key)
+            key_l = key_str.lower()
+            if _under_headers and key_l not in _SAFE_HEADER_KEYS:
+                continue
+            if any(part in key_l for part in _SECRET_KEY_PARTS):
+                continue
+            if key_l == "headers":
+                out[key_str] = _redact_probe_payload(item, _under_headers=True)
+            else:
+                out[key_str] = _redact_probe_payload(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_probe_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_probe_payload(item) for item in value]
+    if isinstance(value, str) and "Bearer " in value:
+        return value.replace("Bearer ", "Bearer [REDACTED] ")
+    return _json_safe(value)
+
+
 def compute_cost_usd(
     *,
     input_tokens: Optional[int],
@@ -178,6 +246,9 @@ async def record_probe_run(
     output_tokens: Optional[int] = None,
     cost_usd: Optional[Decimal] = None,
     error_message: Optional[str] = None,
+    request_payload_jsonb: Optional[Dict[str, Any]] = None,
+    response_jsonb: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
 ) -> Optional[str]:
     """Insert one probe-run telemetry row. Best-effort — returns
     the new probe_run_id on success, None on persistence failure
@@ -212,6 +283,15 @@ async def record_probe_run(
                 error_message=(
                     error_message[:1000] if error_message else None
                 ),
+                request_payload_jsonb=(
+                    _redact_probe_payload(request_payload_jsonb)
+                    if request_payload_jsonb is not None else None
+                ),
+                response_jsonb=(
+                    _json_safe(response_jsonb)
+                    if response_jsonb is not None else None
+                ),
+                model=model,
                 completed_at=_now_utc(),
             )
         )
