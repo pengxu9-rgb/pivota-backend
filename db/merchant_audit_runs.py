@@ -39,6 +39,33 @@ from datetime import datetime, timezone
 from db._jsonb_safe import _json_safe
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def _decode_jsonb_field(value: Any) -> Optional[Dict[str, Any]]:
+    """Coerce a JSONB column read result into a dict.
+
+    `databases` + asyncpg with no explicit jsonb codec returns JSONB columns
+    as JSON-encoded STRINGS. Code paths downstream (worker reading
+    `partial_result_jsonb.launch.audit_mode`, route renderers, etc.) assume
+    a dict and silently fall back to defaults when isinstance(dict) fails —
+    which silently flips the audit to legacy mode on prod even though the
+    integration test (which stores partial_result_jsonb as a real dict in
+    its in-memory fake) passes. Memory feedback_test_helper_masking_production_bug
+    (PR #355 incident) — same pattern.
+
+    Always returns dict or None; never a string.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
 from sqlalchemy import (
     ARRAY,
     Column,
@@ -696,7 +723,7 @@ async def claim_next_pending_run(
             "subject_type": d.get("subject_type"),
             "idempotency_key": d.get("idempotency_key"),
             "requested_by_user_id": d.get("requested_by_user_id"),
-            "partial_result_jsonb": d.get("partial_result_jsonb"),
+            "partial_result_jsonb": _decode_jsonb_field(d.get("partial_result_jsonb")),
             "requested_at": (
                 d["requested_at"].isoformat()
                 if isinstance(d.get("requested_at"), datetime)
@@ -1016,10 +1043,10 @@ async def fetch_audit_run_by_id(
         "audited_via_pivota_canonical": list(
             d.get("audited_via_pivota_canonical") or []
         ),
-        "partial_result_jsonb": d.get("partial_result_jsonb"),
-        "report_jsonb": d.get("report_jsonb"),
-        "cost_summary_jsonb": d.get("cost_summary_jsonb"),
-        "error_jsonb": d.get("error_jsonb"),
+        "partial_result_jsonb": _decode_jsonb_field(d.get("partial_result_jsonb")),
+        "report_jsonb": _decode_jsonb_field(d.get("report_jsonb")),
+        "cost_summary_jsonb": _decode_jsonb_field(d.get("cost_summary_jsonb")),
+        "error_jsonb": _decode_jsonb_field(d.get("error_jsonb")),
         "error_message": d.get("error_message"),
         "idempotency_key": d.get("idempotency_key"),
         "requested_by_user_id": d.get("requested_by_user_id"),
