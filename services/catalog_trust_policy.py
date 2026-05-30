@@ -461,7 +461,7 @@ def _derive_freshness(
 
     return {
         "state": state,
-        "last_verified_at": _to_iso(chosen_ts),
+        "last_verified_at": chosen_ts,
         "verification_source": chosen_src,
     }
 
@@ -630,15 +630,6 @@ def _to_datetime(value: Any) -> Optional[datetime]:
         except ValueError:
             return None
     return None
-
-
-def _to_iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    # Match the Node toISOString output: millisecond precision + 'Z'.
-    aware = dt.astimezone(timezone.utc)
-    ms = aware.microsecond // 1000
-    return aware.strftime("%Y-%m-%dT%H:%M:%S") + f".{ms:03d}Z"
 
 
 @dataclass(frozen=True)
