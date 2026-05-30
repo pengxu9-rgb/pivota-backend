@@ -30,9 +30,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_merchant_product_overlay_active
     ON merchant_product_overlay (product_key, module_key, field_key)
     WHERE approval_status = 'active';
 
--- Read path: the merge hook looks up active overlays by product_key.
+-- Read path: the agent merge hook matches on the merchant_id + source_product_id
+-- segments of product_key via split_part, so an expression index on those
+-- segments (not the whole product_key) is what actually serves the request-time
+-- lookup. Keep the plain product_key index too for writer-side point lookups.
 CREATE INDEX IF NOT EXISTS idx_merchant_product_overlay_product_active
     ON merchant_product_overlay (product_key)
+    WHERE approval_status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_merchant_product_overlay_segments_active
+    ON merchant_product_overlay (
+        split_part(product_key, '|', 1),
+        split_part(product_key, '|', 3)
+    )
     WHERE approval_status = 'active';
 
 COMMIT;

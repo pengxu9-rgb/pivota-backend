@@ -47,9 +47,25 @@ _DAILY_COST_CAP_USD = float(
     os.getenv("AGENT_CENTER_LLM_DAILY_COST_USD_PER_MERCHANT", "5") or "5"
 )
 
-# DeepSeek deepseek-chat (V4 Flash) list rates; mirror provider_registry.py.
+# DeepSeek deepseek-chat (V4 Flash) list rates -- fallback only. The actual rate
+# is resolved per-model from the provider registry at call time (so pointing
+# DEEPSEEK_MODEL at deepseek-reasoner meters at the reasoner rate, not Flash).
 _COST_PER_1K_INPUT_USD = 0.00014
 _COST_PER_1K_OUTPUT_USD = 0.00028
+
+
+def _resolve_deepseek_rates(model_id: str) -> Tuple[float, float]:
+    """(input_per_1k, output_per_1k) for the configured DeepSeek model.
+    Falls back to the headline deepseek-chat rates if the registry is unavailable."""
+    try:
+        from services.llm_providers.provider_registry import get_provider
+
+        provider = get_provider(_PROBE_PROVIDER)
+        if provider is not None:
+            return provider.rate_for_model(model_id)
+    except Exception:
+        pass
+    return _COST_PER_1K_INPUT_USD, _COST_PER_1K_OUTPUT_USD
 
 # Must match GPT55_RUBRIC_REQUIRED_CHECKS in services/pdp_governance_service.py.
 REQUIRED_CHECKS = (
@@ -118,24 +134,32 @@ def _parse_rubric(content: str) -> Optional[Dict[str, Any]]:
     checks = obj.get("checks")
     if not isinstance(checks, dict):
         return None
-    # All required checks must be present; the gate re-validates but we fail
-    # closed here so a malformed model never reaches the gate.
+    # All required checks must be present AND be LITERAL booleans. We must not
+    # coerce here -- bool("false") is True, which would turn a malformed/evasive
+    # rubric into a passing one. Fail closed on any non-bool check value.
     if any(c not in checks for c in REQUIRED_CHECKS):
         return None
-    normalized = {c: bool(checks.get(c)) for c in REQUIRED_CHECKS}
+    if any(not isinstance(checks.get(c), bool) for c in REQUIRED_CHECKS):
+        return None
+    normalized = {c: checks[c] for c in REQUIRED_CHECKS}
+    # A 'pass' is only honored by the gate with non-empty evidence_refs; require
+    # them here too so a 'pass' without evidence fails closed rather than
+    # silently degrading downstream.
+    evidence_refs = obj.get("evidence_refs")
+    if not isinstance(evidence_refs, list):
+        evidence_refs = []
+    evidence_refs = [str(ref) for ref in evidence_refs if str(ref).strip()][:5]
+    if decision == "pass" and not evidence_refs:
+        return None
     try:
         confidence = float(obj.get("confidence"))
     except (TypeError, ValueError):
         confidence = 0.0
-    evidence_refs = obj.get("evidence_refs")
-    if not isinstance(evidence_refs, list):
-        evidence_refs = []
-    # The gate requires evidence_refs + this exact review channel to honor a pass.
     return {
         "decision": decision,
         "checks": normalized,
         "confidence": confidence,
-        "evidence_refs": [str(ref) for ref in evidence_refs][:5],
+        "evidence_refs": evidence_refs,
         "reasons": [],
         "reviewed_in": "codex_external_window",
     }
@@ -228,11 +252,12 @@ async def generate_copy_review_rubric(
         return None
 
     content, input_tokens, output_tokens = result
+    rate_in, rate_out = _resolve_deepseek_rates(settings.deepseek_model)
     cost_usd = compute_cost_usd(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        cost_per_1k_input_tokens_usd=_COST_PER_1K_INPUT_USD,
-        cost_per_1k_output_tokens_usd=_COST_PER_1K_OUTPUT_USD,
+        cost_per_1k_input_tokens_usd=rate_in,
+        cost_per_1k_output_tokens_usd=rate_out,
     )
     await record_probe_run(
         provider=_PROBE_PROVIDER,

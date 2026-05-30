@@ -138,8 +138,10 @@ async def submit_product_pdp_contribution(
 
 class MerchantApproveRequest(BaseModel):
     module_key: str = "copy"
-    version_id: Optional[str] = None
     market: str = DEFAULT_MARKET
+    # NOTE: no caller-supplied version_id -- we always review exactly the staged
+    # version the projection resolves for this merchant's product_key, so a caller
+    # cannot point the approve at an arbitrary (or another merchant's) version.
 
 
 @router.post("/product/{platform}/{platform_product_id}/approve")
@@ -167,18 +169,24 @@ async def approve_product_pdp_module(
         projection = await get_pdp_projection(product_key=product_key, market=body.market)
         pdp_id = projection["pdp"]["pdp_id"]
 
-        # Find the staged module payload the merchant is approving.
-        staged = next(
+        # Find the staged module the merchant is approving. get_pdp_projection
+        # returns one summary per module_key with the staged version nested under
+        # the "staged" key (NOT a top-level "stage" field).
+        module_summary = next(
             (
                 m
                 for m in projection.get("modules", [])
-                if m.get("module_key") == body.module_key and m.get("stage") == "staged"
+                if m.get("module_key") == body.module_key
             ),
             None,
         )
+        staged = (module_summary or {}).get("staged")
         if not staged:
             raise HTTPException(status_code=404, detail="NO_STAGED_MODULE")
-        version_id = body.version_id or staged.get("id")
+        # Always review exactly this staged version (no caller-supplied id).
+        version_id = staged.get("id")
+        if not version_id:
+            raise HTTPException(status_code=404, detail="NO_STAGED_MODULE")
         payload = staged.get("payload") if isinstance(staged.get("payload"), dict) else {}
 
         rubric = await generate_copy_review_rubric(

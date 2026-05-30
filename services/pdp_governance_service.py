@@ -5406,34 +5406,40 @@ async def materialize_overlay_from_module(
         value = extractor(payload)
         if value is None:
             continue
-        # Supersede any prior active overlay for this (product_key, module_key, field_key).
-        await database.execute(
-            merchant_product_overlay.update()
-            .where(
-                (merchant_product_overlay.c.product_key == product_key)
-                & (merchant_product_overlay.c.module_key == module_key)
-                & (merchant_product_overlay.c.field_key == field_key)
-                & (merchant_product_overlay.c.approval_status == "active")
+        # Supersede prior active overlay + insert the new one atomically. The
+        # partial unique index uq_merchant_product_overlay_active enforces at most
+        # one active row per (product_key, module_key, field_key); the transaction
+        # keeps concurrent publishes from both superseding then double-inserting
+        # (which would raise on the unique index and leave the module diverged from
+        # the active overlay). A serialized supersede->insert is correct here.
+        async with database.transaction():
+            await database.execute(
+                merchant_product_overlay.update()
+                .where(
+                    (merchant_product_overlay.c.product_key == product_key)
+                    & (merchant_product_overlay.c.module_key == module_key)
+                    & (merchant_product_overlay.c.field_key == field_key)
+                    & (merchant_product_overlay.c.approval_status == "active")
+                )
+                .values(approval_status="superseded", updated_at=now)
             )
-            .values(approval_status="superseded", updated_at=now)
-        )
-        await database.execute(
-            merchant_product_overlay.insert().values(
-                overlay_id=f"ovl_{uuid.uuid4().hex}",
-                product_key=product_key,
-                content_key=None,
-                module_key=module_key,
-                field_key=field_key,
-                value_jsonb=value,
-                provenance=provenance,
-                source_version_id=published_version_id,
-                approval_status="active",
-                approved_by=actor_id,
-                approved_at=now,
-                created_at=now,
-                updated_at=now,
+            await database.execute(
+                merchant_product_overlay.insert().values(
+                    overlay_id=f"ovl_{uuid.uuid4().hex}",
+                    product_key=product_key,
+                    content_key=None,
+                    module_key=module_key,
+                    field_key=field_key,
+                    value_jsonb=value,
+                    provenance=provenance,
+                    source_version_id=published_version_id,
+                    approval_status="active",
+                    approved_by=actor_id,
+                    approved_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-        )
         written += 1
     return written
 

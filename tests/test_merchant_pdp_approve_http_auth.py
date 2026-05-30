@@ -43,19 +43,31 @@ def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-def _patch_downstream(monkeypatch, mp, *, decision="pass", published=True, rubric_ok=True):
-    pdp_id = "pdp_http_test"
-    product_key = f"{MERCHANT_ID}|{PLATFORM}|{PRODUCT_ID}"
+def _real_shape_projection(pdp_id="pdp_http_test", *, has_staged=True):
+    """Mirror the REAL get_pdp_projection module shape: one summary per module_key
+    with the staged version nested under "staged" (NOT a top-level "stage" field).
+    Using the real shape here is what guards against the projection-parsing bug."""
+    staged = (
+        {"id": "pdpmod_x", "stage": "staged",
+         "payload": {"pdp_description_raw": "draft copy"}, "source_refs": []}
+        if has_staged else None
+    )
+    return {
+        "status": "success",
+        "pdp": {"pdp_id": pdp_id},
+        "modules": [
+            {"module_key": "copy", "status": "draft", "current": None,
+             "staged": staged, "published_payload": None, "source_refs": []},
+        ],
+        "published_payload": {},
+        "activity": [],
+    }
 
+
+def _patch_downstream(monkeypatch, mp, *, decision="pass", published=True,
+                      rubric_ok=True, has_staged=True):
     async def fake_projection(*, product_key, market):
-        return {
-            "pdp": {"pdp_id": pdp_id},
-            "modules": [
-                {"module_key": "copy", "stage": "staged", "id": "pdpmod_x",
-                 "payload": {"pdp_description_raw": "draft copy"}, "source_refs": []},
-            ],
-            "published_payload": {},
-        }
+        return _real_shape_projection(has_staged=has_staged)
 
     async def fake_rubric(*, merchant_id, payload, source_refs=None):
         return {"decision": "pass", "checks": {}, "confidence": 0.9} if rubric_ok else None
@@ -128,12 +140,7 @@ def test_product_key_bound_to_jwt_merchant(monkeypatch):
 
     async def capture_projection(*, product_key, market):
         seen["product_key"] = product_key
-        return {
-            "pdp": {"pdp_id": "pdp_http_test"},
-            "modules": [{"module_key": "copy", "stage": "staged", "id": "pdpmod_x",
-                         "payload": {"pdp_description_raw": "draft copy"}, "source_refs": []}],
-            "published_payload": {},
-        }
+        return _real_shape_projection()
 
     async def fake_rubric(*, merchant_id, payload, source_refs=None):
         seen["rubric_merchant_id"] = merchant_id
@@ -164,6 +171,19 @@ def test_rubric_unavailable_returns_needs_human_review(monkeypatch):
     assert body["decision"] == "needs_human_review"
     assert body["published"] is False
     assert body["reason"] == "copy_review_unavailable"
+
+
+# --- REGRESSION: no staged module in the real projection shape -> 404.
+# Guards the projection-parsing bug where the handler looked for a top-level
+# "stage" key that get_pdp_projection never emits (it nests under "staged"),
+# which made EVERY real approve return NO_STAGED_MODULE. ---
+
+def test_no_staged_module_404(monkeypatch):
+    client, mp = _client(monkeypatch)
+    _patch_downstream(monkeypatch, mp, has_staged=False)
+    r = client.post(_url(), json={"module_key": "copy"}, headers=_auth(_token()))
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "NO_STAGED_MODULE"
 
 
 if __name__ == "__main__":
