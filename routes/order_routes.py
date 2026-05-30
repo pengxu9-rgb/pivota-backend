@@ -7,7 +7,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, Header, Query, status
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 import asyncio
 import time
@@ -60,6 +60,7 @@ from services.commerce_attribution_service import (
 )
 from services.quote_service import (
     QuoteError,
+    QuoteSnapshot,
     QuoteService,
     compute_request_fingerprint,
     normalize_discount_codes,
@@ -202,6 +203,75 @@ def _order_live_quote_revalidation_enabled() -> bool:
         "no",
         "off",
     }
+
+
+FRESH_QUOTE_VALIDATE_SKIP_SECONDS = int(os.getenv("FRESH_QUOTE_VALIDATE_SKIP_SECONDS", "30"))
+
+
+def _fresh_quote_validate_skip_seconds() -> int:
+    raw = os.getenv("FRESH_QUOTE_VALIDATE_SKIP_SECONDS")
+    if raw is None:
+        return max(0, FRESH_QUOTE_VALIDATE_SKIP_SECONDS)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return max(0, FRESH_QUOTE_VALIDATE_SKIP_SECONDS)
+
+
+def _coerce_utc_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _quote_order_items_unchanged(
+    *,
+    quote_request_json: Any,
+    order_items_for_fingerprint: List[Dict[str, Any]],
+) -> bool:
+    if not isinstance(quote_request_json, dict):
+        return False
+    try:
+        quote_items = normalize_items_for_fingerprint(quote_request_json.get("items") or [])
+        order_items = normalize_items_for_fingerprint(order_items_for_fingerprint)
+        return quote_items == order_items
+    except Exception:
+        return False
+
+
+async def _bg_log_order_event(*args, **kwargs) -> None:
+    try:
+        await log_order_event(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("background log_order_event failed: %s", str(exc)[:200])
+
+
+async def _bg_emit_merchant_webhook_event(*args, **kwargs) -> None:
+    try:
+        await emit_merchant_webhook_event(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("background emit_merchant_webhook_event failed: %s", str(exc)[:200])
+
+
+async def _bg_consume_quote_best_effort(
+    quote_service: QuoteService,
+    quote_id: str,
+    *,
+    order_id: str,
+) -> None:
+    try:
+        await quote_service.consume_quote_best_effort(quote_id, order_id=order_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("background consume_quote_best_effort failed: %s", str(exc)[:200])
 
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -3292,6 +3362,7 @@ async def create_new_order(
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(require_admin),  # Agent 需要管理员权限
     precomputed_quote_requirement: Optional[Tuple[bool, Optional[Dict[str, Any]]]] = Depends(lambda: None),
+    precomputed_loaded_quote: Optional[QuoteSnapshot] = Depends(lambda: None),
 ):
     """
     **创建新订单（Agent → Pivota）**
@@ -3312,6 +3383,8 @@ async def create_new_order(
     order_id = None
     if not isinstance(precomputed_quote_requirement, tuple):
         precomputed_quote_requirement = None
+    if precomputed_loaded_quote is not None and not hasattr(precomputed_loaded_quote, "quote_id"):
+        precomputed_loaded_quote = None
     try:
         _t = time.perf_counter()
         await ensure_database_ready()
@@ -3398,13 +3471,24 @@ async def create_new_order(
             live_validation_meta: Optional[Dict[str, Any]] = None
             try:
                 _t = time.perf_counter()
-                quote = await quote_service.load_active_quote_or_raise(
-                    quote_id=order_request.quote_id
-                )
+                if (
+                    precomputed_loaded_quote is not None
+                    and str(getattr(precomputed_loaded_quote, "quote_id", "") or "")
+                    == str(order_request.quote_id)
+                ):
+                    quote = precomputed_loaded_quote
+                    quote_load_source = "precomputed"
+                else:
+                    quote = await quote_service.load_active_quote_or_raise(
+                        quote_id=order_request.quote_id
+                    )
+                    quote_load_source = "fresh"
                 logger.info(
-                    "[OrderRoutes][PERF] step=quote_service.load_active_quote_or_raise duration_ms=%d order=%s",
+                    "[OrderRoutes][PERF] "
+                    "step=quote_service.load_active_quote_or_raise duration_ms=%d order=%s source=%s",
                     int((time.perf_counter() - _t) * 1000),
                     order_id,
+                    quote_load_source,
                 )
 
                 order_items_for_fingerprint = [
@@ -3500,17 +3584,50 @@ async def create_new_order(
                     )
 
                 if _order_live_quote_revalidation_enabled():
-                    _t = time.perf_counter()
-                    live_validation_meta = await quote_service.validate_quote_snapshot_live(
-                        quote,
-                        customer_email=order_request.customer_email,
-                        create_replacement_quote_on_mismatch=True,
+                    skip_seconds = _fresh_quote_validate_skip_seconds()
+                    quote_created_at = _coerce_utc_datetime(getattr(quote, "created_at", None))
+                    quote_age_seconds = (
+                        max(0.0, (datetime.now(timezone.utc) - quote_created_at).total_seconds())
+                        if quote_created_at is not None
+                        else None
                     )
-                    logger.info(
-                        "[OrderRoutes][PERF] step=quote_service.validate_quote_snapshot_live duration_ms=%d order=%s",
-                        int((time.perf_counter() - _t) * 1000),
-                        order_id,
+                    items_unchanged = _quote_order_items_unchanged(
+                        quote_request_json=quote.request_json,
+                        order_items_for_fingerprint=order_items_for_fingerprint,
                     )
+                    if (
+                        skip_seconds > 0
+                        and quote_age_seconds is not None
+                        and quote_age_seconds <= skip_seconds
+                        and items_unchanged
+                    ):
+                        live_validation_meta = {
+                            "status": "validated",
+                            "validated_via": "skip_fresh_quote",
+                            "quote_age_seconds": quote_age_seconds,
+                            "items_unchanged": True,
+                            "fresh_quote_validate_skip_seconds": skip_seconds,
+                        }
+                        logger.info(
+                            "[OrderRoutes][PERF] "
+                            "step=validate_quote_snapshot_live_skipped reason=fresh_quote "
+                            "quote_age_seconds=%d order=%s",
+                            int(quote_age_seconds),
+                            order_id,
+                        )
+                    else:
+                        _t = time.perf_counter()
+                        live_validation_meta = await quote_service.validate_quote_snapshot_live(
+                            quote,
+                            customer_email=order_request.customer_email,
+                            create_replacement_quote_on_mismatch=True,
+                        )
+                        logger.info(
+                            "[OrderRoutes][PERF] "
+                            "step=quote_service.validate_quote_snapshot_live duration_ms=%d order=%s",
+                            int((time.perf_counter() - _t) * 1000),
+                            order_id,
+                        )
 
                 snap = quote.snapshot_json or {}
                 pricing = (snap.get("pricing") or {}) if isinstance(snap, dict) else {}
@@ -4000,27 +4117,29 @@ async def create_new_order(
 
         try:
             _t = time.perf_counter()
-            await emit_merchant_webhook_event(
-                order_request.merchant_id,
-                event_type="order.created",
-                payload={
-                    "order_id": str(order_id),
-                    "merchant_id": str(order_request.merchant_id),
-                    "customer_email": order_request.customer_email,
-                    "total": float(total),
-                    "currency": order_request.currency,
-                    "item_count": len(order_request.items or []),
-                    "psp_used": psp_type,
-                },
+            asyncio.create_task(
+                _bg_emit_merchant_webhook_event(
+                    order_request.merchant_id,
+                    event_type="order.created",
+                    payload={
+                        "order_id": str(order_id),
+                        "merchant_id": str(order_request.merchant_id),
+                        "customer_email": order_request.customer_email,
+                        "total": float(total),
+                        "currency": order_request.currency,
+                        "item_count": len(order_request.items or []),
+                        "psp_used": psp_type,
+                    },
+                )
             )
             logger.info(
-                "[OrderRoutes][PERF] step=emit_merchant_webhook_event duration_ms=%d order=%s",
+                "[OrderRoutes][PERF] step=emit_merchant_webhook_event.enqueued duration_ms=%d order=%s",
                 int((time.perf_counter() - _t) * 1000),
                 order_id,
             )
         except Exception as exc:
             logger.warning(
-                "Failed to emit merchant order.created webhook for %s: %s",
+                "Failed to enqueue merchant order.created webhook for %s: %s",
                 order_request.merchant_id,
                 exc,
             )
@@ -4030,14 +4149,24 @@ async def create_new_order(
             try:
                 quote_service = QuoteService()
                 _t = time.perf_counter()
-                await quote_service.consume_quote_best_effort(order_request.quote_id, order_id=str(order_id))
+                asyncio.create_task(
+                    _bg_consume_quote_best_effort(
+                        quote_service,
+                        order_request.quote_id,
+                        order_id=str(order_id),
+                    )
+                )
                 logger.info(
-                    "[OrderRoutes][PERF] step=quote_service.consume_quote_best_effort duration_ms=%d order=%s",
+                    "[OrderRoutes][PERF] step=quote_service.consume_quote_best_effort.enqueued duration_ms=%d order=%s",
                     int((time.perf_counter() - _t) * 1000),
                     order_id,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Failed to enqueue quote consume for %s: %s",
+                    order_request.quote_id,
+                    str(exc)[:200],
+                )
 
         # 5. 同步创建 Payment Intent（立即返回结果）
         payment_intent_id = None
@@ -4190,27 +4319,36 @@ async def create_new_order(
                     int((time.perf_counter() - _t) * 1000),
                     order_id,
                 )
-                _t = time.perf_counter()
-                await log_order_event(
-                    event_type="order_created",
-                    order_id=order_id,
-                    merchant_id=order_request.merchant_id,
-                    total_amount=float(total),
-                    currency=order_request.currency,
-                    payment_method=psp_type,
-                    metadata={
-                        "total": float(total),
-                        "currency": order_request.currency,
-                        "items_count": len(order_request.items),
-                        "payment_intent_id": payment_intent_id,
-                        "psp_type": psp_type,
-                    },
-                )
-                logger.info(
-                    "[OrderRoutes][PERF] step=log_order_event.order_created duration_ms=%d order=%s",
-                    int((time.perf_counter() - _t) * 1000),
-                    order_id,
-                )
+                try:
+                    _t = time.perf_counter()
+                    asyncio.create_task(
+                        _bg_log_order_event(
+                            event_type="order_created",
+                            order_id=order_id,
+                            merchant_id=order_request.merchant_id,
+                            total_amount=float(total),
+                            currency=order_request.currency,
+                            payment_method=psp_type,
+                            metadata={
+                                "total": float(total),
+                                "currency": order_request.currency,
+                                "items_count": len(order_request.items),
+                                "payment_intent_id": payment_intent_id,
+                                "psp_type": psp_type,
+                            },
+                        )
+                    )
+                    logger.info(
+                        "[OrderRoutes][PERF] step=log_order_event.order_created.enqueued duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        order_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to enqueue order_created log_order_event for %s: %s",
+                        order_id,
+                        str(exc)[:200],
+                    )
             else:
                 logger.error(f"Payment intent creation failed via MultiPSP: {error}")
                 if _order_allows_platform_checkout_fallback(order_metadata):
