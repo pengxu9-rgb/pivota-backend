@@ -67,7 +67,7 @@ class FakeCreditConn:
     async def fetch_one(self, query: str, values: Optional[Dict[str, Any]] = None):
         values = values or {}
         sql = str(query)
-        if "merchant_credit_balance:active_subscription_allowance" in sql:
+        if "merchant_credit_balance/active_subscription_allowance" in sql:
             row = self.subscriptions.get(str(values["merchant_id"]))
             if row and row.get("status") in {"active", "trialing"}:
                 return {
@@ -75,10 +75,10 @@ class FakeCreditConn:
                     "plan_tier": row["plan_tier"],
                 }
             return None
-        if "merchant_credit_balance:get_balance" in sql:
+        if "merchant_credit_balance/get_balance" in sql:
             row = self.balances.get(str(values["merchant_id"]))
             return dict(row) if row else None
-        if "merchant_credit_balance:apply_subscription_allowance" in sql:
+        if "merchant_credit_balance/apply_subscription_allowance" in sql:
             merchant_id = str(values["merchant_id"])
             row = self.balances[merchant_id]
             period_start = values["allowance_period_start"]
@@ -94,10 +94,10 @@ class FakeCreditConn:
             row["updated_at"] = datetime.now(timezone.utc)
             row["version"] = int(row["version"]) + 1
             return dict(row)
-        if "merchant_credit_balance:fetch_usage_replay" in sql:
+        if "merchant_credit_balance/fetch_usage_replay" in sql:
             row = self.events.get(str(values["idempotency_key"]))
             return {"payload": dict(row["payload"])} if row else None
-        if "merchant_credit_balance:claim_usage_operation" in sql:
+        if "merchant_credit_balance/claim_usage_operation" in sql:
             key = str(values["idempotency_key"])
             if key in self.events:
                 return None
@@ -111,19 +111,19 @@ class FakeCreditConn:
                 "quantity": values["quantity"],
             }
             return {"idempotency_key": key, "payload": payload}
-        if "merchant_credit_balance:debit_update" in sql:
+        if "merchant_credit_balance/debit_update" in sql:
             return self._update_balance(
                 values,
                 delta=-int(values.get("balance_debit", values["amount"])),
                 usd_cogs_delta=Decimal(str(values["usd_cogs"])),
             )
-        if "merchant_credit_balance:credit_update" in sql:
+        if "merchant_credit_balance/credit_update" in sql:
             return self._update_balance(
                 values,
                 delta=int(values["amount"]),
                 usd_cogs_delta=-Decimal(str(values["usd_cogs"])),
             )
-        if "merchant_credit_balance:topup_credit_update" in sql:
+        if "merchant_credit_balance/topup_credit_update" in sql:
             merchant_id = str(values["merchant_id"])
             row = self.balances[merchant_id]
             row["credits"] = int(row.get("credits") or 0) + int(values["pack_credits"])
@@ -136,7 +136,7 @@ class FakeCreditConn:
             row["version"] = int(row["version"]) + 1
             row["updated_at"] = datetime.now(timezone.utc)
             return dict(row)
-        if "merchant_credit_balance:pending_overage_charge_update" in sql:
+        if "merchant_credit_balance/pending_overage_charge_update" in sql:
             merchant_id = str(values["merchant_id"])
             row = self.balances[merchant_id]
             charge = int(values["charge_credits"])
@@ -155,16 +155,16 @@ class FakeCreditConn:
     async def execute(self, query: str, values: Optional[Dict[str, Any]] = None):
         values = values or {}
         sql = str(query)
-        if "merchant_credit_balance:ensure_row" in sql:
+        if "merchant_credit_balance/ensure_row" in sql:
             merchant_id = str(values["merchant_id"])
             if merchant_id not in self.balances:
                 self.seed(merchant_id)
             return None
-        if "merchant_credit_balance:store_usage_post_balance" in sql:
+        if "merchant_credit_balance/store_usage_post_balance" in sql:
             key = str(values["idempotency_key"])
             self.events[key]["payload"].update(json.loads(values["payload"]))
             return None
-        if "merchant_credit_balance:set_overage_blocked" in sql:
+        if "merchant_credit_balance/set_overage_blocked" in sql:
             merchant_id = str(values["merchant_id"])
             row = self.balances[merchant_id]
             row["overage_blocked_until_payment"] = True

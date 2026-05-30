@@ -303,7 +303,7 @@ async def _active_subscription_allowance(
 ) -> Optional[Dict[str, Any]]:
     row = await conn.fetch_one(
         """
-        -- merchant_credit_balance:active_subscription_allowance
+        -- merchant_credit_balance/active_subscription_allowance
         SELECT sp.name AS plan_tier,
                sp.monthly_credit_allowance
           FROM user_subscriptions us
@@ -348,7 +348,7 @@ async def apply_subscription_allowance(
         await ensure_row(merchant_id, conn=tx)
         row = await tx.fetch_one(
             """
-            -- merchant_credit_balance:apply_subscription_allowance
+            -- merchant_credit_balance/apply_subscription_allowance
             UPDATE merchant_credit_balance
                SET credits = purchased_credits + :allowance_credits,
                    allowance_credits = :allowance_credits,
@@ -392,7 +392,7 @@ async def get_balance(merchant_id: str) -> Dict[str, Any]:
 async def _get_balance_with_conn(merchant_id: str, conn: Any) -> Dict[str, Any]:
     row = await conn.fetch_one(
         """
-        -- merchant_credit_balance:get_balance
+        -- merchant_credit_balance/get_balance
         SELECT credits, purchased_credits, allowance_credits,
                overage_pending_credits, overage_charged_credits,
                overage_blocked_until_payment,
@@ -412,7 +412,7 @@ async def ensure_row(merchant_id: str, *, conn: Any = None) -> None:
     target = conn or database
     await target.execute(
         """
-        -- merchant_credit_balance:ensure_row
+        -- merchant_credit_balance/ensure_row
         INSERT INTO merchant_credit_balance (merchant_id)
         VALUES (:merchant_id)
         ON CONFLICT (merchant_id) DO NOTHING
@@ -428,7 +428,7 @@ async def _fetch_replay(
 ) -> Optional[Dict[str, Any]]:
     row = await conn.fetch_one(
         """
-        -- merchant_credit_balance:fetch_usage_replay
+        -- merchant_credit_balance/fetch_usage_replay
         SELECT payload
           FROM agent_center_usage_events
          WHERE idempotency_key = :idempotency_key
@@ -476,7 +476,7 @@ async def _claim_operation(
         payload.update(payload_extra)
     row = await conn.fetch_one(
         """
-        -- merchant_credit_balance:claim_usage_operation
+        -- merchant_credit_balance/claim_usage_operation
         INSERT INTO agent_center_usage_events
             (id, idempotency_key, merchant_id, store_id, agent_type,
              workflow_type, event_type, provider, billing_mode,
@@ -514,7 +514,7 @@ async def _store_post_balance(
 ) -> None:
     await conn.execute(
         """
-        -- merchant_credit_balance:store_usage_post_balance
+        -- merchant_credit_balance/store_usage_post_balance
         UPDATE agent_center_usage_events
            SET payload = COALESCE(payload, '{}'::jsonb) || CAST(:payload AS JSONB)
          WHERE idempotency_key = :idempotency_key
@@ -572,7 +572,7 @@ async def _set_overage_blocked(
     target = conn or database
     await target.execute(
         """
-        -- merchant_credit_balance:set_overage_blocked
+        -- merchant_credit_balance/set_overage_blocked
         UPDATE merchant_credit_balance
            SET overage_blocked_until_payment = TRUE,
                overage_last_payment_intent_id = COALESCE(
@@ -740,7 +740,7 @@ async def _apply_delta(
                         charge_credits=overage_charge_credits,
                     )
                 sql = """
-                -- merchant_credit_balance:debit_update
+                -- merchant_credit_balance/debit_update
                 UPDATE merchant_credit_balance
                    SET credits = credits - :balance_debit,
                        purchased_credits = purchased_credits - :purchased_credits,
@@ -789,7 +789,7 @@ async def _apply_delta(
                 overage_charge_credits = 0
                 overage_charge = None
                 sql = """
-                -- merchant_credit_balance:credit_update
+                -- merchant_credit_balance/credit_update
                 UPDATE merchant_credit_balance
                    SET credits = credits + :amount,
                        purchased_credits = purchased_credits + :purchased_credits,
@@ -1244,7 +1244,7 @@ async def _apply_credit_topup(
         await ensure_row(merchant_id, conn=tx)
         row = await tx.fetch_one(
             """
-            -- merchant_credit_balance:topup_credit_update
+            -- merchant_credit_balance/topup_credit_update
             UPDATE merchant_credit_balance
                SET credits = credits + :pack_credits,
                    purchased_credits = purchased_credits + :pack_credits,
@@ -1343,7 +1343,7 @@ async def _charge_pending_overage_for_merchant(
         )
         row = await tx.fetch_one(
             """
-            -- merchant_credit_balance:pending_overage_charge_update
+            -- merchant_credit_balance/pending_overage_charge_update
             UPDATE merchant_credit_balance
                SET overage_pending_credits = overage_pending_credits - :charge_credits,
                    overage_charged_credits = overage_charged_credits + :charge_credits,
@@ -1393,7 +1393,7 @@ async def sweep_pending_overage_charges(
     target = conn or database
     rows = await target.fetch_all(
         """
-        -- merchant_credit_balance:sweep_pending_overage_candidates
+        -- merchant_credit_balance/sweep_pending_overage_candidates
         SELECT merchant_id
           FROM merchant_credit_balance
          WHERE plan_tier <> 'free'
