@@ -6,7 +6,7 @@ Agent 专用 API 路由
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response, Request
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Awaitable, Callable
 from decimal import Decimal
 from datetime import datetime, timedelta
 from collections import OrderedDict
@@ -247,6 +247,25 @@ def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[D
         request.state.traffic_taxonomy = dict(taxonomy)
     except Exception:
         return
+
+
+def _enqueue_agent_create_order_background_task(
+    step_name: str,
+    order_id: Any,
+    awaitable_factory: Callable[[], Awaitable[Any]],
+) -> None:
+    async def _runner() -> None:
+        try:
+            await awaitable_factory()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("background %s failed: %s", step_name, str(exc)[:200])
+
+    asyncio.create_task(_runner())
+    logger.info(
+        "[AgentAPI][PERF] step=%s.enqueued duration_ms=0 order=%s",
+        step_name,
+        order_id,
+    )
 
 
 def _build_confirm_payment_action_from_order(order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -8426,6 +8445,8 @@ async def agent_create_order(
                 else:
                     raise
 
+        _post_create_new_order_tail_started = time.perf_counter()
+
         # PCS v0.2-b (best-effort): emit internal fact for reducer replay (no PII).
         try:
             from services.pcs_fact_ingest import append_internal_fact_best_effort
@@ -8442,22 +8463,26 @@ async def agent_create_order(
             except Exception:
                 quote_meta = None
 
-            await append_internal_fact_best_effort(
-                merchant_id=str(order_request.merchant_id),
-                order_id=str(order_response.order_id),
-                fact_type="internal.order_created",
-                payload={
-                    "order_id": str(order_response.order_id),
-                    "merchant_id": str(order_request.merchant_id),
-                    "quote_id": getattr(order_request, "quote_id", None)
-                    or (quote_meta or {}).get("quote_id"),
-                    "quote_hash_sha256": (quote_meta or {}).get("quote_hash_sha256"),
-                    "currency": str(order_response.currency or order_request.currency or "USD"),
-                    "total": float(order_response.total),
-                    "psp": getattr(order_response, "psp", None),
-                    "idempotency_key": getattr(order_request, "idempotency_key", None),
-                },
-                idempotency_key=getattr(order_request, "idempotency_key", None) or str(order_response.order_id),
+            _enqueue_agent_create_order_background_task(
+                "append_internal_fact_best_effort",
+                _agent_order_id_for_perf,
+                lambda: append_internal_fact_best_effort(
+                    merchant_id=str(order_request.merchant_id),
+                    order_id=str(order_response.order_id),
+                    fact_type="internal.order_created",
+                    payload={
+                        "order_id": str(order_response.order_id),
+                        "merchant_id": str(order_request.merchant_id),
+                        "quote_id": getattr(order_request, "quote_id", None)
+                        or (quote_meta or {}).get("quote_id"),
+                        "quote_hash_sha256": (quote_meta or {}).get("quote_hash_sha256"),
+                        "currency": str(order_response.currency or order_request.currency or "USD"),
+                        "total": float(order_response.total),
+                        "psp": getattr(order_response, "psp", None),
+                        "idempotency_key": getattr(order_request, "idempotency_key", None),
+                    },
+                    idempotency_key=getattr(order_request, "idempotency_key", None) or str(order_response.order_id),
+                ),
             )
         except Exception:
             pass
@@ -8534,12 +8559,16 @@ async def agent_create_order(
         
         # 记录成功请求
         try:
-            await log_agent_request(
-                context=context,
-                status_code=200,
-                merchant_id=order_request.merchant_id,
-                order_id=order_response.order_id,
-                order_amount=order_amount,
+            _enqueue_agent_create_order_background_task(
+                "log_agent_request.success",
+                _agent_order_id_for_perf,
+                lambda: log_agent_request(
+                    context=context,
+                    status_code=200,
+                    merchant_id=order_request.merchant_id,
+                    order_id=order_response.order_id,
+                    order_amount=order_amount,
+                ),
             )
         except Exception as log_error:
             logger.warning(f"[agent_orders_create] usage logging failed after order create: {log_error}")
@@ -8574,7 +8603,11 @@ async def agent_create_order(
                     }
                 )
             if events:
-                await log_product_events(events)
+                _enqueue_agent_create_order_background_task(
+                    "log_product_events",
+                    _agent_order_id_for_perf,
+                    lambda events=events: log_product_events(events),
+                )
         except Exception as e:
             logger.debug(f"Failed to log purchase events: {e}", exc_info=True)
         
@@ -8773,13 +8806,21 @@ async def agent_create_order(
                     logger.debug("checkout decision event enqueue failed", exc_info=True)
 
             asyncio.create_task(_record_checkout_decision())
+            logger.info(
+                "[AgentAPI][PERF] step=record_checkout_decision.enqueued duration_ms=0 order=%s",
+                _agent_order_id_for_perf,
+            )
         except Exception:
             logger.debug("checkout decision event scheduling failed", exc_info=True)
 
         # Store idempotency record (best-effort).
-        await _cache_agent_order_create_response_best_effort(
-            getattr(order_request, "idempotency_key", None),
-            response,
+        _enqueue_agent_create_order_background_task(
+            "_cache_agent_order_create_response_best_effort",
+            _agent_order_id_for_perf,
+            lambda: _cache_agent_order_create_response_best_effort(
+                getattr(order_request, "idempotency_key", None),
+                response,
+            ),
         )
 
         try:
@@ -8799,6 +8840,12 @@ async def agent_create_order(
             )
         except Exception:
             pass
+
+        logger.info(
+            "[AgentAPI][PERF] step=post_create_new_order_tail_total duration_ms=%d order=%s",
+            int((time.perf_counter() - _post_create_new_order_tail_started) * 1000),
+            _agent_order_id_for_perf,
+        )
         
         return response
         
@@ -8893,11 +8940,17 @@ async def agent_create_order(
         except Exception:
             pass
         try:
-            await log_agent_request(
-                context=context,
-                status_code=e.status_code,
-                merchant_id=order_request.merchant_id,
-                error_message=e.detail,
+            error_status_code = e.status_code
+            error_detail = e.detail
+            _enqueue_agent_create_order_background_task(
+                "log_agent_request.http_error",
+                _agent_order_id_for_perf,
+                lambda error_status_code=error_status_code, error_detail=error_detail: log_agent_request(
+                    context=context,
+                    status_code=error_status_code,
+                    merchant_id=order_request.merchant_id,
+                    error_message=error_detail,
+                ),
             )
         except Exception as log_error:
             logger.warning(f"[agent_orders_create] usage logging failed for order create HTTP error: {log_error}")
@@ -8955,11 +9008,16 @@ async def agent_create_order(
         except Exception:
             pass
         try:
-            await log_agent_request(
-                context=context,
-                status_code=500,
-                merchant_id=order_request.merchant_id,
-                error_message=str(e),
+            error_message = str(e)
+            _enqueue_agent_create_order_background_task(
+                "log_agent_request.exception",
+                _agent_order_id_for_perf,
+                lambda error_message=error_message: log_agent_request(
+                    context=context,
+                    status_code=500,
+                    merchant_id=order_request.merchant_id,
+                    error_message=error_message,
+                ),
             )
         except Exception as log_error:
             logger.warning(f"[agent_orders_create] usage logging failed for order create exception: {log_error}")
@@ -8972,10 +9030,14 @@ async def agent_create_order(
         )
         # STEP 3: Record governance metrics (always executed)
         latency_ms = int((time.time() - start_time) * 1000)
-        await agent_governance.record_response(
-            agent_id=context.agent_id,
-            latency_ms=latency_ms,
-            success=success
+        _enqueue_agent_create_order_background_task(
+            "agent_governance.record_response",
+            _agent_order_id_for_perf,
+            lambda latency_ms=latency_ms, success=success: agent_governance.record_response(
+                agent_id=context.agent_id,
+                latency_ms=latency_ms,
+                success=success,
+            ),
         )
 
 
