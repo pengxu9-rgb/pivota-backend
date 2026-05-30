@@ -3290,7 +3290,8 @@ async def _count_paid_merchant_order_failed_best_effort(
 async def create_new_order(
     order_request: CreateOrderRequest,
     background_tasks: BackgroundTasks,
-    current_user: dict = Depends(require_admin)  # Agent 需要管理员权限
+    current_user: dict = Depends(require_admin),  # Agent 需要管理员权限
+    precomputed_quote_requirement: Optional[Tuple[bool, Optional[Dict[str, Any]]]] = Depends(lambda: None),
 ):
     """
     **创建新订单（Agent → Pivota）**
@@ -3307,11 +3308,27 @@ async def create_new_order(
     - 金额使用 Decimal 精确计算
     - 支付信息与订单解耦，失败不影响订单创建
     """
+    _create_order_started = time.perf_counter()
+    order_id = None
+    if not isinstance(precomputed_quote_requirement, tuple):
+        precomputed_quote_requirement = None
     try:
+        _t = time.perf_counter()
         await ensure_database_ready()
+        logger.info(
+            "[OrderRoutes][PERF] step=ensure_database_ready duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            order_id,
+        )
 
         # 1. 验证商户
+        _t = time.perf_counter()
         merchant = await get_merchant_onboarding(order_request.merchant_id)
+        logger.info(
+            "[OrderRoutes][PERF] step=get_merchant_onboarding duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            order_id,
+        )
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
 
@@ -3325,9 +3342,23 @@ async def create_new_order(
             )
 
         # Quote-first enforcement (PCS v0.2-a): dual guard to prevent bypass.
-        from services.quote_first_enforcement import should_require_quote_for_order_create
+        _t = time.perf_counter()
+        if precomputed_quote_requirement is not None:
+            require_quote, require_ctx = precomputed_quote_requirement
+            quote_requirement_source = "precomputed"
+        else:
+            from services.quote_first_enforcement import should_require_quote_for_order_create
 
-        require_quote, require_ctx = await should_require_quote_for_order_create(merchant_id=order_request.merchant_id)
+            require_quote, require_ctx = await should_require_quote_for_order_create(
+                merchant_id=order_request.merchant_id
+            )
+            quote_requirement_source = "fresh"
+        logger.info(
+            "[OrderRoutes][PERF] step=should_require_quote_for_order_create duration_ms=%d order=%s source=%s",
+            int((time.perf_counter() - _t) * 1000),
+            order_id,
+            quote_requirement_source,
+        )
         if require_quote and not order_request.quote_id:
             raise HTTPException(
                 status_code=400,
@@ -3339,9 +3370,15 @@ async def create_new_order(
             )
 
         # 2. 检查库存（如果商户连接了 Shopify）
+        _t = time.perf_counter()
         has_inventory, inventory_info = await check_inventory_availability(
             order_request.merchant_id,
             order_request.items
+        )
+        logger.info(
+            "[OrderRoutes][PERF] step=check_inventory_availability duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            order_id,
         )
         if not has_inventory:
             raise HTTPException(
@@ -3359,8 +3396,14 @@ async def create_new_order(
             quote_service = QuoteService()
             live_validation_meta: Optional[Dict[str, Any]] = None
             try:
+                _t = time.perf_counter()
                 quote = await quote_service.load_active_quote_or_raise(
                     quote_id=order_request.quote_id
+                )
+                logger.info(
+                    "[OrderRoutes][PERF] step=quote_service.load_active_quote_or_raise duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
                 )
 
                 order_items_for_fingerprint = [
@@ -3456,10 +3499,16 @@ async def create_new_order(
                     )
 
                 if _order_live_quote_revalidation_enabled():
+                    _t = time.perf_counter()
                     live_validation_meta = await quote_service.validate_quote_snapshot_live(
                         quote,
                         customer_email=order_request.customer_email,
                         create_replacement_quote_on_mismatch=True,
+                    )
+                    logger.info(
+                        "[OrderRoutes][PERF] step=quote_service.validate_quote_snapshot_live duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        order_id,
                     )
 
                 snap = quote.snapshot_json or {}
@@ -3603,10 +3652,16 @@ async def create_new_order(
             discount_total = Decimal("0")
             applied_promos: List[Dict[str, Any]] = []
             try:
+                _t = time.perf_counter()
                 discount_total, applied_promos = await compute_order_discount_from_promotions(
                     merchant_id=order_request.merchant_id,
                     items=order_request.items,
                     channel="creator_agents",
+                )
+                logger.info(
+                    "[OrderRoutes][PERF] step=compute_order_discount_from_promotions duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
                 )
             except Exception as promo_err:
                 logger.warning(
@@ -3638,11 +3693,17 @@ async def create_new_order(
         selected_psp = None
         route_config: Dict[str, Any] = {}
         try:
+            _t = time.perf_counter()
             selected_psp, route_config = await routing_service.select_psp(
                 agent_id=agent_id or "",
                 merchant_id=order_request.merchant_id,
                 amount=float(total),
                 currency=order_request.currency or "USD",
+            )
+            logger.info(
+                "[OrderRoutes][PERF] step=routing_service.select_psp duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
             )
             logger.info(
                 f"[OrderRoutes] Routing selected PSP '{selected_psp}' for order "
@@ -3663,9 +3724,15 @@ async def create_new_order(
         # Always get psp_id for PSP metrics tracking (even if psp_type is known)
         psp_id_value = None
         try:
+            _t = time.perf_counter()
             psp_type, psp_id_value = await _resolve_active_order_psp(
                 order_request.merchant_id,
                 provider_hint,
+            )
+            logger.info(
+                "[OrderRoutes][PERF] step=_resolve_active_order_psp duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
             )
         except HTTPException:
             raise
@@ -3745,7 +3812,13 @@ async def create_new_order(
         store_id_value: Optional[str] = None
         primary_store: Optional[Dict[str, Any]] = None
         try:
+            _t = time.perf_counter()
             primary_store = await get_primary_store(order_request.merchant_id)
+            logger.info(
+                "[OrderRoutes][PERF] step=get_primary_store duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
+            )
             if primary_store and primary_store.get("store_id"):
                 store_id_value = str(primary_store.get("store_id"))
         except Exception:
@@ -3794,10 +3867,16 @@ async def create_new_order(
         )
         persisted_order_items = _build_persisted_order_items(order_request.items, pricing_quote_meta)
         enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
+        _t = time.perf_counter()
         explicit_preferred_provider = await _ensure_explicit_preferred_psp_available(
             merchant_id=order_request.merchant_id,
             preferred_psp=order_request.preferred_psp,
             enforce_live_readiness=enforce_live_readiness,
+        )
+        logger.info(
+            "[OrderRoutes][PERF] step=_ensure_explicit_preferred_psp_available duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            order_id,
         )
 
         order_data = {
@@ -3826,12 +3905,24 @@ async def create_new_order(
             "psp_id": psp_id_value,  # Include actual PSP ID for metrics tracking
             "payment_method": None
         }
+        _t = time.perf_counter()
         order_id = await create_order(order_data)
+        logger.info(
+            "[OrderRoutes][PERF] step=create_order duration_ms=%d order=%s",
+            int((time.perf_counter() - _t) * 1000),
+            order_id,
+        )
         try:
+            _t = time.perf_counter()
             await upsert_order_attribution_edge(
                 order_id=str(order_id),
                 merchant_id=order_request.merchant_id,
                 metadata=order_metadata,
+            )
+            logger.info(
+                "[OrderRoutes][PERF] step=upsert_order_attribution_edge duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
             )
         except Exception as attribution_exc:
             logger.warning(
@@ -3907,6 +3998,7 @@ async def create_new_order(
                 )
 
         try:
+            _t = time.perf_counter()
             await emit_merchant_webhook_event(
                 order_request.merchant_id,
                 event_type="order.created",
@@ -3920,6 +4012,11 @@ async def create_new_order(
                     "psp_used": psp_type,
                 },
             )
+            logger.info(
+                "[OrderRoutes][PERF] step=emit_merchant_webhook_event duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to emit merchant order.created webhook for %s: %s",
@@ -3931,7 +4028,13 @@ async def create_new_order(
         if order_request.quote_id:
             try:
                 quote_service = QuoteService()
+                _t = time.perf_counter()
                 await quote_service.consume_quote_best_effort(order_request.quote_id, order_id=str(order_id))
+                logger.info(
+                    "[OrderRoutes][PERF] step=quote_service.consume_quote_best_effort duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
+                )
             except Exception:
                 pass
 
@@ -3990,6 +4093,7 @@ async def create_new_order(
                     auth_first_payment_metadata["stripe_capture_method"] = "manual"
                 elif auth_first_psp == "paypal":
                     auth_first_payment_metadata["paypal_intent"] = "AUTHORIZE"
+            _t = time.perf_counter()
             success, payment_intent, error, psp_used = await create_payment_with_failover(
                 merchant_id=order_request.merchant_id,
                 amount=total,
@@ -4030,6 +4134,11 @@ async def create_new_order(
                 canonical_psp_required=True,
                 enforce_live_readiness=enforce_live_readiness,
             )
+            logger.info(
+                "[OrderRoutes][PERF] step=create_payment_with_failover duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
+            )
             response_ms = int((time.monotonic() - start_ts) * 1000)
 
             final_psp = _finalize_order_psp_used(psp_used, psp_type)
@@ -4067,6 +4176,7 @@ async def create_new_order(
                 if redirect_url:
                     logger.info(f"🔗 {psp_type.capitalize()} redirect URL: {redirect_url}")
 
+                _t = time.perf_counter()
                 await update_payment_info(
                     order_id=order_id,
                     payment_intent_id=payment_intent_id,
@@ -4074,6 +4184,12 @@ async def create_new_order(
                     payment_status="awaiting_payment",
                     psp_used=final_psp,
                 )
+                logger.info(
+                    "[OrderRoutes][PERF] step=update_payment_info duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
+                )
+                _t = time.perf_counter()
                 await log_order_event(
                     event_type="order_created",
                     order_id=order_id,
@@ -4089,6 +4205,11 @@ async def create_new_order(
                         "psp_type": psp_type,
                     },
                 )
+                logger.info(
+                    "[OrderRoutes][PERF] step=log_order_event.order_created duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
+                )
             else:
                 logger.error(f"Payment intent creation failed via MultiPSP: {error}")
                 if _order_allows_platform_checkout_fallback(order_metadata):
@@ -4101,10 +4222,16 @@ async def create_new_order(
 
                     platform_checkout = None
                     if not fallback_checkout_url:
+                        _t = time.perf_counter()
                         platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
                             merchant_id=order_request.merchant_id,
                             items=order_request.items,
                             discount_codes=order_request.discount_codes,
+                        )
+                        logger.info(
+                            "[OrderRoutes][PERF] step=_get_platform_checkout_fallback_url_best_effort.payment_failure duration_ms=%d order=%s",
+                            int((time.perf_counter() - _t) * 1000),
+                            order_id,
                         )
 
                     if (fallback_checkout_url or platform_checkout) and not payment_action:
@@ -4119,6 +4246,7 @@ async def create_new_order(
                                 **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
                             },
                         }
+                        _t = time.perf_counter()
                         await log_order_event(
                             event_type="payment_fallback_platform_checkout",
                             order_id=order_id,
@@ -4127,7 +4255,13 @@ async def create_new_order(
                             currency=order_request.currency,
                             metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                         )
+                        logger.info(
+                            "[OrderRoutes][PERF] step=log_order_event.payment_fallback_platform_checkout.payment_failure duration_ms=%d order=%s",
+                            int((time.perf_counter() - _t) * 1000),
+                            order_id,
+                        )
                 elif _platform_checkout_fallback_enabled():
+                    _t = time.perf_counter()
                     await _log_fallback_pollution_attempt_best_effort(
                         order_id=order_id,
                         merchant_id=order_request.merchant_id,
@@ -4137,12 +4271,18 @@ async def create_new_order(
                         reason="psp_unavailable",
                         source="create_new_order.payment_failure",
                     )
+                    logger.info(
+                        "[OrderRoutes][PERF] step=_log_fallback_pollution_attempt_best_effort.payment_failure duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        order_id,
+                    )
                 else:
                     logger.warning(
                         "[OrderRoutes] platform checkout fallback disabled; keeping PSP-first failure visible for order %s",
                         order_id,
                     )
                 # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
+                _t = time.perf_counter()
                 await log_order_event(
                     event_type="payment_intent_failed",
                     order_id=order_id,
@@ -4150,6 +4290,11 @@ async def create_new_order(
                     total_amount=float(total),
                     currency=order_request.currency,
                     metadata={"error": error, "psp_type": final_psp},
+                )
+                logger.info(
+                    "[OrderRoutes][PERF] step=log_order_event.payment_intent_failed duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
                 )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
@@ -4163,10 +4308,16 @@ async def create_new_order(
 
                 platform_checkout = None
                 if not fallback_checkout_url:
+                    _t = time.perf_counter()
                     platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
                         merchant_id=order_request.merchant_id,
                         items=order_request.items,
                         discount_codes=order_request.discount_codes,
+                    )
+                    logger.info(
+                        "[OrderRoutes][PERF] step=_get_platform_checkout_fallback_url_best_effort.payment_exception duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        order_id,
                     )
 
                 if (
@@ -4185,6 +4336,7 @@ async def create_new_order(
                             **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
                         },
                     }
+                    _t = time.perf_counter()
                     await log_order_event(
                         event_type="payment_fallback_platform_checkout",
                         order_id=order_id,
@@ -4193,7 +4345,13 @@ async def create_new_order(
                         currency=order_request.currency,
                         metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                     )
+                    logger.info(
+                        "[OrderRoutes][PERF] step=log_order_event.payment_fallback_platform_checkout.payment_exception duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        order_id,
+                    )
             elif _platform_checkout_fallback_enabled():
+                _t = time.perf_counter()
                 await _log_fallback_pollution_attempt_best_effort(
                     order_id=order_id,
                     merchant_id=order_request.merchant_id,
@@ -4203,12 +4361,18 @@ async def create_new_order(
                     reason="psp_error",
                     source="create_new_order.payment_exception",
                 )
+                logger.info(
+                    "[OrderRoutes][PERF] step=_log_fallback_pollution_attempt_best_effort.payment_exception duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
+                )
             else:
                 logger.warning(
                     "[OrderRoutes] platform checkout fallback disabled after PSP error; keeping failure visible for order %s",
                     order_id,
                 )
             # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
+            _t = time.perf_counter()
             await log_order_event(
                 event_type="payment_intent_failed",
                 order_id=order_id,
@@ -4216,6 +4380,11 @@ async def create_new_order(
                 total_amount=float(total),
                 currency=order_request.currency,
                 metadata={"error": error, "psp_type": final_psp},
+            )
+            logger.info(
+                "[OrderRoutes][PERF] step=log_order_event.payment_intent_failed.payment_exception duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
             )
         except Exception as e:
             logger.error(f"Payment intent creation error: {e}")
@@ -4229,10 +4398,16 @@ async def create_new_order(
 
                 platform_checkout = None
                 if not fallback_checkout_url:
+                    _t = time.perf_counter()
                     platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
                         merchant_id=order_request.merchant_id,
                         items=order_request.items,
                         discount_codes=order_request.discount_codes,
+                    )
+                    logger.info(
+                        "[OrderRoutes][PERF] step=_get_platform_checkout_fallback_url_best_effort.payment_exception_secondary duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        order_id,
                     )
 
                 if (
@@ -4251,6 +4426,7 @@ async def create_new_order(
                             **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
                         },
                     }
+                    _t = time.perf_counter()
                     await log_order_event(
                         event_type="payment_fallback_platform_checkout",
                         order_id=order_id,
@@ -4259,7 +4435,13 @@ async def create_new_order(
                         currency=order_request.currency,
                         metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
                     )
+                    logger.info(
+                        "[OrderRoutes][PERF] step=log_order_event.payment_fallback_platform_checkout.payment_exception_secondary duration_ms=%d order=%s",
+                        int((time.perf_counter() - _t) * 1000),
+                        order_id,
+                    )
             elif _platform_checkout_fallback_enabled():
+                _t = time.perf_counter()
                 await _log_fallback_pollution_attempt_best_effort(
                     order_id=order_id,
                     merchant_id=order_request.merchant_id,
@@ -4269,11 +4451,17 @@ async def create_new_order(
                     reason="psp_error",
                     source="create_new_order.payment_exception_secondary",
                 )
+                logger.info(
+                    "[OrderRoutes][PERF] step=_log_fallback_pollution_attempt_best_effort.payment_exception_secondary duration_ms=%d order=%s",
+                    int((time.perf_counter() - _t) * 1000),
+                    order_id,
+                )
             else:
                 logger.warning(
                     "[OrderRoutes] platform checkout fallback disabled after PSP error; keeping failure visible for order %s",
                     order_id,
                 )
+            _t = time.perf_counter()
             await log_order_event(
                 event_type="payment_intent_error",
                 order_id=order_id,
@@ -4281,6 +4469,11 @@ async def create_new_order(
                 total_amount=float(total),
                 currency=order_request.currency,
                 metadata={"error": str(e)},
+            )
+            logger.info(
+                "[OrderRoutes][PERF] step=log_order_event.payment_intent_error duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                order_id,
             )
 
         # 6. 返回订单信息（支付已同步创建）
@@ -4325,6 +4518,12 @@ async def create_new_order(
     except Exception as e:
         logger.error(f"Order creation internal error: {e}")
         raise HTTPException(status_code=500, detail=f"Order creation internal error: {str(e)}")
+    finally:
+        logger.info(
+            "[OrderRoutes][PERF] step=create_new_order_total duration_ms=%d order=%s",
+            int((time.perf_counter() - _create_order_started) * 1000),
+            order_id,
+        )
 
 
 # ============================================================================

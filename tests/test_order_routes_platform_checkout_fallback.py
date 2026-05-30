@@ -98,12 +98,18 @@ def _build_order_request() -> CreateOrderRequest:
     )
 
 
-def _install_create_new_order_harness(monkeypatch: pytest.MonkeyPatch, module) -> list[tuple[str, dict]]:
+def _install_create_new_order_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    module,
+    quote_requirement_calls: list[str] | None = None,
+) -> list[tuple[str, dict]]:
     import services.quote_first_enforcement as quote_first_enforcement
 
     events: list[tuple[str, dict]] = []
 
     async def fake_should_require_quote_for_order_create(*, merchant_id: str):
+        if quote_requirement_calls is not None:
+            quote_requirement_calls.append(merchant_id)
         return False, {}
 
     async def fake_get_merchant_onboarding(_merchant_id: str):
@@ -145,6 +151,57 @@ def _install_create_new_order_harness(monkeypatch: pytest.MonkeyPatch, module) -
     monkeypatch.setattr(module, "log_order_event", fake_log_order_event)
 
     return events
+
+
+@pytest.mark.asyncio
+async def test_create_new_order_skips_quote_requirement_call_when_precomputed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.delenv("ORDER_PLATFORM_CHECKOUT_FALLBACK_ENABLED", raising=False)
+    quote_requirement_calls: list[str] = []
+    _install_create_new_order_harness(monkeypatch, module, quote_requirement_calls)
+
+    async def fake_create_payment_with_failover(*args, **kwargs):
+        return False, None, "psp unavailable", "stripe"
+
+    monkeypatch.setattr(module, "create_payment_with_failover", fake_create_payment_with_failover)
+
+    response = await module.create_new_order(
+        _build_order_request(),
+        BackgroundTasks(),
+        current_user={},
+        precomputed_quote_requirement=(False, {"source": "agent_create_order"}),
+    )
+
+    assert response.order_id == "ORD_TEST_PLATFORM_FALLBACK"
+    assert quote_requirement_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_new_order_checks_quote_requirement_without_precomputed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.delenv("ORDER_PLATFORM_CHECKOUT_FALLBACK_ENABLED", raising=False)
+    quote_requirement_calls: list[str] = []
+    _install_create_new_order_harness(monkeypatch, module, quote_requirement_calls)
+
+    async def fake_create_payment_with_failover(*args, **kwargs):
+        return False, None, "psp unavailable", "stripe"
+
+    monkeypatch.setattr(module, "create_payment_with_failover", fake_create_payment_with_failover)
+
+    response = await module.create_new_order(
+        _build_order_request(),
+        BackgroundTasks(),
+        current_user={},
+    )
+
+    assert response.order_id == "ORD_TEST_PLATFORM_FALLBACK"
+    assert quote_requirement_calls == ["merch_test"]
 
 
 @pytest.mark.asyncio
