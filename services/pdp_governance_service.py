@@ -22,6 +22,7 @@ from db.pdp_governance import (
     pdp_review_tasks,
     pdp_subject_index,
 )
+from db.merchant_product_overlay import merchant_product_overlay
 from db.products import products_cache
 
 
@@ -5340,6 +5341,122 @@ async def review_module_version(
     }
 
 
+# ---------------------------------------------------------------------------
+# SKU Optimization OS -- hybrid publish path (overlay materialization).
+# Flag-gated, OFF by default. When ON, publishing a governance module also flattens
+# its approved payload into merchant_product_overlay so the public PDP merge hook
+# (PIVOTA-Agent enrichProductWithCatalogPdpContentFields) can serve it at request time.
+# v1 scope: the "copy" module only. Add modules to _OVERLAY_FIELD_MAP to widen coverage.
+# ---------------------------------------------------------------------------
+SKU_OPT_OVERLAY_V1_ENABLED = os.getenv("SKU_OPT_OVERLAY_V1", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# actor_type -> overlay provenance label
+_OVERLAY_PROVENANCE_BY_ACTOR = {
+    REVIEW_ACTOR_HUMAN: "ops_approved",
+}
+
+# Retry budget for the overlay supersede+insert pair vs the active unique index
+# under concurrent publishes (see materialize_overlay_from_module).
+_OVERLAY_MATERIALIZE_MAX_ATTEMPTS = 3
+
+
+def _overlay_copy_description(payload: Dict[str, Any]) -> Optional[str]:
+    """Extract the description body from a published 'copy' module payload."""
+    for key in ("pdp_description_raw", "description", "body", "text", "copy"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+# module_key -> list of (overlay field_key, extractor(payload) -> Optional[value])
+_OVERLAY_FIELD_MAP: Dict[str, List[Tuple[str, Any]]] = {
+    "copy": [("pdp_description_raw", _overlay_copy_description)],
+}
+
+
+async def materialize_overlay_from_module(
+    *,
+    pdp_id: str,
+    module_key: str,
+    published_version_id: str,
+    payload: Dict[str, Any],
+    actor_type: str,
+    actor_id: Optional[str],
+) -> int:
+    """Flatten an approved governance module payload into merchant_product_overlay rows.
+
+    Returns the number of overlay rows written. Best-effort and bounded to modules in
+    _OVERLAY_FIELD_MAP -- callers MUST guard so a failure here never blocks a publish.
+    """
+    field_specs = _OVERLAY_FIELD_MAP.get(module_key)
+    if not field_specs:
+        return 0
+    subject = await database.fetch_one(
+        pdp_subject_index.select().where(pdp_subject_index.c.pdp_id == pdp_id)
+    )
+    product_key = dict(subject).get("representative_product_key") if subject else None
+    if not product_key:
+        return 0
+    provenance = _OVERLAY_PROVENANCE_BY_ACTOR.get(actor_type, "agent_approved")
+    now = _now()
+    written = 0
+    for field_key, extractor in field_specs:
+        value = extractor(payload)
+        if value is None:
+            continue
+        # Supersede prior active overlay + insert the new one. The partial unique
+        # index uq_merchant_product_overlay_active enforces at most one active row
+        # per (product_key, module_key, field_key). The transaction makes each
+        # supersede+insert atomic; the retry handles the residual race where two
+        # concurrent publishers both supersede then both insert -> the loser hits
+        # the unique index, retries (re-supersedes the winner's row, inserts its
+        # own), and the table converges to exactly one active row.
+        for attempt in range(_OVERLAY_MATERIALIZE_MAX_ATTEMPTS):
+            try:
+                async with database.transaction():
+                    await database.execute(
+                        merchant_product_overlay.update()
+                        .where(
+                            (merchant_product_overlay.c.product_key == product_key)
+                            & (merchant_product_overlay.c.module_key == module_key)
+                            & (merchant_product_overlay.c.field_key == field_key)
+                            & (merchant_product_overlay.c.approval_status == "active")
+                        )
+                        .values(approval_status="superseded", updated_at=now)
+                    )
+                    await database.execute(
+                        merchant_product_overlay.insert().values(
+                            overlay_id=f"ovl_{uuid.uuid4().hex}",
+                            product_key=product_key,
+                            content_key=None,
+                            module_key=module_key,
+                            field_key=field_key,
+                            value_jsonb=value,
+                            provenance=provenance,
+                            source_version_id=published_version_id,
+                            approval_status="active",
+                            approved_by=actor_id,
+                            approved_at=now,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                break
+            except Exception:
+                if attempt + 1 >= _OVERLAY_MATERIALIZE_MAX_ATTEMPTS:
+                    raise
+                # lost the race on the active unique index; retry the pair
+                continue
+        written += 1
+    return written
+
+
 async def publish_module_version(
     *,
     pdp_id: str,
@@ -5406,6 +5523,24 @@ async def publish_module_version(
         actor_id=actor_id,
         details={"source_version_id": version_id, "published_version_id": published_row["id"]},
     )
+    if SKU_OPT_OVERLAY_V1_ENABLED:
+        try:
+            await materialize_overlay_from_module(
+                pdp_id=pdp_id,
+                module_key=module_key,
+                published_version_id=published_row["id"],
+                payload=payload,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            )
+        except Exception:  # overlay materialization must never block a publish
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "merchant_product_overlay materialization failed for pdp_id=%s module=%s",
+                pdp_id,
+                module_key,
+            )
     return _serialize_module(published_row)
 
 

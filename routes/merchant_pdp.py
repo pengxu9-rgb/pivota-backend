@@ -1,18 +1,34 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+
+SKU_OPT_OVERLAY_V1_ENABLED = os.getenv("SKU_OPT_OVERLAY_V1", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# Modules a merchant may self-approve via the LLM-reviewed auto-publish path.
+# v1: 'copy' only (low-risk, machine-publishable). Widen deliberately.
+MERCHANT_SELF_APPROVE_MODULES = {"copy"}
+
 from db.database import database
 from services.pdp_governance_service import (
     DEFAULT_MARKET,
+    REVIEW_ACTOR_GPT55,
     create_merchant_contribution,
     ensure_pdp_governance_tables,
     get_pdp_projection,
     parse_product_key,
+    review_module_version,
 )
+from services.pdp_copy_review import generate_copy_review_rubric
 from utils.auth import get_current_user
 
 
@@ -116,5 +132,95 @@ async def submit_product_pdp_contribution(
             notes=body.notes,
             market=body.market,
         )
+    except Exception as exc:
+        raise _map_error(exc)
+
+
+class MerchantApproveRequest(BaseModel):
+    module_key: str = "copy"
+    market: str = DEFAULT_MARKET
+    # NOTE: no caller-supplied version_id -- we always review exactly the staged
+    # version the projection resolves for this merchant's product_key, so a caller
+    # cannot point the approve at an arbitrary (or another merchant's) version.
+
+
+@router.post("/product/{platform}/{platform_product_id}/approve")
+async def approve_product_pdp_module(
+    platform: str,
+    platform_product_id: str,
+    body: MerchantApproveRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Merchant approves a staged module; route through the LLM-reviewed GPT55
+    gate. On pass for a low-risk module the gate auto-publishes, which (when
+    SKU_OPT_OVERLAY_V1 is on) materializes a merchant_product_overlay row that the
+    public PDP merge hook serves. Merchants are NOT direct publish authorities;
+    the gate is. Failure or budget cap -> needs_human_review, nothing publishes.
+    """
+    if not SKU_OPT_OVERLAY_V1_ENABLED:
+        raise HTTPException(status_code=404, detail="SKU_OPT_OVERLAY_V1_DISABLED")
+    if body.module_key not in MERCHANT_SELF_APPROVE_MODULES:
+        raise HTTPException(status_code=400, detail="MODULE_NOT_MERCHANT_APPROVABLE")
+
+    merchant_id = _merchant_id(current_user)
+    product_key = f"{merchant_id}|{platform}|{platform_product_id}"
+    try:
+        parse_product_key(product_key)
+        projection = await get_pdp_projection(product_key=product_key, market=body.market)
+        pdp_id = projection["pdp"]["pdp_id"]
+
+        # Find the staged module the merchant is approving. get_pdp_projection
+        # returns one summary per module_key with the staged version nested under
+        # the "staged" key (NOT a top-level "stage" field).
+        module_summary = next(
+            (
+                m
+                for m in projection.get("modules", [])
+                if m.get("module_key") == body.module_key
+            ),
+            None,
+        )
+        staged = (module_summary or {}).get("staged")
+        if not staged:
+            raise HTTPException(status_code=404, detail="NO_STAGED_MODULE")
+        # Always review exactly this staged version (no caller-supplied id).
+        version_id = staged.get("id")
+        if not version_id:
+            raise HTTPException(status_code=404, detail="NO_STAGED_MODULE")
+        payload = staged.get("payload") if isinstance(staged.get("payload"), dict) else {}
+
+        rubric = await generate_copy_review_rubric(
+            merchant_id=merchant_id,
+            payload=payload,
+            source_refs=staged.get("source_refs"),
+        )
+        if rubric is None:
+            return {
+                "status": "success",
+                "product_key": product_key,
+                "module_key": body.module_key,
+                "decision": "needs_human_review",
+                "published": False,
+                "reason": "copy_review_unavailable",
+            }
+
+        result = await review_module_version(
+            pdp_id=pdp_id,
+            module_key=body.module_key,
+            version_id=version_id,
+            actor_type=REVIEW_ACTOR_GPT55,
+            actor_id=f"merchant:{merchant_id}",
+            external_rubric=rubric,
+        )
+        return {
+            "status": "success",
+            "product_key": product_key,
+            "module_key": body.module_key,
+            "decision": result.get("decision"),
+            "published": bool(result.get("published")),
+            "rubric_confidence": rubric.get("confidence"),
+        }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise _map_error(exc)
