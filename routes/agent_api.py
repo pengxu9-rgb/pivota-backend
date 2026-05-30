@@ -505,10 +505,6 @@ async def _load_replayable_agent_order_create_response(
     if not existing_order:
         return None
     response = await _build_agent_order_create_response_from_order(existing_order)
-    await _cache_agent_order_create_response_best_effort(
-        getattr(order_request, "idempotency_key", None),
-        response,
-    )
     return response
 
 
@@ -546,6 +542,10 @@ async def _load_replayable_agent_order_create_response_with_backoff(
     for attempt in range(total_attempts):
         replay_response = await _load_replayable_agent_order_create_response(order_request)
         if replay_response:
+            await _cache_agent_order_create_response_best_effort(
+                getattr(order_request, "idempotency_key", None),
+                replay_response,
+            )
             return replay_response
         if attempt >= total_attempts - 1:
             break
@@ -7972,20 +7972,79 @@ async def agent_create_order(
                 },
             )
 
-        store_info_for_policy = None
-        platform_for_policy = None
-        try:
+        order_create_idempotency_key = getattr(order_request, "idempotency_key", None)
+        if order_request.quote_id and not order_create_idempotency_key:
+            order_create_idempotency_key = _default_order_create_idempotency_key(
+                merchant_id=order_request.merchant_id,
+                quote_id=order_request.quote_id,
+                preferred_psp=order_request.preferred_psp,
+            )
+
+        replay_order_request = order_request
+        if order_create_idempotency_key != getattr(order_request, "idempotency_key", None):
+            try:
+                replay_order_request = order_request.model_copy(
+                    update={"idempotency_key": order_create_idempotency_key}
+                )
+            except Exception:
+                try:
+                    replay_order_request = SimpleNamespace(**vars(order_request))
+                    replay_order_request.idempotency_key = order_create_idempotency_key
+                except Exception:
+                    replay_order_request = order_request
+
+        async def _timed_get_primary_store_for_policy() -> Optional[Dict[str, Any]]:
             _t = time.perf_counter()
-            store_info_for_policy = await get_primary_store(order_request.merchant_id)
+            store_info = await get_primary_store(order_request.merchant_id)
             logger.info(
                 "[AgentAPI][PERF] step=get_primary_store.policy duration_ms=%d order=%s",
                 int((time.perf_counter() - _t) * 1000),
                 _agent_order_id_for_perf,
             )
-            platform_for_policy = str((store_info_for_policy or {}).get("platform") or "").strip().lower() or None
-        except Exception:
-            store_info_for_policy = None
-            platform_for_policy = None
+            return store_info
+
+        async def _timed_idempotency_get() -> Any:
+            if not order_create_idempotency_key:
+                return None
+            from mvp.idempotency import PostgresIdempotencyStore
+
+            idem = PostgresIdempotencyStore()
+            _t = time.perf_counter()
+            existing = await idem.get(scope="order_create", key=order_create_idempotency_key)
+            logger.info(
+                "[AgentAPI][PERF] step=idempotency.get duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                _agent_order_id_for_perf,
+            )
+            return existing
+
+        async def _timed_load_replayable_agent_order_create_response() -> Optional[Dict[str, Any]]:
+            _t = time.perf_counter()
+            replay = await _load_replayable_agent_order_create_response(replay_order_request)
+            logger.info(
+                "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response duration_ms=%d order=%s",
+                int((time.perf_counter() - _t) * 1000),
+                _agent_order_id_for_perf,
+            )
+            return replay
+
+        _parallel_started = time.perf_counter()
+        store_info_for_policy, idempotency_cache, replay_response = await asyncio.gather(
+            _timed_get_primary_store_for_policy(),
+            _timed_idempotency_get(),
+            _timed_load_replayable_agent_order_create_response(),
+            return_exceptions=True,
+        )
+        logger.info(
+            "[AgentAPI][PERF] step=parallel_pre_create_reads duration_ms=%d order=%s",
+            int((time.perf_counter() - _parallel_started) * 1000),
+            _agent_order_id_for_perf,
+        )
+
+        if isinstance(store_info_for_policy, BaseException):
+            raise store_info_for_policy
+
+        platform_for_policy = str((store_info_for_policy or {}).get("platform") or "").strip().lower() or None
 
         if not platform_for_policy and order_request.quote_id:
             try:
@@ -8035,44 +8094,30 @@ async def agent_create_order(
         # This prevents a first PSP-specific checkout attempt from silently replaying into
         # later attempts that reuse the same quote with a different explicit provider choice.
         if order_request.quote_id and not order_request.idempotency_key:
-            order_request.idempotency_key = _default_order_create_idempotency_key(
-                merchant_id=order_request.merchant_id,
-                quote_id=order_request.quote_id,
-                preferred_psp=order_request.preferred_psp,
-            )
+            order_request.idempotency_key = order_create_idempotency_key
 
-        # Idempotency (best-effort): if provided and already processed, replay the cached response.
-        if order_request.idempotency_key:
-            try:
-                from mvp.idempotency import PostgresIdempotencyStore
+        if isinstance(idempotency_cache, BaseException):
+            raise idempotency_cache
 
-                idem = PostgresIdempotencyStore()
-                _t = time.perf_counter()
-                existing = await idem.get(scope="order_create", key=order_request.idempotency_key)
-                logger.info(
-                    "[AgentAPI][PERF] step=idempotency.get duration_ms=%d order=%s",
-                    int((time.perf_counter() - _t) * 1000),
-                    _agent_order_id_for_perf,
-                )
-                if existing and isinstance(existing.value, dict):
-                    if (
-                        existing.value.get("status") == "success"
-                        and existing.value.get("order_id")
-                        and (existing.value.get("merchant_id") in (None, order_request.merchant_id))
-                    ):
-                        _agent_order_id_for_perf = existing.value.get("order_id")
-                        return existing.value
-            except Exception:
-                pass
-        _t = time.perf_counter()
-        replay_response = await _load_replayable_agent_order_create_response(order_request)
-        logger.info(
-            "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response duration_ms=%d order=%s",
-            int((time.perf_counter() - _t) * 1000),
-            _agent_order_id_for_perf,
-        )
+        # Idempotency replay: if provided and already processed, replay the cached response.
+        idempotency_cache_value = getattr(idempotency_cache, "value", None)
+        if idempotency_cache and isinstance(idempotency_cache_value, dict):
+            if (
+                idempotency_cache_value.get("status") == "success"
+                and idempotency_cache_value.get("order_id")
+                and (idempotency_cache_value.get("merchant_id") in (None, order_request.merchant_id))
+            ):
+                _agent_order_id_for_perf = idempotency_cache_value.get("order_id")
+                return idempotency_cache_value
+
+        if isinstance(replay_response, BaseException):
+            raise replay_response
         if replay_response:
             _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
+            await _cache_agent_order_create_response_best_effort(
+                getattr(order_request, "idempotency_key", None),
+                replay_response,
+            )
             return replay_response
 
         precomputed_loaded_quote = None
