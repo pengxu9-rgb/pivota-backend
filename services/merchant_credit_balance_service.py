@@ -810,9 +810,13 @@ async def _apply_delta(
                           allowance_period_start,
                           plan_tier, updated_at, version
                 """
-            params = {
+            # Params split by operation — asyncpg prepared statements are
+            # strict on extras (an unused bind in params raises ArgumentError
+            # at fetch_one). `amount` is referenced by credit_update only;
+            # debit_update uses `balance_debit` instead. Build the dict per
+            # branch so each query gets exactly the keys its SQL references.
+            params: Dict[str, Any] = {
                 "merchant_id": merchant_id,
-                "amount": int(amount),
                 "purchased_credits": (
                     purchased_debit
                     if operation == "debit"
@@ -834,6 +838,8 @@ async def _apply_delta(
                         ),
                     }
                 )
+            else:
+                params["amount"] = int(amount)
             row = await tx.fetch_one(
                 sql,
                 params,

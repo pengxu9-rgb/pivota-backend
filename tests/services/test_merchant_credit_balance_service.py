@@ -112,9 +112,13 @@ class FakeCreditConn:
             }
             return {"idempotency_key": key, "payload": payload}
         if "merchant_credit_balance/debit_update" in sql:
+            # debit_update SQL references :balance_debit (not :amount);
+            # the credit path uses :amount. The conditional split in
+            # _apply_delta keeps each query's params exact to avoid
+            # asyncpg prepared-statement ArgumentError on extras.
             return self._update_balance(
                 values,
-                delta=-int(values.get("balance_debit", values["amount"])),
+                delta=-int(values["balance_debit"]),
                 usd_cogs_delta=Decimal(str(values["usd_cogs"])),
             )
         if "merchant_credit_balance/credit_update" in sql:
