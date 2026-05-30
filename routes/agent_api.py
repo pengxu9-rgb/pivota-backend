@@ -8056,6 +8056,8 @@ async def agent_create_order(
             _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
             return replay_response
 
+        precomputed_loaded_quote = None
+
         # OfferObject + PreFlight (best-effort, additive): compute canonical offer(s) from quote snapshot and
         # attach to order metadata. Enforcement is gated by `MVP_PREFLIGHT_ENFORCE=true`.
         offers = None
@@ -8074,6 +8076,7 @@ async def agent_create_order(
                     int((time.perf_counter() - _t) * 1000),
                     _agent_order_id_for_perf,
                 )
+                precomputed_loaded_quote = qs
                 if qs.merchant_id != order_request.merchant_id:
                     raise HTTPException(
                         status_code=400,
@@ -8338,8 +8341,17 @@ async def agent_create_order(
                 order_routes_module.create_new_order
             ).parameters:
                 create_new_order_kwargs["precomputed_quote_requirement"] = (require_quote, require_ctx)
+            if (
+                precomputed_loaded_quote is not None
+                and "precomputed_loaded_quote" in inspect.signature(
+                    order_routes_module.create_new_order
+                ).parameters
+            ):
+                create_new_order_kwargs["precomputed_loaded_quote"] = precomputed_loaded_quote
         except (TypeError, ValueError):
             create_new_order_kwargs["precomputed_quote_requirement"] = (require_quote, require_ctx)
+            if precomputed_loaded_quote is not None:
+                create_new_order_kwargs["precomputed_loaded_quote"] = precomputed_loaded_quote
 
         # 调用标准订单创建 (serialize per-merchant to avoid concurrent order creation hazards)
         async with _get_order_create_lock(order_request.merchant_id):

@@ -158,6 +158,7 @@ class QuoteSnapshot:
     snapshot_json: Dict[str, Any]
     quote_hash_sha256: Optional[str]
     debug_id: Optional[str]
+    created_at: Optional[datetime] = None
 
 
 class QuoteError(Exception):
@@ -1248,6 +1249,14 @@ class QuoteService:
                 expires_at = datetime.fromisoformat(expires_at)
             except Exception:
                 expires_at = None
+        created_at = row.get("created_at")
+        if isinstance(created_at, str):
+            try:
+                created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except Exception:
+                created_at = None
+        if isinstance(created_at, datetime) and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
         status = row.get("status")
 
         if status == "consumed":
@@ -1276,6 +1285,7 @@ class QuoteService:
             snapshot_json=row.get("snapshot_json") or {},
             quote_hash_sha256=row.get("quote_hash_sha256"),
             debug_id=row.get("debug_id"),
+            created_at=created_at,
         )
 
     async def consume_quote_best_effort(self, quote_id: str, *, order_id: Optional[str] = None) -> None:
