@@ -9,24 +9,47 @@ missing/blank checks) returns None. The caller treats None as "no rubric" -> the
 GPT55 gate forces needs_human_review and nothing publishes. We never fabricate a
 passing rubric. Flag-gated by SKU_OPT_OVERLAY_V1 at the call site.
 
-NOTE (hardening follow-up): this calls DeepSeek directly like the category
-classifier and is NOT yet routed through the metered orchestrator's per-merchant
-cost cap. The call is merchant-initiated and bounded (one per approve click), so
-multiplier risk is low, but before broad enablement route through
-services/llm_providers/orchestrator (select_provider + deepseek_probe) so spend
-records to db.llm_probe_runs and honors AGENT_CENTER_LLM_DAILY_COST_USD_PER_MERCHANT.
+Metering: before each call we enforce the same per-merchant daily cost cap the LLM
+orchestrator uses (AGENT_CENTER_LLM_DAILY_COST_USD_PER_MERCHANT, default $5),
+summed from db.llm_probe_runs via cost_today_for_merchant. Over cap -> return None
+(fail closed) and record a cost_capped probe row. Every call records a probe_run
+row (succeeded/failed/cost_capped) with real token usage + computed cost, so spend
+shows up in the same telemetry/rollup as the rest of the platform's LLM usage.
 """
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from config.settings import settings
+from db.llm_probe_runs import (
+    STATUS_COST_CAPPED,
+    STATUS_FAILED,
+    STATUS_SUCCEEDED,
+    compute_cost_usd,
+    cost_today_for_merchant,
+    record_probe_run,
+)
 
 logger = logging.getLogger(__name__)
+
+# Telemetry labels (match the registered DeepSeek provider id + a dedicated mode).
+_PROBE_PROVIDER = "deepseek"
+_PROBE_SCAN_MODE = "pdp_copy_review"
+
+# Per-merchant daily cost cap -- same env var the orchestrator honors.
+_DAILY_COST_CAP_USD = float(
+    os.getenv("AGENT_CENTER_LLM_DAILY_COST_USD_PER_MERCHANT", "5") or "5"
+)
+
+# DeepSeek deepseek-chat (V4 Flash) list rates; mirror provider_registry.py.
+_COST_PER_1K_INPUT_USD = 0.00014
+_COST_PER_1K_OUTPUT_USD = 0.00028
 
 # Must match GPT55_RUBRIC_REQUIRED_CHECKS in services/pdp_governance_service.py.
 REQUIRED_CHECKS = (
