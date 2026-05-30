@@ -1069,6 +1069,7 @@ async def search_products(
                 record_decision_event,
                 record_exposure_events,
             )
+            from services.protocols import DEFAULT_PROTOCOL
 
             raw_products = [p for p in (result.get("products") or []) if isinstance(p, dict)]
             rows = []
@@ -1094,6 +1095,7 @@ async def search_products(
                         merchant_id=merchant_id,
                         surface="agent_sdk_fixed.products.search",
                         channel=None,
+                        protocol=DEFAULT_PROTOCOL,
                         agent_context={
                             "agent_id": getattr(context, "agent_id", None),
                             "session_id": getattr(context, "session_id", None),

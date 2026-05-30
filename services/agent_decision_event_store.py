@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from db._jsonb_safe import _json_safe
 from db.database import database
+from services.protocols import DEFAULT_PROTOCOL, validate_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +25,11 @@ _WORKER: Optional[asyncio.Task[None]] = None
 _QUEUE_LOOP: Optional[asyncio.AbstractEventLoop] = None
 _MANY = {"candidates", "exposures"}
 _SPEC = {
-    "decision": ("agent_decision_events", ("decision_id", "merchant_id", "brand_id", "surface", "channel", "agent_context", "attribution_model", "attribution_window_seconds"), "decision_id", {"agent_context"}),
+    "decision": ("agent_decision_events", ("decision_id", "merchant_id", "brand_id", "surface", "channel", "agent_context", "protocol", "attribution_model", "attribution_window_seconds"), "decision_id", {"agent_context"}),
     "candidates": ("agent_decision_candidates", ("candidate_id", "decision_id", "content_key", "catalog_offer_id", "rank_position", "eligibility_flags"), "candidate_id", {"eligibility_flags"}),
     "exposures": ("agent_exposure_events", ("exposure_id", "decision_id", "content_key", "catalog_offer_id", "exposure_position", "slot"), "exposure_id", set()),
-    "checkout": ("checkout_decisions", ("checkout_decision_id", "decision_id", "order_id", "merchant_id", "content_key", "catalog_offer_id", "purchase_route", "quote_context", "psp_context"), "checkout_decision_id", {"quote_context", "psp_context"}),
-    "funnel_link": ("agent_decision_funnel_links", ("link_id", "decision_id", "funnel_event_id", "exposure_id", "checkout_decision_id", "content_key", "catalog_offer_id", "commerce_attribution_edge_id", "merchant_id", "attribution_model", "attribution_window_seconds"), "funnel_event_id", set()),
+    "checkout": ("checkout_decisions", ("checkout_decision_id", "decision_id", "order_id", "merchant_id", "content_key", "catalog_offer_id", "purchase_route", "quote_context", "psp_context", "protocol"), "checkout_decision_id", {"quote_context", "psp_context"}),
+    "funnel_link": ("agent_decision_funnel_links", ("link_id", "decision_id", "funnel_event_id", "exposure_id", "checkout_decision_id", "content_key", "catalog_offer_id", "commerce_attribution_edge_id", "merchant_id", "protocol", "attribution_model", "attribution_window_seconds"), "funnel_event_id", set()),
 }
 _SQL: Dict[str, str] = {}
 
@@ -83,13 +84,16 @@ async def record_decision_event(
     *, decision_id: Optional[str] = None, merchant_id: Optional[str] = None,
     brand_id: Optional[str] = None, surface: Optional[str] = None,
     channel: Optional[str] = None, agent_context: Optional[Dict[str, Any]] = None,
+    protocol: str = DEFAULT_PROTOCOL,
     attribution_model: str = "last_agent_decision_v1", attribution_window_seconds: int = 2592000,
 ) -> str:
     decision_id = decision_id or str(uuid.uuid4())
+    protocol = validate_protocol(protocol)
     await _enqueue("decision", {
         "decision_id": decision_id, "merchant_id": merchant_id, "brand_id": brand_id,
         "surface": surface, "channel": channel, "agent_context": _json_param(agent_context),
-        "attribution_model": attribution_model, "attribution_window_seconds": attribution_window_seconds,
+        "protocol": protocol, "attribution_model": attribution_model,
+        "attribution_window_seconds": attribution_window_seconds,
     })
     return decision_id
 
@@ -121,13 +125,16 @@ async def record_checkout_decision(
     content_key: Optional[str] = None, catalog_offer_id: Optional[str] = None,
     purchase_route: Optional[str] = None, quote_context: Optional[Dict[str, Any]] = None,
     psp_context: Optional[Dict[str, Any]] = None,
+    protocol: str = DEFAULT_PROTOCOL,
 ) -> str:
     checkout_decision_id = checkout_decision_id or str(uuid.uuid4())
+    protocol = validate_protocol(protocol)
     await _enqueue("checkout", {
         "checkout_decision_id": checkout_decision_id, "decision_id": decision_id,
         "order_id": order_id, "merchant_id": merchant_id, "content_key": content_key,
         "catalog_offer_id": catalog_offer_id, "purchase_route": purchase_route,
         "quote_context": _json_param(quote_context), "psp_context": _json_param(psp_context),
+        "protocol": protocol,
     })
     return checkout_decision_id
 
@@ -138,17 +145,19 @@ async def record_funnel_link(
     checkout_decision_id: Optional[str] = None, content_key: Optional[str] = None,
     catalog_offer_id: Optional[str] = None, commerce_attribution_edge_id: Optional[str] = None,
     merchant_id: Optional[str] = None, attribution_model: str = "last_agent_decision_v1",
-    attribution_window_seconds: int = 2592000,
+    attribution_window_seconds: int = 2592000, protocol: str = DEFAULT_PROTOCOL,
 ) -> str:
     if not funnel_event_id:
         return ""
     link_id = link_id or str(uuid.uuid4())
+    protocol = validate_protocol(protocol)
     await _enqueue("funnel_link", {
         "link_id": link_id, "decision_id": decision_id, "funnel_event_id": funnel_event_id,
         "exposure_id": exposure_id, "checkout_decision_id": checkout_decision_id,
         "content_key": content_key, "catalog_offer_id": catalog_offer_id,
         "commerce_attribution_edge_id": commerce_attribution_edge_id, "merchant_id": merchant_id,
-        "attribution_model": attribution_model, "attribution_window_seconds": attribution_window_seconds,
+        "protocol": protocol, "attribution_model": attribution_model,
+        "attribution_window_seconds": attribution_window_seconds,
     })
     return link_id
 
