@@ -109,6 +109,56 @@ _SYSTEM_PROMPT = (
     'decision must be "pass" only if every check is true.'
 )
 
+_SOURCE_GROUNDED_SYSTEM_PROMPT = (
+    "You are a product-listing quality reviewer for an agentic-commerce catalog. "
+    "You are given a merchant-submitted product DESCRIPTION (copy) for a module "
+    "that is eligible for machine publishing. Evaluate it against each check and "
+    "return STRICT JSON only, no prose. Each check is true only if the copy "
+    "clearly satisfies it; default to false when unsure. When SOURCE TEXT is "
+    "provided, source_grounded requires that the description's factual claims "
+    "(ingredients, origin, format, brand) are supported by the source text or "
+    "merchant catalog reference. When SOURCE TEXT is not provided, set "
+    "source_grounded=false unless the description is clearly self-evident.\n\n"
+    "Checks:\n"
+    "- source_grounded: claims are about THIS product and supported by source text"
+    " or the merchant catalog reference when available.\n"
+    "- seller_entity_checkout_not_confused: no mention of a different seller/store/checkout.\n"
+    "- variant_market_consistent: no contradictory size/shade/market claims.\n"
+    "- no_medical_regulated_promo_or_fake_review_claim: no medical/efficacy/regulated"
+    " claims, no fake-review or unverifiable promotional language.\n"
+    "- machine_publish_allowed_module: copy is self-contained and safe to publish"
+    " without human co-review.\n\n"
+    'Return JSON: {"decision":"pass|reject|needs_human_review","checks":'
+    '{"source_grounded":bool,"seller_entity_checkout_not_confused":bool,'
+    '"variant_market_consistent":bool,'
+    '"no_medical_regulated_promo_or_fake_review_claim":bool,'
+    '"machine_publish_allowed_module":bool},"confidence":0..1,'
+    '"evidence_refs":["short quote from the copy"],'
+    '"reviewed_in":"codex_external_window"}. '
+    'decision must be "pass" only if every check is true.'
+)
+
+
+def _source_grounded_user_message(
+    *,
+    copy_text: str,
+    source_url: Optional[str],
+    source_text: Optional[str],
+    catalog_brand: Optional[str],
+    catalog_title: Optional[str],
+) -> str:
+    return (
+        "You will verify a merchant-submitted product description against the source.\n\n"
+        f"SOURCE URL: {source_url or 'not provided'}\n"
+        "SOURCE TEXT (verbatim from the source URL, truncated):\n"
+        f"```\n{(source_text or '')[:2000]}\n```\n\n"
+        "MERCHANT CATALOG REFERENCE:\n"
+        f"- brand: {catalog_brand or 'unknown'}\n"
+        f"- title: {catalog_title or 'unknown'}\n\n"
+        "MERCHANT-SUBMITTED DESCRIPTION (the copy to review):\n"
+        f"```\n{copy_text}\n```"
+    )
+
 
 def _extract_copy_text(payload: Dict[str, Any]) -> str:
     payload = payload if isinstance(payload, dict) else {}
@@ -172,7 +222,12 @@ def _parse_rubric(content: str) -> Optional[Dict[str, Any]]:
 
 
 async def _call_deepseek_review(
-    *, copy_text: str,
+    *,
+    copy_text: str,
+    source_url: Optional[str] = None,
+    source_text: Optional[str] = None,
+    catalog_brand: Optional[str] = None,
+    catalog_title: Optional[str] = None,
 ) -> Optional[Tuple[str, Optional[int], Optional[int], Dict[str, Any], Dict[str, Any], str]]:
     """Return content, usage, request, response, model; or None on no-key.
     Raises on transport/HTTP errors (caller catches + records failure)."""
@@ -180,11 +235,29 @@ async def _call_deepseek_review(
     if not api_key:
         return None
     base_url = settings.deepseek_api_base_url.rstrip("/")
+    source_context_enabled = any(
+        value for value in (source_url, source_text, catalog_brand, catalog_title)
+    )
+    system_prompt = (
+        _SOURCE_GROUNDED_SYSTEM_PROMPT
+        if source_context_enabled else _SYSTEM_PROMPT
+    )
+    user_message = (
+        _source_grounded_user_message(
+            copy_text=copy_text,
+            source_url=source_url,
+            source_text=source_text,
+            catalog_brand=catalog_brand,
+            catalog_title=catalog_title,
+        )
+        if source_context_enabled
+        else f"Product description to review:\n\n{copy_text}"
+    )
     payload = {
         "model": settings.deepseek_model,
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": f"Product description to review:\n\n{copy_text}"},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"},
@@ -220,6 +293,10 @@ async def generate_copy_review_rubric(
     merchant_id: str,
     payload: Dict[str, Any],
     source_refs: Optional[List[Dict[str, Any]]] = None,
+    source_url: Optional[str] = None,
+    source_text: Optional[str] = None,
+    catalog_brand: Optional[str] = None,
+    catalog_title: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a validated rubric dict, or None on any failure (never raises).
 
@@ -250,7 +327,13 @@ async def generate_copy_review_rubric(
         return None
 
     try:
-        result = await _call_deepseek_review(copy_text=copy_text)
+        result = await _call_deepseek_review(
+            copy_text=copy_text,
+            source_url=source_url,
+            source_text=source_text,
+            catalog_brand=catalog_brand,
+            catalog_title=catalog_title,
+        )
     except Exception as exc:  # transport / HTTP / unexpected -> fail closed
         logger.warning("pdp_copy_review deepseek call failed", exc_info=True)
         await record_probe_run(

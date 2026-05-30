@@ -10,8 +10,11 @@ decode (the auth path under test). The already-proven downstream
 (get_pdp_projection / generate_copy_review_rubric / review_module_version) is
 patched so these tests isolate AUTH + GUARDS, not DeepSeek or the DB.
 """
+import asyncio
 import importlib
+import json
 
+from databases import Database
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -58,6 +61,37 @@ def _real_shape_projection(pdp_id="pdp_http_test", *, has_staged=True):
         "modules": [
             {"module_key": "copy", "status": "draft", "current": None,
              "staged": staged, "published_payload": None, "source_refs": []},
+        ],
+        "published_payload": {},
+        "activity": [],
+    }
+
+
+def _real_shape_projection_with_source(pdp_id="pdp_http_test"):
+    return {
+        "status": "success",
+        "pdp": {
+            "pdp_id": pdp_id,
+            "title": "Triple Shine Grape",
+            "brand": "Ownist",
+        },
+        "modules": [
+            {
+                "module_key": "copy",
+                "status": "draft",
+                "current": None,
+                "staged": {
+                    "id": "pdpmod_source",
+                    "stage": "staged",
+                    "payload": {
+                        "pdp_description_raw": "Ownist Triple Shine Grape jelly.",
+                    },
+                    "source_refs": [{"url": "https://ownist.test/products/triple-shine"}],
+                    "source_url": "https://ownist.test/products/triple-shine",
+                },
+                "published_payload": None,
+                "source_refs": [{"url": "https://ownist.test/products/triple-shine"}],
+            },
         ],
         "published_payload": {},
         "activity": [],
@@ -184,6 +218,128 @@ def test_no_staged_module_404(monkeypatch):
     r = client.post(_url(), json={"module_key": "copy"}, headers=_auth(_token()))
     assert r.status_code == 404, r.text
     assert r.json()["detail"] == "NO_STAGED_MODULE"
+
+
+def test_approve_route_persists_source_text_in_deepseek_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("SKU_OPT_OVERLAY_V1", "on")
+    monkeypatch.setenv("OVERLAY_DEEPSEEK_GROUND_AGAINST_SOURCE", "on")
+    import routes.merchant_pdp as mp
+    import services.pdp_copy_review as review
+    import db.llm_probe_runs as lpr
+    from config.settings import settings
+
+    importlib.reload(mp)
+
+    test_db = Database(f"sqlite+aiosqlite:///{tmp_path / 'probe_runs.db'}")
+    asyncio.run(test_db.connect())
+    lpr._DDL_READY = False
+    monkeypatch.setattr(lpr, "database", test_db)
+
+    captured = {"post_count": 0, "get_count": 0}
+
+    class FakeResponse:
+        def __init__(self, *, text="", payload=None):
+            self.text = text
+            self._payload = payload or {}
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url):
+            captured["get_count"] += 1
+            assert url == "https://ownist.test/products/triple-shine"
+            return FakeResponse(
+                text="<html><body><h1>Triple Shine Grape</h1><p>Marine collagen source text.</p></body></html>"
+            )
+
+        async def post(self, url, json=None, headers=None):
+            captured["post_count"] += 1
+            return FakeResponse(
+                payload={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json_module.dumps({
+                                    "decision": "pass",
+                                    "checks": {
+                                        "source_grounded": True,
+                                        "seller_entity_checkout_not_confused": True,
+                                        "variant_market_consistent": True,
+                                        "no_medical_regulated_promo_or_fake_review_claim": True,
+                                        "machine_publish_allowed_module": True,
+                                    },
+                                    "confidence": 0.92,
+                                    "evidence_refs": ["Marine collagen source text"],
+                                    "reviewed_in": "codex_external_window",
+                                })
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+                }
+            )
+
+    json_module = json
+
+    async def fake_projection(*, product_key, market):
+        return _real_shape_projection_with_source()
+
+    async def fake_review(**kwargs):
+        return {"decision": "pass", "published": True, "module": {}}
+
+    monkeypatch.setattr(settings, "deepseek_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepseek_api_base_url", "https://deepseek.test")
+    monkeypatch.setattr(settings, "deepseek_model", "deepseek-chat")
+    monkeypatch.setattr(review.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(mp.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(mp, "get_pdp_projection", fake_projection)
+    monkeypatch.setattr(mp, "review_module_version", fake_review)
+    monkeypatch.setattr(mp, "parse_product_key", lambda pk: tuple(pk.split("|")))
+
+    app = FastAPI()
+    app.include_router(mp.router)
+    client = TestClient(app)
+    try:
+        r = client.post(_url(), json={"module_key": "copy"}, headers=_auth(_token()))
+        assert r.status_code == 200, r.text
+
+        row = asyncio.run(test_db.fetch_one(
+            """
+            SELECT request_payload_jsonb
+              FROM llm_probe_runs
+             WHERE scan_mode = 'pdp_copy_review'
+             ORDER BY completed_at DESC
+             LIMIT 1
+            """
+        ))
+        assert row is not None
+        stored_request = row["request_payload_jsonb"]
+        if isinstance(stored_request, str):
+            stored_request = json.loads(stored_request)
+        user_message = stored_request["messages"][1]["content"]
+        assert "SOURCE TEXT (verbatim from the source URL, truncated):" in user_message
+        assert "Marine collagen source text." in user_message
+        assert "SOURCE URL: https://ownist.test/products/triple-shine" in user_message
+        assert captured["get_count"] == 1
+        assert captured["post_count"] == 1
+    finally:
+        lpr._DDL_READY = False
+        asyncio.run(test_db.disconnect())
 
 
 if __name__ == "__main__":

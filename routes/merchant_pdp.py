@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+import re
+from html.parser import HTMLParser
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
 from pydantic import BaseModel, Field
 
 
@@ -17,6 +20,7 @@ SKU_OPT_OVERLAY_V1_ENABLED = os.getenv("SKU_OPT_OVERLAY_V1", "false").strip().lo
 # Modules a merchant may self-approve via the LLM-reviewed auto-publish path.
 # v1: 'copy' only (low-risk, machine-publishable). Widen deliberately.
 MERCHANT_SELF_APPROVE_MODULES = {"copy"}
+SOURCE_GROUNDING_TIMEOUT_S = 5.0
 
 from db.database import database
 from services.pdp_governance_service import (
@@ -58,6 +62,117 @@ def _map_error(exc: Exception) -> HTTPException:
     if message == "MERCHANT_PRODUCT_FORBIDDEN":
         return HTTPException(status_code=403, detail=message)
     return HTTPException(status_code=500, detail=message[:300])
+
+
+def _source_grounding_enabled() -> bool:
+    return os.getenv("OVERLAY_DEEPSEEK_GROUND_AGAINST_SOURCE", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: List[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
+        if tag.lower() in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript"} and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth and data.strip():
+            self._parts.append(data.strip())
+
+    def text(self) -> str:
+        return " ".join(self._parts)
+
+
+def _html_to_text(html: str) -> str:
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+
+        text = BeautifulSoup(html or "", "html.parser").get_text(" ")
+    except Exception:
+        parser = _TextExtractor()
+        parser.feed(html or "")
+        text = parser.text()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+async def _fetch_source_text(source_url: Optional[str]) -> Optional[str]:
+    if not source_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=SOURCE_GROUNDING_TIMEOUT_S) as client:
+            response = await client.get(source_url)
+        response.raise_for_status()
+        text = _html_to_text(response.text)
+        return text[:2000] if text else None
+    except Exception:
+        return None
+
+
+def _first_text(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _source_url_from_refs(source_refs: Any) -> Optional[str]:
+    refs = source_refs if isinstance(source_refs, list) else []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        url = _first_text(
+            ref.get("source_url"),
+            ref.get("source_original_url"),
+            ref.get("url"),
+            ref.get("canonical_url"),
+            ref.get("destination_url"),
+        )
+        if url:
+            return url
+    return None
+
+
+def _resolve_copy_review_source_context(
+    *,
+    projection: Dict[str, Any],
+    staged: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Optional[str]]:
+    pdp = projection.get("pdp") if isinstance(projection.get("pdp"), dict) else {}
+    source_refs = staged.get("source_refs")
+    return {
+        "source_url": _first_text(
+            staged.get("source_url"),
+            staged.get("source_original_url"),
+            payload.get("source_url"),
+            payload.get("source_original_url"),
+            _source_url_from_refs(source_refs),
+        ),
+        "catalog_brand": _first_text(
+            pdp.get("brand"),
+            staged.get("brand"),
+            payload.get("brand"),
+            payload.get("catalog_brand"),
+        ),
+        "catalog_title": _first_text(
+            pdp.get("title"),
+            staged.get("title"),
+            payload.get("title"),
+            payload.get("catalog_title"),
+        ),
+    }
 
 
 @router.get("/product/{platform}/{platform_product_id}")
@@ -188,11 +303,22 @@ async def approve_product_pdp_module(
         if not version_id:
             raise HTTPException(status_code=404, detail="NO_STAGED_MODULE")
         payload = staged.get("payload") if isinstance(staged.get("payload"), dict) else {}
+        source_context: Dict[str, Optional[str]] = {}
+        if _source_grounding_enabled():
+            source_context = _resolve_copy_review_source_context(
+                projection=projection,
+                staged=staged,
+                payload=payload,
+            )
+            source_context["source_text"] = await _fetch_source_text(
+                source_context.get("source_url")
+            )
 
         rubric = await generate_copy_review_rubric(
             merchant_id=merchant_id,
             payload=payload,
             source_refs=staged.get("source_refs"),
+            **source_context,
         )
         if rubric is None:
             return {
