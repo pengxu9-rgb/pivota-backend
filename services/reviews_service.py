@@ -579,27 +579,24 @@ async def get_review_summary_for_sku(
     # PDP calls this with variant_id=None. In that case, we want product-level aggregation
     # across all variants (not only sku_key ending with the '∅' sentinel).
     is_product_level = (_as_text(variant_id) == "") or (_as_text(variant_id) == VARIANT_ID_SENTINEL)
-    membership = (
-        await get_active_group_membership_for_product_key(product_key)
-        if is_product_level
-        else await get_active_group_membership_for_sku_key(sku_key)
-    )
-    gid_raw = _row_get(membership, "group_id") if membership else None
-    group_id = int(gid_raw) if gid_raw is not None else None
 
-    if is_product_level:
-        merchant_row = await database.fetch_one(
-            """
-            SELECT COUNT(*)::int AS total,
-                   COALESCE(SUM(media_count), 0)::int AS media_count,
-                   COALESCE(AVG(rating), 0)::float AS avg_rating
-            FROM product_reviews
-            WHERE product_key = :pk AND status = 'active'
-            """,
-            {"pk": product_key},
-        )
-    else:
-        merchant_row = await database.fetch_one(
+    # PERF: the group-membership lookup, the merchant aggregate, and the global-import
+    # aggregate are mutually independent — running them sequentially paid three DB
+    # round-trips (expensive when the backend and Postgres are not co-located). Fire
+    # them concurrently so they cost a single round. Semantics are unchanged.
+    async def _fetch_merchant_aggregate():
+        if is_product_level:
+            return await database.fetch_one(
+                """
+                SELECT COUNT(*)::int AS total,
+                       COALESCE(SUM(media_count), 0)::int AS media_count,
+                       COALESCE(AVG(rating), 0)::float AS avg_rating
+                FROM product_reviews
+                WHERE product_key = :pk AND status = 'active'
+                """,
+                {"pk": product_key},
+            )
+        return await database.fetch_one(
             """
             SELECT COUNT(*)::int AS total,
                    COALESCE(SUM(media_count), 0)::int AS media_count,
@@ -609,35 +606,48 @@ async def get_review_summary_for_sku(
             """,
             {"sku_key": sku_key},
         )
+
+    async def _fetch_global_aggregate():
+        if global_product_key and is_product_level:
+            return await database.fetch_one(
+                """
+                SELECT COUNT(*)::int AS total,
+                       COALESCE(SUM(media_count), 0)::int AS media_count
+                FROM product_reviews
+                WHERE product_key = :pk AND status = 'active'
+                """,
+                {"pk": global_product_key},
+            )
+        if global_sku_key and (not is_product_level):
+            return await database.fetch_one(
+                """
+                SELECT COUNT(*)::int AS total,
+                       COALESCE(SUM(media_count), 0)::int AS media_count
+                FROM product_reviews
+                WHERE sku_key = :sku_key AND status = 'active'
+                """,
+                {"sku_key": global_sku_key},
+            )
+        return None
+
+    membership, merchant_row, global_row = await asyncio.gather(
+        (
+            get_active_group_membership_for_product_key(product_key)
+            if is_product_level
+            else get_active_group_membership_for_sku_key(sku_key)
+        ),
+        _fetch_merchant_aggregate(),
+        _fetch_global_aggregate(),
+    )
+
+    gid_raw = _row_get(membership, "group_id") if membership else None
+    group_id = int(gid_raw) if gid_raw is not None else None
+
     merchant_review_count = int(merchant_row["total"] or 0) if merchant_row else 0
     merchant_media_count = int(merchant_row["media_count"] or 0) if merchant_row else 0
 
-    global_review_count = 0
-    global_media_count = 0
-    if global_product_key and is_product_level:
-        global_row = await database.fetch_one(
-            """
-            SELECT COUNT(*)::int AS total,
-                   COALESCE(SUM(media_count), 0)::int AS media_count
-            FROM product_reviews
-            WHERE product_key = :pk AND status = 'active'
-            """,
-            {"pk": global_product_key},
-        )
-        global_review_count = int(global_row["total"] or 0) if global_row else 0
-        global_media_count = int(global_row["media_count"] or 0) if global_row else 0
-    if global_sku_key and (not is_product_level):
-        global_row = await database.fetch_one(
-            """
-            SELECT COUNT(*)::int AS total,
-                   COALESCE(SUM(media_count), 0)::int AS media_count
-            FROM product_reviews
-            WHERE sku_key = :sku_key AND status = 'active'
-            """,
-            {"sku_key": global_sku_key},
-        )
-        global_review_count = int(global_row["total"] or 0) if global_row else 0
-        global_media_count = int(global_row["media_count"] or 0) if global_row else 0
+    global_review_count = int(global_row["total"] or 0) if global_row else 0
+    global_media_count = int(global_row["media_count"] or 0) if global_row else 0
 
     group_total_review_count = 0
     group_media_count = 0
@@ -737,15 +747,44 @@ async def get_review_summary_for_sku(
             scope_params["gsk"] = global_sku_key
     scope_where_sql = " OR ".join(scope_or) if scope_or else "FALSE"
 
-    scope_row = await database.fetch_one(
-        f"""
-        SELECT COUNT(*)::int AS total,
-               COALESCE(SUM(CASE WHEN r.rating IS NOT NULL AND r.rating > 0 THEN 1 ELSE 0 END), 0)::int AS rated_total,
-               COALESCE(AVG(r.rating), 0)::float AS avg_rating
-        FROM product_reviews r
-        WHERE r.status = 'active' AND ({scope_where_sql})
-        """,
-        scope_params,
+    # PERF: scope aggregate, star distribution, and preview rows all read the same
+    # scope predicate and are independent of each other — gather them into one round
+    # instead of three sequential DB round-trips. Result parsing is unchanged below.
+    scope_row, dist_rows, preview_rows = await asyncio.gather(
+        database.fetch_one(
+            f"""
+            SELECT COUNT(*)::int AS total,
+                   COALESCE(SUM(CASE WHEN r.rating IS NOT NULL AND r.rating > 0 THEN 1 ELSE 0 END), 0)::int AS rated_total,
+                   COALESCE(AVG(r.rating), 0)::float AS avg_rating
+            FROM product_reviews r
+            WHERE r.status = 'active' AND ({scope_where_sql})
+            """,
+            scope_params,
+        ),
+        database.fetch_all(
+            f"""
+            SELECT r.rating::int AS rating, COUNT(*)::int AS c
+            FROM product_reviews r
+            WHERE r.status = 'active' AND r.rating IS NOT NULL AND r.rating > 0 AND ({scope_where_sql})
+            GROUP BY r.rating
+            ORDER BY r.rating DESC
+            """,
+            scope_params,
+        ),
+        database.fetch_all(
+            f"""
+            SELECT r.id, r.merchant_id, r.rating,
+                   r.title,
+                   COALESCE(NULLIF(r.body_redacted, ''), r.body) AS body_effective,
+                   r.created_at,
+                   r.media_count
+            FROM product_reviews r
+            WHERE r.status = 'active' AND ({scope_where_sql})
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT 6
+            """,
+            scope_params,
+        ),
     )
     review_count = int(scope_row["total"] or 0) if scope_row else 0
     rated_review_count = int(scope_row["rated_total"] or 0) if scope_row else 0
@@ -755,16 +794,6 @@ async def get_review_summary_for_sku(
     if rating > 5:
         rating = 5.0
 
-    dist_rows = await database.fetch_all(
-        f"""
-        SELECT r.rating::int AS rating, COUNT(*)::int AS c
-        FROM product_reviews r
-        WHERE r.status = 'active' AND r.rating IS NOT NULL AND r.rating > 0 AND ({scope_where_sql})
-        GROUP BY r.rating
-        ORDER BY r.rating DESC
-        """,
-        scope_params,
-    )
     by_star: Dict[int, int] = {}
     for dr in dist_rows:
         try:
@@ -785,21 +814,6 @@ async def get_review_summary_for_sku(
                     "percent": (float(c) / float(rated_review_count)) * 100.0 if rated_review_count else 0.0,
                 }
             )
-
-    preview_rows = await database.fetch_all(
-        f"""
-        SELECT r.id, r.merchant_id, r.rating,
-               r.title,
-               COALESCE(NULLIF(r.body_redacted, ''), r.body) AS body_effective,
-               r.created_at,
-               r.media_count
-        FROM product_reviews r
-        WHERE r.status = 'active' AND ({scope_where_sql})
-        ORDER BY r.created_at DESC, r.id DESC
-        LIMIT 6
-        """,
-        scope_params,
-    )
     preview_review_ids = [int(_row_get(pr, "id") or 0) for pr in preview_rows if int(_row_get(pr, "id") or 0) > 0]
     preview_media_by_review: Dict[int, Dict[str, Any]] = {}
     if preview_review_ids:
