@@ -1,0 +1,62 @@
+name: V3 Audit Gate
+
+# Structural gate for the v3 merchant-audit path.
+#
+# Why this exists: unit tests passed while the v3 worker was silently falling
+# back to the legacy report on prod (a JSONB column wasn't decoded to a dict on
+# read, so the per-SKU branch never executed — fixed in PR #706). A
+# pilot-readiness review caught it; unit tests did not. This gate runs the
+# end-to-end integration test on every change to the audit path so the same
+# class of "v3 silently degrades to legacy" regression is caught BEFORE merge,
+# not after.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "routes/audit_runs_routes.py"
+      - "services/audit_run_worker.py"
+      - "services/agent_center_bd_report_service.py"
+      - "services/merchant_credit_balance_service.py"
+      - "db/merchant_audit_runs.py"
+      - "db/llm_probe_runs.py"
+      - "tests/integration/test_audit_v3_end_to_end.py"
+      - "tests/services/test_agent_center_bd_per_sku.py"
+      - "tests/services/test_merchant_credit_balance_service.py"
+      - ".github/workflows/v3-audit-gate.yml"
+
+jobs:
+  v3-audit-e2e:
+    name: v3 audit end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The e2e test is self-contained (in-memory store, all DB/LLM calls
+      # monkeypatched). DATABASE_URL is set only so module import doesn't fail
+      # building an engine; no live DB is contacted.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run v3 audit end-to-end gate
+        run: |
+          pytest -q \
+            tests/integration/test_audit_v3_end_to_end.py \
+            tests/services/test_agent_center_bd_per_sku.py \
+            tests/services/test_merchant_credit_balance_service.py
