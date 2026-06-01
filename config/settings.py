@@ -176,8 +176,11 @@ class Settings(BaseSettings):
         os.getenv("PIVOTA_BACKEND_INTERNAL_URL")
     )
 
+    # Grounded citation calls (Gemini search-grounding) routinely run 20-40s;
+    # the prior 30s default produced frequent ReadTimeouts mid-audit. 60s gives
+    # headroom (still bounded by one transport retry). Env-overridable.
     agent_center_llm_probe_timeout_s: float = float(
-        os.getenv("AGENT_CENTER_LLM_PROBE_TIMEOUT_S", "30")
+        os.getenv("AGENT_CENTER_LLM_PROBE_TIMEOUT_S", "60")
     )
 
     # Deepseek V4 multi-LLM probe (PR-3a). When DEEPSEEK_API_KEY is

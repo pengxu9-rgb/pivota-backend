@@ -29,6 +29,7 @@ on:
       - "tests/services/test_audit_v3_resolver_sku_key.py"
       - "tests/services/test_audit_v3_probe_runs_jsonb_decode.py"
       - "tests/services/test_audit_v3_prompt_identity.py"
+      - "tests/services/test_audit_v3_probe_fanout_resilience.py"
       - ".github/workflows/v3-audit-gate.yml"
 
 jobs:
@@ -65,4 +66,5 @@ jobs:
             tests/services/test_merchant_credit_balance_service.py \
             tests/services/test_audit_v3_resolver_sku_key.py \
             tests/services/test_audit_v3_probe_runs_jsonb_decode.py \
-            tests/services/test_audit_v3_prompt_identity.py
+            tests/services/test_audit_v3_prompt_identity.py \
+            tests/services/test_audit_v3_probe_fanout_resilience.py
