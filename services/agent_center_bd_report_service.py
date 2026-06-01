@@ -1529,8 +1529,9 @@ def resolve_sku_identity(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
         # Product-level catalog name (not the variant label). Usable but uncurated.
         name, confidence, source = _with_brand(product_title), "medium", "catalog.product_title"
     elif sku_title:
-        # Only a variant/format label is available — identity is unreliable.
-        name, confidence, source = sku_title, "low", "catalog.sku_title"
+        # Only a variant/format label is available — identity is unreliable, but
+        # still brand-prefix so the probe name is as useful as possible.
+        name, confidence, source = _with_brand(sku_title), "low", "catalog.sku_title"
     else:
         name, confidence, source = _s(sku_ctx.get("sku_key")) or "this product", "low", "fallback.sku_key"
 
@@ -3903,12 +3904,14 @@ def _build_per_sku_audit_query_specs(
         or sku_ctx.get("sku_key")
         or "this product"
     )
-    # Canonical shopper-facing identity = brand + product title, de-duplicated so
-    # we never emit "Ownist Ownist ...". This is what most prompts should name.
-    if brand and brand.lower() not in product_title.lower():
-        title = f"{brand} {product_title}"
-    else:
-        title = product_title
+    # Probe identity = the resolved SKU identity: enrichment title_override when
+    # present, else brand+product title (deduped) — never a bare variant label.
+    # Falls back to the local brand+product_title if resolution yields nothing.
+    title = resolve_sku_identity(sku_ctx or {}).get("name") or (
+        f"{brand} {product_title}"
+        if (brand and brand.lower() not in product_title.lower())
+        else product_title
+    )
     variant_label = (sku.get("title") or "").strip()
     product_type = (
         product.get("product_type")
