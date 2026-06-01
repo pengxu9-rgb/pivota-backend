@@ -3770,20 +3770,30 @@ def _build_per_sku_audit_query_specs(
 ) -> List[Tuple[str, str]]:
     product = _get_product(sku_ctx or {})
     sku = _get_sku(sku_ctx or {})
-    title = (
-        sku.get("title")
-        or product.get("title")
+    brand = product.get("brand") or product.get("vendor") or ""
+    # Prefer the PRODUCT title (real shopper-facing identity, e.g.
+    # "Triple Shine Grape") over the variant/SKU label (e.g.
+    # "14 Servings, 2-Week Routine"). Shopper queries built from a bare variant
+    # label don't name the product, so providers return no real citations.
+    product_title = (
+        product.get("title")
         or sku_ctx.get("sku_title")
+        or sku.get("title")
         or sku_ctx.get("sku_key")
         or "this product"
     )
-    brand = product.get("brand") or product.get("vendor") or ""
+    # Canonical shopper-facing identity = brand + product title, de-duplicated so
+    # we never emit "Ownist Ownist ...". This is what most prompts should name.
+    if brand and brand.lower() not in product_title.lower():
+        title = f"{brand} {product_title}"
+    else:
+        title = product_title
+    variant_label = (sku.get("title") or "").strip()
     product_type = (
         product.get("product_type")
         or product.get("category")
         or "product"
     )
-    variant = sku.get("sku") or sku.get("source_variant_id") or ""
     enrichment = (
         sku_ctx.get("product_enrichment")
         if isinstance(sku_ctx.get("product_enrichment"), dict)
@@ -3821,14 +3831,18 @@ def _build_per_sku_audit_query_specs(
     ]
     if brand:
         specs.extend([
-            (f"{brand} {title}", "brand"),
+            # `title` is the de-duplicated brand+product identity, so this never
+            # doubles the brand even when product_title already starts with it.
+            (title, "brand"),
             (f"buy {brand} {product_type} online", "brand"),
             (f"best {product_type} from {brand}", "brand"),
         ])
-    if variant:
+    if variant_label and variant_label.lower() not in title.lower():
+        # Use the human variant label (e.g. "14 Servings, 2-Week Routine") with
+        # the full identity, not the opaque variant id.
         specs.extend([
-            (f"{title} {variant}", "identity"),
-            (f"buy {variant} online", "identity"),
+            (f"{title} {variant_label}", "identity"),
+            (f"buy {title} ({variant_label}) online", "identity"),
         ])
     for topic in topics:
         specs.extend([
