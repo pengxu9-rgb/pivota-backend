@@ -33,6 +33,7 @@ on:
       - "tests/services/test_audit_v3_first_party_and_band.py"
       - "tests/services/test_audit_v3_citation_strict_sku_mention.py"
       - "tests/services/test_audit_v3_identity_resolution.py"
+      - "tests/services/test_audit_v3_identity_robust_citation.py"
       - ".github/workflows/v3-audit-gate.yml"
 
 jobs:
@@ -73,4 +74,5 @@ jobs:
             tests/services/test_audit_v3_probe_fanout_resilience.py \
             tests/services/test_audit_v3_first_party_and_band.py \
             tests/services/test_audit_v3_citation_strict_sku_mention.py \
-            tests/services/test_audit_v3_identity_resolution.py
+            tests/services/test_audit_v3_identity_resolution.py \
+            tests/services/test_audit_v3_identity_robust_citation.py
