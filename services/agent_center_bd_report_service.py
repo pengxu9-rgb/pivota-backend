@@ -1492,6 +1492,72 @@ def _get_enrichment(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
     return enrichment if isinstance(enrichment, dict) else {}
 
 
+def resolve_sku_identity(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve a best-available, bad-name-tolerant product identity for a SKU.
+
+    Merchant catalogs frequently carry variant/format labels as the SKU title
+    ("Garden Gift Set", "14 Servings, 2-Week Routine"), so we never trust
+    `sku.title` as the identity. Name precedence (most→least curated):
+      enrichment.title_override → brand + product.title → product.title → sku.title.
+    We also surface name-INDEPENDENT anchors (PDP url/domain, brand, category,
+    GTIN/barcode, content_key, product_group) for identity-robust matching, plus
+    a `confidence` and `source`. `unresolved` (confidence == "low") means we only
+    have a variant label / no product-level name — such SKUs should be flagged
+    "enrich before trusting visibility" rather than scored as invisible.
+    """
+    product = _get_product(sku_ctx or {})
+    sku = _get_sku(sku_ctx or {})
+    enrichment = _get_enrichment(sku_ctx or {})
+
+    def _s(value: Any) -> str:
+        return str(value).strip() if value not in (None, "") else ""
+
+    brand = _s(product.get("brand") or product.get("vendor"))
+    product_title = _s(product.get("title"))
+    sku_title = _s(sku.get("title"))
+    title_override = _s(enrichment.get("title_override"))
+
+    def _with_brand(title: str) -> str:
+        # Brand-prefix unless already present (mirrors prompt identity, #713).
+        if brand and brand.lower() not in title.lower():
+            return f"{brand} {title}"
+        return title
+
+    if title_override:
+        name, confidence, source = _with_brand(title_override), "high", "enrichment.title_override"
+    elif product_title:
+        # Product-level catalog name (not the variant label). Usable but uncurated.
+        name, confidence, source = _with_brand(product_title), "medium", "catalog.product_title"
+    elif sku_title:
+        # Only a variant/format label is available — identity is unreliable.
+        name, confidence, source = sku_title, "low", "catalog.sku_title"
+    else:
+        name, confidence, source = _s(sku_ctx.get("sku_key")) or "this product", "low", "fallback.sku_key"
+
+    canonical_url = _s(
+        product.get("canonical_url")
+        or product.get("pivota_canonical_url")
+        or sku_ctx.get("canonical_url")
+        or sku_ctx.get("pivota_canonical_url")
+    )
+    anchors = {
+        "canonical_url": canonical_url or None,
+        "domain": normalize_host(canonical_url) if canonical_url else None,
+        "brand": brand or None,
+        "category": _s(product.get("category") or product.get("product_type")) or None,
+        "gtin": _s(sku.get("barcode") or sku.get("gtin")) or None,
+        "content_key": _s(product.get("content_key") or sku_ctx.get("content_key")) or None,
+        "product_group_id": sku_ctx.get("product_group_id") or None,
+    }
+    return {
+        "name": name,
+        "confidence": confidence,
+        "source": source,
+        "anchors": anchors,
+        "unresolved": confidence == "low",
+    }
+
+
 def _get_quality(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
     quality = sku_ctx.get("product_quality_snapshot") or sku_ctx.get("quality_snapshot")
     return quality if isinstance(quality, dict) else {}
@@ -3380,6 +3446,11 @@ async def build_per_sku_report(
         "product_key": sku_ctx.get("product_key") or product.get("product_key"),
         "content_key": sku_ctx.get("content_key") or product.get("content_key"),
         "sku_title": (_get_sku(sku_ctx).get("title") or product.get("title")),
+        # Bad-name-tolerant resolved identity + confidence. When
+        # identity.unresolved is True we only have a variant label / no
+        # product-level name — downstream should treat low scores as
+        # "enrich before trusting", not "invisible".
+        "identity": resolve_sku_identity(sku_ctx),
         "scores": scores,
         "citation_by_provider": (
             citation_by_provider
