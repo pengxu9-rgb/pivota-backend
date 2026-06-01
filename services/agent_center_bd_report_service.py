@@ -2151,14 +2151,16 @@ def _any_model_override(provider_models: Mapping[str, Any]) -> bool:
 
 
 def _source_urls(run: Dict[str, Any]) -> List[str]:
-    urls: List[str] = []
-    for source in run.get("grounding_sources") or []:
-        if isinstance(source, dict) and _nonempty(source.get("uri")):
-            urls.append(str(source.get("uri")))
-    for item in run.get("grounding_chunks") or []:
-        if isinstance(item, str) and item:
-            urls.append(item)
-    return urls
+    # Redirector-aware. Vertex AI grounding wraps every cited URL in a
+    # vertexaisearch.cloud.google.com/grounding-api-redirect/... URI and puts
+    # the REAL publisher domain in the source `title` ("ownist.com"). Matching
+    # first-party / authority against the raw redirector URI never sees the real
+    # domain — so first_party_rate scored 0 even when the merchant's own site
+    # was a grounding source. _identify_run_sources already resolves this
+    # (title for redirectors, host otherwise); reuse it so the merchant domain
+    # is matchable. Both callers (_url_in_sources, the scorer's source_hosts)
+    # want the real source domain, not the opaque redirector.
+    return [src["key"] for src in _identify_run_sources(run) if src.get("key")]
 
 
 def _url_in_sources(run: Dict[str, Any], targets: List[str]) -> bool:
@@ -3452,18 +3454,22 @@ def build_brand_rollup(
     )[:5]
     blocked = []
     for report in per_sku_reports:
+        # Use the authoritative per-SKU band (set by _sku_band = band of the
+        # lowest dimension) so blocked_skus can't disagree with the SKU's own
+        # band. The prior ad-hoc rule (identity/routability < 40 OR citation==0)
+        # ignored content_richness, so SKUs marked band="blocked" by a low
+        # content_richness were missing from blocked_skus entirely.
+        if report.get("band") != "blocked":
+            continue
         scores = report.get("scores") or {}
-        identity = (scores.get("identity") or {}).get("score")
-        routing = (scores.get("routability") or {}).get("score")
-        citation = (scores.get("citation") or {}).get("score")
-        if (identity is not None and identity < 40) or (routing is not None and routing < 40) or citation == 0:
-            blocked.append({
-                "sku_key": report.get("sku_key"),
-                "product_key": report.get("product_key"),
-                "identity": identity,
-                "routability": routing,
-                "citation": citation,
-            })
+        blocked.append({
+            "sku_key": report.get("sku_key"),
+            "product_key": report.get("product_key"),
+            "identity": (scores.get("identity") or {}).get("score"),
+            "routability": (scores.get("routability") or {}).get("score"),
+            "citation": (scores.get("citation") or {}).get("score"),
+            "content_richness": (scores.get("content_richness") or {}).get("score"),
+        })
 
     priority_queue: List[Dict[str, Any]] = []
     for report in per_sku_reports:

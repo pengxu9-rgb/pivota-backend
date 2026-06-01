@@ -534,7 +534,11 @@ def test_build_brand_rollup_priority_queue_ordering():
         {
             "sku_key": "sku-a",
             "product_key": "prod-a",
-            "band": "partial",
+            # citation=0 -> min dimension is 0 -> _sku_band == "blocked". (The
+            # pipeline always sets band via _sku_band(scores); a "partial" band
+            # with citation=0 isn't a state it produces.) blocked_skus is now
+            # derived from band, so this realistic band keeps sku-a blocked.
+            "band": "blocked",
             "impact_proxy": 10,
             "scores": {
                 "identity": {"score": 80},
