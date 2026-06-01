@@ -23,6 +23,7 @@ on:
       - "services/merchant_credit_balance_service.py"
       - "services/catalog_sync_service.py"
       - "services/audit_scheduler.py"
+      - "routes/merchant_store_connections.py"
       - "db/merchant_audit_runs.py"
       - "db/llm_probe_runs.py"
       - "tests/integration/test_audit_v3_end_to_end.py"
@@ -37,6 +38,7 @@ on:
       - "tests/services/test_audit_v3_identity_resolution.py"
       - "tests/services/test_audit_v3_identity_robust_citation.py"
       - "tests/services/test_audit_v3_onboarding_quality_autodrain.py"
+      - "tests/services/test_audit_v3_merchant_sync_ingests_catalog.py"
       - ".github/workflows/v3-audit-gate.yml"
 
 jobs:
@@ -79,4 +81,5 @@ jobs:
             tests/services/test_audit_v3_citation_strict_sku_mention.py \
             tests/services/test_audit_v3_identity_resolution.py \
             tests/services/test_audit_v3_identity_robust_citation.py \
-            tests/services/test_audit_v3_onboarding_quality_autodrain.py
+            tests/services/test_audit_v3_onboarding_quality_autodrain.py \
+            tests/services/test_audit_v3_merchant_sync_ingests_catalog.py

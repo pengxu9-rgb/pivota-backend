@@ -1322,6 +1322,7 @@ async def list_shopify_webhook_events(
 @router.post("/shopify/products/sync")
 async def merchant_sync_shopify_products(
     request: ShopifySyncRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -1448,12 +1449,39 @@ async def merchant_sync_shopify_products(
 
         # Update store product_count
         await database.execute(
-            """UPDATE merchant_stores 
+            """UPDATE merchant_stores
                SET product_count = :count, last_sync = CURRENT_TIMESTAMP
                WHERE store_id = :store_id""",
             {"count": synced_count, "store_id": store["store_id"]}
         )
-        
+
+        # Onboarding→audit readiness (WS-A.2): the sync above populated
+        # products_cache. Ingest it into the catalog so the merchant's OWN sync
+        # action produces an auditable catalog — run_catalog_sync_job then
+        # enqueues the quality backfill (WS-A.1), so the merchant becomes
+        # v3-audit-ready without any admin/webhook step. Run as a BACKGROUND task
+        # to keep this response fast; best-effort so it never breaks the sync.
+        catalog_ingest_queued = False
+        try:
+            from services.catalog_sync_service import (
+                create_catalog_sync_job,
+                run_catalog_sync_job,
+            )
+            cjob = await create_catalog_sync_job(
+                merchant_id=target_merchant_id,
+                connector="shopify",
+                mode="reconcile",
+                scope={"platform": "shopify"},
+                requested_by="merchant_products_sync",
+            )
+            background_tasks.add_task(run_catalog_sync_job, cjob["job_id"])
+            catalog_ingest_queued = True
+        except Exception as exc:  # noqa: BLE001 - readiness hook is best-effort
+            logger.warning(
+                "merchant sync: catalog ingest enqueue failed merchant=%s: %s",
+                target_merchant_id, exc,
+            )
+
         return {
             "status": "success",
             "message": f"Successfully synced {synced_count} products from {store['domain']}",
@@ -1461,7 +1489,8 @@ async def merchant_sync_shopify_products(
                 "product_count": synced_count,
                 "store_domain": store["domain"],
                 "pages_fetched": pages_fetched,
-                "synced_at": datetime.now().isoformat()
+                "synced_at": datetime.now().isoformat(),
+                "catalog_ingest_queued": catalog_ingest_queued
             }
         }
     except HTTPException:
