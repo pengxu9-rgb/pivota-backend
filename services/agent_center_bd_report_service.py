@@ -1529,8 +1529,9 @@ def resolve_sku_identity(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
         # Product-level catalog name (not the variant label). Usable but uncurated.
         name, confidence, source = _with_brand(product_title), "medium", "catalog.product_title"
     elif sku_title:
-        # Only a variant/format label is available — identity is unreliable.
-        name, confidence, source = sku_title, "low", "catalog.sku_title"
+        # Only a variant/format label is available — identity is unreliable, but
+        # still brand-prefix so the probe name is as useful as possible.
+        name, confidence, source = _with_brand(sku_title), "low", "catalog.sku_title"
     else:
         name, confidence, source = _s(sku_ctx.get("sku_key")) or "this product", "low", "fallback.sku_key"
 
@@ -2701,23 +2702,14 @@ def compute_citation_score(
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
         llm_report = url_match.get("llm_self_report") if isinstance(url_match.get("llm_self_report"), dict) else {}
-        if bool(url_match.get("in_grounding")) or _url_in_sources(run, [canonical_url, pivota_url]):
-            first_party_hits += 1
-
         text = _run_text(run)
-        # Affirmative structured signal that the provider actually surfaced the SKU.
-        affirmative_sku = (
-            parsed.get("sku_mentioned") is True
-            or parsed.get("correct_sku") is True
-            or llm_report.get("sku_mentioned") is True
-            or llm_report.get("correct_sku") is True
-        )
-        # Explicit negative verdict: the answer says this is NOT the right/visible
-        # product. A bare name-echo inside such an answer must not count as a SKU
-        # mention — providers echo the queried product name even when denying it
-        # ("'Garden Gift Set' does not contain 'Ownist Triple Collagen'"), which
-        # otherwise inflates exactly the lowest-visibility SKUs (e.g. 4/40
-        # product_visible scoring sku_mention 35/40).
+        # Visibility verdict, shared by ALL buckets. An EXPLICIT negative means
+        # the answer denies this is the right/visible product. Identity-robust
+        # rule: under poor merchant names, providers echo the queried name AND
+        # can ground on the merchant domain even while denying the product — so a
+        # negative verdict must not earn first_party / sku_mention / authority
+        # credit. (It inflated the lowest-visibility SKUs: e.g. Collagen Garden
+        # scored citation 28 on 3/40 visible, ~19 pts from ungated first_party.)
         product_visible = parsed.get("product_visible")
         if product_visible is None:
             product_visible = run.get("product_visible")
@@ -2728,21 +2720,45 @@ def compute_citation_score(
             or parsed.get("correct_sku") is False
             or llm_report.get("correct_sku") is False
         )
+
+        # first_party: merchant-domain grounding counts only when the answer is
+        # not denying the product (domain-grounding inside a "not the product"
+        # answer is not THIS SKU being cited).
+        grounded_first_party = (
+            bool(url_match.get("in_grounding"))
+            or _url_in_sources(run, [canonical_url, pivota_url])
+        )
+        if grounded_first_party and not negative_verdict:
+            first_party_hits += 1
+
+        # Affirmative structured signal that the provider actually surfaced the SKU.
+        affirmative_sku = (
+            parsed.get("sku_mentioned") is True
+            or parsed.get("correct_sku") is True
+            or llm_report.get("sku_mentioned") is True
+            or llm_report.get("correct_sku") is True
+        )
         text_mention = _text_mentions_any(text, [title, sku_title, variant_name])
         if affirmative_sku or (text_mention and not negative_verdict):
             sku_mentions += 1
 
         source_hosts = [normalize_host(url) for url in _source_urls(run)]
         external_source_present = any(host and not _is_first_party_host(host, sku_ctx or {}) for host in source_hosts)
-        if parsed.get("authority_near_variant_found") is True or llm_report.get("authority_near_variant_found") is True or (
-            external_source_present
-            and (
-                parsed.get("correct_sku") is True
-                or llm_report.get("correct_sku") is True
-                or parsed.get("product_visible") is True
-                or llm_report.get("product_visible") is True
-                or _text_mentions_any(text, [title, sku_title, product.get("content_key"), sku_ctx.get("product_group_id")])
+        # authority's text-mention branch carries the same negative-echo flaw as
+        # sku_mention did — gate it on a non-negative verdict. Affirmative
+        # structured signals (correct_sku / product_visible True) still count.
+        authority_affirmed = (
+            parsed.get("correct_sku") is True
+            or llm_report.get("correct_sku") is True
+            or parsed.get("product_visible") is True
+            or llm_report.get("product_visible") is True
+            or (
+                _text_mentions_any(text, [title, sku_title, product.get("content_key"), sku_ctx.get("product_group_id")])
+                and not negative_verdict
             )
+        )
+        if parsed.get("authority_near_variant_found") is True or llm_report.get("authority_near_variant_found") is True or (
+            external_source_present and authority_affirmed
         ):
             authority_hits += 1
 
@@ -3888,12 +3904,14 @@ def _build_per_sku_audit_query_specs(
         or sku_ctx.get("sku_key")
         or "this product"
     )
-    # Canonical shopper-facing identity = brand + product title, de-duplicated so
-    # we never emit "Ownist Ownist ...". This is what most prompts should name.
-    if brand and brand.lower() not in product_title.lower():
-        title = f"{brand} {product_title}"
-    else:
-        title = product_title
+    # Probe identity = the resolved SKU identity: enrichment title_override when
+    # present, else brand+product title (deduped) — never a bare variant label.
+    # Falls back to the local brand+product_title if resolution yields nothing.
+    title = resolve_sku_identity(sku_ctx or {}).get("name") or (
+        f"{brand} {product_title}"
+        if (brand and brand.lower() not in product_title.lower())
+        else product_title
+    )
     variant_label = (sku.get("title") or "").strip()
     product_type = (
         product.get("product_type")

@@ -23,6 +23,21 @@ def _queries(sku_ctx, n=40):
     return [q for q, _axis in _build_per_sku_audit_query_specs(sku_ctx, n)]
 
 
+def test_prompts_use_enrichment_title_override_when_present() -> None:
+    # Increment C: when the enrichment pipeline has curated a clean name, probes
+    # must use it over the (worse) catalog product/sku titles.
+    sku_ctx = {
+        "product": {"title": "TС-GRD-30", "brand": "Ownist", "product_type": "beauty supplement"},
+        "sku": {"title": "Garden Gift Set", "sku": "v9"},
+        "product_enrichment": {"title_override": "Ownist Triple Collagen Garden Edition"},
+    }
+    qs = _queries(sku_ctx)
+    assert any("Ownist Triple Collagen Garden Edition" in q for q in qs)
+    # The poor catalog title and the variant label are not the probe identity.
+    assert not any("TС-GRD-30" in q for q in qs)
+    assert "where can I buy Garden Gift Set" not in qs
+
+
 def test_prompts_name_brand_product_identity_not_variant_label() -> None:
     sku_ctx = {
         "product": {"title": "Triple Shine Grape", "brand": "Ownist",
