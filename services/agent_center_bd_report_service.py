@@ -3086,6 +3086,22 @@ def _matches_sku_run(run: Dict[str, Any], sku_key: str) -> bool:
 
 def _extract_probe_result_candidates(doc: Any, sku_key: str) -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
+    if isinstance(doc, str):
+        # JSONB columns (report_jsonb / partial_result_jsonb) arrive as JSON
+        # STRINGS under asyncpg — there is no global JSON codec (see
+        # db/database.py), so each read path must decode. load_per_sku_probe_runs
+        # reads these via _row_dict (plain dict(row), no decode), so without this
+        # the string fails the `isinstance(doc, dict)` guard below and every
+        # probe run is silently dropped → citation scores 0 with
+        # missing_inputs=["per_sku_audit.raw_runs"]. Mirrors _decode_jsonb_field
+        # in db/merchant_audit_runs.py (the #706 fix on the GET path).
+        stripped = doc.strip()
+        if not stripped:
+            return found
+        try:
+            doc = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return found
     if isinstance(doc, list):
         for item in doc:
             found.extend(_extract_probe_result_candidates(item, sku_key))
