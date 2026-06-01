@@ -1099,7 +1099,16 @@ async def _resolve_merchant_and_products(
             pivota_url_used.append(r["product_key"])
         products.append({
             "product_key": r["product_key"],
-            "sku_key": r["product_key"],
+            # Do NOT alias sku_key = product_key here. catalog_skus.sku_key is
+            # minted as `<product_key>::v::<variant_id>` (see
+            # services/catalog_variant_promoter.py), never the bare product_key.
+            # Pre-setting sku_key short-circuits _sku_keys_for_per_sku_mode()
+            # (it returns early when any sku_key is present, skipping the
+            # catalog_skus lookup), so load_sku_context() then queries
+            # `WHERE sku_key = <product_key>`, finds no row, and every per-SKU
+            # dimension comes back null with missing_inputs=["catalog_skus"].
+            # Leaving sku_key unset lets per-SKU expansion resolve the real
+            # variant sku_keys from catalog_skus.
             "title": r["title"],
             "vendor": r["brand"],
             "product_type": r["product_type"],
