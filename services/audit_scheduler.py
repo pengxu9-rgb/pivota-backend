@@ -436,6 +436,23 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # Onboarding→audit readiness: drain quality-backfill jobs enqueued at the
+        # end of catalog sync. The scorer is deterministic (no LLM), so a 30s
+        # interval is cheap; this populates product_quality_snapshot so a freshly
+        # synced merchant becomes v3-audit-ready without any manual step.
+        from services.product_quality_backfill_service import (
+            process_next_quality_backfill_job,
+        )
+        scheduler.add_job(
+            process_next_quality_backfill_job,
+            "interval",
+            seconds=30,
+            id="quality_backfill_drain_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(

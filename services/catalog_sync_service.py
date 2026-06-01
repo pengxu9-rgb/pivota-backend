@@ -1858,6 +1858,27 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
             source_ref=scope.get("source_ref") or job_id,
             job_id=job_id,
         )
+        # Onboarding→audit readiness: the catalog is now populated, so enqueue a
+        # quality backfill for this merchant. The scheduler's quality-drain tick
+        # processes it (deterministic, no LLM), populating
+        # product_quality_snapshot — without which a freshly-synced merchant's
+        # first v3 audit comes back blocked (content_richness 25 + the
+        # serving-eligibility gate depend on it). Best-effort: never fail the
+        # catalog sync on this hook.
+        try:
+            from db.product_quality_backfill_jobs import create_quality_backfill_job
+            await create_quality_backfill_job(
+                merchant_id=merchant_id,
+                platform=str(scope.get("platform") or connector or "shopify"),
+                requested_by="catalog_sync_autodrain",
+                force_refresh=False,
+                missing_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness hook is best-effort
+            logger.warning(
+                "catalog_sync: quality-backfill enqueue failed merchant=%s: %s",
+                merchant_id, exc,
+            )
         updated = await get_catalog_sync_job(job_id)
         if updated:
             return updated
