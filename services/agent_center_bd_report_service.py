@@ -45,7 +45,18 @@ from services.pivota_indexing_arc import compute_indexing_arc_state
 _ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
 _ANSWER_QUALITY_VERIFY_PROVIDER = "deepseek"
 _PER_SKU_AUDIT_PROBE_SCAN_MODE = "open_product_visibility_test"
-_PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 8
+# PIVOTA-Agent caps one probe request at 8 runs. We deliberately chunk smaller
+# than that cap: each chunk is one grounded LLM call, and an 8-grounded-query
+# call runs right at the agent_center_llm_probe_timeout_s (30s) edge — so fat
+# chunks were the dominant source of per-SKU ReadTimeouts. Smaller chunks make
+# each call faster (well under the timeout) and make a single timeout cost less.
+_PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 4
+# A single transient chunk failure (e.g. a Gemini ReadTimeout) must NOT zero a
+# SKU — we continue to the next chunk so later chunks still produce evidence.
+# But bail this (sku, provider) after this many CONSECUTIVE failures so a
+# genuinely down/slow provider doesn't grind through every remaining chunk at
+# the full per-call timeout (which is what stalled prior runs).
+_PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES = 2
 logger = logging.getLogger(__name__)
 _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
     "Verified citation-positive prompts keep their deterministic "
@@ -4062,6 +4073,7 @@ async def run_per_sku_audit_probe_fanout(
         out[sku_key] = []
         for provider_id in profile_providers:
             model_info = provider_model_metadata.get(provider_id) or {}
+            consecutive_failures = 0
             for chunk_idx, chunk in enumerate(_chunk_query_specs(query_specs), start=1):
                 probe_run_id = (
                     f"{audit_run_id or 'adhoc'}:{sku_key}:"
@@ -4092,6 +4104,7 @@ async def run_per_sku_audit_probe_fanout(
                             model_info=model_info,
                         )
                     )
+                    consecutive_failures = 0
                 except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
                     out[sku_key].append(
                         _failed_per_sku_probe_payload(
@@ -4103,7 +4116,13 @@ async def run_per_sku_audit_probe_fanout(
                             model_info=model_info,
                         )
                     )
-                    break
+                    consecutive_failures += 1
+                    # Don't let one transient chunk timeout zero the SKU: keep
+                    # probing later chunks. Only bail this (sku, provider) once
+                    # failures are CONSECUTIVE (provider likely down), so we
+                    # don't burn the full timeout on every remaining chunk.
+                    if consecutive_failures >= _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES:
+                        break
     return out
 
 
