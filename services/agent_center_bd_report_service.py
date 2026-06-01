@@ -2639,13 +2639,31 @@ def compute_citation_score(
             first_party_hits += 1
 
         text = _run_text(run)
-        if (
+        # Affirmative structured signal that the provider actually surfaced the SKU.
+        affirmative_sku = (
             parsed.get("sku_mentioned") is True
             or parsed.get("correct_sku") is True
             or llm_report.get("sku_mentioned") is True
             or llm_report.get("correct_sku") is True
-            or _text_mentions_any(text, [title, sku_title, variant_name])
-        ):
+        )
+        # Explicit negative verdict: the answer says this is NOT the right/visible
+        # product. A bare name-echo inside such an answer must not count as a SKU
+        # mention — providers echo the queried product name even when denying it
+        # ("'Garden Gift Set' does not contain 'Ownist Triple Collagen'"), which
+        # otherwise inflates exactly the lowest-visibility SKUs (e.g. 4/40
+        # product_visible scoring sku_mention 35/40).
+        product_visible = parsed.get("product_visible")
+        if product_visible is None:
+            product_visible = run.get("product_visible")
+        if product_visible is None:
+            product_visible = llm_report.get("product_visible")
+        negative_verdict = (
+            product_visible is False
+            or parsed.get("correct_sku") is False
+            or llm_report.get("correct_sku") is False
+        )
+        text_mention = _text_mentions_any(text, [title, sku_title, variant_name])
+        if affirmative_sku or (text_mention and not negative_verdict):
             sku_mentions += 1
 
         source_hosts = [normalize_host(url) for url in _source_urls(run)]
