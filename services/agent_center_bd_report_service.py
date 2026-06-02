@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+import asyncio
 import json
 import logging
 import math
@@ -4505,6 +4506,7 @@ async def run_brand_report(
     model_overrides: Optional[Mapping[str, Any]] = None,
     prompts_per_sku: Optional[int] = None,
     max_runs: int = 3,
+    product_concurrency: int = 1,
     include_category_visibility: bool = True,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     integration_state: Optional[Dict[str, Any]] = None,
@@ -4641,16 +4643,23 @@ async def run_brand_report(
 
     per_product: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
-    for idx, p in enumerate(products):
+
+    # Audit one product → ("ok", structured) | ("fail", failure). Extracted so
+    # products can run either sequentially (default — the synced per-SKU audit
+    # is unchanged) or with bounded concurrency (the wedge sets
+    # product_concurrency to keep its ≤5-SKU free audit under the client
+    # timeout). Each call only reads merchant-level immutable inputs and
+    # returns its own result — no shared state — so concurrency is safe; the
+    # caller's semaphore bounds LLM fan-out per the PR #278 safety rule.
+    async def _audit_one_product(p):
         pdp_url = (p.get("pdp_url") or "").strip()
         title = (p.get("title") or "").strip()
         if not pdp_url or not title:
-            failed.append({
+            return ("fail", {
                 "pdp_url": pdp_url,
                 "title": title,
                 "error": "pdp_url and title are required for each product",
             })
-            continue
         try:
             probes_by_provider: Dict[str, Dict[str, Dict[str, Any]]] = {}
             provider_failures: Dict[str, Dict[str, Any]] = {}
@@ -4745,13 +4754,30 @@ async def run_brand_report(
             structured["citation_by_provider"] = citation_by_provider
             if provider_failures:
                 structured["provider_failures"] = provider_failures
-            per_product.append(structured)
+            return ("ok", structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
-            failed.append({
+            return ("fail", {
                 "pdp_url": pdp_url,
                 "title": title,
                 "error": str(exc),
             })
+
+    # Sequential by default (synced audit, behavior-equivalent to the prior
+    # loop); bounded-concurrent when the caller opts in. Order preserved.
+    if product_concurrency and product_concurrency > 1:
+        _sem = asyncio.Semaphore(
+            min(int(product_concurrency), _BRAND_REPORT_MAX_PRODUCTS)
+        )
+
+        async def _bounded(p):
+            async with _sem:
+                return await _audit_one_product(p)
+
+        _results = await asyncio.gather(*[_bounded(p) for p in products])
+    else:
+        _results = [await _audit_one_product(p) for p in products]
+    for _status, _payload in _results:
+        (per_product if _status == "ok" else failed).append(_payload)
 
     aggregate = _aggregate_brand_scores(per_product)
     aggregate["products_count"] = len(products)

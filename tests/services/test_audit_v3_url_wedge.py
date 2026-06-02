@@ -141,6 +141,9 @@ def test_curated_happy_path(client):
     call = client.brand_calls[0]
     assert [p["pdp_url"] for p in call["products"]] == _BODY["product_urls"]
     assert call["products"][0]["title"] == "Product A"
+    # Wedge opts into bounded concurrency so its <=5-SKU audit beats the
+    # client timeout: min(len(products)=2, 3) == 2.
+    assert call["product_concurrency"] == 2
     # Recorded with the wedge marker + the provided URLs as product_keys.
     assert client.started[0]["subject_type"] == "merchant_url"
     assert client.started[0]["product_keys"] == _BODY["product_urls"]
