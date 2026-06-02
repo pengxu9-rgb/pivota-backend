@@ -95,6 +95,7 @@ async def run_bd_probes(
     model: Optional[str] = None,
     model_is_override: bool = False,
     include_category_visibility: bool = True,
+    parallel_scan_modes: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Run the BD-relevant scan modes against the merchant's product.
 
@@ -148,18 +149,30 @@ async def run_bd_probes(
             model_is_override=model_is_override,
         )
 
-    visibility = await _one("open_product_visibility_test")
-    attribution = await _one("merchant_store_attribution_test")
-    out: Dict[str, Dict[str, Any]] = {
-        "visibility": visibility,
-        "attribution": attribution,
-    }
-    # Skip category if product_type is missing — buildCategoryQueries
-    # upstream returns [] in that case and the probe falls back to
-    # product_entity_id which makes the category test meaningless.
+    # The scan modes are independent. Sequential by default; the wedge opts
+    # into parallel_scan_modes so its free audit's ~3 grounded HTTP calls per
+    # product overlap instead of serializing — the dominant per-product cost.
+    # Total in-flight stays bounded by the caller's product_concurrency (#280).
+    # Skip category if product_type is missing — buildCategoryQueries upstream
+    # returns [] there and the probe falls back to product_entity_id, making
+    # the category test meaningless.
     can_run_category = bool(base_context["product"].get("product_type"))
+    scan_modes = [
+        "open_product_visibility_test", "merchant_store_attribution_test",
+    ]
     if include_category_visibility and can_run_category:
-        out["category_visibility"] = await _one("category_visibility_test")
+        scan_modes.append("category_visibility_test")
+    if parallel_scan_modes:
+        results = await asyncio.gather(*[_one(m) for m in scan_modes])
+        by_mode = dict(zip(scan_modes, results))
+    else:
+        by_mode = {mode: await _one(mode) for mode in scan_modes}
+    out: Dict[str, Dict[str, Any]] = {
+        "visibility": by_mode["open_product_visibility_test"],
+        "attribution": by_mode["merchant_store_attribution_test"],
+    }
+    if "category_visibility_test" in by_mode:
+        out["category_visibility"] = by_mode["category_visibility_test"]
     return out
 
 
@@ -4507,6 +4520,7 @@ async def run_brand_report(
     prompts_per_sku: Optional[int] = None,
     max_runs: int = 3,
     product_concurrency: int = 1,
+    parallel_scan_modes: bool = False,
     include_category_visibility: bool = True,
     prior_runs: Optional[List[Dict[str, Any]]] = None,
     integration_state: Optional[Dict[str, Any]] = None,
@@ -4677,6 +4691,7 @@ async def run_brand_report(
                         model=model_info.get("model"),
                         model_is_override=bool(model_info.get("model_is_override")),
                         include_category_visibility=include_category_visibility,
+                        parallel_scan_modes=parallel_scan_modes,
                     )
                 except Exception as exc:  # noqa: BLE001 - isolate providers
                     provider_failures[provider_id] = {

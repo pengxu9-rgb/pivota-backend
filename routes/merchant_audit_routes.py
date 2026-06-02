@@ -1141,10 +1141,13 @@ async def run_merchant_url_audit(
                 provider="gemini",
                 merchant_id=merchant_id,
                 audit_run_id=run_id,
-                # Audit the merchant's ≤5 products with bounded concurrency so
-                # the free wedge stays under the client timeout (the products
-                # are independent; 3 keeps grounded-LLM fan-out modest).
+                # Keep the free wedge under the client timeout: audit the
+                # merchant's ≤5 products with bounded concurrency AND run each
+                # product's 3 grounded scan modes in parallel (the dominant
+                # per-product cost). 3 products × 3 modes bounds in-flight
+                # grounded-LLM fan-out modestly (#280).
                 product_concurrency=min(len(audit_products), 3),
+                parallel_scan_modes=True,
             )
     except ValueError as exc:
         await record_audit_run_completed(
