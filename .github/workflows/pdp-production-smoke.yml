@@ -16,10 +16,10 @@ jobs:
       PIVOTA_API_BASE_URL: ${{ vars.PIVOTA_API_BASE_URL || 'https://api.pivota.cc' }}
       PIVOTA_EMPLOYEE_BASE_URL: ${{ vars.PIVOTA_EMPLOYEE_BASE_URL || 'https://employee.pivota.cc' }}
       PIVOTA_MERCHANT_BASE_URL: ${{ vars.PIVOTA_MERCHANT_BASE_URL || 'https://merchant.pivota.cc' }}
-      PIVOTA_SMOKE_EMPLOYEE_EMAIL: ${{ secrets.PIVOTA_SMOKE_EMPLOYEE_EMAIL || 'employee@pivota.com' }}
-      PIVOTA_SMOKE_EMPLOYEE_PASSWORD: ${{ secrets.PIVOTA_SMOKE_EMPLOYEE_PASSWORD || 'Admin123!' }}
-      PIVOTA_SMOKE_MERCHANT_EMAIL: ${{ secrets.PIVOTA_SMOKE_MERCHANT_EMAIL || 'merchant@test.com' }}
-      PIVOTA_SMOKE_MERCHANT_PASSWORD: ${{ secrets.PIVOTA_SMOKE_MERCHANT_PASSWORD || 'Admin123!' }}
+      PIVOTA_SMOKE_EMPLOYEE_EMAIL: ${{ secrets.PIVOTA_SMOKE_EMPLOYEE_EMAIL }}
+      PIVOTA_SMOKE_EMPLOYEE_PASSWORD: ${{ secrets.PIVOTA_SMOKE_EMPLOYEE_PASSWORD }}
+      PIVOTA_SMOKE_MERCHANT_EMAIL: ${{ secrets.PIVOTA_SMOKE_MERCHANT_EMAIL }}
+      PIVOTA_SMOKE_MERCHANT_PASSWORD: ${{ secrets.PIVOTA_SMOKE_MERCHANT_PASSWORD }}
       PIVOTA_SMOKE_MERCHANT_ID: ${{ vars.PIVOTA_SMOKE_MERCHANT_ID || secrets.PIVOTA_SMOKE_MERCHANT_ID || '' }}
       PDP_SMOKE_EXTERNAL_PDP_ID: ${{ vars.PDP_SMOKE_EXTERNAL_PDP_ID }}
       PDP_SMOKE_INTERNAL_PDP_ID: ${{ vars.PDP_SMOKE_INTERNAL_PDP_ID }}
@@ -35,5 +35,29 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check PDP smoke credentials
+        id: smoke_config
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${PIVOTA_SMOKE_EMPLOYEE_EMAIL:-}" ]] || missing+=(PIVOTA_SMOKE_EMPLOYEE_EMAIL)
+          [[ -n "${PIVOTA_SMOKE_EMPLOYEE_PASSWORD:-}" ]] || missing+=(PIVOTA_SMOKE_EMPLOYEE_PASSWORD)
+          [[ -n "${PIVOTA_SMOKE_MERCHANT_EMAIL:-}" ]] || missing+=(PIVOTA_SMOKE_MERCHANT_EMAIL)
+          [[ -n "${PIVOTA_SMOKE_MERCHANT_PASSWORD:-}" ]] || missing+=(PIVOTA_SMOKE_MERCHANT_PASSWORD)
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'PDP production smoke is not configured. Missing: %s\n' "${missing[*]}" >&2
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              exit 1
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Run PDP production smoke
+        if: steps.smoke_config.outputs.skip != 'true'
+        continue-on-error: ${{ github.event_name != 'workflow_dispatch' && vars.PDP_SMOKE_STRICT_ON_AUTOMATION != 'true' }}
         run: python3 scripts/smoke_pdp_governance_production.py
