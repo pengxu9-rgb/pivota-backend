@@ -246,6 +246,15 @@ def client(stub, monkeypatch):
     monkeypatch.setattr(
         audit_runs_routes, "_resolve_preview_sku_keys", stub.resolve_preview,
     )
+
+    # T2b readiness gate is exercised in test_audit_v3_readiness_gate.py; here it
+    # is a no-op so these endpoint tests don't need the readiness DB stubs.
+    async def _no_readiness_gate(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(
+        audit_runs_routes, "_enforce_audit_readiness", _no_readiness_gate,
+    )
     audit_runs_routes._PREVIEW_CACHE.clear()
 
     app = FastAPI()

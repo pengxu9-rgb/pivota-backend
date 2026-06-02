@@ -53,6 +53,7 @@ from db.merchant_audit_runs import (
 )
 from routes.merchant_audit_routes import _check_audit_rate_limit
 from services.idempotency import compute_audit_idempotency_key
+from services.merchant_audit_readiness import assess_merchant_audit_readiness
 from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
     MissingVerifiedPaymentMethodError,
@@ -341,6 +342,69 @@ async def _resolve_refs_to_product_keys(
             seen.add(key)
             out.append(key)
     return out
+
+
+async def _audit_readiness_platform(
+    merchant_id: str, product_keys: Optional[List[str]] = None,
+) -> str:
+    """Platform to assess audit-readiness against: the dominant platform of the
+    audited products (or the merchant's catalog when no keys are given).
+    Defaults to 'shopify' when the catalog is empty.
+    """
+    from db.catalog import catalog_products
+    from sqlalchemy.sql import func as _func, select as _select
+
+    query = _select(
+        catalog_products.c.platform,
+        _func.count().label("n"),
+    ).where(catalog_products.c.merchant_id == merchant_id)
+    keys = _normalize_nonempty(product_keys or [])
+    if keys:
+        query = query.where(catalog_products.c.product_key.in_(keys))
+    query = query.group_by(catalog_products.c.platform).order_by(
+        _func.count().desc()
+    )
+    rows = await database.fetch_all(query)
+    for row in rows or []:
+        platform = str(dict(row).get("platform") or "").strip()
+        if platform:
+            return platform
+    return "shopify"
+
+
+async def _enforce_audit_readiness(
+    *, merchant_id: str, product_keys: List[str], force: bool,
+) -> None:
+    """Raise 409 when the merchant's audit data isn't ready.
+
+    A fresh merchant can launch before the async content-quality backfill
+    finishes, which makes every SKU score `band=blocked` — a false "you're
+    invisible" first impression. This blocks the run with a clear "still
+    preparing, retry shortly" response instead. `force=true` bypasses (BD /
+    test / fixture re-audits and callers that accept a partial run). No-op when
+    ready. Read-only COUNT probe.
+    """
+    if force:
+        return
+    platform = await _audit_readiness_platform(merchant_id, product_keys)
+    readiness = await assess_merchant_audit_readiness(merchant_id, platform)
+    if readiness.get("ready"):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "merchant_not_audit_ready",
+            "message": (
+                "Your catalog is still being prepared for audit (content "
+                "quality backfill in progress). This usually completes within "
+                "1–2 minutes of a product sync — please try again shortly."
+            ),
+            "blocking_gaps": readiness.get("blocking_gaps") or [],
+            "counts": readiness.get("counts") or {},
+            "platform": platform,
+            "retry_after_seconds": 60,
+        },
+    )
 
 
 # =====================================================================
@@ -822,6 +886,15 @@ async def create_audit_run(
             },
         )
 
+    # Readiness gate: block a fresh merchant from launching before the async
+    # quality backfill finishes (which would yield a false all-blocked audit
+    # that reads as "Pivota doesn't work for me"). force=true bypasses.
+    await _enforce_audit_readiness(
+        merchant_id=auth_merchant_id,
+        product_keys=body.product_keys,
+        force=body.force,
+    )
+
     # Idempotency dedupe (unless force=true).
     debit_idempotency_key: Optional[str]
     if not body.force:
@@ -1112,6 +1185,23 @@ async def create_audit_run(
         run_id=run_id, stage=STAGE_QUEUED,
         idempotent_replay=was_existing,
     )
+
+
+@router.get("/readiness")
+async def get_audit_readiness(
+    auth_merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Pre-launch readiness for the authenticated merchant's v3 audit.
+
+    The portal calls this before/at launch to show "ready" vs "still syncing"
+    instead of running an audit that would come back all-blocked. Mirrors the
+    gate POST /api/audits enforces (unless force=true). Read-only.
+
+    Declared BEFORE GET /{run_id} so "readiness" is matched as a static path,
+    not captured as a run_id.
+    """
+    platform = await _audit_readiness_platform(auth_merchant_id)
+    return await assess_merchant_audit_readiness(auth_merchant_id, platform)
 
 
 @router.get("/{run_id}")
