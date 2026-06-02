@@ -38,7 +38,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from config.settings import settings
 from db.database import database
@@ -102,8 +102,11 @@ class CreateAuditRequest(BaseModel):
         ),
     )
     product_keys: List[str] = Field(
-        ..., min_length=1, max_length=50,
-        description="1–50 product_key values from catalog_products.",
+        default_factory=list, max_length=50,
+        description=(
+            "1–50 product_key values from catalog_products. Optional when "
+            "`sku_keys` is supplied — the two are alternatives."
+        ),
     )
     subject_type: str = Field(
         "merchant",
@@ -150,6 +153,23 @@ class CreateAuditRequest(BaseModel):
             "{\"chatgpt\": \"gpt-5.5-mini\"}. Absent uses profile defaults."
         ),
     )
+    sku_keys: Optional[List[str]] = Field(
+        default=None,
+        max_length=50,
+        description=(
+            "Alternative to product_keys: `platform:source_product_id` "
+            "composites (what the merchant AI-Readiness portal selects). "
+            "Resolved to product_keys server-side, scoped to the merchant."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_products_or_skus(self) -> "CreateAuditRequest":
+        if not self.product_keys and not self.sku_keys:
+            raise ValueError(
+                "provide product_keys or sku_keys (1–50 products to audit)"
+            )
+        return self
 
 
 class AuditPreviewScope(BaseModel):
@@ -233,6 +253,94 @@ async def _missing_product_keys_for_merchant(
     )
     found = {str(r[0]) for r in rows}
     return [k for k in product_keys if k not in found]
+
+
+async def _resolve_refs_to_product_keys(
+    *, merchant_id: str, refs: List[str],
+) -> List[str]:
+    """Resolve audit product references to catalog `product_key`s for a merchant.
+
+    The merchant AI-Readiness portal selects products and sends
+    `platform:source_product_id` composites (single ':'), documenting that the
+    backend resolves them server-side. A ref containing '::' (a minted
+    `<product_key>::v::<variant_id>` sku_key) or no ':' is treated as an
+    already-resolved `product_key` and validated for ownership. Raises 404
+    listing any ref that does not resolve to a product the merchant owns —
+    mirroring the (platform, source_product_id) ownership check the legacy
+    /ai-commerce-readiness route performs.
+    """
+    cleaned = _normalize_nonempty(refs)
+    if not cleaned:
+        return []
+    from db.catalog import catalog_products
+    from sqlalchemy.sql import select as _select
+
+    def _is_composite(ref: str) -> bool:
+        return ":" in ref and "::" not in ref
+
+    composite_refs = [r for r in cleaned if _is_composite(r)]
+    bare_refs = [r for r in cleaned if not _is_composite(r)]
+
+    resolved: List[str] = []
+    missing: List[str] = []
+
+    if composite_refs:
+        pairs = [
+            tuple(part.strip() for part in r.split(":", 1)) for r in composite_refs
+        ]
+        rows = await database.fetch_all(
+            _select(
+                catalog_products.c.product_key,
+                catalog_products.c.platform,
+                catalog_products.c.source_product_id,
+            ).where(
+                catalog_products.c.merchant_id == merchant_id,
+                catalog_products.c.platform.in_([p for p, _ in pairs]),
+                catalog_products.c.source_product_id.in_([s for _, s in pairs]),
+            )
+        )
+        pair_to_key = {
+            (
+                str(dict(row).get("platform") or ""),
+                str(dict(row).get("source_product_id") or ""),
+            ): str(dict(row).get("product_key") or "")
+            for row in rows or []
+        }
+        for ref, pair in zip(composite_refs, pairs):
+            key = pair_to_key.get(pair)
+            if key:
+                resolved.append(key)
+            else:
+                missing.append(ref)
+
+    if bare_refs:
+        not_owned = set(
+            await _missing_product_keys_for_merchant(
+                merchant_id=merchant_id, product_keys=bare_refs,
+            )
+        )
+        for ref in bare_refs:
+            (missing if ref in not_owned else resolved).append(ref)
+
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": (
+                    f"{len(missing)} product reference(s) not found for "
+                    "this merchant."
+                ),
+                "missing_refs": sorted(missing),
+            },
+        )
+
+    seen: set = set()
+    out: List[str] = []
+    for key in resolved:
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
 
 
 # =====================================================================
@@ -478,28 +586,13 @@ async def _resolve_preview_sku_keys(
             ),
         )
     if requested:
-        rows = await database.fetch_all(
-            """
-            SELECT sku_key
-              FROM catalog_skus
-             WHERE merchant_id = :merchant_id
-               AND sku_key = ANY(:sku_keys)
-            """,
-            {"merchant_id": merchant_id, "sku_keys": requested},
+        # The portal sends `platform:source_product_id` composites; resolve to
+        # product_keys (same resolver the run endpoint uses) so the preview cost
+        # and the launched run agree on the product set. Returns product_keys;
+        # the preview only uses the count + cache key, so granularity matches.
+        return await _resolve_refs_to_product_keys(
+            merchant_id=merchant_id, refs=requested,
         )
-        found = {str(dict(row).get("sku_key") or "") for row in rows or []}
-        missing = [key for key in requested if key not in found]
-        if missing:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "message": (
-                        f"{len(missing)} SKU(s) not found for this merchant."
-                    ),
-                    "missing_sku_keys": missing,
-                },
-            )
-        return requested
 
     rows = await database.fetch_all(
         """
@@ -690,6 +783,16 @@ async def create_audit_run(
                 "merchant — cross-tenant audit submission is not "
                 "permitted."
             ),
+        )
+
+    # Portal-ref resolution: the merchant AI-Readiness page selects products
+    # and sends `platform:source_product_id` composites as `sku_keys` (it
+    # documents that the backend resolves them). Resolve to product_keys here
+    # so the rest of the path stays product_key-native. Direct product_keys
+    # callers (BD/tests) are unaffected.
+    if not body.product_keys and body.sku_keys:
+        body.product_keys = await _resolve_refs_to_product_keys(
+            merchant_id=auth_merchant_id, refs=body.sku_keys,
         )
 
     # P1-2: validate that every product_key is owned by the
