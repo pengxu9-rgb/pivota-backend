@@ -26,6 +26,7 @@ on:
       - "routes/merchant_store_connections.py"
       - "services/merchant_audit_readiness.py"
       - "db/merchant_audit_runs.py"
+      - "routes/merchant_audit_routes.py"
       - "db/llm_probe_runs.py"
       - "tests/integration/test_audit_v3_end_to_end.py"
       - "tests/services/test_agent_center_bd_per_sku.py"
@@ -42,6 +43,7 @@ on:
       - "tests/services/test_audit_v3_merchant_sync_ingests_catalog.py"
       - "tests/services/test_audit_v3_full_data_band.py"
       - "tests/services/test_audit_v3_readiness_probe.py"
+      - "tests/services/test_audit_v3_url_wedge.py"
       - ".github/workflows/v3-audit-gate.yml"
 
 jobs:
@@ -87,4 +89,5 @@ jobs:
             tests/services/test_audit_v3_onboarding_quality_autodrain.py \
             tests/services/test_audit_v3_merchant_sync_ingests_catalog.py \
             tests/services/test_audit_v3_full_data_band.py \
-            tests/services/test_audit_v3_readiness_probe.py
+            tests/services/test_audit_v3_readiness_probe.py \
+            tests/services/test_audit_v3_url_wedge.py
