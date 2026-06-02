@@ -789,6 +789,11 @@ def _build_competitive_pressure(
                 f"sources during this probe."
             )
         )
+        framing += (
+            " This is real and immediate competitive pressure — every "
+            "retailer-routed query is a customer a peer won and you "
+            "didn't see."
+        )
     else:
         # Name THIS audit's actual cited hosts when available. NOTE
         # these are "non-merchant hosts cited in grounded sources" —
@@ -817,6 +822,10 @@ def _build_competitive_pressure(
             f"in this category, none had their own .com cited in the "
             f"grounding for these queries. "
             f"{cited_phrase[0].upper() + cited_phrase[1:]}."
+        )
+        framing += (
+            " No peer owns this category in the AI channel yet — it's a "
+            "first-mover opportunity to be the brand AI agents cite."
         )
 
     return {
@@ -1094,9 +1103,9 @@ def _explain_verdict(
         return (
             "There is a gap between this brand's category-level visibility "
             "score and its buyer-intent attribution score. Buyer-intent "
-            "queries grounded their answers in third-party sources rather "
-            "than the merchant's own URL; we did not verify whether those "
-            "sources mention the brand."
+            "queries grounded their answers in third-party retailers and "
+            "editorial sources rather than the merchant's own URL; we did "
+            "not verify whether those sources mention the brand."
         )
 
     if label == VERDICT_STRONG:
@@ -1218,9 +1227,15 @@ def verdict_for(
         and category_visibility_score > 0
         and attribution_score == 0
     ):
+        # A strong category score is itself evidence the brand surfaces via
+        # third parties (Gemini/Vertex grounding often uses redirector hosts
+        # with the real retailer in the source TITLE — e.g. "Sephora: <brand>"
+        # — so the host alone under-counts retailers). Treat strong category
+        # visibility as VIA_RETAILERS; reserve CATEGORY_MENTION for the weaker
+        # "mentioned but not clearly via retailers" case.
         label = (
             VERDICT_VIA_RETAILERS
-            if typed_retail_hosts
+            if (typed_retail_hosts or category_visibility_score >= strong_min)
             else VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY
         )
     else:
@@ -1232,12 +1247,13 @@ def verdict_for(
             strong_min,
             misattr_attr_max,
         )
-        if (
-            has_typed_cited_hosts
-            and label == VERDICT_VIA_RETAILERS
-            and not typed_retail_hosts
-        ):
-            label = VERDICT_PARTIAL
+        # NOTE: the attribution==0 typed-hosts case is handled in the `if`
+        # branch above (retail-vs-editorial → VIA_RETAILERS vs
+        # CATEGORY_MENTION_NO_FIRST_PARTY). Reaching here means attribution>0,
+        # so a VIA_RETAILERS verdict came from the category-visibility gap —
+        # legitimate evidence the brand surfaces via third parties even when
+        # this run's cited hosts aren't classified as retailers. Do NOT
+        # downgrade the gap-driven verdict to PARTIAL on host classification.
     explanation = _explain_verdict(
         label, visibility_score, attribution_score, evidence_dict
     )
@@ -6573,8 +6589,12 @@ def _build_what_pivota_changes(
                 "pivota_status": (
                     "**Indexing-up phase.** Pivota canonical PDPs are in "
                     "the typical 30-90 day post-publication arc working "
-                    "through Search Console URL Inspection. The mechanics "
-                    "below are shipped; Google indexing latency is the "
+                    "through Search Console URL Inspection. In Pivota's own "
+                    f"baseline ({TEST_MERCHANT_REFERENCE['discovery_baseline_path']}), "
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['cited_count']} of "
+                    f"{PIVOTA_PDP_BASELINE_REFERENCE['succeeded_count']} probed "
+                    "canonical PDPs were cited in grounded answers so far. The "
+                    "mechanics below are shipped; Google indexing latency is the "
                     "rate-limiting step before grounded-citation lift."
                 ),
                 "merchant_metric": "attribution_score",
@@ -6649,7 +6669,7 @@ def _build_what_pivota_changes(
                         "shipped": True,
                     },
                     {
-                        "label": "Agent shop gateway — unified agent operation surface (search → cart → checkout)",
+                        "label": "Agent shop gateway (agent_shop_gateway) — unified agent operation surface (search → cart → checkout)",
                         "evidence": "Live API endpoint",
                         "shipped": True,
                     },
@@ -6675,16 +6695,17 @@ def _build_what_pivota_changes(
             "new agent plugs into without bilateral integration work."
         ),
         "methodology_note": (
-            "This audit's attribution score measures Layer 1 only "
+            "This audit's `attribution_score` measures Layer 1 only "
             "(grounded LLM citation via Gemini). The "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_visibility']}/"
             f"{PIVOTA_PDP_BASELINE_REFERENCE['median_attribution']} "
-            "Pivota baseline (open-product visibility + merchant-store "
-            "attribution probes) is comparable only to the attribution "
-            "score. Layer 2's agent-direct surface has no per-merchant "
-            "probe — it's binary by API integration: onboarded "
-            "merchants are agent-queryable, non-onboarded are not. "
-            "Pivota's own canonical PDPs are currently in the "
+            "Pivota baseline (probe modes "
+            f"{', '.join(PIVOTA_PDP_BASELINE_REFERENCE['probe_modes_in_baseline'])}) "
+            "is comparable only to the attribution_score. Layer 2's "
+            "agent-direct surface has no per-merchant probe — it's binary "
+            "by API integration: onboarded merchants are agent-queryable, "
+            "non-onboarded are not. Pivota's own canonical PDPs are "
+            "currently in the "
             f"{PIVOTA_PDP_BASELINE_REFERENCE['indexing_phase'].replace('_', '-')} "
             "phase for Layer 1; Layer 2 is shipped today."
         ),
