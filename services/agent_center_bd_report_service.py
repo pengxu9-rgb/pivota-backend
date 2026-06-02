@@ -2629,6 +2629,9 @@ async def _run_deepseek_verify_pass(
     summary = {
         "status": "completed" if not errors else "partial",
         "provider": _ANSWER_QUALITY_VERIFY_PROVIDER,
+        # Record the resolved verify model so a completed run is reproducible
+        # (which DeepSeek SKU produced the answer-quality de-weighting).
+        "model": (app_settings.deepseek_model or "").strip() or None,
         "role": "verify",
         "verified": len(valid_outputs),
         "flagged": len(flagged_outputs),
