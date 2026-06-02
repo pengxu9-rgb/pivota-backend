@@ -102,6 +102,9 @@ def client(monkeypatch):
     monkeypatch.setattr(mar, "run_brand_report", fake_brand_report)
     monkeypatch.setattr(bdcs, "fetch_curated_audit_product", fake_fetch)
     monkeypatch.setattr(atc, "audit_telemetry", fake_telemetry)
+    # Pin a finite cap so the cap-dependent assertions below are stable
+    # regardless of the env-driven default (lifted for pre-launch testing).
+    monkeypatch.setattr(mar, "_FREE_URL_AUDITS_PER_MERCHANT", 2)
 
     app = FastAPI()
     app.include_router(mar.router)
@@ -177,6 +180,20 @@ def test_free_cap_blocks_at_limit(client):
     # Blocked before any fetch/LLM/record work.
     assert client.started == []
     assert client.brand_calls == []
+
+
+def test_cap_lifted_when_disabled(client, monkeypatch):
+    # cap <= 0 disables the limit entirely (the pre-launch testing default):
+    # audits run no matter how many were used, and the allowance fields go null.
+    monkeypatch.setattr(mar, "_FREE_URL_AUDITS_PER_MERCHANT", 0)
+    client.state["used"] = 99
+    res = client.post(_URL, json=_BODY)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["free_audits_allowed"] is None
+    assert body["free_audits_remaining"] is None
+    assert body["free_audits_used"] == 100  # used+1, still counted for telemetry
+    assert client.brand_calls  # the audit actually ran
 
 
 def test_partial_resolution_audits_what_resolved(client, monkeypatch):
