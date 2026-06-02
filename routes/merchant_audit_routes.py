@@ -908,8 +908,17 @@ async def run_merchant_self_audit(
     }
 
 
-# Free URL-audit wedge (Tier 1): low-friction, no catalog sync required.
-_FREE_URL_AUDITS_PER_MERCHANT = 2
+# Free URL-audit wedge (Tier 1) per-merchant allowance — the cost guard on the
+# free tier. Env-overridable so it can be tuned (or lifted) without a deploy; a
+# value <= 0 LIFTS the cap entirely (unlimited).
+#
+# TESTING (2026-06-03): defaulted to 0 (unlimited) while the founder validates
+# the wedge pre-launch. RESTORE before onboarding real merchants — set env
+# FREE_URL_AUDITS_PER_MERCHANT=2, or revert this default to 2 — otherwise every
+# merchant gets unlimited free audits (Gemini cost + no upsell pressure).
+_FREE_URL_AUDITS_PER_MERCHANT = int(
+    _os.getenv("FREE_URL_AUDITS_PER_MERCHANT", "0")
+)
 
 
 class MerchantUrlAuditRequest(BaseModel):
@@ -1054,7 +1063,7 @@ async def run_merchant_url_audit(
     used = await count_runs_for_merchant_by_subject(
         merchant_id=merchant_id, subject_type="merchant_url",
     )
-    if used >= _FREE_URL_AUDITS_PER_MERCHANT:
+    if _FREE_URL_AUDITS_PER_MERCHANT > 0 and used >= _FREE_URL_AUDITS_PER_MERCHANT:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail={
@@ -1215,10 +1224,14 @@ async def run_merchant_url_audit(
             ],
             "unresolved_urls": unresolved,
         },
-        "free_audits_allowed": _FREE_URL_AUDITS_PER_MERCHANT,
+        "free_audits_allowed": (
+            _FREE_URL_AUDITS_PER_MERCHANT
+            if _FREE_URL_AUDITS_PER_MERCHANT > 0 else None
+        ),
         "free_audits_used": used + 1,
-        "free_audits_remaining": max(
-            0, _FREE_URL_AUDITS_PER_MERCHANT - (used + 1)
+        "free_audits_remaining": (
+            max(0, _FREE_URL_AUDITS_PER_MERCHANT - (used + 1))
+            if _FREE_URL_AUDITS_PER_MERCHANT > 0 else None
         ),
     }
 
