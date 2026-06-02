@@ -77,6 +77,36 @@ async def test_concurrency_isolates_failures(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_parallel_scan_modes_overlaps_probes(monkeypatch):
+    inflight = {"now": 0, "max": 0}
+
+    async def _fake_probe(**kwargs):
+        inflight["now"] += 1
+        inflight["max"] = max(inflight["max"], inflight["now"])
+        await asyncio.sleep(0.02)
+        inflight["now"] -= 1
+        return {
+            "scan_mode": kwargs.get("scan_mode"), "provider": "gemini",
+            "scores": {"visibility_score": 50}, "raw_runs": [], "findings": [],
+            "usage": {},
+        }
+
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+    kw = dict(
+        merchant_name="X", merchant_pdp_url="https://x.com/p/1",
+        product_title="P", product_type="thing", provider="gemini",
+    )
+
+    inflight["max"] = 0
+    await bd.run_bd_probes(**kw, parallel_scan_modes=False)
+    assert inflight["max"] == 1  # default: one scan mode at a time
+
+    inflight["max"] = 0
+    await bd.run_bd_probes(**kw, parallel_scan_modes=True)
+    assert inflight["max"] == 3  # vis + attribution + category overlap
+
+
+@pytest.mark.asyncio
 async def test_concurrency_knob_raises_parallelism(monkeypatch):
     inflight = {"now": 0, "max": 0}
 
