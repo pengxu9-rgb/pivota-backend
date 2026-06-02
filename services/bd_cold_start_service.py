@@ -30,6 +30,7 @@ Honesty rules:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -93,6 +94,165 @@ async def _fetch_shopify_native(pdp_url: str) -> Optional[Dict[str, Any]]:
         return None
     product = payload.get("product")
     return product if isinstance(product, dict) else None
+
+
+# Generic (non-Shopify) PDP fetch: read clean product data straight from the
+# page's structured markup — schema.org JSON-LD Product first (most reliable),
+# OpenGraph title as a fallback. Used by the merchant-CURATED audit path, where
+# the merchant hands us the exact product URL, so we fetch precisely it.
+_PDP_FETCH_TIMEOUT_S = 8.0
+_JSON_LD_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+_OG_META_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\']og:title["\'][^>]*?'
+    r'content=["\'](.*?)["\']',
+    re.IGNORECASE | re.DOTALL,
+)
+_OG_META_REV_RE = re.compile(  # content-before-property attribute ordering
+    r'<meta[^>]+content=["\'](.*?)["\'][^>]*?'
+    r'(?:property|name)=["\']og:title["\']',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _walk_jsonld_for_product(node: Any) -> Optional[Dict[str, Any]]:
+    """Depth-first search a parsed JSON-LD value for the first object whose
+    @type is (or includes) 'Product'. Handles bare objects, arrays, and the
+    common @graph wrapper. Returns the Product node or None."""
+    if isinstance(node, list):
+        for item in node:
+            found = _walk_jsonld_for_product(item)
+            if found:
+                return found
+        return None
+    if not isinstance(node, dict):
+        return None
+    raw_type = node.get("@type")
+    types = raw_type if isinstance(raw_type, list) else [raw_type]
+    if any(str(t).strip().lower() == "product" for t in types if t):
+        return node
+    graph = node.get("@graph")
+    if graph is not None:
+        return _walk_jsonld_for_product(graph)
+    return None
+
+
+async def _fetch_pdp_metadata(pdp_url: str) -> Optional[Dict[str, Any]]:
+    """Fetch a generic (non-Shopify) PDP's HTML and extract clean product data
+    from schema.org JSON-LD (`Product`) with an OpenGraph title fallback.
+    Returns {title, vendor, product_type} or None. Best-effort — the caller
+    treats None as 'could not resolve a product at this URL'."""
+    if not pdp_url:
+        return None
+    try:
+        async with httpx.AsyncClient(
+            timeout=_PDP_FETCH_TIMEOUT_S, follow_redirects=True,
+        ) as client:
+            r = await client.get(
+                pdp_url,
+                headers={
+                    "User-Agent": "Pivota-BD-Audit/1.0",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        logger.debug("pdp metadata fetch error for %s: %s", pdp_url, exc)
+        return None
+    if r.status_code != 200:
+        return None
+    html = r.text or ""
+
+    title: Optional[str] = None
+    vendor: Optional[str] = None
+    product_type: Optional[str] = None
+
+    # 1. JSON-LD Product — the structured, authoritative source.
+    for block in _JSON_LD_RE.findall(html):
+        try:
+            data = json.loads(block.strip())
+        except (ValueError, TypeError):
+            continue
+        product = _walk_jsonld_for_product(data)
+        if not product:
+            continue
+        title = (str(product.get("name") or "")).strip() or None
+        brand = product.get("brand")
+        if isinstance(brand, dict):
+            vendor = (str(brand.get("name") or "")).strip() or None
+        elif isinstance(brand, str):
+            vendor = brand.strip() or None
+        category = product.get("category")
+        if isinstance(category, str):
+            product_type = category.strip() or None
+        if title:
+            break
+
+    # 2. OpenGraph title fallback (handles either attribute ordering).
+    if not title:
+        m = _OG_META_RE.search(html) or _OG_META_REV_RE.search(html)
+        if m:
+            title = (m.group(1) or "").strip() or None
+
+    if not title:
+        return None
+    return {"title": title, "vendor": vendor, "product_type": product_type}
+
+
+async def fetch_curated_audit_product(
+    pdp_url: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Fetch ONE merchant-provided product URL into a clean audit-product dict
+    `{title, pdp_url, vendor, product_type}`.
+
+    The merchant-CURATED audit path: the merchant chose this exact URL, so we
+    fetch precisely it — no discovery, no crawl, no selection heuristics (the
+    #1 source of bad audits). Shopify native `.json` first (richest: vendor +
+    product_type + variants), then a generic JSON-LD/OpenGraph PDP read.
+
+    Returns `(product, None)` on success, or `(None, reason)` when the URL
+    can't be resolved to a real product so the caller can tell the merchant
+    which link to fix.
+    """
+    url = (pdp_url or "").strip()
+    if not url:
+        return None, "empty URL"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return None, (
+            f"{pdp_url!r} is not a valid URL "
+            "(it must start with http:// or https://)"
+        )
+
+    # 1. Shopify native .json — clean, structured, no auth, ~200-500ms.
+    native = await _fetch_shopify_native(url)
+    if native:
+        title = (str(native.get("title") or "")).strip()
+        if title:
+            return {
+                "title": title,
+                "pdp_url": url,
+                "vendor": (str(native.get("vendor") or "")).strip() or None,
+                "product_type": (
+                    (str(native.get("product_type") or "")).strip() or None
+                ),
+            }, None
+
+    # 2. Generic PDP: schema.org JSON-LD Product + OpenGraph fallback.
+    meta = await _fetch_pdp_metadata(url)
+    if meta and meta.get("title"):
+        return {
+            "title": meta["title"],
+            "pdp_url": url,
+            "vendor": meta.get("vendor"),
+            "product_type": meta.get("product_type"),
+        }, None
+
+    return None, (
+        f"couldn't read a product from {url} — make sure the link opens a "
+        "single product page (we read Shopify product JSON or the page's "
+        "structured product data)"
+    )
 
 
 async def _enrich_audit_products(
