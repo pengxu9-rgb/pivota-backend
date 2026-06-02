@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
@@ -911,19 +913,124 @@ _FREE_URL_AUDITS_PER_MERCHANT = 2
 
 
 class MerchantUrlAuditRequest(BaseModel):
-    """POST /url-readiness body. Audits the merchant's storefront by crawling
-    it — no catalog sync. `url` defaults to the merchant's onboarding store_url."""
+    """POST /url-readiness body — merchant-CURATED Tier-1 wedge.
 
-    url: Optional[str] = Field(
+    The merchant gives us their brand site + the specific product URLs they
+    want audited (their own hero SKUs). We FETCH each URL for clean, real data
+    (Shopify `.json` / PDP JSON-LD + OpenGraph) and audit exactly those — we do
+    NOT auto-discover or guess which products to audit (auto-discovery was the
+    #1 source of bad audits). The merchant knows their catalog; nobody guesses.
+    """
+
+    product_urls: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=5,
+        description=(
+            "1–5 product page URLs the merchant wants audited (their hero "
+            "SKUs). We fetch each for clean title / vendor / type data."
+        ),
+    )
+    website: Optional[str] = Field(
         default=None,
         max_length=2000,
         description=(
-            "Storefront URL to audit. Defaults to the merchant's onboarding "
-            "store_url when omitted."
+            "Brand storefront URL, for brand-level context. Defaults to the "
+            "merchant's onboarding store_url when omitted."
         ),
     )
-    max_products: int = Field(default=3, ge=1, le=5)
-    market: str = Field(default="US", min_length=2, max_length=10)
+    brand: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Brand name. Derived from the site domain / fetched product "
+            "vendors when omitted."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wedge honesty post-processing (Phase A). The legacy brand-report engine adds
+# a canned `industry_context` template and buries a self-undermining "we did
+# not verify whether those sources mention your brand" hedge inside each
+# verdict. For the free wedge we DON'T touch the engine — we post-process the
+# assembled report so it ships honest, sample-scoped prose, and we state the
+# real verification limitation ONCE, upfront, in a `methodology` disclosure
+# (built by the handler) instead of as a caveat that undercuts every line.
+# Engine-level verdict/credibility fixes are Phases B–C.
+# ---------------------------------------------------------------------------
+
+# Matches the buried "we did not verify whether those sources mention <brand>"
+# hedge with whatever connector precedes it (period / em-dash / semicolon).
+_HEDGE_CONNECTED_RE = re.compile(
+    r"\s*[—;.]\s*[Ww]e did not verify whether those sources mention "
+    r"(?:your brand or products|your brand|the brand)\.?",
+)
+# Same clause as a standalone capitalized sentence (no leading connector).
+_HEDGE_STANDALONE_RE = re.compile(
+    r"\s*[Ww]e did not verify whether those sources mention "
+    r"(?:your brand or products|your brand|the brand)\.?",
+)
+
+
+def _strip_unverified_hedge(text: str) -> str:
+    """Remove the buried 'we did not verify whether those sources mention…'
+    hedge from a verdict explanation, leaving clean sample-scoped prose. The
+    same limitation is stated upfront in the report's `methodology` block."""
+    if not text or "did not verify" not in text:
+        return text
+    s = _HEDGE_CONNECTED_RE.sub(".", text)
+    s = _HEDGE_STANDALONE_RE.sub("", s)
+    # Inline variant: "...grounded their answers in third-party sources we did
+    # not verify." → end the sentence cleanly.
+    s = s.replace("third-party sources we did not verify.", "third-party sources.")
+    s = s.replace(" we did not verify.", ".")
+    # Normalize whitespace + collapse any doubled period left by the excision.
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\.\s*\.", ".", s)
+    s = re.sub(r"\s+\.", ".", s)
+    return s
+
+
+def _scrub_wedge_report_in_place(node: Any) -> None:
+    """Recursively drop canned `industry_context` and strip the unverified
+    hedge from every string in the assembled wedge report."""
+    if isinstance(node, dict):
+        node.pop("industry_context", None)
+        for k, v in list(node.items()):
+            if isinstance(v, str) and "did not verify" in v:
+                node[k] = _strip_unverified_hedge(v)
+            else:
+                _scrub_wedge_report_in_place(v)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if isinstance(v, str) and "did not verify" in v:
+                node[i] = _strip_unverified_hedge(v)
+            else:
+                _scrub_wedge_report_in_place(v)
+
+
+def _domain_from_url(url: Optional[str]) -> Optional[str]:
+    """Best-effort registrable host (sans www) from a URL or bare domain."""
+    if not url:
+        return None
+    candidate = url if "://" in url else f"https://{url}"
+    try:
+        netloc = (urlparse(candidate).netloc or "").lower()
+    except ValueError:
+        return None
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc or None
+
+
+def _brand_name_from_domain(domain: Optional[str]) -> Optional[str]:
+    """'bblab.shop' → 'Bblab'. Last-resort brand label when nothing else is
+    available; the merchant can override via `brand`."""
+    if not domain:
+        return None
+    label = domain.split(".")[0].replace("-", " ").strip()
+    return label.title() or None
 
 
 @router.post("/url-readiness")
@@ -931,21 +1038,19 @@ async def run_merchant_url_audit(
     body: MerchantUrlAuditRequest,
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
-    """Free URL-audit wedge (Tier 1): audit the merchant's storefront by
-    crawling it (Shopify `.json` + sitemap fallback) — NO catalog sync. The
-    low-friction top of the funnel; the synced per-SKU audit (POST /api/audits)
-    is the deeper tier that unlocks serving/checkout.
+    """Free URL-audit wedge (Tier 1), merchant-CURATED: the merchant gives us
+    their brand site + up to 5 product URLs (their own hero SKUs); we FETCH
+    each for clean, real data and audit exactly those — NO catalog sync, NO
+    auto-discovery. The low-friction top of the funnel; integrating (sync)
+    unlocks the full per-SKU audit + serving/checkout (Tier 2).
 
     Free allowance: the first N URL audits per merchant run without a credit
-    debit; beyond that returns 402 so the merchant connects/upgrades. The cap is
-    checked before any crawl/LLM work, bounding the free tier's Gemini cost.
+    debit; beyond that returns 402 so the merchant connects/upgrades. The cap
+    is checked before any fetch/LLM work, bounding the free tier's Gemini cost.
     """
-    from services.bd_cold_start_service import (
-        BrandDiscoveryError,
-        discover_products_for_audit,
-    )
+    from services.bd_cold_start_service import fetch_curated_audit_product
 
-    # 1. Free-allowance cap (cost control) — before any crawl or LLM call.
+    # 1. Free-allowance cap (cost control) — before any fetch or LLM call.
     used = await count_runs_for_merchant_by_subject(
         merchant_id=merchant_id, subject_type="merchant_url",
     )
@@ -964,59 +1069,66 @@ async def run_merchant_url_audit(
             },
         )
 
-    # 2. Resolve the URL: explicit override, else the merchant's store_url.
-    onboarding = await get_merchant_onboarding(merchant_id) or {}
-    url = (body.url or onboarding.get("store_url") or "").strip()
-    if not url:
+    # 2. Fetch each merchant-provided product URL into a clean audit product.
+    #    We audit exactly what the merchant chose — no discovery, no guessing.
+    fetched = await asyncio.gather(
+        *[fetch_curated_audit_product(u) for u in body.product_urls]
+    )
+    audit_products: List[Dict[str, Any]] = []
+    unresolved: List[Dict[str, str]] = []
+    for raw_url, (product, reason) in zip(body.product_urls, fetched):
+        if product:
+            audit_products.append(product)
+        else:
+            unresolved.append(
+                {"url": raw_url, "reason": reason or "could not resolve"}
+            )
+    if not audit_products:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
-                "code": "no_store_url",
+                "code": "no_products_resolved",
                 "message": (
-                    "No storefront URL to audit — pass `url`, or set your store "
-                    "URL during onboarding."
+                    "We couldn't read a product from any of the URLs you "
+                    "provided. Make sure each link opens a single product page."
                 ),
+                "unresolved": unresolved,
             },
         )
 
-    # 3. Discover products from the live storefront (no catalog sync).
-    try:
-        discovered = await discover_products_for_audit(
-            url, max_products=body.max_products, market=body.market,
-            persist=False,
+    # 3. Resolve brand context: explicit brand/website, else onboarding, else
+    #    derive from the fetched product vendors / the site domain.
+    onboarding = await get_merchant_onboarding(merchant_id) or {}
+    website = (body.website or onboarding.get("store_url") or "").strip() or None
+    merchant_domain = _domain_from_url(website)
+    if not merchant_domain and audit_products:
+        merchant_domain = _domain_from_url(audit_products[0]["pdp_url"])
+    merchant_name = (
+        (body.brand or "").strip()
+        or (onboarding.get("business_name") or "").strip()
+        or next(
+            (p["vendor"] for p in audit_products if p.get("vendor")), None
         )
-    except BrandDiscoveryError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "discovery_failed", "message": str(exc)},
-        )
-    if not discovered.get("products"):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "code": "discovery_failed",
-                "message": "No auditable products found at that URL.",
-            },
-        )
+        or _brand_name_from_domain(merchant_domain)
+        or "your brand"
+    )
 
     # 4. Record the run; subject_type marks it for the free-allowance count.
-    product_refs = [
-        p.get("pdp_url") for p in discovered["products"] if p.get("pdp_url")
-    ]
     run_id = await record_audit_run_started(
-        merchant_id=merchant_id, product_keys=product_refs,
+        merchant_id=merchant_id,
+        product_keys=[p["pdp_url"] for p in audit_products],
         subject_type="merchant_url",
     )
 
-    # 5. Run the brand report on the discovered products, scoped to this
+    # 5. Run the brand report on the merchant-curated products, scoped to this
     #    merchant. Telemetry-wrapped so probe rows carry attribution.
     from services.audit_telemetry_context import audit_telemetry
     try:
         async with audit_telemetry(run_id=run_id, merchant_id=merchant_id):
             brand_report = await run_brand_report(
-                merchant_name=discovered["merchant_name"],
-                merchant_domain=discovered.get("merchant_domain"),
-                products=discovered["products"],
+                merchant_name=merchant_name,
+                merchant_domain=merchant_domain,
+                products=audit_products,
                 provider="gemini",
                 merchant_id=merchant_id,
                 audit_run_id=run_id,
@@ -1049,7 +1161,12 @@ async def run_merchant_url_audit(
             ),
         )
 
-    # 7. Persist completion + return.
+    # 7. Honesty post-processing (Phase A): strip the canned industry_context
+    #    and the buried "we did not verify…" hedge; state the real
+    #    verification limitation once, upfront, in `methodology` below.
+    _scrub_wedge_report_in_place(brand_report)
+
+    # 8. Persist completion + return.
     agg = brand_report.get("aggregate") or {}
     verdict_labels = [
         (p.get("verdict") or {}).get("label") or ""
@@ -1066,15 +1183,33 @@ async def run_merchant_url_audit(
     return {
         "brand_report": brand_report,
         "audit_run_id": run_id,
-        "audited_url": url,
+        "audited_url": website,
         "tier": "url_wedge",
-        "discovery": {
-            "method": discovered.get("discovery_method"),
-            "products_audited": len(discovered["products"]),
-            "products_discovered_total": discovered.get(
-                "products_discovered_total"
+        "audited_products": [
+            {"title": p["title"], "pdp_url": p["pdp_url"]}
+            for p in audit_products
+        ],
+        "methodology": {
+            "model": "merchant_curated",
+            "products_audited": len(audit_products),
+            "products_requested": len(body.product_urls),
+            "queries_per_product": 3,
+            "what_we_checked": (
+                "For each product URL you gave us, we ran AI shopping-agent "
+                "(Gemini grounded search) buyer-intent queries and checked "
+                "whether your own URL was cited in the answer."
             ),
-            "coverage": discovered.get("coverage"),
+            "limitations": [
+                "This is a small free sample (a few queries per product), "
+                "not an exhaustive measurement.",
+                "We have not yet verified whether the third-party sources "
+                "Gemini cited actually mention your brand — so a low score "
+                "here means 'not found in this sample', not a definitive "
+                "'invisible'.",
+                "Connect your store for a deeper, verified, full-catalog "
+                "audit with availability and serving data.",
+            ],
+            "unresolved_urls": unresolved,
         },
         "free_audits_allowed": _FREE_URL_AUDITS_PER_MERCHANT,
         "free_audits_used": used + 1,
