@@ -7,7 +7,8 @@
     "max_per_sku": null
   },
   "provider_default_models": {
-    "chatgpt": "chat-latest"
+    "chatgpt": "chat-latest",
+    "gemini": "gemini-2.5-flash"
   },
   "profiles": {
     "us_shopper": {

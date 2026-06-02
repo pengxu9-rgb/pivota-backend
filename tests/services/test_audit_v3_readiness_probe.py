@@ -59,6 +59,49 @@ async def test_enrichment_missing_is_enhancement_not_blocking(monkeypatch) -> No
     assert any("product_enrichment" in g for g in r["enhancement_gaps"])
 
 
+async def test_enrichment_rows_without_content_elements_flagged(monkeypatch) -> None:
+    # product_enrichment has rows, but they carry only a title_override (no content
+    # elements). Row-count alone would say "enrichment present"; the element-aware
+    # probe must still flag the gap (else it greenlights a title-only merchant).
+    async def _fake_count(table, merchant_id, *, platform=None, where_extra=None):
+        if table == "product_enrichment":
+            if where_extra and "summary_short" in where_extra:
+                return 0  # no row carries any content element
+            return 4      # 4 enrichment rows exist (title_override-only)
+        return {
+            "catalog_products": 4, "products_cache": 4,
+            "product_quality_snapshot": 4,
+        }.get(table, 0)
+    monkeypatch.setattr(mar, "_table_count", _fake_count)
+
+    r = await mar.assess_merchant_audit_readiness("m1")
+    # Enrichment is an enhancement, not a blocking dep — still audit-ready.
+    assert r["ready"] is True
+    assert r["counts"]["product_enrichment"] == 4
+    assert r["counts"]["product_enrichment_with_content"] == 0
+    gap = next((g for g in r["enhancement_gaps"] if "product_enrichment" in g), None)
+    assert gap is not None
+    # The title-only message, NOT the "empty" one.
+    assert "no content elements" in gap
+    assert "4 row(s)" in gap
+
+
+async def test_enrichment_with_content_raises_no_gap(monkeypatch) -> None:
+    # Rows that DO carry content elements -> no enrichment enhancement gap.
+    async def _fake_count(table, merchant_id, *, platform=None, where_extra=None):
+        if table == "product_enrichment":
+            return 4  # both total and with-content return 4
+        return {
+            "catalog_products": 4, "products_cache": 4,
+            "product_quality_snapshot": 4,
+        }.get(table, 0)
+    monkeypatch.setattr(mar, "_table_count", _fake_count)
+
+    r = await mar.assess_merchant_audit_readiness("m1")
+    assert r["ready"] is True
+    assert not any("product_enrichment" in g for g in r["enhancement_gaps"])
+
+
 async def test_count_refuses_non_whitelisted_table() -> None:
     import pytest
     with pytest.raises(ValueError):

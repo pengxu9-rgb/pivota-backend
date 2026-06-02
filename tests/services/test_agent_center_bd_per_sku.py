@@ -437,6 +437,14 @@ async def test_run_brand_report_per_sku_runs_bounded_deepseek_verify(monkeypatch
     assert sku_report["verify_summary"]["sample_cap"] == 1
     assert sku_report["verify_outputs"][0]["provider"] == "deepseek"
     assert sku_report["verify_outputs"][0]["role"] == "verify"
+    # provider_models records the citation/scoring model (gemini) — not {} — so a
+    # run is reproducible; the completed verify_summary records the verify model.
+    assert sku_report["provider_models"]["gemini"] == {
+        "model": "gemini-2.5-flash",
+        "default_model": "gemini-2.5-flash",
+        "model_is_override": False,
+    }
+    assert sku_report["verify_summary"]["model"] == settings_module.settings.deepseek_model
     assert set(sku_report["citation_by_provider"]) == {"gemini"}
     citation = sku_report["scores"]["citation"]
     assert citation["breakdown"]["first_party_rate"]["points"] == 45

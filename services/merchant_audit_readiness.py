@@ -11,7 +11,10 @@ Maps directly to the onboarding→audit gap analysis:
 - product_quality_snapshot.content_quality_score → content_richness 25 +
   serving-eligibility gate 30 (BLOCKING)
 - product_enrichment → content_richness enrichment_coverage 20 + identity
-  title_override (enhancement)
+  title_override (enhancement). Checked element-aware: a row may carry only a
+  title_override (lifts identity) yet none of the content elements
+  (summary_short/bullet_points/usage_scenarios/audience_tags) enrichment_coverage
+  scores — so row-count alone over-credits enrichment.
 - products_cache → the live-store source the quality backfill scores from
   (informational; empty means no live store synced yet)
 """
@@ -74,6 +77,17 @@ async def assess_merchant_audit_readiness(
             where_extra="content_quality_score IS NOT NULL",
         ),
         "product_enrichment": await _table_count("product_enrichment", merchant_id, platform=platform),
+        # Element-aware: rows can exist with only a title_override (used by identity)
+        # yet carry none of the content elements content_richness.enrichment_coverage
+        # actually scores. Count rows that have at least one content element so the
+        # probe does not give false "enrichment present" comfort for title-only rows.
+        "product_enrichment_with_content": await _table_count(
+            "product_enrichment", merchant_id, platform=platform,
+            where_extra=(
+                "(summary_short IS NOT NULL OR bullet_points IS NOT NULL "
+                "OR usage_scenarios IS NOT NULL OR audience_tags IS NOT NULL)"
+            ),
+        ),
     }
 
     blocking_gaps = []
@@ -90,11 +104,19 @@ async def assess_merchant_audit_readiness(
         )
 
     enhancement_gaps = []
-    if counts["product_enrichment"] == 0:
-        enhancement_gaps.append(
-            "product_enrichment empty — enrichment pipeline hasn't run "
-            "(title_override + coverage, ~20 content-richness pts; not blocking)."
-        )
+    if counts["product_enrichment_with_content"] == 0:
+        if counts["product_enrichment"] == 0:
+            enhancement_gaps.append(
+                "product_enrichment empty — enrichment pipeline hasn't run "
+                "(title_override + content elements, ~20 content-richness pts; not blocking)."
+            )
+        else:
+            enhancement_gaps.append(
+                f"product_enrichment has {counts['product_enrichment']} row(s) but no content "
+                "elements (summary_short/bullet_points/usage_scenarios/audience_tags) — likely "
+                "title_override-only; content_richness enrichment_coverage will score 0/20 "
+                "until the enrichment pipeline populates content (not blocking)."
+            )
     if counts["products_cache"] == 0:
         enhancement_gaps.append(
             "products_cache empty — no live store products synced; quality backfill "
