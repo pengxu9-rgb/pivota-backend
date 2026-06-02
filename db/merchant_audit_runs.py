@@ -270,11 +270,15 @@ async def record_audit_run_started(
     *,
     merchant_id: str,
     product_keys: List[str],
+    subject_type: str = "merchant",
 ) -> Optional[str]:
     """Insert a row with `status='running'`. Returns the new run_id
     (a UUID string) or None on persistence failure. Audit continues
     either way — the run_id is also used to UPDATE the row at the
     completion step, so a None return short-circuits that update too.
+
+    `subject_type` marks the run kind (e.g. "merchant_url" for the free
+    URL-audit wedge) so callers can count a specific kind of run.
     """
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
@@ -285,6 +289,7 @@ async def record_audit_run_started(
                 merchant_id=merchant_id,
                 requested_at=_now_utc(),
                 status="running",
+                subject_type=subject_type,
                 product_keys=list(product_keys or []),
             )
         )
@@ -388,6 +393,42 @@ async def count_runs_in_window(
         logger.warning(
             "count_runs_in_window failed for merchant_id=%s: %s",
             merchant_id, str(exc)[:200],
+        )
+        return 0
+
+
+async def count_runs_for_merchant_by_subject(
+    *,
+    merchant_id: str,
+    subject_type: str,
+) -> int:
+    """Count this merchant's audit runs of a given `subject_type` (any
+    status). Used by the free URL-audit wedge to enforce its per-merchant
+    free allowance (subject_type="merchant_url"). Returns 0 on DB error —
+    matches count_runs_in_window's availability-over-strictness trade-off
+    (the cost ceiling also depends on these rows being persisted at all).
+    """
+    await ensure_merchant_audit_runs_table()
+    try:
+        from sqlalchemy.sql import func, select
+        row = await database.fetch_one(
+            select(func.count())
+            .select_from(merchant_audit_runs)
+            .where(
+                merchant_audit_runs.c.merchant_id == merchant_id,
+                merchant_audit_runs.c.subject_type == subject_type,
+            )
+        )
+        if row is None:
+            return 0
+        for v in (row.values() if hasattr(row, "values") else [row[0]]):
+            return int(v or 0)
+        return 0
+    except Exception as exc:
+        logger.warning(
+            "count_runs_for_merchant_by_subject failed for merchant_id=%s "
+            "subject_type=%s: %s",
+            merchant_id, subject_type, str(exc)[:200],
         )
         return 0
 

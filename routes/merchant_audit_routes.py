@@ -53,6 +53,7 @@ from db.apm_config import (
 )
 from db.database import database
 from db.merchant_audit_runs import (
+    count_runs_for_merchant_by_subject,
     count_runs_in_window,
     record_audit_run_completed,
     record_audit_run_started,
@@ -902,6 +903,184 @@ async def run_merchant_self_audit(
         # Phase C-4 PR-C: run_id of the persisted audit row, lets
         # callers fetch this audit's history entry later.
         "audit_run_id": run_id,
+    }
+
+
+# Free URL-audit wedge (Tier 1): low-friction, no catalog sync required.
+_FREE_URL_AUDITS_PER_MERCHANT = 2
+
+
+class MerchantUrlAuditRequest(BaseModel):
+    """POST /url-readiness body. Audits the merchant's storefront by crawling
+    it — no catalog sync. `url` defaults to the merchant's onboarding store_url."""
+
+    url: Optional[str] = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "Storefront URL to audit. Defaults to the merchant's onboarding "
+            "store_url when omitted."
+        ),
+    )
+    max_products: int = Field(default=3, ge=1, le=5)
+    market: str = Field(default="US", min_length=2, max_length=10)
+
+
+@router.post("/url-readiness")
+async def run_merchant_url_audit(
+    body: MerchantUrlAuditRequest,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Free URL-audit wedge (Tier 1): audit the merchant's storefront by
+    crawling it (Shopify `.json` + sitemap fallback) — NO catalog sync. The
+    low-friction top of the funnel; the synced per-SKU audit (POST /api/audits)
+    is the deeper tier that unlocks serving/checkout.
+
+    Free allowance: the first N URL audits per merchant run without a credit
+    debit; beyond that returns 402 so the merchant connects/upgrades. The cap is
+    checked before any crawl/LLM work, bounding the free tier's Gemini cost.
+    """
+    from services.bd_cold_start_service import (
+        BrandDiscoveryError,
+        discover_products_for_audit,
+    )
+
+    # 1. Free-allowance cap (cost control) — before any crawl or LLM call.
+    used = await count_runs_for_merchant_by_subject(
+        merchant_id=merchant_id, subject_type="merchant_url",
+    )
+    if used >= _FREE_URL_AUDITS_PER_MERCHANT:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": "free_audit_limit_reached",
+                "message": (
+                    f"You've used your {_FREE_URL_AUDITS_PER_MERCHANT} free URL "
+                    "audits. Connect your store for the full per-SKU audit, or "
+                    "upgrade to keep auditing by URL."
+                ),
+                "free_audits_allowed": _FREE_URL_AUDITS_PER_MERCHANT,
+                "free_audits_used": used,
+            },
+        )
+
+    # 2. Resolve the URL: explicit override, else the merchant's store_url.
+    onboarding = await get_merchant_onboarding(merchant_id) or {}
+    url = (body.url or onboarding.get("store_url") or "").strip()
+    if not url:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "no_store_url",
+                "message": (
+                    "No storefront URL to audit — pass `url`, or set your store "
+                    "URL during onboarding."
+                ),
+            },
+        )
+
+    # 3. Discover products from the live storefront (no catalog sync).
+    try:
+        discovered = await discover_products_for_audit(
+            url, max_products=body.max_products, market=body.market,
+            persist=False,
+        )
+    except BrandDiscoveryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "discovery_failed", "message": str(exc)},
+        )
+    if not discovered.get("products"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "discovery_failed",
+                "message": "No auditable products found at that URL.",
+            },
+        )
+
+    # 4. Record the run; subject_type marks it for the free-allowance count.
+    product_refs = [
+        p.get("pdp_url") for p in discovered["products"] if p.get("pdp_url")
+    ]
+    run_id = await record_audit_run_started(
+        merchant_id=merchant_id, product_keys=product_refs,
+        subject_type="merchant_url",
+    )
+
+    # 5. Run the brand report on the discovered products, scoped to this
+    #    merchant. Telemetry-wrapped so probe rows carry attribution.
+    from services.audit_telemetry_context import audit_telemetry
+    try:
+        async with audit_telemetry(run_id=run_id, merchant_id=merchant_id):
+            brand_report = await run_brand_report(
+                merchant_name=discovered["merchant_name"],
+                merchant_domain=discovered.get("merchant_domain"),
+                products=discovered["products"],
+                provider="gemini",
+                merchant_id=merchant_id,
+                audit_run_id=run_id,
+            )
+    except ValueError as exc:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
+        )
+    except Exception as exc:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message=str(exc),
+        )
+        raise
+
+    # 6. Mock-data guard (same protection as /ai-commerce-readiness).
+    mock_per_product = _detect_mock_per_product(brand_report)
+    if mock_per_product:
+        await record_audit_run_completed(
+            run_id=run_id, status="failed",
+            error_message="upstream_mock_fallback",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Audit pipeline upstream returned synthetic fallback data; "
+                "refusing to render. Re-run once the upstream is real."
+            ),
+        )
+
+    # 7. Persist completion + return.
+    agg = brand_report.get("aggregate") or {}
+    verdict_labels = [
+        (p.get("verdict") or {}).get("label") or ""
+        for p in (brand_report.get("per_product") or [])
+    ]
+    await record_audit_run_completed(
+        run_id=run_id, status="succeeded",
+        verdict_labels=[v for v in verdict_labels if v],
+        visibility_score_avg=agg.get("avg_visibility"),
+        attribution_score_avg=agg.get("avg_attribution"),
+        category_visibility_score_avg=agg.get("avg_category_visibility"),
+        report_jsonb=brand_report,
+    )
+    return {
+        "brand_report": brand_report,
+        "audit_run_id": run_id,
+        "audited_url": url,
+        "tier": "url_wedge",
+        "discovery": {
+            "method": discovered.get("discovery_method"),
+            "products_audited": len(discovered["products"]),
+            "products_discovered_total": discovered.get(
+                "products_discovered_total"
+            ),
+            "coverage": discovered.get("coverage"),
+        },
+        "free_audits_allowed": _FREE_URL_AUDITS_PER_MERCHANT,
+        "free_audits_used": used + 1,
+        "free_audits_remaining": max(
+            0, _FREE_URL_AUDITS_PER_MERCHANT - (used + 1)
+        ),
     }
 
 
