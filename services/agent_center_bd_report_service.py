@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
 from services.audit_playbook_engine import select_playbooks
+from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.cited_host_classifier import classify_cited_hosts, classify_host
 from services.coverage_profiles import (
     resolve_coverage_profile,
@@ -263,6 +264,13 @@ def _source_matches_merchant(
         brand_lower = merchant_brand.strip().lower()
         if brand_lower and brand_lower in label_lower:
             return True
+        # Phase B: alias-aware match — the merchant is recorded as
+        # "BB Lab Global" but the cited source title says "BB Lab". Only
+        # ADDS matches over the literal compare above (never removes one).
+        if text_mentions_brand(
+            label_lower, derive_brand_aliases(merchant_brand, merchant_host)
+        ):
+            return True
     return False
 
 
@@ -458,13 +466,20 @@ def score_category_visibility(
         re.compile(r"\b" + re.escape(brand_lower) + r"\b")
         if use_word_boundary else None
     )
+    # Phase B: alias set (trailing-suffix-stripped core / de-spaced / host
+    # name) so "BB Lab" in an answer matches a merchant recorded as
+    # "BB Lab Global". Purely additive — the literal compare below is
+    # unchanged; aliases only catch what it would have missed.
+    brand_aliases = derive_brand_aliases(merchant_brand, merchant_host)
 
     def _brand_in(text: str) -> bool:
-        if not brand_lower:
-            return False
-        if brand_pattern is not None:
-            return brand_pattern.search(text) is not None
-        return brand_lower in text
+        if brand_lower:
+            if brand_pattern is not None:
+                if brand_pattern.search(text) is not None:
+                    return True
+            elif brand_lower in text:
+                return True
+        return text_mentions_brand(text, brand_aliases)
 
     details: List[Dict[str, Any]] = []
     matched = 0
@@ -595,6 +610,9 @@ def extract_category_competitors(
     retailer_counter: Counter = Counter()
     brand_lower = (merchant_brand or "").strip().lower()
     host_lower = (merchant_host or "").strip().lower()
+    # Phase B: alias set so the merchant's own aliased mentions ("BB Lab"
+    # for "BB Lab Global") are deduped from competitors / retailers below.
+    brand_aliases = derive_brand_aliases(merchant_brand, merchant_host)
     for run in runs or []:
         parsed = run.get("parsed") or {}
         run_brands = set()
@@ -609,6 +627,8 @@ def extract_category_competitors(
                 brand_lower in name_lower or name_lower in brand_lower
             ):
                 continue  # skip the merchant's own brand
+            if text_mentions_brand(name_lower, brand_aliases):
+                continue  # Phase B: an alias of the merchant, not a rival
             run_brands.add(name)
         for n in run_brands:
             brand_counter[n] += 1
@@ -623,6 +643,8 @@ def extract_category_competitors(
                 continue
             if host_lower and host_lower in label_lower:
                 continue
+            if text_mentions_brand(label_lower, brand_aliases):
+                continue  # Phase B: merchant's own aliased citation
             run_hosts.add(label)
         for h in run_hosts:
             retailer_counter[h] += 1

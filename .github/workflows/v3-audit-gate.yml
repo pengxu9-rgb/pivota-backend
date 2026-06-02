@@ -20,6 +20,7 @@ on:
       - "routes/audit_runs_routes.py"
       - "services/audit_run_worker.py"
       - "services/agent_center_bd_report_service.py"
+      - "services/brand_alias.py"
       - "services/merchant_credit_balance_service.py"
       - "services/catalog_sync_service.py"
       - "services/audit_scheduler.py"
@@ -46,6 +47,8 @@ on:
       - "tests/services/test_audit_v3_readiness_probe.py"
       - "tests/services/test_audit_v3_url_wedge.py"
       - "tests/services/test_curated_audit_fetch.py"
+      - "tests/services/test_brand_alias.py"
+      - "tests/services/test_audit_v3_brand_alias.py"
       - ".github/workflows/v3-audit-gate.yml"
 
 jobs:
@@ -94,5 +97,7 @@ jobs:
             tests/services/test_audit_v3_readiness_probe.py \
             tests/services/test_audit_v3_url_wedge.py \
             tests/services/test_curated_audit_fetch.py \
+            tests/services/test_brand_alias.py \
+            tests/services/test_audit_v3_brand_alias.py \
             tests/services/test_audit_v3_sku_ref_resolution.py \
             tests/services/test_audit_v3_readiness_gate.py
