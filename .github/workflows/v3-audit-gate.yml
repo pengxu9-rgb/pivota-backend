@@ -90,4 +90,6 @@ jobs:
             tests/services/test_audit_v3_merchant_sync_ingests_catalog.py \
             tests/services/test_audit_v3_full_data_band.py \
             tests/services/test_audit_v3_readiness_probe.py \
-            tests/services/test_audit_v3_url_wedge.py
+            tests/services/test_audit_v3_url_wedge.py \
+            tests/services/test_audit_v3_sku_ref_resolution.py \
+            tests/services/test_audit_v3_readiness_gate.py

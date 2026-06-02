@@ -419,6 +419,15 @@ def audit_harness(monkeypatch):
 
     monkeypatch.setattr(audit_runs_routes, "_check_audit_rate_limit", _rate_limit)
 
+    # T2b readiness gate is covered by test_audit_v3_readiness_gate.py; no-op it
+    # here so the end-to-end pipeline test doesn't need readiness DB fixtures.
+    async def _no_readiness_gate(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(
+        audit_runs_routes, "_enforce_audit_readiness", _no_readiness_gate,
+    )
+
     monkeypatch.setattr(mar, "claim_next_pending_run", store.claim_next_pending_run)
     monkeypatch.setattr(mar, "transition_stage", store.transition_stage)
     monkeypatch.setattr(mar, "record_partial_result", store.record_partial_result)

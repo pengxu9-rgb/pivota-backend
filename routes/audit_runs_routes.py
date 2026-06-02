@@ -38,7 +38,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from config.settings import settings
 from db.database import database
@@ -53,6 +53,7 @@ from db.merchant_audit_runs import (
 )
 from routes.merchant_audit_routes import _check_audit_rate_limit
 from services.idempotency import compute_audit_idempotency_key
+from services.merchant_audit_readiness import assess_merchant_audit_readiness
 from services.merchant_credit_balance_service import (
     InsufficientCreditsError,
     MissingVerifiedPaymentMethodError,
@@ -102,8 +103,11 @@ class CreateAuditRequest(BaseModel):
         ),
     )
     product_keys: List[str] = Field(
-        ..., min_length=1, max_length=50,
-        description="1–50 product_key values from catalog_products.",
+        default_factory=list, max_length=50,
+        description=(
+            "1–50 product_key values from catalog_products. Optional when "
+            "`sku_keys` is supplied — the two are alternatives."
+        ),
     )
     subject_type: str = Field(
         "merchant",
@@ -150,6 +154,23 @@ class CreateAuditRequest(BaseModel):
             "{\"chatgpt\": \"gpt-5.5-mini\"}. Absent uses profile defaults."
         ),
     )
+    sku_keys: Optional[List[str]] = Field(
+        default=None,
+        max_length=50,
+        description=(
+            "Alternative to product_keys: `platform:source_product_id` "
+            "composites (what the merchant AI-Readiness portal selects). "
+            "Resolved to product_keys server-side, scoped to the merchant."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_products_or_skus(self) -> "CreateAuditRequest":
+        if not self.product_keys and not self.sku_keys:
+            raise ValueError(
+                "provide product_keys or sku_keys (1–50 products to audit)"
+            )
+        return self
 
 
 class AuditPreviewScope(BaseModel):
@@ -233,6 +254,157 @@ async def _missing_product_keys_for_merchant(
     )
     found = {str(r[0]) for r in rows}
     return [k for k in product_keys if k not in found]
+
+
+async def _resolve_refs_to_product_keys(
+    *, merchant_id: str, refs: List[str],
+) -> List[str]:
+    """Resolve audit product references to catalog `product_key`s for a merchant.
+
+    The merchant AI-Readiness portal selects products and sends
+    `platform:source_product_id` composites (single ':'), documenting that the
+    backend resolves them server-side. A ref containing '::' (a minted
+    `<product_key>::v::<variant_id>` sku_key) or no ':' is treated as an
+    already-resolved `product_key` and validated for ownership. Raises 404
+    listing any ref that does not resolve to a product the merchant owns —
+    mirroring the (platform, source_product_id) ownership check the legacy
+    /ai-commerce-readiness route performs.
+    """
+    cleaned = _normalize_nonempty(refs)
+    if not cleaned:
+        return []
+    from db.catalog import catalog_products
+    from sqlalchemy.sql import select as _select
+
+    def _is_composite(ref: str) -> bool:
+        return ":" in ref and "::" not in ref
+
+    composite_refs = [r for r in cleaned if _is_composite(r)]
+    bare_refs = [r for r in cleaned if not _is_composite(r)]
+
+    resolved: List[str] = []
+    missing: List[str] = []
+
+    if composite_refs:
+        pairs = [
+            tuple(part.strip() for part in r.split(":", 1)) for r in composite_refs
+        ]
+        rows = await database.fetch_all(
+            _select(
+                catalog_products.c.product_key,
+                catalog_products.c.platform,
+                catalog_products.c.source_product_id,
+            ).where(
+                catalog_products.c.merchant_id == merchant_id,
+                catalog_products.c.platform.in_([p for p, _ in pairs]),
+                catalog_products.c.source_product_id.in_([s for _, s in pairs]),
+            )
+        )
+        pair_to_key = {
+            (
+                str(dict(row).get("platform") or ""),
+                str(dict(row).get("source_product_id") or ""),
+            ): str(dict(row).get("product_key") or "")
+            for row in rows or []
+        }
+        for ref, pair in zip(composite_refs, pairs):
+            key = pair_to_key.get(pair)
+            if key:
+                resolved.append(key)
+            else:
+                missing.append(ref)
+
+    if bare_refs:
+        not_owned = set(
+            await _missing_product_keys_for_merchant(
+                merchant_id=merchant_id, product_keys=bare_refs,
+            )
+        )
+        for ref in bare_refs:
+            (missing if ref in not_owned else resolved).append(ref)
+
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": (
+                    f"{len(missing)} product reference(s) not found for "
+                    "this merchant."
+                ),
+                "missing_refs": sorted(missing),
+            },
+        )
+
+    seen: set = set()
+    out: List[str] = []
+    for key in resolved:
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+async def _audit_readiness_platform(
+    merchant_id: str, product_keys: Optional[List[str]] = None,
+) -> str:
+    """Platform to assess audit-readiness against: the dominant platform of the
+    audited products (or the merchant's catalog when no keys are given).
+    Defaults to 'shopify' when the catalog is empty.
+    """
+    from db.catalog import catalog_products
+    from sqlalchemy.sql import func as _func, select as _select
+
+    query = _select(
+        catalog_products.c.platform,
+        _func.count().label("n"),
+    ).where(catalog_products.c.merchant_id == merchant_id)
+    keys = _normalize_nonempty(product_keys or [])
+    if keys:
+        query = query.where(catalog_products.c.product_key.in_(keys))
+    query = query.group_by(catalog_products.c.platform).order_by(
+        _func.count().desc()
+    )
+    rows = await database.fetch_all(query)
+    for row in rows or []:
+        platform = str(dict(row).get("platform") or "").strip()
+        if platform:
+            return platform
+    return "shopify"
+
+
+async def _enforce_audit_readiness(
+    *, merchant_id: str, product_keys: List[str], force: bool,
+) -> None:
+    """Raise 409 when the merchant's audit data isn't ready.
+
+    A fresh merchant can launch before the async content-quality backfill
+    finishes, which makes every SKU score `band=blocked` — a false "you're
+    invisible" first impression. This blocks the run with a clear "still
+    preparing, retry shortly" response instead. `force=true` bypasses (BD /
+    test / fixture re-audits and callers that accept a partial run). No-op when
+    ready. Read-only COUNT probe.
+    """
+    if force:
+        return
+    platform = await _audit_readiness_platform(merchant_id, product_keys)
+    readiness = await assess_merchant_audit_readiness(merchant_id, platform)
+    if readiness.get("ready"):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "merchant_not_audit_ready",
+            "message": (
+                "Your catalog is still being prepared for audit (content "
+                "quality backfill in progress). This usually completes within "
+                "1–2 minutes of a product sync — please try again shortly."
+            ),
+            "blocking_gaps": readiness.get("blocking_gaps") or [],
+            "counts": readiness.get("counts") or {},
+            "platform": platform,
+            "retry_after_seconds": 60,
+        },
+    )
 
 
 # =====================================================================
@@ -478,28 +650,13 @@ async def _resolve_preview_sku_keys(
             ),
         )
     if requested:
-        rows = await database.fetch_all(
-            """
-            SELECT sku_key
-              FROM catalog_skus
-             WHERE merchant_id = :merchant_id
-               AND sku_key = ANY(:sku_keys)
-            """,
-            {"merchant_id": merchant_id, "sku_keys": requested},
+        # The portal sends `platform:source_product_id` composites; resolve to
+        # product_keys (same resolver the run endpoint uses) so the preview cost
+        # and the launched run agree on the product set. Returns product_keys;
+        # the preview only uses the count + cache key, so granularity matches.
+        return await _resolve_refs_to_product_keys(
+            merchant_id=merchant_id, refs=requested,
         )
-        found = {str(dict(row).get("sku_key") or "") for row in rows or []}
-        missing = [key for key in requested if key not in found]
-        if missing:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "message": (
-                        f"{len(missing)} SKU(s) not found for this merchant."
-                    ),
-                    "missing_sku_keys": missing,
-                },
-            )
-        return requested
 
     rows = await database.fetch_all(
         """
@@ -692,6 +849,16 @@ async def create_audit_run(
             ),
         )
 
+    # Portal-ref resolution: the merchant AI-Readiness page selects products
+    # and sends `platform:source_product_id` composites as `sku_keys` (it
+    # documents that the backend resolves them). Resolve to product_keys here
+    # so the rest of the path stays product_key-native. Direct product_keys
+    # callers (BD/tests) are unaffected.
+    if not body.product_keys and body.sku_keys:
+        body.product_keys = await _resolve_refs_to_product_keys(
+            merchant_id=auth_merchant_id, refs=body.sku_keys,
+        )
+
     # P1-2: validate that every product_key is owned by the
     # authenticated merchant BEFORE enqueueing. The legacy
     # `/ai-commerce-readiness` route did the equivalent check inline
@@ -718,6 +885,15 @@ async def create_audit_run(
                 "missing_product_keys": sorted(missing),
             },
         )
+
+    # Readiness gate: block a fresh merchant from launching before the async
+    # quality backfill finishes (which would yield a false all-blocked audit
+    # that reads as "Pivota doesn't work for me"). force=true bypasses.
+    await _enforce_audit_readiness(
+        merchant_id=auth_merchant_id,
+        product_keys=body.product_keys,
+        force=body.force,
+    )
 
     # Idempotency dedupe (unless force=true).
     debit_idempotency_key: Optional[str]
@@ -1009,6 +1185,23 @@ async def create_audit_run(
         run_id=run_id, stage=STAGE_QUEUED,
         idempotent_replay=was_existing,
     )
+
+
+@router.get("/readiness")
+async def get_audit_readiness(
+    auth_merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Pre-launch readiness for the authenticated merchant's v3 audit.
+
+    The portal calls this before/at launch to show "ready" vs "still syncing"
+    instead of running an audit that would come back all-blocked. Mirrors the
+    gate POST /api/audits enforces (unless force=true). Read-only.
+
+    Declared BEFORE GET /{run_id} so "readiness" is matched as a static path,
+    not captured as a run_id.
+    """
+    platform = await _audit_readiness_platform(auth_merchant_id)
+    return await assess_merchant_audit_readiness(auth_merchant_id, platform)
 
 
 @router.get("/{run_id}")

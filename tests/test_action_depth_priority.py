@@ -37,7 +37,7 @@ def reset_caches():
 # ---------------------------------------------------------------------
 
 
-def _cited(host, *, type_, subtype, applies=True, times_cited=1,
+def _cited(host, *, type_, subtype, applies=True, times_cited=2,
            coverage_note="Covers your category.",
            outreach_hint="Editorial pitch."):
     return {
@@ -106,7 +106,7 @@ def test_concrete_next_step_for_unclassified_host_says_research():
     actions = select_playbooks(
         cited_hosts_detailed=[{
             "host": "unknown.example",
-            "times_cited": 1,
+            "times_cited": 2,
             "type": "unclassified", "subtype": None,
             "categories": [],
             "coverage_note": None, "outreach_hint": None,
