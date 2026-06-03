@@ -1168,7 +1168,11 @@ async def run_merchant_url_audit(
         "audited_url": website,
         "tier": "url_wedge",
         "audited_products": [
-            {"title": p["title"], "pdp_url": p["pdp_url"]}
+            {
+                "title": p["title"],
+                "raw_title": p.get("raw_title"),
+                "pdp_url": p["pdp_url"],
+            }
             for p in audit_products
         ],
         "methodology": {

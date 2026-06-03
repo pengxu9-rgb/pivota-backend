@@ -25,7 +25,7 @@ import services.bd_cold_start_service as bdcs
 async def test_fetch_curated_shopify_native_first(monkeypatch):
     async def fake_native(url):
         return {
-            "title": "Collagen Glow",
+            "title": "[Bundle] Collagen Glow (Marine Collagen), 30 sticks x 2box",
             "vendor": "BB Lab",
             "product_type": "Supplements",
         }
@@ -42,6 +42,7 @@ async def test_fetch_curated_shopify_native_first(monkeypatch):
     assert reason is None
     assert product == {
         "title": "Collagen Glow",
+        "raw_title": "[Bundle] Collagen Glow (Marine Collagen), 30 sticks x 2box",
         "pdp_url": "https://bblab.shop/products/collagen-glow",
         "vendor": "BB Lab",
         "product_type": "Supplements",
@@ -54,7 +55,11 @@ async def test_fetch_curated_generic_fallback(monkeypatch):
         return None
 
     async def fake_pdp(url):
-        return {"title": "Wix Serum", "vendor": "Acme", "product_type": None}
+        return {
+            "title": "[Set] Wix Serum, 2 pack",
+            "vendor": "Acme",
+            "product_type": None,
+        }
 
     monkeypatch.setattr(bdcs, "_fetch_shopify_native", no_native)
     monkeypatch.setattr(bdcs, "_fetch_pdp_metadata", fake_pdp)
@@ -64,6 +69,7 @@ async def test_fetch_curated_generic_fallback(monkeypatch):
     )
     assert reason is None
     assert product["title"] == "Wix Serum"
+    assert product["raw_title"] == "[Set] Wix Serum, 2 pack"
     assert product["vendor"] == "Acme"
     assert product["pdp_url"] == "https://acme.com/shop/serum"
 

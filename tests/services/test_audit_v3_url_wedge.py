@@ -70,8 +70,10 @@ def client(monkeypatch):
             return None, f"{pdp_url!r} is not a valid URL"
         handle = pdp_url.rstrip("/").rsplit("/", 1)[-1]
         return (
-            {"title": f"Product {handle.upper()}", "pdp_url": pdp_url,
-             "vendor": "Merch", "product_type": "Supplements"},
+            {"title": f"Product {handle.upper()}",
+             "raw_title": f"[Bundle] Product {handle.upper()}, 2 pack",
+             "pdp_url": pdp_url, "vendor": "Merch",
+             "product_type": "Supplements"},
             None,
         )
 
@@ -140,6 +142,10 @@ def test_post_returns_running_with_run_id(client):
     assert body["tier"] == "url_wedge"
     # Immediately-known fields are echoed so the UI can render context.
     assert [p["pdp_url"] for p in body["audited_products"]] == _BODY["product_urls"]
+    assert [p["raw_title"] for p in body["audited_products"]] == [
+        "[Bundle] Product A, 2 pack",
+        "[Bundle] Product B, 2 pack",
+    ]
     assert body["methodology"]["products_audited"] == 2
     assert body["methodology"]["queries_per_product"] == 2
     assert body["free_audits_remaining"] == 1
