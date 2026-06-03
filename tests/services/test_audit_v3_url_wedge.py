@@ -154,6 +154,28 @@ def test_post_returns_running_with_run_id(client):
     assert client.started[0]["product_keys"] == _BODY["product_urls"]
 
 
+def test_brand_qualify_title_helper():
+    assert mar._brand_qualify_title("BB Lab", "Good Night Collagen") == \
+        "BB Lab Good Night Collagen"
+    # already contains the brand → unchanged
+    assert mar._brand_qualify_title("BB Lab", "BB Lab Collagen") == "BB Lab Collagen"
+    # sentinel / empty brand / empty title → no-op
+    assert mar._brand_qualify_title("your brand", "Collagen") == "Collagen"
+    assert mar._brand_qualify_title("", "Collagen") == "Collagen"
+    assert mar._brand_qualify_title("BB Lab", "") == ""
+
+
+def test_post_brand_qualifies_search_titles(client):
+    # merchant_name resolves to onboarding business_name "Merch"; each product
+    # title is brand-prefixed so the buyer-intent query names the brand.
+    client.state["used"] = 0
+    body = client.post(_URL, json=_BODY).json()
+    assert [p["title"] for p in body["audited_products"]] == [
+        "Merch Product A", "Merch Product B",
+    ]
+    assert [p["pdp_url"] for p in body["audited_products"]] == _BODY["product_urls"]
+
+
 def test_free_cap_blocks_at_limit(client):
     client.state["used"] = 2
     res = client.post(_URL, json=_BODY)
