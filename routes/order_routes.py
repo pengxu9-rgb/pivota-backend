@@ -510,17 +510,45 @@ def _coerce_metadata_bool(value: Any) -> Optional[bool]:
     return None
 
 
-def _resolve_order_live_readiness_requirement(metadata: Optional[Dict[str, Any]]) -> bool:
+def _test_psp_probe_enabled() -> bool:
+    """Server-side master switch (default OFF) for the scoped test-processor probe override."""
+    return str(os.getenv("ALLOW_TEST_PSP_PROBE", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _test_psp_probe_merchants() -> set:
+    """Allowlist of merchant_ids permitted to bypass live-readiness (test-mode probe). Comma-separated env."""
+    raw = os.getenv("TEST_PSP_PROBE_MERCHANTS", "") or ""
+    return {m.strip().lower() for m in raw.split(",") if m.strip()}
+
+
+def _resolve_order_live_readiness_requirement(
+    metadata: Optional[Dict[str, Any]], merchant_id: Optional[str] = None
+) -> bool:
     metadata_dict = metadata if isinstance(metadata, dict) else {}
     explicit = _coerce_metadata_bool(metadata_dict.get("enforce_live_readiness"))
-    if explicit is not None:
-        return explicit
-    allow_test = _coerce_metadata_bool(
-        metadata_dict.get("allow_test_psp_surfaces")
-        or metadata_dict.get("test_psp_surfaces")
-        or metadata_dict.get("allow_test_processors")
-    )
-    if allow_test is True:
+    # An explicit request to ENFORCE live readiness (the stricter choice) is always honored.
+    if explicit is True:
+        return True
+    # A request to BYPASS live readiness (run a TEST processor) — via enforce_live_readiness=false or
+    # allow_test_psp_surfaces=true — is honored ONLY for an explicitly allowlisted merchant while the
+    # server-side probe flag is ON (default OFF). Order metadata is set by EXTERNAL callers (the agent
+    # gateway forwards order.metadata verbatim), so an ungated bypass would let ANY order route to a test
+    # processor and be marked paid with no real charge (goods shipped unpaid). Scoping the bypass to
+    # {ALLOW_TEST_PSP_PROBE on} + {merchant in TEST_PSP_PROBE_MERCHANTS} closes that hole while still
+    # enabling a controlled test-mode charge for the probe merchant.
+    wants_bypass = explicit is False
+    if not wants_bypass:
+        allow_test = _coerce_metadata_bool(
+            metadata_dict.get("allow_test_psp_surfaces")
+            or metadata_dict.get("test_psp_surfaces")
+            or metadata_dict.get("allow_test_processors")
+        )
+        wants_bypass = allow_test is True
+    if (
+        wants_bypass
+        and _test_psp_probe_enabled()
+        and str(merchant_id or "").strip().lower() in _test_psp_probe_merchants()
+    ):
         return False
     return True
 
@@ -3993,7 +4021,7 @@ async def create_new_order(
             "legacy_promotions" if discount_total > 0 else "legacy_incomplete"
         )
         persisted_order_items = _build_persisted_order_items(order_request.items, pricing_quote_meta)
-        enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
+        enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata, merchant_id=order_request.merchant_id)
         _t = time.perf_counter()
         explicit_preferred_provider = await _ensure_explicit_preferred_psp_available(
             merchant_id=order_request.merchant_id,
@@ -4211,7 +4239,7 @@ async def create_new_order(
             # 则通过 metadata.psp_mode 告诉 Stripe 适配器走 Checkout Session 流程，
             # 但 PSP provider 仍然是 "stripe"（由 routing 决定）。
             psp_mode = requested_psp_mode
-            enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata)
+            enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata, merchant_id=order_request.merchant_id)
             payment_return_url = _build_order_payment_return_url(order_id, order_metadata)
             auth_first_payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
             auth_first_psp = str((auth_first_payment_flow or {}).get("psp") or "").strip().lower()

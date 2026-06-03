@@ -92,16 +92,79 @@ def test_resolve_order_live_readiness_requirement_defaults_to_true() -> None:
     assert module._resolve_order_live_readiness_requirement({}) is True
 
 
-def test_resolve_order_live_readiness_requirement_honors_explicit_test_override() -> None:
+def test_resolve_order_live_readiness_requirement_ignores_ungated_test_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The metadata bypass is set by EXTERNAL callers (gateway forwards order.metadata), so without the
+    server-side probe flag + merchant allowlist it MUST be ignored (closes the prior ungated hole)."""
     import routes.order_routes as module
 
+    monkeypatch.delenv("ALLOW_TEST_PSP_PROBE", raising=False)
+    monkeypatch.delenv("TEST_PSP_PROBE_MERCHANTS", raising=False)
+    assert module._resolve_order_live_readiness_requirement({"enforce_live_readiness": False}) is True
+    assert module._resolve_order_live_readiness_requirement({"allow_test_psp_surfaces": True}) is True
+    # even with the flag on, a NON-allowlisted merchant cannot bypass
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", "merch_other")
     assert (
-        module._resolve_order_live_readiness_requirement({"enforce_live_readiness": False})
+        module._resolve_order_live_readiness_requirement(
+            {"allow_test_psp_surfaces": True}, merchant_id="merch_efbc46b4619cfbdf"
+        )
+        is True
+    )
+
+
+def test_resolve_order_live_readiness_requirement_scoped_probe_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bypass is honored ONLY for an allowlisted merchant while the probe flag is on."""
+    import routes.order_routes as module
+
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", "merch_efbc46b4619cfbdf, merch_two")
+    # ALL bypass aliases, as bool AND string token, drive a bypass for an allowlisted merchant (Codex P3)
+    for meta in (
+        {"enforce_live_readiness": False},
+        {"enforce_live_readiness": "false"},
+        {"allow_test_psp_surfaces": True},
+        {"allow_test_psp_surfaces": "true"},
+        {"test_psp_surfaces": True},
+        {"allow_test_processors": True},
+    ):
+        assert (
+            module._resolve_order_live_readiness_requirement(meta, merchant_id="merch_efbc46b4619cfbdf")
+            is False
+        ), meta
+    # merchant match tolerates surrounding case/whitespace
+    assert (
+        module._resolve_order_live_readiness_requirement(
+            {"allow_test_psp_surfaces": True}, merchant_id="  MERCH_efbc46b4619cfbdf  "
+        )
         is False
     )
+    # an explicit request to ENFORCE (stricter) is always honored, even for an allowlisted merchant
     assert (
-        module._resolve_order_live_readiness_requirement({"allow_test_psp_surfaces": True})
-        is False
+        module._resolve_order_live_readiness_requirement(
+            {"enforce_live_readiness": True}, merchant_id="merch_efbc46b4619cfbdf"
+        )
+        is True
+    )
+    # flag OFF → even an allowlisted merchant cannot bypass
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "0")
+    assert (
+        module._resolve_order_live_readiness_requirement(
+            {"allow_test_psp_surfaces": True}, merchant_id="merch_efbc46b4619cfbdf"
+        )
+        is True
+    )
+    # flag ON but EMPTY/whitespace allowlist → no merchant can bypass
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", "   ")
+    assert (
+        module._resolve_order_live_readiness_requirement(
+            {"allow_test_psp_surfaces": True}, merchant_id="merch_efbc46b4619cfbdf"
+        )
+        is True
     )
 
 
