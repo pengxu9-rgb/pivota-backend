@@ -1102,15 +1102,16 @@ def _explain_verdict(
                 )
             else:
                 signal_phrase = (
-                    f"the category-visibility score is {cs}/100 (we don't "
-                    f"have per-run match details for this run)"
+                    "your brand's category presence couldn't be tied to "
+                    "specific grounded sources in this run"
                 )
             base = (
                 f"Your category-visibility score is {cs}/100; your "
                 f"buyer-intent attribution score is {attribution_score}"
                 f"/100 — a {gp}-point gap. " +
                 signal_phrase[0].upper() + signal_phrase[1:] +
-                ", but in few buyer-intent queries"
+                ", and your own URL appeared in few of the "
+                "buyer-intent queries"
             )
             # P0-Q1: retailers_phrase is category-scope evidence; gate
             # it from buyer-intent prose when cited == 0 (no buyer-
