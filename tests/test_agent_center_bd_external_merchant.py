@@ -1671,6 +1671,58 @@ def test_via_retailers_explanation_is_pitch_free_diagnostic() -> None:
     assert "attribution" in e or "captur" in e
 
 
+@pytest.mark.parametrize(
+    ("category_match_details", "expected_signal"),
+    [
+        (
+            [{"in_grounding": True}],
+            "Your URL appears in some category-level grounded sources",
+        ),
+        (
+            [{"title_match": True}],
+            "Your brand was named in some category-level grounded source titles",
+        ),
+        (
+            [{"excerpt_match": True, "matched": True}],
+            "Your brand was mentioned in category-level answer prose",
+        ),
+        (
+            [],
+            (
+                "Your brand's category presence couldn't be tied to specific "
+                "grounded sources in this run"
+            ),
+        ),
+    ],
+)
+def test_via_retailers_evidence_explanation_is_grammatical(
+    category_match_details,
+    expected_signal,
+) -> None:
+    from services.agent_center_bd_report_service import (
+        verdict_for,
+        VERDICT_VIA_RETAILERS,
+    )
+    label, explanation = verdict_for(
+        visibility_score=0,
+        attribution_score=20,
+        category_visibility_score=50,
+        evidence={
+            "attribution_runs_total": 5,
+            "merchant_cited_runs": 1,
+            "top_retailers": [],
+            "category_score": 50,
+            "gap_pct": 30,
+            "category_match_details": category_match_details,
+        },
+    )
+    assert label == VERDICT_VIA_RETAILERS
+    assert expected_signal in explanation
+    assert ", and your own URL appeared in few of the buyer-intent queries." in explanation
+    assert ", but in few buyer-intent queries" not in explanation
+    assert "category-visibility score is 50/100 (we don't have" not in explanation
+
+
 # ---------------------------------------------------------------------------
 # Phase 2f: Voice reframe — "AI Commerce Readiness Report" + value-prop
 # verdicts + new "What Pivota changes" section + industry forward projection

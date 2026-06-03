@@ -101,6 +101,26 @@ async def _fetch_shopify_native(pdp_url: str) -> Optional[Dict[str, Any]]:
 # OpenGraph title as a fallback. Used by the merchant-CURATED audit path, where
 # the merchant hands us the exact product URL, so we fetch precisely it.
 _PDP_FETCH_TIMEOUT_S = 8.0
+_SEARCH_TITLE_UNIT_RE = (
+    r"fl\s*oz|sticks?|tablets?|tabs?|capsules?|caps?|softgels?|"
+    r"gummies|sachets?|servings?|ct|counts?|packs?|boxes|box|"
+    r"bottles?|pouches?|bags?|kg|mg|ml|g|l|oz"
+)
+_LEADING_BRACKET_TAGS_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
+_PARENTHETICAL_QUALIFIER_RE = re.compile(r"\([^)]*\)")
+_TRAILING_MULTIPLIER_UNIT_RE = re.compile(
+    rf"(?:[,\-\s]+|^)[x\u00d7]\s*\d+\s*(?:{_SEARCH_TITLE_UNIT_RE})\b\.?\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_NUM_UNIT_RE = re.compile(
+    rf"(?:[,\-\s]+|^)\d+\s*(?:{_SEARCH_TITLE_UNIT_RE})\b\.?\s*$",
+    re.IGNORECASE,
+)
+_DANGLING_MULTIPLIER_AFTER_UNIT_RE = re.compile(
+    rf"\d+\s*(?:{_SEARCH_TITLE_UNIT_RE})\b\s*[x\u00d7]\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_MULTIPLIER_RE = re.compile(r"\s*[x\u00d7]\s*$", re.IGNORECASE)
 _JSON_LD_RE = re.compile(
     r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
     re.IGNORECASE | re.DOTALL,
@@ -115,6 +135,55 @@ _OG_META_REV_RE = re.compile(  # content-before-property attribute ordering
     r'(?:property|name)=["\']og:title["\']',
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _clean_title_surface(title: str) -> str:
+    return re.sub(r"\s+", " ", title or "").strip(" \t\r\n,.;:-|/")
+
+
+def _token_count(title: str) -> int:
+    return len(re.findall(r"\S+", title or ""))
+
+
+def _strip_trailing_pack_descriptors(title: str) -> str:
+    cleaned = _clean_title_surface(title)
+    while cleaned:
+        before = cleaned
+        cleaned = _TRAILING_MULTIPLIER_UNIT_RE.sub("", cleaned)
+        cleaned = _clean_title_surface(cleaned)
+        cleaned = _TRAILING_NUM_UNIT_RE.sub("", cleaned)
+        cleaned = _clean_title_surface(cleaned)
+        if _DANGLING_MULTIPLIER_AFTER_UNIT_RE.search(cleaned):
+            cleaned = _TRAILING_MULTIPLIER_RE.sub("", cleaned)
+            cleaned = _clean_title_surface(cleaned)
+        if cleaned == before:
+            break
+    return cleaned
+
+
+def normalize_product_title_for_search(raw_title: str) -> str:
+    """Turn a noisy storefront title into a conservative search query title."""
+    original = raw_title or ""
+    bracket_stripped = _clean_title_surface(
+        _LEADING_BRACKET_TAGS_RE.sub("", original)
+    )
+    without_qualifiers = _clean_title_surface(
+        _PARENTHETICAL_QUALIFIER_RE.sub("", bracket_stripped)
+    )
+    pack_stripped = _strip_trailing_pack_descriptors(without_qualifiers)
+
+    if (
+        pack_stripped != without_qualifiers
+        and _token_count(pack_stripped) < 2
+        and _token_count(without_qualifiers) >= 2
+    ):
+        cleaned = without_qualifiers
+    else:
+        cleaned = pack_stripped
+
+    if len(cleaned) < 3 or not any(ch.isalpha() for ch in cleaned):
+        return bracket_stripped or original
+    return cleaned
 
 
 def _walk_jsonld_for_product(node: Any) -> Optional[Dict[str, Any]]:
@@ -227,10 +296,11 @@ async def fetch_curated_audit_product(
     # 1. Shopify native .json — clean, structured, no auth, ~200-500ms.
     native = await _fetch_shopify_native(url)
     if native:
-        title = (str(native.get("title") or "")).strip()
-        if title:
+        raw_title = (str(native.get("title") or "")).strip()
+        if raw_title:
             return {
-                "title": title,
+                "title": normalize_product_title_for_search(raw_title),
+                "raw_title": raw_title,
                 "pdp_url": url,
                 "vendor": (str(native.get("vendor") or "")).strip() or None,
                 "product_type": (
@@ -241,8 +311,10 @@ async def fetch_curated_audit_product(
     # 2. Generic PDP: schema.org JSON-LD Product + OpenGraph fallback.
     meta = await _fetch_pdp_metadata(url)
     if meta and meta.get("title"):
+        raw_title = str(meta["title"]).strip()
         return {
-            "title": meta["title"],
+            "title": normalize_product_title_for_search(raw_title),
+            "raw_title": raw_title,
             "pdp_url": url,
             "vendor": meta.get("vendor"),
             "product_type": meta.get("product_type"),
