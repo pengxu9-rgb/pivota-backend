@@ -1048,6 +1048,22 @@ def _brand_name_from_domain(domain: Optional[str]) -> Optional[str]:
     return label.title() or None
 
 
+def _brand_qualify_title(brand: Optional[str], title: str) -> str:
+    """Prefix the brand to a product title for the buyer-intent search query
+    ('BB Lab Good Night Collagen') so the grounded search names the brand — a
+    bare product name doesn't ground to retailer listings, which scores a real
+    product a false visibility 0. The upstream builds queries from `title` and
+    the wedge runs only the first 2 (max_runs=2), so the brand must be IN the
+    title here. No-op when the brand is missing / the 'your brand' sentinel /
+    already present. (Backend workaround; the clean fix is reordering the
+    upstream query builder so vendor-anchored queries come first.)"""
+    t = (title or "").strip()
+    b = (brand or "").strip()
+    if not t or not b or b.lower() == "your brand" or b.lower() in t.lower():
+        return t
+    return f"{b} {t}"
+
+
 def _is_wedge_run_stale(requested_at: Any) -> bool:
     if not requested_at:
         return False
@@ -1147,6 +1163,12 @@ async def run_merchant_url_audit(
         or _brand_name_from_domain(merchant_domain)
         or "your brand"
     )
+
+    # Brand-qualify each product's search title so the buyer-intent queries
+    # name the brand ("BB Lab Good Night Collagen"). raw_title (the original
+    # fetched title) is preserved by fetch for display/provenance.
+    for p in audit_products:
+        p["title"] = _brand_qualify_title(merchant_name, p.get("title") or "")
 
     # 4. Record the run; subject_type marks it for the free-allowance count.
     run_id = await record_audit_run_started(
