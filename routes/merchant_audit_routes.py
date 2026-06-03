@@ -40,6 +40,7 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -920,6 +921,10 @@ async def run_merchant_self_audit(
 _FREE_URL_AUDITS_PER_MERCHANT = int(
     _os.getenv("FREE_URL_AUDITS_PER_MERCHANT", "0")
 )
+# Two sequential upstream runs fit under the 60s probe timeout while keeping
+# a real evidence floor instead of binary 1-sample verdicts.
+_WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
+_WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
 
 
 class MerchantUrlAuditRequest(BaseModel):
@@ -1043,6 +1048,21 @@ def _brand_name_from_domain(domain: Optional[str]) -> Optional[str]:
     return label.title() or None
 
 
+def _is_wedge_run_stale(requested_at: Any) -> bool:
+    if not requested_at:
+        return False
+    try:
+        requested = datetime.fromisoformat(str(requested_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if requested.tzinfo is None:
+        requested = requested.replace(tzinfo=timezone.utc)
+    age_s = (
+        datetime.now(timezone.utc) - requested.astimezone(timezone.utc)
+    ).total_seconds()
+    return age_s > _WEDGE_RUN_STALE_TTL_S
+
+
 @router.post("/url-readiness")
 async def run_merchant_url_audit(
     body: MerchantUrlAuditRequest,
@@ -1155,7 +1175,7 @@ async def run_merchant_url_audit(
             "model": "merchant_curated",
             "products_audited": len(audit_products),
             "products_requested": len(body.product_urls),
-            "queries_per_product": 3,
+            "queries_per_product": _WEDGE_MAX_RUNS,
             "what_we_checked": (
                 "For each product URL you gave us, we ran AI shopping-agent "
                 "(Gemini grounded search) buyer-intent queries and checked "
@@ -1235,6 +1255,20 @@ async def get_merchant_url_audit(
             else (err or "Audit failed. Please re-run.")
         )
         return {"status": "failed", "run_id": run_id, "error": msg}
+    if run_status == "running" and _is_wedge_run_stale(row.get("requested_at")):
+        try:
+            await record_audit_run_completed(
+                run_id=run_id,
+                status="failed",
+                error_message="audit_timed_out_stale",
+            )
+        except Exception:  # noqa: BLE001 — best-effort stale cleanup
+            logger.warning("Failed to mark stale wedge run failed: %s", run_id)
+        return {
+            "status": "failed",
+            "run_id": run_id,
+            "error": "This audit didn't finish in time — please re-run.",
+        }
     return {"status": "running", "run_id": run_id}
 
 
@@ -1278,6 +1312,7 @@ async def _run_wedge_audit_background(
                 # upstream has spare throughput; async removes the hard ceiling.
                 product_concurrency=min(len(audit_products), 3),
                 parallel_scan_modes=True,
+                max_runs=_WEDGE_MAX_RUNS,
             )
     except Exception as exc:  # noqa: BLE001 — runner must not crash the loop
         await record_audit_run_completed(
