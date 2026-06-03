@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -106,6 +107,7 @@ def client(monkeypatch):
     monkeypatch.setattr(bdcs, "fetch_curated_audit_product", fake_fetch)
     monkeypatch.setattr(atc, "audit_telemetry", fake_telemetry)
     monkeypatch.setattr(mar, "_FREE_URL_AUDITS_PER_MERCHANT", 2)
+    monkeypatch.setattr(mar, "_WEDGE_MAX_RUNS", 2)
 
     app = FastAPI()
     app.include_router(mar.router)
@@ -139,6 +141,7 @@ def test_post_returns_running_with_run_id(client):
     # Immediately-known fields are echoed so the UI can render context.
     assert [p["pdp_url"] for p in body["audited_products"]] == _BODY["product_urls"]
     assert body["methodology"]["products_audited"] == 2
+    assert body["methodology"]["queries_per_product"] == 2
     assert body["free_audits_remaining"] == 1
     # Run recorded with the wedge marker + the provided URLs before kickoff.
     assert client.started[0]["subject_type"] == "merchant_url"
@@ -231,6 +234,7 @@ async def test_background_runner_persists_scrubbed_result(client):
     call = client.brand_calls[0]
     assert call["product_concurrency"] == 1
     assert call["parallel_scan_modes"] is True
+    assert call["max_runs"] == 2
     # Persisted as succeeded with the FULL payload in report_jsonb.
     done = client.completed[-1]
     assert done["status"] == "succeeded"
@@ -265,14 +269,23 @@ async def test_background_runner_records_failure(client, monkeypatch):
 
 # --- GET: poll ---------------------------------------------------------------
 def _get_client(monkeypatch, row):
+    completed: list = []
+
     async def fake_fetch_run(*, run_id):
         return row
 
+    async def fake_completed(*, run_id, status, **kw):
+        completed.append({"run_id": run_id, "status": status, **kw})
+
     monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch_run)
+    monkeypatch.setattr(mar, "record_audit_run_completed", fake_completed)
+    monkeypatch.setattr(mar, "_WEDGE_RUN_STALE_TTL_S", 900)
     app = FastAPI()
     app.include_router(mar.router)
     app.dependency_overrides[auth_module.get_current_merchant] = lambda: "merch-A"
-    return TestClient(app)
+    c = TestClient(app)
+    c.completed = completed
+    return c
 
 
 def test_get_running(monkeypatch):
@@ -282,6 +295,39 @@ def test_get_running(monkeypatch):
     })
     body = c.get(f"{_URL}/run-url-1").json()
     assert body == {"status": "running", "run_id": "run-url-1"}
+    assert c.completed == []
+
+
+def test_get_running_fresh_requested_at_not_stale(monkeypatch):
+    requested_at = datetime.now(timezone.utc).isoformat()
+    c = _get_client(monkeypatch, {
+        "merchant_id": "merch-A", "subject_type": "merchant_url",
+        "status": "running", "report_jsonb": None,
+        "requested_at": requested_at,
+    })
+    body = c.get(f"{_URL}/run-url-1").json()
+    assert body == {"status": "running", "run_id": "run-url-1"}
+    assert c.completed == []
+
+
+def test_get_running_stale_requested_at_fails(monkeypatch):
+    requested_at = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    c = _get_client(monkeypatch, {
+        "merchant_id": "merch-A", "subject_type": "merchant_url",
+        "status": "running", "report_jsonb": None,
+        "requested_at": requested_at,
+    })
+    body = c.get(f"{_URL}/run-url-1").json()
+    assert body == {
+        "status": "failed",
+        "run_id": "run-url-1",
+        "error": "This audit didn't finish in time — please re-run.",
+    }
+    assert c.completed == [{
+        "run_id": "run-url-1",
+        "status": "failed",
+        "error_message": "audit_timed_out_stale",
+    }]
 
 
 def test_get_succeeded_returns_payload(monkeypatch):
