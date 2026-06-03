@@ -57,6 +57,7 @@ from db.database import database
 from db.merchant_audit_runs import (
     count_runs_for_merchant_by_subject,
     count_runs_in_window,
+    fetch_audit_run_by_id,
     record_audit_run_completed,
     record_audit_run_started,
     recent_runs_for_merchant,
@@ -1047,15 +1048,20 @@ async def run_merchant_url_audit(
     body: MerchantUrlAuditRequest,
     merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
-    """Free URL-audit wedge (Tier 1), merchant-CURATED: the merchant gives us
-    their brand site + up to 5 product URLs (their own hero SKUs); we FETCH
-    each for clean, real data and audit exactly those — NO catalog sync, NO
-    auto-discovery. The low-friction top of the funnel; integrating (sync)
-    unlocks the full per-SKU audit + serving/checkout (Tier 2).
+    """Free URL-audit wedge (Tier 1), merchant-CURATED + ASYNC. The merchant
+    gives us their brand site + up to 5 product URLs (their own hero SKUs); we
+    FETCH each for clean, real data and audit exactly those — NO catalog sync,
+    NO auto-discovery.
+
+    The grounded probes can run several MINUTES via the upstream (it serializes
+    grounded calls), far past any client timeout. So this kicks the audit off
+    in the BACKGROUND and returns a `run_id` immediately (status='running');
+    the client polls GET /url-readiness/{run_id} until it's done. Request
+    duration no longer bounds the audit.
 
     Free allowance: the first N URL audits per merchant run without a credit
-    debit; beyond that returns 402 so the merchant connects/upgrades. The cap
-    is checked before any fetch/LLM work, bounding the free tier's Gemini cost.
+    debit; beyond that returns 402. The cap (+ the per-URL fetch) is checked
+    synchronously, before the run is recorded.
     """
     from services.bd_cold_start_service import fetch_curated_audit_product
 
@@ -1128,76 +1134,16 @@ async def run_merchant_url_audit(
         product_keys=[p["pdp_url"] for p in audit_products],
         subject_type="merchant_url",
     )
-
-    # 5. Run the brand report on the merchant-curated products, scoped to this
-    #    merchant. Telemetry-wrapped so probe rows carry attribution.
-    from services.audit_telemetry_context import audit_telemetry
-    try:
-        async with audit_telemetry(run_id=run_id, merchant_id=merchant_id):
-            brand_report = await run_brand_report(
-                merchant_name=merchant_name,
-                merchant_domain=merchant_domain,
-                products=audit_products,
-                provider="gemini",
-                merchant_id=merchant_id,
-                audit_run_id=run_id,
-                # Keep the free wedge under the client timeout: audit the
-                # merchant's ≤5 products with bounded concurrency AND run each
-                # product's 3 grounded scan modes in parallel (the dominant
-                # per-product cost). 3 products × 3 modes bounds in-flight
-                # grounded-LLM fan-out modestly (#280).
-                product_concurrency=min(len(audit_products), 3),
-                parallel_scan_modes=True,
-            )
-    except ValueError as exc:
-        await record_audit_run_completed(
-            run_id=run_id, status="failed", error_message=str(exc),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
-        )
-    except Exception as exc:
-        await record_audit_run_completed(
-            run_id=run_id, status="failed", error_message=str(exc),
-        )
-        raise
-
-    # 6. Mock-data guard (same protection as /ai-commerce-readiness).
-    mock_per_product = _detect_mock_per_product(brand_report)
-    if mock_per_product:
-        await record_audit_run_completed(
-            run_id=run_id, status="failed",
-            error_message="upstream_mock_fallback",
-        )
+    if not run_id:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Audit pipeline upstream returned synthetic fallback data; "
-                "refusing to render. Re-run once the upstream is real."
-            ),
+            detail="Could not start the audit (storage unavailable). Re-try.",
         )
 
-    # 7. Honesty post-processing (Phase A): strip the canned industry_context
-    #    and the buried "we did not verify…" hedge; state the real
-    #    verification limitation once, upfront, in `methodology` below.
-    _scrub_wedge_report_in_place(brand_report)
-
-    # 8. Persist completion + return.
-    agg = brand_report.get("aggregate") or {}
-    verdict_labels = [
-        (p.get("verdict") or {}).get("label") or ""
-        for p in (brand_report.get("per_product") or [])
-    ]
-    await record_audit_run_completed(
-        run_id=run_id, status="succeeded",
-        verdict_labels=[v for v in verdict_labels if v],
-        visibility_score_avg=agg.get("avg_visibility"),
-        attribution_score_avg=agg.get("avg_attribution"),
-        category_visibility_score_avg=agg.get("avg_category_visibility"),
-        report_jsonb=brand_report,
-    )
-    return {
-        "brand_report": brand_report,
+    # 5. The result fields known immediately (no LLM yet). Stored with the
+    #    report when the background run completes, and echoed in the 202 so the
+    #    client can render "auditing N products…" right away.
+    base_payload = {
         "audit_run_id": run_id,
         "audited_url": website,
         "tier": "url_wedge",
@@ -1237,6 +1183,139 @@ async def run_merchant_url_audit(
             if _FREE_URL_AUDITS_PER_MERCHANT > 0 else None
         ),
     }
+
+    # 6. Kick the audit off in the background; the client polls for the result.
+    _schedule_wedge_audit(
+        _run_wedge_audit_background(
+            run_id=run_id,
+            merchant_id=merchant_id,
+            merchant_name=merchant_name,
+            merchant_domain=merchant_domain,
+            audit_products=audit_products,
+            base_payload=base_payload,
+        )
+    )
+
+    return {"status": "running", "run_id": run_id, "brand_report": None, **base_payload}
+
+
+@router.get("/url-readiness/{run_id}")
+async def get_merchant_url_audit(
+    run_id: str,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Poll a free URL-audit wedge run kicked off by POST /url-readiness.
+
+    Returns `{status: 'running'}` until the background audit finishes, then the
+    full result (`status: 'succeeded'` + brand_report + methodology + …) or
+    `{status: 'failed', error}`. Scoped to the calling merchant + the wedge
+    subject_type so it can't read another merchant's or a synced run.
+    """
+    row = await fetch_audit_run_by_id(run_id=run_id)
+    if (
+        not row
+        or row.get("merchant_id") != merchant_id
+        or row.get("subject_type") != "merchant_url"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "audit_run_not_found", "message": "No such audit run."},
+        )
+    run_status = row.get("status") or "running"
+    if run_status == "succeeded":
+        # report_jsonb holds the full result payload assembled by the runner.
+        return row.get("report_jsonb") or {
+            "status": "succeeded", "run_id": run_id, "brand_report": None,
+        }
+    if run_status == "failed":
+        err = row.get("error_message") or ""
+        msg = (
+            "The audit pipeline returned fallback data; please re-run."
+            if err == "upstream_mock_fallback"
+            else (err or "Audit failed. Please re-run.")
+        )
+        return {"status": "failed", "run_id": run_id, "error": msg}
+    return {"status": "running", "run_id": run_id}
+
+
+# Keep references to in-flight background audits so the event loop doesn't GC
+# them mid-run (asyncio only holds weak refs to bare tasks).
+_WEDGE_BG_TASKS: set = set()
+
+
+def _schedule_wedge_audit(coro) -> None:
+    """Schedule a background wedge-audit coroutine on the running loop and hold
+    a reference until it finishes. Indirection point so tests can stub the
+    background run without patching the global asyncio.create_task."""
+    task = asyncio.create_task(coro)
+    _WEDGE_BG_TASKS.add(task)
+    task.add_done_callback(_WEDGE_BG_TASKS.discard)
+
+
+async def _run_wedge_audit_background(
+    *,
+    run_id: str,
+    merchant_id: str,
+    merchant_name: str,
+    merchant_domain: Optional[str],
+    audit_products: List[Dict[str, Any]],
+    base_payload: Dict[str, Any],
+) -> None:
+    """Run the wedge brand report OFF the request path and persist the full,
+    client-ready result into the run's report_jsonb. Never raises — failures
+    are recorded as status='failed' so the poller surfaces them cleanly."""
+    from services.audit_telemetry_context import audit_telemetry
+    try:
+        async with audit_telemetry(run_id=run_id, merchant_id=merchant_id):
+            brand_report = await run_brand_report(
+                merchant_name=merchant_name,
+                merchant_domain=merchant_domain,
+                products=audit_products,
+                provider="gemini",
+                merchant_id=merchant_id,
+                audit_run_id=run_id,
+                # Bounded concurrency + parallel scan modes still help when the
+                # upstream has spare throughput; async removes the hard ceiling.
+                product_concurrency=min(len(audit_products), 3),
+                parallel_scan_modes=True,
+            )
+    except Exception as exc:  # noqa: BLE001 — runner must not crash the loop
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message=str(exc)[:2000],
+        )
+        return
+
+    # Mock-data guard (same protection as /ai-commerce-readiness).
+    if _detect_mock_per_product(brand_report):
+        await record_audit_run_completed(
+            run_id=run_id, status="failed",
+            error_message="upstream_mock_fallback",
+        )
+        return
+
+    # Honesty post-processing (Phase A): strip the canned industry_context +
+    # the buried "we did not verify…" hedge.
+    _scrub_wedge_report_in_place(brand_report)
+
+    agg = brand_report.get("aggregate") or {}
+    verdict_labels = [
+        (p.get("verdict") or {}).get("label") or ""
+        for p in (brand_report.get("per_product") or [])
+    ]
+    full_payload = {
+        "status": "succeeded",
+        "run_id": run_id,
+        "brand_report": brand_report,
+        **base_payload,
+    }
+    await record_audit_run_completed(
+        run_id=run_id, status="succeeded",
+        verdict_labels=[v for v in verdict_labels if v],
+        visibility_score_avg=agg.get("avg_visibility"),
+        attribution_score_avg=agg.get("avg_attribution"),
+        category_visibility_score_avg=agg.get("avg_category_visibility"),
+        report_jsonb=full_payload,
+    )
 
 
 @router.post("/configure-apm")

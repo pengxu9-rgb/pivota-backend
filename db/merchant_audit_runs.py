@@ -1055,6 +1055,7 @@ async def fetch_audit_run_by_id(
         "run_id": str(d.get("run_id")) if d.get("run_id") else None,
         "merchant_id": d.get("merchant_id"),
         "subject_type": d.get("subject_type"),
+        "status": d.get("status"),
         "stage": d.get("stage"),
         "stage_updated_at": (
             d["stage_updated_at"].isoformat()
