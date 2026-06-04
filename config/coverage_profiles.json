@@ -30,6 +30,12 @@
       "verify_providers": [],
       "notes": "Both run as primary grounded citation probers; results combine via MAX with per-provider drill-down. Validates the multi-LLM path before adding OpenAI/Claude."
     },
+    "gemini_deepseek_chatgpt": {
+      "label": "Gemini + DeepSeek + ChatGPT (tri grounded)",
+      "providers": ["gemini", "deepseek", "chatgpt"],
+      "verify_providers": [],
+      "notes": "Wedge hero-SKU tri-prober: adds grounded ChatGPT (OpenAI Responses API + web_search_preview) as a co-equal primary. Gated on OPENAI_API_KEY in PIVOTA-Agent; without it ChatGPT returns mock_fallback_no_openai_key and is filtered by the per-SKU honesty guard, so it simply doesn't appear until the key is live. Hero-SKU only (free tier) — the brand report stays gemini_deepseek for cost."
+    },
     "full": {
       "label": "Full Coverage",
       "providers": ["gemini", "chatgpt", "claude", "perplexity"],

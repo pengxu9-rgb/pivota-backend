@@ -1380,7 +1380,9 @@ async def _run_wedge_audit_background(
             hero_product=hero_product or {},
             merchant_id=merchant_id,
             run_id=run_id,
-            coverage_profile="gemini_deepseek",
+            # Hero SKU gets the tri-prober (adds grounded ChatGPT); the brand
+            # report above stays gemini_deepseek so ChatGPT cost is hero-only.
+            coverage_profile="gemini_deepseek_chatgpt",
             prompts_per_sku=14,
         )
     except Exception as exc:  # noqa: BLE001 — wedge SKU block must degrade
