@@ -154,26 +154,65 @@ def test_post_returns_running_with_run_id(client):
     assert client.started[0]["product_keys"] == _BODY["product_urls"]
 
 
-def test_brand_qualify_title_helper():
-    assert mar._brand_qualify_title("BB Lab", "Good Night Collagen") == \
-        "BB Lab Good Night Collagen"
-    # already contains the brand → unchanged
-    assert mar._brand_qualify_title("BB Lab", "BB Lab Collagen") == "BB Lab Collagen"
-    # sentinel / empty brand / empty title → no-op
-    assert mar._brand_qualify_title("your brand", "Collagen") == "Collagen"
-    assert mar._brand_qualify_title("", "Collagen") == "Collagen"
-    assert mar._brand_qualify_title("BB Lab", "") == ""
-
-
-def test_post_brand_qualifies_search_titles(client):
-    # merchant_name resolves to onboarding business_name "Merch"; each product
-    # title is brand-prefixed so the buyer-intent query names the brand.
+def test_post_vendor_fallback_when_absent(client, monkeypatch):
     client.state["used"] = 0
+    captured_runs: list = []
+
+    def capture_background_run(**kwargs):
+        captured_runs.append(kwargs)
+
+        async def noop():
+            return None
+
+        return noop()
+
+    async def fetch_without_vendor(pdp_url):
+        handle = pdp_url.rstrip("/").rsplit("/", 1)[-1]
+        return (
+            {"title": f"Product {handle.upper()}",
+             "raw_title": f"[Bundle] Product {handle.upper()}, 2 pack",
+             "pdp_url": pdp_url,
+             "product_type": "Supplements"},
+            None,
+        )
+
+    monkeypatch.setattr(mar, "_run_wedge_audit_background", capture_background_run)
+    monkeypatch.setattr(bdcs, "fetch_curated_audit_product", fetch_without_vendor)
+
     body = client.post(_URL, json=_BODY).json()
     assert [p["title"] for p in body["audited_products"]] == [
-        "Merch Product A", "Merch Product B",
+        "Product A", "Product B",
     ]
-    assert [p["pdp_url"] for p in body["audited_products"]] == _BODY["product_urls"]
+    assert [p["vendor"] for p in body["audited_products"]] == ["Merch", "Merch"]
+    assert [p["title"] for p in captured_runs[-1]["audit_products"]] == [
+        "Product A", "Product B",
+    ]
+    assert [p["vendor"] for p in captured_runs[-1]["audit_products"]] == [
+        "Merch", "Merch",
+    ]
+
+    async def fetch_with_vendor(pdp_url):
+        handle = pdp_url.rstrip("/").rsplit("/", 1)[-1]
+        return (
+            {"title": f"Product {handle.upper()}",
+             "raw_title": f"[Bundle] Product {handle.upper()}, 2 pack",
+             "pdp_url": pdp_url,
+             "vendor": "Fetched Brand",
+             "product_type": "Supplements"},
+            None,
+        )
+
+    monkeypatch.setattr(bdcs, "fetch_curated_audit_product", fetch_with_vendor)
+    body = client.post(_URL, json=_BODY).json()
+    assert [p["title"] for p in body["audited_products"]] == [
+        "Product A", "Product B",
+    ]
+    assert [p["vendor"] for p in body["audited_products"]] == [
+        "Fetched Brand", "Fetched Brand",
+    ]
+    assert [p["vendor"] for p in captured_runs[-1]["audit_products"]] == [
+        "Fetched Brand", "Fetched Brand",
+    ]
 
 
 def test_free_cap_blocks_at_limit(client):

@@ -921,8 +921,8 @@ async def run_merchant_self_audit(
 _FREE_URL_AUDITS_PER_MERCHANT = int(
     _os.getenv("FREE_URL_AUDITS_PER_MERCHANT", "0")
 )
-# Two sequential upstream runs fit under the 60s probe timeout while keeping
-# a real evidence floor instead of binary 1-sample verdicts.
+# Two sequential upstream runs keep a real evidence floor instead of binary
+# 1-sample verdicts; the LLM probe timeout is sized for grounded searches.
 _WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
 _WEDGE_RUN_STALE_TTL_S = int(_os.getenv("WEDGE_RUN_STALE_TTL_S", "900"))
 
@@ -1048,22 +1048,6 @@ def _brand_name_from_domain(domain: Optional[str]) -> Optional[str]:
     return label.title() or None
 
 
-def _brand_qualify_title(brand: Optional[str], title: str) -> str:
-    """Prefix the brand to a product title for the buyer-intent search query
-    ('BB Lab Good Night Collagen') so the grounded search names the brand — a
-    bare product name doesn't ground to retailer listings, which scores a real
-    product a false visibility 0. The upstream builds queries from `title` and
-    the wedge runs only the first 2 (max_runs=2), so the brand must be IN the
-    title here. No-op when the brand is missing / the 'your brand' sentinel /
-    already present. (Backend workaround; the clean fix is reordering the
-    upstream query builder so vendor-anchored queries come first.)"""
-    t = (title or "").strip()
-    b = (brand or "").strip()
-    if not t or not b or b.lower() == "your brand" or b.lower() in t.lower():
-        return t
-    return f"{b} {t}"
-
-
 def _is_wedge_run_stale(requested_at: Any) -> bool:
     if not requested_at:
         return False
@@ -1164,11 +1148,17 @@ async def run_merchant_url_audit(
         or "your brand"
     )
 
-    # Brand-qualify each product's search title so the buyer-intent queries
-    # name the brand ("BB Lab Good Night Collagen"). raw_title (the original
-    # fetched title) is preserved by fetch for display/provenance.
-    for p in audit_products:
-        p["title"] = _brand_qualify_title(merchant_name, p.get("title") or "")
+    # Ensure each product carries a brand for the upstream's vendor-anchored
+    # buyer-intent query. Prefer the fetched Shopify vendor; fall back to the
+    # resolved merchant brand when absent. Title stays clean (no brand prefix -
+    # the upstream prepends the vendor, so prefixing here double-brands).
+    brand_for_vendor = (
+        merchant_name if merchant_name and merchant_name != "your brand" else None
+    )
+    if brand_for_vendor:
+        for p in audit_products:
+            if not (p.get("vendor") or "").strip():
+                p["vendor"] = brand_for_vendor
 
     # 4. Record the run; subject_type marks it for the free-allowance count.
     run_id = await record_audit_run_started(
@@ -1194,6 +1184,7 @@ async def run_merchant_url_audit(
                 "title": p["title"],
                 "raw_title": p.get("raw_title"),
                 "pdp_url": p["pdp_url"],
+                "vendor": p.get("vendor"),
             }
             for p in audit_products
         ],
