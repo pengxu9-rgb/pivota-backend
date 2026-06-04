@@ -72,6 +72,35 @@ _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
     "Deterministic first_party, sku_mention, and authority buckets are "
     "unchanged."
 )
+_SOURCE_ROLE_COMPETITOR_TYPES = {
+    "cdn",
+    "community",
+    "editorial",
+    "forum",
+    "marketplace",
+    "publisher",
+    "reddit",
+    "retailer",
+    "social",
+    "video",
+}
+_GENERIC_COMPETITOR_PHRASES = {
+    "n/a",
+    "na",
+    "none",
+    "no durable owner",
+    "no owner",
+    "no clear owner",
+    "no single owner",
+    "various",
+    "various brands",
+    "several",
+    "several brands",
+    "multiple brands",
+    "many brands",
+    "unknown",
+    "not available",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +297,7 @@ def _source_matches_merchant(
     *,
     merchant_host: Optional[str],
     merchant_brand: Optional[str],
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
 ) -> bool:
     """A grounding source counts as merchant-attribution when:
       - host matches the verified merchant host (rare with redirectors), OR
@@ -286,10 +316,53 @@ def _source_matches_merchant(
         # "BB Lab Global" but the cited source title says "BB Lab". Only
         # ADDS matches over the literal compare above (never removes one).
         if text_mentions_brand(
-            label_lower, derive_brand_aliases(merchant_brand, merchant_host)
+            label_lower,
+            derive_brand_aliases(
+                merchant_brand,
+                merchant_host,
+                _clean_identity_tuple(merchant_vendors),
+            ),
         ):
             return True
     return False
+
+
+def _clean_identity_tuple(values: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
+    out: List[str] = []
+    seen = set()
+    for value in values or ():
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            seen.add(key)
+            out.append(cleaned)
+    return tuple(out)
+
+
+def _merchant_identity_tuple(*values: Any) -> Tuple[str, ...]:
+    expanded: List[str] = []
+    for value in values:
+        if isinstance(value, dict):
+            for key in (
+                "merchant_name",
+                "merchant_brand",
+                "brand",
+                "brand_name",
+                "storefront_name",
+                "parent_brand",
+                "vendor",
+                "product_vendor",
+            ):
+                item = value.get(key)
+                if item:
+                    expanded.append(str(item))
+            continue
+        if isinstance(value, (list, tuple, set)):
+            expanded.extend(str(item) for item in value if item)
+            continue
+        if value:
+            expanded.append(str(value))
+    return _clean_identity_tuple(tuple(expanded))
 
 
 def extract_cited_hosts(
@@ -297,6 +370,7 @@ def extract_cited_hosts(
     *,
     merchant_host: Optional[str],
     merchant_brand: Optional[str] = None,
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
 ) -> Tuple[Counter, int, int]:
     """Walk every run's grounding sources and return:
       - Counter of {competitor_label: occurrences} — labels are
@@ -321,7 +395,10 @@ def extract_cited_hosts(
         run_competitor_labels = set()
         for src in sources:
             if _source_matches_merchant(
-                src, merchant_host=merchant_host, merchant_brand=merchant_brand,
+                src,
+                merchant_host=merchant_host,
+                merchant_brand=merchant_brand,
+                merchant_vendors=merchant_vendors,
             ):
                 merchant_in_run = True
             else:
@@ -424,6 +501,7 @@ def score_category_visibility(
     *,
     merchant_host: Optional[str],
     merchant_brand: Optional[str],
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """Re-score category-visibility runs from raw probe data.
 
@@ -488,7 +566,11 @@ def score_category_visibility(
     # name) so "BB Lab" in an answer matches a merchant recorded as
     # "BB Lab Global". Purely additive — the literal compare below is
     # unchanged; aliases only catch what it would have missed.
-    brand_aliases = derive_brand_aliases(merchant_brand, merchant_host)
+    brand_aliases = derive_brand_aliases(
+        merchant_brand,
+        merchant_host,
+        _clean_identity_tuple(merchant_vendors),
+    )
 
     def _brand_in(text: str) -> bool:
         if brand_lower:
@@ -607,6 +689,7 @@ def extract_category_competitors(
     *,
     merchant_host: Optional[str],
     merchant_brand: Optional[str],
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Aggregate the rich competitor data Gemini returns on category
     queries — currently dropped on the floor by the BD report. Two
@@ -630,7 +713,11 @@ def extract_category_competitors(
     host_lower = (merchant_host or "").strip().lower()
     # Phase B: alias set so the merchant's own aliased mentions ("BB Lab"
     # for "BB Lab Global") are deduped from competitors / retailers below.
-    brand_aliases = derive_brand_aliases(merchant_brand, merchant_host)
+    brand_aliases = derive_brand_aliases(
+        merchant_brand,
+        merchant_host,
+        _clean_identity_tuple(merchant_vendors),
+    )
     for run in runs or []:
         parsed = run.get("parsed") or {}
         run_brands = set()
@@ -647,6 +734,8 @@ def extract_category_competitors(
                 continue  # skip the merchant's own brand
             if text_mentions_brand(name_lower, brand_aliases):
                 continue  # Phase B: an alias of the merchant, not a rival
+            if not _valid_competitor_brand_candidate(name):
+                continue
             run_brands.add(name)
         for n in run_brands:
             brand_counter[n] += 1
@@ -681,6 +770,36 @@ def extract_category_competitors(
             "confidence": classification.get("confidence") or "fallback",
         })
     return (competitor_brands, retailer_hosts)
+
+
+def _valid_competitor_brand_candidate(name: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(name or "").strip())
+    if not cleaned:
+        return False
+    lowered = cleaned.lower().strip(" .,:;-/")
+    if lowered in _GENERIC_COMPETITOR_PHRASES:
+        return False
+    if any(
+        phrase in lowered
+        for phrase in (
+            "durable owner",
+            "clear owner",
+            "single owner",
+            "various brand",
+            "several brand",
+        )
+    ):
+        return False
+    if len(cleaned) > 80:
+        return False
+    tokens = re.findall(r"[A-Za-z0-9]+", cleaned)
+    if not tokens or not any(re.search(r"[A-Za-z]", token) for token in tokens):
+        return False
+    classification = classify_host(cleaned)
+    host_type = str(classification.get("type") or "unclassified").strip().lower()
+    if host_type in _SOURCE_ROLE_COMPETITOR_TYPES:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -8887,10 +9006,16 @@ def build_structured_report(
     # Store" → matches brand "Beauty of Joseon") is what catches
     # attribution through Vertex AI's redirector wrapper.
     merchant_brand = (product_vendor or merchant_name or "").strip() or None
+    merchant_identities = _merchant_identity_tuple(
+        merchant_name,
+        product_vendor,
+        brand_context,
+    )
     competitors, merchant_cited_runs, runs_with_any_citation = extract_cited_hosts(
         attribution_runs,
         merchant_host=merchant_host,
         merchant_brand=merchant_brand,
+        merchant_vendors=merchant_identities,
     )
 
     # Re-score category from raw_runs so brand text-matches in
@@ -8903,12 +9028,14 @@ def build_structured_report(
             category_runs,
             merchant_host=merchant_host,
             merchant_brand=merchant_brand,
+            merchant_vendors=merchant_identities,
         )
         category_competitor_brands, category_retailer_hosts = (
             extract_category_competitors(
                 category_runs,
                 merchant_host=merchant_host,
                 merchant_brand=merchant_brand,
+                merchant_vendors=merchant_identities,
             )
         )
     elif category_visibility_result is not None:

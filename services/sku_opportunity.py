@@ -61,6 +61,10 @@ _DOMAIN_TOKEN_RE = re.compile(
     r"(?<!@)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
     re.IGNORECASE,
 )
+_COMPARISON_TOKEN_RE = re.compile(
+    r"\b(?:alternatives?|dupes?|versus|vs|compare|compared|comparison)\b",
+    re.IGNORECASE,
+)
 
 
 def build_sku_opportunity(
@@ -138,6 +142,7 @@ def _score_prompt_group(
         or sku_ctx.get("merchant_brand")
     )
     merchant_host = _merchant_host(sku_ctx, product)
+    merchant_identities = _merchant_identity_values(sku_ctx, product)
     axis_metadata = _merged_axis_metadata(runs)
     axis = str(axis_metadata.get("axis") or "").strip().lower() or "unknown"
     query_class = _query_class(query, axis)
@@ -153,12 +158,14 @@ def _score_prompt_group(
         runs,
         merchant_host=merchant_host,
         merchant_brand=str(merchant_brand or ""),
+        merchant_vendors=merchant_identities,
     )
     source_route = _source_route(source_roles, sku_ctx)
     competitors, competitor_counts = _competitors_for_runs(
         runs,
         merchant_host=merchant_host,
         merchant_brand=str(merchant_brand or ""),
+        merchant_vendors=merchant_identities,
     )
     any_competitor_first_party = _any_competitor_first_party(runs, competitors)
     provider_analysis = _provider_analysis(runs, sku_ctx=sku_ctx, product=product)
@@ -217,6 +224,8 @@ def _score_prompt_group(
     substitution = _substitution(
         query=query,
         axis=axis,
+        sku_ctx=sku_ctx,
+        product=product,
         provider_analysis=provider_analysis,
         provider_verdicts=provider_verdicts,
         competitors=competitors,
@@ -663,6 +672,7 @@ def _competitors_for_runs(
     *,
     merchant_host: Optional[str],
     merchant_brand: str,
+    merchant_vendors: Tuple[str, ...] = (),
 ) -> Tuple[List[str], Counter]:
     counter: Counter = Counter()
     first_seen: Dict[str, int] = {}
@@ -685,6 +695,7 @@ def _competitors_for_runs(
         runs,
         merchant_host=merchant_host,
         merchant_brand=merchant_brand,
+        merchant_vendors=merchant_vendors,
     )
     for row in competitor_rows or []:
         normalized = _clean_competitor_name(row.get("name"))
@@ -977,27 +988,29 @@ def _substitution(
     *,
     query: str,
     axis: str,
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
     provider_analysis: Dict[str, Dict[str, Any]],
     provider_verdicts: Dict[str, str],
     competitors: List[str],
     competitor_counts: Counter,
 ) -> Dict[str, Any]:
-    comparison_axis = axis in {"comparison", "alternatives"} or any(
-        token in query
-        for token in (" alternative", " alternatives", " vs ", "compare")
+    comparison_signal = axis in {"comparison", "alternatives"} or bool(
+        _COMPARISON_TOKEN_RE.search(query or "")
     )
+    merchant_named = _query_mentions_merchant(query, sku_ctx=sku_ctx, product=product)
     product_absent_or_loss = not any(
         row.get("product_positive") or row.get("grounded_positive")
         for row in provider_analysis.values()
-    ) and any(verdict == "loss" for verdict in provider_verdicts.values())
-    if comparison_axis and product_absent_or_loss and competitors:
+    ) and any(verdict in {"loss", "absent"} for verdict in provider_verdicts.values())
+    if merchant_named and product_absent_or_loss and competitors:
         top = competitors[0]
         if competitor_counts.get(top, 0) < 2:
             top = _durable_competitor(competitor_counts) or top
         engines = sorted(
             provider
             for provider, verdict in provider_verdicts.items()
-            if verdict == "loss"
+            if verdict in {"loss", "absent"}
         )
         return {
             "present": True,
@@ -1005,6 +1018,7 @@ def _substitution(
             "prompt": query,
             "engines": engines,
         }
+    _ = comparison_signal  # Secondary signal is intentionally not the alert gate.
     return {"present": False}
 
 
@@ -1302,7 +1316,12 @@ def _intent_for(query: str, axis: str, axis_metadata: Mapping[str, Any]) -> Dict
     elif q.startswith(("best ", "top ", "what is the best ")) or axis == "category":
         weight = 1.0
         label = "category-purchase"
-    elif axis in {"review", "comparison"} or any(token in q for token in ("review", "alternative", " vs ", "worth")):
+    elif (
+        axis in {"review", "comparison"}
+        or "review" in q
+        or "worth" in q
+        or _COMPARISON_TOKEN_RE.search(q)
+    ):
         weight = 0.8
         label = "consideration"
     elif axis in {"objection", "brand-objection"}:
@@ -1432,6 +1451,66 @@ def _merchant_host(sku_ctx: Dict[str, Any], product: Dict[str, Any]) -> Optional
         or sku_ctx.get("canonical_url")
         or sku_ctx.get("pivota_canonical_url")
         or ""
+    )
+
+
+def _merchant_identity_values(sku_ctx: Dict[str, Any], product: Dict[str, Any]) -> Tuple[str, ...]:
+    sku = sku_ctx.get("sku") if isinstance(sku_ctx.get("sku"), dict) else {}
+    values = (
+        product.get("brand"),
+        product.get("vendor"),
+        sku_ctx.get("merchant_brand"),
+        sku_ctx.get("merchant_name"),
+        product.get("storefront_name"),
+        product.get("parent_brand"),
+        sku_ctx.get("storefront_name"),
+        sku_ctx.get("parent_brand"),
+        sku.get("brand"),
+        sku.get("vendor"),
+    )
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            seen.add(key)
+            out.append(cleaned)
+    return tuple(out)
+
+
+def _query_mentions_merchant(
+    query: str,
+    *,
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> bool:
+    sku = sku_ctx.get("sku") if isinstance(sku_ctx.get("sku"), dict) else {}
+    values: List[Any] = [
+        product.get("title"),
+        product.get("raw_title"),
+        product.get("brand"),
+        product.get("vendor"),
+        sku_ctx.get("merchant_brand"),
+        sku_ctx.get("merchant_name"),
+        sku_ctx.get("sku_title"),
+        sku.get("sku"),
+        sku.get("barcode"),
+        sku.get("gtin"),
+    ]
+    if _text_mentions_any(query, values):
+        return True
+
+    merchant_host = _merchant_host(sku_ctx, product)
+    primary = (
+        product.get("brand")
+        or product.get("vendor")
+        or sku_ctx.get("merchant_brand")
+        or sku_ctx.get("merchant_name")
+    )
+    return text_mentions_brand(
+        _norm_query(query),
+        derive_brand_aliases(str(primary or ""), merchant_host, _merchant_identity_values(sku_ctx, product)),
     )
 
 
