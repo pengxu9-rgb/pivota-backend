@@ -234,6 +234,20 @@ def test_us_shopper_resolves_deepseek_verify_provider():
     assert coverage["pending_engine_support"] == []
 
 
+def test_gemini_deepseek_resolves_dual_primary_providers():
+    from services.coverage_profiles import (
+        load_coverage_profile_config,
+        resolve_coverage_profile,
+    )
+
+    load_coverage_profile_config.cache_clear()
+    coverage = resolve_coverage_profile(coverage_profile="gemini_deepseek")
+    assert coverage["providers"] == ["gemini", "deepseek"]
+    assert coverage["verify_providers"] == []
+    assert coverage["pending_engine_support"] == []
+    assert coverage["provider_default_models"]["deepseek"] == "deepseek-chat"
+
+
 def test_identity_score_good_and_missing_data():
     from services.agent_center_bd_report_service import compute_identity_score
 
