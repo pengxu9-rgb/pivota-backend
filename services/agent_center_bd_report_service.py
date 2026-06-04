@@ -3483,6 +3483,13 @@ async def build_per_sku_report(
         probe_runs,
         fallback=provider_model_metadata,
     )
+    from services.sku_opportunity import build_sku_opportunity
+
+    opportunity = build_sku_opportunity(
+        sku_ctx,
+        probe_runs,
+        attribute_graph=build_sku_attribute_graph(product),
+    )
 
     if sku_ctx.get("missing_inputs") and not product.get("product_key"):
         null_breakdown = {
@@ -3550,6 +3557,7 @@ async def build_per_sku_report(
             verify_sample=None,
         ),
         "verify_outputs": verify_outputs or [],
+        "opportunity": opportunity,
     }
     return report
 
