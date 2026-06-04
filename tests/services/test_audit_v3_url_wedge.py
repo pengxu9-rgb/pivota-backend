@@ -334,7 +334,9 @@ async def test_background_runner_persists_scrubbed_result(client):
     assert payload["tier"] == "url_wedge"
     report = payload["brand_report"]
     assert payload["sku_intelligence"]["headline"].startswith("Nobody owns")
-    assert client.sku_intel_calls[0]["coverage_profile"] == "gemini_deepseek"
+    # Hero SKU runs the tri-prober (adds grounded ChatGPT); the brand report
+    # above stays gemini_deepseek so ChatGPT cost is hero-only.
+    assert client.sku_intel_calls[0]["coverage_profile"] == "gemini_deepseek_chatgpt"
     assert client.sku_intel_calls[0]["prompts_per_sku"] == 14
     assert client.sku_intel_calls[0]["hero_product"]["title"] == "P"
     # Honesty scrub applied in the runner.

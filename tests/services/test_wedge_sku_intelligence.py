@@ -204,6 +204,31 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_wedge_hero_sku_intelligence_tri_prober_includes_chatgpt(monkeypatch):
+    # The wedge hero SKU uses the gemini_deepseek_chatgpt profile: ChatGPT runs
+    # as a co-equal grounded prober and shows up as a third matrix column.
+    monkeypatch.setattr(bd, "_build_per_sku_audit_query_records", _four_money_shot_records)
+    calls = _install_probe(monkeypatch)
+
+    out = await bd.run_wedge_hero_sku_intelligence(
+        hero_product=_hero_product(),
+        merchant_id="merch-A",
+        run_id="run-url-1",
+        coverage_profile="gemini_deepseek_chatgpt",
+        prompts_per_sku=4,
+    )
+
+    assert {call["provider"] for call in calls} == {"gemini", "deepseek", "chatgpt"}
+    assert out["is_empty"] is False
+    assert all("chatgpt" in row for row in out["prompt_matrix"])
+    branded = next(
+        row for row in out["prompt_matrix"]
+        if "where can i buy" in row["query"].lower()
+    )
+    assert branded["chatgpt"] == "win"
+
+
+@pytest.mark.asyncio
 async def test_run_wedge_hero_sku_intelligence_mock_upstream_is_honest(monkeypatch):
     # Per-SKU honesty parity with the brand-report mock guard: if the upstream
     # returns fallback/mock data, do NOT fabricate a money-shot on synthetic

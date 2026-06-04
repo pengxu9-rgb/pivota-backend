@@ -25,7 +25,10 @@ from services.agent_center_bd_report_service import (
 from services.cited_host_classifier import classify_host
 
 
-_KNOWN_PROVIDERS = ("gemini", "deepseek")
+# Ordering/fallback for per-prompt provider verdicts. _expected_providers also
+# auto-discovers any provider present in the runs (so this list is for stable
+# ordering, not a gate) — chatgpt is added as the wedge hero-SKU tri-prober.
+_KNOWN_PROVIDERS = ("gemini", "deepseek", "chatgpt")
 _OWNED_PROVIDER_VERDICTS = {"win", "partial"}
 _SHOPPING_WORDS = {
     "buy",

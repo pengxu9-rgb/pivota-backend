@@ -4713,6 +4713,9 @@ def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
         "intent_ladder_layer": _sku_intelligence_ladder_layer(row),
         "gemini": verdicts.get("gemini", "absent"),
         "deepseek": verdicts.get("deepseek", "absent"),
+        # Present only when ChatGPT ran (OPENAI_API_KEY live); mock/no-key runs
+        # are filtered upstream so this stays "absent" until the key is set.
+        "chatgpt": verdicts.get("chatgpt", "absent"),
         "ownership_state": row.get("ownership_state"),
         "who_owns": _who_owns_prompt(row),
         "sources": _prompt_sources(row),
