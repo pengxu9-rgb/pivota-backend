@@ -104,6 +104,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "rows_skipped_no_title": 0,
         "rows_upserted": 0,
         "rows_skipped_no_op_in_dry_run": 0,
+        "rows_skipped_sig_collision": 0,
     }
     samples: List[Dict[str, Any]] = []
 
@@ -141,8 +142,16 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         if not args.apply:
             outcomes["rows_skipped_no_op_in_dry_run"] += 1
             continue
-        await database.execute(UPSERT_SQL, row_to_upsert_params(row))
-        outcomes["rows_upserted"] += 1
+        try:
+            await database.execute(UPSERT_SQL, row_to_upsert_params(row))
+            outcomes["rows_upserted"] += 1
+        except Exception as exc:  # noqa: BLE001 - skip sig collisions; never abort the whole run
+            msg = str(exc).lower()
+            if "unique" in msg or "duplicate key" in msg:
+                outcomes["rows_skipped_sig_collision"] += 1
+                logger.warning("skip sig-collision content_key=%s: %s", ck, exc)
+                continue
+            raise
 
     return {"outcome_counts": outcomes, "samples": samples}
 
