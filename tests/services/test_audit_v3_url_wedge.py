@@ -58,6 +58,7 @@ def client(monkeypatch):
     started: list = []
     completed: list = []
     brand_calls: list = []
+    sku_intel_calls: list = []
 
     async def fake_count(*, merchant_id, subject_type):
         return state["used"]
@@ -89,6 +90,27 @@ def client(monkeypatch):
         brand_calls.append(kwargs)
         return _canned_report()
 
+    async def fake_sku_intelligence(**kwargs):
+        sku_intel_calls.append(kwargs)
+        return {
+            "hero_sku": {
+                "title": (kwargs.get("hero_product") or {}).get("title"),
+                "pdp_url": (kwargs.get("hero_product") or {}).get("pdp_url"),
+                "vendor": (kwargs.get("hero_product") or {}).get("vendor"),
+            },
+            "headline": "Nobody owns `test lane` yet, and your product is exactly that - own it.",
+            "intent_ladder": {},
+            "top_open_lanes": [{
+                "query": "test lane",
+                "first_move": "Add a PDP section + FAQ for this lane",
+            }],
+            "substitution_alert": {"present": False},
+            "prompt_matrix": [],
+            "demand_state_summary": "open lane detected",
+            "coverage": {},
+            "is_empty": False,
+        }
+
     @asynccontextmanager
     async def fake_telemetry(*, run_id, merchant_id):
         yield
@@ -106,6 +128,7 @@ def client(monkeypatch):
     monkeypatch.setattr(mar, "record_audit_run_started", fake_started)
     monkeypatch.setattr(mar, "record_audit_run_completed", fake_completed)
     monkeypatch.setattr(mar, "run_brand_report", fake_brand_report)
+    monkeypatch.setattr(mar, "run_wedge_hero_sku_intelligence", fake_sku_intelligence)
     monkeypatch.setattr(bdcs, "fetch_curated_audit_product", fake_fetch)
     monkeypatch.setattr(atc, "audit_telemetry", fake_telemetry)
     monkeypatch.setattr(mar, "_FREE_URL_AUDITS_PER_MERCHANT", 2)
@@ -115,8 +138,8 @@ def client(monkeypatch):
     app.include_router(mar.router)
     app.dependency_overrides[auth_module.get_current_merchant] = lambda: "merch-A"
     c = TestClient(app)
-    c.state, c.started, c.completed, c.brand_calls = (
-        state, started, completed, brand_calls,
+    c.state, c.started, c.completed, c.brand_calls, c.sku_intel_calls = (
+        state, started, completed, brand_calls, sku_intel_calls,
     )
     return c
 
@@ -310,12 +333,74 @@ async def test_background_runner_persists_scrubbed_result(client):
     assert payload["status"] == "succeeded"
     assert payload["tier"] == "url_wedge"
     report = payload["brand_report"]
+    assert payload["sku_intelligence"]["headline"].startswith("Nobody owns")
+    assert client.sku_intel_calls[0]["coverage_profile"] == "gemini_deepseek"
+    assert client.sku_intel_calls[0]["prompts_per_sku"] == 14
+    assert client.sku_intel_calls[0]["hero_product"]["title"] == "P"
     # Honesty scrub applied in the runner.
     assert "industry_context" not in report
     assert "industry_context" not in report["per_product"][0]
     expl = report["aggregate"]["brand_verdict_explanation"]
     assert "did not verify" not in expl
     assert "iherb.com" in expl
+
+
+@pytest.mark.asyncio
+async def test_background_runner_selects_first_product_with_attributes(client, monkeypatch):
+    seen: list = []
+
+    async def fake_sku_intelligence(**kwargs):
+        seen.append(kwargs)
+        return {"is_empty": False, "headline": "ok"}
+
+    monkeypatch.setattr(mar, "run_wedge_hero_sku_intelligence", fake_sku_intelligence)
+
+    await mar._run_wedge_audit_background(
+        run_id="run-url-1",
+        merchant_id="merch-A",
+        merchant_name="BB Lab",
+        merchant_domain="bblab.shop",
+        audit_products=[
+            {"title": "No Attrs", "pdp_url": "https://m/p/1", "vendor": "BB Lab"},
+            {
+                "title": "Hero Attrs",
+                "pdp_url": "https://m/p/2",
+                "vendor": "BB Lab",
+                "attributes_raw": {"tags": ["halal"]},
+            },
+        ],
+        base_payload={},
+    )
+
+    assert seen[0]["hero_product"]["title"] == "Hero Attrs"
+    assert seen[0]["hero_product"]["_wedge_hero_index"] == 1
+    payload = client.completed[-1]["report_jsonb"]
+    assert "brand_report" in payload
+    assert payload["sku_intelligence"] == {"is_empty": False, "headline": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_background_runner_degrades_when_sku_intelligence_raises(client, monkeypatch):
+    async def boom(**kwargs):
+        raise RuntimeError("hero sku failed")
+
+    monkeypatch.setattr(mar, "run_wedge_hero_sku_intelligence", boom)
+
+    await mar._run_wedge_audit_background(
+        run_id="run-url-1",
+        merchant_id="merch-A",
+        merchant_name="BB Lab",
+        merchant_domain="bblab.shop",
+        audit_products=[{"title": "P", "pdp_url": "https://m/p/1"}],
+        base_payload={},
+    )
+
+    done = client.completed[-1]
+    assert done["status"] == "succeeded"
+    payload = done["report_jsonb"]
+    assert "brand_report" in payload
+    assert payload["sku_intelligence"]["is_empty"] is True
+    assert "hero sku failed" in payload["sku_intelligence"]["error_note"]
 
 
 @pytest.mark.asyncio

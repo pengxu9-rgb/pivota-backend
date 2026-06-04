@@ -119,3 +119,70 @@ async def test_consecutive_failures_bail_after_cap(monkeypatch) -> None:
 
     assert len(calls) == cap, f"expected bail after {cap} consecutive failures, got {len(calls)}"
     assert bd._flatten_probe_runs(out[SKU_KEY]) == []
+
+
+async def test_fanout_matches_shared_probe_per_sku_ctx(monkeypatch) -> None:
+    """Refactor regression: DB fan-out is just load_sku_context + shared loop."""
+    calls: List[Dict[str, Any]] = []
+    ctx = _sku_ctx()
+
+    async def _fake_sku_keys(products, merchant_id):
+        return [SKU_KEY]
+
+    async def _fake_load_ctx(sku_key, merchant_id):
+        assert sku_key == SKU_KEY
+        assert merchant_id == MERCHANT
+        return ctx
+
+    async def _fake_probe(*, scan_mode, scan_target_id, merchant_id, store_id,
+                          context, provider, max_runs, model=None,
+                          model_is_override=False):
+        calls.append({
+            "scan_target_id": scan_target_id,
+            "provider": provider,
+            "queries": list(context.get("queries") or []),
+        })
+        return {
+            "scan_mode": scan_mode,
+            "provider": provider,
+            "model": model,
+            "model_is_override": model_is_override,
+            "raw_runs": [
+                {
+                    "query": q,
+                    "parsed": {"product_visible": True, "correct_sku": True},
+                    "grounding_sources": [
+                        {"uri": ctx["product"]["canonical_url"], "title": "Ownist"}
+                    ],
+                }
+                for q in context.get("queries") or []
+            ],
+        }
+
+    monkeypatch.setattr(bd, "_sku_keys_for_per_sku_mode", _fake_sku_keys)
+    monkeypatch.setattr(bd, "load_sku_context", _fake_load_ctx)
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    fanout = await bd.run_per_sku_audit_probe_fanout(
+        merchant_id=MERCHANT,
+        audit_run_id="run_fanout_test",
+        products=[{"product_key": "p1"}],
+        coverage_profile="pilot_gemini",
+        prompts_per_sku=4,
+    )
+    coverage = bd.resolve_coverage_profile(coverage_profile="pilot_gemini")
+    provider_models = bd.resolve_provider_models(coverage["providers"])
+    direct = await bd._probe_per_sku_ctx(
+        sku_ctx=ctx,
+        merchant_id=MERCHANT,
+        coverage=coverage,
+        provider_model_metadata=provider_models,
+        prompts_per_sku=4,
+        audit_run_id="run_fanout_test",
+    )
+
+    assert fanout == {SKU_KEY: direct}
+    assert fanout[SKU_KEY][0]["scan_mode"] == "per_sku_audit"
+    assert fanout[SKU_KEY][0]["provider"] == "gemini"
+    assert fanout[SKU_KEY][0]["runs_count"] == 4
+    assert len(calls) == 2

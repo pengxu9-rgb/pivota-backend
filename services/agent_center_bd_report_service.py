@@ -2220,6 +2220,9 @@ def _flatten_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
             row = dict(probe)
             row.setdefault("_probe_run_id", probe.get("probe_run_id") or probe.get("run_id") or probe.get("id"))
             out.append(row)
+        else:
+            for nested in probe.values():
+                out.extend(_flatten_probe_runs(nested))
     return out
 
 
@@ -4515,6 +4518,422 @@ def _failed_per_sku_probe_payload(
     }
 
 
+async def _probe_per_sku_ctx(
+    *,
+    sku_ctx: Dict[str, Any],
+    merchant_id: str,
+    coverage: Mapping[str, Any],
+    provider_model_metadata: Mapping[str, Any],
+    prompts_per_sku: int,
+    audit_run_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Run the normalized per-SKU audit probe loop for an already-built ctx."""
+    safe_ctx = sku_ctx if isinstance(sku_ctx, dict) else {}
+    sku_key = str(safe_ctx.get("sku_key") or "").strip() or "sku"
+    target_prompts = max(1, int(prompts_per_sku or 0))
+    query_records = _build_per_sku_audit_query_records(safe_ctx, target_prompts)
+    query_specs = [
+        (str(record.get("query") or ""), str(record.get("axis") or "intent"))
+        for record in query_records
+    ]
+    query_metadata = _query_metadata_from_records(query_records)
+    out: List[Dict[str, Any]] = []
+    for provider_id in list((coverage or {}).get("providers") or []):
+        model_info = provider_model_metadata.get(provider_id) or {}
+        consecutive_failures = 0
+        for chunk_idx, chunk in enumerate(_chunk_query_specs(query_specs), start=1):
+            probe_run_id = (
+                f"{audit_run_id or 'adhoc'}:{sku_key}:"
+                f"{provider_id}:per_sku:{chunk_idx}"
+            )
+            try:
+                result = await llm_client.probe(
+                    scan_mode=_PER_SKU_AUDIT_PROBE_SCAN_MODE,
+                    scan_target_id=probe_run_id,
+                    merchant_id=str(merchant_id),
+                    store_id=f"{merchant_id}_audit",
+                    context=_per_sku_probe_context(safe_ctx, chunk),
+                    provider=provider_id,
+                    max_runs=len(chunk),
+                    model=model_info.get("model"),
+                    model_is_override=bool(
+                        model_info.get("model_is_override")
+                    ),
+                )
+                out.append(
+                    _normalize_per_sku_probe_payload(
+                        result=result,
+                        requested_provider=provider_id,
+                        sku_key=sku_key,
+                        sku_ctx=safe_ctx,
+                        query_specs=chunk,
+                        probe_run_id=probe_run_id,
+                        model_info=model_info,
+                        query_metadata=query_metadata,
+                    )
+                )
+                consecutive_failures = 0
+            except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
+                out.append(
+                    _failed_per_sku_probe_payload(
+                        provider=provider_id,
+                        sku_key=sku_key,
+                        sku_ctx=safe_ctx,
+                        probe_run_id=probe_run_id,
+                        error=str(exc),
+                        model_info=model_info,
+                    )
+                )
+                consecutive_failures += 1
+                # Don't let one transient chunk timeout zero the SKU: keep
+                # probing later chunks. Only bail this (sku, provider) once
+                # failures are CONSECUTIVE (provider likely down), so we
+                # don't burn the full timeout on every remaining chunk.
+                if consecutive_failures >= _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES:
+                    break
+    return out
+
+
+def _wedge_hero_index(hero_product: Mapping[str, Any]) -> int:
+    for key in ("hero_index", "_wedge_hero_index"):
+        try:
+            return max(0, int(hero_product.get(key)))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _wedge_product_key(hero_product: Mapping[str, Any], sku_key: str) -> str:
+    for key in ("product_key", "pdp_url", "canonical_url", "url", "title"):
+        value = str(hero_product.get(key) or "").strip()
+        if value:
+            return value
+    return sku_key
+
+
+def _wedge_hero_sku_ctx(
+    hero_product: Mapping[str, Any],
+    *,
+    merchant_id: str,
+) -> Dict[str, Any]:
+    hero_index = _wedge_hero_index(hero_product)
+    sku_key = f"wedge:{hero_index}"
+    title = str(hero_product.get("title") or hero_product.get("raw_title") or "Hero SKU").strip()
+    vendor = str(hero_product.get("vendor") or hero_product.get("brand") or "").strip()
+    pdp_url = str(
+        hero_product.get("pdp_url")
+        or hero_product.get("canonical_url")
+        or hero_product.get("url")
+        or ""
+    ).strip()
+    product_type = str(
+        hero_product.get("product_type")
+        or hero_product.get("category")
+        or "product"
+    ).strip()
+    attributes_raw = hero_product.get("attributes_raw")
+    product = {
+        "title": title,
+        "raw_title": hero_product.get("raw_title") or title,
+        "vendor": vendor,
+        "brand": vendor,
+        "product_type": product_type,
+        "attributes_raw": attributes_raw if isinstance(attributes_raw, dict) else {},
+        "canonical_url": pdp_url,
+        "pivota_canonical_url": None,
+    }
+    return {
+        "sku_key": sku_key,
+        "merchant_id": str(merchant_id),
+        "product_key": _wedge_product_key(hero_product, sku_key),
+        "product": product,
+        "sku": {"title": title, "sku_key": sku_key},
+    }
+
+
+def _first_move_for_lane(lane: Mapping[str, Any]) -> str:
+    ownership = str(lane.get("current_ownership") or "").lower()
+    source_route = str(lane.get("source_route") or "").lower()
+    if ownership in {"retailer-owned", "marketplace-owned"} or source_route in {"retailer", "marketplace"}:
+        return "Fix your listing on the cited retailer"
+    if ownership == "publisher-owned" or source_route == "publisher":
+        return "Pitch the cited publisher for roundup inclusion"
+    if ownership == "forum-owned" or source_route == "forum":
+        return "Build reviews/UGC"
+    return "Add a PDP section + FAQ for this lane"
+
+
+def _sku_intelligence_ladder_layer(row: Mapping[str, Any]) -> Optional[str]:
+    axis = str(row.get("axis") or "").lower()
+    query_class = str(row.get("query_class") or "").lower()
+    query = str(row.get("normalized_query") or row.get("query") or "").lower()
+    if query_class == "sidewalk" or axis == "sidewalk":
+        return "sidewalk_opportunity"
+    if axis in {"intent", "price", "brand", "identity"} or (
+        query_class == "branded" and any(t in query for t in ("buy", "price", "shop", "where"))
+    ):
+        return "branded_transactional"
+    if axis in {"review", "comparison"} or any(
+        token in query
+        for token in ("review", "reviews", "alternative", "alternatives", " vs ", "worth")
+    ):
+        return "branded_consideration"
+    if axis in {"objection", "brand-objection"} or query.startswith("is "):
+        return "objection"
+    if query_class == "head":
+        return "head_category"
+    if query_class in {"attribute", "category"}:
+        return "attribute_category"
+    return None
+
+
+def _who_owns_prompt(row: Mapping[str, Any]) -> Optional[Any]:
+    ownership = str(row.get("ownership_state") or "").lower()
+    competitors = row.get("competitors")
+    source_summary = row.get("source_summary") if isinstance(row.get("source_summary"), dict) else {}
+    top_hosts = source_summary.get("top_cited_hosts") or []
+    if ownership in {"competitor-owned", "retailer-owned", "publisher-owned", "forum-owned"}:
+        if competitors:
+            return competitors[0] if isinstance(competitors, list) else competitors
+        if top_hosts and isinstance(top_hosts[0], dict):
+            return top_hosts[0].get("host")
+    return None
+
+
+def _prompt_sources(row: Mapping[str, Any]) -> List[Any]:
+    source_summary = row.get("source_summary") if isinstance(row.get("source_summary"), dict) else {}
+    sources = source_summary.get("top_cited_hosts") or []
+    return sources[:3] if isinstance(sources, list) else []
+
+
+def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
+    verdicts = row.get("provider_verdicts") if isinstance(row.get("provider_verdicts"), dict) else {}
+    return {
+        "query": row.get("query"),
+        "intent_ladder_layer": _sku_intelligence_ladder_layer(row),
+        "gemini": verdicts.get("gemini", "absent"),
+        "deepseek": verdicts.get("deepseek", "absent"),
+        "ownership_state": row.get("ownership_state"),
+        "who_owns": _who_owns_prompt(row),
+        "sources": _prompt_sources(row),
+        "opportunity_score": row.get("opportunity_score"),
+    }
+
+
+def _lost_head_category_for_money_shot(
+    per_prompt: List[Dict[str, Any]],
+    product_type: str,
+) -> str:
+    candidates = [
+        row for row in per_prompt
+        if row.get("axis") == "category"
+        and row.get("ownership_state") != "merchant-owned"
+    ]
+    if not candidates:
+        return f"the broad {product_type or 'product'} category"
+    candidates.sort(
+        key=lambda row: (
+            float(row.get("opportunity_score") or 0),
+            str(row.get("query") or "").lower(),
+        )
+    )
+    return str(candidates[0].get("query") or "").strip() or f"the broad {product_type or 'product'} category"
+
+
+def _sku_intelligence_headline(
+    *,
+    opportunity: Mapping[str, Any],
+    title: str,
+    product_type: str,
+) -> str:
+    top_open_lanes = opportunity.get("top_open_lanes") or []
+    if not top_open_lanes:
+        prompt_count = len(opportunity.get("per_prompt") or [])
+        return (
+            f"We tested {prompt_count} buyer prompts for {title}. "
+            "No open lane stood out this run — here's how AI sees you today."
+        )
+    top_open_lane = str((top_open_lanes[0] or {}).get("query") or "").strip()
+    if not top_open_lane:
+        prompt_count = len(opportunity.get("per_prompt") or [])
+        return (
+            f"We tested {prompt_count} buyer prompts for {title}. "
+            "No open lane stood out this run — here's how AI sees you today."
+        )
+    lost_head_category = _lost_head_category_for_money_shot(
+        list(opportunity.get("per_prompt") or []),
+        product_type,
+    )
+    if lost_head_category.startswith("the broad "):
+        return (
+            f"Nobody owns `{top_open_lane}` yet, and your product is exactly "
+            "that — own it."
+        )
+    return (
+        f"You lost `{lost_head_category}`, but nobody owns `{top_open_lane}` "
+        "and your product is exactly that. Build this page and source trail now."
+    )
+
+
+def _display_sku_intelligence(
+    *,
+    sku_ctx: Dict[str, Any],
+    opportunity: Mapping[str, Any],
+) -> Dict[str, Any]:
+    product = _get_product(sku_ctx or {})
+    title = str(product.get("title") or sku_ctx.get("sku_key") or "this product")
+    product_type = str(product.get("product_type") or product.get("category") or "product")
+    per_prompt = [
+        row for row in (opportunity.get("per_prompt") or [])
+        if isinstance(row, dict)
+    ]
+    sidewalk_open_queries = {
+        row.get("query")
+        for row in per_prompt
+        if row.get("open_lane")
+        and _sku_intelligence_ladder_layer(row) == "sidewalk_opportunity"
+    }
+    open_lanes = [
+        lane for lane in (opportunity.get("top_open_lanes") or [])
+        if isinstance(lane, dict)
+        and lane.get("query") in sidewalk_open_queries
+    ]
+    lanes = [
+        {**dict(lane), "first_move": _first_move_for_lane(lane)}
+        for lane in open_lanes[:3]
+    ]
+    matrix_rows = [
+        _trim_sku_intelligence_prompt(row)
+        for row in per_prompt
+    ]
+    matrix_rows.sort(
+        key=lambda row: (
+            -float(row.get("opportunity_score") or 0),
+            str(row.get("query") or "").lower(),
+        )
+    )
+    is_empty = len(lanes) == 0
+    display_opportunity = dict(opportunity)
+    display_opportunity["top_open_lanes"] = lanes
+    return {
+        "hero_sku": {
+            "title": title,
+            "pdp_url": product.get("canonical_url") or product.get("pdp_url"),
+            "vendor": product.get("vendor") or product.get("brand"),
+        },
+        "headline": _sku_intelligence_headline(
+            opportunity=display_opportunity,
+            title=title,
+            product_type=product_type,
+        ),
+        "intent_ladder": opportunity.get("intent_ladder") or {},
+        "top_open_lanes": lanes,
+        "substitution_alert": opportunity.get("substitution_alert") or {"present": False},
+        "prompt_matrix": matrix_rows,
+        "demand_state_summary": opportunity.get("demand_state_summary"),
+        "coverage": opportunity.get("confidence") or {},
+        "is_empty": is_empty,
+    }
+
+
+def _empty_sku_intelligence(
+    sku_ctx: Optional[Dict[str, Any]] = None,
+    *,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Honest empty-state SKU intelligence: hero context + a clear reason, never
+    a fabricated lane. Used when the per-SKU upstream is mock/unavailable."""
+    product = _get_product(sku_ctx or {})
+    out: Dict[str, Any] = {
+        "hero_sku": {
+            "title": product.get("title"),
+            "pdp_url": product.get("canonical_url") or product.get("pdp_url"),
+            "vendor": product.get("vendor") or product.get("brand"),
+        },
+        "headline": note or (
+            "No open lane stood out this run — here's how AI sees you today."
+        ),
+        "intent_ladder": {},
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+        "prompt_matrix": [],
+        "demand_state_summary": None,
+        "coverage": {},
+        "is_empty": True,
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
+async def run_wedge_hero_sku_intelligence(
+    *,
+    hero_product: Dict[str, Any],
+    merchant_id: str,
+    run_id: str,
+    coverage_profile: str,
+    prompts_per_sku: int = 14,
+) -> Dict[str, Any]:
+    """Run the hero URL-fetched wedge product through per-SKU opportunity."""
+    if not isinstance(hero_product, dict) or not hero_product:
+        return {
+            "hero_sku": {"title": None, "pdp_url": None, "vendor": None},
+            "headline": (
+                "We tested 0 buyer prompts for this product. No open lane "
+                "stood out this run — here's how AI sees you today."
+            ),
+            "intent_ladder": {},
+            "top_open_lanes": [],
+            "substitution_alert": {"present": False},
+            "prompt_matrix": [],
+            "demand_state_summary": None,
+            "coverage": {},
+            "is_empty": True,
+        }
+    sku_ctx = _wedge_hero_sku_ctx(hero_product, merchant_id=str(merchant_id))
+    attribute_graph = build_sku_attribute_graph(_get_product(sku_ctx))
+    coverage = resolve_coverage_profile(coverage_profile=coverage_profile)
+    profile_providers = list(coverage.get("providers") or [])
+    provider_model_metadata = resolve_provider_models(profile_providers)
+    probe_runs = await _probe_per_sku_ctx(
+        sku_ctx=sku_ctx,
+        merchant_id=str(merchant_id),
+        coverage=coverage,
+        provider_model_metadata=provider_model_metadata,
+        prompts_per_sku=prompts_per_sku,
+        audit_run_id=run_id,
+    )
+    # Honesty parity with the brand-report mock guard (_detect_mock_per_product):
+    # the per-SKU probes are a SEPARATE upstream call, so a transient fallback
+    # here can produce synthetic runs even when the brand report was real. Drop
+    # mock-provider runs; if no real signal remains, return the honest
+    # empty-state rather than fabricate a money-shot on synthetic data.
+    real_runs = [
+        run for run in probe_runs
+        if _classify_provider(str((run or {}).get("provider") or "")).get("is_real")
+    ]
+    if probe_runs and not real_runs:
+        return _empty_sku_intelligence(
+            sku_ctx,
+            note=(
+                "We couldn't verify this product against live AI search this "
+                "run — the upstream returned fallback data. Try again shortly."
+            ),
+        )
+
+    from services.sku_opportunity import build_sku_opportunity
+
+    opportunity = build_sku_opportunity(
+        sku_ctx,
+        {sku_ctx["sku_key"]: real_runs},
+        attribute_graph=attribute_graph,
+    )
+    return _display_sku_intelligence(
+        sku_ctx=sku_ctx,
+        opportunity=opportunity,
+    )
+
+
 async def run_per_sku_audit_probe_fanout(
     *,
     merchant_id: str,
@@ -4548,66 +4967,14 @@ async def run_per_sku_audit_probe_fanout(
     out: Dict[str, List[Dict[str, Any]]] = {}
     for sku_key in sku_keys:
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
-        query_records = _build_per_sku_audit_query_records(sku_ctx, target_prompts)
-        query_specs = [
-            (str(record.get("query") or ""), str(record.get("axis") or "intent"))
-            for record in query_records
-        ]
-        query_metadata = _query_metadata_from_records(query_records)
-        out[sku_key] = []
-        for provider_id in profile_providers:
-            model_info = provider_model_metadata.get(provider_id) or {}
-            consecutive_failures = 0
-            for chunk_idx, chunk in enumerate(_chunk_query_specs(query_specs), start=1):
-                probe_run_id = (
-                    f"{audit_run_id or 'adhoc'}:{sku_key}:"
-                    f"{provider_id}:per_sku:{chunk_idx}"
-                )
-                try:
-                    result = await llm_client.probe(
-                        scan_mode=_PER_SKU_AUDIT_PROBE_SCAN_MODE,
-                        scan_target_id=probe_run_id,
-                        merchant_id=str(merchant_id),
-                        store_id=f"{merchant_id}_audit",
-                        context=_per_sku_probe_context(sku_ctx, chunk),
-                        provider=provider_id,
-                        max_runs=len(chunk),
-                        model=model_info.get("model"),
-                        model_is_override=bool(
-                            model_info.get("model_is_override")
-                        ),
-                    )
-                    out[sku_key].append(
-                        _normalize_per_sku_probe_payload(
-                            result=result,
-                            requested_provider=provider_id,
-                            sku_key=sku_key,
-                            sku_ctx=sku_ctx,
-                            query_specs=chunk,
-                            probe_run_id=probe_run_id,
-                            model_info=model_info,
-                            query_metadata=query_metadata,
-                        )
-                    )
-                    consecutive_failures = 0
-                except Exception as exc:  # noqa: BLE001 - isolate provider/chunk
-                    out[sku_key].append(
-                        _failed_per_sku_probe_payload(
-                            provider=provider_id,
-                            sku_key=sku_key,
-                            sku_ctx=sku_ctx,
-                            probe_run_id=probe_run_id,
-                            error=str(exc),
-                            model_info=model_info,
-                        )
-                    )
-                    consecutive_failures += 1
-                    # Don't let one transient chunk timeout zero the SKU: keep
-                    # probing later chunks. Only bail this (sku, provider) once
-                    # failures are CONSECUTIVE (provider likely down), so we
-                    # don't burn the full timeout on every remaining chunk.
-                    if consecutive_failures >= _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES:
-                        break
+        out[sku_key] = await _probe_per_sku_ctx(
+            sku_ctx=sku_ctx,
+            merchant_id=str(merchant_id),
+            coverage=coverage,
+            provider_model_metadata=provider_model_metadata,
+            prompts_per_sku=target_prompts,
+            audit_run_id=audit_run_id,
+        )
     return out
 
 
