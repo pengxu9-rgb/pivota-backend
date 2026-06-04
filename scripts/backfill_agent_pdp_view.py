@@ -199,16 +199,18 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 async def run_agent_pdp_view_sweep(*, limit: int = 0) -> Dict[str, Any]:
-    """Scheduler entry point (registered in services/audit_scheduler.py at
-    03:30 UTC, ahead of the 04:00 nightly_index_health classifier).
+    """Scheduler entry point (registered on a 30-minute interval in
+    services/audit_scheduler.py).
 
     Incrementally materializes agent_pdp_view for content_keys that are
-    missing or stale, so newly-crawled products enter the serving
-    projection before the classifier reads it. The Stage 3a-iii inline
-    writer normally keeps apv fresh on every seed commit; this sweep is the
-    safety net that prevents silent stranding (the 2026-05/06 incident,
-    where ~1,800 products fell out of serving for ~3 weeks because the
-    materialization had stalled).
+    missing or stale, so newly-crawled products — mirrored into
+    catalog_products by the 15-min external_seed_catalog_materialization
+    tick, which does NOT write agent_pdp_view — enter the serving
+    projection within ~30 min. The Stage 3a-iii inline writer keeps apv
+    fresh on seed-edit/authoring paths; this sweep covers the bulk
+    materialization path the inline writer misses (the 2026-05/06 incident,
+    where ~1,800 products fell out of serving because the manual apv
+    backfill stopped on 2026-05-21).
 
     Never raises — errors are caught and returned in the summary so a
     failure surfaces in logs rather than killing the scheduler.

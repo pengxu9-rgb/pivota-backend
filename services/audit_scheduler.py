@@ -106,22 +106,24 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
-        # agent_pdp_view incremental materialization sweep. Runs 30 min
-        # ahead of nightly_index_health (04:00) so newly-crawled products
-        # enter the serving projection before the classifier reads it. The
-        # Stage 3a-iii inline writer normally keeps apv fresh on every seed
-        # commit; this sweep is the safety net against silent stranding
-        # (2026-05/06 incident: materialization stalled ~3 weeks, ~1,800
-        # products fell out of serving).
+        # agent_pdp_view incremental materialization sweep. Runs every 30
+        # min so newly-crawled products (mirrored into catalog_products by
+        # the 15-min external_seed_catalog_materialization tick, which does
+        # NOT write agent_pdp_view) enter the serving projection within ~30
+        # min instead of waiting for a daily batch. The Stage 3a-iii inline
+        # writer keeps apv fresh on seed-edit/authoring paths; this sweep is
+        # the safety net that covers the bulk materialization path the
+        # inline writer misses (2026-05/06 incident: the manual apv backfill
+        # stopped on 2026-05-21 and ~1,800 products fell out of serving).
+        # Incremental + coalesce + max_instances=1 keep it cheap and
+        # non-overlapping.
         from scripts.backfill_agent_pdp_view import run_agent_pdp_view_sweep
         scheduler.add_job(
             run_agent_pdp_view_sweep,
-            "cron",
-            hour=3,
-            minute=30,
+            "interval",
+            minutes=30,
             id="agent_pdp_view_sweep",
             replace_existing=True,
-            misfire_grace_time=3600,
             coalesce=True,
             max_instances=1,
         )
