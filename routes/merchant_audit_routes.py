@@ -1322,7 +1322,7 @@ async def _run_wedge_audit_background(
                 merchant_name=merchant_name,
                 merchant_domain=merchant_domain,
                 products=audit_products,
-                provider="gemini",
+                coverage_profile="gemini_deepseek",
                 merchant_id=merchant_id,
                 audit_run_id=run_id,
                 # Bounded concurrency + parallel scan modes still help when the

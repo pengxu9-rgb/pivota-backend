@@ -130,8 +130,15 @@ def _build_system_prompt(scan_mode: str) -> str:
     structured JSON matching the field set the downstream scorer
     expects.
     """
+    grounded_search_instruction = (
+        "You have live web search. SEARCH THE WEB for the user's query "
+        "before answering. The canonical signal is the cited sources "
+        "you retrieve, not your own knowledge. If you retrieved no "
+        "source, set the boolean false. "
+    )
     if scan_mode == "open_product_visibility_test":
         return (
+            grounded_search_instruction +
             "You are a shopping assistant. When asked about a product, "
             "respond ONLY with a JSON object of this exact shape: "
             '{"product_visible": <bool>, "competitors_listed": '
@@ -145,6 +152,7 @@ def _build_system_prompt(scan_mode: str) -> str:
         )
     if scan_mode == "merchant_store_attribution_test":
         return (
+            grounded_search_instruction +
             "You are a shopping assistant. When asked where to buy a "
             "product, respond ONLY with a JSON object of this exact "
             'shape: {"merchant_url_found": <bool>, "evidence_excerpt": '
@@ -156,6 +164,7 @@ def _build_system_prompt(scan_mode: str) -> str:
         )
     if scan_mode == "category_visibility_test":
         return (
+            grounded_search_instruction +
             "You are a shopping research assistant. When asked about "
             "the best products in a category, respond ONLY with a "
             'JSON object of this exact shape: {"brand_appears": '

@@ -100,6 +100,35 @@ def test_max_runs_caps_query_count():
 
 
 # ---------------------------------------------------------------------
+# Prompt grounding instructions
+# ---------------------------------------------------------------------
+
+
+def test_primary_scan_prompts_require_web_search_and_cited_sources():
+    from services.llm_providers.deepseek_probe import _build_system_prompt
+
+    for scan_mode in (
+        "open_product_visibility_test",
+        "merchant_store_attribution_test",
+        "category_visibility_test",
+    ):
+        prompt = _build_system_prompt(scan_mode)
+        assert "web search" in prompt
+        assert "SEARCH THE WEB" in prompt
+        assert "cited sources" in prompt
+
+
+def test_answer_quality_verify_prompt_stays_ungrounded():
+    from services.llm_providers import deepseek_probe
+
+    prompt = deepseek_probe._build_system_prompt(
+        deepseek_probe.ANSWER_QUALITY_VERIFY_SCAN_MODE
+    )
+    assert "SEARCH THE WEB" not in prompt
+    assert "cited sources" not in prompt
+
+
+# ---------------------------------------------------------------------
 # Response parsing
 # ---------------------------------------------------------------------
 
@@ -988,6 +1017,55 @@ async def test_agent_center_llm_client_routes_deepseek_to_local_path(
     assert called_with["scan_mode"] == "open_product_visibility_test"
     assert called_with["product_title"] == "Greens Gummies"
     assert called_with["merchant_brand"] == "Grüns"
+
+
+@pytest.mark.asyncio
+async def test_agent_center_llm_client_deepseek_accepts_nested_product_context(
+    monkeypatch,
+):
+    from services import agent_center_llm_client
+    from services.llm_providers import deepseek_probe
+    from config import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "deepseek_api_key", "test-key")
+
+    called_with: Dict[str, Any] = {}
+
+    async def fake_probe_one_scan_mode(**kwargs):
+        called_with.update(kwargs)
+        return {
+            "scan_mode": kwargs.get("scan_mode"),
+            "provider": "deepseek",
+            "runs_count": 1,
+            "scores": {"visibility_score": 50, "attribution_echo_rate": 0},
+            "findings": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "raw_runs": [],
+        }
+
+    monkeypatch.setattr(deepseek_probe, "probe_one_scan_mode", fake_probe_one_scan_mode)
+
+    result = await agent_center_llm_client.probe(
+        scan_mode="open_product_visibility_test",
+        scan_target_id="prod_123",
+        merchant_id="merch_test",
+        store_id="store_test",
+        context={
+            "product": {
+                "title": "X",
+                "vendor": "B",
+                "product_type": "T",
+            },
+            "merchant_pdp_url": "https://brand.example/p/x",
+        },
+        provider="deepseek",
+        max_runs=1,
+    )
+
+    assert result["provider"] == "deepseek"
+    assert called_with["product_title"] == "X"
+    assert called_with["merchant_brand"] == "B"
+    assert called_with["product_type"] == "T"
 
 
 @pytest.mark.asyncio

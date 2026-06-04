@@ -286,7 +286,13 @@ async def _probe_via_deepseek(
             "provider='deepseek' probes."
         )
     ctx = dict(context or {})
-    product_title = (ctx.get("product_title") or "").strip()
+    prod = ctx.get("product") or {}
+    product_title = (
+        ctx.get("product_title") or prod.get("title") or ""
+    ).strip()
+    product_type = ctx.get("product_type") or prod.get("product_type")
+    merchant_brand = ctx.get("merchant_brand") or prod.get("vendor")
+    merchant_pdp_url = ctx.get("merchant_pdp_url")
     if not product_title:
         # Without product context the probe queries are meaningless;
         # surface as caller error so the route layer maps to 422.
@@ -305,9 +311,9 @@ async def _probe_via_deepseek(
                 return await probe_one_scan_mode(
                     scan_mode=scan_mode,
                     product_title=product_title,
-                    product_type=ctx.get("product_type"),
-                    merchant_brand=ctx.get("merchant_brand"),
-                    merchant_pdp_url=ctx.get("merchant_pdp_url"),
+                    product_type=product_type,
+                    merchant_brand=merchant_brand,
+                    merchant_pdp_url=merchant_pdp_url,
                     verify_query=ctx.get("verify_query"),
                     verify_answer_text=ctx.get("verify_answer_text"),
                     verify_evidence_excerpt=ctx.get("verify_evidence_excerpt"),

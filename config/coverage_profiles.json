@@ -1,6 +1,6 @@
 {
   "default_profile": "us_shopper",
-  "engine_supported_providers": ["mock", "gemini", "chatgpt", "claude"],
+  "engine_supported_providers": ["mock", "gemini", "chatgpt", "claude", "deepseek"],
   "verify_supported_providers": ["deepseek"],
   "default_verify_sample": {
     "positive_fraction": 0.25,
@@ -8,6 +8,7 @@
   },
   "provider_default_models": {
     "chatgpt": "chat-latest",
+    "deepseek": "deepseek-chat",
     "gemini": "gemini-2.5-flash"
   },
   "profiles": {
@@ -22,6 +23,12 @@
       "providers": ["gemini"],
       "verify_providers": ["deepseek"],
       "notes": "Phased pilot profile: isolate Gemini citation + DeepSeek answer-quality verify; ChatGPT added later via us_shopper once this phase validates."
+    },
+    "gemini_deepseek": {
+      "label": "Gemini + DeepSeek (dual grounded)",
+      "providers": ["gemini", "deepseek"],
+      "verify_providers": [],
+      "notes": "Both run as primary grounded citation probers; results combine via MAX with per-provider drill-down. Validates the multi-LLM path before adding OpenAI/Claude."
     },
     "full": {
       "label": "Full Coverage",

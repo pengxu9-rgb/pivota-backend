@@ -299,6 +299,7 @@ async def test_background_runner_persists_scrubbed_result(client):
     )
     # Wedge opts into bounded concurrency + parallel scan modes.
     call = client.brand_calls[0]
+    assert call["coverage_profile"] == "gemini_deepseek"
     assert call["product_concurrency"] == 1
     assert call["parallel_scan_modes"] is True
     assert call["max_runs"] == 2
