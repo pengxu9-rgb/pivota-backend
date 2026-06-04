@@ -42,6 +42,10 @@ from services.coverage_profiles import (
     resolve_provider_models,
 )
 from services.pivota_indexing_arc import compute_indexing_arc_state
+from services.sku_sidewalk import (
+    build_sku_attribute_graph,
+    generate_sidewalk_query_specs,
+)
 
 
 _ANSWER_QUALITY_VERIFY_SCAN_MODE = "answer_quality_verify"
@@ -3945,10 +3949,9 @@ def _dedupe_query_specs(specs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return out
 
 
-def _build_per_sku_audit_query_specs(
+def _build_per_sku_base_query_specs(
     sku_ctx: Dict[str, Any],
-    prompts_per_sku: int,
-) -> List[Tuple[str, str]]:
+) -> Tuple[List[Tuple[str, str]], str, str]:
     product = _get_product(sku_ctx or {})
     sku = _get_sku(sku_ctx or {})
     brand = product.get("brand") or product.get("vendor") or ""
@@ -4036,18 +4039,298 @@ def _build_per_sku_audit_query_specs(
         specs.append((f"{title} {bullet}", "content"))
 
     specs = _dedupe_query_specs(specs)
-    target = max(1, int(prompts_per_sku or 0))
-    if len(specs) >= target:
-        return specs[:target]
+    return specs, title, str(product_type or "product")
+
+
+def _query_tuple_records(
+    specs: List[Tuple[str, str]],
+) -> List[Dict[str, Any]]:
+    return [{"query": query, "axis": axis} for query, axis in specs]
+
+
+def _dedupe_query_spec_records(
+    records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        query = str(record.get("query") or "").strip()
+        if not query:
+            continue
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        row = dict(record)
+        row["query"] = query
+        row["axis"] = str(row.get("axis") or "intent").strip() or "intent"
+        out.append(row)
+    return out
+
+
+def _fill_per_sku_query_records(
+    records: List[Dict[str, Any]],
+    *,
+    target: int,
+    title: str,
+) -> List[Dict[str, Any]]:
+    records = _dedupe_query_spec_records(records)
+    target = max(1, int(target or 0))
+    if len(records) >= target:
+        return records[:target]
 
     axes = ("intent", "review", "comparison", "price", "category")
     idx = 1
-    while len(specs) < target:
+    while len(records) < target:
         axis = axes[(idx - 1) % len(axes)]
-        specs.append((f"{title} shopper question {idx}", axis))
-        specs = _dedupe_query_specs(specs)
+        records.append({"query": f"{title} shopper question {idx}", "axis": axis})
+        records = _dedupe_query_spec_records(records)
         idx += 1
-    return specs[:target]
+    return records[:target]
+
+
+def _product_has_attributes_raw(product: Mapping[str, Any]) -> bool:
+    attrs = product.get("attributes_raw")
+    if not isinstance(attrs, dict):
+        return False
+    return any(value not in (None, "", [], {}) for value in attrs.values())
+
+
+def _sidewalk_query_records_for_sku(
+    sku_ctx: Dict[str, Any],
+    *,
+    title: str,
+    product_type: str,
+    prompts_per_sku: int,
+) -> List[Dict[str, Any]]:
+    product = _get_product(sku_ctx or {})
+    if not _product_has_attributes_raw(product):
+        return []
+
+    graph = build_sku_attribute_graph(product)
+    target = 16 if int(prompts_per_sku or 0) > 16 else 6
+    specs = generate_sidewalk_query_specs(
+        graph,
+        title=title,
+        product_type=product_type,
+        n=target,
+        sku_ctx=sku_ctx,
+    )
+    records: List[Dict[str, Any]] = []
+    for spec in specs:
+        query = str(spec.get("query") or "").strip()
+        if not query:
+            continue
+        records.append({
+            "query": query,
+            "axis": "sidewalk",
+            "attribute_basis": list(spec.get("attribute_basis") or []),
+            "evidence": list(spec.get("evidence") or []),
+            "intent_weight": float(spec.get("intent_weight") or 0.0),
+        })
+    return _dedupe_query_spec_records(records)
+
+
+def _append_records(
+    out: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+    *,
+    limit: int,
+) -> None:
+    if limit <= 0:
+        return
+    seen = {str(item.get("query") or "").strip().lower() for item in out}
+    for record in candidates:
+        query = str(record.get("query") or "").strip()
+        if not query:
+            continue
+        key = query.lower()
+        if key in seen:
+            continue
+        out.append(record)
+        seen.add(key)
+        if len(out) >= limit:
+            return
+
+
+def _take_axis_records(
+    records: List[Dict[str, Any]],
+    axes: set[str],
+    *,
+    count: int,
+    selected: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    taken: List[Dict[str, Any]] = []
+    seen = {str(item.get("query") or "").strip().lower() for item in selected}
+    for record in records:
+        if str(record.get("axis") or "") not in axes:
+            continue
+        query = str(record.get("query") or "").strip()
+        if not query or query.lower() in seen:
+            continue
+        taken.append(record)
+        seen.add(query.lower())
+        if len(taken) >= count:
+            break
+    return taken
+
+
+def _sidewalk_budget(target: int, available: int) -> int:
+    if available <= 0:
+        return 0
+    if target >= 14:
+        desired = min(6, max(4, target - 10))
+    elif target >= 12:
+        desired = 4
+    else:
+        desired = max(1, target // 3)
+    return min(available, desired)
+
+
+def _budgeted_wedge_query_records(
+    *,
+    base_records: List[Dict[str, Any]],
+    sidewalk_records: List[Dict[str, Any]],
+    target: int,
+    title: str,
+) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    _append_records(
+        selected,
+        _take_axis_records(
+            base_records, {"intent"}, count=3, selected=selected,
+        ),
+        limit=target,
+    )
+    _append_records(
+        selected,
+        _take_axis_records(
+            base_records, {"review", "comparison"}, count=3, selected=selected,
+        ),
+        limit=target,
+    )
+    _append_records(
+        selected,
+        _take_axis_records(
+            base_records, {"category"}, count=3, selected=selected,
+        ),
+        limit=target,
+    )
+    _append_records(
+        selected,
+        sidewalk_records[:_sidewalk_budget(target, len(sidewalk_records))],
+        limit=target,
+    )
+    _append_records(
+        selected,
+        _take_axis_records(
+            base_records, {"brand", "objection", "identity"},
+            count=2,
+            selected=selected,
+        ),
+        limit=target,
+    )
+
+    selected_keys = {
+        str(record.get("query") or "").strip().lower()
+        for record in selected
+    }
+    remaining_base = [
+        record for record in base_records
+        if str(record.get("query") or "").strip().lower() not in selected_keys
+    ]
+    remaining_sidewalk = [
+        record for record in sidewalk_records
+        if str(record.get("query") or "").strip().lower() not in selected_keys
+    ]
+    return _fill_per_sku_query_records(
+        selected + remaining_base + remaining_sidewalk,
+        target=target,
+        title=title,
+    )
+
+
+def _build_per_sku_audit_query_records(
+    sku_ctx: Dict[str, Any],
+    prompts_per_sku: int,
+) -> List[Dict[str, Any]]:
+    base_specs, title, product_type = _build_per_sku_base_query_specs(sku_ctx or {})
+    target = max(1, int(prompts_per_sku or 0))
+    base_records = _query_tuple_records(base_specs)
+    sidewalk_records = _sidewalk_query_records_for_sku(
+        sku_ctx or {},
+        title=title,
+        product_type=product_type,
+        prompts_per_sku=target,
+    )
+    if not sidewalk_records:
+        return _fill_per_sku_query_records(
+            base_records,
+            target=target,
+            title=title,
+        )
+    if target <= 16:
+        return _budgeted_wedge_query_records(
+            base_records=base_records,
+            sidewalk_records=sidewalk_records,
+            target=target,
+            title=title,
+        )
+    return _fill_per_sku_query_records(
+        base_records + sidewalk_records,
+        target=target,
+        title=title,
+    )
+
+
+def _query_metadata_from_records(
+    records: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if record.get("axis") != "sidewalk":
+            continue
+        query = str(record.get("query") or "").strip()
+        if not query:
+            continue
+        metadata[query] = {
+            "axis": "sidewalk",
+            "attribute_basis": list(record.get("attribute_basis") or []),
+            "evidence": list(record.get("evidence") or []),
+            "intent_weight": float(record.get("intent_weight") or 0.0),
+        }
+    return metadata
+
+
+def _build_per_sku_audit_query_metadata(
+    sku_ctx: Dict[str, Any],
+    prompts_per_sku: int,
+) -> Dict[str, Dict[str, Any]]:
+    """Expose sidewalk evidence beside the legacy tuple prompt API.
+
+    `_build_per_sku_audit_query_specs` must keep returning `(query, axis)`
+    tuples for existing probe callers. This sibling is the rendering seam for
+    later pieces that need query -> attribute_basis/evidence without changing
+    that tuple contract.
+    """
+    return _query_metadata_from_records(
+        _build_per_sku_audit_query_records(sku_ctx or {}, prompts_per_sku)
+    )
+
+
+def _build_per_sku_audit_query_specs(
+    sku_ctx: Dict[str, Any],
+    prompts_per_sku: int,
+) -> List[Tuple[str, str]]:
+    return [
+        (str(record.get("query") or ""), str(record.get("axis") or "intent"))
+        for record in _build_per_sku_audit_query_records(
+            sku_ctx or {},
+            prompts_per_sku,
+        )
+    ]
 
 
 def _chunk_query_specs(
@@ -4107,12 +4390,17 @@ def _normalize_per_sku_probe_payload(
     query_specs: List[Tuple[str, str]],
     probe_run_id: str,
     model_info: Mapping[str, Any],
+    query_metadata: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     payload = dict(result or {})
     actual_provider = str(
         payload.get("provider") or requested_provider
     ).strip().lower()
     axis_by_query = {query.strip().lower(): axis for query, axis in query_specs}
+    metadata_by_query = {
+        str(query or "").strip().lower(): dict(meta or {})
+        for query, meta in (query_metadata or {}).items()
+    }
     product = _get_product(sku_ctx or {})
     canonical_url = product.get("canonical_url") or sku_ctx.get("canonical_url")
     pivota_url = (
@@ -4140,6 +4428,17 @@ def _normalize_per_sku_probe_payload(
             "source": "v3_per_sku_audit",
             "upstream_scan_mode": payload.get("scan_mode"),
         })
+        sidewalk_meta = metadata_by_query.get(query.lower())
+        if sidewalk_meta:
+            meta.update({
+                "sidewalk_attribute_basis": list(
+                    sidewalk_meta.get("attribute_basis") or []
+                ),
+                "sidewalk_evidence": list(sidewalk_meta.get("evidence") or []),
+                "sidewalk_intent_weight": float(
+                    sidewalk_meta.get("intent_weight") or 0.0
+                ),
+            })
         row["axis_metadata"] = meta
         if not isinstance(row.get("url_match"), dict):
             row["url_match"] = {
@@ -4241,7 +4540,12 @@ async def run_per_sku_audit_probe_fanout(
     out: Dict[str, List[Dict[str, Any]]] = {}
     for sku_key in sku_keys:
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
-        query_specs = _build_per_sku_audit_query_specs(sku_ctx, target_prompts)
+        query_records = _build_per_sku_audit_query_records(sku_ctx, target_prompts)
+        query_specs = [
+            (str(record.get("query") or ""), str(record.get("axis") or "intent"))
+            for record in query_records
+        ]
+        query_metadata = _query_metadata_from_records(query_records)
         out[sku_key] = []
         for provider_id in profile_providers:
             model_info = provider_model_metadata.get(provider_id) or {}
@@ -4274,6 +4578,7 @@ async def run_per_sku_audit_probe_fanout(
                             query_specs=chunk,
                             probe_run_id=probe_run_id,
                             model_info=model_info,
+                            query_metadata=query_metadata,
                         )
                     )
                     consecutive_failures = 0

@@ -40,13 +40,15 @@ async def test_fetch_curated_shopify_native_first(monkeypatch):
         "https://bblab.shop/products/collagen-glow"
     )
     assert reason is None
-    assert product == {
+    expected_existing_keys = {
         "title": "Collagen Glow",
         "raw_title": "[Bundle] Collagen Glow (Marine Collagen), 30 sticks x 2box",
         "pdp_url": "https://bblab.shop/products/collagen-glow",
         "vendor": "BB Lab",
         "product_type": "Supplements",
     }
+    assert {key: product[key] for key in expected_existing_keys} == expected_existing_keys
+    assert product["attributes_raw"]["source"] == "shopify_native"
 
 
 @pytest.mark.asyncio

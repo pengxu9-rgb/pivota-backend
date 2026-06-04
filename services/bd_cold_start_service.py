@@ -30,6 +30,7 @@ Honesty rules:
 from __future__ import annotations
 
 import asyncio
+from html import unescape
 import json
 import logging
 import re
@@ -135,10 +136,197 @@ _OG_META_REV_RE = re.compile(  # content-before-property attribute ordering
     r'(?:property|name)=["\']og:title["\']',
     re.IGNORECASE | re.DOTALL,
 )
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_SCRIPT_STYLE_RE = re.compile(
+    r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL,
+)
+_ATTRIBUTE_TEXT_CAP = 2000
+_ATTRIBUTE_BODY_HTML_CAP = 4000
+_ATTRIBUTE_VARIANT_CAP = 20
+_ATTRIBUTE_OPTION_VALUE_CAP = 25
 
 
 def _clean_title_surface(title: str) -> str:
     return re.sub(r"\s+", " ", title or "").strip(" \t\r\n,.;:-|/")
+
+
+def _cap_text(value: Any, limit: int = _ATTRIBUTE_TEXT_CAP) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"\s+", " ", text)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip()
+
+
+def _strip_html_to_text(value: Any, limit: int = _ATTRIBUTE_TEXT_CAP) -> Optional[str]:
+    """Keep product-copy evidence usable without adding a parser dependency."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    without_script = _HTML_SCRIPT_STYLE_RE.sub(" ", raw)
+    without_tags = _HTML_TAG_RE.sub(" ", without_script)
+    return _cap_text(unescape(without_tags), limit=limit)
+
+
+def _normalize_tags(raw_tags: Any) -> List[str]:
+    if isinstance(raw_tags, str):
+        items = raw_tags.split(",")
+    elif isinstance(raw_tags, list):
+        items = raw_tags
+    else:
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        tag = _cap_text(item, limit=120)
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
+
+
+def _compact_shopify_variants(raw_variants: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_variants, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for variant in raw_variants[:_ATTRIBUTE_VARIANT_CAP]:
+        if not isinstance(variant, dict):
+            continue
+        row: Dict[str, Any] = {}
+        for key in ("title", "price", "option1", "option2", "option3"):
+            value = _cap_text(variant.get(key), limit=160)
+            if value is not None:
+                row[key] = value
+        if "available" in variant:
+            row["available"] = bool(variant.get("available"))
+        if row:
+            out.append(row)
+    return out
+
+
+def _compact_shopify_options(raw_options: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_options, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for option in raw_options:
+        if not isinstance(option, dict):
+            continue
+        name = _cap_text(option.get("name"), limit=120)
+        values_raw = option.get("values")
+        values: List[str] = []
+        if isinstance(values_raw, list):
+            for item in values_raw[:_ATTRIBUTE_OPTION_VALUE_CAP]:
+                value = _cap_text(item, limit=120)
+                if value:
+                    values.append(value)
+        row: Dict[str, Any] = {}
+        if name:
+            row["name"] = name
+        if values:
+            row["values"] = values
+        if row:
+            out.append(row)
+    return out
+
+
+def _compact_shopify_images(raw_images: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_images, list):
+        return None
+    first_url: Optional[str] = None
+    for image in raw_images:
+        if isinstance(image, dict):
+            first_url = _cap_text(
+                image.get("src") or image.get("url") or image.get("original_src"),
+                limit=500,
+            )
+        elif isinstance(image, str):
+            first_url = _cap_text(image, limit=500)
+        if first_url:
+            break
+    return {"count": len(raw_images), **({"first_url": first_url} if first_url else {})}
+
+
+def _compact_jsonld_offers(raw_offers: Any) -> List[Dict[str, Any]]:
+    offers = raw_offers if isinstance(raw_offers, list) else [raw_offers]
+    out: List[Dict[str, Any]] = []
+    for offer in offers[:_ATTRIBUTE_VARIANT_CAP]:
+        if not isinstance(offer, dict):
+            continue
+        row: Dict[str, Any] = {}
+        for key in ("price", "priceCurrency", "availability"):
+            value = _cap_text(offer.get(key), limit=160)
+            if value is not None:
+                row[key] = value
+        if row:
+            out.append(row)
+    return out
+
+
+def _compact_jsonld_rating(raw_rating: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_rating, dict):
+        return None
+    row: Dict[str, Any] = {}
+    for key in ("ratingValue", "reviewCount"):
+        value = _cap_text(raw_rating.get(key), limit=80)
+        if value is not None:
+            row[key] = value
+    return row or None
+
+
+def _jsonld_brand_name(raw_brand: Any) -> Optional[str]:
+    if isinstance(raw_brand, dict):
+        return _cap_text(raw_brand.get("name"), limit=160)
+    if isinstance(raw_brand, str):
+        return _cap_text(raw_brand, limit=160)
+    return None
+
+
+def _shopify_attributes_raw(product: Dict[str, Any]) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {"source": "shopify_native"}
+    tags = _normalize_tags(product.get("tags"))
+    if tags:
+        attrs["tags"] = tags
+    body_html = _cap_text(product.get("body_html"), limit=_ATTRIBUTE_BODY_HTML_CAP)
+    if body_html:
+        attrs["body_html"] = body_html
+        attrs["description"] = _strip_html_to_text(body_html)
+    variants = _compact_shopify_variants(product.get("variants"))
+    if variants:
+        attrs["variants"] = variants
+    options = _compact_shopify_options(product.get("options"))
+    if options:
+        attrs["options"] = options
+    product_type = _cap_text(product.get("product_type"), limit=160)
+    if product_type:
+        attrs["product_type"] = product_type
+    handle = _cap_text(product.get("handle"), limit=240)
+    if handle:
+        attrs["handle"] = handle
+    images = _compact_shopify_images(product.get("images"))
+    if images:
+        attrs["images"] = images
+    return attrs
+
+
+def _pdp_attributes_raw(meta: Dict[str, Any]) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {"source": "pdp_metadata"}
+    for key in ("description", "brand", "category", "product_type"):
+        value = meta.get(key)
+        if value is not None:
+            attrs[key] = value
+    offers = meta.get("offers")
+    if offers:
+        attrs["offers"] = offers
+    rating = meta.get("aggregateRating")
+    if rating:
+        attrs["aggregateRating"] = rating
+    return attrs
 
 
 def _token_count(title: str) -> int:
@@ -211,8 +399,9 @@ def _walk_jsonld_for_product(node: Any) -> Optional[Dict[str, Any]]:
 async def _fetch_pdp_metadata(pdp_url: str) -> Optional[Dict[str, Any]]:
     """Fetch a generic (non-Shopify) PDP's HTML and extract clean product data
     from schema.org JSON-LD (`Product`) with an OpenGraph title fallback.
-    Returns {title, vendor, product_type} or None. Best-effort — the caller
-    treats None as 'could not resolve a product at this URL'."""
+    Returns {title, vendor, product_type} plus optional Product attributes, or
+    None. Best-effort — the caller treats None as 'could not resolve a product
+    at this URL'."""
     if not pdp_url:
         return None
     try:
@@ -236,6 +425,11 @@ async def _fetch_pdp_metadata(pdp_url: str) -> Optional[Dict[str, Any]]:
     title: Optional[str] = None
     vendor: Optional[str] = None
     product_type: Optional[str] = None
+    description: Optional[str] = None
+    offers: List[Dict[str, Any]] = []
+    aggregate_rating: Optional[Dict[str, Any]] = None
+    brand_name: Optional[str] = None
+    category_name: Optional[str] = None
 
     # 1. JSON-LD Product — the structured, authoritative source.
     for block in _JSON_LD_RE.findall(html):
@@ -247,14 +441,15 @@ async def _fetch_pdp_metadata(pdp_url: str) -> Optional[Dict[str, Any]]:
         if not product:
             continue
         title = (str(product.get("name") or "")).strip() or None
-        brand = product.get("brand")
-        if isinstance(brand, dict):
-            vendor = (str(brand.get("name") or "")).strip() or None
-        elif isinstance(brand, str):
-            vendor = brand.strip() or None
+        brand_name = _jsonld_brand_name(product.get("brand"))
+        vendor = brand_name
         category = product.get("category")
         if isinstance(category, str):
-            product_type = category.strip() or None
+            category_name = category.strip() or None
+            product_type = category_name
+        description = _cap_text(product.get("description"))
+        offers = _compact_jsonld_offers(product.get("offers"))
+        aggregate_rating = _compact_jsonld_rating(product.get("aggregateRating"))
         if title:
             break
 
@@ -266,7 +461,16 @@ async def _fetch_pdp_metadata(pdp_url: str) -> Optional[Dict[str, Any]]:
 
     if not title:
         return None
-    return {"title": title, "vendor": vendor, "product_type": product_type}
+    return {
+        "title": title,
+        "vendor": vendor,
+        "product_type": product_type,
+        **({"description": description} if description else {}),
+        **({"offers": offers} if offers else {}),
+        **({"aggregateRating": aggregate_rating} if aggregate_rating else {}),
+        **({"brand": brand_name} if brand_name else {}),
+        **({"category": category_name} if category_name else {}),
+    }
 
 
 async def fetch_curated_audit_product(
@@ -306,6 +510,7 @@ async def fetch_curated_audit_product(
                 "product_type": (
                     (str(native.get("product_type") or "")).strip() or None
                 ),
+                "attributes_raw": _shopify_attributes_raw(native),
             }, None
 
     # 2. Generic PDP: schema.org JSON-LD Product + OpenGraph fallback.
@@ -318,6 +523,7 @@ async def fetch_curated_audit_product(
             "pdp_url": url,
             "vendor": meta.get("vendor"),
             "product_type": meta.get("product_type"),
+            "attributes_raw": _pdp_attributes_raw(meta),
         }, None
 
     return None, (
