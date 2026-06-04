@@ -41,6 +41,7 @@ from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
 )
+from services.next_best_action import build_next_best_action
 from services.pivota_indexing_arc import compute_indexing_arc_state
 from services.sku_sidewalk import (
     build_sku_attribute_graph,
@@ -8829,7 +8830,7 @@ def _build_merchant_view(
         and brand_audited_against.lower() != storefront_name.lower()
     )
 
-    return {
+    merchant_view = {
         "headline": {
             "verdict_label": verdict_label,
             # Client-facing softer rendering of verdict_label. Used by
@@ -8947,6 +8948,13 @@ def _build_merchant_view(
         ),
         "pivota_value_prop": what_pivota_changes,
     }
+    merchant_view["next_best_action"] = build_next_best_action(
+        merchant_view=merchant_view,
+        competitive_pressure=competitive_pressure,
+        integration_state=integration_state,
+        is_cold_start=_is_cold_start_audit(integration_state),
+    )
+    return merchant_view
 
 
 def build_structured_report(

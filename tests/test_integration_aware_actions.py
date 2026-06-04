@@ -157,6 +157,10 @@ async def test_get_integration_state_handles_missing_helpers_gracefully(monkeypa
 
 
 def test_merchant_view_prepends_integration_action_when_state_incomplete():
+    """Use a half-integrated state here. The both-missing state is the
+    cold-start audit sentinel and is intentionally suppressed by
+    _build_merchant_view so cold BD audits do not lead with integration.
+    """
     from services.agent_center_bd_report_service import (
         VERDICT_INVISIBLE,
         _build_merchant_view,
@@ -185,7 +189,7 @@ def test_merchant_view_prepends_integration_action_when_state_incomplete():
         url_source=None,
         merchant_brand="TestBrand",
         merchant_host=None,
-        integration_state=_state(store=False, psp=False),
+        integration_state=_state(store=True, psp=False),
     )
     actions = mv["actions"]
     assert len(actions) >= 1
