@@ -31,12 +31,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 
 from utils.logger import logger
 
 _REGISTRY_PATH = Path(__file__).resolve().parent.parent / "data" / "cited_host_registry.json"
 _REGISTRY_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_REGISTRY_ALIAS_CACHE: Optional[Dict[str, str]] = None
 _CDN_HOST_SUFFIXES = (
     "ctfassets.net",
     "cloudfront.net",
@@ -51,7 +53,7 @@ def _load_registry() -> Dict[str, Dict[str, Any]]:
     on read/parse failure so audit pipelines never crash because BD
     happened to ship malformed JSON — they just degrade to all hosts
     being unclassified."""
-    global _REGISTRY_CACHE
+    global _REGISTRY_CACHE, _REGISTRY_ALIAS_CACHE
     if _REGISTRY_CACHE is not None:
         return _REGISTRY_CACHE
     try:
@@ -89,7 +91,66 @@ def _load_registry() -> Dict[str, Dict[str, Any]]:
         for k, v in raw_hosts.items()
         if isinstance(v, dict) and (k or "").strip()
     }
+    _REGISTRY_ALIAS_CACHE = None
     return _REGISTRY_CACHE
+
+
+def _normalize_host_key(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if raw.startswith(("http://", "https://")):
+        raw = re.sub(r"^https?://", "", raw)
+    raw = raw.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip(".")
+    if raw.startswith("www."):
+        raw = raw[4:]
+    return raw
+
+
+def _normalize_alias(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"^https?://", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _alias_index(registry: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    global _REGISTRY_ALIAS_CACHE
+    if _REGISTRY_ALIAS_CACHE is not None:
+        return _REGISTRY_ALIAS_CACHE
+    aliases: Dict[str, str] = {}
+    for host, entry in registry.items():
+        for alias in entry.get("aliases") or []:
+            normalized = _normalize_alias(alias)
+            if len(normalized) >= 3 and normalized not in aliases:
+                aliases[normalized] = host
+    _REGISTRY_ALIAS_CACHE = aliases
+    return _REGISTRY_ALIAS_CACHE
+
+
+# Aliases that are also common English words — resolve them ONLY on an exact
+# match, never as a substring, so a coincidental title like "best collagen for
+# your target audience" can't be mis-attributed to target.com. Real citations
+# titled "Amazon.com: ..." still resolve via domain-token extraction upstream.
+_COMMON_WORD_ALIASES = {"target", "amazon"}
+
+
+def _resolve_alias(value: str, registry: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    normalized = _normalize_alias(value)
+    if not normalized:
+        return None
+    aliases = _alias_index(registry)
+    exact = aliases.get(normalized)
+    if exact:
+        return exact
+    padded = f" {normalized} "
+    matches = [
+        (alias, host)
+        for alias, host in aliases.items()
+        if alias not in _COMMON_WORD_ALIASES and f" {alias} " in padded
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (-len(item[0]), item[1]))
+    return matches[0][1]
 
 
 def _unclassified(host: Optional[str]) -> Dict[str, Any]:
@@ -120,6 +181,27 @@ def _unclassified(host: Optional[str]) -> Dict[str, Any]:
         out["editorial_cadence"] = None
         out["ai_grounding_weight"] = None
         out["expected_outreach_cycle_weeks"] = None
+    return out
+
+
+def _default_known_host(host: str) -> Optional[Dict[str, Any]]:
+    if not (
+        host in _DEFAULT_TIER_BY_HOST
+        or host in _DEFAULT_CADENCE_BY_HOST
+        or host in _DEFAULT_GROUNDING_WEIGHT_BY_HOST
+    ):
+        return None
+    out = _unclassified(host)
+    out["type"] = "editorial"
+    out["confidence"] = "default_map"
+    out["subtype"] = "review_site"
+    out["tier"] = _default_tier_for_host(host, "editorial")
+    out["editorial_cadence"] = _default_cadence_for_host(host)
+    out["ai_grounding_weight"] = _default_grounding_weight_for_host(host)
+    out["expected_outreach_cycle_weeks"] = _default_outreach_cycle_weeks(
+        out["editorial_cadence"],
+        "editorial",
+    )
     return out
 
 
@@ -304,12 +386,20 @@ def classify_host(
     if not host:
         return _unclassified(host)
 
-    h = host.strip().lower()
+    h = _normalize_host_key(host)
     registry = _load_registry()
     entry = registry.get(h)
     if not entry:
+        alias_host = _resolve_alias(host, registry)
+        if alias_host:
+            h = alias_host
+            entry = registry.get(h)
+    if not entry:
         if _matches_cdn_suffix(h):
             return _cdn_fallback(h)
+        known = _default_known_host(h) if registry else None
+        if known:
+            return known
         return _unclassified(h)
 
     categories = list(entry.get("categories") or [])
@@ -387,5 +477,6 @@ def classify_cited_hosts(
 def reset_registry_cache() -> None:
     """Test hook — drop the in-memory cache so the next lookup
     re-reads from disk. Used by tests that monkeypatch `_REGISTRY_PATH`."""
-    global _REGISTRY_CACHE
+    global _REGISTRY_CACHE, _REGISTRY_ALIAS_CACHE
     _REGISTRY_CACHE = None
+    _REGISTRY_ALIAS_CACHE = None
