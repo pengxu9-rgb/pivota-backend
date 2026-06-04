@@ -2446,6 +2446,40 @@ def _text_mentions_any(text: str, values: List[Any]) -> bool:
     return False
 
 
+def _has_structured_citation_boolean(
+    parsed: Dict[str, Any],
+    run: Dict[str, Any],
+    llm_report: Dict[str, Any],
+) -> bool:
+    for key in ("product_visible", "correct_sku", "sku_mentioned"):
+        if (
+            isinstance(parsed.get(key), bool)
+            or isinstance(run.get(key), bool)
+            or isinstance(llm_report.get(key), bool)
+        ):
+            return True
+    return False
+
+
+def _citation_text_denies_product(text: str) -> bool:
+    haystack = _norm_text(text)
+    if not haystack:
+        return False
+    denial_phrases = (
+        "no listing",
+        "no listings",
+        "cannot find",
+        "cant find",
+        "could not find",
+        "couldnt find",
+        "not available",
+        "does not match",
+        "doesnt match",
+        "not the product",
+    )
+    return any(phrase in haystack for phrase in denial_phrases)
+
+
 def _is_first_party_host(host: Optional[str], sku_ctx: Dict[str, Any]) -> bool:
     if not host:
         return False
@@ -2917,14 +2951,26 @@ def compute_citation_score(
             first_party_hits += 1
 
         # Affirmative structured signal that the provider actually surfaced the SKU.
+        # correct_sku=True remains independently affirmative; a mere
+        # sku_mentioned=True echo does not override an explicit negative verdict.
         affirmative_sku = (
-            parsed.get("sku_mentioned") is True
-            or parsed.get("correct_sku") is True
-            or llm_report.get("sku_mentioned") is True
+            parsed.get("correct_sku") is True
             or llm_report.get("correct_sku") is True
+            or (
+                (
+                    parsed.get("sku_mentioned") is True
+                    or llm_report.get("sku_mentioned") is True
+                )
+                and not negative_verdict
+            )
         )
         text_mention = _text_mentions_any(text, [title, sku_title, variant_name])
-        if affirmative_sku or (text_mention and not negative_verdict):
+        text_only_denial = (
+            text_mention
+            and not _has_structured_citation_boolean(parsed, run, llm_report)
+            and _citation_text_denies_product(text)
+        )
+        if affirmative_sku or (text_mention and not negative_verdict and not text_only_denial):
             sku_mentions += 1
 
         source_hosts = [normalize_host(url) for url in _source_urls(run)]
@@ -2942,8 +2988,13 @@ def compute_citation_score(
                 and not negative_verdict
             )
         )
-        if parsed.get("authority_near_variant_found") is True or llm_report.get("authority_near_variant_found") is True or (
-            external_source_present and authority_affirmed
+        near_variant_found = (
+            parsed.get("authority_near_variant_found") is True
+            or llm_report.get("authority_near_variant_found") is True
+        )
+        if external_source_present and (
+            authority_affirmed
+            or (near_variant_found and not negative_verdict)
         ):
             authority_hits += 1
 

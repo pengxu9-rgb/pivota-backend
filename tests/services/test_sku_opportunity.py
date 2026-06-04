@@ -568,6 +568,94 @@ def test_real_open_lane_survives():
     assert opp["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
 
 
+def test_grounded_denial_does_not_create_demand_or_open_lane():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "parsed": {},
+            "sources": [
+                {"uri": "https://glossary-one.example/acai", "title": "Acai glossary"},
+                {"uri": "https://glossary-two.example/collagen", "title": "Collagen overview"},
+                {"uri": "https://nutrition-notes.example/beauty", "title": "Nutrition notes"},
+            ],
+            "raw": "I don't have enough information to identify a buyer recommendation.",
+            "axis_metadata": _sidewalk_meta(),
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["demand_signal"] == 0.0
+    assert row["ownership_state"] == "no-demand"
+    assert row["demand_state"] == "no-demand"
+    assert row["open_lane"] is False
+    assert opp["top_open_lanes"] == []
+
+
+def test_weak_single_source_demand_is_not_primary_open_lane():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = [{
+        "provider": "gemini",
+        "probe_run_id": "probe-gemini",
+        "raw_runs": [
+            _run(
+                query="halal collagen sticks before bed",
+                axis="sidewalk",
+                provider="gemini",
+                parsed={},
+                sources=[
+                    {"uri": "https://niche-notes.example/halal-collagen", "title": "Niche collagen notes"},
+                ],
+                raw="One niche source says shoppers can buy halal collagen sticks before bed.",
+                axis_metadata=_sidewalk_meta(),
+            )
+        ],
+    }]
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["demand_signal"] == 0.4
+    assert row["confidence"] < 0.8
+    assert row["open_lane"] is False
+    assert opp["top_open_lanes"] == []
+
+
+def test_branded_only_summary_marks_unbranded_not_measured():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "where can I buy BB Lab Good Night Collagen",
+            "axis": "intent",
+            "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
+            "sources": [
+                {"uri": "https://bblab.shop/products/good-night-collagen", "title": "BB Lab PDP"},
+            ],
+            "raw": "BB Lab Good Night Collagen is available from BB Lab.",
+            "in_grounding": True,
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+
+    assert opp["intent_ladder"]["branded_transactional"]["score"] >= 70
+    assert opp["intent_ladder"]["head_category"]["prompts"] == 0
+    assert opp["intent_ladder"]["attribute_category"]["prompts"] == 0
+    assert opp["demand_state_summary"] == "branded demand protected, unbranded not measured"
+
+
 def test_demand_state_summary_branded_protected_unbranded_absent():
     # branded wins + category lost to a durable competitor + NO open lanes
     # => "branded demand protected, unbranded absent" (not "open lane detected").
