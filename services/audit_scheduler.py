@@ -106,6 +106,45 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # agent_pdp_view incremental materialization sweep. Runs 30 min
+        # ahead of nightly_index_health (04:00) so newly-crawled products
+        # enter the serving projection before the classifier reads it. The
+        # Stage 3a-iii inline writer normally keeps apv fresh on every seed
+        # commit; this sweep is the safety net against silent stranding
+        # (2026-05/06 incident: materialization stalled ~3 weeks, ~1,800
+        # products fell out of serving).
+        from scripts.backfill_agent_pdp_view import run_agent_pdp_view_sweep
+        scheduler.add_job(
+            run_agent_pdp_view_sweep,
+            "cron",
+            hour=3,
+            minute=30,
+            id="agent_pdp_view_sweep",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # Freshness watchdog. Alerts (Sentry) if the materialization or the
+        # classifier has not advanced in >25h, or if image-bearing products
+        # pile up outside agent_pdp_view. Runs at 05:00, after the 04:00
+        # classifier should have finished. Cannot self-detect the scheduler
+        # being fully down — pair with an external uptime / log-absence alert.
+        from jobs.index_pipeline_freshness_check import (
+            run_index_pipeline_freshness_check,
+        )
+        scheduler.add_job(
+            run_index_pipeline_freshness_check,
+            "cron",
+            hour=5,
+            minute=0,
+            id="index_pipeline_freshness_check",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+
         # P2.2: drive queued audit_runs through the async lifecycle.
         # No production traffic flows here until P2.3 ships POST
         # /api/audits, so the tick is a safe no-op until then. 10s

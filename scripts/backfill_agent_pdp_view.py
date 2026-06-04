@@ -84,20 +84,50 @@ async def _fetch_content_keys(*, limit: int, offset: int) -> List[str]:
     return [r["content_key"] for r in rows or []]
 
 
+async def _fetch_stale_content_keys(*, limit: int = 0) -> List[str]:
+    """content_keys that need (re)materialization: either missing from
+    agent_pdp_view entirely, or whose catalog_products row changed after
+    the last agent_pdp_view refresh. Drives the daily incremental sweep so
+    it only touches rows that actually need work (vs the full-table
+    _fetch_content_keys window used by the one-shot backfill).
+    """
+    limit_clause = "LIMIT :limit" if limit > 0 else ""
+    sql = f"""
+        SELECT DISTINCT cp.content_key
+        FROM catalog_products cp
+        LEFT JOIN agent_pdp_view apv ON apv.content_key = cp.content_key
+        WHERE cp.content_key IS NOT NULL
+          AND (
+            apv.content_key IS NULL
+            OR (
+              cp.updated_at IS NOT NULL
+              AND (apv.refreshed_at IS NULL OR cp.updated_at > apv.refreshed_at)
+            )
+          )
+        ORDER BY cp.content_key ASC
+        {limit_clause}
+    """
+    params: Dict[str, Any] = {}
+    if limit > 0:
+        params["limit"] = int(limit)
+    rows = await database.fetch_all(sql, params)
+    return [r["content_key"] for r in rows or []]
+
+
 # ---------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------
 
-async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
-    if not getattr(database, "is_connected", False):
-        await database.connect()
+async def _materialize_content_keys(
+    content_keys: List[str], *, apply: bool
+) -> Dict[str, Any]:
+    """Assemble + UPSERT agent_pdp_view rows for the given content_keys.
 
-    content_keys = await _fetch_content_keys(limit=args.limit, offset=args.offset)
-    logger.info(
-        "loaded %d content_keys (limit=%d offset=%d)",
-        len(content_keys), args.limit, args.offset,
-    )
-
+    Shared by the one-shot backfill (_drive) and the incremental scheduled
+    sweep (run_agent_pdp_view_sweep). A per-row sig collision (a different
+    content_key already owns this pivota_signature_id) is skipped, never
+    fatal, so one duplicate cannot block the rest of the run.
+    """
     outcomes: Dict[str, int] = {
         "content_keys_considered": len(content_keys),
         "rows_assembled": 0,
@@ -139,7 +169,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
                 "primary_merchant_id": row["primary_merchant_id"],
             })
 
-        if not args.apply:
+        if not apply:
             outcomes["rows_skipped_no_op_in_dry_run"] += 1
             continue
         try:
@@ -154,6 +184,58 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
             raise
 
     return {"outcome_counts": outcomes, "samples": samples}
+
+
+async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
+    if not getattr(database, "is_connected", False):
+        await database.connect()
+
+    content_keys = await _fetch_content_keys(limit=args.limit, offset=args.offset)
+    logger.info(
+        "loaded %d content_keys (limit=%d offset=%d)",
+        len(content_keys), args.limit, args.offset,
+    )
+    return await _materialize_content_keys(content_keys, apply=args.apply)
+
+
+async def run_agent_pdp_view_sweep(*, limit: int = 0) -> Dict[str, Any]:
+    """Scheduler entry point (registered in services/audit_scheduler.py at
+    03:30 UTC, ahead of the 04:00 nightly_index_health classifier).
+
+    Incrementally materializes agent_pdp_view for content_keys that are
+    missing or stale, so newly-crawled products enter the serving
+    projection before the classifier reads it. The Stage 3a-iii inline
+    writer normally keeps apv fresh on every seed commit; this sweep is the
+    safety net that prevents silent stranding (the 2026-05/06 incident,
+    where ~1,800 products fell out of serving for ~3 weeks because the
+    materialization had stalled).
+
+    Never raises — errors are caught and returned in the summary so a
+    failure surfaces in logs rather than killing the scheduler.
+    """
+    summary: Dict[str, Any] = {
+        "job": "agent_pdp_view_sweep",
+        "content_keys_considered": 0,
+        "rows_assembled": 0,
+        "rows_upserted": 0,
+        "rows_skipped_sig_collision": 0,
+        "error": None,
+    }
+    try:
+        if not getattr(database, "is_connected", False):
+            await database.connect()
+        content_keys = await _fetch_stale_content_keys(limit=limit)
+        logger.info(
+            "agent_pdp_view_sweep: %d stale/missing content_keys",
+            len(content_keys),
+        )
+        result = await _materialize_content_keys(content_keys, apply=True)
+        summary.update(result["outcome_counts"])
+        logger.info("agent_pdp_view_sweep done: %s", summary)
+    except Exception as exc:  # noqa: BLE001 - scheduler entry point must never raise
+        logger.error("agent_pdp_view_sweep failed: %s", exc, exc_info=True)
+        summary["error"] = repr(exc)
+    return summary
 
 
 def _parse_args() -> argparse.Namespace:
