@@ -100,6 +100,35 @@ def test_max_runs_caps_query_count():
 
 
 # ---------------------------------------------------------------------
+# Prompt grounding instructions
+# ---------------------------------------------------------------------
+
+
+def test_primary_scan_prompts_require_web_search_and_cited_sources():
+    from services.llm_providers.deepseek_probe import _build_system_prompt
+
+    for scan_mode in (
+        "open_product_visibility_test",
+        "merchant_store_attribution_test",
+        "category_visibility_test",
+    ):
+        prompt = _build_system_prompt(scan_mode)
+        assert "web search" in prompt
+        assert "SEARCH THE WEB" in prompt
+        assert "cited sources" in prompt
+
+
+def test_answer_quality_verify_prompt_stays_ungrounded():
+    from services.llm_providers import deepseek_probe
+
+    prompt = deepseek_probe._build_system_prompt(
+        deepseek_probe.ANSWER_QUALITY_VERIFY_SCAN_MODE
+    )
+    assert "SEARCH THE WEB" not in prompt
+    assert "cited sources" not in prompt
+
+
+# ---------------------------------------------------------------------
 # Response parsing
 # ---------------------------------------------------------------------
 
