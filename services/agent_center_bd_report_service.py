@@ -1354,7 +1354,10 @@ def calibrate_thresholds_from_baseline(
 # ---------------------------------------------------------------------------
 
 
-_REAL_PROVIDERS = {"gemini", "chatgpt", "claude"}
+# Providers that run a real LLM (vs a mock fallback). DeepSeek is a real
+# backend-direct provider — it must be here, or the multi-provider mock guard
+# wrongly rejects a combined "gemini,deepseek" report as synthetic.
+_REAL_PROVIDERS = {"gemini", "chatgpt", "claude", "deepseek"}
 
 
 def _classify_provider(upstream_provider: str) -> Dict[str, Any]:

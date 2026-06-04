@@ -196,7 +196,11 @@ def test_classify_provider_marks_real_engine_providers():
     assert _classify_provider("gemini")["is_real"] is True
     assert _classify_provider("chatgpt")["is_real"] is True
     assert _classify_provider("claude")["is_real"] is True
+    assert _classify_provider("deepseek")["is_real"] is True
     assert _classify_provider("gemini,chatgpt")["is_real"] is True
+    # The dual-prober combined string must classify as real (regression:
+    # "deepseek" was missing from _REAL_PROVIDERS → false mock rejection).
+    assert _classify_provider("gemini,deepseek")["is_real"] is True
     assert _classify_provider("local_mock_no_internal_key")["is_real"] is False
     assert _classify_provider("mock_fallback_no_gemini_key")["is_real"] is False
     assert _classify_provider("mock")["is_real"] is False
