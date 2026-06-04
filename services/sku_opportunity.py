@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from services.agent_center_bd_report_service import (
+    _VERTEX_REDIRECTOR_HOSTS,
     _flatten_probe_runs,
     _is_first_party_host,
     _run_text,
@@ -22,6 +23,7 @@ from services.agent_center_bd_report_service import (
     extract_cited_hosts,
     normalize_host,
 )
+from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.cited_host_classifier import classify_host
 
 
@@ -55,6 +57,10 @@ _ROLE_PRIORITY = {
     "forum": 3,
     "unclassified": 1,
 }
+_DOMAIN_TOKEN_RE = re.compile(
+    r"(?<!@)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
+    re.IGNORECASE,
+)
 
 
 def build_sku_opportunity(
@@ -190,6 +196,7 @@ def _score_prompt_group(
         query_class=query_class,
         demand_signal=demand_signal,
         durable_competitor=durable_competitor,
+        source_route=source_route,
         density_score=density["score"],
         attribute_fit=attribute_fit,
         intent_weight=intent["weight"],
@@ -379,10 +386,23 @@ def _run_visibility_verdict(
         run,
         [canonical_url, pivota_url],
     )
-    source_hosts = [normalize_host(url) for url in _source_urls(run)]
+    source_identifiers = _run_source_identifiers(run)
+    source_hosts = [
+        str(identifier.get("host") or "")
+        for identifier in source_identifiers
+        if identifier.get("host")
+    ]
     grounded_first_party = bool(
         grounded_first_party
         or any(_is_first_party_host(host, sku_ctx or {}) for host in source_hosts)
+        or any(
+            _source_label_matches_merchant(
+                str(identifier.get("label") or ""),
+                sku_ctx=sku_ctx,
+                product=product,
+            )
+            for identifier in source_identifiers
+        )
     )
     grounded_any = bool(
         run.get("grounding_sources")
@@ -435,6 +455,105 @@ def _run_visibility_verdict(
     }
 
 
+def _run_source_identifiers(run: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return source identifiers with redirector titles resolved when possible."""
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add(*, host: Optional[str], label: str, is_redirector: bool) -> None:
+        clean_host = normalize_host(host or "") if host else None
+        clean_label = str(label or clean_host or "").strip()
+        key = clean_host or clean_label.lower()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append({
+            "host": clean_host,
+            "label": clean_label,
+            "is_redirector": is_redirector,
+        })
+
+    sources_raw = run.get("grounding_sources")
+    if isinstance(sources_raw, list) and sources_raw:
+        for source in sources_raw:
+            if not isinstance(source, dict):
+                continue
+            uri = source.get("uri") or ""
+            title = str(source.get("title") or "").strip()
+            raw_host = normalize_host(uri) or ""
+            is_redirector = raw_host in _VERTEX_REDIRECTOR_HOSTS
+            if is_redirector:
+                add(
+                    host=_host_from_source_label(title),
+                    label=title,
+                    is_redirector=True,
+                )
+            else:
+                add(
+                    host=raw_host or _host_from_source_label(title),
+                    label=title or raw_host,
+                    is_redirector=False,
+                )
+        return out
+
+    for source_url in _source_urls(run):
+        host = normalize_host(source_url)
+        if not host or host in _VERTEX_REDIRECTOR_HOSTS:
+            continue
+        add(host=host, label=host, is_redirector=False)
+    return out
+
+
+def _host_from_source_label(label: str) -> Optional[str]:
+    text = str(label or "").strip()
+    if not text:
+        return None
+    domain_match = _DOMAIN_TOKEN_RE.search(text)
+    if domain_match:
+        return normalize_host(domain_match.group(0))
+    classification = classify_host(text)
+    if classification.get("type") != "unclassified":
+        return str(classification.get("host") or "") or None
+    return None
+
+
+def _source_label_matches_merchant(
+    label: str,
+    *,
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> bool:
+    label_lower = str(label or "").strip().lower()
+    if not label_lower:
+        return False
+    merchant_host = _merchant_host(sku_ctx, product)
+    if merchant_host and merchant_host in label_lower:
+        return True
+    merchant_brand = (
+        product.get("brand")
+        or product.get("vendor")
+        or sku_ctx.get("merchant_brand")
+    )
+    if _text_mentions_any(
+        label_lower,
+        [
+            product.get("title"),
+            product.get("raw_title"),
+            product.get("brand"),
+            product.get("vendor"),
+            sku_ctx.get("sku_title"),
+            (sku_ctx.get("sku") or {}).get("title")
+            if isinstance(sku_ctx.get("sku"), dict)
+            else None,
+        ],
+    ):
+        return True
+    return text_mentions_brand(
+        label_lower,
+        derive_brand_aliases(str(merchant_brand or ""), merchant_host),
+    )
+
+
 def _source_roles_for_runs(
     runs: List[Dict[str, Any]],
     merchant_category: Optional[str],
@@ -442,17 +561,10 @@ def _source_roles_for_runs(
     rows: Dict[str, Dict[str, Any]] = {}
     for run in runs:
         seen_in_run = set()
-        for source in run.get("grounding_sources") or []:
-            if not isinstance(source, dict):
-                continue
-            host = normalize_host(source.get("uri") or "")
-            if not host:
-                continue
-            seen_in_run.add(host)
-        for source_url in _source_urls(run):
-            host = normalize_host(source_url) or str(source_url or "").strip().lower()
+        for identifier in _run_source_identifiers(run):
+            host = identifier.get("host")
             if host:
-                seen_in_run.add(host)
+                seen_in_run.add(str(host))
         for host in seen_in_run:
             classification = classify_host(host, merchant_category=merchant_category)
             role = _normalize_role(classification.get("type"), host)
@@ -504,11 +616,46 @@ def _source_route(source_roles: List[Dict[str, Any]], sku_ctx: Dict[str, Any]) -
             role_counts[row.get("role") or "unclassified"] += int(row.get("times_cited") or 1)
     if not role_counts:
         return "none"
-    role, count = role_counts.most_common(1)[0]
-    total = sum(role_counts.values()) or 1
-    if count / total < 0.5 and len(role_counts) > 1:
+    role = _dominant_role(role_counts)
+    if role is None:
         return "fragmented"
+    return role
+
+
+def _dominant_role(role_counts: Counter) -> Optional[str]:
+    if not role_counts:
+        return None
+    ordered = role_counts.most_common()
+    role, count = ordered[0]
+    total = sum(role_counts.values()) or 1
+    if len(ordered) > 1 and (count / total < 0.5 or count == ordered[1][1]):
+        return None
     return str(role)
+
+
+def _source_owned_state(
+    *,
+    source_route: str,
+    source_roles: List[Dict[str, Any]],
+    sku_ctx: Dict[str, Any],
+) -> Optional[str]:
+    if source_route == "fragmented":
+        return None
+    role_counts: Counter = Counter()
+    for row in source_roles:
+        if _is_first_party_host(row.get("host"), sku_ctx or {}):
+            continue
+        role_counts[row.get("role") or "unclassified"] += int(row.get("times_cited") or 1)
+    role = _dominant_role(role_counts)
+    if role in {"retailer", "marketplace"} or source_route in {"retailer", "marketplace"}:
+        return "retailer-owned"
+    if role == "publisher" or source_route == "publisher":
+        return "publisher-owned"
+    if role == "forum" or source_route == "forum":
+        return "forum-owned"
+    if role == "brand":
+        return "competitor-owned"
+    return None
 
 
 def _competitors_for_runs(
@@ -774,36 +921,19 @@ def _ownership_state(
         return "merchant-owned"
     if durable_competitor:
         return "competitor-owned"
-    if open_lane:
-        return "open-lane"
     if merchant_mentions:
         return "merchant-mentioned"
 
-    non_first_party_roles = [
-        row.get("role")
-        for row in source_roles
-        if not _is_first_party_host(row.get("host"), sku_ctx or {})
-    ]
-    role_counts = Counter(non_first_party_roles)
-    if role_counts:
-        role, count = role_counts.most_common(1)[0]
-        total = sum(role_counts.values()) or 1
-        if count / total >= 0.4:
-            if role in {"retailer", "marketplace"} or source_route in {"retailer", "marketplace"}:
-                return "retailer-owned"
-            if role == "publisher" or source_route == "publisher":
-                return "publisher-owned"
-            if role == "forum" or source_route == "forum":
-                return "forum-owned"
-            if role == "brand":
-                return "competitor-owned"
-    if source_route in {"retailer", "marketplace"}:
-        return "retailer-owned"
-    if source_route == "publisher":
-        return "publisher-owned"
-    if source_route == "forum":
-        return "forum-owned"
-    return "open-lane" if demand_signal > 0 else "no-demand"
+    source_owner = _source_owned_state(
+        source_route=source_route,
+        source_roles=source_roles,
+        sku_ctx=sku_ctx,
+    )
+    if source_owner:
+        return source_owner
+    if open_lane:
+        return "open-lane"
+    return "open-lane"
 
 
 def _is_open_lane(
@@ -811,6 +941,7 @@ def _is_open_lane(
     query_class: str,
     demand_signal: float,
     durable_competitor: Optional[str],
+    source_route: str,
     density_score: float,
     attribute_fit: float,
     intent_weight: float,
@@ -824,6 +955,15 @@ def _is_open_lane(
     if durable_competitor:
         return False
     if any(row.get("grounded_first_party") for row in provider_analysis.values()):
+        return False
+    if source_route in {"retailer", "publisher", "forum", "marketplace"}:
+        return False
+    if any(
+        row.get("merchant_mention")
+        or row.get("product_positive")
+        or row.get("verdict") in _OWNED_PROVIDER_VERDICTS
+        for row in provider_analysis.values()
+    ):
         return False
     return (
         density_score <= 0.45

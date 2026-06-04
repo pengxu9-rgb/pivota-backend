@@ -137,6 +137,41 @@ def test_lookup_is_case_insensitive():
     assert a["host"] == b["host"] == "nymag.com"
 
 
+def test_display_name_aliases_resolve_to_registry_hosts():
+    from services.cited_host_classifier import classify_host
+
+    healthline = classify_host("Healthline collagen guide", merchant_category="supplements")
+    assert healthline["host"] == "healthline.com"
+    assert healthline["type"] == "editorial"
+
+    olive_young = classify_host("Olive Young Global", merchant_category="beauty")
+    assert olive_young["host"] == "oliveyoungglobal.com"
+    assert olive_young["type"] == "retailer"
+
+    wirecutter = classify_host("Wirecutter", merchant_category="home")
+    assert wirecutter["host"] == "wirecutter.com"
+    assert wirecutter["type"] == "editorial"
+
+    reddit = classify_host("Reddit thread", merchant_category="beauty")
+    assert reddit["host"] == "reddit.com"
+    assert reddit["type"] == "video"
+
+
+def test_common_word_aliases_resolve_only_on_exact_match():
+    """'Target'/'Amazon' are also common English words, so they must NOT
+    resolve as a substring of a coincidental title (precision guard), but an
+    exact title still resolves to the retailer."""
+    from services.cited_host_classifier import classify_host
+    # Coincidental word -> must stay unclassified, not become target.com.
+    miss = classify_host("best collagen for your target audience", merchant_category="beauty")
+    assert miss["type"] == "unclassified"
+    assert miss["host"] != "target.com"
+    # Exact brand title still resolves.
+    hit = classify_host("Target", merchant_category="beauty")
+    assert hit["host"] == "target.com"
+    assert hit["type"] == "retailer"
+
+
 def test_applies_to_merchant_category_false_when_category_mismatch():
     """nymag.com has 'fashion'/'sleepwear'/'beauty'/'home'/'fitness' in
     its categories — fitness merchant should still get applies=True

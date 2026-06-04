@@ -7,6 +7,7 @@
       "type": "editorial | retailer | marketplace | video | brand | unclassified",
       "subtype": "review_site | department_store | luxury | mass_market | fashion_marketplace | beauty_retailer | wellness_retailer | regional | review_aggregator | creator_platform | social",
       "categories": "list of merchant categories where this host has notable AI-channel presence",
+      "aliases": "optional list of Gemini/Vertex display names that should resolve to this host",
       "coverage_note": "1-2 sentences: what this host actually publishes for these categories, why it matters",
       "outreach_hint": "1 sentence: which lever applies (editorial pitch / wholesale onboarding / creator partnership / etc.)"
     },
@@ -17,6 +18,7 @@
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["supplements", "health", "wellness", "beauty", "fitness"],
+      "aliases": ["Healthline"],
       "coverage_note": "Healthline is a top-ranked health and wellness publisher with very high AI-channel pickup for supplement, ingredient, and 'best {category}' queries; frequently grounded for collagen, vitamin, and skincare-ingredient answers.",
       "outreach_hint": "Editorially controlled - influence via clinical/dietitian sourcing and inclusion in expert roundups rather than direct product pitches."
     },
@@ -59,6 +61,7 @@
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Stylevana"],
       "coverage_note": "Stylevana is a major K-beauty cross-border retailer; AI routes K-beauty buying queries (Korean collagen, sunscreen, skincare) through its listings.",
       "outreach_hint": "Wholesale/marketplace onboarding plus accurate listing titles, stock, and reviews."
     },
@@ -66,6 +69,7 @@
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty", "fashion"],
+      "aliases": ["YesStyle"],
       "coverage_note": "YesStyle is a large Asian beauty and fashion retailer frequently cited by AI as a buying route for K-beauty skincare and supplements.",
       "outreach_hint": "Marketplace onboarding plus listing optimization (title, attributes, availability, reviews)."
     },
@@ -73,6 +77,7 @@
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["StyleKorean"],
       "coverage_note": "StyleKorean is a K-beauty retailer and brand aggregator AI cites for Korean skincare and beauty-supplement purchase routes.",
       "outreach_hint": "Wholesale/retailer onboarding plus accurate, review-backed product listings."
     },
@@ -92,6 +97,7 @@
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
+      "aliases": ["The New York Times", "NYTimes"],
       "coverage_note": "Wirecutter (NYT's reviews vertical) is the most-cited consumer review site; inclusion is the single highest-impact editorial placement.",
       "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission.",
       "pitch_recipient": {
@@ -100,10 +106,19 @@
         "note": "Wirecutter doesn't accept open pitches by email — submit via their official submission guidelines page. Multi-month review cycle."
       }
     },
+    "wirecutter.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
+      "aliases": ["Wirecutter", "NYT Wirecutter", "The New York Times Wirecutter"],
+      "coverage_note": "Wirecutter is The New York Times' consumer reviews vertical; AI assistants frequently ground category recommendations in its tested roundups.",
+      "outreach_hint": "Wirecutter editorial pitch — competitive, multi-month review cycle, requires sample submission."
+    },
     "forbes.com": {
       "type": "editorial",
       "subtype": "review_site",
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics"],
+      "aliases": ["Forbes", "Forbes Vetted"],
       "coverage_note": "Forbes Vetted runs lifestyle / loungewear / category 'best of' lists; growing AI-channel pickup in 2025-2026.",
       "outreach_hint": "Forbes Vetted editorial pitch via their submission process.",
       "pitch_recipient": {
@@ -215,6 +230,7 @@
       "type": "editorial",
       "subtype": "beauty",
       "categories": ["beauty"],
+      "aliases": ["Byrdie"],
       "coverage_note": "Beauty + wellness editorial; affiliate roundups + ingredient explainers.",
       "outreach_hint": "Editorial pitch — beauty editors, sample-based."
     },
@@ -237,6 +253,7 @@
       "type": "marketplace",
       "subtype": "mass_market",
       "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics", "food_bev"],
+      "aliases": ["Amazon"],
       "coverage_note": "Largest US marketplace; AI-channel grounded for almost every D2C category. Listings + reviews surface heavily.",
       "outreach_hint": "Wholesale onboarding via Amazon Vendor Central or 3P seller via Seller Central."
     },
@@ -279,6 +296,7 @@
       "type": "retailer",
       "subtype": "mass_market",
       "categories": ["fashion", "sleepwear", "beauty", "home", "food_bev"],
+      "aliases": ["Target"],
       "coverage_note": "Mass-market US retailer; A-Beauty / D2C-collab heavy in beauty + lifestyle.",
       "outreach_hint": "Target vendor onboarding (note: prefers established brands at scale)."
     },
@@ -286,6 +304,7 @@
       "type": "retailer",
       "subtype": "mass_market",
       "categories": ["fashion", "sleepwear", "beauty", "home", "food_bev"],
+      "aliases": ["Walmart"],
       "coverage_note": "Largest US mass-market retailer; growing D2C presence via Walmart+ + marketplace.",
       "outreach_hint": "Walmart Marketplace onboarding (3P) or Walmart vendor (1P)."
     },
@@ -314,6 +333,7 @@
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty"],
+      "aliases": ["Sephora"],
       "coverage_note": "Largest beauty specialty retailer; AI-channel grounded for nearly every beauty query.",
       "outreach_hint": "Sephora Accelerate program (D2C/indie brands) or wholesale via vendor relations."
     },
@@ -321,6 +341,7 @@
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty"],
+      "aliases": ["Ulta", "Ulta Beauty"],
       "coverage_note": "Mass + premium beauty retailer; strong AI-channel grounding for beauty.",
       "outreach_hint": "Ulta Sparked program (D2C/indie) or wholesale."
     },
@@ -360,6 +381,14 @@
       "coverage_note": "Visual product discovery; AI-channel grounding weight low compared to editorial.",
       "outreach_hint": "Influencer partnerships — Instagram-first creators."
     },
+    "reddit.com": {
+      "type": "video",
+      "subtype": "social",
+      "categories": ["fashion", "sleepwear", "beauty", "home", "fitness", "electronics", "food_bev", "supplements", "health", "wellness"],
+      "aliases": ["Reddit"],
+      "coverage_note": "Reddit threads surface as community evidence in grounded answers, especially for reviews, routines, and product comparisons.",
+      "outreach_hint": "Monitor community concerns and answer recurring questions through owned content; do not treat Reddit as a direct placement channel."
+    },
 
     "etsy.com": {
       "type": "marketplace",
@@ -387,6 +416,7 @@
       "type": "retailer",
       "subtype": "beauty_retailer",
       "categories": ["beauty"],
+      "aliases": ["Olive Young", "Olive Young Global"],
       "coverage_note": "K-beauty specialty retailer (international); high AI-channel grounding for K-beauty queries.",
       "outreach_hint": "K-beauty wholesale — Olive Young vendor relations."
     },

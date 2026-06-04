@@ -273,6 +273,21 @@ def _runs_both_providers(specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
+def _sidewalk_meta() -> Dict[str, Any]:
+    return {
+        "sidewalk_attribute_basis": ["halal", "collagen", "stick"],
+        "sidewalk_evidence": {"halal": "tag", "collagen": "title", "stick": "body"},
+        "sidewalk_intent_weight": 1.0,
+    }
+
+
+def _redirector_source(title: str, suffix: str) -> Dict[str, str]:
+    return {
+        "uri": f"https://vertexaisearch.cloud.google.com/grounding-api-redirect/{suffix}",
+        "title": title,
+    }
+
+
 def test_ownership_states_by_source_role():
     # Covers the per-prompt ownership branches the BB Lab scenario does not pin:
     # retailer-/publisher-/forum-owned routing and no-demand.
@@ -327,6 +342,141 @@ def test_ownership_states_by_source_role():
     assert rows["collagen stick opinions"]["ownership_state"] == "forum-owned"
     assert rows["obscure collagen trivia xyzzy"]["ownership_state"] == "no-demand"
     assert rows["obscure collagen trivia xyzzy"]["demand_state"] == "no-demand"
+
+
+def test_redirector_publisher_owned_not_open_lane():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "parsed": {"product_visible": False, "correct_sku": False},
+            "sources": [
+                _redirector_source("Healthline", "healthline-a"),
+                _redirector_source("Healthline collagen supplement guide", "healthline-b"),
+            ],
+            "raw": "Healthline discusses collagen supplements before bed.",
+            "axis_metadata": _sidewalk_meta(),
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["source_route"] == "publisher"
+    assert row["ownership_state"] == "publisher-owned"
+    assert row["open_lane"] is False
+    assert all(lane["query"] != "halal collagen sticks before bed" for lane in opp["top_open_lanes"])
+
+
+def test_redirector_retailer_owned():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "parsed": {"product_visible": False, "correct_sku": False},
+            "sources": [
+                _redirector_source("Sephora", "sephora"),
+                _redirector_source("Olive Young Global", "oliveyoung"),
+            ],
+            "raw": "Retailers like Sephora and Olive Young Global carry similar collagen sticks.",
+            "axis_metadata": _sidewalk_meta(),
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["source_route"] == "retailer"
+    assert row["ownership_state"] == "retailer-owned"
+    assert row["open_lane"] is False
+
+
+def test_redirector_first_party():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
+            "sources": [_redirector_source("BB Lab official PDP", "bblab-pdp")],
+            "raw": "BB Lab Good Night Collagen is cited from the BB Lab official PDP.",
+            "axis_metadata": _sidewalk_meta(),
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["provider_verdicts"] == {"gemini": "win", "deepseek": "win"}
+    assert row["ownership_state"] == "merchant-owned"
+    assert row["open_lane"] is False
+
+
+def test_weak_merchant_mention_not_open_lane():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "parsed": {},
+            "sources": [
+                {"uri": "https://small-shop.example/halal-collagen", "title": "Small halal collagen shop"},
+                {"uri": "https://routine-notes.example/collagen-bedtime", "title": "Bedtime collagen notes"},
+            ],
+            "raw": "BB Lab is mentioned in a few small bedtime collagen notes, but no source owns the lane.",
+            "axis_metadata": _sidewalk_meta(),
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["source_route"] == "unclassified"
+    assert row["ownership_state"] == "merchant-mentioned"
+    assert row["open_lane"] is False
+    assert opp["top_open_lanes"] == []
+
+
+def test_real_open_lane_survives():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "parsed": {"product_visible": False, "correct_sku": False},
+            "sources": [
+                {"uri": "https://small-shop.example/halal-collagen", "title": "Small halal collagen shop"},
+                {"uri": "https://routine-notes.example/collagen-bedtime", "title": "Bedtime collagen notes"},
+            ],
+            "raw": "Fragmented small sources discuss halal collagen sticks before bed with no clear owner.",
+            "axis_metadata": _sidewalk_meta(),
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["source_route"] == "unclassified"
+    assert row["ownership_state"] == "open-lane"
+    assert row["open_lane"] is True
+    assert opp["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
 
 
 def test_demand_state_summary_branded_protected_unbranded_absent():
