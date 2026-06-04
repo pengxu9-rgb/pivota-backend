@@ -48,6 +48,26 @@ def test_known_editorial_host_returns_full_annotation():
     assert out["applies_to_merchant_category"] is True
 
 
+def test_health_and_kbeauty_vertical_hosts_classified():
+    """Wedge vertical coverage: the registry was seeded for sleepwear/home,
+    leaving health/supplement publishers (e.g. Healthline) and K-beauty
+    retailers unclassified. These were added so publisher-/retailer-owned
+    detection works for beauty/supplement merchants (the wedge's core vertical).
+    """
+    from services.cited_host_classifier import classify_host
+    for host in (
+        "healthline.com", "verywellhealth.com", "medicalnewstoday.com",
+        "mindbodygreen.com", "prevention.com", "womenshealthmag.com",
+    ):
+        out = classify_host(host, merchant_category="supplements")
+        assert out["type"] == "editorial", host
+        assert out["coverage_note"] and out["outreach_hint"], host
+    for host in ("stylevana.com", "yesstyle.com", "stylekorean.com"):
+        out = classify_host(host, merchant_category="beauty")
+        assert out["type"] == "retailer", host
+        assert "kbeauty" in out["categories"], host
+
+
 def test_known_host_with_pitch_recipient_passes_it_through():
     """Phase A regression: the playbook engine builds pitch_draft
     from `host_entry.pitch_recipient`. Without classify_host
