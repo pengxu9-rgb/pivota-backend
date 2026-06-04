@@ -64,7 +64,10 @@ from db.merchant_audit_runs import (
     recent_runs_for_merchant,
 )
 from db.merchant_onboarding import get_merchant_onboarding
-from services.agent_center_bd_report_service import run_brand_report
+from services.agent_center_bd_report_service import (
+    run_brand_report,
+    run_wedge_hero_sku_intelligence,
+)
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from utils.auth import get_current_merchant
@@ -1063,6 +1066,28 @@ def _is_wedge_run_stale(requested_at: Any) -> bool:
     return age_s > _WEDGE_RUN_STALE_TTL_S
 
 
+def _wedge_product_has_attributes(product: Dict[str, Any]) -> bool:
+    attrs = product.get("attributes_raw")
+    if not isinstance(attrs, dict):
+        return False
+    return any(value not in (None, "", [], {}) for value in attrs.values())
+
+
+def _select_wedge_hero_product(
+    audit_products: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not audit_products:
+        return None
+    for idx, product in enumerate(audit_products):
+        if _wedge_product_has_attributes(product):
+            hero = dict(product)
+            hero["_wedge_hero_index"] = idx
+            return hero
+    hero = dict(audit_products[0])
+    hero["_wedge_hero_index"] = 0
+    return hero
+
+
 @router.post("/url-readiness")
 async def run_merchant_url_audit(
     body: MerchantUrlAuditRequest,
@@ -1349,6 +1374,21 @@ async def _run_wedge_audit_background(
     # the buried "we did not verify…" hedge.
     _scrub_wedge_report_in_place(brand_report)
 
+    try:
+        hero_product = _select_wedge_hero_product(audit_products)
+        sku_intelligence = await run_wedge_hero_sku_intelligence(
+            hero_product=hero_product or {},
+            merchant_id=merchant_id,
+            run_id=run_id,
+            coverage_profile="gemini_deepseek",
+            prompts_per_sku=14,
+        )
+    except Exception as exc:  # noqa: BLE001 — wedge SKU block must degrade
+        sku_intelligence = {
+            "is_empty": True,
+            "error_note": str(exc)[:500],
+        }
+
     agg = brand_report.get("aggregate") or {}
     verdict_labels = [
         (p.get("verdict") or {}).get("label") or ""
@@ -1358,6 +1398,7 @@ async def _run_wedge_audit_background(
         "status": "succeeded",
         "run_id": run_id,
         "brand_report": brand_report,
+        "sku_intelligence": sku_intelligence,
         **base_payload,
     }
     await record_audit_run_completed(

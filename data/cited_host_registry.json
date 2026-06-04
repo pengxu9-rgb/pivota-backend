@@ -13,6 +13,69 @@
     "added_for_test_merchant_audits": "2026-05-07 — initial seed covering hosts that appeared in merch_efbc46b4619cfbdf sleepwear audit + the broader fashion/beauty/lifestyle review surface."
   },
   "hosts": {
+    "healthline.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["supplements", "health", "wellness", "beauty", "fitness"],
+      "coverage_note": "Healthline is a top-ranked health and wellness publisher with very high AI-channel pickup for supplement, ingredient, and 'best {category}' queries; frequently grounded for collagen, vitamin, and skincare-ingredient answers.",
+      "outreach_hint": "Editorially controlled - influence via clinical/dietitian sourcing and inclusion in expert roundups rather than direct product pitches."
+    },
+    "verywellhealth.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["supplements", "health", "wellness"],
+      "coverage_note": "Verywell Health publishes dietitian- and physician-reviewed supplement and ingredient explainers that AI assistants cite for efficacy and 'is X good for you' queries.",
+      "outreach_hint": "Influence through medical-reviewer relationships and cited research; editorial, not a paid-placement channel."
+    },
+    "medicalnewstoday.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["supplements", "health", "wellness"],
+      "coverage_note": "Medical News Today provides clinically framed ingredient and supplement coverage AI grounds in for safety and efficacy questions.",
+      "outreach_hint": "Influence via cited research and expert commentary; editorial, not commercial."
+    },
+    "mindbodygreen.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["wellness", "supplements", "beauty", "fitness"],
+      "coverage_note": "mindbodygreen runs wellness and beauty-from-within roundups (collagen, skin supplements) with strong AI-channel presence for 'best {supplement} for skin' prompts.",
+      "outreach_hint": "Pitch the wellness/beauty editorial desk for roundup inclusion; ~4-8 week cycle."
+    },
+    "prevention.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["health", "wellness", "supplements", "fitness"],
+      "coverage_note": "Prevention publishes consumer health and supplement roundups with broad mainstream and AI-channel reach.",
+      "outreach_hint": "Editorial pitch to health/nutrition editors for roundup inclusion."
+    },
+    "womenshealthmag.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["health", "fitness", "wellness", "beauty"],
+      "coverage_note": "Women's Health covers supplements, beauty-from-within, and fitness products in frequently-cited roundups.",
+      "outreach_hint": "Editorial pitch to the health/beauty desk; creator and expert tie-ins help."
+    },
+    "stylevana.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "coverage_note": "Stylevana is a major K-beauty cross-border retailer; AI routes K-beauty buying queries (Korean collagen, sunscreen, skincare) through its listings.",
+      "outreach_hint": "Wholesale/marketplace onboarding plus accurate listing titles, stock, and reviews."
+    },
+    "yesstyle.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty", "fashion"],
+      "coverage_note": "YesStyle is a large Asian beauty and fashion retailer frequently cited by AI as a buying route for K-beauty skincare and supplements.",
+      "outreach_hint": "Marketplace onboarding plus listing optimization (title, attributes, availability, reviews)."
+    },
+    "stylekorean.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "coverage_note": "StyleKorean is a K-beauty retailer and brand aggregator AI cites for Korean skincare and beauty-supplement purchase routes.",
+      "outreach_hint": "Wholesale/retailer onboarding plus accurate, review-backed product listings."
+    },
     "nymag.com": {
       "type": "editorial",
       "subtype": "review_site",

@@ -1,0 +1,1380 @@
+"""Per-prompt SKU opportunity scoring.
+
+Piece 3 is intentionally pure analysis: it consumes already-collected probe
+runs and product attributes, then returns prompt-level ownership, density,
+opportunity, and SKU-level summaries. Route wiring/rendering stays elsewhere.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+from services.agent_center_bd_report_service import (
+    _flatten_probe_runs,
+    _is_first_party_host,
+    _run_text,
+    _source_urls,
+    _text_mentions_any,
+    _url_in_sources,
+    extract_category_competitors,
+    extract_cited_hosts,
+    normalize_host,
+)
+from services.cited_host_classifier import classify_host
+
+
+_KNOWN_PROVIDERS = ("gemini", "deepseek")
+_OWNED_PROVIDER_VERDICTS = {"win", "partial"}
+_SHOPPING_WORDS = {
+    "buy",
+    "best",
+    "price",
+    "shop",
+    "store",
+    "review",
+    "reviews",
+    "alternative",
+    "alternatives",
+    "vs",
+    "compare",
+    "comparison",
+    "supplement",
+    "for sale",
+    "under",
+}
+_ROLE_PRIORITY = {
+    "brand": 7,
+    "marketplace": 6,
+    "retailer": 5,
+    "publisher": 4,
+    "forum": 3,
+    "unclassified": 1,
+}
+
+
+def build_sku_opportunity(
+    sku_ctx: Dict[str, Any],
+    probe_runs: Any,
+    *,
+    attribute_graph: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build additive per-prompt opportunity intelligence for one SKU."""
+    product = _get_product(sku_ctx)
+    graph = attribute_graph if isinstance(attribute_graph, dict) else {}
+    runs = _flatten_probe_runs(probe_runs)
+    groups = _group_runs_by_query(runs)
+    all_providers = _expected_providers(runs)
+
+    per_prompt = [
+        _score_prompt_group(
+            sku_ctx=sku_ctx,
+            product=product,
+            query=query,
+            runs=group_runs,
+            providers=all_providers,
+            attribute_graph=graph,
+        )
+        for query, group_runs in sorted(groups.items(), key=lambda item: item[0])
+    ]
+    per_prompt.sort(
+        key=lambda row: (
+            -float(row.get("opportunity_score") or 0),
+            str(row.get("query") or "").lower(),
+        )
+    )
+    aggregate = _build_sku_aggregate(per_prompt, providers=all_providers)
+    return {
+        "per_prompt": per_prompt,
+        "sku_aggregate": aggregate,
+        "opportunity_formula": {
+            "score": (
+                "attribute_fit * intent_weight * demand_signal * "
+                "(1 - density) * volume_proxy * actionability * confidence"
+            ),
+            "scale": "0-100 capped deterministic heuristic",
+            "volume_proxy": (
+                "Proxy only: derived from query class, grounded sources, "
+                "and named competitors. It is not measured search volume."
+            ),
+        },
+        # Top-level aliases keep the renderer simple without changing the
+        # canonical sku_aggregate block.
+        "intent_ladder": aggregate["intent_ladder"],
+        "top_open_lanes": aggregate["top_open_lanes"],
+        "demand_state_summary": aggregate["demand_state_summary"],
+        "substitution_alert": aggregate["substitution_alert"],
+        "confidence": aggregate["confidence"],
+    }
+
+
+def _score_prompt_group(
+    *,
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+    query: str,
+    runs: List[Dict[str, Any]],
+    providers: List[str],
+    attribute_graph: Dict[str, Any],
+) -> Dict[str, Any]:
+    merchant_category = (
+        product.get("product_type")
+        or product.get("category")
+        or sku_ctx.get("category")
+    )
+    merchant_brand = (
+        product.get("brand")
+        or product.get("vendor")
+        or sku_ctx.get("merchant_brand")
+    )
+    merchant_host = _merchant_host(sku_ctx, product)
+    axis_metadata = _merged_axis_metadata(runs)
+    axis = str(axis_metadata.get("axis") or "").strip().lower() or "unknown"
+    query_class = _query_class(query, axis)
+    attribute_fit = _attribute_fit(query, axis_metadata, attribute_graph, product)
+    intent = _intent_for(query, axis, axis_metadata)
+
+    source_roles = _source_roles_for_runs(runs, merchant_category)
+    source_counts = Counter({
+        str(source["host"]): int(source.get("times_cited") or 0)
+        for source in source_roles
+    })
+    cited_counter, merchant_cited_runs, runs_with_citations = extract_cited_hosts(
+        runs,
+        merchant_host=merchant_host,
+        merchant_brand=str(merchant_brand or ""),
+    )
+    source_route = _source_route(source_roles, sku_ctx)
+    competitors, competitor_counts = _competitors_for_runs(
+        runs,
+        merchant_host=merchant_host,
+        merchant_brand=str(merchant_brand or ""),
+    )
+    any_competitor_first_party = _any_competitor_first_party(runs, competitors)
+    provider_analysis = _provider_analysis(runs, sku_ctx=sku_ctx, product=product)
+    provider_verdicts = {
+        provider: provider_analysis.get(provider, {}).get("verdict", "absent")
+        for provider in providers
+    }
+    engine_agreement = _engine_agreement(provider_verdicts)
+    demand_signal = _demand_signal(runs, provider_analysis, competitors)
+    density = _density(
+        query=query,
+        query_class=query_class,
+        source_counts=source_counts,
+        source_roles=source_roles,
+        competitor_count=len(competitors),
+        competitor_counts=competitor_counts,
+        any_competitor_first_party=any_competitor_first_party,
+        attribute_fit=attribute_fit,
+    )
+    confidence = _confidence(provider_analysis)
+    volume_proxy = _volume_proxy(
+        query_class=query_class,
+        source_roles=source_roles,
+        competitor_count=len(competitors),
+    )
+    actionability = _actionability(
+        attribute_fit=attribute_fit,
+        density_score=density["score"],
+        source_route=source_route,
+        demand_signal=demand_signal,
+    )
+
+    durable_competitor = _durable_competitor(competitor_counts)
+    open_lane = _is_open_lane(
+        query_class=query_class,
+        demand_signal=demand_signal,
+        durable_competitor=durable_competitor,
+        density_score=density["score"],
+        attribute_fit=attribute_fit,
+        intent_weight=intent["weight"],
+        actionability=actionability,
+        provider_analysis=provider_analysis,
+    )
+    ownership_state = _ownership_state(
+        runs=runs,
+        sku_ctx=sku_ctx,
+        provider_analysis=provider_analysis,
+        provider_verdicts=provider_verdicts,
+        source_route=source_route,
+        source_roles=source_roles,
+        durable_competitor=durable_competitor,
+        open_lane=open_lane,
+        demand_signal=demand_signal,
+    )
+    substitution = _substitution(
+        query=query,
+        axis=axis,
+        provider_analysis=provider_analysis,
+        provider_verdicts=provider_verdicts,
+        competitors=competitors,
+        competitor_counts=competitor_counts,
+    )
+    opportunity_score, opportunity_factors = _opportunity_score(
+        query_class=query_class,
+        attribute_fit=attribute_fit,
+        intent_weight=intent["weight"],
+        demand_signal=demand_signal,
+        density_score=density["score"],
+        volume_proxy=volume_proxy,
+        actionability=actionability,
+        confidence=confidence,
+        ownership_state=ownership_state,
+    )
+    demand_state = _prompt_demand_state(
+        demand_signal=demand_signal,
+        open_lane=open_lane,
+        ownership_state=ownership_state,
+    )
+
+    return {
+        "query": _display_query(runs, query),
+        "normalized_query": query,
+        "axis": axis,
+        "query_class": query_class,
+        "provider_verdicts": provider_verdicts,
+        "engine_agreement": engine_agreement,
+        "ownership_state": ownership_state,
+        "source_roles": source_roles,
+        "source_route": source_route,
+        "source_summary": {
+            "merchant_cited_runs": merchant_cited_runs,
+            "runs_with_citations": runs_with_citations,
+            "top_cited_hosts": [
+                {"host": host, "times_cited": count}
+                for host, count in cited_counter.most_common(5)
+            ],
+        },
+        "competitors": competitors,
+        "competitor_count": len(competitors),
+        "any_competitor_first_party": any_competitor_first_party,
+        "density": density,
+        "demand_signal": demand_signal,
+        "demand_state": demand_state,
+        "attribute_fit": attribute_fit,
+        "intent": intent,
+        "intent_weight": intent["weight"],
+        "volume_proxy": volume_proxy,
+        "actionability": actionability,
+        "confidence": confidence,
+        "opportunity_score": opportunity_score,
+        "opportunity_factors": opportunity_factors,
+        "open_lane": open_lane,
+        "substitution": substitution,
+        "attribute_basis": _clean_basis(axis_metadata.get("sidewalk_attribute_basis")),
+        "evidence": axis_metadata.get("sidewalk_evidence"),
+    }
+
+
+def _group_runs_by_query(runs: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        key = _norm_query(run.get("query"))
+        if not key:
+            continue
+        grouped[key].append(run)
+    return dict(grouped)
+
+
+def _expected_providers(runs: List[Dict[str, Any]]) -> List[str]:
+    seen = {
+        str(run.get("_provider") or run.get("provider") or "").strip().lower()
+        for run in runs or []
+    }
+    ordered = [provider for provider in _KNOWN_PROVIDERS if provider in seen]
+    extras = sorted(provider for provider in seen if provider and provider not in ordered)
+    providers = ordered + extras
+    return providers or list(_KNOWN_PROVIDERS)
+
+
+def _provider_analysis(
+    runs: List[Dict[str, Any]],
+    *,
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    by_provider: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for run in runs:
+        provider = str(run.get("_provider") or run.get("provider") or "").strip().lower()
+        by_provider[provider or "unknown"].append(run)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for provider, provider_runs in by_provider.items():
+        verdicts = [_run_visibility_verdict(run, sku_ctx, product) for run in provider_runs]
+        shopping_answer = any(v["shopping_answer"] for v in verdicts)
+        competitors_named = any(v["competitors_named"] for v in verdicts)
+        product_positive = any(v["product_positive"] for v in verdicts)
+        grounded_positive = any(v["grounded_positive"] for v in verdicts)
+        merchant_mention = any(v["merchant_mention"] for v in verdicts)
+        negative = any(v["negative_verdict"] for v in verdicts)
+
+        if grounded_positive:
+            verdict = "win"
+        elif product_positive or merchant_mention:
+            verdict = "partial"
+        elif competitors_named and (negative or not merchant_mention):
+            verdict = "loss"
+        elif shopping_answer:
+            verdict = "partial" if merchant_mention else "loss"
+        else:
+            verdict = "absent"
+        out[provider] = {
+            "verdict": verdict,
+            "shopping_answer": shopping_answer,
+            "competitors_named": competitors_named,
+            "product_positive": product_positive,
+            "grounded_positive": grounded_positive,
+            "merchant_mention": merchant_mention,
+            "negative_verdict": negative,
+            "grounded_first_party": any(v["grounded_first_party"] for v in verdicts),
+        }
+    return out
+
+
+def _run_visibility_verdict(
+    run: Dict[str, Any],
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Mirror compute_citation_score's per-run visibility gates."""
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+    url_match = run.get("url_match") if isinstance(run.get("url_match"), dict) else {}
+    llm_report = (
+        url_match.get("llm_self_report")
+        if isinstance(url_match.get("llm_self_report"), dict)
+        else {}
+    )
+    product_visible = parsed.get("product_visible")
+    if product_visible is None:
+        product_visible = run.get("product_visible")
+    if product_visible is None:
+        product_visible = llm_report.get("product_visible")
+
+    correct_sku = (
+        parsed.get("correct_sku")
+        if parsed.get("correct_sku") is not None
+        else llm_report.get("correct_sku")
+    )
+    sku_mentioned = (
+        parsed.get("sku_mentioned")
+        if parsed.get("sku_mentioned") is not None
+        else llm_report.get("sku_mentioned")
+    )
+    negative_verdict = (
+        product_visible is False
+        or correct_sku is False
+        or llm_report.get("correct_sku") is False
+    )
+
+    canonical_url = product.get("canonical_url") or sku_ctx.get("canonical_url")
+    pivota_url = product.get("pivota_canonical_url") or sku_ctx.get("pivota_canonical_url")
+    grounded_first_party = bool(url_match.get("in_grounding")) or _url_in_sources(
+        run,
+        [canonical_url, pivota_url],
+    )
+    source_hosts = [normalize_host(url) for url in _source_urls(run)]
+    grounded_first_party = bool(
+        grounded_first_party
+        or any(_is_first_party_host(host, sku_ctx or {}) for host in source_hosts)
+    )
+    grounded_any = bool(
+        run.get("grounding_sources")
+        or run.get("grounding_chunks")
+        or source_hosts
+    )
+    text = _run_text(run)
+    merchant_mention = _text_mentions_any(
+        text,
+        [
+            product.get("title"),
+            product.get("raw_title"),
+            product.get("brand"),
+            product.get("vendor"),
+            sku_ctx.get("sku_title"),
+            (sku_ctx.get("sku") or {}).get("title")
+            if isinstance(sku_ctx.get("sku"), dict)
+            else None,
+        ],
+    )
+    product_positive = (
+        correct_sku is True
+        or product_visible is True
+        or sku_mentioned is True
+        or (merchant_mention and not negative_verdict)
+    )
+    grounded_positive = bool(
+        not negative_verdict
+        and grounded_any
+        and (correct_sku is True or product_visible is True)
+    )
+    competitors_named = bool(_raw_competitors(run))
+    shopping_answer = bool(
+        grounded_any
+        or competitors_named
+        or _looks_like_shopping_answer(_run_text(run))
+    )
+    return {
+        "product_visible": product_visible,
+        "correct_sku": correct_sku,
+        "sku_mentioned": sku_mentioned,
+        "negative_verdict": negative_verdict,
+        "grounded_first_party": grounded_first_party and not negative_verdict,
+        "grounded_any": grounded_any,
+        "product_positive": product_positive and not negative_verdict,
+        "grounded_positive": grounded_positive,
+        "merchant_mention": merchant_mention and not negative_verdict,
+        "competitors_named": competitors_named,
+        "shopping_answer": shopping_answer,
+    }
+
+
+def _source_roles_for_runs(
+    runs: List[Dict[str, Any]],
+    merchant_category: Optional[str],
+) -> List[Dict[str, Any]]:
+    rows: Dict[str, Dict[str, Any]] = {}
+    for run in runs:
+        seen_in_run = set()
+        for source in run.get("grounding_sources") or []:
+            if not isinstance(source, dict):
+                continue
+            host = normalize_host(source.get("uri") or "")
+            if not host:
+                continue
+            seen_in_run.add(host)
+        for source_url in _source_urls(run):
+            host = normalize_host(source_url) or str(source_url or "").strip().lower()
+            if host:
+                seen_in_run.add(host)
+        for host in seen_in_run:
+            classification = classify_host(host, merchant_category=merchant_category)
+            role = _normalize_role(classification.get("type"), host)
+            row = rows.setdefault(
+                host,
+                {
+                    "host": host,
+                    "role": role,
+                    "raw_type": classification.get("type") or "unclassified",
+                    "tier": classification.get("tier"),
+                    "times_cited": 0,
+                },
+            )
+            row["times_cited"] += 1
+
+    return sorted(
+        rows.values(),
+        key=lambda row: (
+            -int(row.get("times_cited") or 0),
+            -_ROLE_PRIORITY.get(str(row.get("role") or ""), 0),
+            str(row.get("host") or ""),
+        ),
+    )
+
+
+def _normalize_role(raw_type: Any, host: Optional[str] = None) -> str:
+    role = str(raw_type or "").strip().lower()
+    host_text = str(host or "").lower()
+    if role == "editorial":
+        return "publisher"
+    if role in {"reddit", "forum", "social", "video", "community"}:
+        return "forum"
+    if "reddit." in host_text or host_text == "reddit.com":
+        return "forum"
+    if role in {"retailer", "publisher", "marketplace", "brand", "unclassified"}:
+        return role
+    return "unclassified"
+
+
+def _source_route(source_roles: List[Dict[str, Any]], sku_ctx: Dict[str, Any]) -> str:
+    if not source_roles:
+        return "none"
+    role_counts: Counter = Counter()
+    for row in source_roles:
+        host = row.get("host")
+        if _is_first_party_host(host, sku_ctx or {}):
+            role_counts["first-party"] += int(row.get("times_cited") or 1)
+        else:
+            role_counts[row.get("role") or "unclassified"] += int(row.get("times_cited") or 1)
+    if not role_counts:
+        return "none"
+    role, count = role_counts.most_common(1)[0]
+    total = sum(role_counts.values()) or 1
+    if count / total < 0.5 and len(role_counts) > 1:
+        return "fragmented"
+    return str(role)
+
+
+def _competitors_for_runs(
+    runs: List[Dict[str, Any]],
+    *,
+    merchant_host: Optional[str],
+    merchant_brand: str,
+) -> Tuple[List[str], Counter]:
+    counter: Counter = Counter()
+    first_seen: Dict[str, int] = {}
+
+    def remember(name: str) -> None:
+        if name not in first_seen:
+            first_seen[name] = len(first_seen)
+        counter[name] += 1
+
+    for run in runs:
+        for name in _raw_competitors(run):
+            normalized = _clean_competitor_name(name)
+            if not normalized:
+                continue
+            if _same_brand(normalized, merchant_brand):
+                continue
+            remember(normalized)
+
+    competitor_rows, _host_rows = extract_category_competitors(
+        runs,
+        merchant_host=merchant_host,
+        merchant_brand=merchant_brand,
+    )
+    for row in competitor_rows or []:
+        normalized = _clean_competitor_name(row.get("name"))
+        if not normalized or _same_brand(normalized, merchant_brand):
+            continue
+        if normalized not in first_seen:
+            first_seen[normalized] = len(first_seen)
+        counter[normalized] += int(row.get("times_cited") or 1)
+
+    names = [
+        name
+        for name, _count in sorted(
+            counter.items(),
+            key=lambda item: (-item[1], first_seen.get(item[0], 9999), item[0].lower()),
+        )
+    ]
+    return names, counter
+
+
+def _raw_competitors(run: Dict[str, Any]) -> List[Any]:
+    parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+    out: List[Any] = []
+    for value in (
+        parsed.get("competitors_listed"),
+        parsed.get("competitors_appearing"),
+        run.get("competitors_listed"),
+        run.get("competitors_appearing"),
+    ):
+        if isinstance(value, list):
+            out.extend(value)
+    return out
+
+
+def _any_competitor_first_party(
+    runs: List[Dict[str, Any]],
+    competitors: List[str],
+) -> bool:
+    if not competitors:
+        return False
+    competitor_keys = [re.sub(r"[^a-z0-9]+", "", name.lower()) for name in competitors]
+    competitor_words = [
+        [word for word in re.findall(r"[a-z0-9]+", name.lower()) if len(word) >= 4]
+        for name in competitors
+    ]
+    for run in runs:
+        for source in run.get("grounding_sources") or []:
+            if not isinstance(source, dict):
+                continue
+            host = normalize_host(source.get("uri") or "")
+            title = str(source.get("title") or "").lower()
+            haystack = re.sub(r"[^a-z0-9]+", "", " ".join([host or "", title]))
+            if any(key and key in haystack for key in competitor_keys):
+                return True
+            host_segment = (host or "").split(".", 1)[0]
+            for words in competitor_words:
+                if words and all(word in host_segment for word in words):
+                    return True
+    return False
+
+
+def _density(
+    *,
+    query: str,
+    query_class: str,
+    source_counts: Counter,
+    source_roles: List[Dict[str, Any]],
+    competitor_count: int,
+    competitor_counts: Counter,
+    any_competitor_first_party: bool,
+    attribute_fit: float,
+) -> Dict[str, Any]:
+    if competitor_count <= 0:
+        competitor_score = 0.0
+    elif competitor_count == 1:
+        competitor_score = 0.2
+    elif competitor_count <= 4:
+        competitor_score = 0.55
+    else:
+        competitor_score = 0.9
+
+    repeated_source = any(count >= 2 for count in source_counts.values())
+    repeated_competitor = any(count >= 2 for count in competitor_counts.values())
+    repeated_owner = repeated_source or repeated_competitor
+    repeated_owner_score = 1.0 if repeated_competitor else (0.6 if repeated_source else 0.0)
+    total_sources = sum(source_counts.values())
+    source_concentration = (
+        max(source_counts.values()) / total_sources
+        if total_sources
+        else 0.0
+    )
+    prompt_specificity_score = {
+        "head": 1.0,
+        "category": 0.55,
+        "attribute": 0.25,
+        "sidewalk": 0.1,
+        "objection": 0.35,
+        "branded": 0.2,
+    }.get(query_class, 0.4)
+    source_authority_bonus = _source_authority_bonus(source_roles)
+    score = (
+        (0.35 * competitor_score)
+        + (0.20 * repeated_owner_score)
+        + (0.15 if any_competitor_first_party else 0.0)
+        + (0.12 * source_concentration)
+        + (0.12 * prompt_specificity_score)
+        + (0.04 * (1.0 - attribute_fit))
+        + (0.02 * source_authority_bonus)
+    )
+    score = _clamp(score)
+    if score < 0.33:
+        band = "low"
+    elif score < 0.60:
+        band = "medium"
+    else:
+        band = "high"
+    repeated_owner_value: Any = False
+    if repeated_competitor:
+        repeated_owner_value = _durable_competitor(competitor_counts)
+    elif repeated_source:
+        repeated_owner_value = source_counts.most_common(1)[0][0]
+    return {
+        "score": round(score, 4),
+        "band": band,
+        "features": {
+            "competitor_count": competitor_count,
+            "repeated_owner": repeated_owner_value,
+            "first_party_competitor": any_competitor_first_party,
+            "source_concentration": round(source_concentration, 4),
+            "prompt_specificity": query_class,
+            "merchant_fit": round(attribute_fit, 4),
+        },
+    }
+
+
+def _source_authority_bonus(source_roles: List[Dict[str, Any]]) -> float:
+    if not source_roles:
+        return 0.0
+    top_roles = {row.get("role") for row in source_roles[:3]}
+    if "publisher" in top_roles or "marketplace" in top_roles:
+        return 1.0
+    if "retailer" in top_roles:
+        return 0.7
+    if "forum" in top_roles:
+        return 0.4
+    return 0.2
+
+
+def _demand_signal(
+    runs: List[Dict[str, Any]],
+    provider_analysis: Dict[str, Dict[str, Any]],
+    competitors: List[str],
+) -> float:
+    shopping_runs = sum(1 for row in provider_analysis.values() if row.get("shopping_answer"))
+    source_count = sum(len(run.get("grounding_sources") or []) for run in runs)
+    competitor_count = len(competitors)
+    if shopping_runs <= 0 and source_count <= 0 and competitor_count <= 0:
+        return 0.0
+    if shopping_runs >= 2 and (source_count or competitor_count):
+        return 1.0 if competitor_count >= 2 or source_count >= 3 else 0.7
+    if source_count >= 2 or competitor_count >= 2:
+        return 0.7
+    return 0.4
+
+
+def _opportunity_score(
+    *,
+    query_class: str,
+    attribute_fit: float,
+    intent_weight: float,
+    demand_signal: float,
+    density_score: float,
+    volume_proxy: float,
+    actionability: float,
+    confidence: float,
+    ownership_state: str,
+) -> Tuple[float, Dict[str, float]]:
+    candidate_lane = query_class in {"head", "category", "attribute", "sidewalk", "objection"}
+    if not candidate_lane or demand_signal <= 0:
+        raw = 0.0
+    else:
+        raw = (
+            attribute_fit
+            * intent_weight
+            * demand_signal
+            * (1.0 - density_score)
+            * volume_proxy
+            * actionability
+            * confidence
+        )
+        if ownership_state == "merchant-owned":
+            raw *= 0.15
+        elif ownership_state == "merchant-mentioned":
+            raw *= 0.65
+        elif ownership_state.endswith("-owned") and ownership_state != "open-lane":
+            raw *= 0.45
+    return (
+        round(min(100.0, max(0.0, raw * 100.0)), 2),
+        {
+            "attribute_fit": round(attribute_fit, 4),
+            "intent_weight": round(intent_weight, 4),
+            "demand_signal": round(demand_signal, 4),
+            "density_inverse": round(1.0 - density_score, 4),
+            "volume_proxy": round(volume_proxy, 4),
+            "actionability": round(actionability, 4),
+            "confidence": round(confidence, 4),
+        },
+    )
+
+
+def _ownership_state(
+    *,
+    runs: List[Dict[str, Any]],
+    sku_ctx: Dict[str, Any],
+    provider_analysis: Dict[str, Dict[str, Any]],
+    provider_verdicts: Dict[str, str],
+    source_route: str,
+    source_roles: List[Dict[str, Any]],
+    durable_competitor: Optional[str],
+    open_lane: bool,
+    demand_signal: float,
+) -> str:
+    if demand_signal <= 0:
+        return "no-demand"
+    first_party_positive = any(
+        row.get("grounded_first_party") and row.get("verdict") == "win"
+        for row in provider_analysis.values()
+    )
+    wins = sum(1 for verdict in provider_verdicts.values() if verdict == "win")
+    merchant_mentions = sum(
+        1 for verdict in provider_verdicts.values()
+        if verdict in _OWNED_PROVIDER_VERDICTS
+    )
+    if first_party_positive and wins >= 1:
+        return "merchant-owned"
+    if durable_competitor:
+        return "competitor-owned"
+    if open_lane:
+        return "open-lane"
+    if merchant_mentions:
+        return "merchant-mentioned"
+
+    non_first_party_roles = [
+        row.get("role")
+        for row in source_roles
+        if not _is_first_party_host(row.get("host"), sku_ctx or {})
+    ]
+    role_counts = Counter(non_first_party_roles)
+    if role_counts:
+        role, count = role_counts.most_common(1)[0]
+        total = sum(role_counts.values()) or 1
+        if count / total >= 0.4:
+            if role in {"retailer", "marketplace"} or source_route in {"retailer", "marketplace"}:
+                return "retailer-owned"
+            if role == "publisher" or source_route == "publisher":
+                return "publisher-owned"
+            if role == "forum" or source_route == "forum":
+                return "forum-owned"
+            if role == "brand":
+                return "competitor-owned"
+    if source_route in {"retailer", "marketplace"}:
+        return "retailer-owned"
+    if source_route == "publisher":
+        return "publisher-owned"
+    if source_route == "forum":
+        return "forum-owned"
+    return "open-lane" if demand_signal > 0 else "no-demand"
+
+
+def _is_open_lane(
+    *,
+    query_class: str,
+    demand_signal: float,
+    durable_competitor: Optional[str],
+    density_score: float,
+    attribute_fit: float,
+    intent_weight: float,
+    actionability: float,
+    provider_analysis: Dict[str, Dict[str, Any]],
+) -> bool:
+    if query_class not in {"sidewalk", "attribute", "category", "objection"}:
+        return False
+    if demand_signal < 0.4:
+        return False
+    if durable_competitor:
+        return False
+    if any(row.get("grounded_first_party") for row in provider_analysis.values()):
+        return False
+    return (
+        density_score <= 0.45
+        and attribute_fit >= 0.70
+        and intent_weight >= 0.80
+        and actionability >= 0.80
+    )
+
+
+def _substitution(
+    *,
+    query: str,
+    axis: str,
+    provider_analysis: Dict[str, Dict[str, Any]],
+    provider_verdicts: Dict[str, str],
+    competitors: List[str],
+    competitor_counts: Counter,
+) -> Dict[str, Any]:
+    comparison_axis = axis in {"comparison", "alternatives"} or any(
+        token in query
+        for token in (" alternative", " alternatives", " vs ", "compare")
+    )
+    product_absent_or_loss = not any(
+        row.get("product_positive") or row.get("grounded_positive")
+        for row in provider_analysis.values()
+    ) and any(verdict == "loss" for verdict in provider_verdicts.values())
+    if comparison_axis and product_absent_or_loss and competitors:
+        top = competitors[0]
+        if competitor_counts.get(top, 0) < 2:
+            top = _durable_competitor(competitor_counts) or top
+        engines = sorted(
+            provider
+            for provider, verdict in provider_verdicts.items()
+            if verdict == "loss"
+        )
+        return {
+            "present": True,
+            "substituted_by": top,
+            "prompt": query,
+            "engines": engines,
+        }
+    return {"present": False}
+
+
+def _build_sku_aggregate(
+    per_prompt: List[Dict[str, Any]],
+    *,
+    providers: List[str],
+) -> Dict[str, Any]:
+    intent_ladder = _intent_ladder(per_prompt)
+    top_open_lanes = _top_open_lanes(per_prompt)
+    substitution_alert = _substitution_alert(per_prompt)
+    return {
+        "intent_ladder": intent_ladder,
+        "top_open_lanes": top_open_lanes,
+        "demand_state_summary": _demand_state_summary(per_prompt, intent_ladder, top_open_lanes),
+        "substitution_alert": substitution_alert,
+        "confidence": _coverage_confidence(per_prompt, providers=providers),
+    }
+
+
+def _intent_ladder(per_prompt: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    layers = {
+        "branded_transactional": [],
+        "branded_consideration": [],
+        "head_category": [],
+        "attribute_category": [],
+        "sidewalk_opportunity": [],
+        "objection": [],
+    }
+    for row in per_prompt:
+        layer = _ladder_layer(row)
+        if layer:
+            layers[layer].append(row)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for layer, rows in layers.items():
+        if layer == "sidewalk_opportunity":
+            open_scores = [
+                float(row.get("opportunity_score") or 0)
+                for row in rows
+                if row.get("open_lane")
+            ]
+            # Count x strength: one strong open sidewalk lane should be visible,
+            # several strong lanes should approach 100.
+            score = min(100, int(round(sum(open_scores) * 0.75)))
+            out[layer] = {
+                "score": score,
+                "prompts": len(rows),
+                "open_lanes": len(open_scores),
+                "basis": "opportunity_score_count_x_strength",
+            }
+        else:
+            owned = sum(
+                1
+                for row in rows
+                if row.get("ownership_state") == "merchant-owned"
+                or row.get("provider_verdicts", {}).values()
+                and any(v == "win" for v in row.get("provider_verdicts", {}).values())
+            )
+            answerable = sum(1 for row in rows if row.get("demand_signal", 0) > 0)
+            denominator = len(rows)
+            if layer == "objection":
+                numerator = owned + sum(
+                    1
+                    for row in rows
+                    if row.get("ownership_state") == "merchant-mentioned"
+                    or row.get("demand_signal", 0) >= 0.7
+                )
+            else:
+                numerator = owned
+            score = int(round((numerator / denominator) * 100)) if denominator else 0
+            out[layer] = {
+                "score": score,
+                "prompts": denominator,
+                "owned_or_answerable": numerator,
+                "answered": answerable,
+                "basis": "% owned/visible" if layer != "objection" else "% answerable",
+            }
+    return out
+
+
+def _top_open_lanes(per_prompt: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    lanes = [
+        row
+        for row in per_prompt
+        if row.get("open_lane")
+        and row.get("query_class") in {"sidewalk", "attribute", "category", "objection"}
+    ]
+    lanes.sort(
+        key=lambda row: (
+            -float(row.get("opportunity_score") or 0),
+            str(row.get("query") or "").lower(),
+        )
+    )
+    out = []
+    for row in lanes[:3]:
+        out.append({
+            "query": row.get("query"),
+            "why_fit": row.get("attribute_basis") or _why_fit_from_features(row),
+            "current_ownership": row.get("ownership_state"),
+            "density_band": (row.get("density") or {}).get("band"),
+            "intent": row.get("intent"),
+            "source_route": row.get("source_route"),
+            "demand_state": row.get("demand_state"),
+            "opportunity_score": row.get("opportunity_score"),
+        })
+    return out
+
+
+def _substitution_alert(per_prompt: List[Dict[str, Any]]) -> Dict[str, Any]:
+    alerts = [
+        row
+        for row in per_prompt
+        if isinstance(row.get("substitution"), dict)
+        and row["substitution"].get("present")
+    ]
+    if not alerts:
+        return {"present": False}
+    alerts.sort(
+        key=lambda row: (
+            -float(row.get("demand_signal") or 0),
+            -len(row.get("substitution", {}).get("engines") or []),
+            str(row.get("query") or "").lower(),
+        )
+    )
+    sub = alerts[0]["substitution"]
+    return {
+        "present": True,
+        "prompt": sub.get("prompt") or alerts[0].get("query"),
+        "substituted_by": sub.get("substituted_by"),
+        "engines": sub.get("engines") or [],
+    }
+
+
+def _demand_state_summary(
+    per_prompt: List[Dict[str, Any]],
+    intent_ladder: Dict[str, Dict[str, Any]],
+    top_open_lanes: List[Dict[str, Any]],
+) -> str:
+    if top_open_lanes:
+        return "open lane detected"
+    demand_exists_absent = any(
+        row.get("demand_signal", 0) > 0
+        and row.get("ownership_state") in {
+            "competitor-owned",
+            "retailer-owned",
+            "publisher-owned",
+            "forum-owned",
+            "open-lane",
+        }
+        for row in per_prompt
+    )
+    branded_score = (intent_ladder.get("branded_transactional") or {}).get("score") or 0
+    unbranded_scores = [
+        (intent_ladder.get("head_category") or {}).get("score") or 0,
+        (intent_ladder.get("attribute_category") or {}).get("score") or 0,
+    ]
+    if branded_score >= 70 and unbranded_scores and max(unbranded_scores) < 40:
+        return "branded demand protected, unbranded absent"
+    if demand_exists_absent:
+        return "demand exists but you are absent"
+    return "no meaningful demand detected"
+
+
+def _coverage_confidence(
+    per_prompt: List[Dict[str, Any]],
+    *,
+    providers: List[str],
+) -> Dict[str, Any]:
+    prompts = len(per_prompt)
+    provider_counts = Counter()
+    agreement_counts = Counter()
+    for row in per_prompt:
+        agreement_counts[row.get("engine_agreement") or "neither"] += 1
+        for provider, verdict in (row.get("provider_verdicts") or {}).items():
+            if verdict != "absent":
+                provider_counts[provider] += 1
+    covered = sum(1 for row in per_prompt if row.get("demand_signal", 0) > 0)
+    return {
+        "providers": providers,
+        "provider_run_counts": dict(sorted(provider_counts.items())),
+        "engine_agreement_counts": dict(sorted(agreement_counts.items())),
+        "prompt_count": prompts,
+        "prompts_with_demand": covered,
+        "coverage_summary": (
+            f"{covered}/{prompts} prompts showed demand; "
+            f"{agreement_counts.get('both', 0)} had both-engine SKU visibility"
+        )
+        if prompts
+        else "0/0 prompts showed demand",
+    }
+
+
+def _ladder_layer(row: Dict[str, Any]) -> Optional[str]:
+    axis = str(row.get("axis") or "").lower()
+    query_class = row.get("query_class")
+    query = str(row.get("normalized_query") or row.get("query") or "").lower()
+    if query_class == "sidewalk" or axis == "sidewalk":
+        return "sidewalk_opportunity"
+    if axis in {"intent", "price", "brand", "identity"} or (
+        query_class == "branded" and any(t in query for t in ("buy", "price", "shop", "where"))
+    ):
+        return "branded_transactional"
+    if axis in {"review", "comparison"} or any(
+        token in query
+        for token in ("review", "reviews", "alternative", "alternatives", " vs ", "worth")
+    ):
+        return "branded_consideration"
+    if axis in {"objection", "brand-objection"} or query.startswith("is "):
+        return "objection"
+    if query_class == "head":
+        return "head_category"
+    if query_class in {"attribute", "category"}:
+        return "attribute_category"
+    return None
+
+
+def _prompt_demand_state(
+    *,
+    demand_signal: float,
+    open_lane: bool,
+    ownership_state: str,
+) -> str:
+    if demand_signal <= 0:
+        return "no-demand"
+    if open_lane:
+        return "open-lane"
+    if ownership_state == "merchant-owned":
+        return "protected"
+    if ownership_state == "merchant-mentioned":
+        return "repair"
+    return "contested"
+
+
+def _engine_agreement(provider_verdicts: Dict[str, str]) -> str:
+    positive = sum(1 for verdict in provider_verdicts.values() if verdict in _OWNED_PROVIDER_VERDICTS)
+    if positive >= 2:
+        return "both"
+    if positive == 1:
+        return "one"
+    return "neither"
+
+
+def _confidence(provider_analysis: Dict[str, Dict[str, Any]]) -> float:
+    shopping = [row for row in provider_analysis.values() if row.get("shopping_answer")]
+    if len(shopping) >= 2:
+        return 1.0
+    if any(row.get("grounded_positive") or row.get("competitors_named") for row in shopping):
+        return 0.8
+    if shopping:
+        return 0.5
+    return 0.0
+
+
+def _query_class(query: str, axis: str) -> str:
+    q = _norm_query(query)
+    if axis == "sidewalk":
+        return "sidewalk"
+    if axis in {"objection", "brand-objection"}:
+        return "objection"
+    if axis in {"intent", "price", "brand", "identity", "review", "comparison"}:
+        return "branded"
+    if axis in {"attribute", "concern", "use_case"}:
+        return "attribute"
+    if axis == "category":
+        modifiers = [
+            "for ",
+            "with ",
+            "without ",
+            "under ",
+            "halal",
+            "korean",
+            "stick",
+            "sticks",
+            "before",
+        ]
+        if q.startswith(("best ", "top ", "what is the best ")) and not any(m in q for m in modifiers):
+            return "head"
+        return "category"
+    if q.startswith(("best ", "top ", "what is the best ")):
+        return "head"
+    return "attribute" if len(q.split()) >= 4 else "category"
+
+
+def _intent_for(query: str, axis: str, axis_metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    passthrough = axis_metadata.get("sidewalk_intent_weight")
+    weight = _coerce_float(passthrough)
+    label: str
+    q = _norm_query(query)
+    if weight is not None:
+        label = _intent_label_from_weight(weight)
+    elif any(token in q for token in ("buy", "shop", "price", "for sale", "where can i buy", "discount")):
+        weight = 1.2
+        label = "transactional"
+    elif q.startswith(("best ", "top ", "what is the best ")) or axis == "category":
+        weight = 1.0
+        label = "category-purchase"
+    elif axis in {"review", "comparison"} or any(token in q for token in ("review", "alternative", " vs ", "worth")):
+        weight = 0.8
+        label = "consideration"
+    elif axis in {"objection", "brand-objection"}:
+        weight = 0.8
+        label = "consideration"
+    elif axis == "sidewalk":
+        weight = 1.0
+        label = "category-purchase"
+    else:
+        weight = 0.6
+        label = "education"
+    return {"label": label, "weight": round(float(weight), 4)}
+
+
+def _intent_label_from_weight(weight: float) -> str:
+    if weight >= 1.15:
+        return "transactional"
+    if weight >= 0.95:
+        return "category-purchase"
+    if weight >= 0.75:
+        return "consideration"
+    return "education"
+
+
+def _attribute_fit(
+    query: str,
+    axis_metadata: Mapping[str, Any],
+    attribute_graph: Dict[str, Any],
+    product: Dict[str, Any],
+) -> float:
+    q = _norm_query(query)
+    basis = _clean_basis(axis_metadata.get("sidewalk_attribute_basis"))
+    if basis:
+        basis_hits = sum(1 for attr in basis if _attr_in_query(attr, q))
+        if basis_hits == len(basis):
+            return 1.0
+        return round(min(1.0, 0.75 + (0.25 * basis_hits / max(1, len(basis)))), 4)
+
+    attrs = _flatten_attributes(attribute_graph)
+    hits = sum(1 for attr in attrs if _attr_in_query(attr, q))
+    score = min(0.85, hits * 0.18)
+    product_type = _norm_query(product.get("product_type") or product.get("category"))
+    if product_type and any(word in q for word in product_type.split() if len(word) >= 4):
+        score = max(score, 0.45)
+    if _text_mentions_any(
+        query,
+        [
+            product.get("title"),
+            product.get("raw_title"),
+            product.get("brand"),
+            product.get("vendor"),
+        ],
+    ):
+        score = max(score, 0.9)
+    return round(_clamp(score), 4)
+
+
+def _flatten_attributes(attribute_graph: Dict[str, Any]) -> List[str]:
+    classes = attribute_graph.get("classes") if isinstance(attribute_graph.get("classes"), dict) else {}
+    out: List[str] = []
+    for values in classes.values():
+        if isinstance(values, list):
+            out.extend(str(value).strip().lower() for value in values if str(value).strip())
+    return sorted(set(out), key=lambda value: (-len(value), value))
+
+
+def _volume_proxy(
+    *,
+    query_class: str,
+    source_roles: List[Dict[str, Any]],
+    competitor_count: int,
+) -> float:
+    base = {
+        "head": 1.2,
+        "category": 1.0,
+        "attribute": 0.8,
+        "sidewalk": 0.8,
+        "objection": 0.7,
+        "branded": 0.6,
+    }.get(query_class, 0.7)
+    if competitor_count >= 5:
+        base = max(base, 1.0)
+    if len(source_roles) >= 3 and query_class != "sidewalk":
+        base = min(1.2, base + 0.1)
+    return round(base, 4)
+
+
+def _actionability(
+    *,
+    attribute_fit: float,
+    density_score: float,
+    source_route: str,
+    demand_signal: float,
+) -> float:
+    if demand_signal <= 0:
+        return 0.0
+    if attribute_fit >= 0.75 and density_score <= 0.45:
+        return 1.0
+    if source_route in {"retailer", "marketplace", "publisher"}:
+        return 0.5 if density_score >= 0.6 else 0.8
+    if source_route == "forum":
+        return 0.7
+    return 0.8
+
+
+def _durable_competitor(competitor_counts: Counter) -> Optional[str]:
+    if not competitor_counts:
+        return None
+    name, count = sorted(
+        competitor_counts.items(),
+        key=lambda item: (-item[1], item[0].lower()),
+    )[0]
+    return name if count >= 2 else None
+
+
+def _looks_like_shopping_answer(text: str) -> bool:
+    haystack = str(text or "").strip().lower()
+    if not haystack:
+        return False
+    return any(word in haystack for word in _SHOPPING_WORDS)
+
+
+def _merchant_host(sku_ctx: Dict[str, Any], product: Dict[str, Any]) -> Optional[str]:
+    return normalize_host(
+        product.get("canonical_url")
+        or product.get("pivota_canonical_url")
+        or sku_ctx.get("canonical_url")
+        or sku_ctx.get("pivota_canonical_url")
+        or ""
+    )
+
+
+def _merged_axis_metadata(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for run in runs:
+        meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+        for key, value in meta.items():
+            if key not in merged and value not in (None, "", []):
+                merged[key] = value
+    return merged
+
+
+def _display_query(runs: List[Dict[str, Any]], fallback: str) -> str:
+    for run in runs:
+        query = str(run.get("query") or "").strip()
+        if query:
+            return query
+    return fallback
+
+
+def _clean_basis(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = re.split(r"[,/+|]", str(value))
+    out = []
+    seen = set()
+    for raw in values:
+        cleaned = str(raw or "").strip().lower()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
+
+
+def _attr_in_query(attr: str, query_norm: str) -> bool:
+    attr_norm = _norm_query(attr)
+    if not attr_norm:
+        return False
+    if attr_norm in query_norm:
+        return True
+    words = [word for word in attr_norm.split() if len(word) >= 4]
+    return bool(words and all(word in query_norm for word in words))
+
+
+def _clean_competitor_name(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return text[:80]
+
+
+def _same_brand(candidate: str, merchant_brand: str) -> bool:
+    c = _norm_query(candidate)
+    b = _norm_query(merchant_brand)
+    if not c or not b:
+        return False
+    return c == b or c in b or b in c
+
+
+def _why_fit_from_features(row: Dict[str, Any]) -> List[str]:
+    basis = row.get("attribute_basis") or []
+    if basis:
+        return basis
+    query = str(row.get("normalized_query") or row.get("query") or "")
+    return [query]
+
+
+def _norm_query(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _get_product(sku_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    product = sku_ctx.get("product") if isinstance(sku_ctx, dict) else None
+    return product if isinstance(product, dict) else (sku_ctx or {})
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, float(value)))
