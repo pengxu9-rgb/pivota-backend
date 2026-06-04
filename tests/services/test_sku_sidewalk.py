@@ -171,6 +171,162 @@ def test_sidewalk_no_stutter_when_attr_spans_classes():
         ), query
 
 
+def test_sidewalk_negated_halal_does_not_generate_certified_lane():
+    from services.sku_sidewalk import (
+        build_sku_attribute_graph,
+        generate_sidewalk_query_specs,
+    )
+
+    product = {
+        "title": "PureGlow Collagen Capsules",
+        "product_type": "collagen supplement",
+        "attributes_raw": {
+            "description": "Fish collagen capsules. This product is not halal certified.",
+        },
+    }
+    graph = build_sku_attribute_graph(product)
+    specs = generate_sidewalk_query_specs(
+        graph, title=product["title"], product_type=product["product_type"], n=8,
+    )
+
+    assert "halal" not in graph["classes"]["certification_constraint"]
+    assert not any("halal" in spec["query"] for spec in specs)
+
+
+def test_sidewalk_negated_pregnancy_audience_is_suppressed():
+    from services.sku_sidewalk import (
+        build_sku_attribute_graph,
+        generate_sidewalk_query_specs,
+    )
+
+    product = {
+        "title": "PureGlow Collagen Capsules",
+        "product_type": "collagen supplement",
+        "attributes_raw": {
+            "description": (
+                "Collagen capsules. No melatonin. Not intended for pregnant people."
+            ),
+        },
+    }
+    graph = build_sku_attribute_graph(product)
+    specs = generate_sidewalk_query_specs(
+        graph, title=product["title"], product_type=product["product_type"], n=8,
+    )
+
+    assert "pregnancy" not in graph["classes"]["audience"]
+    assert not any("pregnancy" in spec["query"] or "pregnant" in spec["query"] for spec in specs)
+
+
+def test_sidewalk_mineral_oil_free_deodorant_does_not_get_mineral_lane():
+    from services.sku_sidewalk import (
+        build_sku_attribute_graph,
+        generate_sidewalk_query_specs,
+    )
+
+    product = {
+        "title": "FreshNest Mineral Oil Free Deodorant Refill Pods",
+        "product_type": "deodorant",
+        "attributes_raw": {
+            "description": "Refill pods for sensitive skin. Mineral oil free and baking soda free.",
+        },
+    }
+    graph = build_sku_attribute_graph(product)
+    specs = generate_sidewalk_query_specs(
+        graph, title=product["title"], product_type=product["product_type"], n=8,
+    )
+
+    assert "mineral" not in graph["classes"]["certification_constraint"]
+    assert not any(spec["query"].startswith("mineral deodorant") for spec in specs)
+
+
+def test_sidewalk_positive_high_care_and_certification_lanes_survive():
+    from services.sku_sidewalk import (
+        build_sku_attribute_graph,
+        generate_sidewalk_query_specs,
+    )
+
+    halal_product = {
+        "title": "PureGlow Halal Collagen Capsules",
+        "product_type": "collagen supplement",
+        "attributes_raw": {
+            "description": "Halal certified fish collagen capsules.",
+        },
+    }
+    halal_graph = build_sku_attribute_graph(halal_product)
+    halal_specs = generate_sidewalk_query_specs(
+        halal_graph,
+        title=halal_product["title"],
+        product_type=halal_product["product_type"],
+        n=8,
+    )
+    assert "halal" in halal_graph["classes"]["certification_constraint"]
+    assert any("halal collagen capsules" == spec["query"] for spec in halal_specs)
+
+    sunscreen_product = {
+        "title": "SunnyPocket Kids Mineral Sunscreen Stick",
+        "product_type": "kids sunscreen",
+        "attributes_raw": {
+            "tags": ["kids", "mineral"],
+            "description": "Mineral sunscreen stick with zinc oxide for kids and summer camp.",
+        },
+    }
+    sunscreen_graph = build_sku_attribute_graph(sunscreen_product)
+    sunscreen_specs = generate_sidewalk_query_specs(
+        sunscreen_graph,
+        title=sunscreen_product["title"],
+        product_type=sunscreen_product["product_type"],
+        n=10,
+    )
+    sunscreen_queries = {spec["query"] for spec in sunscreen_specs}
+    assert "kids" in sunscreen_graph["classes"]["audience"]
+    assert "mineral" in sunscreen_graph["classes"]["certification_constraint"]
+    assert "mineral sunscreen sticks" in sunscreen_queries
+    assert any("for kids" in query for query in sunscreen_queries)
+
+
+def test_sidewalk_category_format_stutter_and_generic_supplement_fallback():
+    from services.sku_sidewalk import (
+        build_sku_attribute_graph,
+        generate_sidewalk_query_specs,
+    )
+
+    balm_product = {
+        "title": "Leaf Root Vegan Lip Balm",
+        "product_type": "balm",
+        "attributes_raw": {
+            "tags": ["vegan"],
+            "description": "A vegan balm for sensitive skin.",
+        },
+    }
+    balm_graph = build_sku_attribute_graph(balm_product)
+    balm_specs = generate_sidewalk_query_specs(
+        balm_graph, title=balm_product["title"], product_type=balm_product["product_type"], n=8,
+    )
+    balm_queries = [spec["query"] for spec in balm_specs]
+    assert "vegan balm" in balm_queries
+    assert not any("balm balm" in query for query in balm_queries)
+
+    vitamin_product = {
+        "title": "Maternova Postpartum Hair Vitamins Gummies",
+        "product_type": "supplement",
+        "attributes_raw": {
+            "tags": ["vegan", "gummies", "postpartum", "hair vitamins"],
+            "description": "Vegan gummies for postpartum hair vitamins routines. No melatonin.",
+        },
+    }
+    vitamin_graph = build_sku_attribute_graph(vitamin_product)
+    vitamin_specs = generate_sidewalk_query_specs(
+        vitamin_graph,
+        title=vitamin_product["title"],
+        product_type=vitamin_product["product_type"],
+        n=8,
+    )
+    vitamin_queries = [spec["query"] for spec in vitamin_specs]
+    assert "hair vitamin" in vitamin_graph["classes"]["category"]
+    assert any("hair vitamin" in query for query in vitamin_queries)
+    assert not any("supplement" in query for query in vitamin_queries)
+
+
 def test_per_sku_budget_mix():
     from services.agent_center_bd_report_service import (
         _build_per_sku_audit_query_metadata,

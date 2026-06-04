@@ -123,7 +123,7 @@ def test_competitor_dedup_treats_alias_as_self():
     runs = [
         _run(
             "best collagen brands",
-            competitors_appearing=["BB Lab", "Olive Young", "Vital Proteins"],
+            competitors_appearing=["BB Lab", "NeoCell", "Vital Proteins"],
             grounding_sources=[
                 {"uri": "https://r1/", "title": "BB Lab Official"},
                 {"uri": "https://r2/", "title": "iHerb"},
@@ -135,8 +135,66 @@ def test_competitor_dedup_treats_alias_as_self():
     )
     names = {c["name"] for c in competitor_brands}
     assert "BB Lab" not in names           # the merchant's own alias, deduped
-    assert "Olive Young" in names
+    assert "NeoCell" in names
     assert "Vital Proteins" in names
     hosts = {h["host"] for h in retailer_hosts}
     assert "BB Lab Official" not in hosts  # merchant's own aliased citation
     assert "iHerb" in hosts
+
+
+def test_competitor_extraction_rejects_sources_and_generic_owner_phrases():
+    runs = [
+        _run(
+            "BB Lab collagen alternatives",
+            competitors_appearing=[
+                "Vital Proteins",
+                "Amazon",
+                "Healthline",
+                "No durable owner",
+            ],
+        ),
+    ]
+
+    competitor_brands, _retailer_hosts = extract_category_competitors(
+        runs, merchant_host=_HOST, merchant_brand=_MERCHANT,
+    )
+
+    assert [brand["name"] for brand in competitor_brands] == ["Vital Proteins"]
+
+
+def test_full_merchant_identity_set_filters_alternate_brand_names():
+    runs = [
+        _run(
+            "BB Lab collagen alternatives",
+            excerpt="BB Lab collagen is discussed in the answer.",
+            grounding_sources=[{"uri": "https://r/", "title": "BB Lab on iHerb"}],
+            competitors_appearing=["BB Lab", "Vital Proteins", "NeoCell"],
+        ),
+    ]
+    identities = ("BB Lab Global", "Nutrione")
+
+    score, details = score_category_visibility(
+        runs,
+        merchant_host=_HOST,
+        merchant_brand="Nutrione",
+        merchant_vendors=identities,
+    )
+    _competitors, merchant_cited_runs, _runs_with_citation = extract_cited_hosts(
+        runs,
+        merchant_host=_HOST,
+        merchant_brand="Nutrione",
+        merchant_vendors=identities,
+    )
+    competitor_brands, _retailer_hosts = extract_category_competitors(
+        runs,
+        merchant_host=_HOST,
+        merchant_brand="Nutrione",
+        merchant_vendors=identities,
+    )
+
+    names = {brand["name"] for brand in competitor_brands}
+    assert score == 100
+    assert details[0]["title_match"] is True
+    assert merchant_cited_runs == 1
+    assert "BB Lab" not in names
+    assert names == {"Vital Proteins", "NeoCell"}

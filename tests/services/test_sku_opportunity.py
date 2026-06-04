@@ -194,6 +194,31 @@ def _bb_lab_probe_runs() -> List[Dict[str, Any]]:
     ]
 
 
+def _freshnest_sku_ctx() -> Dict[str, Any]:
+    product = {
+        "product_key": "prod-freshnest",
+        "merchant_id": "m-freshnest",
+        "title": "FreshNest Probiotic Deodorant Refill Pods",
+        "brand": "FreshNest",
+        "vendor": "FreshNest",
+        "product_type": "deodorant",
+        "category": "beauty",
+        "description": "Probiotic deodorant refill pods for sensitive skin.",
+        "canonical_url": "https://freshnest.example/products/probiotic-deodorant-pods",
+        "attributes_raw": {
+            "tags": ["deodorant", "refill pods", "sensitive skin"],
+            "description": "Probiotic deodorant refill pods for sensitive skin.",
+        },
+    }
+    return {
+        "sku_key": "sku-freshnest",
+        "merchant_id": "m-freshnest",
+        "product_key": "prod-freshnest",
+        "product": product,
+        "sku": {"sku_key": "sku-freshnest", "sku": "FN-PODS"},
+    }
+
+
 def _by_query(opportunity: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {
         row["normalized_query"]: row
@@ -245,6 +270,70 @@ def test_sku_opportunity_scores_bb_lab_prompt_cases():
     assert opportunity["intent_ladder"]["head_category"]["score"] < 50
     assert opportunity["intent_ladder"]["sidewalk_opportunity"]["score"] > 0
     assert opportunity["demand_state_summary"] == "open lane detected"
+
+
+def test_substitution_requires_merchant_named_loss_but_is_axis_agnostic():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _freshnest_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    competitors = ["Native", "Lume", "Myro"]
+    competitor_sources = [
+        {"uri": "https://nativecos.com/deodorant", "title": "Native deodorant"},
+        {"uri": "https://lumedeodorant.com/products", "title": "Lume deodorant"},
+    ]
+    runs = _runs_both_providers([
+        {
+            "query": "where can I buy FreshNest Probiotic Deodorant Refill Pods",
+            "axis": "intent",
+            "parsed": {
+                "product_visible": False,
+                "correct_sku": False,
+                "competitors_listed": competitors,
+                "competitors_appearing": competitors,
+            },
+            "sources": competitor_sources,
+            "raw": "I could not verify FreshNest; try Native, Lume, or Myro.",
+        },
+        {
+            "query": "refillable deodorant pods vs sticks",
+            "axis": "comparison",
+            "parsed": {
+                "product_visible": False,
+                "correct_sku": False,
+                "competitors_listed": competitors,
+                "competitors_appearing": competitors,
+            },
+            "sources": competitor_sources,
+            "raw": "Native, Lume, and Myro are common refillable deodorant options.",
+        },
+        {
+            "query": "alternatives to FreshNest Probiotic Deodorant Refill Pods",
+            "axis": "unknown",
+            "parsed": {
+                "product_visible": False,
+                "correct_sku": False,
+                "competitors_listed": competitors,
+                "competitors_appearing": competitors,
+            },
+            "sources": competitor_sources,
+            "raw": "Alternatives to FreshNest include Native, Lume, and Myro.",
+        },
+    ])
+    opportunity = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    rows = _by_query(opportunity)
+
+    branded_buy = rows["where can i buy freshnest probiotic deodorant refill pods"]
+    assert branded_buy["substitution"]["present"] is True
+    assert branded_buy["substitution"]["substituted_by"] == "Native"
+
+    unbranded_comparison = rows["refillable deodorant pods vs sticks"]
+    assert unbranded_comparison["substitution"]["present"] is False
+
+    branded_alternatives = rows["alternatives to freshnest probiotic deodorant refill pods"]
+    assert branded_alternatives["substitution"]["present"] is True
+    assert branded_alternatives["substitution"]["substituted_by"] == "Native"
 
 
 def test_sku_opportunity_is_deterministic():

@@ -28,6 +28,8 @@ ATTRIBUTE_CLASSES: Tuple[str, ...] = (
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
+_CONTEXT_SPLIT_RE = re.compile(r"[,.;:!?()\[\]\n\r]+")
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 _CATEGORY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("collagen", "collagen"),
@@ -35,6 +37,7 @@ _CATEGORY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("sun screen", "sunscreen"),
     ("deodorant", "deodorant"),
     ("serum", "serum"),
+    ("hair vitamins", "hair vitamin"),
     ("hair vitamin", "hair vitamin"),
     ("balm", "balm"),
     ("supplement", "supplement"),
@@ -160,6 +163,27 @@ _MEDICAL_BLOCKLIST: Tuple[str, ...] = (
     "safe for kids",
 )
 _GENERIC_CATEGORIES = {"", "product", "products", "item", "items"}
+_NEGATION_TOKENS = {
+    "not",
+    "no",
+    "without",
+    "lack",
+    "lacks",
+    "lacking",
+    "isnt",
+    "doesnt",
+    "dont",
+    "cant",
+    "cannot",
+}
+_NEGATION_AWARE_CLASSES = {
+    "certification_constraint",
+    "exclusion",
+    "proof",
+    "audience",
+}
+_HIGH_CARE_AUDIENCES = {"pregnancy", "kids"}
+_HIGH_CARE_POSITIVE_SOURCES = {"product_type", "tag", "title", "variant"}
 
 
 def _clean_attr(value: Any) -> str:
@@ -178,6 +202,142 @@ def _search_text(value: Any) -> str:
 def _has_phrase(text: str, phrase: str) -> bool:
     needle = _search_text(phrase).strip()
     return bool(needle) and f" {needle} " in _search_text(text)
+
+
+def _context_tokens(value: Any) -> List[str]:
+    text = str(value or "").lower()
+    text = text.replace("’", "'").replace("`", "'")
+    text = re.sub(r"\b(isn|doesn|don|aren|wasn|weren|can)'?t\b", r"\1t", text)
+    text = text.replace("-", " ")
+    return _TOKEN_RE.findall(text)
+
+
+def _phrase_spans(tokens: List[str], phrase: str) -> List[Tuple[int, int]]:
+    needle = _context_tokens(phrase)
+    if not tokens or not needle or len(needle) > len(tokens):
+        return []
+    width = len(needle)
+    return [
+        (idx, idx + width)
+        for idx in range(0, len(tokens) - width + 1)
+        if tokens[idx:idx + width] == needle
+    ]
+
+
+def _exclusion_phrase_is_own_negation(phrase_tokens: List[str]) -> bool:
+    if not phrase_tokens:
+        return False
+    if phrase_tokens[0] in {"no", "without"}:
+        return True
+    return phrase_tokens[-1:] == ["free"] or phrase_tokens[-2:] == ["free", "of"]
+
+
+def _match_is_negated(
+    *,
+    tokens: List[str],
+    start: int,
+    end: int,
+    class_name: str,
+    phrase: str,
+) -> bool:
+    if class_name not in _NEGATION_AWARE_CLASSES:
+        return False
+    lookback = tokens[max(0, start - 5):start]
+    own_exclusion_negation = (
+        class_name == "exclusion"
+        and _exclusion_phrase_is_own_negation(_context_tokens(phrase))
+        and not lookback
+    )
+    if not own_exclusion_negation and any(token in _NEGATION_TOKENS for token in lookback):
+        return True
+    if len(lookback) >= 2 and lookback[-2:] == ["free", "of"]:
+        return True
+    if len(lookback) >= 3 and lookback[-3:] == ["doesnt", "contain"]:
+        return True
+    if class_name == "certification_constraint":
+        lookahead = tokens[end:min(len(tokens), end + 4)]
+        if "not" in lookahead and any(token.startswith("certif") for token in lookahead):
+            return True
+        if "isnt" in lookahead and any(token.startswith("certif") for token in lookahead):
+            return True
+    return False
+
+
+def _mineral_context_allows(segment: str, tokens: List[str], start: int, end: int) -> bool:
+    phrase_window = tokens[max(0, start - 3):min(len(tokens), end + 4)]
+    window = " ".join(phrase_window)
+    segment_text = " ".join(tokens)
+    if "mineral oil" in window or "mineral oil" in segment_text:
+        return False
+    allowed_contexts = (
+        "mineral sunscreen",
+        "mineral sun screen",
+        "mineral spf",
+        "zinc oxide",
+        "titanium dioxide",
+    )
+    normalized_segment = _search_text(segment)
+    return any(context in normalized_segment for context in allowed_contexts)
+
+
+def _high_care_positive_context(
+    *,
+    tokens: List[str],
+    start: int,
+    end: int,
+    attr: str,
+    source: str,
+) -> bool:
+    if attr not in _HIGH_CARE_AUDIENCES:
+        return True
+    if source in _HIGH_CARE_POSITIVE_SOURCES:
+        return True
+    before = tokens[max(0, start - 4):start]
+    after = tokens[end:min(len(tokens), end + 4)]
+    if "for" in before[-3:]:
+        return True
+    if any(token in before for token in {"made", "designed", "formulated", "intended", "suitable"}):
+        return True
+    if attr == "pregnancy" and any(token in after for token in {"support", "routine", "use"}):
+        return True
+    if attr == "kids" and any(token in after for token in {"sunscreen", "stick", "balm", "deodorant"}):
+        return True
+    return False
+
+
+def _has_allowed_phrase_match(
+    *,
+    text: str,
+    source: str,
+    class_name: str,
+    phrase: str,
+    attr: str,
+) -> bool:
+    for segment in _CONTEXT_SPLIT_RE.split(str(text or "")):
+        tokens = _context_tokens(segment)
+        for start, end in _phrase_spans(tokens, phrase):
+            if _match_is_negated(
+                tokens=tokens,
+                start=start,
+                end=end,
+                class_name=class_name,
+                phrase=phrase,
+            ):
+                continue
+            if class_name == "certification_constraint" and attr == "mineral":
+                if not _mineral_context_allows(segment, tokens, start, end):
+                    continue
+            if class_name == "audience" and attr in _HIGH_CARE_AUDIENCES:
+                if not _high_care_positive_context(
+                    tokens=tokens,
+                    start=start,
+                    end=end,
+                    attr=attr,
+                    source=source,
+                ):
+                    continue
+            return True
+    return False
 
 
 def _dedupe(items: Iterable[str]) -> List[str]:
@@ -281,7 +441,13 @@ def _add_lexicon_matches(
     lexicon: Iterable[Tuple[str, str]],
 ) -> None:
     for phrase, attr in lexicon:
-        if _has_phrase(text, phrase):
+        if _has_allowed_phrase_match(
+            text=text,
+            source=source,
+            class_name=class_name,
+            phrase=phrase,
+            attr=attr,
+        ):
             _add_attr(classes, evidence, class_name, attr, source)
 
 
@@ -435,7 +601,11 @@ def _first_buyer_category(classes: Mapping[str, List[str]], product_type: str) -
             return cleaned
     product_type_text = _clean_attr(product_type)
     for _phrase, category in _CATEGORY_TERMS:
-        if _has_phrase(product_type_text, category) and category not in _GENERIC_CATEGORIES:
+        if (
+            _has_phrase(product_type_text, category)
+            and category not in _GENERIC_CATEGORIES
+            and category != "supplement"
+        ):
             return category
     return None
 
@@ -469,7 +639,7 @@ def _query_has_category(query: str, category: str) -> bool:
     return bool(category) and _has_phrase(query, category)
 
 
-def _violates_guardrail(query: str) -> bool:
+def _violates_guardrail(query: str, basis: Iterable[str] | None = None) -> bool:
     q = _clean_query(query)
     if "sleep" in q:
         return True
@@ -477,6 +647,11 @@ def _violates_guardrail(query: str) -> bool:
         if blocked in q:
             return True
     if "safe" in q and "reef-safe" not in q:
+        return True
+    cleaned_basis = set(_dedupe(basis or []))
+    if re.search(r"\bfor\s+(?:pregnancy|pregnant)\b", q) and "pregnancy" not in cleaned_basis:
+        return True
+    if re.search(r"\bfor\s+(?:kids|children|child|baby)\b", q) and "kids" not in cleaned_basis:
         return True
     return False
 
@@ -505,7 +680,7 @@ def _candidate(
     if not cleaned_basis:
         return None
     cleaned_query = _clean_query(query)
-    if not cleaned_query or _violates_guardrail(cleaned_query):
+    if not cleaned_query or _violates_guardrail(cleaned_query, cleaned_basis):
         return None
     return {
         "query": cleaned_query,
@@ -524,6 +699,32 @@ def _benefit_for_category(category: str) -> Optional[str]:
     if category == "deodorant":
         return "gym"
     return None
+
+
+def _destutter_query(value: str) -> str:
+    words = _clean_query(value).split()
+    if not words:
+        return ""
+    changed = True
+    while changed:
+        changed = False
+        out: List[str] = []
+        idx = 0
+        while idx < len(words):
+            if idx + 1 < len(words) and words[idx] == words[idx + 1]:
+                out.append(words[idx])
+                idx += 2
+                changed = True
+                continue
+            if idx + 3 < len(words) and words[idx:idx + 2] == words[idx + 2:idx + 4]:
+                out.extend(words[idx:idx + 2])
+                idx += 4
+                changed = True
+                continue
+            out.append(words[idx])
+            idx += 1
+        words = out
+    return " ".join(words)
 
 
 def generate_sidewalk_query_specs(
@@ -547,7 +748,11 @@ def generate_sidewalk_query_specs(
     if not category:
         return []
 
-    formats = list(classes.get("format") or [])
+    formats = [
+        item
+        for item in (classes.get("format") or [])
+        if _clean_attr(item) != category
+    ]
     constraints = list(classes.get("certification_constraint") or [])
     audiences = list(classes.get("audience") or [])
     use_cases = [item for item in (classes.get("use_case") or []) if item != "sleep"]
@@ -558,6 +763,7 @@ def generate_sidewalk_query_specs(
     candidates: List[Dict[str, Any]] = []
 
     def add(query: str, basis: Iterable[str], weight: float) -> None:
+        query = _destutter_query(query)
         if not _query_has_category(query, category):
             return
         item = _candidate(safe_graph, query, basis, weight)
