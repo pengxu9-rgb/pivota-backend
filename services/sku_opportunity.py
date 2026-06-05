@@ -65,6 +65,20 @@ _COMPARISON_TOKEN_RE = re.compile(
     r"\b(?:alternatives?|dupes?|versus|vs|compare|compared|comparison)\b",
     re.IGNORECASE,
 )
+_NO_INFO_DENIAL_RE = re.compile(
+    r"\b(?:"
+    r"(?:do not|don't|does not|doesn't|did not|didn't|cannot|can't)\s+"
+    r"have\s+(?:enough\s+)?(?:information|data|details|context)\b"
+    r"|(?:do not|don't|does not|doesn't|did not|didn't|cannot|can't)\s+"
+    r"(?:find|identify|locate|verify|determine)\b"
+    r"|could(?:\s+not|n't)\s+(?:find|identify|locate|determine)\b"
+    r"|no\s+(?:information|listing|listings|result|results)\b"
+    r"|not\s+enough\s+information\b"
+    r"|insufficient\s+information\b"
+    r"|unable\s+to\s+(?:find|identify|locate|verify|determine)\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def build_sku_opportunity(
@@ -438,27 +452,39 @@ def _run_visibility_verdict(
         or sku_mentioned is True
         or (merchant_mention and not negative_verdict)
     )
+    positive_product_signal = product_positive and not negative_verdict
+    positive_merchant_signal = merchant_mention and not negative_verdict
     grounded_positive = bool(
         not negative_verdict
         and grounded_any
         and (correct_sku is True or product_visible is True)
     )
     competitors_named = bool(_raw_competitors(run))
+    no_info_denial = _looks_like_no_info_denial(text)
+    retail_marketplace_route = _run_has_retail_marketplace_route(run, product)
+    category_answer = grounded_any and _mentions_product_category(text, product)
     shopping_answer = bool(
-        grounded_any
-        or competitors_named
-        or _looks_like_shopping_answer(_run_text(run))
+        not no_info_denial
+        and (
+            competitors_named
+            or positive_product_signal
+            or positive_merchant_signal
+            or retail_marketplace_route
+            or _looks_like_shopping_answer(text)
+            or category_answer
+        )
     )
     return {
         "product_visible": product_visible,
         "correct_sku": correct_sku,
         "sku_mentioned": sku_mentioned,
         "negative_verdict": negative_verdict,
+        "no_info_denial": no_info_denial,
         "grounded_first_party": grounded_first_party and not negative_verdict,
         "grounded_any": grounded_any,
-        "product_positive": product_positive and not negative_verdict,
+        "product_positive": positive_product_signal,
         "grounded_positive": grounded_positive,
-        "merchant_mention": merchant_mention and not negative_verdict,
+        "merchant_mention": positive_merchant_signal,
         "competitors_named": competitors_named,
         "shopping_answer": shopping_answer,
     }
@@ -849,9 +875,13 @@ def _demand_signal(
     competitors: List[str],
 ) -> float:
     shopping_runs = sum(1 for row in provider_analysis.values() if row.get("shopping_answer"))
-    source_count = sum(len(run.get("grounding_sources") or []) for run in runs)
+    source_count = sum(
+        len(run.get("grounding_sources") or [])
+        for run in runs
+        if not _looks_like_no_info_denial(_run_text(run))
+    )
     competitor_count = len(competitors)
-    if shopping_runs <= 0 and source_count <= 0 and competitor_count <= 0:
+    if shopping_runs <= 0:
         return 0.0
     if shopping_runs >= 2 and (source_count or competitor_count):
         return 1.0 if competitor_count >= 2 or source_count >= 3 else 0.7
@@ -962,6 +992,8 @@ def _is_open_lane(
     if query_class not in {"sidewalk", "attribute", "category", "objection"}:
         return False
     if demand_signal < 0.4:
+        return False
+    if demand_signal < 0.7 and _confidence(provider_analysis) < 0.8:
         return False
     if durable_competitor:
         return False
@@ -1171,13 +1203,22 @@ def _demand_state_summary(
         }
         for row in per_prompt
     )
-    branded_score = (intent_ladder.get("branded_transactional") or {}).get("score") or 0
-    unbranded_scores = [
-        (intent_ladder.get("head_category") or {}).get("score") or 0,
-        (intent_ladder.get("attribute_category") or {}).get("score") or 0,
+    branded_layer = intent_ladder.get("branded_transactional") or {}
+    branded_score = branded_layer.get("score") or 0
+    unbranded_layers = [
+        intent_ladder.get("head_category") or {},
+        intent_ladder.get("attribute_category") or {},
     ]
-    if branded_score >= 70 and unbranded_scores and max(unbranded_scores) < 40:
-        return "branded demand protected, unbranded absent"
+    measured_unbranded = [
+        layer
+        for layer in unbranded_layers
+        if int(layer.get("prompts") or 0) > 0
+    ]
+    if branded_score >= 70:
+        if measured_unbranded and max((layer.get("score") or 0) for layer in measured_unbranded) < 40:
+            return "branded demand protected, unbranded absent"
+        if not measured_unbranded:
+            return "branded demand protected, unbranded not measured"
     if demand_exists_absent:
         return "demand exists but you are absent"
     return "no meaningful demand detected"
@@ -1442,6 +1483,45 @@ def _looks_like_shopping_answer(text: str) -> bool:
     if not haystack:
         return False
     return any(word in haystack for word in _SHOPPING_WORDS)
+
+
+def _looks_like_no_info_denial(text: str) -> bool:
+    return bool(_NO_INFO_DENIAL_RE.search(str(text or "")))
+
+
+def _run_has_retail_marketplace_route(run: Dict[str, Any], product: Dict[str, Any]) -> bool:
+    merchant_category = product.get("product_type") or product.get("category")
+    for identifier in _run_source_identifiers(run):
+        host = identifier.get("host")
+        if not host:
+            continue
+        role = _normalize_role(
+            classify_host(str(host), merchant_category=merchant_category).get("type"),
+            str(host),
+        )
+        if role in {"retailer", "marketplace"}:
+            return True
+    return False
+
+
+def _mentions_product_category(text: str, product: Dict[str, Any]) -> bool:
+    haystack = str(text or "").strip().lower()
+    if not haystack:
+        return False
+    candidates: List[str] = []
+    for value in (
+        product.get("product_type"),
+        product.get("category"),
+        product.get("title"),
+        product.get("raw_title"),
+        product.get("description"),
+    ):
+        candidates.extend(
+            token
+            for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+            if len(token) >= 5
+        )
+    return any(token in haystack for token in set(candidates))
 
 
 def _merchant_host(sku_ctx: Dict[str, Any], product: Dict[str, Any]) -> Optional[str]:

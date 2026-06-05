@@ -175,7 +175,8 @@ def _multi_provider_probe_runs() -> List[Dict[str, Any]]:
                     },
                     "evidence_excerpt": "TestBrand Bright Skin Serum is cited by ChatGPT.",
                     "grounding_sources": [
-                        {"uri": "https://merchant.test/products/serum", "title": "Bright Skin Serum"}
+                        {"uri": "https://merchant.test/products/serum", "title": "Bright Skin Serum"},
+                        {"uri": "https://allure.com/best-serums", "title": "Best serums"},
                     ],
                     "grounding_chunks": ["https://merchant.test/products/serum"],
                     "url_match": {"in_grounding": True},
@@ -204,6 +205,10 @@ def _positive_probe_runs(count: int = 4) -> List[Dict[str, Any]]:
                 {
                     "uri": "https://merchant.test/products/serum",
                     "title": "Bright Skin Serum",
+                },
+                {
+                    "uri": "https://forbes.com/best-serums",
+                    "title": "Best serums",
                 }
             ],
             "grounding_chunks": ["https://merchant.test/products/serum"],
