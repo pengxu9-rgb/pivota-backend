@@ -359,6 +359,36 @@ def test_validation_fix_still_rejects_hallucinated_entities():
     assert any("VogueBeauty" in failure for failure in failures)
 
 
+@pytest.mark.parametrize(
+    ("line", "invented_brand"),
+    [
+        (
+            "You lose to Vital Proteins and Moonjuice in the category.",
+            "Moonjuice",
+        ),
+        (
+            "AI ranks Vital Proteins and NeoCell and FakeBrandX here.",
+            "FakeBrandX",
+        ),
+        (
+            "Healthline cites Vital Proteins and Glowtox over you.",
+            "Glowtox",
+        ),
+    ],
+)
+def test_validation_fix_rejects_conjoined_hallucinated_entities(line, invented_brand):
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = line
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert f"unknown-entity:{invented_brand}" in failures
+    assert "unknown-entity:Vital Proteins" not in failures
+    assert "unknown-entity:NeoCell" not in failures
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
 def test_validation_fix_allows_cited_source_names_but_rejects_unknown_sources():
     evidence = _validation_fix_evidence()
     brief = _validation_fix_grounded_brief()

@@ -691,9 +691,15 @@ def _extract_named_entities(text: str) -> List[Tuple[str, bool]]:
     entities: List[Tuple[str, bool]] = []
     seen_spans: List[Tuple[int, int]] = []
     for match in _PROPER_SEQUENCE_RE.finditer(text):
-        entity = _clean_entity(match.group(0))
-        if entity and not _entity_is_stopword(entity):
-            entities.append((entity, _is_sentence_initial(text, match.start())))
+        sequence = _clean_entity(match.group(0))
+        if sequence:
+            sequence_sentence_initial = _is_sentence_initial(text, match.start())
+            for chunk_index, chunk in enumerate(re.split(r"\s+(?:and|&)\s+", sequence)):
+                entity = _clean_entity(chunk)
+                if entity and not _entity_is_stopword(entity):
+                    entities.append(
+                        (entity, sequence_sentence_initial and chunk_index == 0)
+                    )
             seen_spans.append(match.span())
 
     for match in _SINGLE_ENTITY_RE.finditer(text):
