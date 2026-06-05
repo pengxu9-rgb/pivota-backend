@@ -100,11 +100,11 @@ def test_max_runs_caps_query_count():
 
 
 # ---------------------------------------------------------------------
-# Prompt grounding instructions
+# Prompt grounding boundary
 # ---------------------------------------------------------------------
 
 
-def test_primary_scan_prompts_require_web_search_and_cited_sources():
+def test_primary_scan_prompts_stay_ungrounded():
     from services.llm_providers.deepseek_probe import _build_system_prompt
 
     for scan_mode in (
@@ -113,9 +113,10 @@ def test_primary_scan_prompts_require_web_search_and_cited_sources():
         "category_visibility_test",
     ):
         prompt = _build_system_prompt(scan_mode)
-        assert "web search" in prompt
-        assert "SEARCH THE WEB" in prompt
-        assert "cited sources" in prompt
+        assert "You do not have live web search" in prompt
+        assert "model knowledge only" in prompt
+        assert "SEARCH THE WEB" not in prompt
+        assert "cited sources" not in prompt
 
 
 def test_answer_quality_verify_prompt_stays_ungrounded():
@@ -425,9 +426,9 @@ def test_build_findings_high_severity_for_low_score():
 # _call_deepseek_chat itself, so they never exercise the actual HTTP
 # request body. These tests intercept at the transport layer to pin
 # the canonical request shape (URL, headers, model, messages,
-# response_format, temperature, max_tokens, tools=web_search,
-# enable_search) — regressions there would silently break grounded
-# audits without surfacing in any other test.
+# response_format, temperature, max_tokens, and absence of invalid
+# web_search tooling) — regressions there would silently reintroduce
+# the Deepseek 400 path without surfacing in most other tests.
 # ---------------------------------------------------------------------
 
 
@@ -501,14 +502,15 @@ async def test_call_deepseek_chat_sends_canonical_request_body(monkeypatch):
     assert body["response_format"] == {"type": "json_object"}
     assert body["temperature"] == 0.2
     assert body["max_tokens"] == 800
+    assert "tools" not in body
+    assert "enable_search" not in body
 
 
 @pytest.mark.asyncio
-async def test_call_deepseek_chat_includes_web_search_when_enabled(monkeypatch):
-    """enable_web_search=True (default) → body carries both the
-    OpenAI-compatible `tools` array AND the older `enable_search`
-    flag. Deepseek ignores unknown fields rather than 4xx-ing, so
-    sending both is the documented defensive shape."""
+async def test_call_deepseek_chat_ignores_web_search_when_enabled(monkeypatch):
+    """enable_web_search=True is retained for caller compatibility, but
+    Deepseek chat must stay ungrounded: no invalid web_search tool and
+    no enable_search flag."""
     from services.llm_providers import deepseek_probe
 
     transport, captured = _capturing_transport()
@@ -538,14 +540,14 @@ async def test_call_deepseek_chat_includes_web_search_when_enabled(monkeypatch):
         enable_web_search=True,
     )
     body = captured["body"]
-    assert body["tools"] == [{"type": "web_search"}]
-    assert body["enable_search"] is True
+    assert "tools" not in body
+    assert "enable_search" not in body
 
 
 @pytest.mark.asyncio
 async def test_call_deepseek_chat_omits_web_search_when_disabled(monkeypatch):
     """enable_web_search=False → no `tools`, no `enable_search` in the
-    body. Audits that opt out of grounding shouldn't pay for tool calls."""
+    body."""
     from services.llm_providers import deepseek_probe
 
     transport, captured = _capturing_transport()

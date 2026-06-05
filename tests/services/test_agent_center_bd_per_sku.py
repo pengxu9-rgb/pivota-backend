@@ -239,6 +239,22 @@ def test_us_shopper_resolves_deepseek_verify_provider():
     assert coverage["pending_engine_support"] == []
 
 
+def test_wedge_profiles_resolve_brand_and_hero_primary_providers():
+    from services.coverage_profiles import (
+        load_coverage_profile_config,
+        resolve_coverage_profile,
+    )
+
+    load_coverage_profile_config.cache_clear()
+    brand = resolve_coverage_profile(coverage_profile="pilot_gemini")
+    hero = resolve_coverage_profile(coverage_profile="us_shopper")
+
+    assert brand["providers"] == ["gemini"]
+    assert brand["verify_providers"] == ["deepseek"]
+    assert hero["providers"] == ["gemini", "chatgpt"]
+    assert hero["verify_providers"] == ["deepseek"]
+
+
 def test_gemini_deepseek_resolves_dual_primary_providers():
     from services.coverage_profiles import (
         load_coverage_profile_config,
