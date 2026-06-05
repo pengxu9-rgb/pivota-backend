@@ -9,7 +9,14 @@ from services.next_best_action import (
     PRIMARY_INTEGRATION_COMPLETION,
     PRIMARY_RETAILER_ROUTE_LEAK,
     PRIMARY_RETRIEVAL_FOUNDATION,
+    PRIMARY_SKU_CONTENT_REVISION_GAP,
+    PRIMARY_SKU_INSUFFICIENT_DATA,
+    PRIMARY_SKU_OPEN_LANE_CAPTURE,
+    PRIMARY_SKU_PROTECTED_MONITORING,
+    PRIMARY_SKU_SOURCE_ROUTE_REPAIR,
+    PRIMARY_SKU_SUBSTITUTION_LEAK,
     build_next_best_action,
+    build_sku_next_best_action,
 )
 
 
@@ -79,6 +86,34 @@ def _assert_70_30(nba: Dict[str, Any]) -> None:
     assert all(isinstance(a, str) and a.strip() for a in nba["self_serve_actions"])
     assert isinstance(nba["pivota_path"], str) and nba["pivota_path"].strip()
     assert set(nba["cta"]) == {"label", "trust_note"}
+
+
+def _sku_identity(unresolved: bool = False) -> Dict[str, Any]:
+    return {
+        "name": "BB Lab Good Night Collagen",
+        "confidence": "low" if unresolved else "medium",
+        "unresolved": unresolved,
+    }
+
+
+def _sku_scores(score: int = 90) -> Dict[str, Any]:
+    return {
+        "identity": {"score": score},
+        "content_richness": {"score": score},
+        "routability": {"score": score},
+        "citation": {"score": score},
+    }
+
+
+def _sku_base_opportunity() -> Dict[str, Any]:
+    return {
+        "per_prompt": [],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+        "demand_state_summary": "tested",
+        "intent_ladder": {},
+        "confidence": {"prompt_count": 4, "prompts_with_demand": 2},
+    }
 
 
 def test_invisible_retrieval_prescription_is_diy_first_not_integration():
@@ -451,3 +486,161 @@ def test_integration_completion_gap_only_for_non_cold_incomplete():
         is_cold_start=True,
     )
     assert cold["primary_gap"] != PRIMARY_INTEGRATION_COMPLETION
+
+
+def test_sku_nba_open_lane_uses_top_lane_first_move():
+    opportunity = _sku_base_opportunity()
+    opportunity["top_open_lanes"] = [
+        {
+            "query": "halal collagen sticks before bed",
+            "first_move": "Add a PDP section + FAQ for this lane",
+            "current_ownership": "open-lane",
+            "source_route": "unclassified",
+            "why_fit": ["halal", "collagen", "stick"],
+            "opportunity_score": 42.5,
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_OPEN_LANE_CAPTURE
+    assert nba["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert nba["evidence_used"]["top_open_lane"]["query"] == "halal collagen sticks before bed"
+    _assert_70_30(nba)
+
+
+def test_sku_nba_substitution_names_substitute_in_first_move():
+    opportunity = _sku_base_opportunity()
+    opportunity["substitution_alert"] = {
+        "present": True,
+        "prompt": "BB Lab collagen alternatives",
+        "substituted_by": "Vital Proteins",
+        "engines": ["deepseek", "gemini"],
+    }
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(),
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
+    assert "Vital Proteins" in nba["first_move"]
+    assert "comparison and alternatives content" in nba["first_move"]
+    _assert_70_30(nba)
+
+
+def test_sku_nba_content_gap_references_content_richness_bucket():
+    opportunity = _sku_base_opportunity()
+    gaps = [
+        {
+            "dimension": "content_richness",
+            "bucket": "vertical_structure",
+            "points": 0,
+            "max": 20,
+            "gap": 20,
+            "reason": "missing ingredients and usage guides",
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=gaps,
+        scores=_sku_scores(65),
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP
+    assert "vertical structure" in nba["first_move"]
+    assert "missing ingredients and usage guides" in nba["why_this_first"]
+    _assert_70_30(nba)
+
+
+def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
+    for route, ownership, expected in [
+        ("retailer", "retailer-owned", "retailer/marketplace listing"),
+        ("publisher", "publisher-owned", "Pitch the cited publisher"),
+    ]:
+        opportunity = _sku_base_opportunity()
+        opportunity["per_prompt"] = [
+            {
+                "query": f"best collagen source via {route}",
+                "ownership_state": ownership,
+                "source_route": route,
+                "opportunity_score": 31.5,
+                "demand_signal": 1.0,
+                "source_summary": {
+                    "top_cited_hosts": [{"host": f"{route}.example", "times_cited": 2}]
+                },
+            }
+        ]
+
+        nba = build_sku_next_best_action(
+            opportunity=opportunity,
+            scores=_sku_scores(85),
+            identity=_sku_identity(),
+            sku_title="BB Lab Good Night Collagen",
+        )
+
+        assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
+        assert expected in nba["first_move"]
+        assert nba["evidence_used"]["source_route_prompt"]["source_route"] == route
+        _assert_70_30(nba)
+
+
+def test_sku_nba_protected_monitoring_has_no_fake_urgency():
+    opportunity = _sku_base_opportunity()
+    opportunity["per_prompt"] = [
+        {
+            "query": "where can I buy BB Lab Good Night Collagen",
+            "ownership_state": "merchant-owned",
+            "source_route": "first-party",
+            "opportunity_score": 0.0,
+            "demand_signal": 1.0,
+        },
+        {
+            "query": "BB Lab Good Night Collagen review",
+            "ownership_state": "merchant-mentioned",
+            "source_route": "first-party",
+            "opportunity_score": 0.0,
+            "demand_signal": 0.7,
+        },
+    ]
+    opportunity["confidence"] = {"prompt_count": 2, "prompts_with_demand": 2}
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=[],
+        scores=_sku_scores(90),
+        identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_PROTECTED_MONITORING
+    assert "Do not manufacture urgency" in nba["why_this_first"]
+    assert "critical" not in nba["headline"].lower()
+    _assert_70_30(nba)
+
+
+def test_sku_nba_thin_coverage_returns_insufficient_data():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 0, "prompts_with_demand": 0}
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=[],
+        scores={},
+        identity=_sku_identity(unresolved=True),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_INSUFFICIENT_DATA
+    assert "should not fabricate a lane" in nba["why_this_first"]
+    _assert_70_30(nba)

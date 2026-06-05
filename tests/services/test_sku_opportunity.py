@@ -266,6 +266,9 @@ def test_sku_opportunity_scores_bb_lab_prompt_cases():
     }
 
     assert opportunity["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
+    assert opportunity["top_open_lanes"][0]["current_ownership"] == "open-lane"
+    assert opportunity["top_open_lanes"][0]["source_route"] == "unclassified"
+    assert opportunity["top_open_lanes"][0]["first_move"] == "Add a PDP section + FAQ for this lane"
     assert opportunity["intent_ladder"]["branded_transactional"]["score"] >= 90
     assert opportunity["intent_ladder"]["head_category"]["score"] < 50
     assert opportunity["intent_ladder"]["sidewalk_opportunity"]["score"] > 0
@@ -737,3 +740,7 @@ async def test_build_per_sku_report_preserves_prior_keys_and_adds_opportunity(mo
     assert prior_keys.issubset(report.keys())
     assert "opportunity" in report
     assert report["opportunity"]["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
+    assert report["opportunity"]["top_open_lanes"][0]["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert "next_best_action" in report
+    assert report["next_best_action"]["primary_gap"] == "open_lane_capture"
+    assert report["next_best_action"]["first_move"] == "Add a PDP section + FAQ for this lane"

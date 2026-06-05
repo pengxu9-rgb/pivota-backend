@@ -183,6 +183,10 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     }
     assert out["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
     assert out["top_open_lanes"][0]["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert out["next_best_action"]["primary_gap"] == "open_lane_capture"
+    assert out["next_best_action"]["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert len(out["next_best_action"]["self_serve_actions"]) == 2
+    assert out["next_best_action"]["pivota_path"]
     assert "You lost `best collagen supplements for skin`" in out["headline"]
     assert "`halal collagen sticks before bed`" in out["headline"]
     assert out["substitution_alert"]["present"] is True
@@ -257,6 +261,7 @@ async def test_run_wedge_hero_sku_intelligence_mock_upstream_is_honest(monkeypat
 
     assert out["is_empty"] is True
     assert out["top_open_lanes"] == []
+    assert out["next_best_action"]["primary_gap"] == "insufficient_data"
     assert "fallback data" in out.get("note", "")
     # The synthetic runs must NOT produce a money-shot.
     assert "You lost" not in out["headline"]
@@ -278,6 +283,7 @@ async def test_run_wedge_hero_sku_intelligence_empty_state_without_attributes(mo
 
     assert out["is_empty"] is True
     assert out["top_open_lanes"] == []
+    assert "next_best_action" in out
     assert "We tested 3 buyer prompts for BB Lab Good Night Collagen" in out["headline"]
     assert "No open lane stood out this run" in out["headline"]
     assert out["intent_ladder"]

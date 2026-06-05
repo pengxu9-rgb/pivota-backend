@@ -693,6 +693,18 @@ def _source_owned_state(
     return None
 
 
+def _first_move_for_lane(lane: Mapping[str, Any]) -> str:
+    ownership = str(lane.get("current_ownership") or "").lower()
+    source_route = str(lane.get("source_route") or "").lower()
+    if ownership in {"retailer-owned", "marketplace-owned"} or source_route in {"retailer", "marketplace"}:
+        return "Fix your listing on the cited retailer"
+    if ownership == "publisher-owned" or source_route == "publisher":
+        return "Pitch the cited publisher for roundup inclusion"
+    if ownership == "forum-owned" or source_route == "forum":
+        return "Build reviews/UGC"
+    return "Add a PDP section + FAQ for this lane"
+
+
 def _competitors_for_runs(
     runs: List[Dict[str, Any]],
     *,
@@ -1147,7 +1159,7 @@ def _top_open_lanes(per_prompt: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
     out = []
     for row in lanes[:3]:
-        out.append({
+        lane = {
             "query": row.get("query"),
             "why_fit": row.get("attribute_basis") or _why_fit_from_features(row),
             "current_ownership": row.get("ownership_state"),
@@ -1156,7 +1168,9 @@ def _top_open_lanes(per_prompt: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "source_route": row.get("source_route"),
             "demand_state": row.get("demand_state"),
             "opportunity_score": row.get("opportunity_score"),
-        })
+        }
+        lane["first_move"] = _first_move_for_lane(lane)
+        out.append(lane)
     return out
 
 
