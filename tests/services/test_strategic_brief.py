@@ -167,6 +167,117 @@ def _grounded_brief() -> Dict[str, Any]:
     }
 
 
+def _validation_fix_evidence() -> Dict[str, Any]:
+    return {
+        "product": {
+            "title": "BB Lab Low Molecular Collagen",
+            "brand": "BB Lab",
+            "attributes": {
+                "category": ["collagen supplement"],
+                "format": ["stick", "powder"],
+                "ingredient": ["low molecular collagen", "vitamin c"],
+                "certification": ["halal"],
+                "audience": ["women"],
+                "use_case": ["before bed", "skin"],
+            },
+        },
+        "position": {
+            "strong_when_named": 72,
+            "weak_in_category": 18,
+            "branded_consideration": 40,
+        },
+        "category_battle": {
+            "prompts": [
+                "best collagen supplements for skin",
+                "top collagen for women",
+            ],
+            "winners": ["Vital Proteins", "NeoCell", "Sports Research"],
+            "ranked_by": [
+                {"host": "healthline.com", "role": "publisher"},
+                {"host": "amazon.com", "role": "marketplace"},
+            ],
+            "prompt_details": [],
+        },
+        "substitution": {
+            "present": True,
+            "on_prompt": "BB Lab collagen alternatives",
+            "handed_to": "Vital Proteins",
+            "engines": ["gemini"],
+        },
+        "open_lanes": [
+            {
+                "query": "halal collagen sticks before bed",
+                "why_fit": ["halal", "collagen", "stick", "before bed"],
+                "who_controls": "none/fragmented",
+                "channel_role": "open",
+            }
+        ],
+        "channel_map": [
+            {
+                "query": "halal collagen sticks before bed",
+                "controlled_by": [{"host": "reddit.com", "role": "forum"}],
+                "role": "open",
+            }
+        ],
+        "demand_state": "branded protected, category lost, niche open",
+        "notes": {"merchant_can_act_in_30d": True, "health_sensitive": True},
+    }
+
+
+def _validation_fix_grounded_brief() -> Dict[str, Any]:
+    return {
+        "position": (
+            "BB Lab is a niche challenger - strong when shoppers name you, "
+            "invisible in the broad collagen category."
+        ),
+        "core_decision": (
+            "Stop fighting Vital Proteins head-on in the category. Double down "
+            "on the halal bedtime-collagen lane where no one is the answer yet."
+        ),
+        "why_you_lose": (
+            "Vital Proteins, NeoCell, and Sports Research win because Healthline "
+            "ranks them and Amazon reviews back them. Reviews and publisher "
+            "authority are the moat, not your page."
+        ),
+        "your_angle": (
+            "Reframe BB Lab as the halal, low-molecular bedtime collagen stick - "
+            "a category of one. Concentrate where your halal certification IS "
+            "the answer."
+        ),
+        "traffic_strategy": [
+            {
+                "where": "halal collagen sticks before bed",
+                "who_controls": "none/fragmented",
+                "how": "Own your product pages so AI has your answer to cite.",
+            },
+            {
+                "where": "category prompts",
+                "who_controls": "Healthline",
+                "how": (
+                    "Skip Healthline for now - earn niche placements first."
+                ),
+            },
+        ],
+        "substitution_play": (
+            "Counter the Vital Proteins hand-off with a direct comparison on "
+            "your page."
+        ),
+        "first_moves": [
+            "Add the halal and bedtime story to your page.",
+            "Seed reviews on Amazon to close the authority gap.",
+            "Target the open halal lane with a dedicated page.",
+            "Publish a comparison versus Vital Proteins.",
+        ],
+        "diy_vs_pivota": {
+            "self_serve": ["Update your PDP", "Collect reviews"],
+            "pivota": (
+                "Pivota makes your page citable and buyable for the lanes you "
+                "claim."
+            ),
+        },
+    }
+
+
 def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
     evidence = _evidence()
 
@@ -214,6 +325,89 @@ def test_build_sku_brief_prompt_uses_exact_role_and_injects_evidence_json():
 
 def test_validate_grounding_accepts_fully_grounded_brief():
     assert strategic_brief.validate_grounding(_grounded_brief(), _evidence()) is True
+
+
+def test_validation_fix_accepts_grounded_bb_lab_brief_without_false_positives():
+    brief = _validation_fix_grounded_brief()
+    evidence = _validation_fix_evidence()
+
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
+def test_validation_fix_still_rejects_hallucinated_entities():
+    evidence = _validation_fix_evidence()
+    hallucinated = {
+        "position": "You are a challenger.",
+        "core_decision": "x",
+        "why_you_lose": (
+            "AI hands buyers to Moonjuice and CollagenKing, ranked by "
+            "VogueBeauty.com."
+        ),
+        "your_angle": "x",
+        "traffic_strategy": [{"where": "x", "who_controls": "x", "how": "x"}],
+        "substitution_play": None,
+        "first_moves": ["x"],
+        "diy_vs_pivota": {"self_serve": ["x"], "pivota": "x"},
+    }
+
+    failures = strategic_brief._grounding_failures(hallucinated, evidence)
+
+    assert strategic_brief.validate_grounding(hallucinated, evidence) is False
+    assert any("Moonjuice" in failure for failure in failures)
+    assert any("CollagenKing" in failure for failure in failures)
+    assert any("VogueBeauty" in failure for failure in failures)
+
+
+def test_validation_fix_allows_cited_source_names_but_rejects_unknown_sources():
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = (
+        "Vital Proteins and NeoCell win because Healthline ranks them, Amazon "
+        "reviews support them, and Reddit controls the forum conversation."
+    )
+
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+
+    brief["why_you_lose"] = (
+        "Vital Proteins win because Healthline ranks them and Forbes repeats "
+        "the answer."
+    )
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert any("Forbes" in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Set the page at $29.99 to beat the substitutes.",
+        "Offer 40% off to win the lane.",
+        "Claim 50,000 reviews against Vital Proteins.",
+    ],
+)
+def test_validation_fix_rejects_fabricated_numeric_claims(claim):
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = claim
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert any(failure.startswith("forbidden:") for failure in failures)
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+def test_validation_fix_allows_legitimate_operational_numbers():
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = (
+        "Make these 3 first moves in 30 days and keep each check under "
+        "60 seconds."
+    )
+
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+    assert strategic_brief.validate_grounding(brief, evidence) is True
 
 
 @pytest.mark.parametrize(

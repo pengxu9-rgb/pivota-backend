@@ -88,6 +88,12 @@ _REQUIRED_BRIEF_KEYS = {
 }
 _FORBIDDEN_PATTERNS = (
     re.compile(r"/100", re.IGNORECASE),
+    re.compile(r"\$\s?\d", re.IGNORECASE),
+    re.compile(r"\b\d+(?:\.\d+)?\s?%", re.IGNORECASE),
+    re.compile(
+        r"\b\d[\d,]*\+?\s*(?:reviews?|ratings?|stars?|customers?|users?|sales?|followers?|subscribers?)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bsource route\b", re.IGNORECASE),
     re.compile(r"\bopportunity score\b", re.IGNORECASE),
     re.compile(r"\bcanonical enriched\b", re.IGNORECASE),
@@ -140,6 +146,7 @@ _ENTITY_STOPWORDS = {
     "For",
     "If",
     "Instead",
+    "IS",
     "JSON",
     "Keep",
     "Lane",
@@ -189,6 +196,10 @@ _INTERNAL_ALLOWED_ENTITIES = {
     "sku",
     "ugc",
 }
+_MULTIPART_TLDS = {"co.uk", "com.au", "co.jp", "co.kr", "com.br"}
+_SENTENCE_BOUNDARY_CHARS = {".", "!", "?", ":", ";", "\n", "•", "–", "—", "-"}
+_SENTENCE_PREFIX_STRIP_CHARS = " \t\r\f\v\"'`“”‘’()[]{}<>"
+_CONNECTOR_WORDS = {"of", "the", "for", "and", "&"}
 
 
 def assemble_sku_brief_evidence(
@@ -595,9 +606,15 @@ def _grounding_failures(
         if not _phrase_allowed(phrase, allowed["phrases"]):
             failures.append(f"unknown-quoted-lane:{quote}")
 
-    for entity in _extract_named_entities(text):
-        if not _entity_allowed(entity, allowed):
-            failures.append(f"unknown-entity:{entity}")
+    for entity, sentence_initial in _extract_named_entities(text):
+        if _entity_allowed(entity, allowed):
+            continue
+        if sentence_initial and _is_multiword_entity(entity):
+            first_unallowed = _sentence_initial_unallowed_token(entity, allowed)
+            if first_unallowed:
+                failures.append(f"unknown-entity:{first_unallowed}")
+            continue
+        failures.append(f"unknown-entity:{entity}")
     return failures
 
 
@@ -618,7 +635,8 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         host = _normalize_host(value)
         if host:
             allowed_domains.add(host)
-            allowed_terms.add(_norm_entity(host))
+            add_term(host)
+            add_term(_registrable_label(host))
 
     product = _as_mapping(evidence.get("product"))
     add_term(product.get("title"))
@@ -669,17 +687,13 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _extract_named_entities(text: str) -> List[str]:
-    entities: List[str] = []
+def _extract_named_entities(text: str) -> List[Tuple[str, bool]]:
+    entities: List[Tuple[str, bool]] = []
     seen_spans: List[Tuple[int, int]] = []
     for match in _PROPER_SEQUENCE_RE.finditer(text):
         entity = _clean_entity(match.group(0))
         if entity and not _entity_is_stopword(entity):
-            chunks = re.split(r"\s+(?:and|&)\s+", entity)
-            for chunk in chunks:
-                clean = _clean_entity(chunk)
-                if clean and not _entity_is_stopword(clean):
-                    entities.append(clean)
+            entities.append((entity, _is_sentence_initial(text, match.start())))
             seen_spans.append(match.span())
 
     for match in _SINGLE_ENTITY_RE.finditer(text):
@@ -687,8 +701,58 @@ def _extract_named_entities(text: str) -> List[str]:
             continue
         entity = _clean_entity(match.group(0))
         if entity and not _entity_is_stopword(entity):
-            entities.append(entity)
-    return _unique(entities)
+            sentence_initial = _is_sentence_initial(text, match.start())
+            if sentence_initial and not _is_brand_shaped(entity):
+                continue
+            entities.append((entity, sentence_initial))
+    out: List[Tuple[str, bool]] = []
+    seen: Set[Tuple[str, bool]] = set()
+    for entity, sentence_initial in entities:
+        key = (_norm_entity(entity), sentence_initial)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((entity, sentence_initial))
+    return out
+
+
+def _sentence_initial_unallowed_token(
+    entity: str,
+    allowed: Mapping[str, Any],
+) -> Optional[str]:
+    tokens = [
+        _clean_entity(token)
+        for token in re.split(r"\s+", entity)
+        if _clean_entity(token)
+    ]
+    if tokens and not _is_brand_shaped(tokens[0]):
+        tokens = tokens[1:]
+    while tokens and tokens[0].lower() in _CONNECTOR_WORDS:
+        tokens = tokens[1:]
+    while tokens and tokens[-1].lower() in _CONNECTOR_WORDS:
+        tokens = tokens[:-1]
+    for token in tokens:
+        if token.lower() in _CONNECTOR_WORDS:
+            continue
+        if not _entity_allowed(token, allowed):
+            return token
+    return None
+
+
+def _is_multiword_entity(entity: str) -> bool:
+    return len([token for token in re.split(r"\s+", entity.strip()) if token]) > 1
+
+
+def _is_sentence_initial(text: str, idx: int) -> bool:
+    prefix = text[:idx].rstrip(_SENTENCE_PREFIX_STRIP_CHARS)
+    return not prefix or prefix[-1] in _SENTENCE_BOUNDARY_CHARS
+
+
+def _is_brand_shaped(token: str) -> bool:
+    return bool(
+        re.search(r"[a-z][A-Z]", token)
+        or re.search(r"(?:[A-Za-z]\d|\d[A-Za-z])", token)
+    )
 
 
 def _entity_allowed(entity: str, allowed: Mapping[str, Any]) -> bool:
@@ -786,6 +850,19 @@ def _normalize_host(value: Any) -> str:
     text = text.strip().strip("/").lower()
     text = re.sub(r"^www\.", "", text)
     return text.split("/", 1)[0]
+
+
+def _registrable_label(host: Any) -> str:
+    normalized = _normalize_host(host)
+    if not normalized:
+        return ""
+    labels = [label for label in normalized.split(".") if label]
+    if len(labels) < 2:
+        return labels[0] if labels else ""
+    suffix = ".".join(labels[-2:])
+    if suffix in _MULTIPART_TLDS and len(labels) >= 3:
+        return labels[-3]
+    return labels[-2]
 
 
 def _norm_entity(value: Any) -> str:
