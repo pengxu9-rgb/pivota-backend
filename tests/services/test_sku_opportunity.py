@@ -743,4 +743,4 @@ async def test_build_per_sku_report_preserves_prior_keys_and_adds_opportunity(mo
     assert report["opportunity"]["top_open_lanes"][0]["first_move"] == "Add a PDP section + FAQ for this lane"
     assert "next_best_action" in report
     assert report["next_best_action"]["primary_gap"] == "open_lane_capture"
-    assert report["next_best_action"]["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert "halal collagen sticks before bed" in report["next_best_action"]["first_move"]

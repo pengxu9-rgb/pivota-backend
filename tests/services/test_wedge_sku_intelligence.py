@@ -184,7 +184,7 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     assert out["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
     assert out["top_open_lanes"][0]["first_move"] == "Add a PDP section + FAQ for this lane"
     assert out["next_best_action"]["primary_gap"] == "open_lane_capture"
-    assert out["next_best_action"]["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert "halal collagen sticks before bed" in out["next_best_action"]["first_move"]
     assert len(out["next_best_action"]["self_serve_actions"]) == 2
     assert out["next_best_action"]["pivota_path"]
     assert "You lost `best collagen supplements for skin`" in out["headline"]

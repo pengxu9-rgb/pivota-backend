@@ -137,11 +137,11 @@ def test_invisible_retrieval_prescription_is_diy_first_not_integration():
     )
 
     assert nba["primary_gap"] == PRIMARY_RETRIEVAL_FOUNDATION
-    assert "Submit and validate the canonical PDPs" in nba["first_move"]
-    assert "Product/Offer" in nba["first_move"]
-    assert "canonical AI-channel PDPs" in nba["pivota_path"]
-    assert "monitoring" in nba["pivota_path"]
-    assert "Pivota onboarding" not in nba["first_move"]
+    # DIY-first: the first move is the merchant's own indexing work, not "use Pivota".
+    assert "google" in nba["first_move"].lower()
+    assert "pivota" not in nba["first_move"].lower()
+    assert "Google Search Console" in nba["self_serve_actions"][0]
+    assert "re-check" in nba["pivota_path"].lower()
     _assert_70_30(nba)
 
 
@@ -163,9 +163,9 @@ def test_retailer_route_leak_prescribes_direct_attribution_not_generic_pr():
     nba = build_next_best_action(merchant_view=mv)
 
     assert nba["primary_gap"] == PRIMARY_RETAILER_ROUTE_LEAK
-    assert "first-party buying path" in nba["headline"]
-    assert "margin and customer-data leak" in nba["why_this_first"]
-    assert "generic PR" in nba["why_this_first"]
+    assert "retailers" in nba["headline"].lower()
+    assert "margin and customer data" in nba["why_this_first"]
+    assert "pr problem" in nba["why_this_first"].lower()  # not generic PR
     assert "sephora.com" in nba["self_serve_actions"][1]
     _assert_70_30(nba)
 
@@ -192,9 +192,9 @@ def test_category_discovery_gap_prescribes_content_and_publisher_inclusion():
     nba = build_next_best_action(merchant_view=mv)
 
     assert nba["primary_gap"] == PRIMARY_CATEGORY_DISCOVERY
-    assert "category-intent comparison" in nba["first_move"]
-    assert "pitch the cited sources" in nba["first_move"]
-    assert "failed query wording" in nba["self_serve_actions"][0]
+    assert "comparison content" in nba["first_move"].lower()
+    assert "sources" in nba["first_move"].lower()
+    assert "category questions" in nba["self_serve_actions"][0].lower()
     assert "nymag.com" in nba["self_serve_actions"][1]
     _assert_70_30(nba)
 
@@ -270,8 +270,8 @@ def test_strong_verdict_defense_has_no_fake_urgency():
     nba = build_next_best_action(merchant_view=mv)
 
     assert nba["primary_gap"] == PRIMARY_FIRST_PARTY_DEFENSE
-    assert "Defend" in nba["headline"]
-    assert "Do not manufacture urgency" in nba["why_this_first"]
+    assert "defend" in nba["headline"].lower()
+    assert "don't manufacture" in nba["why_this_first"].lower()
     assert "critical" not in nba["headline"].lower()
     _assert_70_30(nba)
 
@@ -339,7 +339,7 @@ def test_non_cold_incomplete_integration_can_lead_when_gate_is_real():
 
     assert mv["actions"][0]["lever"] == "pivota_integration"
     assert mv["next_best_action"]["primary_gap"] == PRIMARY_INTEGRATION_COMPLETION
-    assert mv["next_best_action"]["cta"]["label"] == "Finish Pivota onboarding"
+    assert mv["next_best_action"]["cta"]["label"] == "Finish Pivota setup"
     _assert_70_30(mv["next_best_action"])
 
 
@@ -509,7 +509,7 @@ def test_sku_nba_open_lane_uses_top_lane_first_move():
     )
 
     assert nba["primary_gap"] == PRIMARY_SKU_OPEN_LANE_CAPTURE
-    assert nba["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert "halal collagen sticks before bed" in nba["first_move"]
     assert nba["evidence_used"]["top_open_lane"]["query"] == "halal collagen sticks before bed"
     _assert_70_30(nba)
 
@@ -532,7 +532,7 @@ def test_sku_nba_substitution_names_substitute_in_first_move():
 
     assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
     assert "Vital Proteins" in nba["first_move"]
-    assert "comparison and alternatives content" in nba["first_move"]
+    assert "comparison" in nba["first_move"].lower()
     _assert_70_30(nba)
 
 
@@ -559,7 +559,7 @@ def test_sku_nba_content_gap_references_content_richness_bucket():
 
     assert nba["primary_gap"] == PRIMARY_SKU_CONTENT_REVISION_GAP
     assert "vertical structure" in nba["first_move"]
-    assert "missing ingredients and usage guides" in nba["why_this_first"]
+    assert "vertical structure" in nba["why_this_first"]
     _assert_70_30(nba)
 
 
@@ -624,8 +624,8 @@ def test_sku_nba_protected_monitoring_has_no_fake_urgency():
     )
 
     assert nba["primary_gap"] == PRIMARY_SKU_PROTECTED_MONITORING
-    assert "Do not manufacture urgency" in nba["why_this_first"]
-    assert "critical" not in nba["headline"].lower()
+    blob = (nba["headline"] + " " + nba["first_move"] + " " + nba["why_this_first"]).lower()
+    assert not any(p in blob for p in ("act now", "before it", "don't wait", "hurry", "limited time"))
     _assert_70_30(nba)
 
 
@@ -642,5 +642,69 @@ def test_sku_nba_thin_coverage_returns_insufficient_data():
     )
 
     assert nba["primary_gap"] == PRIMARY_SKU_INSUFFICIENT_DATA
-    assert "should not fabricate a lane" in nba["why_this_first"]
+    assert "won't invent" in nba["why_this_first"]
     _assert_70_30(nba)
+
+
+_FORBIDDEN_JARGON = (
+    "/100", "source route", "opportunity score", "canonical enriched",
+    "agent-resolvable", "schema-friendly", "content_richness", "grounded agent",
+)
+
+
+def _nba_strings(nba: Dict[str, Any]) -> str:
+    parts = [
+        str(nba.get("headline") or ""),
+        str(nba.get("why_this_first") or ""),
+        str(nba.get("first_move") or ""),
+        str(nba.get("pivota_path") or ""),
+        *[str(a) for a in nba.get("self_serve_actions") or []],
+        str((nba.get("cta") or {}).get("label") or ""),
+        str((nba.get("cta") or {}).get("trust_note") or ""),
+    ]
+    return " ".join(parts).lower()
+
+
+def test_no_internal_jargon_leaks_to_merchant_copy():
+    """Merchant-facing prescription copy (brand AND per-SKU) must never expose
+    internal scoring jargon, raw taxonomy, or fake-precision scores."""
+    nbas: List[Dict[str, Any]] = []
+
+    nbas.append(build_next_best_action(
+        merchant_view=_merchant_view(
+            verdict="INVISIBLE", visibility=10, attribution=5, category_visibility=8,
+            failed_queries=[_failed_query("best collagen")]),
+        is_cold_start=True))
+    nbas.append(build_next_best_action(
+        merchant_view=_merchant_view(
+            verdict="VISIBLE VIA RETAILERS", visibility=70, attribution=40, category_visibility=65,
+            cited_hosts=[{"host": "amazon.com", "type": "marketplace", "times_cited": 3}]),
+        is_cold_start=True))
+    nbas.append(build_next_best_action(
+        merchant_view=_merchant_view(
+            verdict="STRONG", visibility=90, attribution=88, category_visibility=85),
+        is_cold_start=True))
+
+    open_opp = _sku_base_opportunity()
+    open_opp["top_open_lanes"] = [{
+        "query": "halal collagen sticks before bed", "first_move": "x",
+        "current_ownership": "open-lane", "source_route": "unclassified",
+        "why_fit": ["halal", "collagen"], "opportunity_score": 42.5,
+    }]
+    nbas.append(build_sku_next_best_action(
+        opportunity=open_opp, scores=_sku_scores(), identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen"))
+
+    sub_opp = _sku_base_opportunity()
+    sub_opp["substitution_alert"] = {
+        "present": True, "prompt": "BB Lab collagen alternatives",
+        "substituted_by": "Vital Proteins", "engines": ["gemini"],
+    }
+    nbas.append(build_sku_next_best_action(
+        opportunity=sub_opp, scores=_sku_scores(), identity=_sku_identity(),
+        sku_title="BB Lab Good Night Collagen"))
+
+    for nba in nbas:
+        blob = _nba_strings(nba)
+        leaked = [j for j in _FORBIDDEN_JARGON if j in blob]
+        assert not leaked, f"{nba['primary_gap']} leaked jargon {leaked}: {blob}"

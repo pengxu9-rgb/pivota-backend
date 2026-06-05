@@ -270,212 +270,165 @@ def _sku_prescription_for_gap(
     substitution = _as_mapping(evidence.get("substitution_alert"))
     content_gap = _as_mapping(evidence.get("content_gap"))
     route_prompt = _as_mapping(evidence.get("source_route_prompt"))
-    coverage = _as_mapping(evidence.get("coverage"))
     first_pivota_path = _sku_pivota_path(sku_title)
 
     if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
         query = _sku_query_phrase(top_lane.get("query"))
-        ownership = str(top_lane.get("current_ownership") or "unowned").replace("-", " ")
-        source_route = str(top_lane.get("source_route") or "none").replace("-", " ")
-        score = top_lane.get("opportunity_score")
-        why_fit = _phrase(_as_str_list(top_lane.get("why_fit")), "the SKU attributes match the prompt")
+        why_fit = _phrase(_as_str_list(top_lane.get("why_fit")), "your product attributes")
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"Capture the open lane for {sku_title} before it becomes contested.",
+            headline=f"Own the answer to {query} while it's still up for grabs.",
             why_this_first=(
-                f"The top SKU opportunity is {query}: current ownership is "
-                f"{ownership}, source route is {source_route}, and opportunity "
-                f"score is {_sku_score_label(score)}. The fit evidence is "
-                f"{why_fit}, so this is the cleanest demand pocket to own first."
+                f"Shoppers are already asking AI for {query} and no brand owns the "
+                f"answer yet, and you're a literal match ({why_fit})."
             ),
-            first_move=str(top_lane.get("first_move") or "Add a PDP section + FAQ for this lane"),
+            first_move=f"Add a page section and FAQ that answer {query}.",
             self_serve_actions=[
                 (
-                    f"Add a PDP section and FAQ that answer {query} in buyer "
-                    "language, with proof, usage facts, schema-friendly fields, "
-                    "and links to supporting sources."
+                    f"Write a short section and FAQ in plain buyer words for {query}, "
+                    f"leading with what makes you the match: {why_fit}."
                 ),
                 (
-                    "Create a small source trail for the lane: reviews, retailer "
-                    "facts where relevant, comparison proof, and schema that make "
-                    "the official PDP easier for grounded agents to cite."
+                    "Give AI a reason to cite you: add a couple of real reviews and "
+                    "one comparison page for this use case."
                 ),
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
-            cta=_sku_cta("Create the canonical SKU answer path"),
+            cta=_sku_cta("Create the answer AI cites for this"),
         )
 
     if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
-        substitute = str(substitution.get("substituted_by") or "the named substitute").strip()
+        substitute = str(substitution.get("substituted_by") or "a competitor").strip()
         prompt = _sku_query_phrase(substitution.get("prompt"))
-        engines = _phrase(_as_str_list(substitution.get("engines")), "the tested engines")
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"Stop AI from substituting {sku_title} with {substitute}.",
+            headline=f"When buyers ask for alternatives, AI names {substitute}, not {sku_title}.",
             why_this_first=(
-                f"The substitution alert fired on {prompt}: {engines} routed "
-                f"the answer to {substitute} instead of the tested SKU. That "
-                "means the buyer is already asking close to the product, but "
-                "AI lacks enough comparison evidence to keep this SKU in the answer."
+                f"On {prompt}, AI answers with {substitute} instead of {sku_title}. "
+                "Those buyers are already shopping your category, they just don't "
+                "have a reason to pick you yet."
             ),
-            first_move=(
-                f"Publish comparison and alternatives content that names {substitute} "
-                f"and explains when {sku_title} is the better fit."
-            ),
+            first_move=f"Publish a {sku_title} vs {substitute} comparison that shows when you win.",
             self_serve_actions=[
                 (
-                    f"Add a PDP or supporting-page module for {sku_title} vs "
-                    f"{substitute}: use cases, ingredients or specs, claims proof, "
-                    "price/pack details, and who should choose each option."
+                    f"Make a clear {sku_title} vs {substitute} comparison: use cases, "
+                    "what's different, proof, and price, so the choice is obvious."
                 ),
                 (
-                    f"Update FAQ/schema and internal links so alternatives prompts "
-                    f"like {prompt} resolve to the official SKU page instead of "
-                    "only third-party or competitor pages."
+                    f"Answer the {prompt} question on your own page so it resolves to "
+                    "you, not a third party."
                 ),
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
-            cta=_sku_cta("Turn the comparison into an owned SKU path"),
+            cta=_sku_cta("Turn the comparison into an answer AI cites"),
         )
 
     if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP:
         bucket = _sku_gap_label(content_gap)
-        reason = str(content_gap.get("reason") or "the content-richness score has missing evidence")
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"Close the content gap on {sku_title} before expanding outreach.",
+            headline=f"Fill the gaps on {sku_title}'s page before chasing reach.",
             why_this_first=(
-                f"The largest per-SKU content issue is {bucket}: {reason}. "
-                "This is a PDP evidence problem, so the first move should be "
-                "content, FAQ, schema, ingredient/spec, or claim-substantiation "
-                "work rather than a playbook escalation."
+                f"AI can't confidently recommend a product it can't read, and "
+                f"{sku_title}'s page is thin on {bucket}. That's the first fix."
             ),
-            first_move=(
-                f"Repair {bucket} with PDP sections, FAQ/schema, and ingredient "
-                "or product-fact content that answers the failed SKU prompts."
-            ),
+            first_move=f"Add the missing {bucket} to {sku_title}'s page.",
             self_serve_actions=[
                 (
-                    f"Fill the missing {bucket} evidence on the official PDP: "
-                    "summary, bullets, usage, audience fit, ingredients/specs, "
-                    "watchouts, images, freshness, and substantiation as applicable."
+                    f"Fill in {bucket} in plain language: what it is, who it's for, "
+                    "how to use it, and the facts a buyer needs to decide."
                 ),
                 (
-                    "Validate that the revised PDP exposes Product, Offer, FAQ, "
-                    "and key fact fields in crawlable markup before re-running "
-                    "the same per-SKU prompts."
+                    "Make sure those facts show up in the page itself, then re-run "
+                    "the audit to confirm they landed."
                 ),
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
-            cta=_sku_cta("Publish canonical SKU enrichment"),
+            cta=_sku_cta("Publish the enriched product page"),
         )
 
     if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
         query = _sku_query_phrase(route_prompt.get("query"))
-        route = str(route_prompt.get("source_route") or "unknown").strip().lower()
-        ownership = str(route_prompt.get("ownership_state") or "unknown").strip().lower()
-        hosts = _phrase(_host_names(route_prompt.get("sources")), "the cited sources")
+        hosts = _phrase(_host_names(route_prompt.get("sources")), "other sites")
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"Repair the source route that is winning {query}.",
+            headline=f"For {query}, AI leans on {hosts}, not you.",
             why_this_first=(
-                f"For {sku_title}, {query} is currently {ownership} with a "
-                f"{route or 'unknown'} source route and cited sources including "
-                f"{hosts}. This is not an empty lane; the fix is to work through "
-                "the source role already shaping the answer."
+                f"This lane isn't empty, AI is just citing {hosts} for it. You win "
+                "it by getting into the source that already shapes the answer, then "
+                "making your own page the better one."
             ),
             first_move=_sku_source_route_first_move(route_prompt),
             self_serve_actions=[
                 _sku_source_route_self_serve(route_prompt),
-                (
-                    "Mirror the fix on the official PDP with clearer facts, "
-                    "comparison proof, reviews/UGC, and schema so the merchant-owned "
-                    "page can compete with the cited route."
-                ),
+                "Then make your own page the better answer: clearer facts, proof, and a few reviews.",
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
-            cta=_sku_cta("Reclaim the SKU source route"),
+            cta=_sku_cta("Win back the cited answer"),
         )
 
     if primary_gap == PRIMARY_SKU_PROTECTED_MONITORING:
-        coverage_text = str(coverage.get("coverage_summary") or "tested prompts show usable coverage")
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"Protect {sku_title}'s owned path and monitor for drift.",
+            headline=f"You own {sku_title}'s answers, keep it that way.",
             why_this_first=(
-                f"{coverage_text}. The SKU evidence is merchant-owned or strong "
-                "and no higher-priority open lane, substitution leak, content gap, "
-                "or source-route repair surfaced. Do not manufacture urgency; "
-                "the right move is defense and measured expansion."
+                f"{sku_title} is showing up well and nothing is slipping. Don't "
+                "invent work, protect what's working and watch for changes."
             ),
             first_move=(
-                "Keep monitoring active and investigate only material drops in "
-                "first-party citation, SKU mention quality, or new competitor/source-route wins."
+                "Keep an eye out for AI citing you less, or a competitor starting "
+                "to win these prompts."
             ),
             self_serve_actions=[
                 (
-                    "Maintain PDP facts, Product/Offer/FAQ schema, price, stock, "
-                    "shipping, returns, images, and variant data before catalog "
-                    "or theme changes."
+                    "Keep your page facts current, price, stock, shipping, returns, "
+                    "and images, before any big catalog or theme change."
                 ),
                 (
-                    "Watch cited retailer, publisher, forum, and competitor pages "
-                    "for stale SKU facts or new comparison language that could "
-                    "pull future AI answers away."
+                    "Watch the sites AI cites, and competitors' pages, for stale "
+                    "facts or new comparison claims that could pull answers away."
                 ),
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
-            cta=_sku_cta("Monitor SKU attribution drift"),
+            cta=_sku_cta("Monitor for drift"),
         )
 
     identity = _as_mapping(evidence.get("identity"))
-    unresolved = bool(identity.get("unresolved"))
-    prompt_count = _score(coverage.get("prompt_count"))
-    demand_count = _score(coverage.get("prompts_with_demand"))
     reason = (
-        "the resolved SKU identity is still low-confidence"
-        if unresolved
-        else f"coverage is too thin ({demand_count}/{prompt_count} prompts showed demand)"
+        "we couldn't pin down exactly which product this is"
+        if bool(identity.get("unresolved"))
+        else "there wasn't enough signal this run"
     )
     return _base_payload(
         primary_gap=PRIMARY_SKU_INSUFFICIENT_DATA,
-        headline=f"Resolve {sku_title}'s evidence before choosing a commercial move.",
+        headline=f"We need a bit more to go on for {sku_title}.",
         why_this_first=(
-            f"The per-SKU audit should not fabricate a lane: {reason}. "
-            "Rerun after identity and coverage improve, then choose an open-lane, "
-            "substitution, content, or source-route prescription from real evidence."
+            f"We won't invent a recommendation, {reason}. Tighten the product "
+            "details and we'll give you a real next move."
         ),
-        first_move=(
-            "Resolve the product identity and rerun per-SKU prompts before "
-            "prescribing an open lane or source-route repair."
-        ),
+        first_move="Make sure the product details are complete, then re-run the audit.",
         self_serve_actions=[
             (
-                "Enrich title, brand, category, variant labels, GTIN/SKU, PDP URL, "
-                "description, images, price, stock, and schema so the product can "
-                "be tested as a real SKU."
+                "Complete the basics: title, brand, category, variants, price, "
+                "images, and a clear description."
             ),
-            (
-                "Run enough buyer-intent, category, comparison, and attribute "
-                "prompts to produce grounded demand and citation evidence."
-            ),
+            "Then re-run, so we can test it as a real product with real demand.",
         ],
         pivota_path=first_pivota_path,
         evidence_used=evidence,
-        cta=_sku_cta("Normalize and retest this SKU"),
+        cta=_sku_cta("Complete the details and retest"),
     )
 
 
 def _sku_pivota_path(sku_title: str) -> str:
     return (
-        f"Use Pivota to publish a canonical enriched module/schema for {sku_title} "
-        "on the AI-channel PDP, serve it as the agent-resolvable owned path, "
-        "connect checkout, and monitor whether the same SKU prompts move."
+        f"Pivota can make {sku_title}'s page the one AI cites and lets shoppers "
+        "buy, and tell you when these prompts start naming you."
     )
 
 
@@ -661,15 +614,6 @@ def _sku_query_phrase(value: Any) -> str:
     return f'"{text}"' if text else "the tested SKU prompt"
 
 
-def _sku_score_label(value: Any) -> str:
-    if value is None:
-        return "not available"
-    try:
-        return f"{float(value):.2f}/100"
-    except (TypeError, ValueError):
-        return str(value)
-
-
 def _sku_source_route_first_move(prompt: Mapping[str, Any]) -> str:
     route = str(prompt.get("source_route") or "").strip().lower()
     ownership = str(prompt.get("ownership_state") or "").strip().lower()
@@ -761,209 +705,158 @@ def _prescription_for_gap(
     evidence: Mapping[str, Any],
     is_cold_start: bool,
 ) -> Dict[str, Any]:
-    headline = _as_mapping(merchant_view.get("headline"))
-    verdict_label = str(headline.get("verdict_label") or "").strip()
-    scores = _as_mapping(evidence.get("scores"))
-    score_text = _score_text(scores)
     retailer_phrase = _phrase(_host_names(evidence.get("retailer_hosts")), "no named retailer hosts")
     source_phrase = _phrase(_host_names(evidence.get("source_hosts")), "no named editorial hosts")
     cited_phrase = _phrase(_host_names(evidence.get("cited_hosts")), "no high-confidence cited hosts")
     competitor_phrase = _phrase(_as_str_list(evidence.get("competitors_named")), "no repeated named competitors")
     failed_query_phrase = _phrase(_query_examples(evidence.get("failed_query_examples")), "no failed-query examples")
-    attr_gap = _attribution_gap(scores)
-    category_gap = _category_gap(scores)
 
     if primary_gap == PRIMARY_INTEGRATION_COMPLETION:
         missing = _integration_missing_labels(evidence.get("integration_missing_pieces"))
         missing_phrase = _phrase(missing, "required onboarding steps")
         return _base_payload(
             primary_gap=primary_gap,
-            headline="Complete the missing integration step before optimizing the audit queue.",
+            headline="Finish connecting your store before we optimize the rest.",
             why_this_first=(
-                f"{score_text}. This merchant is already in onboarding, "
-                f"but {missing_phrase} is still incomplete. Until that gate "
-                "is closed, Pivota cannot reliably serve canonical product "
-                "surfaces or complete agent checkout, so integration is the "
-                "only prescription allowed to outrank the diagnostic fixes."
+                f"You're mid-setup, but {missing_phrase} isn't connected yet. "
+                "Until it is, Pivota can't serve your products to AI or take "
+                "checkout, so finishing setup comes first."
             ),
-            first_move=(
-                f"Finish {missing_phrase}, then re-run the same audit so the "
-                "diagnostic actions below are measured against an active "
-                "canonical and checkout path."
-            ),
+            first_move=f"Finish connecting {missing_phrase}, then re-run this audit.",
             self_serve_actions=[
                 (
-                    "Keep the official PDPs indexable while onboarding finishes: "
-                    "canonical tags, robots, Product/Offer schema, price, stock, "
-                    "shipping, returns, and core product facts should be current."
+                    "Keep your product pages live and accurate while you finish: "
+                    "current price, stock, shipping, returns, and core details."
                 ),
                 (
-                    f"Use the failed-query evidence ({failed_query_phrase}) to "
-                    "prepare the first PDP/content fixes before the next audit."
+                    f"Line up the first page fixes from the questions you're losing "
+                    f"({failed_query_phrase}) so they're ready right after setup."
                 ),
             ],
             pivota_path=(
-                f"Complete Pivota onboarding for {missing_phrase} so canonical "
-                "AI-channel PDPs, normalized catalog data, monitoring, and "
-                "agent checkout can operate."
+                f"Finish Pivota setup for {missing_phrase} so your products can be "
+                "served to AI and bought directly."
             ),
             evidence_used=evidence,
             cta={
-                "label": "Finish Pivota onboarding",
+                "label": "Finish Pivota setup",
                 "trust_note": (
-                    "This leads only for non-cold merchants already in onboarding; "
-                    "cold audits keep integration as the Pivota path, not the "
-                    "diagnostic lead."
+                    "This only leads for merchants already setting up; a cold audit "
+                    "keeps setup as the Pivota option, not the first step."
                 ),
             },
         )
 
     if primary_gap == PRIMARY_RETRIEVAL_FOUNDATION:
-        cold_note = (
-            " If this is a cold audit, connect Pivota only after the "
-            "retrieval work is clear."
-            if is_cold_start
-            else ""
-        )
         return _base_payload(
             primary_gap=primary_gap,
-            headline="Fix retrieval foundations before chasing PR or retailer expansion.",
+            headline="AI can't find you yet — fix that before anything else.",
             why_this_first=(
-                f"The audit verdict is {verdict_label or 'INVISIBLE'} with "
-                f"{score_text}. Failed buyer-intent queries such as "
-                f"{failed_query_phrase} did not cite the merchant-owned URL; "
-                f"the cited slots went to {cited_phrase}. Agents cannot "
-                "reliably cite or transact through a page they cannot retrieve, "
-                "parse, and trust."
+                f"When buyers asked {failed_query_phrase}, AI didn't cite your "
+                f"site at all; the answers went to {cited_phrase}. AI can't "
+                "recommend a page it can't find and read."
             ),
             first_move=(
-                "Submit and validate the canonical PDPs: sitemap, URL "
-                "Inspection, indexable server-rendered content, and clean "
-                "Product/Offer/Breadcrumb/FAQ schema."
+                "Get your product pages indexed and readable: submit them to "
+                "Google, and make sure the content and key facts are in the page itself."
             ),
             self_serve_actions=[
                 (
-                    "Submit the sitemap and top PDPs in Google Search Console; "
-                    "inspect each URL for noindex, robots, canonical, redirect, "
-                    "and server-rendering issues."
+                    "Submit your sitemap and top product pages in Google Search "
+                    "Console, and check each one isn't accidentally blocked from search."
                 ),
                 (
-                    "Repair Product, Offer, AggregateRating, BreadcrumbList, "
-                    "and FAQ schema, then add factual PDP depth for price, "
-                    "availability, shipping, returns, images, materials or "
-                    "ingredients, sizing, variants, and buyer-intent wording."
+                    "Make sure price, availability, and the core product facts are "
+                    "visible in the page text, not only in images or scripts."
                 ),
             ],
             pivota_path=(
-                "Use Pivota if you want canonical AI-channel PDPs, normalized "
-                "structured product data, checkout-ready surfaces, and recurring "
-                f"monitoring against these same failed queries.{cold_note}"
+                "Pivota can publish clean, AI-ready versions of your pages, make "
+                "them buyable, and re-check these same questions over time."
             ),
             evidence_used=evidence,
             cta={
-                "label": "Create the canonical AI-channel path",
+                "label": "Make your pages the answer AI cites",
                 "trust_note": (
-                    "You can do the indexing and schema cleanup yourself; "
-                    "Pivota is for canonical serving, checkout, and monitoring."
+                    "You can do the indexing and content cleanup yourself; Pivota "
+                    "is for serving a clean buyable page and monitoring."
                 ),
             },
         )
 
     if primary_gap == PRIMARY_RETAILER_ROUTE_LEAK:
-        gap_phrase = (
-            f" by {attr_gap} points"
-            if attr_gap is not None
-            else ""
-        )
         return _base_payload(
             primary_gap=primary_gap,
-            headline="Reclaim the first-party buying path retailers are taking.",
+            headline="AI sends your buyers to retailers — take that path back.",
             why_this_first=(
-                f"{score_text}. Category or product visibility is meaningful, "
-                f"but first-party attribution trails{gap_phrase}; AI agents "
-                f"cited retailer or marketplace routes including {retailer_phrase}. "
-                "That is a margin and customer-data leak, not a generic PR problem."
+                f"Shoppers can find you, but AI points them to {retailer_phrase} "
+                "instead of your own page. That's lost margin and customer data, "
+                "not a PR problem."
             ),
             first_move=(
-                "Make the official PDP the richest, clearest, most reliable "
-                "buying source, then correct the retailer or marketplace pages "
-                "agents already cite."
+                "Make your own page the best place to buy, then fix the retailer "
+                "listings AI is citing."
             ),
             self_serve_actions=[
                 (
-                    "Upgrade the official PDP beyond the cited retailer pages: "
-                    "complete specs, proof, reviews, media, FAQs, current price, "
-                    "availability, return policy, and truthful official-store language."
+                    "Make your product page beat the retailer pages: full details, "
+                    "proof, reviews, current price, stock, and returns."
                 ),
                 (
-                    f"Audit the cited retailer or marketplace listings ({retailer_phrase}) "
-                    "for title, images, claims, variants, price, availability, and "
-                    "authorization status while deciding whether to lean into or "
-                    "pull back from those routes."
+                    f"Check the cited retailer listings ({retailer_phrase}) for wrong "
+                    "titles, images, price, or stock, and decide which routes to lean into."
                 ),
             ],
             pivota_path=(
-                "Use Pivota to publish a canonical, agent-resolvable owned PDP, "
-                "make the path transactable through checkout, and monitor whether "
-                "direct attribution rises against the same retailer-captured queries."
+                "Pivota can make your own page the one AI cites and buys from, and "
+                "show you whether direct sales rise against those retailer-won questions."
             ),
             evidence_used=evidence,
             cta={
-                "label": "Build the owned AI buying path",
+                "label": "Win back the buying path",
                 "trust_note": (
-                    "Retailer cleanup is merchant-led; Pivota uniquely handles "
-                    "canonical serving, agent checkout, and recurring attribution proof."
+                    "Fixing retailer listings is yours to do; Pivota makes your own "
+                    "page the cited, buyable one and proves whether direct sales rise."
                 ),
             },
         )
 
     if primary_gap == PRIMARY_CATEGORY_DISCOVERY:
-        gap_phrase = (
-            f" by {category_gap} points"
-            if category_gap is not None
-            else ""
+        source_or_cited = (
+            source_phrase if source_phrase != "no named editorial hosts" else cited_phrase
         )
         return _base_payload(
             primary_gap=primary_gap,
-            headline="Win category discovery before optimizing more named-product visibility.",
+            headline="Shoppers who know you find you — new shoppers don't.",
             why_this_first=(
-                f"{score_text}. Named-product visibility beats category visibility"
-                f"{gap_phrase}, which means shoppers who already know the brand "
-                "can find it more easily than shoppers asking the non-branded "
-                f"category question. Failed prompts such as {failed_query_phrase} "
-                f"and competitors including {competitor_phrase} show where the "
-                "consideration set is leaking."
+                "When people search the category instead of your name, you're not "
+                f"in the answer. {failed_query_phrase} went to {competitor_phrase}. "
+                "That's where you're losing new buyers."
             ),
             first_move=(
-                "Add category-intent comparison and proof modules to the official "
-                "PDPs and supporting pages, then pitch the cited sources that "
-                "shape those category answers."
+                "Add category and comparison content to your pages, and get into "
+                "the sources that shape those answers."
             ),
             self_serve_actions=[
                 (
-                    "Use the exact failed query wording to add intent modules: "
-                    "best for, compare-to, ingredients or materials, dose or specs, "
-                    "who should use it, claims substantiation, FAQs, and alternatives."
+                    "Answer the exact category questions on your pages: best-for, "
+                    "compare-to, who it's for, and the proof behind it."
                 ),
                 (
-                    f"Pitch cited editorial, review, listicle, creator, or retailer "
-                    f"surfaces ({source_phrase if source_phrase != 'no named editorial hosts' else cited_phrase}) "
-                    f"with the competitor angle: why the brand belongs next to "
-                    f"{competitor_phrase}."
+                    f"Pitch the sites AI cites for these ({source_or_cited}) on why "
+                    f"you belong next to {competitor_phrase}."
                 ),
             ],
             pivota_path=(
-                "Use Pivota to convert failed-query evidence into canonical "
-                "category modules, serve them on AI-channel PDPs, and re-test "
-                "category prompts monthly; integrate if the owned path also needs "
-                "to become transactable."
+                "Pivota can turn these gaps into category pages AI cites, and "
+                "re-check the category questions each month."
             ),
             evidence_used=evidence,
             cta={
-                "label": "Turn category gaps into canonical modules",
+                "label": "Turn category gaps into pages AI cites",
                 "trust_note": (
-                    "The content and pitching work is merchant-owned; Pivota "
-                    "keeps it canonical, structured, measurable, and buyable."
+                    "The content and outreach are yours to do; Pivota keeps it "
+                    "structured, measurable, and buyable."
                 ),
             },
         )
@@ -971,82 +864,72 @@ def _prescription_for_gap(
     if primary_gap == PRIMARY_COMPETITOR_SOURCE:
         return _base_payload(
             primary_gap=primary_gap,
-            headline="Get into the sources that are teaching AI to prefer competitors.",
+            headline="Get into the sources teaching AI to prefer your competitors.",
             why_this_first=(
-                f"{score_text}. Competitors including {competitor_phrase} appeared "
-                f"in the failed-query evidence, and AI cited source hosts such as "
-                f"{source_phrase}. Because those sources are repeated and named, "
-                "the next move is targeted inclusion, not generic awareness work."
+                f"{competitor_phrase} keep showing up because AI leans on "
+                f"{source_phrase}. Since it's the same few sources, the move is "
+                "getting into them, not broad awareness."
             ),
             first_move=(
-                "Pitch the cited editorial, video, forum, or publisher surfaces "
-                "with a concrete comparison and proof angle tied to the failed prompts."
+                "Pitch the specific sites AI cites with a concrete comparison and "
+                "proof, tied to the questions you're losing."
             ),
             self_serve_actions=[
                 (
-                    "Use each cited host's coverage note and outreach hint to send "
-                    "a specific pitch with product facts, proof assets, images, "
-                    "pricing, availability, and why the product belongs in the "
-                    "same comparison set as the named competitors."
+                    "Send each cited site a specific pitch: your product facts, proof, "
+                    f"and why you belong in the same comparison as {competitor_phrase}."
                 ),
                 (
-                    f"Build supporting pages or creator proof around the failed "
-                    f"queries ({failed_query_phrase}) so newly earned coverage "
-                    "has a first-party source to cite."
+                    f"Back it with your own page answering {failed_query_phrase}, so "
+                    "any new coverage has a clear source to point to."
                 ),
             ],
             pivota_path=(
-                "Use Pivota to rank the cited source targets, generate evidence-backed "
-                "pitch drafts from the audit, and re-test whether new coverage is "
-                "indexed and cited; canonical PDPs and checkout become the owned "
-                "path once inclusion starts moving."
+                "Pivota can rank the right sites to target, draft the pitches from "
+                "your audit, and track whether new coverage shows up in AI answers."
             ),
             evidence_used=evidence,
             cta={
-                "label": "Prioritize cited-source outreach",
+                "label": "Prioritize the sites AI cites",
                 "trust_note": (
-                    "Pivota cannot force editorial inclusion; it can identify the "
-                    "right targets, draft from evidence, and measure citation movement."
+                    "Pivota can't force coverage; it finds the right targets, drafts "
+                    "from your evidence, and measures whether citations move."
                 ),
             },
         )
 
     return _base_payload(
         primary_gap=PRIMARY_FIRST_PARTY_DEFENSE,
-        headline="Defend the owned path and monitor for drift.",
+        headline="You're in good shape — defend it and watch for changes.",
         why_this_first=(
-            f"{score_text}. The audit did not find a higher-confidence retailer, "
-            f"category, or competitor-source leak from the available evidence "
-            f"({cited_phrase}; {competitor_phrase}). Do not manufacture urgency: "
-            "the right first move is to protect current first-party attribution "
-            "and expand only where future audits expose a real gap."
+            "We didn't find a clear leak to retailers, the category, or competitor "
+            "sources this run. Don't manufacture work, protect what's working and "
+            "revisit when something shifts."
         ),
         first_move=(
-            "Keep recurring monitoring active and investigate only material drops "
-            "in first-party attribution, category visibility, or competitor pressure."
+            "Keep monitoring, and act only on real drops in how AI cites you or "
+            "new competitor pressure."
         ),
         self_serve_actions=[
             (
-                "Maintain schema, sitemap, canonical tags, pricing, availability, "
-                "shipping, return policy, and PDP factual depth before major theme "
-                "or catalog changes."
+                "Keep your page facts, price, stock, and returns current before any "
+                "big catalog or theme change."
             ),
             (
-                "Watch cited retailer, marketplace, editorial, and competitor pages "
-                "for stale facts or new comparison language that could change AI answers."
+                "Watch the sites AI cites and competitor pages for stale facts or "
+                "new comparison claims."
             ),
         ],
         pivota_path=(
-            "Use Pivota for recurring monitoring, drift alerts, canonical AI-channel "
-            "serving, and agent checkout only if agent-direct transactability is a "
-            "strategic goal."
+            "Pivota can keep monitoring, alert you to changes, and keep your pages "
+            "AI-ready and buyable if that becomes a goal."
         ),
         evidence_used=evidence,
         cta={
-            "label": "Monitor AI attribution drift",
+            "label": "Monitor for drift",
             "trust_note": (
-                "Strong audits should not be scared into a rebuild; Pivota is useful "
-                "when monitoring, canonical serving, or checkout needs to be durable."
+                "A strong result shouldn't be scared into a rebuild; Pivota is for "
+                "monitoring and keeping your pages durable when you need it."
             ),
         },
     )
@@ -1335,35 +1218,6 @@ def _competitor_evidence(
 
     ordered_keys = sorted(counts, key=lambda k: (-counts[k], display[k].lower()))
     return [display[k] for k in ordered_keys], counts
-
-
-def _score_text(scores: Mapping[str, Any]) -> str:
-    visibility = _score(scores.get("visibility"))
-    attribution = _score(scores.get("attribution"))
-    category_visibility = _optional_score(scores.get("category_visibility"))
-    if category_visibility is None:
-        return f"Visibility is {visibility}/100 and attribution is {attribution}/100"
-    return (
-        f"Visibility is {visibility}/100, attribution is {attribution}/100, "
-        f"and category visibility is {category_visibility}/100"
-    )
-
-
-def _attribution_gap(scores: Mapping[str, Any]) -> Optional[int]:
-    attribution = _score(scores.get("attribution"))
-    category_visibility = _optional_score(scores.get("category_visibility"))
-    visibility = _score(scores.get("visibility"))
-    basis = category_visibility if category_visibility is not None else visibility
-    gap = basis - attribution
-    return gap if gap >= 25 else None
-
-
-def _category_gap(scores: Mapping[str, Any]) -> Optional[int]:
-    category_visibility = _optional_score(scores.get("category_visibility"))
-    if category_visibility is None:
-        return None
-    gap = _score(scores.get("visibility")) - category_visibility
-    return gap if gap >= 25 else None
 
 
 def _host_names(value: Any) -> List[str]:
