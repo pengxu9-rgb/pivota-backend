@@ -198,6 +198,20 @@ class Settings(BaseSettings):
     # support, which the probe relies on for predictable JSON outputs.
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+    # Strategic brief synthesis (per-SKU Wave 1). Default-off: the report
+    # path must remain deterministic unless explicitly enabled and keyed.
+    strategic_brief_provider: str = os.getenv("STRATEGIC_BRIEF_PROVIDER", "deepseek")
+    strategic_brief_model: str = os.getenv("STRATEGIC_BRIEF_MODEL", "")
+    strategic_brief_enabled: bool = (
+        os.getenv("STRATEGIC_BRIEF_ENABLED", "false").lower() == "true"
+    )
+    openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1")
+    anthropic_api_key: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
+    anthropic_model: str = os.getenv(
+        "ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"
+    )
+
     # SerpAPI — deterministic web search for the BD social-intel probes.
     # The 3 social probes (own presence / KOL / competitive) replaced
     # Gemini's discretionary `google_search` grounding (which a 2026-05-14

@@ -1,0 +1,845 @@
+"""Per-SKU strategic brief assembly and grounding validation.
+
+The LLM is only allowed to frame deterministic audit facts. This module builds
+the facts, sends the exact brief prompt when enabled/keyed, and rejects any
+brief that names entities or lanes outside the evidence block.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from urllib.parse import urlparse
+
+from config.settings import settings
+from services.llm_synthesis import (
+    LLMSynthesisError,
+    configured_key_for_provider,
+    default_model_for_provider,
+    normalize_provider,
+    synthesize,
+)
+
+_STRATEGIC_BRIEF_SYSTEM_PROMPT = """You are a senior D2C brand & growth strategist — the merchant's marketing director — writing the
+next-steps section of an AI-shopping-visibility audit. You make sharp, decisive calls a smart founder
+would act on. You are NOT a checklist generator.
+
+ABSOLUTE GROUNDING RULES (this is a trust product — violating these is worse than being vague):
+- Use ONLY facts present in the EVIDENCE block. Every brand, website/source, attribute, certification,
+  format, audience, and lane you mention MUST appear in EVIDENCE verbatim.
+- NEVER invent competitors, sources, statistics, review counts, prices, certifications, or claims.
+- If EVIDENCE doesn't support a point, don't make it. Distinguish "AI's answers show…" (fact) from
+  "this suggests…" (your inference) explicitly.
+- No internal jargon, no scores, no taxonomy terms (no "/100", "ownership state", "source route",
+  "opportunity score"). Plain language a busy merchant reads in 60 seconds.
+
+WRITE the brief as JSON with these fields — each must be specific to THIS product and EVIDENCE:
+- position: one honest sentence on where they really stand (e.g. "niche challenger, strong when named,
+  invisible in the category").
+- core_decision: the ONE big strategic call, stated plainly and decisively (what to do, what to STOP doing,
+  and why — name the real reason from evidence).
+- why_you_lose: WHY the category winners win — synthesize the named winners × the sources that rank them ×
+  what that implies about their moat (reviews/authority/distribution/positioning). The merchant should
+  understand this is structural, not a PDP problem.
+- your_angle: the defensible positioning wedge = the merchant's differentiating attributes that the named
+  winners lack. Reframe them from "a {category}" to a category of one. Be concrete about the lanes where
+  their differentiation IS the answer.
+- traffic_strategy: a ranked list of where the missed, WINNABLE demand is + who controls each channel
+  (the cited sources/retailers/communities from EVIDENCE) + the realistic path in. NOT "pitch a publisher" —
+  name the channel and the move (own your pages for X, fix listings on the cited retailer Y, seed UGC on Z,
+  earn the specific niche publisher W). Explicitly say which big lanes to NOT chase yet and why.
+- substitution_play: if a substitution is present, how to win those buyers back (comparison/positioning vs
+  the named substitute), else null.
+- first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
+  strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so AI has your
+  answer to cite for the lane you're claiming").
+- diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
+  — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
+
+_ATTRIBUTE_FIELD_MAP = {
+    "category": ("category",),
+    "format": ("format",),
+    "ingredient": ("ingredient",),
+    "certification": ("certification", "certification_constraint"),
+    "audience": ("audience",),
+    "use_case": ("use_case",),
+    "geography": ("geography",),
+    "proof": ("proof",),
+    "exclusion": ("exclusion",),
+}
+_LOST_CATEGORY_OWNERSHIP = {
+    "competitor-owned",
+    "publisher-owned",
+    "retailer-owned",
+    "marketplace-owned",
+    "forum-owned",
+}
+_NO_CONTROL_ROUTES = {"", "none", "unclassified", "fragmented", "open-lane"}
+_REQUIRED_BRIEF_KEYS = {
+    "position",
+    "core_decision",
+    "why_you_lose",
+    "your_angle",
+    "traffic_strategy",
+    "substitution_play",
+    "first_moves",
+    "diy_vs_pivota",
+}
+_FORBIDDEN_PATTERNS = (
+    re.compile(r"/100", re.IGNORECASE),
+    re.compile(r"\bsource route\b", re.IGNORECASE),
+    re.compile(r"\bopportunity score\b", re.IGNORECASE),
+    re.compile(r"\bcanonical enriched\b", re.IGNORECASE),
+    re.compile(r"\bagent-resolvable\b", re.IGNORECASE),
+    re.compile(r"\bownership state\b", re.IGNORECASE),
+    re.compile(r"\bcontent_richness\b", re.IGNORECASE),
+    re.compile(r"\bschema-friendly\b", re.IGNORECASE),
+    re.compile(r"\bgrounded agent\b", re.IGNORECASE),
+    re.compile(r"\bscores?\b", re.IGNORECASE),
+)
+_DOMAIN_RE = re.compile(
+    r"(?<!@)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
+    re.IGNORECASE,
+)
+_QUOTE_RE = re.compile(r"[\"'`“”‘’]([^\"'`“”‘’]{4,160})[\"'`“”‘’]")
+_CAP_WORD = r"(?:[A-Z][A-Za-z0-9&'’-]*|[A-Z]{2,}|[A-Za-z]+[A-Z][A-Za-z0-9]*)"
+_PROPER_SEQUENCE_RE = re.compile(
+    rf"\b{_CAP_WORD}(?:[ \t]+(?:of|the|for))*[ \t]+{_CAP_WORD}"
+    rf"(?:[ \t]+(?:of|the|for|and|&|{_CAP_WORD}))*\b"
+)
+_SINGLE_ENTITY_RE = re.compile(
+    r"\b(?:[A-Z]{2,}|[A-Z][a-z][A-Za-z0-9'’-]{2,}|[A-Za-z]+[A-Z][A-Za-z0-9]*)\b"
+)
+_ENTITY_STOPWORDS = {
+    "A",
+    "AI",
+    "An",
+    "And",
+    "Answer",
+    "Answers",
+    "As",
+    "Because",
+    "Before",
+    "Big",
+    "Build",
+    "Buyers",
+    "Category",
+    "Channel",
+    "Create",
+    "Decision",
+    "Demand",
+    "Do",
+    "Don",
+    "Earn",
+    "Evidence",
+    "FAQ",
+    "FAQs",
+    "First",
+    "Fix",
+    "For",
+    "If",
+    "Instead",
+    "JSON",
+    "Keep",
+    "Lane",
+    "Lanes",
+    "Make",
+    "Merchant",
+    "NOT",
+    "No",
+    "Own",
+    "PDP",
+    "Pivota",
+    "Publish",
+    "Seed",
+    "Shoppers",
+    "SKU",
+    "Start",
+    "Stop",
+    "Strategy",
+    "That",
+    "The",
+    "Their",
+    "Then",
+    "These",
+    "This",
+    "Those",
+    "Track",
+    "Traffic",
+    "UGC",
+    "Use",
+    "When",
+    "Where",
+    "Why",
+    "Win",
+    "Write",
+    "WRITE",
+    "You",
+    "Your",
+}
+_INTERNAL_ALLOWED_ENTITIES = {
+    "ai",
+    "d2c",
+    "faq",
+    "faqs",
+    "json",
+    "pdp",
+    "pivota",
+    "sku",
+    "ugc",
+}
+
+
+def assemble_sku_brief_evidence(
+    *,
+    opportunity: Mapping[str, Any],
+    attribute_graph: Mapping[str, Any],
+    primary_gaps: Optional[List[Mapping[str, Any]]] = None,
+    scores: Optional[Mapping[str, Any]] = None,
+    identity: Optional[Mapping[str, Any]] = None,
+    sku_title: Optional[str] = None,
+) -> Dict[str, Any]:
+    del primary_gaps, scores
+    opportunity_map = _as_mapping(opportunity)
+    identity_map = _as_mapping(identity)
+    attributes = _attribute_evidence(attribute_graph)
+    title = _clean_str(sku_title) or _clean_str(identity_map.get("name")) or "this SKU"
+    anchors = _as_mapping(identity_map.get("anchors"))
+    brand = _clean_str(anchors.get("brand"))
+
+    category_rows = _category_battle_rows(opportunity_map)
+    category_battle = _category_battle(category_rows)
+    top_open_lanes = _top_open_lane_rows(opportunity_map)
+    channel_map = _channel_map(
+        top_open_lanes=top_open_lanes,
+        per_prompt=_as_list(opportunity_map.get("per_prompt")),
+    )
+
+    return {
+        "product": {
+            "title": title,
+            "brand": brand or None,
+            "attributes": attributes,
+        },
+        "position": _position_from_ladder(opportunity_map),
+        "category_battle": category_battle,
+        "substitution": _substitution_evidence(opportunity_map),
+        "open_lanes": [_open_lane_evidence(lane) for lane in top_open_lanes],
+        "channel_map": channel_map,
+        "demand_state": opportunity_map.get("demand_state_summary"),
+        "notes": {
+            "merchant_can_act_in_30d": True,
+            "health_sensitive": _health_sensitive(
+                title=title,
+                brand=brand,
+                attributes=attributes,
+            ),
+        },
+    }
+
+
+def build_sku_brief_prompt(evidence: Mapping[str, Any]) -> Tuple[str, str]:
+    user = "EVIDENCE:\n" + json.dumps(
+        evidence,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    return _STRATEGIC_BRIEF_SYSTEM_PROMPT, user
+
+
+async def generate_sku_strategic_brief(
+    evidence: Mapping[str, Any],
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not getattr(settings, "strategic_brief_enabled", False):
+        return None
+    try:
+        selected_provider = normalize_provider(
+            provider or settings.strategic_brief_provider
+        )
+    except LLMSynthesisError:
+        return None
+    if not configured_key_for_provider(selected_provider):
+        return None
+    selected_model = (
+        str(model or settings.strategic_brief_model or "").strip()
+        or default_model_for_provider(selected_provider)
+    )
+    system, user = build_sku_brief_prompt(evidence)
+
+    for _attempt in range(3):
+        try:
+            result = await synthesize(
+                system=system,
+                user=user,
+                provider=selected_provider,
+                model=selected_model,
+                max_tokens=1200,
+            )
+        except LLMSynthesisError:
+            return None
+        brief = _parse_brief_json(result.get("text"))
+        if not isinstance(brief, dict) or not _has_required_shape(brief):
+            continue
+        if validate_grounding(brief, evidence):
+            return brief
+    return None
+
+
+def validate_grounding(brief: Mapping[str, Any], evidence: Mapping[str, Any]) -> bool:
+    return not _grounding_failures(brief, evidence)
+
+
+def _attribute_evidence(attribute_graph: Mapping[str, Any]) -> Dict[str, List[str]]:
+    graph = _as_mapping(attribute_graph)
+    classes = _as_mapping(graph.get("classes"))
+    out: Dict[str, List[str]] = {}
+    for output_name, source_names in _ATTRIBUTE_FIELD_MAP.items():
+        values: List[str] = []
+        for source_name in source_names:
+            values.extend(_as_str_list(classes.get(source_name)))
+        out[output_name] = _unique(values)
+    return out
+
+
+def _position_from_ladder(opportunity: Mapping[str, Any]) -> Dict[str, Optional[int]]:
+    ladder = _as_mapping(opportunity.get("intent_ladder"))
+    return {
+        "strong_when_named": _score_from_layer(
+            ladder.get("branded_transactional")
+        ),
+        "weak_in_category": _score_from_layer(ladder.get("head_category")),
+        "branded_consideration": _score_from_layer(
+            ladder.get("branded_consideration")
+        ),
+    }
+
+
+def _category_battle_rows(opportunity: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    rows: List[Mapping[str, Any]] = []
+    for row in _as_list(opportunity.get("per_prompt")):
+        if not isinstance(row, Mapping):
+            continue
+        query = _clean_str(row.get("query"))
+        if not query:
+            continue
+        query_class = _clean_str(row.get("query_class")).lower()
+        axis = _clean_str(row.get("axis")).lower()
+        if query_class not in {"head", "category"} and axis != "category":
+            continue
+        ownership = _clean_str(row.get("ownership_state")).lower()
+        provider_verdicts = _as_mapping(row.get("provider_verdicts"))
+        lost_by_verdict = any(
+            str(verdict).strip().lower() == "loss"
+            for verdict in provider_verdicts.values()
+        )
+        if (
+            ownership in _LOST_CATEGORY_OWNERSHIP
+            or lost_by_verdict
+            or _as_str_list(row.get("competitors"))
+        ):
+            rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            -float(row.get("demand_signal") or 0),
+            -float(row.get("opportunity_score") or 0),
+            _clean_str(row.get("query")).lower(),
+        )
+    )
+    return rows
+
+
+def _category_battle(rows: List[Mapping[str, Any]]) -> Dict[str, Any]:
+    prompts: List[str] = []
+    winners: List[str] = []
+    ranked_by: List[Dict[str, str]] = []
+    prompt_details: List[Dict[str, Any]] = []
+    for row in rows:
+        query = _clean_str(row.get("query"))
+        if query:
+            prompts.append(query)
+        row_competitors = _as_str_list(row.get("competitors"))
+        winners.extend(row_competitors)
+        source_roles = _source_role_chips(row)
+        ranked_by.extend(source_roles)
+        prompt_details.append({
+            "query": query,
+            "ownership": _clean_str(row.get("ownership_state")) or None,
+            "competitors": _unique(row_competitors),
+            "source_roles": source_roles,
+        })
+    return {
+        "prompts": _unique(prompts),
+        "winners": _unique(winners),
+        "ranked_by": _unique_host_roles(ranked_by),
+        "prompt_details": prompt_details,
+    }
+
+
+def _substitution_evidence(opportunity: Mapping[str, Any]) -> Dict[str, Any]:
+    substitution = _as_mapping(opportunity.get("substitution_alert"))
+    handed_to = (
+        _clean_str(substitution.get("handed_to"))
+        or _clean_str(substitution.get("substituted_by"))
+    )
+    prompt = (
+        _clean_str(substitution.get("on_prompt"))
+        or _clean_str(substitution.get("prompt"))
+    )
+    present = bool(substitution.get("present")) and bool(handed_to or prompt)
+    return {
+        "present": present,
+        "on_prompt": prompt or None,
+        "handed_to": handed_to or None,
+        "engines": _as_str_list(substitution.get("engines")),
+    }
+
+
+def _top_open_lane_rows(opportunity: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    lanes = [
+        lane for lane in _as_list(opportunity.get("top_open_lanes"))
+        if isinstance(lane, Mapping) and _clean_str(lane.get("query"))
+    ]
+    return lanes[:3]
+
+
+def _open_lane_evidence(lane: Mapping[str, Any]) -> Dict[str, Any]:
+    source_route = _clean_str(lane.get("source_route")).lower()
+    current = _clean_str(lane.get("current_ownership")).lower()
+    who_controls = current or source_route
+    if who_controls in _NO_CONTROL_ROUTES or source_route in _NO_CONTROL_ROUTES:
+        who_controls = "none/fragmented"
+    channel_role = "open" if who_controls == "none/fragmented" else who_controls
+    return {
+        "query": _clean_str(lane.get("query")),
+        "why_fit": _as_str_list(lane.get("why_fit")),
+        "who_controls": who_controls,
+        "channel_role": channel_role,
+    }
+
+
+def _channel_map(
+    *,
+    top_open_lanes: List[Mapping[str, Any]],
+    per_prompt: List[Any],
+) -> List[Dict[str, Any]]:
+    rows_by_query = {
+        _norm_phrase(row.get("query")): row
+        for row in per_prompt
+        if isinstance(row, Mapping) and _clean_str(row.get("query"))
+    }
+    out: List[Dict[str, Any]] = []
+    for lane in top_open_lanes:
+        query = _clean_str(lane.get("query"))
+        row = rows_by_query.get(_norm_phrase(query)) or {}
+        controlled_by = _unique_host_roles(_source_role_chips(row))
+        source_route = _clean_str(row.get("source_route") or lane.get("source_route")).lower()
+        role = (
+            "open"
+            if source_route in _NO_CONTROL_ROUTES or not controlled_by
+            else source_route
+        )
+        out.append({
+            "lane": query,
+            "query": query,
+            "controlled_by": controlled_by,
+            "role": role,
+        })
+    return out
+
+
+def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:
+    chips: List[Dict[str, str]] = []
+    for source in _as_list(row.get("source_roles")):
+        if not isinstance(source, Mapping):
+            continue
+        host = _normalize_host(source.get("host"))
+        if not host:
+            continue
+        role = _clean_str(source.get("role")) or "unclassified"
+        chips.append({"host": host, "role": role})
+    if chips:
+        return chips
+
+    source_summary = _as_mapping(row.get("source_summary"))
+    for source in _as_list(source_summary.get("top_cited_hosts")):
+        if not isinstance(source, Mapping):
+            continue
+        host = _normalize_host(source.get("host"))
+        if host:
+            chips.append({"host": host, "role": "unclassified"})
+    return chips
+
+
+def _unique_host_roles(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for row in rows:
+        host = _normalize_host(row.get("host"))
+        role = _clean_str(row.get("role")) or "unclassified"
+        if not host:
+            continue
+        key = (host.lower(), role.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"host": host, "role": role})
+    return out
+
+
+def _health_sensitive(
+    *,
+    title: str,
+    brand: str,
+    attributes: Mapping[str, List[str]],
+) -> bool:
+    text = " ".join(
+        [
+            title,
+            brand,
+            *[
+                item
+                for values in attributes.values()
+                for item in values
+            ],
+        ]
+    ).lower()
+    return any(
+        token in text
+        for token in (
+            "collagen",
+            "deodorant",
+            "fish",
+            "glycine",
+            "health",
+            "probiotic",
+            "skin",
+            "supplement",
+            "vitamin",
+            "wellness",
+        )
+    )
+
+
+def _parse_brief_json(raw_text: Any) -> Optional[Dict[str, Any]]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        try:
+            parsed = json.loads(fence.group(1))
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(text[start:end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _has_required_shape(brief: Mapping[str, Any]) -> bool:
+    if not _REQUIRED_BRIEF_KEYS.issubset(brief.keys()):
+        return False
+    if not isinstance(brief.get("traffic_strategy"), list):
+        return False
+    if not isinstance(brief.get("first_moves"), list):
+        return False
+    if not (3 <= len(brief.get("first_moves") or []) <= 5):
+        return False
+    diy = brief.get("diy_vs_pivota")
+    if not isinstance(diy, Mapping) or not isinstance(diy.get("self_serve"), list):
+        return False
+    if not isinstance(diy.get("pivota"), str):
+        return False
+    return True
+
+
+def _grounding_failures(
+    brief: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> List[str]:
+    text = "\n".join(_iter_leaf_text(brief))
+    failures = [
+        f"forbidden:{pattern.pattern}"
+        for pattern in _FORBIDDEN_PATTERNS
+        if pattern.search(text)
+    ]
+    allowed = _allowed_grounding(evidence)
+
+    for domain in _DOMAIN_RE.findall(text):
+        normalized = _normalize_host(domain)
+        if normalized and normalized not in allowed["domains"]:
+            failures.append(f"unknown-domain:{domain}")
+
+    for quote in _QUOTE_RE.findall(text):
+        phrase = _norm_phrase(quote)
+        if not phrase or len(phrase.split()) < 2:
+            continue
+        if not _looks_like_lane_quote(phrase, allowed):
+            continue
+        if not _phrase_allowed(phrase, allowed["phrases"]):
+            failures.append(f"unknown-quoted-lane:{quote}")
+
+    for entity in _extract_named_entities(text):
+        if not _entity_allowed(entity, allowed):
+            failures.append(f"unknown-entity:{entity}")
+    return failures
+
+
+def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
+    allowed_terms: Set[str] = set(_INTERNAL_ALLOWED_ENTITIES)
+    allowed_domains: Set[str] = set()
+    allowed_phrases: Set[str] = set()
+    attribute_words: Set[str] = set()
+
+    def add_term(value: Any) -> None:
+        text = _clean_str(value)
+        if not text:
+            return
+        allowed_terms.add(_norm_entity(text))
+        allowed_phrases.add(_norm_phrase(text))
+
+    def add_domain(value: Any) -> None:
+        host = _normalize_host(value)
+        if host:
+            allowed_domains.add(host)
+            allowed_terms.add(_norm_entity(host))
+
+    product = _as_mapping(evidence.get("product"))
+    add_term(product.get("title"))
+    add_term(product.get("brand"))
+    attributes = _as_mapping(product.get("attributes"))
+    for values in attributes.values():
+        for attr in _as_str_list(values):
+            add_term(attr)
+            for word in re.findall(r"[a-z0-9]+", attr.lower()):
+                attribute_words.add(word)
+
+    category_battle = _as_mapping(evidence.get("category_battle"))
+    for prompt in _as_str_list(category_battle.get("prompts")):
+        add_term(prompt)
+    for winner in _as_str_list(category_battle.get("winners")):
+        add_term(winner)
+    for ranked in _as_list(category_battle.get("ranked_by")):
+        if isinstance(ranked, Mapping):
+            add_domain(ranked.get("host"))
+
+    substitution = _as_mapping(evidence.get("substitution"))
+    add_term(substitution.get("handed_to"))
+    add_term(substitution.get("on_prompt"))
+
+    for lane in _as_list(evidence.get("open_lanes")):
+        if not isinstance(lane, Mapping):
+            continue
+        add_term(lane.get("query"))
+        for why in _as_str_list(lane.get("why_fit")):
+            add_term(why)
+            for word in re.findall(r"[a-z0-9]+", why.lower()):
+                attribute_words.add(word)
+
+    for lane in _as_list(evidence.get("channel_map")):
+        if not isinstance(lane, Mapping):
+            continue
+        add_term(lane.get("lane"))
+        add_term(lane.get("query"))
+        for controller in _as_list(lane.get("controlled_by")):
+            if isinstance(controller, Mapping):
+                add_domain(controller.get("host"))
+
+    return {
+        "terms": allowed_terms,
+        "domains": allowed_domains,
+        "phrases": {phrase for phrase in allowed_phrases if phrase},
+        "attribute_words": attribute_words,
+    }
+
+
+def _extract_named_entities(text: str) -> List[str]:
+    entities: List[str] = []
+    seen_spans: List[Tuple[int, int]] = []
+    for match in _PROPER_SEQUENCE_RE.finditer(text):
+        entity = _clean_entity(match.group(0))
+        if entity and not _entity_is_stopword(entity):
+            chunks = re.split(r"\s+(?:and|&)\s+", entity)
+            for chunk in chunks:
+                clean = _clean_entity(chunk)
+                if clean and not _entity_is_stopword(clean):
+                    entities.append(clean)
+            seen_spans.append(match.span())
+
+    for match in _SINGLE_ENTITY_RE.finditer(text):
+        if any(start <= match.start() and match.end() <= end for start, end in seen_spans):
+            continue
+        entity = _clean_entity(match.group(0))
+        if entity and not _entity_is_stopword(entity):
+            entities.append(entity)
+    return _unique(entities)
+
+
+def _entity_allowed(entity: str, allowed: Mapping[str, Any]) -> bool:
+    normalized = _norm_entity(entity)
+    if not normalized:
+        return True
+    if normalized in allowed["terms"]:
+        return True
+    domain = _normalize_host(entity)
+    if domain and domain in allowed["domains"]:
+        return True
+    if normalized in _INTERNAL_ALLOWED_ENTITIES:
+        return True
+    for term in allowed["terms"]:
+        if len(term.split()) < 2:
+            continue
+        if _phrase_contains(term, normalized) or _phrase_contains(normalized, term):
+            return True
+    words = re.findall(r"[a-z0-9]+", normalized)
+    if words and all(word in allowed["attribute_words"] for word in words):
+        return True
+    return False
+
+
+def _phrase_allowed(phrase: str, allowed_phrases: Set[str]) -> bool:
+    if phrase in allowed_phrases:
+        return True
+    return any(
+        _phrase_contains(allowed, phrase) or _phrase_contains(phrase, allowed)
+        for allowed in allowed_phrases
+        if len(allowed.split()) >= 2
+    )
+
+
+def _looks_like_lane_quote(phrase: str, allowed: Mapping[str, Any]) -> bool:
+    if phrase in allowed["phrases"]:
+        return True
+    words = set(re.findall(r"[a-z0-9]+", phrase))
+    shopping_words = {
+        "alternative",
+        "alternatives",
+        "best",
+        "buy",
+        "compare",
+        "comparison",
+        "dupe",
+        "dupes",
+        "review",
+        "reviews",
+        "shop",
+        "top",
+        "vs",
+        "where",
+    }
+    if words & shopping_words:
+        return True
+    attribute_overlap = words & allowed["attribute_words"]
+    return len(attribute_overlap) >= 2 or (len(words) >= 3 and bool(attribute_overlap))
+
+
+def _phrase_contains(haystack: str, needle: str) -> bool:
+    if not haystack or not needle:
+        return False
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", haystack))
+
+
+def _iter_leaf_text(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for child in value.values():
+            yield from _iter_leaf_text(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_leaf_text(child)
+
+
+def _score_from_layer(layer: Any) -> Optional[int]:
+    mapping = _as_mapping(layer)
+    if not mapping:
+        return None
+    try:
+        return int(round(float(mapping.get("score"))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_host(value: Any) -> str:
+    text = _clean_str(value).lower()
+    if not text:
+        return ""
+    if "://" in text:
+        parsed = urlparse(text)
+        text = parsed.hostname or text
+    text = text.strip().strip("/").lower()
+    text = re.sub(r"^www\.", "", text)
+    return text.split("/", 1)[0]
+
+
+def _norm_entity(value: Any) -> str:
+    return re.sub(r"\s+", " ", _clean_str(value).lower()).strip()
+
+
+def _norm_phrase(value: Any) -> str:
+    text = _norm_entity(value)
+    text = re.sub(r"[^a-z0-9.&+ -]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _clean_entity(value: str) -> str:
+    return _clean_str(value).strip(" ,.;:()[]{}")
+
+
+def _entity_is_stopword(entity: str) -> bool:
+    if entity in _ENTITY_STOPWORDS:
+        return True
+    normalized = _norm_entity(entity)
+    return normalized in _INTERNAL_ALLOWED_ENTITIES
+
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _as_str_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [
+            item
+            for item in (_clean_str(v) for v in value)
+            if item
+        ]
+    text = _clean_str(value)
+    return [text] if text else []
+
+
+def _clean_str(value: Any) -> str:
+    return str(value).strip() if value not in (None, "") else ""
+
+
+def _unique(values: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        text = _clean_str(value)
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out

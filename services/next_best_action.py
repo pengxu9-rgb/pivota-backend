@@ -8,8 +8,11 @@ rollups or content-revision wiring.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+
+logger = logging.getLogger(__name__)
 
 PRIMARY_INTEGRATION_COMPLETION = "integration_completion_gap"
 PRIMARY_RETRIEVAL_FOUNDATION = "retrieval_foundation_gap"
@@ -198,6 +201,53 @@ def build_sku_next_best_action(
         failing_prompts=_as_list(failing_prompts),
     )
     return prescription
+
+
+async def attach_sku_strategic_brief(
+    next_best_action: Mapping[str, Any],
+    *,
+    opportunity: Mapping[str, Any],
+    attribute_graph: Mapping[str, Any],
+    primary_gaps: Optional[List[Mapping[str, Any]]] = None,
+    scores: Optional[Mapping[str, Any]] = None,
+    identity: Optional[Mapping[str, Any]] = None,
+    sku_title: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Optionally attach an evidence-grounded strategic brief.
+
+    The deterministic next_best_action remains the contract and fallback. Any
+    synthesis, parsing, validation, or config failure returns the original
+    fields unchanged and without a strategic_brief key.
+    """
+
+    out = dict(next_best_action or {})
+    try:
+        from services.strategic_brief import (
+            assemble_sku_brief_evidence,
+            generate_sku_strategic_brief,
+        )
+
+        evidence = assemble_sku_brief_evidence(
+            opportunity=opportunity,
+            attribute_graph=attribute_graph,
+            primary_gaps=primary_gaps,
+            scores=scores,
+            identity=identity,
+            sku_title=sku_title,
+        )
+        brief = await generate_sku_strategic_brief(
+            evidence,
+            provider=provider,
+            model=model,
+        )
+    except Exception:
+        logger.warning("strategic brief attach failed; using deterministic NBA", exc_info=True)
+        return out
+    if brief:
+        out["strategic_brief"] = brief
+    return out
 
 
 def _classify_sku_primary_gap(

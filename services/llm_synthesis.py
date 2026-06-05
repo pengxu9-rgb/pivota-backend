@@ -1,0 +1,285 @@
+"""Backend-direct LLM synthesis for grounded audit brief framing.
+
+This module intentionally performs ungrounded chat completion only: no web
+search tools, no retrieval, no audit recomputation. Callers supply the full
+evidence block and must validate grounding before exposing any text.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Mapping, Optional
+
+import httpx
+
+from config.settings import settings
+
+
+class LLMSynthesisError(RuntimeError):
+    """Base typed failure for strategic synthesis providers."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.status_code = status_code
+
+
+class MissingLLMKeyError(LLMSynthesisError):
+    """Raised when the selected provider has no configured API key."""
+
+
+class LLMSynthesisHTTPError(LLMSynthesisError):
+    """Raised on provider HTTP or transport failures."""
+
+
+_PROVIDER_ALIASES = {
+    "deepseek": "deepseek",
+    "openai": "openai",
+    "chatgpt": "openai",
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+}
+_DEFAULT_TIMEOUT_S = 30.0
+
+
+def normalize_provider(provider: str) -> str:
+    normalized = str(provider or "").strip().lower()
+    canonical = _PROVIDER_ALIASES.get(normalized)
+    if not canonical:
+        raise LLMSynthesisError(
+            f"Unsupported synthesis provider: {provider}",
+            provider=normalized or "unknown",
+        )
+    return canonical
+
+
+def default_model_for_provider(provider: str) -> str:
+    canonical = normalize_provider(provider)
+    if canonical == "deepseek":
+        return settings.deepseek_model
+    if canonical == "openai":
+        return settings.openai_model
+    if canonical == "anthropic":
+        return settings.anthropic_model
+    raise LLMSynthesisError(
+        f"Unsupported synthesis provider: {provider}",
+        provider=canonical,
+    )
+
+
+def configured_key_for_provider(provider: str) -> Optional[str]:
+    canonical = normalize_provider(provider)
+    if canonical == "deepseek":
+        return settings.deepseek_api_key
+    if canonical == "openai":
+        return settings.openai_api_key
+    if canonical == "anthropic":
+        return settings.anthropic_api_key
+    return None
+
+
+async def synthesize(
+    *,
+    system: str,
+    user: str,
+    provider: str,
+    model: str,
+    max_tokens: int = 1200,
+) -> Dict[str, Any]:
+    canonical = normalize_provider(provider)
+    selected_model = str(model or default_model_for_provider(canonical)).strip()
+    if not selected_model:
+        raise LLMSynthesisError(
+            "No synthesis model configured",
+            provider=canonical,
+        )
+
+    if canonical == "anthropic":
+        return await _call_anthropic_messages(
+            system=system,
+            user=user,
+            model=selected_model,
+            max_tokens=max_tokens,
+        )
+    return await _call_openai_compatible_chat(
+        system=system,
+        user=user,
+        provider=canonical,
+        model=selected_model,
+        max_tokens=max_tokens,
+    )
+
+
+async def _call_openai_compatible_chat(
+    *,
+    system: str,
+    user: str,
+    provider: str,
+    model: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    if provider == "deepseek":
+        api_key = settings.deepseek_api_key
+        url = _deepseek_chat_url(settings.deepseek_api_base_url)
+    elif provider == "openai":
+        api_key = settings.openai_api_key
+        url = "https://api.openai.com/v1/chat/completions"
+    else:
+        raise LLMSynthesisError(
+            f"Unsupported OpenAI-compatible provider: {provider}",
+            provider=provider,
+        )
+    if not api_key:
+        raise MissingLLMKeyError(
+            f"{provider} API key is not configured",
+            provider=provider,
+        )
+
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+        "max_tokens": int(max_tokens),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = await _post_json(
+        url=url,
+        body=body,
+        headers=headers,
+        provider=provider,
+    )
+    choices = payload.get("choices") or []
+    message = choices[0].get("message") if choices and isinstance(choices[0], Mapping) else {}
+    text = str((message or {}).get("content") or "")
+    usage = _openai_usage(payload.get("usage"))
+    return {
+        "text": text,
+        "usage": usage,
+        "provider": provider,
+        "model": model,
+    }
+
+
+async def _call_anthropic_messages(
+    *,
+    system: str,
+    user: str,
+    model: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    api_key = settings.anthropic_api_key
+    if not api_key:
+        raise MissingLLMKeyError(
+            "anthropic API key is not configured",
+            provider="anthropic",
+        )
+    body: Dict[str, Any] = {
+        "model": model,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+        "temperature": 0.2,
+        "max_tokens": int(max_tokens),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    payload = await _post_json(
+        url="https://api.anthropic.com/v1/messages",
+        body=body,
+        headers=headers,
+        provider="anthropic",
+    )
+    text = _anthropic_text(payload)
+    usage_block = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
+    return {
+        "text": text,
+        "usage": {
+            "input_tokens": usage_block.get("input_tokens"),
+            "output_tokens": usage_block.get("output_tokens"),
+        },
+        "provider": "anthropic",
+        "model": model,
+    }
+
+
+async def _post_json(
+    *,
+    url: str,
+    body: Dict[str, Any],
+    headers: Dict[str, str],
+    provider: str,
+) -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_S) as client:
+            response = await client.post(url, json=body, headers=headers)
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise LLMSynthesisHTTPError(
+            f"{provider} synthesis transport failure: {exc}",
+            provider=provider,
+        ) from exc
+    if response.status_code >= 400:
+        raise LLMSynthesisHTTPError(
+            f"{provider} synthesis HTTP {response.status_code}: {response.text[:200]}",
+            provider=provider,
+            status_code=response.status_code,
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise LLMSynthesisHTTPError(
+            f"{provider} synthesis returned invalid JSON",
+            provider=provider,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise LLMSynthesisHTTPError(
+            f"{provider} synthesis returned non-object JSON",
+            provider=provider,
+        )
+    return payload
+
+
+def _deepseek_chat_url(base_url: str) -> str:
+    base = str(base_url or "https://api.deepseek.com").strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def _openai_usage(raw: Any) -> Dict[str, Any]:
+    usage = raw if isinstance(raw, Mapping) else {}
+    return {
+        "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
+        "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
+    }
+
+
+def _anthropic_text(payload: Mapping[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = [
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, Mapping)
+        and (block.get("type") in (None, "text"))
+        and str(block.get("text") or "")
+    ]
+    return "".join(parts)

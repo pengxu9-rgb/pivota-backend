@@ -208,6 +208,36 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_wedge_hero_sku_intelligence_attaches_optional_strategic_brief(monkeypatch):
+    monkeypatch.setattr(bd, "_build_per_sku_audit_query_records", _four_money_shot_records)
+    _install_probe(monkeypatch)
+    attach_calls: List[Dict[str, Any]] = []
+
+    async def fake_attach(next_best_action: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        attach_calls.append(kwargs)
+        assert next_best_action["primary_gap"] == "open_lane_capture"
+        out = dict(next_best_action)
+        out["strategic_brief"] = {"position": "grounded"}
+        return out
+
+    monkeypatch.setattr(bd, "attach_sku_strategic_brief", fake_attach)
+
+    out = await bd.run_wedge_hero_sku_intelligence(
+        hero_product=_hero_product(),
+        merchant_id="merch-A",
+        run_id="run-url-1",
+        coverage_profile="gemini_deepseek",
+        prompts_per_sku=4,
+    )
+
+    assert out["next_best_action"]["primary_gap"] == "open_lane_capture"
+    assert out["next_best_action"]["strategic_brief"] == {"position": "grounded"}
+    assert len(attach_calls) == 1
+    assert attach_calls[0]["opportunity"]["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
+    assert attach_calls[0]["attribute_graph"]["classes"]["certification_constraint"] == ["halal"]
+
+
+@pytest.mark.asyncio
 async def test_run_wedge_hero_sku_intelligence_tri_prober_includes_chatgpt(monkeypatch):
     # The wedge hero SKU uses the gemini_deepseek_chatgpt profile: ChatGPT runs
     # as a co-equal grounded prober and shows up as a third matrix column.

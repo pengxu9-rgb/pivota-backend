@@ -744,3 +744,38 @@ async def test_build_per_sku_report_preserves_prior_keys_and_adds_opportunity(mo
     assert "next_best_action" in report
     assert report["next_best_action"]["primary_gap"] == "open_lane_capture"
     assert "halal collagen sticks before bed" in report["next_best_action"]["first_move"]
+
+
+@pytest.mark.asyncio
+async def test_build_per_sku_report_attaches_optional_strategic_brief(monkeypatch):
+    from services import agent_center_bd_report_service as bd
+
+    async def fake_load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
+        ctx = _bb_lab_sku_ctx()
+        ctx["sku_key"] = sku_key
+        ctx["merchant_id"] = merchant_id
+        return ctx
+
+    async def fake_load_runs(sku_key: str, merchant_id: str, audit_run_id: str) -> List[Dict[str, Any]]:
+        return _bb_lab_probe_runs()
+
+    attach_calls: List[Dict[str, Any]] = []
+
+    async def fake_attach(next_best_action: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        attach_calls.append(kwargs)
+        assert next_best_action["primary_gap"] == "open_lane_capture"
+        out = dict(next_best_action)
+        out["strategic_brief"] = {"position": "grounded"}
+        return out
+
+    monkeypatch.setattr(bd, "load_sku_context", fake_load_sku_context)
+    monkeypatch.setattr(bd, "load_per_sku_probe_runs", fake_load_runs)
+    monkeypatch.setattr(bd, "attach_sku_strategic_brief", fake_attach)
+
+    report = await bd.build_per_sku_report("sku-bblab", "m-1", "audit-1")
+
+    assert report["next_best_action"]["primary_gap"] == "open_lane_capture"
+    assert report["next_best_action"]["strategic_brief"] == {"position": "grounded"}
+    assert len(attach_calls) == 1
+    assert attach_calls[0]["opportunity"]["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
+    assert attach_calls[0]["attribute_graph"]["classes"]["certification_constraint"] == ["halal"]
