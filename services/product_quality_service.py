@@ -13,7 +13,9 @@ pipeline (with behavior data and models) can be added separately.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -31,6 +33,11 @@ logger = logging.getLogger(__name__)
 QUALITY_SOURCE_SNAPSHOT = "snapshot"
 QUALITY_SOURCE_PREVIEW = "preview"
 QUALITY_SOURCE_NONE = "none"
+DEFAULT_QUALITY_RULES_VERSION = "v1-lite"
+SOURCE_BACKED_COMPONENTS_RULES_VERSION = "v1-source-backed-components"
+SOURCE_BACKED_OPTIONAL_COMPONENTS_FLAG = (
+    "PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS"
+)
 
 _QUALITY_SCORE_FIELDS = (
     "content_quality_score",
@@ -104,6 +111,30 @@ def _as_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _as_source_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _as_source_array(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _flag_enabled(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def quality_source_backed_optional_components_enabled() -> bool:
+    return _flag_enabled(os.getenv(SOURCE_BACKED_OPTIONAL_COMPONENTS_FLAG))
+
+
 def _coerce_list(value: Any) -> List[Any]:
     if value is None:
         return []
@@ -127,6 +158,149 @@ def _first_non_empty(*values: Any) -> Any:
             continue
         return value
     return None
+
+
+def _first_source_text(*values: Any) -> str:
+    for value in values:
+        normalized = _as_text(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def _object_text_value_count(value: Any) -> int:
+    obj = _as_source_dict(value)
+    return sum(1 for item in obj.values() if _as_text(item))
+
+
+def _read_what_it_is(product_intel: Any) -> str:
+    intel = _as_source_dict(product_intel)
+    core = _as_source_dict(intel.get("product_intel_core"))
+    legacy_core = _as_source_dict(intel.get("core"))
+    return _first_source_text(
+        _as_source_dict(core.get("what_it_is")).get("body"),
+        _as_source_dict(core.get("whatItIs")).get("body"),
+        _as_source_dict(legacy_core.get("what_it_is")).get("body"),
+        _as_source_dict(legacy_core.get("whatItIs")).get("body"),
+    )
+
+
+def _source_backed_roots(
+    payload: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    product_payload = _as_source_dict(payload.get("product_payload")) or payload
+    seed_data = _as_source_dict(
+        payload.get("seed_data") or payload.get("seed_data_json")
+    )
+    snapshot = _as_source_dict(seed_data.get("snapshot"))
+    return product_payload, seed_data, snapshot
+
+
+def source_backed_summary_text(payload: Dict[str, Any]) -> str:
+    product_payload, seed_data, snapshot = _source_backed_roots(payload)
+    return _first_source_text(
+        seed_data.get("summary"),
+        seed_data.get("pdp_summary"),
+        seed_data.get("short_description"),
+        seed_data.get("product_summary"),
+        snapshot.get("summary"),
+        snapshot.get("pdp_summary"),
+        snapshot.get("short_description"),
+        _read_what_it_is(seed_data.get("product_intel")),
+        _read_what_it_is(snapshot.get("product_intel")),
+        product_payload.get("summary"),
+        product_payload.get("short_description"),
+        product_payload.get("product_summary"),
+        _read_what_it_is(product_payload.get("product_intel")),
+    )
+
+
+def source_backed_attribute_signal_count(payload: Dict[str, Any]) -> int:
+    product_payload, seed_data, snapshot = _source_backed_roots(payload)
+    ingredient_intel = _as_source_dict(seed_data.get("ingredient_intel"))
+    snapshot_ingredient_intel = _as_source_dict(snapshot.get("ingredient_intel"))
+    explicit_product_payload = _as_source_dict(payload.get("product_payload"))
+    nested_payload_seed_data = (
+        _as_source_dict(explicit_product_payload.get("seed_data"))
+        if explicit_product_payload
+        else {}
+    )
+
+    detail_sections = sum(
+        len(_as_source_array(value))
+        for value in (
+            seed_data.get("pdp_details_sections"),
+            snapshot.get("pdp_details_sections"),
+            product_payload.get("pdp_details_sections"),
+            nested_payload_seed_data.get("pdp_details_sections"),
+        )
+    )
+    structured_ingredients = sum(
+        len(_as_source_array(value))
+        for value in (
+            seed_data.get("active_ingredients"),
+            seed_data.get("ingredients_inci"),
+            seed_data.get("inci_list"),
+            ingredient_intel.get("inci_list"),
+            snapshot.get("active_ingredients"),
+            snapshot.get("ingredients_inci"),
+            snapshot.get("inci_list"),
+            snapshot_ingredient_intel.get("inci_list"),
+        )
+    )
+    source_backed_text_fields = sum(
+        1
+        for value in (
+            seed_data.get("pdp_how_to_use_raw"),
+            seed_data.get("pdp_ingredients_raw"),
+            seed_data.get("raw_ingredient_text_clean"),
+            snapshot.get("pdp_how_to_use_raw"),
+            snapshot.get("pdp_ingredients_raw"),
+            snapshot.get("raw_ingredient_text_clean"),
+        )
+        if _as_text(value)
+    )
+    explicit_attributes = (
+        _object_text_value_count(seed_data.get("attributes"))
+        + _object_text_value_count(snapshot.get("attributes"))
+        + _object_text_value_count(product_payload.get("attributes"))
+    )
+    return (
+        detail_sections
+        + structured_ingredients
+        + source_backed_text_fields
+        + explicit_attributes
+    )
+
+
+def score_source_backed_summary(
+    payload: Dict[str, Any],
+    *,
+    enabled: bool,
+) -> Tuple[float, str]:
+    if not enabled:
+        return 0.0, ""
+    summary = source_backed_summary_text(payload)
+    if len(summary) >= 80:
+        return 1.0, summary
+    if len(summary) >= 30:
+        return 0.7, summary
+    return 0.0, summary
+
+
+def score_source_backed_attributes(
+    payload: Dict[str, Any],
+    *,
+    enabled: bool,
+) -> Tuple[float, int]:
+    if not enabled:
+        return 0.0, 0
+    signal_count = source_backed_attribute_signal_count(payload)
+    if signal_count >= 3:
+        return 1.0, signal_count
+    if signal_count >= 1:
+        return 0.7, signal_count
+    return 0.0, signal_count
 
 
 def _extract_main_image(product_data: Dict[str, Any]) -> Optional[str]:
@@ -429,7 +603,11 @@ def summarize_quality_coverage(
     }
 
 
-def preview_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
+def preview_quality(
+    payload: Dict[str, Any],
+    *,
+    score_source_backed_components: Optional[bool] = None,
+) -> Dict[str, Any]:
     """
     Compute a lightweight content quality preview score based on the
     partial product payload coming from the Merchant Portal.
@@ -441,6 +619,11 @@ def preview_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
     - L3: summary_short, bullet_points
     """
     problems: List[Dict[str, Any]] = []
+    source_backed_enabled = (
+        quality_source_backed_optional_components_enabled()
+        if score_source_backed_components is None
+        else bool(score_source_backed_components)
+    )
 
     # Title / naming
     title = (
@@ -509,11 +692,18 @@ def preview_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # L3: summary / bullets
     summary = payload.get("summary_short") or ""
-    summary_score = _text_length_score(summary, min_len=20, max_len=120)
+    source_summary_score, source_summary = score_source_backed_summary(
+        payload,
+        enabled=source_backed_enabled,
+    )
+    summary_score = max(
+        _text_length_score(summary, min_len=20, max_len=120),
+        source_summary_score,
+    )
     bullets = payload.get("bullet_points") or []
     bullets_count = len(bullets)
     bullets_ok = bullets_count >= 3
-    if not summary:
+    if not summary and not source_summary:
         problems.append({
             "field": "summary_short",
             "code": "missing_summary",
@@ -537,6 +727,10 @@ def preview_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
         attribute_score += 0.5
     if has_usage:
         attribute_score += 0.5
+    source_attribute_score, source_attribute_signal_count = (
+        score_source_backed_attributes(payload, enabled=source_backed_enabled)
+    )
+    attribute_score = max(attribute_score, source_attribute_score)
 
     # Aggregate into a 0–100 content quality preview
     # This is intentionally simple and easy to tweak.
@@ -568,7 +762,7 @@ def preview_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Conversion potential is not computed in preview; just stub for now.
     conversion_potential_score = None
 
-    return {
+    result = {
         "content_quality_score": content_quality_score,
         "model_readiness_score": model_readiness_score,
         "conversion_potential_score": conversion_potential_score,
@@ -578,6 +772,13 @@ def preview_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
             for name, score in raw_components
         ],
     }
+    if source_backed_enabled:
+        result["source_backed_fields"] = {
+            "optional_components_enabled": True,
+            "summary_length": len(source_summary),
+            "attribute_signal_count": source_attribute_signal_count,
+        }
+    return result
 
 
 async def full_quality_eval(
@@ -586,8 +787,9 @@ async def full_quality_eval(
     platform_product_id: str,
     geo_code: Optional[str],
     payload: Dict[str, Any],
-    rules_version: str = "v1-lite",
+    rules_version: str = DEFAULT_QUALITY_RULES_VERSION,
     model_version: str = "none",
+    score_source_backed_components: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Full evaluation entrypoint.
@@ -599,7 +801,16 @@ async def full_quality_eval(
     - incorporate behavior metrics
     - call ML models for richer scoring
     """
-    result = preview_quality(payload)
+    result = preview_quality(
+        payload,
+        score_source_backed_components=score_source_backed_components,
+    )
+    effective_rules_version = rules_version
+    if (
+        rules_version == DEFAULT_QUALITY_RULES_VERSION
+        and result.get("source_backed_fields", {}).get("optional_components_enabled")
+    ):
+        effective_rules_version = SOURCE_BACKED_COMPONENTS_RULES_VERSION
 
     # Optional convenience product_id (composite)
     product_id = f"{merchant_id}|{platform}|{platform_product_id}"
@@ -613,7 +824,7 @@ async def full_quality_eval(
         "content_quality_score": result.get("content_quality_score"),
         "model_readiness_score": result.get("model_readiness_score"),
         "conversion_potential_score": result.get("conversion_potential_score"),
-        "rules_version": rules_version,
+        "rules_version": effective_rules_version,
         "model_version": model_version,
         "details": result,
     }

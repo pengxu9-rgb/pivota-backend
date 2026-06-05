@@ -1,7 +1,12 @@
+import pytest
+
+from services import product_quality_service as svc
 from services.product_quality_service import (
     QUALITY_SOURCE_PREVIEW,
     QUALITY_SOURCE_SNAPSHOT,
+    SOURCE_BACKED_COMPONENTS_RULES_VERSION,
     build_quality_payload_from_cache_row,
+    preview_quality,
     summarize_quality_coverage,
 )
 
@@ -80,3 +85,106 @@ def test_summarize_quality_coverage_tracks_snapshot_preview_and_unscored() -> No
     assert summary["latest_snapshot_at"] == "2026-03-19T00:00:00Z"
     assert summary["backfill_recommended"] is True
     assert summary["active_backfill_job"]["job_id"] == "qbf_123"
+
+
+def _source_backed_quality_payload(**overrides):
+    payload = {
+        "title_local": "Barrier Serum",
+        "description_local": (
+            "A source-backed serum description with enough detail to clear the "
+            "full deterministic description component."
+        ),
+        "main_image_url": "https://example.test/serum.jpg",
+        "image_list": ["https://example.test/serum.jpg"],
+        "brand": "Pivota Test",
+        "global_category_id": "Serum",
+        "price_local_value": 24.0,
+        "seed_data": {
+            "summary": (
+                "A concise source-backed product summary that is long enough "
+                "to score as a complete summary component."
+            ),
+            "pdp_details_sections": [
+                {"heading": "Benefits", "content": "Hydrates and supports the skin barrier."}
+            ],
+            "pdp_how_to_use_raw": "Apply after cleansing.",
+            "ingredient_intel": {"inci_list": ["water"]},
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _component_score(result, name):
+    return next(item["score"] for item in result["components"] if item["name"] == name)
+
+
+def test_source_backed_components_remain_zero_by_default() -> None:
+    result = preview_quality(_source_backed_quality_payload())
+
+    assert result["content_quality_score"] == 71.4
+    assert _component_score(result, "summary") == 0.0
+    assert _component_score(result, "attributes") == 0.0
+    assert "source_backed_fields" not in result
+
+
+def test_scores_source_backed_summary_and_attributes_when_enabled() -> None:
+    result = preview_quality(
+        _source_backed_quality_payload(),
+        score_source_backed_components=True,
+    )
+
+    assert result["content_quality_score"] == 100.0
+    assert _component_score(result, "summary") == 100.0
+    assert _component_score(result, "attributes") == 100.0
+    assert result["source_backed_fields"] == {
+        "optional_components_enabled": True,
+        "summary_length": 101,
+        "attribute_signal_count": 3,
+    }
+    assert {item["code"] for item in result["problems"]} == {"insufficient_bullets"}
+
+
+def test_source_backed_attribute_signal_can_clear_quality_threshold() -> None:
+    payload = _source_backed_quality_payload(
+        description_local="",
+        seed_data={
+            "pdp_details_sections": [
+                {"heading": "Texture", "content": "Lightweight gel serum."}
+            ],
+        },
+    )
+
+    historical = preview_quality(payload, score_source_backed_components=False)
+    lifted = preview_quality(payload, score_source_backed_components=True)
+
+    assert historical["content_quality_score"] == 57.1
+    assert lifted["content_quality_score"] == 67.1
+    assert _component_score(lifted, "attributes") == 70.0
+
+
+@pytest.mark.asyncio
+async def test_full_quality_eval_bumps_rules_version_for_source_backed_scoring(monkeypatch) -> None:
+    captured = {}
+
+    async def fake_execute(query, *_args, **_kwargs):
+        captured["params"] = query.compile().params
+        return None
+
+    async def fake_fetch_one(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(svc.database, "execute", fake_execute)
+    monkeypatch.setattr(svc.database, "fetch_one", fake_fetch_one)
+
+    result = await svc.full_quality_eval(
+        merchant_id="merchant",
+        platform="shopify",
+        platform_product_id="prod_1",
+        geo_code="default",
+        payload=_source_backed_quality_payload(),
+        score_source_backed_components=True,
+    )
+
+    assert result["content_quality_score"] == 100.0
+    assert captured["params"]["rules_version"] == SOURCE_BACKED_COMPONENTS_RULES_VERSION
