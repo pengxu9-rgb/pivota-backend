@@ -42,7 +42,7 @@ def _adyen_hmac_key_bytes(secret: str) -> bytes:
 
 
 def _adyen_escape_component(value: object) -> str:
-    return str(value or "").replace("\\", "\\\\").replace(":", "\\:")
+    return str("" if value is None else value).replace("\\", "\\\\").replace(":", "\\:")
 
 
 def _adyen_notification_signing_string(notification: dict) -> str:

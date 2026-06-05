@@ -24,7 +24,7 @@ from main import app
 
 
 def _adyen_escape_component(value: object) -> str:
-    return str(value or "").replace("\\", "\\\\").replace(":", "\\:")
+    return str("" if value is None else value).replace("\\", "\\\\").replace(":", "\\:")
 
 
 def _adyen_hmac_signature(notification: Dict[str, Any], secret: str) -> str:
@@ -79,6 +79,79 @@ def _adyen_payload(
             }
         ]
     }
+
+
+def test_adyen_official_hmac_canonical_vector_still_verifies() -> None:
+    import routes.psp_routes as psp_routes_module
+
+    secret = "44782DEF547AAA06C910C43932B1EB0C71FC68D9D0C057550C48EC2ACF6BA056"
+    notification = {
+        "pspReference": "7914073381342284",
+        "merchantAccountCode": "TestMerchant",
+        "merchantReference": "TestPayment-1407325143704",
+        "amount": {
+            "value": 1130,
+            "currency": "EUR",
+        },
+        "eventCode": "AUTHORISATION",
+        "success": "true",
+        "additionalData": {
+            "hmacSignature": "coqCmt/IZ4E3CzPvMY8zTjQVL5hYJUiBRg8UU+iCWo0=",
+        },
+    }
+
+    assert psp_routes_module._verify_adyen_notification_hmac(notification, secret) is True
+    assert (
+        psp_routes_module._adyen_notification_signing_string(notification)
+        == "7914073381342284::TestMerchant:TestPayment-1407325143704:1130:EUR:AUTHORISATION:true"
+    )
+
+
+def test_adyen_zero_amount_hmac_signing_string_keeps_zero_value() -> None:
+    import routes.psp_routes as psp_routes_module
+
+    secret = "44782DEF547AAA06C910C43932B1EB0C71FC68D9D0C057550C48EC2ACF6BA056"
+    notification = {
+        "pspReference": "WMKKJTS2T75GW7V5",
+        "merchantAccountCode": "WoopayECOM",
+        "merchantReference": "testMerchantRef1",
+        "amount": {
+            "value": 0,
+            "currency": "EUR",
+        },
+        "eventCode": "AUTHENTICATION",
+        "success": "true",
+        "additionalData": {},
+    }
+    signing_string = psp_routes_module._adyen_notification_signing_string(notification)
+
+    assert signing_string == "WMKKJTS2T75GW7V5::WoopayECOM:testMerchantRef1:0:EUR:AUTHENTICATION:true"
+    digest = hmac.new(bytes.fromhex(secret), signing_string.encode("utf-8"), hashlib.sha256).digest()
+    notification["additionalData"]["hmacSignature"] = base64.b64encode(digest).decode("utf-8")
+
+    assert psp_routes_module._verify_adyen_notification_hmac(notification, secret) is True
+
+
+def test_adyen_zero_amount_signing_string_has_no_empty_amount_segment() -> None:
+    import routes.psp_routes as psp_routes_module
+
+    notification = {
+        "pspReference": "WMKKJTS2T75GW7V5",
+        "merchantAccountCode": "WoopayECOM",
+        "merchantReference": "testMerchantRef1",
+        "amount": {
+            "value": 0,
+            "currency": "EUR",
+        },
+        "eventCode": "AUTHENTICATION",
+        "success": "true",
+        "additionalData": {},
+    }
+    signing_string = psp_routes_module._adyen_notification_signing_string(notification)
+
+    assert ":::" not in signing_string
+    assert ":testMerchantRef1::EUR:" not in signing_string
+    assert ":testMerchantRef1:0:EUR:" in signing_string
 
 
 @pytest.mark.asyncio
