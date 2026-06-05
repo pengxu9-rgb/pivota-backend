@@ -184,7 +184,7 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     assert out["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
     assert out["top_open_lanes"][0]["first_move"] == "Add a PDP section + FAQ for this lane"
     assert out["next_best_action"]["primary_gap"] == "open_lane_capture"
-    assert out["next_best_action"]["first_move"] == "Add a PDP section + FAQ for this lane"
+    assert "halal collagen sticks before bed" in out["next_best_action"]["first_move"]
     assert len(out["next_best_action"]["self_serve_actions"]) == 2
     assert out["next_best_action"]["pivota_path"]
     assert "You lost `best collagen supplements for skin`" in out["headline"]
@@ -205,6 +205,36 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     assert sidewalk["intent_ladder_layer"] == "sidewalk_opportunity"
     assert sidewalk["ownership_state"] == "open-lane"
     assert out["coverage"]["prompt_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_run_wedge_hero_sku_intelligence_attaches_optional_strategic_brief(monkeypatch):
+    monkeypatch.setattr(bd, "_build_per_sku_audit_query_records", _four_money_shot_records)
+    _install_probe(monkeypatch)
+    attach_calls: List[Dict[str, Any]] = []
+
+    async def fake_attach(next_best_action: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        attach_calls.append(kwargs)
+        assert next_best_action["primary_gap"] == "open_lane_capture"
+        out = dict(next_best_action)
+        out["strategic_brief"] = {"position": "grounded"}
+        return out
+
+    monkeypatch.setattr(bd, "attach_sku_strategic_brief", fake_attach)
+
+    out = await bd.run_wedge_hero_sku_intelligence(
+        hero_product=_hero_product(),
+        merchant_id="merch-A",
+        run_id="run-url-1",
+        coverage_profile="gemini_deepseek",
+        prompts_per_sku=4,
+    )
+
+    assert out["next_best_action"]["primary_gap"] == "open_lane_capture"
+    assert out["next_best_action"]["strategic_brief"] == {"position": "grounded"}
+    assert len(attach_calls) == 1
+    assert attach_calls[0]["opportunity"]["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
+    assert attach_calls[0]["attribute_graph"]["classes"]["certification_constraint"] == ["halal"]
 
 
 @pytest.mark.asyncio

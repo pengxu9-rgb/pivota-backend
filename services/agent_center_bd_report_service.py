@@ -41,7 +41,11 @@ from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
 )
-from services.next_best_action import build_next_best_action, build_sku_next_best_action
+from services.next_best_action import (
+    attach_sku_strategic_brief,
+    build_next_best_action,
+    build_sku_next_best_action,
+)
 from services.pivota_indexing_arc import compute_indexing_arc_state
 from services.sku_sidewalk import (
     build_sku_attribute_graph,
@@ -3659,10 +3663,11 @@ async def build_per_sku_report(
     )
     from services.sku_opportunity import build_sku_opportunity
 
+    attribute_graph = build_sku_attribute_graph(product)
     opportunity = build_sku_opportunity(
         sku_ctx,
         probe_runs,
-        attribute_graph=build_sku_attribute_graph(product),
+        attribute_graph=attribute_graph,
     )
 
     if sku_ctx.get("missing_inputs") and not product.get("product_key"):
@@ -3715,6 +3720,15 @@ async def build_per_sku_report(
         scores=scores,
         failing_prompts=failing_prompts,
         verify_summary=verify_summary_out,
+        identity=identity,
+        sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
+    )
+    next_best_action = await attach_sku_strategic_brief(
+        next_best_action,
+        opportunity=opportunity,
+        attribute_graph=attribute_graph,
+        primary_gaps=primary_gaps,
+        scores=scores,
         identity=identity,
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
     )
@@ -5139,10 +5153,32 @@ async def run_wedge_hero_sku_intelligence(
         {sku_ctx["sku_key"]: real_runs},
         attribute_graph=attribute_graph,
     )
-    return _display_sku_intelligence(
+    display = _display_sku_intelligence(
         sku_ctx=sku_ctx,
         opportunity=opportunity,
     )
+    product = _get_product(sku_ctx)
+    title = str(product.get("title") or sku_ctx.get("sku_key") or "this product")
+    brief_opportunity = dict(opportunity)
+    brief_opportunity["top_open_lanes"] = list(display.get("top_open_lanes") or [])
+    display["next_best_action"] = await attach_sku_strategic_brief(
+        display.get("next_best_action") or {},
+        opportunity=brief_opportunity,
+        attribute_graph=attribute_graph,
+        primary_gaps=[],
+        scores={},
+        identity={
+            "name": title,
+            "confidence": "medium" if title and title != "this product" else "low",
+            "unresolved": not bool(title and title != "this product"),
+            "anchors": {
+                "brand": product.get("brand") or product.get("vendor"),
+                "category": product.get("category") or product.get("product_type"),
+            },
+        },
+        sku_title=title,
+    )
+    return display
 
 
 async def run_per_sku_audit_probe_fanout(
