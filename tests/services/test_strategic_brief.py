@@ -182,9 +182,9 @@ def _validation_fix_evidence() -> Dict[str, Any]:
             },
         },
         "position": {
-            "strong_when_named": 72,
-            "weak_in_category": 18,
-            "branded_consideration": 40,
+            "strong_when_named": "strong",
+            "weak_in_category": "weak",
+            "branded_consideration": "moderate",
         },
         "category_battle": {
             "prompts": [
@@ -286,9 +286,9 @@ def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
     assert evidence["product"]["attributes"]["certification"] == ["halal"]
     assert evidence["product"]["attributes"]["format"] == ["stick"]
     assert evidence["position"] == {
-        "strong_when_named": 100,
-        "weak_in_category": 0,
-        "branded_consideration": 0,
+        "strong_when_named": "strong",
+        "weak_in_category": "weak",
+        "branded_consideration": "weak",
     }
     assert evidence["category_battle"]["prompts"] == ["best collagen supplements for skin"]
     assert evidence["category_battle"]["winners"] == [
@@ -335,6 +335,26 @@ def test_validation_fix_accepts_grounded_bb_lab_brief_without_false_positives():
     assert strategic_brief.validate_grounding(brief, evidence) is True
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "When AI (Gemini) suggests Vital Proteins as an alternative, publish a comparison.",
+        "Reframe to the only halal-certified, low-molecular collagen stick designed for bedtime skin repair.",
+        "Answer the question 'What is the best halal collagen stick for bedtime?' with schema.",
+        "Stop competing on generic 'best collagen for skin' terms.",
+        "Do NOT chase Healthline, and you cannot DIY this at scale.",
+        "Publish 'BB Lab vs Vital Proteins: Why Halal Matters for Bedtime Collagen'.",
+    ],
+)
+def test_validation_fix_accepts_prose_robust_grounded_lines(line):
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = line
+
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
 def test_validation_fix_still_rejects_hallucinated_entities():
     evidence = _validation_fix_evidence()
     hallucinated = {
@@ -357,6 +377,39 @@ def test_validation_fix_still_rejects_hallucinated_entities():
     assert any("Moonjuice" in failure for failure in failures)
     assert any("CollagenKing" in failure for failure in failures)
     assert any("VogueBeauty" in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Pitch Halal Girl Boss and Muslim Mamas.", "Halal Girl Boss"),
+        ("Share it on Pinterest for visual search.", "Pinterest"),
+        ("Seed r/SkincareAddiction.", "SkincareAddiction"),
+        ("Seed r/HalalBeauty.", "HalalBeauty"),
+    ],
+)
+def test_validation_fix_rejects_invented_channels_and_publications(line, expected):
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = line
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert any(expected in failure for failure in failures)
+    if "Halal Girl Boss" in line:
+        assert any("Muslim Mamas" in failure for failure in failures)
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+def test_validation_fix_rejects_lane_quotes_with_ungrounded_recombinations():
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = 'Own "collagen gummies for men" next.'
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert any("gummies" in failure for failure in failures)
+    assert strategic_brief.validate_grounding(brief, evidence) is False
 
 
 @pytest.mark.parametrize(
@@ -412,6 +465,7 @@ def test_validation_fix_allows_cited_source_names_but_rejects_unknown_sources():
 @pytest.mark.parametrize(
     "claim",
     [
+        "Report the position as 72/100.",
         "Set the page at $29.99 to beat the substitutes.",
         "Offer 40% off to win the lane.",
         "Claim 50,000 reviews against Vital Proteins.",
@@ -425,6 +479,28 @@ def test_validation_fix_rejects_fabricated_numeric_claims(claim):
     failures = strategic_brief._grounding_failures(brief, evidence)
 
     assert any(failure.startswith("forbidden:") for failure in failures)
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+@pytest.mark.parametrize(
+    ("claim", "expected"),
+    [
+        ("Position it as collagen for kids.", "safety-sensitive:kids"),
+        ("Target collagen for diabetics.", "safety-sensitive:diabetics"),
+        (
+            "Market the best collagen for pregnant women.",
+            "safety-sensitive:pregnant",
+        ),
+    ],
+)
+def test_validation_fix_rejects_ungrounded_health_sensitive_claims(claim, expected):
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = claim
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert expected in failures
     assert strategic_brief.validate_grounding(brief, evidence) is False
 
 

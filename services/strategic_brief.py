@@ -33,6 +33,13 @@ ABSOLUTE GROUNDING RULES (this is a trust product — violating these is worse t
   "this suggests…" (your inference) explicitly.
 - No internal jargon, no scores, no taxonomy terms (no "/100", "ownership state", "source route",
   "opportunity score"). Plain language a busy merchant reads in 60 seconds.
+- Reference ONLY channels, communities, retailers, publishers, blogs, and brands that appear in EVIDENCE. Do
+  NOT name specific influencers, publications, blogs, subreddits, hashtags, or platforms that are not in
+  EVIDENCE (e.g. do not invent a subreddit name or an influencer handle). If EVIDENCE says a forum/community
+  controls a lane, refer to it generically (e.g. "the relevant communities").
+- Describe position qualitatively. NEVER output a number, score, rating, review count, price, percentage, or
+  "/100" — none appear in your EVIDENCE.
+- When you mention a search lane/query, use the EVIDENCE wording for it.
 
 WRITE the brief as JSON with these fields — each must be specific to THIS product and EVIDENCE:
 - position: one honest sentence on where they really stand (e.g. "niche challenger, strong when named,
@@ -108,7 +115,7 @@ _DOMAIN_RE = re.compile(
     r"(?<!@)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
     re.IGNORECASE,
 )
-_QUOTE_RE = re.compile(r"[\"'`“”‘’]([^\"'`“”‘’]{4,160})[\"'`“”‘’]")
+_QUOTE_RE = re.compile(r"[\"'`“”‘’]([^\"'`“”‘’\n]{4,160})[\"'`“”‘’]")
 _CAP_WORD = r"(?:[A-Z][A-Za-z0-9&'’-]*|[A-Z]{2,}|[A-Za-z]+[A-Z][A-Za-z0-9]*)"
 _PROPER_SEQUENCE_RE = re.compile(
     rf"\b{_CAP_WORD}(?:[ \t]+(?:of|the|for))*[ \t]+{_CAP_WORD}"
@@ -151,8 +158,10 @@ _ENTITY_STOPWORDS = {
     "Keep",
     "Lane",
     "Lanes",
+    "Matters",
     "Make",
     "Merchant",
+    "Muslim",
     "NOT",
     "No",
     "Own",
@@ -176,6 +185,7 @@ _ENTITY_STOPWORDS = {
     "Traffic",
     "UGC",
     "Use",
+    "What",
     "When",
     "Where",
     "Why",
@@ -187,19 +197,155 @@ _ENTITY_STOPWORDS = {
 }
 _INTERNAL_ALLOWED_ENTITIES = {
     "ai",
+    "anthropic",
+    "bing",
+    "chatgpt",
+    "claude",
+    "copilot",
     "d2c",
+    "deepseek",
+    "diy",
     "faq",
     "faqs",
+    "gemini",
+    "google",
     "json",
+    "openai",
     "pdp",
+    "perplexity",
     "pivota",
     "sku",
     "ugc",
+}
+_AI_ENGINE_ENTITIES = {
+    "anthropic",
+    "bing",
+    "chatgpt",
+    "claude",
+    "copilot",
+    "deepseek",
+    "gemini",
+    "google",
+    "openai",
+    "perplexity",
 }
 _MULTIPART_TLDS = {"co.uk", "com.au", "co.jp", "co.kr", "com.br"}
 _SENTENCE_BOUNDARY_CHARS = {".", "!", "?", ":", ";", "\n", "•", "–", "—", "-"}
 _SENTENCE_PREFIX_STRIP_CHARS = " \t\r\f\v\"'`“”‘’()[]{}<>"
 _CONNECTOR_WORDS = {"of", "the", "for", "and", "&"}
+_SHOPPING_WORDS = {
+    "alternative",
+    "alternatives",
+    "best",
+    "buy",
+    "compare",
+    "comparison",
+    "dupe",
+    "dupes",
+    "review",
+    "reviews",
+    "shop",
+    "top",
+    "vs",
+    "where",
+}
+_QUOTE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "cannot",
+    "cant",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "its",
+    "no",
+    "not",
+    "of",
+    "on",
+    "or",
+    "the",
+    "this",
+    "to",
+    "what",
+    "when",
+    "with",
+    "without",
+    "you",
+    "your",
+}
+_COMMON_PROSE_WORDS = {
+    "answer",
+    "answers",
+    "category",
+    "certified",
+    "claim",
+    "claims",
+    "designed",
+    "lane",
+    "lanes",
+    "only",
+    "page",
+    "pages",
+    "query",
+    "queries",
+    "repair",
+    "site",
+    "terms",
+}
+_ALLCAPS_FUNCTION_WORDS = _QUOTE_STOPWORDS | {
+    "chase",
+    "keep",
+    "make",
+    "must",
+    "own",
+    "stop",
+    "use",
+}
+_SAFETY_SENSITIVE_TERMS = {
+    "kids",
+    "kid",
+    "children",
+    "child",
+    "infant",
+    "infants",
+    "toddler",
+    "toddlers",
+    "baby",
+    "babies",
+    "pregnant",
+    "pregnancy",
+    "prenatal",
+    "nursing",
+    "breastfeeding",
+    "diabetic",
+    "diabetics",
+    "diabetes",
+    "hypertension",
+    "medication",
+    "medications",
+    "disease",
+    "cancer",
+    "cure",
+    "cures",
+    "treat",
+    "treats",
+    "treatment",
+    "clinical",
+    "clinically",
+    "fda",
+}
 
 
 def assemble_sku_brief_evidence(
@@ -317,14 +463,14 @@ def _attribute_evidence(attribute_graph: Mapping[str, Any]) -> Dict[str, List[st
     return out
 
 
-def _position_from_ladder(opportunity: Mapping[str, Any]) -> Dict[str, Optional[int]]:
+def _position_from_ladder(opportunity: Mapping[str, Any]) -> Dict[str, Optional[str]]:
     ladder = _as_mapping(opportunity.get("intent_ladder"))
     return {
-        "strong_when_named": _score_from_layer(
+        "strong_when_named": _position_band_from_layer(
             ladder.get("branded_transactional")
         ),
-        "weak_in_category": _score_from_layer(ladder.get("head_category")),
-        "branded_consideration": _score_from_layer(
+        "weak_in_category": _position_band_from_layer(ladder.get("head_category")),
+        "branded_consideration": _position_band_from_layer(
             ladder.get("branded_consideration")
         ),
     }
@@ -592,6 +738,14 @@ def _grounding_failures(
     ]
     allowed = _allowed_grounding(evidence)
 
+    for term in sorted(_SAFETY_SENSITIVE_TERMS):
+        if term not in allowed["safety_words"] and re.search(
+            rf"\b{re.escape(term)}\b",
+            text,
+            re.IGNORECASE,
+        ):
+            failures.append(f"safety-sensitive:{term}")
+
     for domain in _DOMAIN_RE.findall(text):
         normalized = _normalize_host(domain)
         if normalized and normalized not in allowed["domains"]:
@@ -601,10 +755,11 @@ def _grounding_failures(
         phrase = _norm_phrase(quote)
         if not phrase or len(phrase.split()) < 2:
             continue
-        if not _looks_like_lane_quote(phrase, allowed):
+        if not _is_checkable_lane_quote(quote, phrase, allowed):
             continue
-        if not _phrase_allowed(phrase, allowed["phrases"]):
-            failures.append(f"unknown-quoted-lane:{quote}")
+        ungrounded = _first_ungrounded_lane_token(phrase, allowed)
+        if ungrounded:
+            failures.append(f"unknown-quoted-lane:{quote}:{ungrounded}")
 
     for entity, sentence_initial in _extract_named_entities(text):
         if _entity_allowed(entity, allowed):
@@ -623,6 +778,7 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     allowed_domains: Set[str] = set()
     allowed_phrases: Set[str] = set()
     attribute_words: Set[str] = set()
+    safety_words: Set[str] = set()
 
     def add_term(value: Any) -> None:
         text = _clean_str(value)
@@ -630,6 +786,19 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
             return
         allowed_terms.add(_norm_entity(text))
         allowed_phrases.add(_norm_phrase(text))
+
+    def add_attribute_word(word: str) -> None:
+        normalized = word.lower()
+        if not normalized:
+            return
+        attribute_words.add(normalized)
+        safety_words.add(normalized)
+        if normalized == "stick":
+            attribute_words.add("sticks")
+        elif normalized.endswith("y"):
+            attribute_words.add(f"{normalized[:-1]}ies")
+        elif not normalized.endswith("s"):
+            attribute_words.add(f"{normalized}s")
 
     def add_domain(value: Any) -> None:
         host = _normalize_host(value)
@@ -642,11 +811,16 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     add_term(product.get("title"))
     add_term(product.get("brand"))
     attributes = _as_mapping(product.get("attributes"))
-    for values in attributes.values():
+    for field, values in attributes.items():
         for attr in _as_str_list(values):
             add_term(attr)
             for word in re.findall(r"[a-z0-9]+", attr.lower()):
-                attribute_words.add(word)
+                add_attribute_word(word)
+            attr_words = set(re.findall(r"[a-z0-9]+", attr.lower()))
+            if {"before", "bed"}.issubset(attr_words):
+                attribute_words.add("bedtime")
+                if field in {"audience", "use_case"}:
+                    safety_words.add("bedtime")
 
     category_battle = _as_mapping(evidence.get("category_battle"))
     for prompt in _as_str_list(category_battle.get("prompts")):
@@ -668,7 +842,10 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         for why in _as_str_list(lane.get("why_fit")):
             add_term(why)
             for word in re.findall(r"[a-z0-9]+", why.lower()):
-                attribute_words.add(word)
+                add_attribute_word(word)
+            why_words = set(re.findall(r"[a-z0-9]+", why.lower()))
+            if {"before", "bed"}.issubset(why_words):
+                attribute_words.add("bedtime")
 
     for lane in _as_list(evidence.get("channel_map")):
         if not isinstance(lane, Mapping):
@@ -679,11 +856,19 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
             if isinstance(controller, Mapping):
                 add_domain(controller.get("host"))
 
+    grounded_words = set(attribute_words)
+    for value in allowed_terms | allowed_phrases:
+        grounded_words.update(re.findall(r"[a-z0-9]+", value))
+    grounded_words.update(_SHOPPING_WORDS)
+    grounded_words.update(_AI_ENGINE_ENTITIES)
+
     return {
         "terms": allowed_terms,
         "domains": allowed_domains,
         "phrases": {phrase for phrase in allowed_phrases if phrase},
         "attribute_words": attribute_words,
+        "grounded_words": grounded_words,
+        "safety_words": safety_words,
     }
 
 
@@ -731,16 +916,26 @@ def _sentence_initial_unallowed_token(
         for token in re.split(r"\s+", entity)
         if _clean_entity(token)
     ]
-    if tokens and not _is_brand_shaped(tokens[0]):
+    if (
+        tokens
+        and not _is_brand_shaped(tokens[0])
+        and not _entity_allowed(tokens[0], allowed)
+    ):
         tokens = tokens[1:]
-    while tokens and tokens[0].lower() in _CONNECTOR_WORDS:
+    while tokens and _is_ignorable_entity_token(tokens[0]):
         tokens = tokens[1:]
-    while tokens and tokens[-1].lower() in _CONNECTOR_WORDS:
+    while tokens and _is_ignorable_entity_token(tokens[-1]):
         tokens = tokens[:-1]
-    for token in tokens:
-        if token.lower() in _CONNECTOR_WORDS:
+    for idx, token in enumerate(tokens):
+        if _is_ignorable_entity_token(token):
             continue
         if not _entity_allowed(token, allowed):
+            if idx > 0 and any(
+                _entity_allowed(previous, allowed)
+                for previous in tokens[:idx]
+                if not _is_ignorable_entity_token(previous)
+            ):
+                return " ".join(tokens)
             return token
     return None
 
@@ -793,30 +988,88 @@ def _phrase_allowed(phrase: str, allowed_phrases: Set[str]) -> bool:
     )
 
 
+def _is_checkable_lane_quote(
+    quote: str,
+    phrase: str,
+    allowed: Mapping[str, Any],
+) -> bool:
+    if quote.strip().endswith("?"):
+        return False
+    if _is_title_case_quote(quote):
+        return False
+    significant = _significant_quote_tokens(phrase)
+    if len(significant) > 7:
+        return False
+    return _looks_like_lane_quote(phrase, allowed)
+
+
+def _first_ungrounded_lane_token(
+    phrase: str,
+    allowed: Mapping[str, Any],
+) -> Optional[str]:
+    grounded_words = allowed["grounded_words"]
+    for token in _significant_quote_tokens(phrase):
+        if not _word_grounded(token, grounded_words):
+            return token
+    return None
+
+
 def _looks_like_lane_quote(phrase: str, allowed: Mapping[str, Any]) -> bool:
     if phrase in allowed["phrases"]:
         return True
     words = set(re.findall(r"[a-z0-9]+", phrase))
-    shopping_words = {
-        "alternative",
-        "alternatives",
-        "best",
-        "buy",
-        "compare",
-        "comparison",
-        "dupe",
-        "dupes",
-        "review",
-        "reviews",
-        "shop",
-        "top",
-        "vs",
-        "where",
-    }
-    if words & shopping_words:
+    ordered_words = re.findall(r"[a-z0-9]+", phrase)
+    if ordered_words and ordered_words[0] in {"a", "an", "the"} and not (
+        words & _SHOPPING_WORDS
+    ):
+        return False
+    if words & _SHOPPING_WORDS:
         return True
+    if words & _COMMON_PROSE_WORDS:
+        return False
     attribute_overlap = words & allowed["attribute_words"]
     return len(attribute_overlap) >= 2 or (len(words) >= 3 and bool(attribute_overlap))
+
+
+def _significant_quote_tokens(phrase: str) -> List[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", phrase.lower())
+        if token not in _QUOTE_STOPWORDS
+        and token not in _CONNECTOR_WORDS
+        and token not in _COMMON_PROSE_WORDS
+    ]
+
+
+def _is_title_case_quote(quote: str) -> bool:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9&'’-]*", quote)
+    if len(words) < 2:
+        return False
+    capitalized = [
+        word
+        for word in words
+        if word[:1].isupper() or (len(word) > 1 and word.isupper())
+    ]
+    return len(capitalized) / len(words) > 0.6
+
+
+def _word_grounded(token: str, grounded_words: Set[str]) -> bool:
+    if token in grounded_words:
+        return True
+    if token.endswith("ies") and f"{token[:-3]}y" in grounded_words:
+        return True
+    if token.endswith("s") and token[:-1] in grounded_words:
+        return True
+    return False
+
+
+def _is_ignorable_entity_token(token: str) -> bool:
+    normalized = _norm_entity(token)
+    return (
+        normalized in _CONNECTOR_WORDS
+        or _entity_is_stopword(token)
+        or (token.isupper() and normalized in _ALLCAPS_FUNCTION_WORDS)
+    )
 
 
 def _phrase_contains(haystack: str, needle: str) -> bool:
@@ -836,14 +1089,19 @@ def _iter_leaf_text(value: Any) -> Iterable[str]:
             yield from _iter_leaf_text(child)
 
 
-def _score_from_layer(layer: Any) -> Optional[int]:
+def _position_band_from_layer(layer: Any) -> Optional[str]:
     mapping = _as_mapping(layer)
     if not mapping:
         return None
     try:
-        return int(round(float(mapping.get("score"))))
+        score = float(mapping.get("score"))
     except (TypeError, ValueError):
         return None
+    if score >= 67:
+        return "strong"
+    if score >= 34:
+        return "moderate"
+    return "weak"
 
 
 def _normalize_host(value: Any) -> str:
@@ -889,7 +1147,10 @@ def _entity_is_stopword(entity: str) -> bool:
     if entity in _ENTITY_STOPWORDS:
         return True
     normalized = _norm_entity(entity)
-    return normalized in _INTERNAL_ALLOWED_ENTITIES
+    return (
+        normalized in {stopword.lower() for stopword in _ENTITY_STOPWORDS}
+        or normalized in _INTERNAL_ALLOWED_ENTITIES
+    )
 
 
 def _as_mapping(value: Any) -> Dict[str, Any]:
