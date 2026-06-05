@@ -41,21 +41,42 @@ ABSOLUTE GROUNDING RULES (this is a trust product — violating these is worse t
   "/100" — none appear in your EVIDENCE.
 - When you mention a search lane/query, use the EVIDENCE wording for it.
 
+CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a trust product):
+- COMPETITORS: EVIDENCE names which competitors win, but NOT their product attributes
+  (grounding_notes.competitor_attributes = "not_assessed"). NEVER state as fact that a competitor lacks,
+  is missing, or does not have a feature. You MAY note a likely positioning gap as YOUR INFERENCE, marked as
+  such: "incumbents are generally positioned as broad <category>; a dedicated <your differentiator> looks like
+  an opening — worth confirming." Your differentiation is YOUR attributes; the WEDGE is real, the competitor
+  comparison is an inference to verify.
+- CHANNELS: recommend a specific marketplace, retailer, community, forum, social platform, or publisher ONLY
+  if it appears in grounding_notes.evidenced_channels. Do NOT assume the merchant already sells on Amazon or
+  any marketplace (grounding_notes.merchant_channels = "unknown"). If a lane has no evidenced channel, the move
+  is "own your own page/site for this lane first." You may suggest a marketplace/community move only
+  CONDITIONALLY: "if you already sell on <evidenced channel>, …". Do NOT invent communities, subreddits,
+  influencers, or platforms.
+- LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
+  singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
+  — just don't present it as the searched lane.)
+- FACT vs INFERENCE: only "AI's answers show…/EVIDENCE shows…" statements are facts. Everything else is your
+  read — phrase it as inference. Avoid absolutes like "locked" or "you cannot do this alone"; prefer grounded
+  causal phrasing ("structurally hard to win because incumbents are ranked by <evidenced source>").
+
 WRITE the brief as JSON with these fields — each must be specific to THIS product and EVIDENCE:
 - position: one honest sentence on where they really stand (e.g. "niche challenger, strong when named,
   invisible in the category").
 - core_decision: the ONE big strategic call, stated plainly and decisively (what to do, what to STOP doing,
   and why — name the real reason from evidence).
 - why_you_lose: WHY the category winners win — synthesize the named winners × the sources that rank them ×
-  what that implies about their moat (reviews/authority/distribution/positioning). The merchant should
-  understand this is structural, not a PDP problem.
+  what the evidenced ranking sources imply about their moat (reviews/authority/distribution/positioning).
+  Do not claim competitor feature gaps as fact; make any competitor positioning read explicit inference.
 - your_angle: the defensible positioning wedge = the merchant's differentiating attributes that the named
-  winners lack. Reframe them from "a {category}" to a category of one. Be concrete about the lanes where
-  their differentiation IS the answer.
+  product actually has. Reframe them from "a {category}" to a category of one without saying winners lack
+  those attributes as fact. Use exact EVIDENCE lane wording where their differentiation IS the answer.
 - traffic_strategy: a ranked list of where the missed, WINNABLE demand is + who controls each channel
-  (the cited sources/retailers/communities from EVIDENCE) + the realistic path in. NOT "pitch a publisher" —
-  name the channel and the move (own your pages for X, fix listings on the cited retailer Y, seed UGC on Z,
-  earn the specific niche publisher W). Explicitly say which big lanes to NOT chase yet and why.
+  (name only sources/retailers/communities from grounding_notes.evidenced_channels) + the realistic path in.
+  If no channel is evidenced for a lane, say to own your page/site first. Marketplace/community moves must be
+  conditional ("if you already sell on <evidenced channel>..."). Explicitly say which big lanes to NOT chase
+  yet and why.
 - substitution_play: if a substitution is present, how to win those buyers back (comparison/positioning vs
   the named substitute), else null.
 - first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
@@ -372,6 +393,11 @@ def assemble_sku_brief_evidence(
         top_open_lanes=top_open_lanes,
         per_prompt=_as_list(opportunity_map.get("per_prompt")),
     )
+    grounding_notes = _grounding_notes(
+        category_battle=category_battle,
+        channel_map=channel_map,
+        opportunity=opportunity_map,
+    )
 
     return {
         "product": {
@@ -384,6 +410,7 @@ def assemble_sku_brief_evidence(
         "substitution": _substitution_evidence(opportunity_map),
         "open_lanes": [_open_lane_evidence(lane) for lane in top_open_lanes],
         "channel_map": channel_map,
+        "grounding_notes": grounding_notes,
         "demand_state": opportunity_map.get("demand_state_summary"),
         "notes": {
             "merchant_can_act_in_30d": True,
@@ -607,6 +634,49 @@ def _channel_map(
             "role": role,
         })
     return out
+
+
+def _grounding_notes(
+    *,
+    category_battle: Mapping[str, Any],
+    channel_map: List[Mapping[str, Any]],
+    opportunity: Mapping[str, Any],
+) -> Dict[str, Any]:
+    evidenced_channels: List[Mapping[str, Any]] = []
+    for ranked in _as_list(_as_mapping(category_battle).get("ranked_by")):
+        if isinstance(ranked, Mapping):
+            evidenced_channels.append(ranked)
+    for lane in channel_map:
+        if not isinstance(lane, Mapping):
+            continue
+        for controller in _as_list(lane.get("controlled_by")):
+            if isinstance(controller, Mapping):
+                evidenced_channels.append(controller)
+    evidenced_channels.extend(_substitution_source_roles(opportunity))
+    return {
+        "competitor_attributes": "not_assessed",
+        "merchant_channels": "unknown",
+        "evidenced_channels": _unique_host_roles(evidenced_channels),
+    }
+
+
+def _substitution_source_roles(opportunity: Mapping[str, Any]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    alert = _as_mapping(opportunity.get("substitution_alert"))
+    rows.extend(_source_role_chips(alert))
+    alert_prompt = _norm_phrase(alert.get("prompt") or alert.get("on_prompt"))
+    for row in _as_list(opportunity.get("per_prompt")):
+        if not isinstance(row, Mapping):
+            continue
+        substitution = _as_mapping(row.get("substitution"))
+        row_prompt = _norm_phrase(row.get("query"))
+        if not substitution.get("present") and (
+            not alert_prompt or row_prompt != alert_prompt
+        ):
+            continue
+        rows.extend(_source_role_chips(row))
+        rows.extend(_source_role_chips(substitution))
+    return _unique_host_roles(rows)
 
 
 def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:

@@ -310,6 +310,83 @@ def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
         {"host": "wellness-notes.example", "role": "publisher"},
         {"host": "halal-beauty.example", "role": "publisher"},
     ]
+    grounding_notes = evidence["grounding_notes"]
+    assert set(grounding_notes.keys()) == {
+        "competitor_attributes",
+        "merchant_channels",
+        "evidenced_channels",
+    }
+    assert grounding_notes["competitor_attributes"] == "not_assessed"
+    assert grounding_notes["merchant_channels"] == "unknown"
+    assert {"host": "forbes.com", "role": "publisher"} in grounding_notes["evidenced_channels"]
+    assert {"host": "amazon.com", "role": "marketplace"} in grounding_notes["evidenced_channels"]
+    assert {"host": "wellness-notes.example", "role": "publisher"} in grounding_notes["evidenced_channels"]
+    assert {"host": "halal-beauty.example", "role": "publisher"} in grounding_notes["evidenced_channels"]
+
+
+def test_assemble_sku_brief_evidence_grounding_notes_use_real_evidenced_channels():
+    opportunity = _opportunity()
+    opportunity["per_prompt"][0]["source_roles"] = [
+        {"host": "https://www.healthline.com/nutrition/collagen", "role": "publisher"},
+        {"host": "amazon.com", "role": "marketplace"},
+    ]
+    opportunity["per_prompt"][2]["substitution"]["source_roles"] = [
+        {"host": "comparison.example", "role": "publisher"},
+    ]
+
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph=_attribute_graph(),
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert evidence["grounding_notes"] == {
+        "competitor_attributes": "not_assessed",
+        "merchant_channels": "unknown",
+        "evidenced_channels": [
+            {"host": "healthline.com", "role": "publisher"},
+            {"host": "amazon.com", "role": "marketplace"},
+            {"host": "wellness-notes.example", "role": "publisher"},
+            {"host": "halal-beauty.example", "role": "publisher"},
+            {"host": "comparison.example", "role": "publisher"},
+        ],
+    }
+
+
+def test_assemble_sku_brief_evidence_grounding_notes_empty_without_channels():
+    opportunity = {
+        "intent_ladder": {},
+        "per_prompt": [
+            {
+                "query": "best collagen supplements for skin",
+                "axis": "category",
+                "query_class": "head",
+                "provider_verdicts": {"gemini": "loss"},
+                "ownership_state": "competitor-owned",
+                "competitors": ["Vital Proteins"],
+            }
+        ],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+    }
+
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph=_attribute_graph(),
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert evidence["grounding_notes"] == {
+        "competitor_attributes": "not_assessed",
+        "merchant_channels": "unknown",
+        "evidenced_channels": [],
+    }
 
 
 def test_build_sku_brief_prompt_uses_exact_role_and_injects_evidence_json():
@@ -321,6 +398,16 @@ def test_build_sku_brief_prompt_uses_exact_role_and_injects_evidence_json():
     assert "WRITE the brief as JSON with these fields" in system
     assert user.startswith("EVIDENCE:\n")
     assert json.loads(user.split("EVIDENCE:\n", 1)[1]) == evidence
+
+
+def test_system_prompt_contains_claim_discipline_rules():
+    system = strategic_brief._STRATEGIC_BRIEF_SYSTEM_PROMPT
+
+    assert "CLAIM DISCIPLINE" in system
+    assert "competitor" in system.lower()
+    assert "grounding_notes.evidenced_channels" in system
+    assert "EXACT wording" in system
+    assert "inference" in system.lower()
 
 
 def test_validate_grounding_accepts_fully_grounded_brief():
