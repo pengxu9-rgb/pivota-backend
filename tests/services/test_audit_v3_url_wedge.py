@@ -322,7 +322,7 @@ async def test_background_runner_persists_scrubbed_result(client):
     )
     # Wedge opts into bounded concurrency + parallel scan modes.
     call = client.brand_calls[0]
-    assert call["coverage_profile"] == "gemini_deepseek"
+    assert call["coverage_profile"] == "pilot_gemini"
     assert call["product_concurrency"] == 1
     assert call["parallel_scan_modes"] is True
     assert call["max_runs"] == 2
@@ -334,9 +334,9 @@ async def test_background_runner_persists_scrubbed_result(client):
     assert payload["tier"] == "url_wedge"
     report = payload["brand_report"]
     assert payload["sku_intelligence"]["headline"].startswith("Nobody owns")
-    # Hero SKU runs the tri-prober (adds grounded ChatGPT); the brand report
-    # above stays gemini_deepseek so ChatGPT cost is hero-only.
-    assert client.sku_intel_calls[0]["coverage_profile"] == "gemini_deepseek_chatgpt"
+    # Hero SKU adds grounded ChatGPT; the brand report stays Gemini-only
+    # primary for cost.
+    assert client.sku_intel_calls[0]["coverage_profile"] == "us_shopper"
     assert client.sku_intel_calls[0]["prompts_per_sku"] == 14
     assert client.sku_intel_calls[0]["hero_product"]["title"] == "P"
     # Honesty scrub applied in the runner.

@@ -1347,7 +1347,7 @@ async def _run_wedge_audit_background(
                 merchant_name=merchant_name,
                 merchant_domain=merchant_domain,
                 products=audit_products,
-                coverage_profile="gemini_deepseek",
+                coverage_profile="pilot_gemini",
                 merchant_id=merchant_id,
                 audit_run_id=run_id,
                 # Bounded concurrency + parallel scan modes still help when the
@@ -1380,9 +1380,9 @@ async def _run_wedge_audit_background(
             hero_product=hero_product or {},
             merchant_id=merchant_id,
             run_id=run_id,
-            # Hero SKU gets the tri-prober (adds grounded ChatGPT); the brand
-            # report above stays gemini_deepseek so ChatGPT cost is hero-only.
-            coverage_profile="gemini_deepseek_chatgpt",
+            # Hero SKU gets grounded ChatGPT as the second engine; the brand
+            # report above stays pilot_gemini so ChatGPT cost is hero-only.
+            coverage_profile="us_shopper",
             prompts_per_sku=14,
         )
     except Exception as exc:  # noqa: BLE001 — wedge SKU block must degrade

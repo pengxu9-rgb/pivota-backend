@@ -1,4 +1,4 @@
-"""Deepseek V4 grounded-probe client (PR-3a).
+"""Deepseek V4 ungrounded-probe client (PR-3a).
 
 Backend-direct integration with the Deepseek chat completions API for
 multi-LLM audit coverage. Bypasses the upstream PIVOTA-Agent codex
@@ -26,14 +26,14 @@ url_match}`. This means downstream code (score_category_visibility,
 the BD report builder, the merchant_view assembler) consumes Deepseek
 results identically to Gemini.
 
-**Web grounding.** Deepseek V4's API supports web search via the
-`tools=[{"type": "web_search"}]` parameter (OpenAI-compatible). When
-the API returns search citations, they're normalized into
-grounding_sources matching the Gemini chunk shape. When grounding
-is unavailable for a given query (Deepseek answered from training
-data alone), grounding_chunks/sources land as empty arrays — the
-downstream scorer correctly treats this as "no grounded evidence" and
-doesn't credit the run.
+**Grounding boundary.** Deepseek chat does not provide server-side web
+search on this API path; `tools` only accepts function tools, so this
+client never sends `tools=[{"type": "web_search"}]` or `enable_search`.
+Deepseek runs as an ungrounded answer-quality/verify signal. Grounded
+probing must use Gemini or ChatGPT. If a response payload includes
+citation metadata anyway, it is normalized into grounding_sources
+matching the Gemini chunk shape; otherwise grounding_chunks/sources
+land as empty arrays.
 
 **Cost guard.** Reuses the per-merchant + global semaphore from
 agent_center_llm_client. Caller must wrap probe calls in those
@@ -130,15 +130,15 @@ def _build_system_prompt(scan_mode: str) -> str:
     structured JSON matching the field set the downstream scorer
     expects.
     """
-    grounded_search_instruction = (
-        "You have live web search. SEARCH THE WEB for the user's query "
-        "before answering. The canonical signal is the cited sources "
-        "you retrieve, not your own knowledge. If you retrieved no "
-        "source, set the boolean false. "
+    ungrounded_primary_instruction = (
+        "You do not have live web search in this Deepseek path. Answer "
+        "from your model knowledge only, be conservative when evidence "
+        "is uncertain, and do not claim to have searched or retrieved "
+        "live source citations. "
     )
     if scan_mode == "open_product_visibility_test":
         return (
-            grounded_search_instruction +
+            ungrounded_primary_instruction +
             "You are a shopping assistant. When asked about a product, "
             "respond ONLY with a JSON object of this exact shape: "
             '{"product_visible": <bool>, "competitors_listed": '
@@ -152,7 +152,7 @@ def _build_system_prompt(scan_mode: str) -> str:
         )
     if scan_mode == "merchant_store_attribution_test":
         return (
-            grounded_search_instruction +
+            ungrounded_primary_instruction +
             "You are a shopping assistant. When asked where to buy a "
             "product, respond ONLY with a JSON object of this exact "
             'shape: {"merchant_url_found": <bool>, "evidence_excerpt": '
@@ -164,7 +164,7 @@ def _build_system_prompt(scan_mode: str) -> str:
         )
     if scan_mode == "category_visibility_test":
         return (
-            grounded_search_instruction +
+            ungrounded_primary_instruction +
             "You are a shopping research assistant. When asked about "
             "the best products in a category, respond ONLY with a "
             'JSON object of this exact shape: {"brand_appears": '
@@ -273,12 +273,11 @@ def _parse_deepseek_response(raw_text: str) -> Optional[Dict[str, Any]]:
 def _extract_grounding_sources(
     response_payload: Dict[str, Any],
 ) -> List[Dict[str, str]]:
-    """Pull web-search citations out of Deepseek's response, normalizing
+    """Normalize citation metadata from a Deepseek response, if present,
     to the Gemini grounding-source shape `{uri, title}`.
 
-    Deepseek's grounding metadata may surface in several places
-    depending on API version + tools-enabled status:
-      - `choices[0].message.tool_calls` for explicit web_search tool
+    This client does not request web search. Citation metadata is still
+    parsed defensively when present in captured or future payloads:
       - `choices[0].message.annotations` for citation annotations
         (OpenAI-compatible format)
       - Top-level `citations` field
@@ -425,15 +424,9 @@ async def _call_deepseek_chat(
         # full response with competitor list is well under 1k tokens.
         "max_tokens": 800,
     }
-    if enable_web_search:
-        # Two attempts at the web-search tool format. Newer Deepseek V4
-        # uses OpenAI-compatible tools; older may use a different key.
-        # Adding both is safe — Deepseek ignores unknown fields rather
-        # than 4xx-ing on them.
-        body["tools"] = [{"type": "web_search"}]
-        # Some Deepseek versions expose grounding via this top-level
-        # flag; older versions ignore it. Both are tried defensively.
-        body["enable_search"] = True
+    # Retained for caller compatibility; Deepseek chat rejects web_search as a
+    # non-function tool, so this path must remain ungrounded.
+    _ = enable_web_search
 
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
