@@ -349,6 +349,49 @@ _COMMON_WORDS = frozenset({
     "work",
     "works",
 })
+# Common English adjective/noun/verb STEMS that show up in coined titles and
+# marketing prose. With _stem_is_common (suffix-stripping) these also cover
+# inflections (smarter→smart, routines→routine, winning→win), so the entity
+# scan never mistakes ordinary headline words for invented proper nouns. Keep
+# DISTINCTIVE handle/brand words (e.g. "girl", "boss", "mama") OUT so coined
+# names like "Halal Girl Boss" still fail.
+_COMMON_STEMS = frozenset({
+    # adjectives
+    "smart", "simple", "fast", "slow", "strong", "weak", "clean", "safe",
+    "fresh", "long", "short", "light", "heavy", "easy", "hard", "big", "small",
+    "quick", "good", "bad", "great", "high", "low", "real", "true", "clear",
+    "bold", "sharp", "soft", "warm", "cool", "rich", "pure", "natural",
+    "organic", "healthy", "gentle", "daily", "nightly", "modern", "classic",
+    "premium", "affordable", "effective", "powerful", "unique", "special",
+    "perfect", "ideal", "essential", "key", "main", "core", "broad", "narrow",
+    "deep", "wide", "full", "open", "smarter", "better",
+    # nouns
+    "choice", "way", "story", "moment", "secret", "formula", "advantage",
+    "edge", "guide", "method", "system", "step", "move", "play", "reason",
+    "truth", "point", "idea", "plan", "goal", "focus", "value", "trust",
+    "proof", "result", "growth", "market", "brand", "niche", "angle", "option",
+    "gap", "lever", "factor", "driver", "signal", "insight", "takeaway",
+    "summary", "recommendation", "action", "tactic", "strategy", "approach",
+    "audience", "segment", "customer", "shopper", "buyer", "consumer",
+    "supply", "source", "channel", "platform", "community", "forum", "ranking",
+    "visibility", "presence", "authority", "distribution", "copy", "article",
+    "name", "label", "tag", "moment", "ritual", "glow", "skin", "beauty",
+    "wellness", "supplement", "stick", "powder", "capsule", "serum", "cream",
+    "routine", "night", "day", "morning", "bedtime", "story",
+    # verbs / actions
+    "own", "build", "create", "publish", "optimize", "capture", "target",
+    "reach", "position", "reframe", "differentiate", "beat", "compete", "rank",
+    "cite", "serve", "monitor", "seed", "pitch", "earn", "frame", "write",
+    "add", "update", "fix", "stop", "start", "chase", "avoid", "prioritize",
+    "double", "lean", "drive", "grow", "convert", "highlight", "emphasize",
+    "include", "ensure", "share", "answer", "compare", "differentiate",
+    # common marketing nouns/adjectives that show up in coined headlines
+    "weapon", "bright", "proven", "prove", "roadmap", "playbook", "powerhouse",
+    "blueprint", "hack", "game", "changer", "boost", "leader", "expert",
+    "trend", "recipe", "checklist", "framework", "template", "toolkit", "hook",
+    "winner", "advantage", "edge", "momentum", "leverage", "shortcut", "wedge",
+})
+_STEM_SUFFIXES = ("iest", "ier", "est", "ing", "er", "ed", "es", "ly", "s")
 _QUOTE_STOPWORDS = {
     "a",
     "an",
@@ -1242,17 +1285,47 @@ def _entity_word_grounded_or_common(
     )
 
 
+_COMMON_WORD_SETS = (
+    _COMMON_WORDS,
+    _COMMON_STEMS,
+    _CONNECTOR_WORDS,
+    _SHOPPING_WORDS,
+    _QUOTE_STOPWORDS,
+    _COMMON_PROSE_WORDS,
+    _ENTITY_STOPWORD_NORMALIZED,
+    _INTERNAL_ALLOWED_ENTITIES,
+)
+
+
+def _common_word_stems(normalized: str) -> Set[str]:
+    """Candidate base forms for an inflected word (smarter→smart, routines→
+    routine, winning→win, stories→story) so common-word membership covers
+    inflections without listing every form."""
+    cands = {normalized}
+    if len(normalized) > 4 and normalized.endswith("ies"):
+        cands.add(normalized[:-3] + "y")
+    for suffix in _STEM_SUFFIXES:
+        if normalized.endswith(suffix) and len(normalized) - len(suffix) >= 3:
+            stem = normalized[: -len(suffix)]
+            cands.add(stem)
+            cands.add(stem + "e")  # simpler→simple, using→use
+            if suffix in ("ier", "iest"):
+                cands.add(stem + "y")  # easier→easy
+            if len(stem) >= 2 and stem[-1] == stem[-2]:
+                cands.add(stem[:-1])  # running→run, bigger→big
+    return cands
+
+
 def _is_common_entity_word(token: str) -> bool:
     normalized = _norm_entity(token)
-    return (
-        normalized in _COMMON_WORDS
-        or normalized in _CONNECTOR_WORDS
-        or normalized in _SHOPPING_WORDS
-        or normalized in _QUOTE_STOPWORDS
-        or normalized in _COMMON_PROSE_WORDS
-        or normalized in _ENTITY_STOPWORD_NORMALIZED
-        or normalized in _INTERNAL_ALLOWED_ENTITIES
-    )
+    if any(normalized in word_set for word_set in _COMMON_WORD_SETS):
+        return True
+    # Inflected forms of a common stem (smarter, routines, winning) are common
+    # too — never an invented proper noun.
+    for candidate in _common_word_stems(normalized):
+        if candidate in _COMMON_WORDS or candidate in _COMMON_STEMS:
+            return True
+    return False
 
 
 def _is_ignorable_entity_token(token: str) -> bool:
