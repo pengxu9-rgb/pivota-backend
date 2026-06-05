@@ -41,7 +41,7 @@ from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
 )
-from services.next_best_action import build_next_best_action
+from services.next_best_action import build_next_best_action, build_sku_next_best_action
 from services.pivota_indexing_arc import compute_indexing_arc_state
 from services.sku_sidewalk import (
     build_sku_attribute_graph,
@@ -3701,6 +3701,24 @@ async def build_per_sku_report(
             "citation": {"score": citation_score, "breakdown": citation_breakdown},
         }
 
+    identity = resolve_sku_identity(sku_ctx)
+    primary_gaps = _primary_gaps(scores)
+    failing_prompts = _failing_prompts(probe_runs)
+    verify_summary_out = verify_summary or _verify_skipped_summary(
+        reason="not_run",
+        positives_count=len(_citation_positive_verify_candidates(sku_ctx, probe_runs)),
+        verify_sample=None,
+    )
+    next_best_action = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=primary_gaps,
+        scores=scores,
+        failing_prompts=failing_prompts,
+        verify_summary=verify_summary_out,
+        identity=identity,
+        sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
+    )
+
     report = {
         "sku_key": sku_key,
         "product_key": sku_ctx.get("product_key") or product.get("product_key"),
@@ -3710,7 +3728,7 @@ async def build_per_sku_report(
         # identity.unresolved is True we only have a variant label / no
         # product-level name — downstream should treat low scores as
         # "enrich before trusting", not "invisible".
-        "identity": resolve_sku_identity(sku_ctx),
+        "identity": identity,
         "scores": scores,
         "citation_by_provider": (
             citation_by_provider
@@ -3718,20 +3736,17 @@ async def build_per_sku_report(
             else {}
         ),
         "band": _sku_band(scores),
-        "primary_gaps": _primary_gaps(scores),
+        "primary_gaps": primary_gaps,
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
         "axis_coverage": _axis_coverage(probe_runs),
-        "failing_prompts": _failing_prompts(probe_runs),
+        "failing_prompts": failing_prompts,
         "impact_proxy": _impact_proxy_from_context(sku_ctx),
         "provider_models": provider_models,
         "model_is_override": _any_model_override(provider_models),
-        "verify_summary": verify_summary or _verify_skipped_summary(
-            reason="not_run",
-            positives_count=len(_citation_positive_verify_candidates(sku_ctx, probe_runs)),
-            verify_sample=None,
-        ),
+        "verify_summary": verify_summary_out,
         "verify_outputs": verify_outputs or [],
         "opportunity": opportunity,
+        "next_best_action": next_best_action,
     }
     return report
 
@@ -4822,18 +4837,6 @@ def _wedge_hero_sku_ctx(
     }
 
 
-def _first_move_for_lane(lane: Mapping[str, Any]) -> str:
-    ownership = str(lane.get("current_ownership") or "").lower()
-    source_route = str(lane.get("source_route") or "").lower()
-    if ownership in {"retailer-owned", "marketplace-owned"} or source_route in {"retailer", "marketplace"}:
-        return "Fix your listing on the cited retailer"
-    if ownership == "publisher-owned" or source_route == "publisher":
-        return "Pitch the cited publisher for roundup inclusion"
-    if ownership == "forum-owned" or source_route == "forum":
-        return "Build reviews/UGC"
-    return "Add a PDP section + FAQ for this lane"
-
-
 def _sku_intelligence_ladder_layer(row: Mapping[str, Any]) -> Optional[str]:
     axis = str(row.get("axis") or "").lower()
     query_class = str(row.get("query_class") or "").lower()
@@ -4972,10 +4975,7 @@ def _display_sku_intelligence(
         if isinstance(lane, dict)
         and lane.get("query") in sidewalk_open_queries
     ]
-    lanes = [
-        {**dict(lane), "first_move": _first_move_for_lane(lane)}
-        for lane in open_lanes[:3]
-    ]
+    lanes = [dict(lane) for lane in open_lanes[:3]]
     matrix_rows = [
         _trim_sku_intelligence_prompt(row)
         for row in per_prompt
@@ -4989,6 +4989,15 @@ def _display_sku_intelligence(
     is_empty = len(lanes) == 0
     display_opportunity = dict(opportunity)
     display_opportunity["top_open_lanes"] = lanes
+    next_best_action = build_sku_next_best_action(
+        opportunity=display_opportunity,
+        identity={
+            "name": title,
+            "confidence": "medium" if title and title != "this product" else "low",
+            "unresolved": not bool(title and title != "this product"),
+        },
+        sku_title=title,
+    )
     return {
         "hero_sku": {
             "title": title,
@@ -5006,6 +5015,7 @@ def _display_sku_intelligence(
         "prompt_matrix": matrix_rows,
         "demand_state_summary": opportunity.get("demand_state_summary"),
         "coverage": opportunity.get("confidence") or {},
+        "next_best_action": next_best_action,
         "is_empty": is_empty,
     }
 
@@ -5018,6 +5028,21 @@ def _empty_sku_intelligence(
     """Honest empty-state SKU intelligence: hero context + a clear reason, never
     a fabricated lane. Used when the per-SKU upstream is mock/unavailable."""
     product = _get_product(sku_ctx or {})
+    title = product.get("title")
+    next_best_action = build_sku_next_best_action(
+        opportunity={
+            "per_prompt": [],
+            "top_open_lanes": [],
+            "substitution_alert": {"present": False},
+            "confidence": {"prompt_count": 0, "prompts_with_demand": 0},
+        },
+        identity={
+            "name": title or "this product",
+            "confidence": "medium" if title else "low",
+            "unresolved": not bool(title),
+        },
+        sku_title=title,
+    )
     out: Dict[str, Any] = {
         "hero_sku": {
             "title": product.get("title"),
@@ -5033,6 +5058,7 @@ def _empty_sku_intelligence(
         "prompt_matrix": [],
         "demand_state_summary": None,
         "coverage": {},
+        "next_best_action": next_best_action,
         "is_empty": True,
     }
     if note:
@@ -5050,6 +5076,16 @@ async def run_wedge_hero_sku_intelligence(
 ) -> Dict[str, Any]:
     """Run the hero URL-fetched wedge product through per-SKU opportunity."""
     if not isinstance(hero_product, dict) or not hero_product:
+        next_best_action = build_sku_next_best_action(
+            opportunity={
+                "per_prompt": [],
+                "top_open_lanes": [],
+                "substitution_alert": {"present": False},
+                "confidence": {"prompt_count": 0, "prompts_with_demand": 0},
+            },
+            identity={"name": "this product", "confidence": "low", "unresolved": True},
+            sku_title="this product",
+        )
         return {
             "hero_sku": {"title": None, "pdp_url": None, "vendor": None},
             "headline": (
@@ -5062,6 +5098,7 @@ async def run_wedge_hero_sku_intelligence(
             "prompt_matrix": [],
             "demand_state_summary": None,
             "coverage": {},
+            "next_best_action": next_best_action,
             "is_empty": True,
         }
     sku_ctx = _wedge_hero_sku_ctx(hero_product, merchant_id=str(merchant_id))

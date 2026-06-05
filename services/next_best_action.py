@@ -18,6 +18,13 @@ PRIMARY_CATEGORY_DISCOVERY = "category_discovery_gap"
 PRIMARY_COMPETITOR_SOURCE = "competitor_source_gap"
 PRIMARY_FIRST_PARTY_DEFENSE = "first_party_defense"
 
+PRIMARY_SKU_OPEN_LANE_CAPTURE = "open_lane_capture"
+PRIMARY_SKU_SUBSTITUTION_LEAK = "substitution_leak"
+PRIMARY_SKU_CONTENT_REVISION_GAP = "content_revision_gap"
+PRIMARY_SKU_SOURCE_ROUTE_REPAIR = "source_route_repair"
+PRIMARY_SKU_PROTECTED_MONITORING = "protected_monitoring"
+PRIMARY_SKU_INSUFFICIENT_DATA = "insufficient_data"
+
 _VERDICT_INVISIBLE = "INVISIBLE"
 _VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
 _VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
@@ -37,6 +44,14 @@ _SOURCE_HOST_TYPES = {
 _LOW_CONFIDENCE_HOST_TYPES = {"cdn", "unclassified"}
 _REQUIRED_INTEGRATION_PIECES = {"store_platform", "psp"}
 _SEVERITY_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2}
+_SKU_REPAIR_OWNERSHIP = {
+    "retailer-owned",
+    "marketplace-owned",
+    "publisher-owned",
+    "forum-owned",
+    "competitor-owned",
+}
+_SKU_REPAIR_ROUTES = {"retailer", "marketplace", "publisher", "forum", "brand"}
 
 
 def classify_primary_gap(
@@ -138,6 +153,605 @@ def build_next_best_action(
         evidence=evidence,
     )
     return prescription
+
+
+def build_sku_next_best_action(
+    *,
+    opportunity: Mapping[str, Any],
+    primary_gaps: Optional[List[Mapping[str, Any]]] = None,
+    scores: Optional[Mapping[str, Any]] = None,
+    failing_prompts: Optional[List[Mapping[str, Any]]] = None,
+    verify_summary: Optional[Mapping[str, Any]] = None,
+    identity: Optional[Mapping[str, Any]] = None,
+    sku_title: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a deterministic per-SKU next-best-action prescription."""
+
+    opportunity_map = _as_mapping(opportunity)
+    gaps = [
+        dict(gap)
+        for gap in _as_list(primary_gaps)
+        if isinstance(gap, Mapping)
+    ]
+    primary_gap = _classify_sku_primary_gap(
+        opportunity=opportunity_map,
+        primary_gaps=gaps,
+        scores=_as_mapping(scores),
+        identity=_as_mapping(identity),
+    )
+    evidence = _build_sku_evidence_used(
+        opportunity=opportunity_map,
+        primary_gaps=gaps,
+        scores=_as_mapping(scores),
+        failing_prompts=_as_list(failing_prompts),
+        verify_summary=_as_mapping(verify_summary),
+        identity=_as_mapping(identity),
+        sku_title=sku_title,
+    )
+    prescription = _sku_prescription_for_gap(
+        primary_gap=primary_gap,
+        evidence=evidence,
+    )
+    prescription["secondary_moves"] = _sku_secondary_moves(
+        primary_gap=primary_gap,
+        primary_gaps=gaps,
+        failing_prompts=_as_list(failing_prompts),
+    )
+    return prescription
+
+
+def _classify_sku_primary_gap(
+    *,
+    opportunity: Mapping[str, Any],
+    primary_gaps: List[Mapping[str, Any]],
+    scores: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> str:
+    if _sku_top_open_lane(opportunity):
+        return PRIMARY_SKU_OPEN_LANE_CAPTURE
+
+    if _as_mapping(opportunity.get("substitution_alert")).get("present"):
+        return PRIMARY_SKU_SUBSTITUTION_LEAK
+
+    if _sku_top_content_gap(primary_gaps):
+        return PRIMARY_SKU_CONTENT_REVISION_GAP
+
+    if _sku_source_route_prompt(opportunity):
+        return PRIMARY_SKU_SOURCE_ROUTE_REPAIR
+
+    if _sku_is_protected(
+        opportunity=opportunity,
+        primary_gaps=primary_gaps,
+        scores=scores,
+        identity=identity,
+    ):
+        return PRIMARY_SKU_PROTECTED_MONITORING
+
+    return PRIMARY_SKU_INSUFFICIENT_DATA
+
+
+def _build_sku_evidence_used(
+    *,
+    opportunity: Mapping[str, Any],
+    primary_gaps: List[Mapping[str, Any]],
+    scores: Mapping[str, Any],
+    failing_prompts: List[Any],
+    verify_summary: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    sku_title: Optional[str],
+) -> Dict[str, Any]:
+    return {
+        "sku_title": _sku_title(identity=identity, sku_title=sku_title),
+        "identity": dict(identity),
+        "scores": _sku_scores(scores),
+        "top_open_lane": _sku_lane_chip(_sku_top_open_lane(opportunity)),
+        "substitution_alert": dict(_as_mapping(opportunity.get("substitution_alert"))),
+        "content_gap": _sku_gap_chip(_sku_top_content_gap(primary_gaps)),
+        "source_route_prompt": _sku_prompt_chip(_sku_source_route_prompt(opportunity)),
+        "coverage": dict(_as_mapping(opportunity.get("confidence"))),
+        "demand_state_summary": opportunity.get("demand_state_summary"),
+        "intent_ladder": dict(_as_mapping(opportunity.get("intent_ladder"))),
+        "failing_prompt_examples": [
+            _sku_failing_prompt_chip(prompt)
+            for prompt in failing_prompts[:5]
+            if _sku_failing_prompt_chip(prompt)
+        ],
+        "verify_summary": dict(verify_summary),
+    }
+
+
+def _sku_prescription_for_gap(
+    *,
+    primary_gap: str,
+    evidence: Mapping[str, Any],
+) -> Dict[str, Any]:
+    sku_title = str(evidence.get("sku_title") or "this SKU")
+    top_lane = _as_mapping(evidence.get("top_open_lane"))
+    substitution = _as_mapping(evidence.get("substitution_alert"))
+    content_gap = _as_mapping(evidence.get("content_gap"))
+    route_prompt = _as_mapping(evidence.get("source_route_prompt"))
+    coverage = _as_mapping(evidence.get("coverage"))
+    first_pivota_path = _sku_pivota_path(sku_title)
+
+    if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
+        query = _sku_query_phrase(top_lane.get("query"))
+        ownership = str(top_lane.get("current_ownership") or "unowned").replace("-", " ")
+        source_route = str(top_lane.get("source_route") or "none").replace("-", " ")
+        score = top_lane.get("opportunity_score")
+        why_fit = _phrase(_as_str_list(top_lane.get("why_fit")), "the SKU attributes match the prompt")
+        return _base_payload(
+            primary_gap=primary_gap,
+            headline=f"Capture the open lane for {sku_title} before it becomes contested.",
+            why_this_first=(
+                f"The top SKU opportunity is {query}: current ownership is "
+                f"{ownership}, source route is {source_route}, and opportunity "
+                f"score is {_sku_score_label(score)}. The fit evidence is "
+                f"{why_fit}, so this is the cleanest demand pocket to own first."
+            ),
+            first_move=str(top_lane.get("first_move") or "Add a PDP section + FAQ for this lane"),
+            self_serve_actions=[
+                (
+                    f"Add a PDP section and FAQ that answer {query} in buyer "
+                    "language, with proof, usage facts, schema-friendly fields, "
+                    "and links to supporting sources."
+                ),
+                (
+                    "Create a small source trail for the lane: reviews, retailer "
+                    "facts where relevant, comparison proof, and schema that make "
+                    "the official PDP easier for grounded agents to cite."
+                ),
+            ],
+            pivota_path=first_pivota_path,
+            evidence_used=evidence,
+            cta=_sku_cta("Create the canonical SKU answer path"),
+        )
+
+    if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
+        substitute = str(substitution.get("substituted_by") or "the named substitute").strip()
+        prompt = _sku_query_phrase(substitution.get("prompt"))
+        engines = _phrase(_as_str_list(substitution.get("engines")), "the tested engines")
+        return _base_payload(
+            primary_gap=primary_gap,
+            headline=f"Stop AI from substituting {sku_title} with {substitute}.",
+            why_this_first=(
+                f"The substitution alert fired on {prompt}: {engines} routed "
+                f"the answer to {substitute} instead of the tested SKU. That "
+                "means the buyer is already asking close to the product, but "
+                "AI lacks enough comparison evidence to keep this SKU in the answer."
+            ),
+            first_move=(
+                f"Publish comparison and alternatives content that names {substitute} "
+                f"and explains when {sku_title} is the better fit."
+            ),
+            self_serve_actions=[
+                (
+                    f"Add a PDP or supporting-page module for {sku_title} vs "
+                    f"{substitute}: use cases, ingredients or specs, claims proof, "
+                    "price/pack details, and who should choose each option."
+                ),
+                (
+                    f"Update FAQ/schema and internal links so alternatives prompts "
+                    f"like {prompt} resolve to the official SKU page instead of "
+                    "only third-party or competitor pages."
+                ),
+            ],
+            pivota_path=first_pivota_path,
+            evidence_used=evidence,
+            cta=_sku_cta("Turn the comparison into an owned SKU path"),
+        )
+
+    if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP:
+        bucket = _sku_gap_label(content_gap)
+        reason = str(content_gap.get("reason") or "the content-richness score has missing evidence")
+        return _base_payload(
+            primary_gap=primary_gap,
+            headline=f"Close the content gap on {sku_title} before expanding outreach.",
+            why_this_first=(
+                f"The largest per-SKU content issue is {bucket}: {reason}. "
+                "This is a PDP evidence problem, so the first move should be "
+                "content, FAQ, schema, ingredient/spec, or claim-substantiation "
+                "work rather than a playbook escalation."
+            ),
+            first_move=(
+                f"Repair {bucket} with PDP sections, FAQ/schema, and ingredient "
+                "or product-fact content that answers the failed SKU prompts."
+            ),
+            self_serve_actions=[
+                (
+                    f"Fill the missing {bucket} evidence on the official PDP: "
+                    "summary, bullets, usage, audience fit, ingredients/specs, "
+                    "watchouts, images, freshness, and substantiation as applicable."
+                ),
+                (
+                    "Validate that the revised PDP exposes Product, Offer, FAQ, "
+                    "and key fact fields in crawlable markup before re-running "
+                    "the same per-SKU prompts."
+                ),
+            ],
+            pivota_path=first_pivota_path,
+            evidence_used=evidence,
+            cta=_sku_cta("Publish canonical SKU enrichment"),
+        )
+
+    if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
+        query = _sku_query_phrase(route_prompt.get("query"))
+        route = str(route_prompt.get("source_route") or "unknown").strip().lower()
+        ownership = str(route_prompt.get("ownership_state") or "unknown").strip().lower()
+        hosts = _phrase(_host_names(route_prompt.get("sources")), "the cited sources")
+        return _base_payload(
+            primary_gap=primary_gap,
+            headline=f"Repair the source route that is winning {query}.",
+            why_this_first=(
+                f"For {sku_title}, {query} is currently {ownership} with a "
+                f"{route or 'unknown'} source route and cited sources including "
+                f"{hosts}. This is not an empty lane; the fix is to work through "
+                "the source role already shaping the answer."
+            ),
+            first_move=_sku_source_route_first_move(route_prompt),
+            self_serve_actions=[
+                _sku_source_route_self_serve(route_prompt),
+                (
+                    "Mirror the fix on the official PDP with clearer facts, "
+                    "comparison proof, reviews/UGC, and schema so the merchant-owned "
+                    "page can compete with the cited route."
+                ),
+            ],
+            pivota_path=first_pivota_path,
+            evidence_used=evidence,
+            cta=_sku_cta("Reclaim the SKU source route"),
+        )
+
+    if primary_gap == PRIMARY_SKU_PROTECTED_MONITORING:
+        coverage_text = str(coverage.get("coverage_summary") or "tested prompts show usable coverage")
+        return _base_payload(
+            primary_gap=primary_gap,
+            headline=f"Protect {sku_title}'s owned path and monitor for drift.",
+            why_this_first=(
+                f"{coverage_text}. The SKU evidence is merchant-owned or strong "
+                "and no higher-priority open lane, substitution leak, content gap, "
+                "or source-route repair surfaced. Do not manufacture urgency; "
+                "the right move is defense and measured expansion."
+            ),
+            first_move=(
+                "Keep monitoring active and investigate only material drops in "
+                "first-party citation, SKU mention quality, or new competitor/source-route wins."
+            ),
+            self_serve_actions=[
+                (
+                    "Maintain PDP facts, Product/Offer/FAQ schema, price, stock, "
+                    "shipping, returns, images, and variant data before catalog "
+                    "or theme changes."
+                ),
+                (
+                    "Watch cited retailer, publisher, forum, and competitor pages "
+                    "for stale SKU facts or new comparison language that could "
+                    "pull future AI answers away."
+                ),
+            ],
+            pivota_path=first_pivota_path,
+            evidence_used=evidence,
+            cta=_sku_cta("Monitor SKU attribution drift"),
+        )
+
+    identity = _as_mapping(evidence.get("identity"))
+    unresolved = bool(identity.get("unresolved"))
+    prompt_count = _score(coverage.get("prompt_count"))
+    demand_count = _score(coverage.get("prompts_with_demand"))
+    reason = (
+        "the resolved SKU identity is still low-confidence"
+        if unresolved
+        else f"coverage is too thin ({demand_count}/{prompt_count} prompts showed demand)"
+    )
+    return _base_payload(
+        primary_gap=PRIMARY_SKU_INSUFFICIENT_DATA,
+        headline=f"Resolve {sku_title}'s evidence before choosing a commercial move.",
+        why_this_first=(
+            f"The per-SKU audit should not fabricate a lane: {reason}. "
+            "Rerun after identity and coverage improve, then choose an open-lane, "
+            "substitution, content, or source-route prescription from real evidence."
+        ),
+        first_move=(
+            "Resolve the product identity and rerun per-SKU prompts before "
+            "prescribing an open lane or source-route repair."
+        ),
+        self_serve_actions=[
+            (
+                "Enrich title, brand, category, variant labels, GTIN/SKU, PDP URL, "
+                "description, images, price, stock, and schema so the product can "
+                "be tested as a real SKU."
+            ),
+            (
+                "Run enough buyer-intent, category, comparison, and attribute "
+                "prompts to produce grounded demand and citation evidence."
+            ),
+        ],
+        pivota_path=first_pivota_path,
+        evidence_used=evidence,
+        cta=_sku_cta("Normalize and retest this SKU"),
+    )
+
+
+def _sku_pivota_path(sku_title: str) -> str:
+    return (
+        f"Use Pivota to publish a canonical enriched module/schema for {sku_title} "
+        "on the AI-channel PDP, serve it as the agent-resolvable owned path, "
+        "connect checkout, and monitor whether the same SKU prompts move."
+    )
+
+
+def _sku_cta(label: str) -> Dict[str, str]:
+    return {
+        "label": label,
+        "trust_note": (
+            "The merchant can make the PDP, listing, content, and outreach fixes "
+            "directly; Pivota is for canonical SKU serving, checkout, and monitoring."
+        ),
+    }
+
+
+def _sku_top_open_lane(opportunity: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    for lane in _as_list(opportunity.get("top_open_lanes")):
+        if isinstance(lane, Mapping) and str(lane.get("query") or "").strip():
+            return lane
+    return None
+
+
+def _sku_top_content_gap(primary_gaps: List[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
+    content_gaps = [
+        gap for gap in primary_gaps
+        if str(gap.get("dimension") or "").strip() == "content_richness"
+    ]
+    if not content_gaps:
+        return None
+    content_gaps.sort(
+        key=lambda gap: (
+            -_score(gap.get("gap")),
+            str(gap.get("bucket") or ""),
+        )
+    )
+    return content_gaps[0]
+
+
+def _sku_source_route_prompt(opportunity: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    candidates: List[Mapping[str, Any]] = []
+    for row in _as_list(opportunity.get("per_prompt")):
+        if not isinstance(row, Mapping):
+            continue
+        ownership = str(row.get("ownership_state") or "").strip().lower()
+        source_route = str(row.get("source_route") or "").strip().lower()
+        if ownership not in _SKU_REPAIR_OWNERSHIP and source_route not in _SKU_REPAIR_ROUTES:
+            continue
+        if ownership == "merchant-owned":
+            continue
+        if _score(row.get("opportunity_score")) <= 0 and float(row.get("demand_signal") or 0) <= 0:
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda row: (
+            -float(row.get("opportunity_score") or 0),
+            str(row.get("query") or "").lower(),
+        )
+    )
+    return candidates[0]
+
+
+def _sku_is_protected(
+    *,
+    opportunity: Mapping[str, Any],
+    primary_gaps: List[Mapping[str, Any]],
+    scores: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> bool:
+    if identity.get("unresolved"):
+        return False
+    coverage = _as_mapping(opportunity.get("confidence"))
+    if _score(coverage.get("prompt_count")) <= 0:
+        return False
+
+    score_values = [
+        value for value in _sku_scores(scores).values()
+        if value is not None
+    ]
+    strong_scores = bool(score_values) and min(score_values) >= 70
+    material_gap = any(_score(gap.get("gap")) >= 20 for gap in primary_gaps)
+    if not strong_scores or material_gap:
+        return False
+
+    rows = [
+        row for row in _as_list(opportunity.get("per_prompt"))
+        if isinstance(row, Mapping)
+    ]
+    demand_rows = [
+        row for row in rows
+        if str(row.get("ownership_state") or "") != "no-demand"
+        and float(row.get("demand_signal") or 0) > 0
+    ]
+    if not demand_rows:
+        return False
+    owned_rows = [
+        row for row in demand_rows
+        if str(row.get("ownership_state") or "").lower()
+        in {"merchant-owned", "merchant-mentioned"}
+    ]
+    return len(owned_rows) >= max(1, (len(demand_rows) + 1) // 2)
+
+
+def _sku_title(*, identity: Mapping[str, Any], sku_title: Optional[str]) -> str:
+    return str(identity.get("name") or sku_title or "this SKU").strip() or "this SKU"
+
+
+def _sku_scores(scores: Mapping[str, Any]) -> Dict[str, Optional[int]]:
+    out: Dict[str, Optional[int]] = {}
+    for dimension, payload in scores.items():
+        if isinstance(payload, Mapping):
+            raw_score = payload.get("score")
+        else:
+            raw_score = payload
+        out[str(dimension)] = None if raw_score is None else _score(raw_score)
+    return out
+
+
+def _sku_lane_chip(lane: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not lane:
+        return {}
+    return {
+        "query": lane.get("query"),
+        "why_fit": _as_str_list(lane.get("why_fit")),
+        "current_ownership": lane.get("current_ownership"),
+        "source_route": lane.get("source_route"),
+        "demand_state": lane.get("demand_state"),
+        "density_band": lane.get("density_band"),
+        "opportunity_score": lane.get("opportunity_score"),
+        "first_move": lane.get("first_move"),
+    }
+
+
+def _sku_gap_chip(gap: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not gap:
+        return {}
+    return {
+        "dimension": gap.get("dimension"),
+        "bucket": gap.get("bucket"),
+        "points": gap.get("points"),
+        "max": gap.get("max"),
+        "gap": gap.get("gap"),
+        "reason": gap.get("reason"),
+    }
+
+
+def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not prompt:
+        return {}
+    source_summary = _as_mapping(prompt.get("source_summary"))
+    return {
+        "query": prompt.get("query"),
+        "ownership_state": prompt.get("ownership_state"),
+        "source_route": prompt.get("source_route"),
+        "opportunity_score": prompt.get("opportunity_score"),
+        "why_fit": prompt.get("attribute_basis") or prompt.get("evidence"),
+        "sources": _as_list(source_summary.get("top_cited_hosts"))[:3],
+        "competitors": _as_list(prompt.get("competitors"))[:5],
+    }
+
+
+def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(prompt, Mapping):
+        return None
+    query = str(prompt.get("query") or "").strip()
+    if not query:
+        return None
+    return {
+        "query": query,
+        "reason": prompt.get("reason"),
+        "provider": prompt.get("provider"),
+        "grounding_sources": _as_list(prompt.get("grounding_sources"))[:3],
+        "competitors_named": _as_list(prompt.get("competitors_named"))[:5],
+    }
+
+
+def _sku_gap_label(gap: Mapping[str, Any]) -> str:
+    bucket = str(gap.get("bucket") or "content_richness").strip()
+    return bucket.replace("_", " ")
+
+
+def _sku_query_phrase(value: Any) -> str:
+    text = str(value or "").strip()
+    return f'"{text}"' if text else "the tested SKU prompt"
+
+
+def _sku_score_label(value: Any) -> str:
+    if value is None:
+        return "not available"
+    try:
+        return f"{float(value):.2f}/100"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _sku_source_route_first_move(prompt: Mapping[str, Any]) -> str:
+    route = str(prompt.get("source_route") or "").strip().lower()
+    ownership = str(prompt.get("ownership_state") or "").strip().lower()
+    query = _sku_query_phrase(prompt.get("query"))
+    competitors = _phrase(_as_str_list(prompt.get("competitors")), "the named competitor")
+    if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
+        return f"Fix the cited retailer/marketplace listing for {query}"
+    if ownership == "publisher-owned" or route == "publisher":
+        return f"Pitch the cited publisher for roundup inclusion around {query}"
+    if ownership == "forum-owned" or route == "forum":
+        return f"Build reviews/UGC that answer {query}"
+    return f"Publish comparison proof for {query} against {competitors}"
+
+
+def _sku_source_route_self_serve(prompt: Mapping[str, Any]) -> str:
+    route = str(prompt.get("source_route") or "").strip().lower()
+    ownership = str(prompt.get("ownership_state") or "").strip().lower()
+    sources = _phrase(_host_names(prompt.get("sources")), "the cited sources")
+    if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
+        return (
+            f"Audit {sources} for title, images, claims, variants, price, "
+            "availability, authorization, and SKU facts."
+        )
+    if ownership == "publisher-owned" or route == "publisher":
+        return (
+            f"Pitch {sources} with SKU facts, proof assets, images, pricing, "
+            "availability, and a specific comparison angle."
+        )
+    if ownership == "forum-owned" or route == "forum":
+        return (
+            f"Build review and UGC proof that can show up near {sources}, "
+            "then link it back to the official PDP."
+        )
+    return (
+        "Add comparison content naming the competitor, with substantiated "
+        "differences, use cases, specs/ingredients, and review proof."
+    )
+
+
+def _sku_secondary_moves(
+    *,
+    primary_gap: str,
+    primary_gaps: List[Mapping[str, Any]],
+    failing_prompts: List[Any],
+) -> List[Dict[str, Any]]:
+    moves: List[Dict[str, Any]] = []
+    primary_content_gap = _sku_top_content_gap(primary_gaps)
+    for gap in primary_gaps:
+        if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP and gap == primary_content_gap:
+            continue
+        title = f"Fix {str(gap.get('dimension') or 'sku')}.{str(gap.get('bucket') or 'gap')}"
+        moves.append({
+            "title": title,
+            "severity": "medium" if _score(gap.get("gap")) < 20 else "high",
+            "lever": "sku_gap_repair",
+            "target_host": None,
+            "concrete_next_step": str(gap.get("reason") or "Close the next largest per-SKU score gap."),
+            "reason": (
+                f"It is the next largest per-SKU gap at "
+                f"{_score(gap.get('gap'))} missing points."
+            ),
+            "evidence": _sku_gap_chip(gap),
+        })
+        if len(moves) >= 2:
+            return moves
+
+    for prompt in failing_prompts:
+        chip = _sku_failing_prompt_chip(prompt)
+        if not chip:
+            continue
+        moves.append({
+            "title": f"Re-test failed SKU prompt: {chip['query']}",
+            "severity": "medium",
+            "lever": "sku_prompt_retest",
+            "target_host": None,
+            "concrete_next_step": "Revise the PDP/source evidence, then re-run this exact prompt.",
+            "reason": "It is named in the per-SKU failing prompt evidence.",
+            "evidence": chip,
+        })
+        if len(moves) >= 2:
+            break
+    return moves
 
 
 def _prescription_for_gap(
