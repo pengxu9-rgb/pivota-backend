@@ -148,6 +148,7 @@ _PROPER_SEQUENCE_RE = re.compile(
     rf"\b{_CAP_WORD}(?:[ \t]+(?:of|the|for))*[ \t]+{_CAP_WORD}"
     rf"(?:[ \t]+(?:of|the|for|and|&|{_CAP_WORD}))*\b"
 )
+_QUOTE_BOUNDARY_RE = re.compile(r"[\"'`“”‘’]")
 _SINGLE_ENTITY_RE = re.compile(
     r"\b(?:[A-Z]{2,}|[A-Z][a-z][A-Za-z0-9'’-]{2,}|[A-Za-z]+[A-Z][A-Za-z0-9]*)\b"
 )
@@ -222,6 +223,9 @@ _ENTITY_STOPWORDS = {
     "You",
     "Your",
 }
+_ENTITY_STOPWORD_NORMALIZED = frozenset(
+    stopword.lower() for stopword in _ENTITY_STOPWORDS
+)
 _INTERNAL_ALLOWED_ENTITIES = {
     "ai",
     "anthropic",
@@ -276,6 +280,75 @@ _SHOPPING_WORDS = {
     "vs",
     "where",
 }
+_COMMON_WORDS = frozenset({
+    "answer",
+    "answers",
+    "best",
+    "better",
+    "blog",
+    "buy",
+    "category",
+    "certified",
+    "claim",
+    "claims",
+    "comparison",
+    "content",
+    "cta",
+    "ctr",
+    "demand",
+    "designed",
+    "description",
+    "difference",
+    "diy",
+    "faq",
+    "faqs",
+    "guide",
+    "h1",
+    "h2",
+    "headline",
+    "how",
+    "keyword",
+    "keywords",
+    "lane",
+    "lanes",
+    "link",
+    "listing",
+    "matter",
+    "matters",
+    "meta",
+    "more",
+    "new",
+    "only",
+    "page",
+    "pages",
+    "phrase",
+    "post",
+    "product",
+    "queries",
+    "query",
+    "repair",
+    "roi",
+    "routine",
+    "search",
+    "seo",
+    "site",
+    "sku",
+    "story",
+    "terms",
+    "title",
+    "tip",
+    "tips",
+    "traffic",
+    "url",
+    "what",
+    "when",
+    "where",
+    "why",
+    "win",
+    "wins",
+    "work",
+    "works",
+})
 _QUOTE_STOPWORDS = {
     "a",
     "an",
@@ -936,6 +1009,7 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     for value in allowed_terms | allowed_phrases:
         grounded_words.update(re.findall(r"[a-z0-9]+", value))
     grounded_words.update(_SHOPPING_WORDS)
+    grounded_words.update(_COMMON_WORDS)
     grounded_words.update(_AI_ENGINE_ENTITIES)
 
     return {
@@ -951,22 +1025,26 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
 def _extract_named_entities(text: str) -> List[Tuple[str, bool]]:
     entities: List[Tuple[str, bool]] = []
     seen_spans: List[Tuple[int, int]] = []
-    for match in _PROPER_SEQUENCE_RE.finditer(text):
-        sequence = _clean_entity(match.group(0))
-        if sequence:
-            sequence_sentence_initial = _is_sentence_initial(text, match.start())
-            for chunk_index, chunk in enumerate(re.split(r"\s+(?:and|&)\s+", sequence)):
-                entity = _clean_entity(chunk)
-                if entity and not _entity_is_stopword(entity):
-                    entities.append(
-                        (entity, sequence_sentence_initial and chunk_index == 0)
-                    )
-            seen_spans.append(match.span())
+    for segment_start, segment in _proper_sequence_segments(text):
+        for match in _PROPER_SEQUENCE_RE.finditer(segment):
+            sequence_start = segment_start + match.start()
+            sequence_end = segment_start + match.end()
+            sequence = _clean_entity(match.group(0))
+            if sequence:
+                sequence_sentence_initial = _is_sentence_initial(text, sequence_start)
+                for chunk_index, chunk in enumerate(re.split(r"\s+(?:and|&)\s+", sequence)):
+                    entity = _clean_entity(chunk)
+                    if entity and not _entity_is_stopword(entity):
+                        entities.append(
+                            (entity, sequence_sentence_initial and chunk_index == 0)
+                        )
+                seen_spans.append((sequence_start, sequence_end))
 
     for match in _SINGLE_ENTITY_RE.finditer(text):
         if any(start <= match.start() and match.end() <= end for start, end in seen_spans):
             continue
-        entity = _clean_entity(match.group(0))
+        sequence = _clean_entity(match.group(0))
+        entity = sequence
         if entity and not _entity_is_stopword(entity):
             sentence_initial = _is_sentence_initial(text, match.start())
             if sentence_initial and not _is_brand_shaped(entity):
@@ -981,6 +1059,16 @@ def _extract_named_entities(text: str) -> List[Tuple[str, bool]]:
         seen.add(key)
         out.append((entity, sentence_initial))
     return out
+
+
+def _proper_sequence_segments(text: str) -> Iterable[Tuple[int, str]]:
+    start = 0
+    for match in _QUOTE_BOUNDARY_RE.finditer(text):
+        if match.start() > start:
+            yield start, text[start:match.start()]
+        start = match.end()
+    if start < len(text):
+        yield start, text[start:]
 
 
 def _sentence_initial_unallowed_token(
@@ -1036,6 +1124,8 @@ def _entity_allowed(entity: str, allowed: Mapping[str, Any]) -> bool:
     normalized = _norm_entity(entity)
     if not normalized:
         return True
+    if _is_common_entity_word(normalized):
+        return True
     if normalized in allowed["terms"]:
         return True
     domain = _normalize_host(entity)
@@ -1050,6 +1140,8 @@ def _entity_allowed(entity: str, allowed: Mapping[str, Any]) -> bool:
             return True
     words = re.findall(r"[a-z0-9]+", normalized)
     if words and all(word in allowed["attribute_words"] for word in words):
+        return True
+    if words and all(_entity_word_grounded_or_common(word, allowed) for word in words):
         return True
     return False
 
@@ -1114,6 +1206,7 @@ def _significant_quote_tokens(phrase: str) -> List[str]:
         if token not in _QUOTE_STOPWORDS
         and token not in _CONNECTOR_WORDS
         and token not in _COMMON_PROSE_WORDS
+        and token not in _COMMON_WORDS
     ]
 
 
@@ -1137,6 +1230,29 @@ def _word_grounded(token: str, grounded_words: Set[str]) -> bool:
     if token.endswith("s") and token[:-1] in grounded_words:
         return True
     return False
+
+
+def _entity_word_grounded_or_common(
+    token: str,
+    allowed: Mapping[str, Any],
+) -> bool:
+    return _is_common_entity_word(token) or _word_grounded(
+        token,
+        allowed["grounded_words"],
+    )
+
+
+def _is_common_entity_word(token: str) -> bool:
+    normalized = _norm_entity(token)
+    return (
+        normalized in _COMMON_WORDS
+        or normalized in _CONNECTOR_WORDS
+        or normalized in _SHOPPING_WORDS
+        or normalized in _QUOTE_STOPWORDS
+        or normalized in _COMMON_PROSE_WORDS
+        or normalized in _ENTITY_STOPWORD_NORMALIZED
+        or normalized in _INTERNAL_ALLOWED_ENTITIES
+    )
 
 
 def _is_ignorable_entity_token(token: str) -> bool:
@@ -1224,8 +1340,9 @@ def _entity_is_stopword(entity: str) -> bool:
         return True
     normalized = _norm_entity(entity)
     return (
-        normalized in {stopword.lower() for stopword in _ENTITY_STOPWORDS}
+        normalized in _ENTITY_STOPWORD_NORMALIZED
         or normalized in _INTERNAL_ALLOWED_ENTITIES
+        or _is_common_entity_word(normalized)
     )
 
 

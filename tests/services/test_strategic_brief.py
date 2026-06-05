@@ -431,6 +431,10 @@ def test_validation_fix_accepts_grounded_bb_lab_brief_without_false_positives():
         "Stop competing on generic 'best collagen for skin' terms.",
         "Do NOT chase Healthline, and you cannot DIY this at scale.",
         "Publish 'BB Lab vs Vital Proteins: Why Halal Matters for Bedtime Collagen'.",
+        "Publish a blog post or guide titled 'Why a Halal Bedtime Collagen Stick Works Better' and link it to the product page.",
+        "Put the exact phrase in the URL, H1, and meta description.",
+        "Create a page titled 'The Halal Bedtime Collagen Stick Difference'.",
+        "BB Lab vs Vital Proteins: Why Halal Matters for Bedtime Collagen",
     ],
 )
 def test_validation_fix_accepts_prose_robust_grounded_lines(line):
@@ -526,6 +530,17 @@ def test_validation_fix_rejects_conjoined_hallucinated_entities(line, invented_b
     assert f"unknown-entity:{invented_brand}" in failures
     assert "unknown-entity:Vital Proteins" not in failures
     assert "unknown-entity:NeoCell" not in failures
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+def test_validation_fix_rejects_title_case_invented_brand_in_common_word_title():
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["core_decision"] = "Why Moonjuice Collagen Works Better"
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert "unknown-entity:Moonjuice" in failures
     assert strategic_brief.validate_grounding(brief, evidence) is False
 
 
