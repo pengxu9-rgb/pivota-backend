@@ -580,8 +580,8 @@ def test_sku_nba_content_gap_references_content_richness_bucket():
 
 def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
     for route, ownership, expected in [
-        ("retailer", "retailer-owned", "first-order offer"),
-        ("publisher", "publisher-owned", "pitch the cited publisher"),
+        ("retailer", "retailer-owned", "official source of truth"),
+        ("publisher", "publisher-owned", "pitch the cited source trail"),
     ]:
         opportunity = _sku_base_opportunity()
         opportunity["per_prompt"] = [
@@ -666,6 +666,7 @@ def test_sku_nba_bb_lab_brand_path_ties_operational_moves_to_retailer_exposure()
     play_blob = json.dumps(play).lower()
     assert play["lane"] == "best collagen sticks"
     assert play["controllers"] == ["amazon.com", "walmart.com"]
+    assert play["controller_strategy"] == "leading_retailer_competition"
     assert play["page"] == "your official PDP"
     assert {move["type"] for move in play["moves"]} == {
         "first_order_offer",
@@ -724,6 +725,7 @@ def test_sku_nba_ownist_brand_path_ties_offer_bundle_to_real_exposed_lane():
     assert "why-buy-direct" in copy
     assert nba["canonical_page_play"]["lane"] == "best beauty supplement for glow"
     assert "walmart.com" in nba["canonical_page_play"]["controllers"]
+    assert nba["canonical_page_play"]["controller_strategy"] == "leading_retailer_competition"
     assert "exact discount depths" in nba["canonical_page_play"]["economics_policy"]
 
 
@@ -784,7 +786,7 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
         _ownist_lane(
             "vitamin c collagen jelly",
             opportunity_score=5.45,
-            controllers=["cogentsteps.net", "medsysgroup.com", "oliveyoung.com"],
+            controllers=["cogentsteps.net", "medsysgroup.com", "hellokoop.com"],
             attribute_basis=["vitamin c", "collagen", "jelly"],
         ),
         _ownist_lane(
@@ -821,8 +823,17 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
     assert "subscription incentive" in copy
     assert "why-buy-direct" in copy
     play = nba["canonical_page_play"]
+    play_blob = json.dumps(play).lower()
     assert play["lane"] == "vitamin c collagen jelly"
-    assert play["controllers"] == ["cogentsteps.net", "medsysgroup.com", "oliveyoung.com"]
+    assert play["controllers"] == ["cogentsteps.net", "medsysgroup.com", "hellokoop.com"]
+    assert play["controller_strategy"] == "canonical_source_vacuum"
+    assert {move["type"] for move in play["moves"]} == {
+        "canonical_source_authority",
+        "authorized_distribution_or_reseller_cleanup",
+        "direct_buy_reason",
+    }
+    assert "source of truth" in play_blob
+    assert "beat cogentsteps" not in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "%" not in copy and "$" not in copy
 

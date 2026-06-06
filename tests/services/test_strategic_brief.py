@@ -512,6 +512,7 @@ def test_assemble_sku_brief_evidence_supports_ownist_brand_path_exposure():
     ]
     assert ownist_path["destination"] == "the brand's own website"
     assert ownist_path["merchant_archetype"] == "brand"
+    assert ownist_path["controller_strategy"] == "leading_retailer_competition"
     assert ownist_path["recommended_moves"] == [
         "Make the official brand PDP the cited + buyable canonical page for this lane.",
         "Add a first-order offer without inventing a discount depth.",
@@ -556,7 +557,7 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
                 "source_roles": [
                     {"host": "cogentsteps.net", "role": "publisher"},
                     {"host": "medsysgroup.com", "role": "publisher"},
-                    {"host": "oliveyoung.com", "role": "retailer"},
+                    {"host": "hellokoop.com", "role": "retailer"},
                 ],
             },
         ],
@@ -591,9 +592,11 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
     assert opportunities[0]["controlled_by"] == [
         {"host": "cogentsteps.net", "role": "publisher"},
         {"host": "medsysgroup.com", "role": "publisher"},
-        {"host": "oliveyoung.com", "role": "retailer"},
+        {"host": "hellokoop.com", "role": "retailer"},
     ]
-    assert "cited + buyable canonical page" in opportunities[0]["recommended_moves"][0]
+    assert opportunities[0]["controller_strategy"] == "canonical_source_vacuum"
+    assert "official source of truth" in opportunities[0]["recommended_moves"][0]
+    assert "weak third-party reseller trail" in opportunities[0]["recommended_moves"][1]
     assert len(opportunities[0]["controlled_by"]) == 3
 
 
@@ -625,6 +628,52 @@ def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabri
     assert "why-buy-direct" in blob
     assert "%" not in blob
     assert "$" not in blob
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
+def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacuum():
+    evidence = _evidence()
+    evidence["product"]["title"] = "Ownist Triple Shine Grape"
+    evidence["product"]["brand"] = "Ownist"
+    evidence["product"]["merchant_path"] = {
+        "archetype": "brand",
+        "destination": "the brand's own website",
+        "page_label": "the official brand PDP",
+        "goal": "drive buyers to the brand's own website",
+    }
+    evidence["buyer_path_opportunities"] = [
+        {
+            "query": "vitamin c collagen jelly",
+            "controlled_by": [
+                {"host": "cogentsteps.net", "role": "publisher"},
+                {"host": "medsysgroup.com", "role": "publisher"},
+                {"host": "hellokoop.com", "role": "retailer"},
+            ],
+            "controller_strategy": "canonical_source_vacuum",
+            "controller_profile": {
+                "strategy": "canonical_source_vacuum",
+                "label": "Canonical-source vacuum",
+            },
+            "recommended_moves": [
+                "Make the official brand PDP the official source of truth for this lane before treating it as a retailer value fight.",
+                "Audit the weak third-party reseller trail for wrong SKU facts, stock, authorization, and stale listings.",
+                "Add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof on the official page.",
+            ],
+        }
+    ]
+
+    brief = strategic_brief._deterministic_brief(evidence)
+    blob = json.dumps(brief).lower()
+
+    assert brief is not None
+    assert "official source of truth" in blob
+    assert "weak third-party reseller trail" in blob
+    assert "canonical-source gap" not in blob
+    assert "beat cogentsteps" not in blob
+    assert "first-order offer" in blob
+    assert "starter + replenishment bundle" in blob
+    assert "why-buy-direct" in blob
+    assert "%" not in blob and "$" not in blob
     assert strategic_brief.validate_grounding(brief, evidence) is True
 
 

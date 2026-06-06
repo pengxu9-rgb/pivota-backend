@@ -36,6 +36,10 @@ from urllib.parse import urlparse
 from services import agent_center_llm_client as llm_client
 from services.audit_playbook_engine import select_playbooks
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
+from services.buyer_path_controller_quality import (
+    controller_profile as build_controller_profile,
+    is_canonical_source_vacuum,
+)
 from services.cited_host_classifier import classify_cited_hosts, classify_host
 from services.coverage_profiles import (
     resolve_coverage_profile,
@@ -5100,18 +5104,102 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
     controllers = hosts[:3]
     controller_phrase = ", ".join(controllers) if controllers else "the cited sources"
     lane = query or "this exposed lane"
+    profile = build_controller_profile(
+        {"host": host, "role": row.get("source_route") or row.get("ownership_state")}
+        for host in controllers
+    )
+    if is_canonical_source_vacuum(profile):
+        move = (
+            f"Use the cited + buyable official page for {lane} as the source of truth "
+            f"and replace the weak third-party reseller trail from {controller_phrase}: "
+            "canonical SKU facts, proof, stock, authorized where-to-buy, plus first-order "
+            "offer, starter + replenishment bundle, subscription incentive, and "
+            "why-buy-direct proof."
+        )
+        moves = [
+            {
+                "type": "canonical_source_authority",
+                "operator_action": (
+                    f"Make the official page the source of truth for {lane}: exact SKU "
+                    "facts, proof, stock, returns, and authorized where-to-buy."
+                ),
+            },
+            {
+                "type": "authorized_distribution_or_reseller_cleanup",
+                "operator_action": (
+                    "Audit the weak third-party trail for wrong titles, images, variants, "
+                    "stock, authorization, and stale SKU facts; decide which real authorized "
+                    "retail routes deserve attention."
+                ),
+            },
+            {
+                "type": "direct_buy_reason",
+                "operator_action": (
+                    "Add first-order offer, starter + replenishment bundle, subscription "
+                    "incentive, and why-buy-direct proof."
+                ),
+            },
+        ]
+    elif str(profile.get("strategy") or "") == "source_authority_gap":
+        move = (
+            f"Use the cited + buyable official page for {lane} as the source of truth "
+            f"before pitching {controller_phrase}: proof, availability, images, offer "
+            "mechanics, bundle/subscription options, and why-buy-direct proof."
+        )
+        moves = [
+            {
+                "type": "canonical_source_authority",
+                "operator_action": f"Make the official page the cited + buyable source for {lane}.",
+            },
+            {
+                "type": "evidenced_source_outreach",
+                "operator_action": f"Pitch {controller_phrase} with official SKU facts, proof assets, availability, and images.",
+            },
+            {
+                "type": "direct_buy_reason",
+                "operator_action": (
+                    "Add first-order offer, starter + replenishment bundle, subscription "
+                    "incentive, and why-buy-direct proof."
+                ),
+            },
+        ]
+    else:
+        move = (
+            f"Use the cited + buyable official page for {lane} to win the direct "
+            f"buyer path against {controller_phrase}: first-order offer, starter + "
+            "replenishment bundle, subscription incentive, and why-buy-direct proof."
+        )
+        moves = [
+            {
+                "type": "first_order_offer",
+                "operator_action": f"Attach a first-order offer to the official page for {lane}.",
+            },
+            {
+                "type": "starter_replenishment_bundle",
+                "operator_action": f"Add a starter + replenishment bundle on the official page for {lane}.",
+            },
+            {
+                "type": "subscription_or_why_buy_direct",
+                "operator_action": (
+                    "Add subscription incentive and why-buy-direct proof: guarantee, "
+                    "samples, loyalty, returns, stock, and fresh product facts."
+                ),
+            },
+        ]
     return {
         "prescription_class": "operational_efficiency",
         "lane": query,
         "controllers": controllers,
-        "move": (
-            f"Use the cited + buyable official page for {lane} "
-            f"to beat {controller_phrase}: first-order offer, starter + replenishment "
-            "bundle, subscription incentive, and why-buy-direct proof."
-        ),
+        "controller_strategy": profile.get("strategy"),
+        "controller_strategy_label": profile.get("label"),
+        "controller_profile": profile,
+        "move": move,
         "canonical_page_play": {
             "lane": lane,
             "controllers": controllers,
+            "controller_strategy": profile.get("strategy"),
+            "controller_strategy_label": profile.get("label"),
+            "controller_profile": profile,
             "page": "the official page",
             "economics_policy": (
                 "Mechanics only: first-order offer, starter + replenishment bundle, "
@@ -5119,23 +5207,7 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
                 "exact discount depths, bundle prices, savings percentages, or margin "
                 "claims without audited margin or promo evidence."
             ),
-            "moves": [
-                {
-                    "type": "first_order_offer",
-                    "operator_action": f"Attach a first-order offer to the official page for {lane}.",
-                },
-                {
-                    "type": "starter_replenishment_bundle",
-                    "operator_action": f"Add a starter + replenishment bundle on the official page for {lane}.",
-                },
-                {
-                    "type": "subscription_or_why_buy_direct",
-                    "operator_action": (
-                        "Add subscription incentive and why-buy-direct proof: guarantee, "
-                        "samples, loyalty, returns, stock, and fresh product facts."
-                    ),
-                },
-            ],
+            "moves": moves,
             "checkout_readiness": (
                 "Make the page cited, buyable, and agent-checkout ready before trying "
                 "to redirect the cited source trail."
@@ -5598,14 +5670,6 @@ def _lost_head_category_for_money_shot(
     return str(candidates[0].get("query") or "").strip() or f"the broad {product_type or 'product'} category"
 
 
-_BUYER_PATH_OWNED_STATES = {
-    "retailer-owned",
-    "marketplace-owned",
-    "publisher-owned",
-    "forum-owned",
-}
-
-
 def _headline_join(hosts: List[str]) -> str:
     hosts = [h for h in hosts if h][:3]
     if not hosts:
@@ -5622,15 +5686,15 @@ def _top_exposed_lane(per_prompt: List[Mapping[str, Any]]) -> Optional[Dict[str,
     controls the buyer path (the de-inflated EXPOSURE — not an open lane)."""
     rows = [
         row for row in per_prompt
-        if str(row.get("ownership_state") or "").lower() in _BUYER_PATH_OWNED_STATES
-        and float(row.get("demand_signal") or 0) > 0
+        if is_third_party_controlled_lane(row)
+        and has_lane_demand(row)
         and str(row.get("query") or "").strip()
     ]
     if not rows:
         return None
     rows.sort(
         key=lambda row: (
-            -float(row.get("opportunity_score") or 0),
+            lane_priority_sort_key(row),
             -float(row.get("demand_signal") or 0),
             str(row.get("query") or "").lower(),
         )
@@ -5747,7 +5811,13 @@ def _display_sku_intelligence(
             str(row.get("query") or "").lower(),
         )
     )
-    is_empty = len(lanes) == 0
+    has_exposure = any(
+        is_third_party_controlled_lane(row)
+        and has_lane_demand(row)
+        and str(row.get("query") or "").strip()
+        for row in prioritized_per_prompt
+    )
+    is_empty = len(lanes) == 0 and not has_exposure
     display_opportunity = dict(opportunity)
     display_opportunity["per_prompt"] = prioritized_per_prompt
     display_opportunity["top_open_lanes"] = lanes

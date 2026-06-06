@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 import pytest
 
 import services.agent_center_bd_report_service as bd
+from services.sku_lane_priority import build_lane_product_evidence
 
 
 def _hero_product(*, attributes: bool = True) -> Dict[str, Any]:
@@ -215,10 +216,11 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     assert "starter + replenishment bundle" in head["buyer_path_action"]["move"]
     play = head["buyer_path_action"]["canonical_page_play"]
     assert play["lane"] == "best collagen supplements for skin"
+    assert play["controller_strategy"] == "canonical_source_vacuum"
     assert {move["type"] for move in play["moves"]} == {
-        "first_order_offer",
-        "starter_replenishment_bundle",
-        "subscription_or_why_buy_direct",
+        "canonical_source_authority",
+        "authorized_distribution_or_reseller_cleanup",
+        "direct_buy_reason",
     }
     assert "exact discount depths" in play["economics_policy"]
     assert "agent-checkout ready" in play["checkout_readiness"]
@@ -329,7 +331,7 @@ async def test_run_wedge_hero_sku_intelligence_empty_state_without_attributes(mo
         prompts_per_sku=3,
     )
 
-    assert out["is_empty"] is True
+    assert out["is_empty"] is False
     assert out["top_open_lanes"] == []
     assert "next_best_action" in out
     # The fixture's category lane is third-party (amazon.com) controlled with
@@ -341,3 +343,102 @@ async def test_run_wedge_hero_sku_intelligence_empty_state_without_attributes(mo
     assert out["intent_ladder"]
     assert len(out["prompt_matrix"]) == 3
     assert out["substitution_alert"]["present"] is True
+
+
+def test_sku_intelligence_headline_uses_merchant_fit_lane_priority_for_ownist_exposure():
+    product = {
+        "title": "Ownist Triple Shine Grape",
+        "raw_title": "Ownist Triple Shine Grape Collagen Jelly",
+        "vendor": "Ownist",
+        "product_type": "beauty supplement",
+        "canonical_url": "https://ownist.com/products/triple-shine-grape",
+    }
+    product_evidence = build_lane_product_evidence(
+        product=product,
+        attribute_graph={
+            "classes": {
+                "category": ["collagen jelly"],
+                "format": ["jelly"],
+                "ingredient": ["vitamin c", "collagen"],
+                "use_case": ["healthy skin", "anti age"],
+                "geography": ["korean"],
+            }
+        },
+        sku_title="Ownist Triple Shine Grape",
+    )
+    opportunity = {
+        "per_prompt": [
+            {
+                "query": "healthy snacks collagen jelly",
+                "axis": "sidewalk",
+                "query_class": "sidewalk",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "opportunity_score": 18.0,
+                "demand_signal": 1.0,
+                "attribute_basis": ["healthy snacks", "collagen", "jelly"],
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "cogentsteps.net", "times_cited": 2},
+                        {"host": "medsysgroup.com", "times_cited": 1},
+                    ]
+                },
+            },
+            {
+                "query": "vitamin c collagen jelly",
+                "axis": "sidewalk",
+                "query_class": "sidewalk",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "opportunity_score": 5.45,
+                "demand_signal": 1.0,
+                "attribute_basis": ["vitamin c", "collagen", "jelly"],
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "cogentsteps.net", "times_cited": 2},
+                        {"host": "medsysgroup.com", "times_cited": 1},
+                        {"host": "hellokoop.com", "times_cited": 1},
+                    ]
+                },
+            },
+            {
+                "query": "healthy skin collagen jelly",
+                "axis": "sidewalk",
+                "query_class": "sidewalk",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "opportunity_score": 13.63,
+                "demand_signal": 1.0,
+                "attribute_basis": ["healthy skin", "collagen", "jelly"],
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "ubuy.mq", "times_cited": 1},
+                        {"host": "truehuebeauty.com", "times_cited": 1},
+                    ]
+                },
+            },
+        ],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+        "demand_state_summary": "third-party exposure",
+        "intent_ladder": {},
+        "confidence": {"prompt_count": 3, "prompts_with_demand": 3},
+        "product_evidence": product_evidence,
+    }
+
+    out = bd._display_sku_intelligence(
+        sku_ctx={"sku_key": "ownist", "product": product},
+        opportunity=opportunity,
+    )
+
+    assert out["is_empty"] is False
+    assert "vitamin c collagen jelly" in out["headline"]
+    assert "healthy snacks collagen jelly" not in out["headline"]
+    assert out["next_best_action"]["evidence_used"]["source_route_prompt"]["query"] == (
+        "vitamin c collagen jelly"
+    )
+    assert out["prompt_matrix"][0]["query"] == "vitamin c collagen jelly"
+    action = out["prompt_matrix"][0]["buyer_path_action"]
+    assert action["controller_strategy"] == "canonical_source_vacuum"
+    assert "source of truth" in action["move"]
+    assert "beat cogentsteps" not in action["move"].lower()

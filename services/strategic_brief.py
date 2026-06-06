@@ -13,6 +13,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from config.settings import settings
+from services.buyer_path_controller_quality import (
+    controller_profile as build_controller_profile,
+    is_canonical_source_vacuum,
+)
 from services.llm_synthesis import (
     LLMSynthesisError,
     configured_key_for_provider,
@@ -805,6 +809,7 @@ def _buyer_path_opportunity(
     merchant_path: Mapping[str, Any],
 ) -> Dict[str, Any]:
     controllers = _buyer_path_controllers(row)
+    profile = build_controller_profile(controllers)
     route = _clean_str(row.get("source_route")).lower()
     ownership = _clean_str(row.get("ownership_state")).lower()
     route_label = route or ownership.replace("-owned", "") or "third-party"
@@ -813,9 +818,12 @@ def _buyer_path_opportunity(
         "exposure": ownership or None,
         "route": route_label,
         "controlled_by": controllers,
+        "controller_strategy": profile.get("strategy"),
+        "controller_strategy_label": profile.get("label"),
+        "controller_profile": profile,
         "destination": _clean_str(merchant_path.get("destination")),
         "merchant_archetype": _clean_str(merchant_path.get("archetype")),
-        "recommended_moves": _buyer_path_moves(merchant_path),
+        "recommended_moves": _buyer_path_moves(merchant_path, profile),
         **_lane_priority_fields(row),
     }
 
@@ -835,8 +843,27 @@ def _buyer_path_controllers(row: Mapping[str, Any]) -> List[Dict[str, str]]:
     return _unique_host_roles(_source_role_chips(row))[:3]
 
 
-def _buyer_path_moves(merchant_path: Mapping[str, Any]) -> List[str]:
+def _buyer_path_moves(
+    merchant_path: Mapping[str, Any],
+    controller_profile: Optional[Mapping[str, Any]] = None,
+) -> List[str]:
     page = _clean_str(merchant_path.get("page_label")) or "merchant-controlled page"
+    profile = _as_mapping(controller_profile)
+    if is_canonical_source_vacuum(profile):
+        return [
+            f"Make {page} the official source of truth for this lane before treating it as a retailer value fight.",
+            "Audit the weak third-party reseller trail for wrong SKU facts, stock, authorization, and stale listings.",
+            "Decide which real authorized retail or marketplace routes deserve attention.",
+            "Add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof on the official page.",
+            "Keep exact offer economics mechanics-only until audited promo or margin evidence exists.",
+        ]
+    if _clean_str(profile.get("strategy")) == "source_authority_gap":
+        return [
+            f"Make {page} the cited + buyable official source for this lane.",
+            "Use official proof, availability, images, and SKU facts before pitching the evidenced source trail.",
+            "Add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof on the official page.",
+            "Do not invent new channels; work only the cited sources in the evidence.",
+        ]
     return [
         f"Make {page} the cited + buyable canonical page for this lane.",
         "Add a first-order offer without inventing a discount depth.",
@@ -1106,6 +1133,29 @@ def _validated_deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict
     return None
 
 
+def _deterministic_traffic_how(
+    opportunity: Mapping[str, Any],
+    *,
+    page_label: str,
+    default_how: str,
+) -> str:
+    profile = _as_mapping(opportunity.get("controller_profile")) or build_controller_profile(
+        _as_list(opportunity.get("controlled_by"))
+    )
+    if is_canonical_source_vacuum(profile):
+        return (
+            f"Make {page_label} the official source of truth first, audit the weak "
+            "third-party reseller trail, then add offer, bundle, subscription, and "
+            "why-buy-direct proof."
+        )
+    if _clean_str(profile.get("strategy")) == "source_authority_gap":
+        return (
+            f"Make {page_label} the cited + buyable official source first, then pitch "
+            "the evidenced source trail with proof and direct-buy mechanics."
+        )
+    return default_how
+
+
 def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     product = _as_mapping(evidence.get("product"))
     title = _clean_str(product.get("title")) or "this SKU"
@@ -1129,43 +1179,135 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
     controller_phrase = _controller_phrase(controllers)
     attributes = _as_mapping(product.get("attributes"))
     angle_terms = _brief_angle_terms(attributes)
+    lead_profile = _as_mapping(lead.get("controller_profile")) or build_controller_profile(
+        _as_list(lead.get("controlled_by"))
+    )
+    vacuum_strategy = is_canonical_source_vacuum(lead_profile)
+    source_authority_strategy = _clean_str(lead_profile.get("strategy")) == "source_authority_gap"
 
-    first_moves = [
-        (
-            f"Make {page_label} the cited + buyable canonical page for {query}, "
-            "then add a first-order offer so buyers have a reason to choose the "
-            "merchant path."
-        ),
-        (
-            f"Add a starter + replenishment bundle on {page_label} for {query}, "
-            "so the page has a concrete value reason beyond third-party exposure."
-        ),
-        (
-            "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
-            "loyalty, returns, stock, and fresh facts."
-        ),
-    ]
+    if vacuum_strategy:
+        first_moves = [
+            (
+                f"Make {page_label} the official source of truth for {query}: exact "
+                "SKU facts, proof, stock, returns, and authorized where-to-buy."
+            ),
+            (
+                f"Audit {controller_phrase} for wrong titles, images, variants, stock, "
+                "authorization, and stale facts before treating this as a retailer value fight."
+            ),
+            (
+                "Add first-order offer, starter + replenishment bundle, subscription "
+                "incentive, and why-buy-direct proof once the official page is source-ready."
+            ),
+        ]
+    elif source_authority_strategy:
+        first_moves = [
+            (
+                f"Make {page_label} the cited + buyable official source for {query}, "
+                "with proof, availability, images, and fresh SKU facts."
+            ),
+            (
+                f"Pitch {controller_phrase} only after the official page carries the "
+                "facts and direct-buy reason."
+            ),
+            (
+                "Add first-order offer, starter + replenishment bundle, subscription "
+                "incentive, and why-buy-direct proof."
+            ),
+        ]
+    else:
+        first_moves = [
+            (
+                f"Make {page_label} the cited + buyable canonical page for {query}, "
+                "then add a first-order offer so buyers have a reason to choose the "
+                "merchant path."
+            ),
+            (
+                f"Add a starter + replenishment bundle on {page_label} for {query}, "
+                "so the page has a concrete value reason beyond third-party exposure."
+            ),
+            (
+                "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
+                "loyalty, returns, stock, and fresh facts."
+            ),
+        ]
     if controller_phrase != "the cited sources":
         first_moves.append(
             f"Update the source trail around {controller_phrase} only after {page_label} "
             "has the direct buying reason."
         )
 
-    return {
-        "position": (
+    if vacuum_strategy:
+        position = (
+            f"{title} has real demand in AI answers, but AI is filling the buying path "
+            f"with {controller_phrase}, not {destination}."
+        )
+        core_decision = (
+            f"Fix the official-source gap for {query} first; appearing in AI answers "
+            "is not the win while third-party hosts define where buyers go."
+        )
+        why_you_lose = (
+            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
+            f"{destination} is not yet the strongest official source for this lane."
+        )
+        traffic_how_default = (
+            f"Make {page_label} the official source of truth first, audit the weak "
+            "third-party reseller trail, then add offer, bundle, subscription, and "
+            "why-buy-direct proof."
+        )
+        self_serve = [
+            "Publish official SKU facts, proof, stock, returns, and authorized where-to-buy.",
+            "Audit weak third-party reseller listings and add the direct-buy mechanics.",
+        ]
+    elif source_authority_strategy:
+        position = (
+            f"{title} has real demand in AI answers, but the buying path is shaped by "
+            f"{controller_phrase}, not {destination}."
+        )
+        core_decision = (
+            f"Make {page_label} the official source for {query}, then work the cited "
+            "source trail with the same facts."
+        )
+        why_you_lose = (
+            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
+            "third-party source authority is capturing the path before the official page does."
+        )
+        traffic_how_default = (
+            f"Make {page_label} the cited + buyable official source first, then pitch "
+            "the evidenced source trail with proof and direct-buy mechanics."
+        )
+        self_serve = [
+            "Publish official proof, availability, images, and SKU facts.",
+            "Pitch only the cited sources and add the direct-buy mechanics.",
+        ]
+    else:
+        position = (
             f"{title} has real demand in AI answers, but the buying path is controlled "
             f"by {controller_phrase}, not {destination}."
-        ),
-        "core_decision": (
+        )
+        core_decision = (
             f"Make {page_label} the better place to buy for {query}; appearing in "
             "AI answers is not the win until buyers have a reason to choose the "
             "merchant-controlled path."
-        ),
-        "why_you_lose": (
+        )
+        why_you_lose = (
             f"AI's answers show {controller_phrase} shaping {query}. That suggests "
             "source and distribution authority are capturing the buyer path before "
             f"{destination} does."
-        ),
+        )
+        traffic_how_default = (
+            f"Make {page_label} the cited + buyable canonical page first, "
+            "then add the offer, bundle, subscription, and why-buy-direct proof."
+        )
+        self_serve = [
+            "Add the offer, bundle, subscription, and why-buy-direct proof.",
+            "Keep price, stock, returns, reviews, and product facts fresh.",
+        ]
+
+    return {
+        "position": position,
+        "core_decision": core_decision,
+        "why_you_lose": why_you_lose,
         "your_angle": (
             f"Use the evidenced product angle — {angle_terms} — as the reason the "
             "merchant-controlled page deserves to be cited and bought from."
@@ -1181,8 +1323,11 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
                     )
                 ),
                 "how": (
-                    f"Make {page_label} the cited + buyable canonical page first, "
-                    "then add the offer, bundle, subscription, and why-buy-direct proof."
+                    _deterministic_traffic_how(
+                        item,
+                        page_label=page_label,
+                        default_how=traffic_how_default,
+                    )
                 ),
             }
             for item in opportunities[:3]
@@ -1190,10 +1335,7 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         "substitution_play": _deterministic_substitution_play(evidence, page_label),
         "first_moves": first_moves[:5],
         "diy_vs_pivota": {
-            "self_serve": [
-                "Add the offer, bundle, subscription, and why-buy-direct proof.",
-                "Keep price, stock, returns, reviews, and product facts fresh.",
-            ],
+            "self_serve": self_serve,
             "pivota": (
                 "Pivota makes the canonical page cited, buyable, and agent-checkout "
                 "ready, then monitors whether these same lanes move toward the "
