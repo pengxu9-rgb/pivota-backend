@@ -47,6 +47,12 @@ from services.next_best_action import (
     build_sku_next_best_action,
 )
 from services.pivota_indexing_arc import compute_indexing_arc_state
+from services.sku_lane_priority import (
+    enrich_lane_priority,
+    has_lane_demand,
+    is_third_party_controlled_lane,
+    lane_priority_sort_key,
+)
 from services.sku_sidewalk import (
     build_sku_attribute_graph,
     generate_sidewalk_query_specs,
@@ -5080,19 +5086,9 @@ def _prompt_sources(row: Mapping[str, Any]) -> List[Any]:
 
 
 def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    ownership = str(row.get("ownership_state") or "").strip().lower()
-    route = str(row.get("source_route") or "").strip().lower()
-    if ownership == "merchant-owned":
+    if not is_third_party_controlled_lane(row):
         return None
-    if ownership not in {
-        "retailer-owned",
-        "marketplace-owned",
-        "publisher-owned",
-        "forum-owned",
-        "competitor-owned",
-    } and route not in {"retailer", "marketplace", "publisher", "forum", "brand"}:
-        return None
-    if float(row.get("demand_signal") or 0) <= 0 and float(row.get("opportunity_score") or 0) <= 0:
+    if not has_lane_demand(row):
         return None
     query = str(row.get("query") or "").strip()
     sources = _prompt_sources(row)
@@ -5108,11 +5104,26 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
         "lane": query,
         "controllers": controllers,
         "move": (
-            f"Use the official page for {query or 'this exposed lane'} to beat "
-            f"{controller_phrase}: first-order offer, starter + replenishment bundle, "
-            "subscription incentive, and why-buy-direct proof."
+            f"Use the cited + buyable official page for {query or 'this exposed lane'} "
+            f"to beat {controller_phrase}: first-order offer, starter + replenishment "
+            "bundle, subscription incentive, and why-buy-direct proof."
         ),
     }
+
+
+def _lane_priority_output_fields(row: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in (
+        "lane_priority_score",
+        "merchant_fit_score",
+        "conversion_fit_score",
+        "merchant_fit_reasons",
+        "fit_penalties",
+        "selection_reason",
+    ):
+        if key in row:
+            out[key] = row.get(key)
+    return out
 
 
 def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -5128,7 +5139,11 @@ def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
         "ownership_state": row.get("ownership_state"),
         "who_owns": _who_owns_prompt(row),
         "sources": _prompt_sources(row),
+        "source_route": row.get("source_route"),
+        "demand_signal": row.get("demand_signal"),
+        "attribute_basis": row.get("attribute_basis"),
         "opportunity_score": row.get("opportunity_score"),
+        **_lane_priority_output_fields(row),
     }
     buyer_path_action = _sku_intelligence_buyer_path_action(row)
     if buyer_path_action:
@@ -5233,15 +5248,44 @@ def _buyer_path_prompt_count(rows: List[Mapping[str, Any]]) -> int:
     return count
 
 
-def _buyer_path_primary_row(rows: List[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
+def _buyer_path_selected_action_query(next_best_action: Mapping[str, Any]) -> str:
+    evidence = next_best_action.get("evidence_used")
+    if not isinstance(evidence, Mapping):
+        return ""
+    prompt = evidence.get("source_route_prompt")
+    if not isinstance(prompt, Mapping):
+        return ""
+    return _buyer_path_clean_str(prompt.get("query")).lower()
+
+
+def _buyer_path_primary_row(
+    rows: List[Mapping[str, Any]],
+    *,
+    next_best_action: Optional[Mapping[str, Any]] = None,
+) -> Optional[Mapping[str, Any]]:
     candidates = [
         row for row in rows
         if _buyer_path_is_third_party(row) and _buyer_path_clean_str(row.get("query"))
     ]
     if not candidates:
         return None
+    selected_query = (
+        _buyer_path_selected_action_query(next_best_action)
+        if isinstance(next_best_action, Mapping) else ""
+    )
+    if selected_query:
+        selected = next(
+            (
+                row for row in candidates
+                if _buyer_path_clean_str(row.get("query")).lower() == selected_query
+            ),
+            None,
+        )
+        if selected:
+            return selected
     candidates.sort(
         key=lambda row: (
+            lane_priority_sort_key(row),
             -float(row.get("opportunity_score") or 0),
             _buyer_path_clean_str(row.get("query")).lower(),
         )
@@ -5295,14 +5339,21 @@ def summarize_sku_buyer_path(sku_intelligence: Mapping[str, Any]) -> Dict[str, A
     merchant_owned_count = sum(1 for row in rows if _buyer_path_is_merchant_owned(row))
     third_party_rows = [row for row in rows if _buyer_path_is_third_party(row)]
     third_party_controlled_count = len(third_party_rows)
-    primary_row = _buyer_path_primary_row(rows)
+    next_best_action = sku_intelligence.get("next_best_action")
+    primary_row = _buyer_path_primary_row(
+        rows,
+        next_best_action=next_best_action if isinstance(next_best_action, Mapping) else None,
+    )
     primary_lane = (
         _buyer_path_clean_str(primary_row.get("query")) if primary_row else None
     )
     controllers: List[str] = []
+    if primary_row:
+        controllers.extend(_buyer_path_row_controllers(primary_row))
     for row in third_party_rows:
+        if primary_row is row:
+            continue
         controllers.extend(_buyer_path_row_controllers(row))
-    next_best_action = sku_intelligence.get("next_best_action")
     if not controllers and isinstance(next_best_action, Mapping):
         controllers.extend(_buyer_path_fallback_controllers(next_best_action))
     top_controllers = _buyer_path_unique(controllers)[:3]
@@ -5561,9 +5612,20 @@ def _display_sku_intelligence(
         row for row in (opportunity.get("per_prompt") or [])
         if isinstance(row, dict)
     ]
+    product_evidence = (
+        opportunity.get("product_evidence")
+        if isinstance(opportunity.get("product_evidence"), Mapping)
+        else {}
+    )
+    prioritized_per_prompt = [
+        enrich_lane_priority(row, product_evidence=product_evidence)
+        if is_third_party_controlled_lane(row) and has_lane_demand(row)
+        else dict(row)
+        for row in per_prompt
+    ]
     sidewalk_open_queries = {
         row.get("query")
-        for row in per_prompt
+        for row in prioritized_per_prompt
         if row.get("open_lane")
         and _sku_intelligence_ladder_layer(row) == "sidewalk_opportunity"
     }
@@ -5575,16 +5637,21 @@ def _display_sku_intelligence(
     lanes = [dict(lane) for lane in open_lanes[:3]]
     matrix_rows = [
         _trim_sku_intelligence_prompt(row)
-        for row in per_prompt
+        for row in prioritized_per_prompt
     ]
     matrix_rows.sort(
         key=lambda row: (
+            0 if row.get("lane_priority_score") is not None else 1,
+            -float(row.get("lane_priority_score") or 0),
+            -float(row.get("merchant_fit_score") or 0),
+            -float(row.get("conversion_fit_score") or 0),
             -float(row.get("opportunity_score") or 0),
             str(row.get("query") or "").lower(),
         )
     )
     is_empty = len(lanes) == 0
     display_opportunity = dict(opportunity)
+    display_opportunity["per_prompt"] = prioritized_per_prompt
     display_opportunity["top_open_lanes"] = lanes
     next_best_action = build_sku_next_best_action(
         opportunity=display_opportunity,

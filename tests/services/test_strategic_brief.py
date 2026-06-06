@@ -501,26 +501,131 @@ def test_assemble_sku_brief_evidence_supports_ownist_brand_path_exposure():
     assert evidence["product"]["merchant_path"]["goal"] == (
         "drive buyers to the brand's own website"
     )
-    assert evidence["buyer_path_opportunities"] == [
-        {
-            "query": "best beauty supplement for glow",
-            "exposure": "retailer-owned",
-            "route": "retailer",
-            "controlled_by": [
-                {"host": "walmart.com", "role": "retailer"},
-                {"host": "amazon.com", "role": "marketplace"},
-            ],
-            "destination": "the brand's own website",
-            "merchant_archetype": "brand",
-            "recommended_moves": [
-                "Make the official brand PDP the canonical cited page for this lane.",
-                "Add a first-order offer without inventing a discount depth.",
-                "Add a starter + replenishment bundle.",
-                "Add a subscription incentive where the product supports replenishment.",
-                "Add why-buy-direct proof: guarantee, samples, loyalty, returns, stock, and fresh facts.",
-            ],
-        }
+    assert len(evidence["buyer_path_opportunities"]) == 1
+    ownist_path = evidence["buyer_path_opportunities"][0]
+    assert ownist_path["query"] == "best beauty supplement for glow"
+    assert ownist_path["exposure"] == "retailer-owned"
+    assert ownist_path["route"] == "retailer"
+    assert ownist_path["controlled_by"] == [
+        {"host": "walmart.com", "role": "retailer"},
+        {"host": "amazon.com", "role": "marketplace"},
     ]
+    assert ownist_path["destination"] == "the brand's own website"
+    assert ownist_path["merchant_archetype"] == "brand"
+    assert ownist_path["recommended_moves"] == [
+        "Make the official brand PDP the cited + buyable canonical page for this lane.",
+        "Add a first-order offer without inventing a discount depth.",
+        "Add a starter + replenishment bundle.",
+        "Add a subscription incentive where the product supports replenishment.",
+        "Add why-buy-direct proof: guarantee, samples, loyalty, returns, stock, and fresh facts.",
+    ]
+    assert ownist_path["lane_priority_score"] >= 0
+
+
+def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_snack_drift():
+    opportunity = {
+        "intent_ladder": {
+            "branded_transactional": {"score": 100},
+            "head_category": {"score": 20},
+        },
+        "per_prompt": [
+            {
+                "query": "healthy snacks collagen jelly",
+                "axis": "sidewalk",
+                "query_class": "sidewalk",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "demand_signal": 1.0,
+                "opportunity_score": 18.0,
+                "attribute_basis": ["healthy snacks", "collagen", "jelly"],
+                "source_roles": [
+                    {"host": "cogentsteps.net", "role": "publisher"},
+                    {"host": "medsysgroup.com", "role": "publisher"},
+                    {"host": "hellokoop.com", "role": "retailer"},
+                ],
+            },
+            {
+                "query": "vitamin c collagen jelly",
+                "axis": "sidewalk",
+                "query_class": "sidewalk",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "demand_signal": 1.0,
+                "opportunity_score": 5.45,
+                "attribute_basis": ["vitamin c", "collagen", "jelly"],
+                "source_roles": [
+                    {"host": "cogentsteps.net", "role": "publisher"},
+                    {"host": "medsysgroup.com", "role": "publisher"},
+                    {"host": "oliveyoung.com", "role": "retailer"},
+                ],
+            },
+        ],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+    }
+
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph={
+            "classes": {
+                "category": ["collagen jelly"],
+                "format": ["jelly"],
+                "ingredient": ["vitamin c", "collagen"],
+                "use_case": ["healthy skin", "anti age"],
+                "geography": ["korean"],
+            }
+        },
+        primary_gaps=[],
+        scores={},
+        identity={
+            "name": "Ownist Triple Shine Grape",
+            "anchors": {"brand": "Ownist"},
+            "merchant_type": "brand",
+        },
+        sku_title="Ownist Triple Shine Grape",
+    )
+
+    opportunities = evidence["buyer_path_opportunities"]
+    assert opportunities[0]["query"] == "vitamin c collagen jelly"
+    assert opportunities[0]["lane_priority_score"] > opportunities[1]["lane_priority_score"]
+    assert opportunities[0]["controlled_by"] == [
+        {"host": "cogentsteps.net", "role": "publisher"},
+        {"host": "medsysgroup.com", "role": "publisher"},
+        {"host": "oliveyoung.com", "role": "retailer"},
+    ]
+    assert "cited + buyable canonical page" in opportunities[0]["recommended_moves"][0]
+    assert len(opportunities[0]["controlled_by"]) == 3
+
+
+def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabricated_economics():
+    evidence = _evidence()
+    evidence["buyer_path_opportunities"] = [
+        {
+            "query": "vitamin c collagen jelly",
+            "controlled_by": [
+                {"host": "oliveyoung.com", "role": "retailer"},
+                {"host": "costco.com", "role": "retailer"},
+                {"host": "flyairseoul.com", "role": "publisher"},
+            ],
+            "recommended_moves": [
+                "Make the official brand PDP the cited + buyable canonical page for this lane.",
+                "Add a first-order offer without inventing a discount depth.",
+            ],
+        },
+    ]
+
+    brief = strategic_brief._deterministic_brief(evidence)
+    blob = json.dumps(brief).lower()
+
+    assert brief is not None
+    assert "cited + buyable canonical page" in blob
+    assert "agent-checkout ready" in blob
+    assert "first-order offer" in blob
+    assert "starter + replenishment bundle" in blob
+    assert "why-buy-direct" in blob
+    assert "%" not in blob
+    assert "$" not in blob
+    assert strategic_brief.validate_grounding(brief, evidence) is True
 
 
 def test_validation_fix_accepts_grounded_bb_lab_brief_without_false_positives():

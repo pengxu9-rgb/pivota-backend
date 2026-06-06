@@ -2654,6 +2654,21 @@ def test_buyer_path_postprocessor_caps_ownist_controllers_and_avoids_grape_jelly
     brand_report["merchant_name"] = "Ownist"
     sku_intelligence = _sku_intelligence_with_prompt_rows([
         {
+            "query": "healthy snacks collagen jelly",
+            "ownership_state": "retailer-owned",
+            "sources": [
+                {"host": "cogentsteps.net", "times_cited": 1},
+                {"host": "medsysgroup.com", "times_cited": 1},
+                {"host": "hellokoop.com", "times_cited": 1},
+            ],
+            "buyer_path_action": {
+                "controllers": ["cogentsteps.net", "medsysgroup.com", "hellokoop.com"],
+            },
+            "opportunity_score": 18.0,
+            "lane_priority_score": 0.21,
+            "fit_penalties": ["lifestyle_drift:healthy snacks"],
+        },
+        {
             "query": "vitamin c collagen jelly",
             "ownership_state": "retailer-owned",
             "sources": [
@@ -2665,6 +2680,7 @@ def test_buyer_path_postprocessor_caps_ownist_controllers_and_avoids_grape_jelly
                 "controllers": ["oliveyoung.com", "costco.com", "flyairseoul.com"],
             },
             "opportunity_score": 14.82,
+            "lane_priority_score": 0.74,
         },
         {
             "query": "anti age collagen jelly",
@@ -2679,6 +2695,16 @@ def test_buyer_path_postprocessor_caps_ownist_controllers_and_avoids_grape_jelly
             "opportunity_score": 10.1,
         },
     ])
+    sku_intelligence["next_best_action"]["evidence_used"] = {
+        "source_route_prompt": {
+            "query": "vitamin c collagen jelly",
+            "sources": [
+                {"host": "oliveyoung.com", "times_cited": 1},
+                {"host": "costco.com", "times_cited": 1},
+                {"host": "flyairseoul.com", "times_cited": 1},
+            ],
+        }
+    }
 
     assert all("grape jelly" not in row["query"].lower() for row in sku_intelligence["prompt_matrix"])
     out = apply_buyer_path_verdict_to_brand_report(brand_report, sku_intelligence)
@@ -2693,6 +2719,7 @@ def test_buyer_path_postprocessor_caps_ownist_controllers_and_avoids_grape_jelly
     ]
     assert len(buyer_path["top_controllers"]) == 3
     assert "grape jelly" not in out["per_product"][0]["verdict"]["explanation"].lower()
+    assert "healthy snacks collagen jelly" not in out["per_product"][0]["verdict"]["explanation"]
 
 
 def test_buyer_path_postprocessor_keeps_strong_display_when_path_is_merchant_controlled() -> None:

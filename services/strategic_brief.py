@@ -20,6 +20,12 @@ from services.llm_synthesis import (
     normalize_provider,
     synthesize,
 )
+from services.sku_lane_priority import (
+    build_lane_product_evidence,
+    has_lane_demand,
+    is_third_party_controlled_lane,
+    prioritize_lanes,
+)
 
 _STRATEGIC_BRIEF_SYSTEM_PROMPT = """You are a senior D2C brand & growth strategist — the merchant's marketing director — writing the
 next-steps section of an AI-shopping-visibility audit. You make sharp, decisive calls a smart founder
@@ -519,6 +525,12 @@ def assemble_sku_brief_evidence(
     anchors = _as_mapping(identity_map.get("anchors"))
     brand = _clean_str(anchors.get("brand"))
     merchant_path = _merchant_path(identity=identity_map, opportunity=opportunity_map)
+    product_evidence = _as_mapping(opportunity_map.get("product_evidence")) or build_lane_product_evidence(
+        product={"title": title, "brand": brand, "category": anchors.get("category")},
+        attribute_graph=attribute_graph,
+        identity=identity_map,
+        sku_title=title,
+    )
 
     category_rows = _category_battle_rows(opportunity_map)
     category_battle = _category_battle(category_rows)
@@ -548,6 +560,7 @@ def assemble_sku_brief_evidence(
         "buyer_path_opportunities": _buyer_path_opportunities(
             opportunity=opportunity_map,
             merchant_path=merchant_path,
+            product_evidence=product_evidence,
         ),
         "grounding_notes": grounding_notes,
         "demand_state": opportunity_map.get("demand_state_summary"),
@@ -749,6 +762,7 @@ def _buyer_path_opportunities(
     *,
     opportunity: Mapping[str, Any],
     merchant_path: Mapping[str, Any],
+    product_evidence: Mapping[str, Any],
 ) -> List[Dict[str, Any]]:
     rows: List[Mapping[str, Any]] = []
     for row in _as_list(opportunity.get("per_prompt")):
@@ -757,31 +771,33 @@ def _buyer_path_opportunities(
         query = _clean_str(row.get("query"))
         if not query:
             continue
-        ownership = _clean_str(row.get("ownership_state")).lower()
-        route = _clean_str(row.get("source_route")).lower()
-        if ownership not in _LOST_CATEGORY_OWNERSHIP and route not in {
-            "retailer",
-            "marketplace",
-            "publisher",
-            "forum",
-        }:
+        if not is_third_party_controlled_lane(row):
             continue
-        if float(row.get("demand_signal") or 0) <= 0 and float(row.get("opportunity_score") or 0) <= 0:
+        if not has_lane_demand(row):
             continue
         if not _buyer_path_controllers(row):
             continue
         rows.append(row)
-    rows.sort(
-        key=lambda row: (
-            -float(row.get("opportunity_score") or 0),
-            -float(row.get("demand_signal") or 0),
-            _clean_str(row.get("query")).lower(),
-        )
+    prioritized = prioritize_lanes(
+        rows,
+        product_evidence=product_evidence,
     )
-    return [
-        _buyer_path_opportunity(row, merchant_path)
-        for row in rows[:5]
-    ]
+    return [_buyer_path_opportunity(row, merchant_path) for row in prioritized[:5]]
+
+
+def _lane_priority_fields(row: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in (
+        "lane_priority_score",
+        "merchant_fit_score",
+        "conversion_fit_score",
+        "merchant_fit_reasons",
+        "fit_penalties",
+        "selection_reason",
+    ):
+        if key in row:
+            out[key] = row.get(key)
+    return out
 
 
 def _buyer_path_opportunity(
@@ -800,6 +816,7 @@ def _buyer_path_opportunity(
         "destination": _clean_str(merchant_path.get("destination")),
         "merchant_archetype": _clean_str(merchant_path.get("archetype")),
         "recommended_moves": _buyer_path_moves(merchant_path),
+        **_lane_priority_fields(row),
     }
 
 
@@ -821,7 +838,7 @@ def _buyer_path_controllers(row: Mapping[str, Any]) -> List[Dict[str, str]]:
 def _buyer_path_moves(merchant_path: Mapping[str, Any]) -> List[str]:
     page = _clean_str(merchant_path.get("page_label")) or "merchant-controlled page"
     return [
-        f"Make {page} the canonical cited page for this lane.",
+        f"Make {page} the cited + buyable canonical page for this lane.",
         "Add a first-order offer without inventing a discount depth.",
         "Add a starter + replenishment bundle.",
         "Add a subscription incentive where the product supports replenishment.",
@@ -1115,8 +1132,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
 
     first_moves = [
         (
-            f"Make {page_label} the canonical cited page for {query}, then add "
-            "a first-order offer so buyers have a reason to choose the merchant path."
+            f"Make {page_label} the cited + buyable canonical page for {query}, "
+            "then add a first-order offer so buyers have a reason to choose the "
+            "merchant path."
         ),
         (
             f"Add a starter + replenishment bundle on {page_label} for {query}, "
@@ -1139,9 +1157,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"by {controller_phrase}, not {destination}."
         ),
         "core_decision": (
-            f"Make {page_label} the better place to buy for {query}; stop treating "
-            "third-party exposure as a win until buyers have a reason to choose the "
-            "merchant-controlled page."
+            f"Make {page_label} the better place to buy for {query}; appearing in "
+            "AI answers is not the win until buyers have a reason to choose the "
+            "merchant-controlled path."
         ),
         "why_you_lose": (
             f"AI's answers show {controller_phrase} shaping {query}. That suggests "
@@ -1163,8 +1181,8 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
                     )
                 ),
                 "how": (
-                    f"Make {page_label} the canonical page first, then add the "
-                    "offer, bundle, subscription, and why-buy-direct proof."
+                    f"Make {page_label} the cited + buyable canonical page first, "
+                    "then add the offer, bundle, subscription, and why-buy-direct proof."
                 ),
             }
             for item in opportunities[:3]
@@ -1177,8 +1195,9 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
                 "Keep price, stock, returns, reviews, and product facts fresh.",
             ],
             "pivota": (
-                "Pivota makes the page cited and buyable, then monitors whether "
-                "these same lanes move toward the merchant-controlled path."
+                "Pivota makes the canonical page cited, buyable, and agent-checkout "
+                "ready, then monitors whether these same lanes move toward the "
+                "merchant-controlled path."
             ),
         },
     }

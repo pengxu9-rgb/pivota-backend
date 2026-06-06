@@ -25,6 +25,7 @@ from services.agent_center_bd_report_service import (
 )
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.cited_host_classifier import classify_host
+from services.sku_lane_priority import build_lane_product_evidence
 
 
 # Ordering/fallback for per-prompt provider verdicts. _expected_providers also
@@ -112,9 +113,15 @@ def build_sku_opportunity(
         )
     )
     aggregate = _build_sku_aggregate(per_prompt, providers=all_providers)
+    product_evidence = build_lane_product_evidence(
+        product=product,
+        sku_ctx=sku_ctx,
+        attribute_graph=graph,
+    )
     return {
         "per_prompt": per_prompt,
         "sku_aggregate": aggregate,
+        "product_evidence": product_evidence,
         "opportunity_formula": {
             "score": (
                 "attribute_fit * intent_weight * demand_signal * "

@@ -18,6 +18,7 @@ from services.next_best_action import (
     build_next_best_action,
     build_sku_next_best_action,
 )
+from services.sku_lane_priority import build_lane_product_evidence
 
 
 def _merchant_view(
@@ -694,6 +695,138 @@ def test_sku_nba_ownist_brand_path_ties_offer_bundle_to_real_exposed_lane():
     assert "bundle" in copy
     assert "subscription incentive" in copy
     assert "why-buy-direct" in copy
+
+
+def _ownist_product_evidence(*, snack_positioning: bool = False) -> Dict[str, Any]:
+    product = {
+        "title": "Ownist Triple Shine Grape",
+        "category": "healthy snacks" if snack_positioning else "beauty supplement",
+        "tags": ["healthy snacks"] if snack_positioning else [],
+    }
+    graph = {
+        "classes": {
+            "category": ["collagen jelly"],
+            "format": ["jelly"],
+            "ingredient": ["collagen"] if snack_positioning else ["vitamin c", "collagen"],
+            "use_case": [] if snack_positioning else ["healthy skin", "anti age"],
+            "geography": [] if snack_positioning else ["korean"],
+        }
+    }
+    return build_lane_product_evidence(product=product, attribute_graph=graph)
+
+
+def _ownist_lane(
+    query: str,
+    *,
+    opportunity_score: float,
+    controllers: List[str],
+    attribute_basis: List[str],
+) -> Dict[str, Any]:
+    return {
+        "query": query,
+        "axis": "sidewalk",
+        "query_class": "sidewalk",
+        "ownership_state": "retailer-owned",
+        "source_route": "retailer",
+        "opportunity_score": opportunity_score,
+        "demand_signal": 1.0,
+        "attribute_basis": attribute_basis,
+        "source_summary": {
+            "top_cited_hosts": [
+                {"host": host, "times_cited": 1}
+                for host in controllers
+            ]
+        },
+    }
+
+
+def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 5, "prompts_with_demand": 5}
+    opportunity["product_evidence"] = _ownist_product_evidence()
+    opportunity["per_prompt"] = [
+        _ownist_lane(
+            "healthy snacks collagen jelly",
+            opportunity_score=18.0,
+            controllers=["cogentsteps.net", "medsysgroup.com", "hellokoop.com"],
+            attribute_basis=["healthy snacks", "collagen", "jelly"],
+        ),
+        _ownist_lane(
+            "vitamin c collagen jelly",
+            opportunity_score=5.45,
+            controllers=["cogentsteps.net", "medsysgroup.com", "oliveyoung.com"],
+            attribute_basis=["vitamin c", "collagen", "jelly"],
+        ),
+        _ownist_lane(
+            "healthy skin collagen jelly",
+            opportunity_score=13.63,
+            controllers=["ubuy.mq", "truehuebeauty.com", "dodoskin.com"],
+            attribute_basis=["healthy skin", "collagen", "jelly"],
+        ),
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(80),
+        identity={
+            "name": "Ownist Triple Shine Grape",
+            "anchors": {"brand": "Ownist"},
+            "merchant_type": "brand",
+            "unresolved": False,
+        },
+        sku_title="Ownist Triple Shine Grape",
+    )
+
+    selected = nba["evidence_used"]["source_route_prompt"]
+    copy = _nba_strings(nba)
+    assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
+    assert selected["query"] == "vitamin c collagen jelly"
+    assert selected["lane_priority_score"] > 0
+    assert "vitamin c collagen jelly" in copy
+    assert "healthy snacks collagen jelly" not in nba["first_move"]
+    assert "cited + buyable" in copy
+    assert "agent-checkout ready" in copy
+    assert "first-order offer" in copy
+    assert "starter + replenishment bundle" in copy
+    assert "subscription incentive" in copy
+    assert "why-buy-direct" in copy
+    assert "%" not in copy and "$" not in copy
+
+
+def test_sku_nba_ownist_allows_healthy_snacks_when_explicitly_supported():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 3, "prompts_with_demand": 3}
+    opportunity["product_evidence"] = _ownist_product_evidence(snack_positioning=True)
+    opportunity["per_prompt"] = [
+        _ownist_lane(
+            "healthy snacks collagen jelly",
+            opportunity_score=18.0,
+            controllers=["cogentsteps.net", "medsysgroup.com", "hellokoop.com"],
+            attribute_basis=["healthy snacks", "collagen", "jelly"],
+        ),
+        _ownist_lane(
+            "vitamin c collagen jelly",
+            opportunity_score=5.45,
+            controllers=["cogentsteps.net", "medsysgroup.com", "oliveyoung.com"],
+            attribute_basis=["vitamin c", "collagen", "jelly"],
+        ),
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(80),
+        identity={
+            "name": "Ownist Collagen Healthy Snack Jelly",
+            "anchors": {"brand": "Ownist"},
+            "merchant_type": "brand",
+            "unresolved": False,
+        },
+        sku_title="Ownist Collagen Healthy Snack Jelly",
+    )
+
+    selected = nba["evidence_used"]["source_route_prompt"]
+    assert selected["query"] == "healthy snacks collagen jelly"
+    assert selected["fit_penalties"] == []
 
 
 def test_sku_nba_channel_path_drives_to_channel_site_when_explicit():

@@ -11,6 +11,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from services.sku_lane_priority import (
+    has_lane_demand,
+    is_third_party_controlled_lane,
+    prioritize_lanes,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +53,6 @@ _SOURCE_HOST_TYPES = {
 _LOW_CONFIDENCE_HOST_TYPES = {"cdn", "unclassified"}
 _REQUIRED_INTEGRATION_PIECES = {"store_platform", "psp"}
 _SEVERITY_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2}
-_SKU_REPAIR_OWNERSHIP = {
-    "retailer-owned",
-    "marketplace-owned",
-    "publisher-owned",
-    "forum-owned",
-    "competitor-owned",
-}
-_SKU_REPAIR_ROUTES = {"retailer", "marketplace", "publisher", "forum", "brand"}
-
-
 def classify_primary_gap(
     *,
     merchant_view: Mapping[str, Any],
@@ -492,8 +488,9 @@ def _sku_prescription_for_gap(
 
 def _sku_pivota_path(sku_title: str) -> str:
     return (
-        f"Pivota can make {sku_title}'s page the one AI cites and lets shoppers "
-        "buy, and tell you when these prompts start naming you."
+        f"Pivota can make {sku_title}'s canonical page cited, buyable, and "
+        "agent-checkout ready, then tell you when these prompts start routing "
+        "toward your owned path."
     )
 
 
@@ -502,7 +499,8 @@ def _sku_cta(label: str) -> Dict[str, str]:
         "label": label,
         "trust_note": (
             "The merchant can make the PDP, listing, content, and outreach fixes "
-            "directly; Pivota is for canonical SKU serving, checkout, and monitoring."
+            "directly; Pivota is for cited + buyable canonical SKU serving, "
+            "agent-checkout readiness, and monitoring."
         ),
     }
 
@@ -535,24 +533,18 @@ def _sku_source_route_prompt(opportunity: Mapping[str, Any]) -> Optional[Mapping
     for row in _as_list(opportunity.get("per_prompt")):
         if not isinstance(row, Mapping):
             continue
-        ownership = str(row.get("ownership_state") or "").strip().lower()
-        source_route = str(row.get("source_route") or "").strip().lower()
-        if ownership not in _SKU_REPAIR_OWNERSHIP and source_route not in _SKU_REPAIR_ROUTES:
+        if not is_third_party_controlled_lane(row):
             continue
-        if ownership == "merchant-owned":
-            continue
-        if _score(row.get("opportunity_score")) <= 0 and float(row.get("demand_signal") or 0) <= 0:
+        if not has_lane_demand(row):
             continue
         candidates.append(row)
     if not candidates:
         return None
-    candidates.sort(
-        key=lambda row: (
-            -float(row.get("opportunity_score") or 0),
-            str(row.get("query") or "").lower(),
-        )
+    prioritized = prioritize_lanes(
+        candidates,
+        product_evidence=_as_mapping(opportunity.get("product_evidence")),
     )
-    return candidates[0]
+    return prioritized[0]
 
 
 def _sku_has_resolved_coverage(
@@ -665,7 +657,7 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     if not prompt:
         return {}
     source_summary = _as_mapping(prompt.get("source_summary"))
-    return {
+    out = {
         "query": prompt.get("query"),
         "ownership_state": prompt.get("ownership_state"),
         "source_route": prompt.get("source_route"),
@@ -674,6 +666,17 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         "sources": _as_list(source_summary.get("top_cited_hosts"))[:3],
         "competitors": _as_list(prompt.get("competitors"))[:5],
     }
+    for key in (
+        "lane_priority_score",
+        "merchant_fit_score",
+        "conversion_fit_score",
+        "merchant_fit_reasons",
+        "fit_penalties",
+        "selection_reason",
+    ):
+        if key in prompt:
+            out[key] = prompt.get(key)
+    return out
 
 
 def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
@@ -804,8 +807,9 @@ def _sku_source_route_first_move(
     competitors = _phrase(_as_str_list(prompt.get("competitors")), "the named competitor")
     page = _merchant_page_label(merchant_path)
     direct_play = (
-        f"Make {page} the better buying path for {query}: first-order offer, "
-        "starter + replenishment bundle, subscription incentive, and why-buy-direct proof"
+        f"Make {page} the cited + buyable canonical path for {query}: first-order "
+        "offer, starter + replenishment bundle, subscription incentive, and "
+        "why-buy-direct proof"
     )
     if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
         return f"{direct_play}; then fix the cited retailer/marketplace listings."
@@ -830,14 +834,14 @@ def _sku_source_route_self_serve(
     if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
         return (
             f"On {page}, tie {query} to a first-order offer, starter + replenishment "
-            "bundle, subscription incentive, and why-buy-direct block so buyers have "
-            f"a reason to choose you over {sources}."
+            "bundle, subscription incentive, and why-buy-direct block so the cited "
+            f"page gives buyers a reason to choose you over {sources}."
         )
     if ownership == "publisher-owned" or route == "publisher":
         return (
             f"On {page}, answer {query} with proof, reviews, offer mechanics, "
-            "bundle/subscription options, and a why-buy-direct block before pitching "
-            f"{sources}."
+            "bundle/subscription options, and a why-buy-direct block so the canonical "
+            f"page is worth sending buyers to before pitching {sources}."
         )
     if ownership == "forum-owned" or route == "forum":
         return (
@@ -894,14 +898,14 @@ def _sku_operator_moves(
         {
             "type": "first_order_offer",
             "lane": lane,
-            "move": f"Attach a first-order offer to {page} for {lane}.",
+            "move": f"Attach a first-order offer to the cited + buyable {page} for {lane}.",
             "why": f"The answer is already exposed through {controller}; buyers need a reason to choose {destination}.",
             "evidence": {"controllers": sources[:3]},
         },
         {
             "type": "bundle_or_replenishment",
             "lane": lane,
-            "move": f"Create a starter + replenishment bundle on {page} for {lane}.",
+            "move": f"Create a starter + replenishment bundle on the cited + buyable {page} for {lane}.",
             "why": "A bundle gives AI and shoppers a concrete value reason to prefer the merchant-controlled path.",
             "evidence": {"controllers": sources[:3]},
         },
@@ -912,7 +916,7 @@ def _sku_operator_moves(
                 "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
                 "loyalty, returns, stock, and fresh product facts."
             ),
-            "why": f"Those details make {destination} materially different from the cited third-party route.",
+            "why": f"Those details make {destination} materially different from the cited third-party route and ready for agent checkout.",
             "evidence": {"controllers": sources[:3]},
         },
     ]
