@@ -72,11 +72,22 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   buyers to the brand's own website. If archetype is "channel", the commercial goal is to drive buyers to the
   channel's own website. Do not blur those paths.
 - OPERATIONAL ECONOMICS: when buyer_path_opportunities exist, match the prescription to the controller
-  strategy. For canonical_source_vacuum or source_authority_gap, lead with authority/citability/source-trail
-  repair first; first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct
-  proof are downstream once the official page is source-ready. For leading retailer/marketplace competition,
-  include those direct-buy mechanics as the click-winning play. Do NOT invent discount depths, prices, savings
-  percentages, review counts, retailer facts, or margin claims unless they appear in EVIDENCE.
+  strategy. For canonical_source_vacuum or source_authority_gap, write a mechanism-level authority playbook
+  in this order: (1) make the merchant page more retrievable by targeting the exact evidenced lane, (2) make it
+  more extractable with product/offer/review/FAQ schema, (3) state the lane's evidenced attributes in plain page
+  text, (4) build verified reviews/proof to close the authority gap, (5) work the cited source by controller
+  type: forum/community = participate in or seed accurate product info in the evidenced discussion; publisher/
+  listicle = pitch the evidenced publisher with exact SKU facts and proof; retailer/marketplace = claim or fix
+  the evidenced listing, (6) keep SKU facts consistent across the merchant page and cited sources, (7) re-audit
+  the same lane and verify materiality before treating exposure as lost buyer traffic. Only after that, add
+  first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof. For
+  leading retailer/marketplace competition, keep listing fixes and direct-buy mechanics as the click-winning
+  play, with only a light retrieval/schema layer. Do NOT invent discount depths, prices, savings percentages,
+  review counts, retailer facts, or margin claims unless they appear in EVIDENCE.
+- AUTHORITY HONESTY: never promise that ChatGPT, Gemini, or any AI engine will cite, rank, or route to the
+  merchant page. Phrase the work as making the page more retrievable, extractable, citable, and authoritative
+  for the evidenced lane. Keep the materiality caveat: exposure is citation evidence, not proven buyer traffic,
+  until the lane is re-audited and verified.
 - LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
   singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
   — just don't present it as the searched lane.)
@@ -112,10 +123,11 @@ WRITE the brief as JSON with these fields — each must be specific to THIS prod
 - substitution_play: if a substitution is present, how to win those buyers back (comparison/positioning vs
   the named substitute), else null.
 - first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
-  strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so AI has your
-  answer to cite for the lane you're claiming"). When EVIDENCE shows weak reseller/source-route exposure, at
-  least one first move must name the exact lane and source-authority repair. When EVIDENCE shows credible
-  retailer/marketplace competition, at least one first move must name the exact lane and the operational reason
+  strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so it is more
+  citable for the lane you're claiming"). When EVIDENCE shows weak reseller/source-route exposure, at
+  least one first move must name the exact lane and source-authority repair, using the mechanism order above
+  and controller-type source route. When EVIDENCE shows credible retailer/marketplace competition, at least
+  one first move must name the exact lane, listing fix, light retrieval/schema layer, and the operational reason
   to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
@@ -139,6 +151,9 @@ _LOST_CATEGORY_OWNERSHIP = {
     "forum-owned",
 }
 _NO_CONTROL_ROUTES = {"", "none", "unclassified", "fragmented", "open-lane"}
+_COMMUNITY_CONTROLLER_TYPES = {"community", "forum", "reddit", "social"}
+_PUBLISHER_CONTROLLER_TYPES = {"editorial", "publisher", "video"}
+_LISTING_CONTROLLER_TYPES = {"marketplace", "retailer"}
 _REQUIRED_BRIEF_KEYS = {
     "position",
     "core_decision",
@@ -837,7 +852,12 @@ def _buyer_path_opportunity(
         "exposure_read": profile.get("exposure_read"),
         "destination": _clean_str(merchant_path.get("destination")),
         "merchant_archetype": _clean_str(merchant_path.get("archetype")),
-        "recommended_moves": _buyer_path_moves(merchant_path, profile),
+        "recommended_moves": _buyer_path_moves(
+            merchant_path,
+            profile,
+            row=row,
+            controllers=controllers,
+        ),
         **_lane_priority_fields(row),
     }
 
@@ -849,32 +869,124 @@ def _buyer_path_controllers(row: Mapping[str, Any]) -> List[Dict[str, str]]:
 def _buyer_path_moves(
     merchant_path: Mapping[str, Any],
     controller_profile: Optional[Mapping[str, Any]] = None,
+    *,
+    row: Optional[Mapping[str, Any]] = None,
+    controllers: Optional[List[Mapping[str, Any]]] = None,
 ) -> List[str]:
     page = _clean_str(merchant_path.get("page_label")) or "merchant-controlled page"
     profile = _as_mapping(controller_profile)
-    if is_canonical_source_vacuum(profile):
+    lane = _clean_str(_as_mapping(row).get("query")) or "this lane"
+    controller_phrase = _controller_phrase(list(controllers or []))
+    attributes = _buyer_path_attribute_phrase(_as_mapping(row))
+    if is_canonical_source_vacuum(profile) or _clean_str(profile.get("strategy")) == "source_authority_gap":
         return [
-            f"Make {page} the official source AI can cite for this lane before framing it as a retailer value fight.",
-            "Publish exact product naming, structured product data, proof, stock, and authorized where-to-buy.",
-            "Audit the weak third-party reseller trail for wrong SKU facts, stock, authorization, and stale listings; verify materiality before calling it lost traffic.",
-            "Decide which real authorized retail or marketplace routes deserve attention.",
-            "After the official page is source-ready, add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof.",
-            "Keep exact offer economics mechanics-only until audited promo or margin evidence exists.",
-        ]
-    if _clean_str(profile.get("strategy")) == "source_authority_gap":
-        return [
-            f"Make {page} the cited + buyable official source for this lane.",
-            "Use official proof, availability, images, and SKU facts before pitching the evidenced source trail.",
-            "Add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof on the official page.",
-            "Do not invent new channels; work only the cited sources in the evidence.",
+            (
+                f"Build {page} to rank for the exact lane {lane}: use the lane wording "
+                "in title, H1, metadata, and body copy so it is more retrievable and citable."
+            ),
+            (
+                f"Add product/offer/review/FAQ schema on {page} for {lane}, covering "
+                "price, availability, reviews, and decision questions."
+            ),
+            (
+                f"State {attributes} in plain page text for {lane}, not only in images, "
+                "PDFs, or variant labels."
+            ),
+            (
+                f"Build verified review and proof signals on {page} so it is more "
+                f"authoritative for {lane}."
+            ),
+            _sentence(
+                _controller_source_route_action(profile, controller_phrase, lane, page)
+            ),
+            (
+                f"Keep SKU name, {attributes}, images, availability, and canonical URL "
+                f"consistent across {page} and {controller_phrase}."
+            ),
+            (
+                f"Re-audit {lane} after the changes; verify whether exposure becomes "
+                "more citable through the merchant path before treating it as material buyer traffic."
+            ),
+            (
+                "After the page is more retrievable, extractable, and authoritative, add "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof."
+            ),
         ]
     return [
-        f"Make {page} the cited + buyable canonical page for this lane.",
+        f"Make {page} the more citable + buyable canonical page for this lane.",
         "Add a first-order offer without inventing a discount depth.",
         "Add a starter + replenishment bundle.",
         "Add a subscription incentive where the product supports replenishment.",
         "Add why-buy-direct proof: guarantee, samples, loyalty, returns, stock, and fresh facts.",
     ]
+
+
+def _buyer_path_attribute_phrase(row: Mapping[str, Any]) -> str:
+    values = (
+        _as_str_list(row.get("attribute_basis"))
+        or _as_str_list(row.get("why_fit"))
+        or _as_str_list(row.get("evidence"))
+    )
+    return _phrase_join(values[:5], "the evidenced lane attributes")
+
+
+def _controller_types(profile: Mapping[str, Any]) -> List[str]:
+    out: List[str] = []
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        for key in ("input_role", "type"):
+            value = _clean_str(row.get(key)).lower()
+            if value:
+                out.append(value)
+    return out
+
+
+def _controller_source_route_move_type(profile: Mapping[str, Any]) -> str:
+    types = set(_controller_types(profile))
+    if types & _COMMUNITY_CONTROLLER_TYPES:
+        return "community_source_participation"
+    if types & _PUBLISHER_CONTROLLER_TYPES:
+        return "publisher_source_pitch"
+    if types & _LISTING_CONTROLLER_TYPES:
+        return "retailer_listing_accuracy"
+    return "evidenced_source_update"
+
+
+def _controller_source_route_action(
+    profile: Mapping[str, Any],
+    controller_phrase: str,
+    lane: str,
+    page: str,
+) -> str:
+    move_type = _controller_source_route_move_type(profile)
+    if move_type == "community_source_participation":
+        return (
+            f"participate in or seed accurate product info in the {controller_phrase} "
+            f"discussion for {lane}, using only facts already published on {page}"
+        )
+    if move_type == "publisher_source_pitch":
+        return (
+            f"pitch {controller_phrase} for {lane} with exact SKU facts, proof "
+            f"assets, images, availability, and the canonical page at {page}"
+        )
+    if move_type == "retailer_listing_accuracy":
+        return (
+            f"claim or fix the {controller_phrase} listing for {lane}: title, "
+            "images, variant, stock, authorization, and SKU facts"
+        )
+    return (
+        f"work the evidenced source trail around {controller_phrase} for {lane} "
+        f"with the same facts published on {page}"
+    )
+
+
+def _sentence(text: str) -> str:
+    cleaned = _clean_str(text)
+    if not cleaned:
+        return ""
+    return cleaned[:1].upper() + cleaned[1:].rstrip(".") + "."
 
 
 def _channel_map(
@@ -1171,14 +1283,18 @@ def _deterministic_traffic_how(
     )
     if is_canonical_source_vacuum(profile):
         return (
-            f"Make {page_label} the official source AI can cite first, audit the weak "
-            "third-party reseller trail, verify materiality, then add offer, bundle, "
-            "subscription, and why-buy-direct proof after the page is source-ready."
+            f"Make {page_label} more retrievable and extractable for the exact lane, "
+            "state the evidenced attributes in text, build reviews/proof, work the "
+            "cited source by controller type, keep source facts consistent, re-audit "
+            "and verify materiality, then add offer, bundle, subscription, and "
+            "why-buy-direct proof last."
         )
     if _clean_str(profile.get("strategy")) == "source_authority_gap":
         return (
-            f"Make {page_label} the cited + buyable official source first, then pitch "
-            "the evidenced source trail with proof and direct-buy mechanics."
+            f"Make {page_label} more retrievable, extractable, and authoritative for "
+            "the exact lane, work the evidenced source trail by controller type, keep "
+            "facts consistent, re-audit and verify materiality, then add direct-buy "
+            "mechanics last."
         )
     return default_how
 
@@ -1200,7 +1316,7 @@ def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
         return (
             f"Start with {query} as the first beachhead and do not chase {deferred} "
             "yet; the tighter lane is more product-specific and easier to turn into "
-            "the official cited + buyable route."
+            "the official more citable + buyable route."
         )
     return (
         f"Start with {query} as the first beachhead because it is product-specific "
@@ -1231,49 +1347,71 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
     controller_phrase = _controller_phrase(controllers)
     attributes = _as_mapping(product.get("attributes"))
     angle_terms = _brief_angle_terms(attributes)
-    lead_profile = _as_mapping(lead.get("controller_profile")) or build_controller_profile(
-        _as_list(lead.get("controlled_by"))
-    )
+    lead_profile = _as_mapping(lead.get("controller_profile"))
+    if not _as_list(lead_profile.get("classified_controllers")):
+        lead_profile = build_controller_profile(_as_list(lead.get("controlled_by")))
     vacuum_strategy = is_canonical_source_vacuum(lead_profile)
     source_authority_strategy = _clean_str(lead_profile.get("strategy")) == "source_authority_gap"
     sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
     wedge_decision = _deterministic_wedge_decision(sideways_wedge)
+    source_action = _sentence(
+        _controller_source_route_action(lead_profile, controller_phrase, query, page_label)
+    )
 
     if vacuum_strategy:
         first_moves = [
             (
-                f"Make {page_label} the official source AI can cite for {query}: exact "
-                "SKU facts, structured product data, proof, stock, returns, and authorized where-to-buy."
+                f"Build {page_label} to rank for the exact lane {query} and add "
+                "product/offer/review/FAQ schema, so it is more retrievable and "
+                "extractable before any conversion play."
             ),
             (
-                f"Audit {controller_phrase} for wrong titles, images, variants, stock, "
-                "authorization, and stale facts; verify whether this citation trail is material "
-                "before framing it as a retailer value fight."
+                f"State {angle_terms} in plain page text for {query}, then build "
+                "verified reviews and proof so the official page is more authoritative."
             ),
             (
-                "After the official page is source-ready, add first-order offer, starter + replenishment bundle, "
-                "subscription incentive, and why-buy-direct proof."
+                source_action
+            ),
+            (
+                f"Keep SKU name, {angle_terms}, images, availability, and canonical URL "
+                f"consistent across {page_label} and {controller_phrase}; re-audit {query} "
+                "and verify materiality before treating exposure as lost buyer traffic."
+            ),
+            (
+                "After the page is more retrievable, extractable, and authoritative, add "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof."
             ),
         ]
     elif source_authority_strategy:
         first_moves = [
             (
-                f"Make {page_label} the cited + buyable official source for {query}, "
-                "with proof, availability, images, and fresh SKU facts."
+                f"Build {page_label} to rank for the exact lane {query} and add "
+                "product/offer/review/FAQ schema, so it is more retrievable and "
+                "extractable before outreach."
             ),
             (
-                f"Pitch {controller_phrase} only after the official page carries the "
-                "facts and direct-buy reason."
+                f"State {angle_terms} in plain page text for {query}, then build "
+                "verified reviews and proof so the official page is more authoritative."
             ),
             (
-                "Add first-order offer, starter + replenishment bundle, subscription "
-                "incentive, and why-buy-direct proof."
+                source_action
+            ),
+            (
+                f"Keep SKU name, {angle_terms}, images, availability, and canonical URL "
+                f"consistent across {page_label} and {controller_phrase}; re-audit {query} "
+                "and verify materiality before treating exposure as lost buyer traffic."
+            ),
+            (
+                "After the page is more retrievable, extractable, and authoritative, add "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof."
             ),
         ]
     else:
         first_moves = [
             (
-                f"Make {page_label} the cited + buyable canonical page for {query}, "
+                f"Make {page_label} the more citable + buyable canonical page for {query}, "
                 "then add a first-order offer so buyers have a reason to choose the "
                 "merchant path."
             ),
@@ -1298,22 +1436,25 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"{controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Fix the official-source gap for {query} and verify materiality first; do not frame "
-            "obscure cited hosts as a conversion fight before the official page is the citable source."
+            f"Make {page_label} more retrievable, extractable, citable, and authoritative for "
+            f"{query}, then verify materiality; do not frame obscure cited hosts as a conversion "
+            "fight before the authority mechanism is in place."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping the citation trail for {query}. "
-            f"That suggests {destination} is not yet the strongest official source for this lane."
+            f"That suggests {destination} is not yet the most authoritative fact-bearing source "
+            "for this lane."
         )
         traffic_how_default = (
-            f"Make {page_label} the official source AI can cite first, audit the weak "
-            "third-party reseller trail, verify materiality, then add offer, bundle, "
-            "subscription, and why-buy-direct proof after the page is source-ready."
+            f"Make {page_label} more retrievable and extractable for {query}, state "
+            f"{angle_terms} in text, build reviews/proof, work {controller_phrase} by "
+            "controller type, keep facts consistent, re-audit and verify materiality, "
+            "then add offer, bundle, subscription, and why-buy-direct proof last."
         )
         self_serve = [
-            "Publish official SKU facts, structured product data, proof, stock, returns, and authorized where-to-buy.",
-            "Audit weak third-party reseller listings and verify whether those citations are material.",
-            "Add direct-buy mechanics after the official page is source-ready.",
+            f"Build {page_label} around the exact lane, schema, and plain-text attributes.",
+            f"Work {controller_phrase} by controller type and keep facts consistent.",
+            "Re-audit the lane and verify materiality before adding direct-buy mechanics.",
         ]
     elif source_authority_strategy:
         position = (
@@ -1321,20 +1462,25 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"{controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Make {page_label} the official source for {query}, then work the cited "
-            "source trail with the same facts."
+            f"Make {page_label} more retrievable, extractable, citable, and authoritative "
+            f"for {query}, then work the cited source trail by controller type with the "
+            "same facts."
         )
         why_you_lose = (
             f"AI's answers show {controller_phrase} shaping {query}. That suggests "
-            "third-party source authority is capturing the path before the official page does."
+            "third-party source authority is carrying the facts and trust before the "
+            "official page does."
         )
         traffic_how_default = (
-            f"Make {page_label} the cited + buyable official source first, then pitch "
-            "the evidenced source trail with proof and direct-buy mechanics."
+            f"Make {page_label} more retrievable and extractable for {query}, state "
+            f"{angle_terms} in text, build reviews/proof, work {controller_phrase} by "
+            "controller type, keep facts consistent, re-audit and verify materiality, "
+            "then add direct-buy mechanics last."
         )
         self_serve = [
-            "Publish official proof, availability, images, and SKU facts.",
-            "Pitch only the cited sources and add the direct-buy mechanics.",
+            f"Build {page_label} around the exact lane, schema, and plain-text attributes.",
+            f"Work {controller_phrase} by controller type and keep facts consistent.",
+            "Re-audit the lane and verify materiality before adding direct-buy mechanics.",
         ]
     else:
         position = (
@@ -1352,7 +1498,7 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"{destination} does."
         )
         traffic_how_default = (
-            f"Make {page_label} the cited + buyable canonical page first, "
+            f"Make {page_label} the more citable + buyable canonical page first, "
             "then add the offer, bundle, subscription, and why-buy-direct proof."
         )
         self_serve = [
@@ -1380,7 +1526,7 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             how = (
                 f"Do not start here yet; use {beachhead_query} first because it is "
                 "more product-specific and easier to make the official page the best "
-                "cited + buyable route."
+                "more citable + buyable route."
             )
         traffic_strategy.append({
             "where": item_query,
@@ -1411,7 +1557,7 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         "diy_vs_pivota": {
             "self_serve": self_serve,
             "pivota": (
-                "Pivota makes the canonical page cited, buyable, and agent-checkout "
+                "Pivota makes the canonical page more citable, buyable, and agent-checkout "
                 "ready, then monitors whether these same lanes move toward the "
                 "merchant-controlled path."
             ),

@@ -12,6 +12,21 @@ from services.next_best_action import (
     build_sku_next_best_action,
 )
 
+_OVERPROMISE_PATTERNS = (
+    "will cite",
+    "will rank",
+    "guaranteed",
+    "guarantee ai citation",
+    "guarantee ai ranking",
+    "rank #1",
+)
+
+
+def _assert_no_overpromise_payload(payload: Mapping[str, Any]) -> None:
+    blob = json.dumps(payload).lower()
+    leaked = [pattern for pattern in _OVERPROMISE_PATTERNS if pattern in blob]
+    assert not leaked, leaked
+
 
 def _attribute_graph() -> Dict[str, Any]:
     return {
@@ -609,6 +624,13 @@ def test_system_prompt_contains_claim_discipline_rules():
     assert "grounding_notes.evidenced_channels" in system
     assert "MERCHANT PATH" in system
     assert "OPERATIONAL ECONOMICS" in system
+    assert "AUTHORITY HONESTY" in system
+    assert "product/offer/review/FAQ schema" in system
+    assert "forum/community = participate in or seed accurate product info" in system
+    assert "publisher/" in system and "pitch the evidenced publisher" in system
+    assert "retailer/marketplace = claim or fix" in system
+    assert "never promise" in system.lower()
+    assert "more retrievable, extractable, citable, and authoritative" in system
     assert "EXACT wording" in system
     assert "inference" in system.lower()
 
@@ -701,7 +723,7 @@ def test_assemble_sku_brief_evidence_supports_ownist_brand_path_exposure():
     assert ownist_path["merchant_archetype"] == "brand"
     assert ownist_path["controller_strategy"] == "leading_retailer_competition"
     assert ownist_path["recommended_moves"] == [
-        "Make the official brand PDP the cited + buyable canonical page for this lane.",
+        "Make the official brand PDP the more citable + buyable canonical page for this lane.",
         "Add a first-order offer without inventing a discount depth.",
         "Add a starter + replenishment bundle.",
         "Add a subscription incentive where the product supports replenishment.",
@@ -782,11 +804,15 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
         {"host": "medsysgroup.com", "role": "publisher", "times_cited": 2},
     ]
     assert opportunities[0]["controller_strategy"] == "canonical_source_vacuum"
-    assert "official source AI can cite" in opportunities[0]["recommended_moves"][0]
-    assert "structured product data" in opportunities[0]["recommended_moves"][1]
-    assert "weak third-party reseller trail" in opportunities[0]["recommended_moves"][2]
-    assert "verify materiality" in opportunities[0]["recommended_moves"][2]
-    assert "After the official page is source-ready" in opportunities[0]["recommended_moves"][4]
+    assert "rank for the exact lane vitamin c collagen jelly" in opportunities[0]["recommended_moves"][0]
+    assert "product/offer/review/FAQ schema" in opportunities[0]["recommended_moves"][1]
+    assert "vitamin c, collagen, and jelly in plain page text" in opportunities[0]["recommended_moves"][2]
+    assert "verified review and proof signals" in opportunities[0]["recommended_moves"][3]
+    assert "Pitch cogentsteps.net, hellokoop.com, and medsysgroup.com" in opportunities[0]["recommended_moves"][4]
+    assert "consistent across" in opportunities[0]["recommended_moves"][5]
+    assert "Re-audit vitamin c collagen jelly" in opportunities[0]["recommended_moves"][6]
+    assert "material buyer traffic" in opportunities[0]["recommended_moves"][6]
+    assert "After the page is more retrievable" in opportunities[0]["recommended_moves"][7]
     assert len(opportunities[0]["controlled_by"]) == 3
     wedge = evidence["sideways_wedge"]
     assert wedge["recommended_beachhead_lane"]["query"] == "vitamin c collagen jelly"
@@ -811,6 +837,7 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
     assert "Do not start here yet" in snack_strategy["how"]
     assert "vitamin c collagen jelly" in snack_strategy["how"]
     assert strategic_brief.validate_grounding(brief, evidence) is True
+    _assert_no_overpromise_payload(brief)
 
 
 def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabricated_economics():
@@ -824,7 +851,7 @@ def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabri
                 {"host": "flyairseoul.com", "role": "publisher"},
             ],
             "recommended_moves": [
-                "Make the official brand PDP the cited + buyable canonical page for this lane.",
+                "Make the official brand PDP the more citable + buyable canonical page for this lane.",
                 "Add a first-order offer without inventing a discount depth.",
             ],
         },
@@ -834,7 +861,7 @@ def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabri
     blob = json.dumps(brief).lower()
 
     assert brief is not None
-    assert "cited + buyable canonical page" in blob
+    assert "more citable + buyable canonical page" in blob
     assert "agent-checkout ready" in blob
     assert "first-order offer" in blob
     assert "starter + replenishment bundle" in blob
@@ -868,9 +895,9 @@ def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacu
                 "label": "Canonical-source vacuum",
             },
             "recommended_moves": [
-                    "Make the official brand PDP the official source AI can cite for this lane before framing it as a retailer value fight.",
-                "Audit the weak third-party reseller trail for wrong SKU facts, stock, authorization, and stale listings.",
-                "Add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof on the official page.",
+                "Build the official brand PDP to rank for the exact lane vitamin c collagen jelly.",
+                "Add product/offer/review/FAQ schema.",
+                "State vitamin c, collagen, and jelly in plain page text.",
             ],
         }
     ]
@@ -879,10 +906,13 @@ def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacu
     blob = json.dumps(brief).lower()
 
     assert brief is not None
-    assert "official source ai can cite" in blob
-    assert "weak third-party reseller trail" in blob
+    assert "rank for the exact lane vitamin c collagen jelly" in blob
+    assert "product/offer/review/faq schema" in blob
+    assert "plain page text for vitamin c collagen jelly" in blob
+    assert "pitch cogentsteps.net, medsysgroup.com, and hellokoop.com" in blob
+    assert "re-audit vitamin c collagen jelly" in blob
     assert "verify materiality" in blob
-    assert "citable source" in blob
+    assert "more citable" in blob
     assert "canonical-source gap" not in blob
     assert "beat cogentsteps" not in blob
     assert "first-order offer" in blob
@@ -891,6 +921,7 @@ def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacu
     assert "obscure cited hosts as a conversion fight" in blob
     assert "%" not in blob and "$" not in blob
     assert strategic_brief.validate_grounding(brief, evidence) is True
+    _assert_no_overpromise_payload(brief)
 
 
 def test_validation_fix_accepts_grounded_bb_lab_brief_without_false_positives():

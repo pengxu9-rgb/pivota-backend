@@ -174,10 +174,13 @@ def test_retailer_route_leak_prescribes_direct_attribution_not_generic_pr():
     assert play["lane"] == "best serum for dry skin"
     assert play["controllers"] == ["sephora.com", "amazon.com"]
     assert {move["type"] for move in play["moves"]} == {
+        "retail_listing_accuracy",
+        "light_retrieval_schema_layer",
         "first_order_offer",
         "starter_replenishment_bundle",
         "subscription_or_why_buy_direct",
     }
+    assert "product/offer schema" in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "agent-checkout ready" in play["checkout_readiness"]
     assert "%" not in play_blob and "$" not in play_blob
@@ -579,9 +582,9 @@ def test_sku_nba_content_gap_references_content_richness_bucket():
 
 
 def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
-    for route, ownership, expected in [
-        ("retailer", "retailer-owned", "official source ai can cite"),
-        ("publisher", "publisher-owned", "pitch the cited source trail"),
+    for route, ownership, expected_type in [
+        ("retailer", "retailer-owned", "retailer_listing_accuracy"),
+        ("publisher", "publisher-owned", "publisher_source_pitch"),
     ]:
         opportunity = _sku_base_opportunity()
         opportunity["per_prompt"] = [
@@ -605,21 +608,21 @@ def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
         )
 
         assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
-        blob = _nba_strings(nba)
-        assert expected in nba["first_move"].lower()
         if route == "retailer":
             assert "first-order offer" not in nba["first_move"].lower()
             assert "starter + replenishment bundle" not in nba["first_move"].lower()
         assert nba["prescription_class"] == "operational_efficiency"
         assert nba["merchant_path"]["archetype"] == "brand"
+        assert "more retrievable" in nba["first_move"].lower()
+        assert "product/offer/review/faq schema" in nba["first_move"].lower()
+        play_blob = json.dumps(nba["canonical_page_play"]).lower()
+        assert expected_type in play_blob
         if route == "retailer":
-            play_blob = json.dumps(nba["canonical_page_play"]).lower()
-            assert "after the official page is source-ready" in play_blob
+            assert "claim or fix" in play_blob
             assert "first-order offer" in play_blob
             assert "starter + replenishment bundle" in play_blob
         else:
-            play_blob = json.dumps(nba["canonical_page_play"]).lower()
-            assert "direct_buy_reason" in play_blob
+            assert "pitch publisher.example" in play_blob
             assert "first-order offer" in play_blob
             assert "starter + replenishment bundle" in play_blob
         assert nba["evidence_used"]["source_route_prompt"]["source_route"] == route
@@ -680,10 +683,13 @@ def test_sku_nba_bb_lab_brand_path_ties_operational_moves_to_retailer_exposure()
     assert play["controller_strategy"] == "leading_retailer_competition"
     assert play["page"] == "your official PDP"
     assert {move["type"] for move in play["moves"]} == {
+        "retail_listing_accuracy",
+        "light_retrieval_schema_layer",
         "first_order_offer",
         "starter_replenishment_bundle",
         "subscription_or_why_buy_direct",
     }
+    assert "product/offer schema" in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "agent-checkout ready" in play["checkout_readiness"]
     assert "%" not in play_blob and "$" not in play_blob
@@ -765,11 +771,14 @@ def test_sku_nba_bb_lab_sideways_wedge_prefers_halal_before_bed_over_head_pressu
     assert "Start with \"halal collagen sticks before bed\"" in nba["why_this_first"]
     assert nba["canonical_page_play"]["controller_strategy"] == "canonical_source_vacuum"
     play_blob = json.dumps(nba["canonical_page_play"]).lower()
-    assert "official source ai can cite" in play_blob
-    assert "weak third-party trail" in play_blob
+    assert "rank for the exact lane halal collagen sticks before bed" in play_blob
+    assert "product/offer/review/faq schema" in play_blob
+    assert "re-audit halal collagen sticks before bed" in play_blob
+    assert "verify whether exposure becomes more citable" in play_blob
     assert '"confidence": "fallback"' not in play_blob
     assert '"confidence": "inferred"' in play_blob
     assert "%" not in _nba_strings(nba) and "$" not in _nba_strings(nba)
+    _assert_no_overpromise(nba)
 
 
 def test_sku_nba_ownist_brand_path_ties_offer_bundle_to_real_exposed_lane():
@@ -820,6 +829,158 @@ def test_sku_nba_ownist_brand_path_ties_offer_bundle_to_real_exposed_lane():
     assert "walmart.com" in nba["canonical_page_play"]["controllers"]
     assert nba["canonical_page_play"]["controller_strategy"] == "leading_retailer_competition"
     assert "exact discount depths" in nba["canonical_page_play"]["economics_policy"]
+
+
+def test_sku_nba_bb_lab_forum_authority_playbook_is_ordered_and_honest():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 4, "prompts_with_demand": 4}
+    opportunity["per_prompt"] = [
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "query_class": "sidewalk",
+            "ownership_state": "forum-owned",
+            "source_route": "forum",
+            "opportunity_score": 55.0,
+            "demand_signal": 1.0,
+            "attribute_basis": ["halal", "collagen", "stick", "before bed"],
+            "source_summary": {
+                "top_cited_hosts": [{"host": "reddit.com", "times_cited": 2}]
+            },
+            "source_roles": [{"host": "reddit.com", "role": "forum", "times_cited": 2}],
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(84),
+        identity={"name": "BB Lab Good Night Collagen", "anchors": {"brand": "BB Lab"}},
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    play = nba["canonical_page_play"]
+    move_types = [move["type"] for move in play["moves"]]
+    play_blob = json.dumps(play).lower()
+
+    assert play["controller_strategy"] == "source_authority_gap"
+    assert move_types == [
+        "retrieval_lane_rank",
+        "structured_extraction_schema",
+        "facts_in_page_text",
+        "reviews_authority_gap",
+        "community_source_participation",
+        "source_fact_consistency",
+        "measure_reaudit_materiality",
+        "direct_buy_reason",
+    ]
+    assert move_types[-1] == "direct_buy_reason"
+    assert "rank for the exact lane halal collagen sticks before bed" in play_blob
+    assert "product/offer/review/faq schema" in play_blob
+    assert "state halal, collagen, stick, and before bed in plain page text" in play_blob
+    assert "participate in or seed accurate product info in the reddit.com discussion" in play_blob
+    assert "re-audit halal collagen sticks before bed" in play_blob
+    assert "material buyer traffic" in play_blob
+    assert "first-order offer" in play["moves"][-1]["operator_action"].lower()
+    _assert_no_overpromise(nba)
+
+
+def test_sku_nba_publisher_authority_move_pitches_the_evidenced_publisher():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 3, "prompts_with_demand": 3}
+    opportunity["per_prompt"] = [
+        {
+            "query": "best Korean collagen sticks",
+            "axis": "category",
+            "query_class": "head",
+            "ownership_state": "publisher-owned",
+            "source_route": "publisher",
+            "opportunity_score": 28.0,
+            "demand_signal": 1.0,
+            "attribute_basis": ["korean", "collagen", "stick"],
+            "source_summary": {
+                "top_cited_hosts": [{"host": "beautyeditorial.example", "times_cited": 2}]
+            },
+            "source_roles": [
+                {"host": "beautyeditorial.example", "role": "publisher", "times_cited": 2}
+            ],
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(78),
+        identity={"name": "Retailer Collagen Listing", "merchant_type": "retailer"},
+        sku_title="Retailer Collagen Listing",
+    )
+
+    play = nba["canonical_page_play"]
+    play_blob = json.dumps(play).lower()
+
+    assert play["controller_strategy"] == "source_authority_gap"
+    assert "publisher_source_pitch" in {move["type"] for move in play["moves"]}
+    assert "pitch beautyeditorial.example for best korean collagen sticks" in play_blob
+    assert "product/offer/review/faq schema" in play_blob
+    assert play["moves"][-1]["type"] == "direct_buy_reason"
+    _assert_no_overpromise(nba)
+
+
+def test_sku_nba_ownist_leading_retailer_keeps_listing_and_conversion_path():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 5, "prompts_with_demand": 5}
+    opportunity["per_prompt"] = [
+        {
+            "query": "where can I buy Ownist Triple Shine Grape",
+            "axis": "intent",
+            "query_class": "transactional",
+            "ownership_state": "retailer-owned",
+            "source_route": "retailer",
+            "opportunity_score": 39.0,
+            "demand_signal": 1.0,
+            "source_summary": {
+                "top_cited_hosts": [
+                    {"host": "oliveyoung.com", "times_cited": 2},
+                    {"host": "iherb.com", "times_cited": 2},
+                ]
+            },
+            "source_roles": [
+                {"host": "oliveyoung.com", "role": "retailer", "times_cited": 2},
+                {"host": "iherb.com", "role": "retailer", "times_cited": 2},
+            ],
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(80),
+        identity={
+            "name": "Ownist Triple Shine Grape",
+            "anchors": {"brand": "Ownist"},
+            "merchant_type": "brand",
+            "unresolved": False,
+        },
+        sku_title="Ownist Triple Shine Grape",
+    )
+
+    play = nba["canonical_page_play"]
+    move_types = [move["type"] for move in play["moves"]]
+    play_blob = json.dumps(play).lower()
+
+    assert play["controller_strategy"] == "leading_retailer_competition"
+    assert move_types == [
+        "retail_listing_accuracy",
+        "light_retrieval_schema_layer",
+        "first_order_offer",
+        "starter_replenishment_bundle",
+        "subscription_or_why_buy_direct",
+    ]
+    assert "claim or fix iherb.com and oliveyoung.com listings" in play_blob
+    assert "product/offer schema as a light authority layer" in play_blob
+    assert "product/offer/review/faq schema" not in play_blob
+    assert "measure_reaudit_materiality" not in play_blob
+    assert "first-order offer" in play_blob
+    assert "starter + replenishment bundle" in play_blob
+    assert "why-buy-direct" in play_blob
+    _assert_no_overpromise(nba)
 
 
 def _ownist_product_evidence(*, snack_positioning: bool = False) -> Dict[str, Any]:
@@ -920,31 +1081,40 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
     assert wedge["canonical_page_play"]["lane"] == "vitamin c collagen jelly"
     assert "vitamin c collagen jelly" in copy
     assert "healthy snacks collagen jelly" not in nba["first_move"]
-    assert "cited + buyable" in copy
+    assert "more citable + buyable" in copy
     assert "agent-checkout ready" in copy
     play = nba["canonical_page_play"]
     play_blob = json.dumps(play).lower()
     assert play["lane"] == "vitamin c collagen jelly"
     assert play["controllers"] == ["cogentsteps.net", "hellokoop.com", "medsysgroup.com"]
     assert play["controller_strategy"] == "canonical_source_vacuum"
-    assert {move["type"] for move in play["moves"]} == {
-        "canonical_source_authority",
-        "authorized_distribution_or_reseller_cleanup",
+    assert [move["type"] for move in play["moves"]] == [
+        "retrieval_lane_rank",
+        "structured_extraction_schema",
+        "facts_in_page_text",
+        "reviews_authority_gap",
+        "retailer_listing_accuracy",
+        "source_fact_consistency",
+        "measure_reaudit_materiality",
         "direct_buy_reason",
-    }
-    assert "official source ai can cite" in play_blob
-    assert "citation trail" in play_blob
-    assert "after the official page is source-ready" in play_blob
+    ]
+    assert "rank for the exact lane vitamin c collagen jelly" in play_blob
+    assert "product/offer/review/faq schema" in play_blob
+    assert "state vitamin c, collagen, and jelly in plain page text" in play_blob
+    assert "claim or fix the cogentsteps.net, hellokoop.com, and medsysgroup.com listing" in play_blob
+    assert "re-audit vitamin c collagen jelly" in play_blob
+    assert "after the page is more retrievable, extractable, and authoritative" in play_blob
     assert "first-order offer" in play_blob
     assert "starter + replenishment bundle" in play_blob
     assert "subscription incentive" in play_blob
     assert "why-buy-direct" in play_blob
     assert "first-order offer" not in nba["first_move"].lower()
     assert "starter + replenishment bundle" not in nba["first_move"].lower()
-    assert "weak third-party trail" in play_blob
+    assert "material buyer traffic" in play_blob
     assert "beat cogentsteps" not in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "%" not in copy and "$" not in copy
+    _assert_no_overpromise(nba)
 
 
 def test_sku_nba_ownist_allows_healthy_snacks_when_explicitly_supported():
@@ -1137,6 +1307,22 @@ def _nba_strings(nba: Dict[str, Any]) -> str:
         str((nba.get("cta") or {}).get("trust_note") or ""),
     ]
     return " ".join(parts).lower()
+
+
+_OVERPROMISE_PATTERNS = (
+    "will cite",
+    "will rank",
+    "guaranteed",
+    "guarantee ai citation",
+    "guarantee ai ranking",
+    "rank #1",
+)
+
+
+def _assert_no_overpromise(payload: Mapping[str, Any]) -> None:
+    blob = json.dumps(payload).lower()
+    leaked = [pattern for pattern in _OVERPROMISE_PATTERNS if pattern in blob]
+    assert not leaked, leaked
 
 
 def test_no_internal_jargon_leaks_to_merchant_copy():
