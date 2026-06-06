@@ -20,6 +20,7 @@ PAYMENT_PSP="${PAYMENT_PSP:-stripe}"
 PAYMENT_BRIDGE_SOURCE="${PAYMENT_BRIDGE_SOURCE:-operator_canary_bridge}"
 PAYMENT_INTENT_PREFERRED_PSPS="${PAYMENT_INTENT_PREFERRED_PSPS:-}"
 PAYMENT_INTENT_PSP_MODE="${PAYMENT_INTENT_PSP_MODE:-}"
+PAYMENT_INTENT_TEST_PSP_PROBE="${PAYMENT_INTENT_TEST_PSP_PROBE:-0}"
 RUN_REFUND=0
 RUN_RETURN_ELIGIBILITY=0
 RUN_RETURN_SYNC=0
@@ -69,6 +70,8 @@ Options:
                                Optional. Comma-separated PSP preference order for payment-intent creation.
   --payment-intent-psp-mode VALUE
                                Optional. Pass through psp_mode for payment-intent creation, e.g. stripe_checkout.
+  --payment-intent-test-psp-probe
+                               Explicitly mark payment-intent creation as an allowlisted test PSP probe.
   --buyer-email EMAIL          Canary checkout buyer email. Default: $BUYER_EMAIL
   --customer-name NAME         Canary checkout customer name. Default: $CUSTOMER_NAME
   --address-name NAME          Canary shipping recipient. Default: $ADDRESS_NAME
@@ -188,6 +191,10 @@ parse_args() {
       --payment-intent-psp-mode)
         PAYMENT_INTENT_PSP_MODE="${2:-}"
         shift 2
+        ;;
+      --payment-intent-test-psp-probe)
+        PAYMENT_INTENT_TEST_PSP_PROBE=1
+        shift
         ;;
       --buyer-email)
         BUYER_EMAIL="${2:-}"
@@ -420,6 +427,7 @@ main() {
   info "Merchant: $MERCHANT_ID"
   info "Canary write enabled: $CANARY_WRITE"
   info "Create payment intent: $CREATE_PAYMENT_INTENT"
+  info "Payment intent test PSP probe: $PAYMENT_INTENT_TEST_PSP_PROBE"
   info "Payment status sync: $PAYMENT_STATUS_SYNC"
   info "Run refund: $RUN_REFUND"
   info "Run return eligibility: $RUN_RETURN_ELIGIBILITY"
@@ -545,6 +553,7 @@ main() {
     jq -n \
       --arg preferred_psps_csv "$PAYMENT_INTENT_PREFERRED_PSPS" \
       --arg psp_mode "$PAYMENT_INTENT_PSP_MODE" \
+      --argjson test_psp_probe "$PAYMENT_INTENT_TEST_PSP_PROBE" \
       '
         {
           preferred_psps: (
@@ -552,7 +561,8 @@ main() {
             else ($preferred_psps_csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))
             end
           ),
-          psp_mode: (if $psp_mode == "" then null else $psp_mode end)
+          psp_mode: (if $psp_mode == "" then null else $psp_mode end),
+          test_psp_probe: ($test_psp_probe == 1)
         }
       ' >"$payment_intent_payload_json"
 
