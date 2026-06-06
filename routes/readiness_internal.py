@@ -63,6 +63,7 @@ class PaymentBridgeRequest(BaseModel):
 class PaymentIntentRequest(BaseModel):
     preferred_psps: Optional[list[str]] = None
     psp_mode: Optional[str] = Field(default=None, max_length=64)
+    test_psp_probe: bool = False
 
 
 class PaymentStatusSyncRequest(BaseModel):
@@ -522,6 +523,7 @@ async def create_payment_intent(
             checkout_id,
             preferred_psps=body.preferred_psps if body else None,
             psp_mode=body.psp_mode if body else None,
+            test_psp_probe=bool(body.test_psp_probe) if body else False,
         )
     except readiness_service.UnsupportedMerchantError:
         raise _unsupported_merchant(merchant_id)
