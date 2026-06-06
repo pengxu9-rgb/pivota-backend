@@ -26,6 +26,7 @@ from services.llm_synthesis import (
 )
 from services.sku_lane_priority import (
     build_lane_product_evidence,
+    build_sideways_wedge,
     has_lane_demand,
     is_third_party_controlled_lane,
     prioritize_lanes,
@@ -74,6 +75,9 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
 - LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
   singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
   — just don't present it as the searched lane.)
+- SIDEWAYS DEMAND: if sideways_wedge.recommended_beachhead_lane exists, treat that lane as the first
+  beachhead before broad/high-pressure prompts. Explain which broad or weak-fit lanes to not chase yet, using
+  only sideways_wedge.head_prompt_pressure and sideways_wedge.do_not_chase_yet.
 - FACT vs INFERENCE: only "AI's answers show…/EVIDENCE shows…" statements are facts. Everything else is your
   read — phrase it as inference. Do not use the word "locked" or absolutes like "you cannot do this alone";
   say a query is "owned/controlled by <evidenced source>" and frame Pivota's help as the specific service it
@@ -564,6 +568,10 @@ def assemble_sku_brief_evidence(
         "buyer_path_opportunities": _buyer_path_opportunities(
             opportunity=opportunity_map,
             merchant_path=merchant_path,
+            product_evidence=product_evidence,
+        ),
+        "sideways_wedge": _as_mapping(opportunity_map.get("sideways_wedge")) or build_sideways_wedge(
+            _as_list(opportunity_map.get("per_prompt")),
             product_evidence=product_evidence,
         ),
         "grounding_notes": grounding_notes,
@@ -1156,6 +1164,31 @@ def _deterministic_traffic_how(
     return default_how
 
 
+def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
+    beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
+    query = _clean_str(beachhead.get("query"))
+    if not query:
+        return ""
+    deferred = next(
+        (
+            _clean_str(item.get("query"))
+            for item in _as_list(sideways_wedge.get("do_not_chase_yet"))
+            if isinstance(item, Mapping) and _clean_str(item.get("query"))
+        ),
+        "",
+    )
+    if deferred:
+        return (
+            f"Start with {query} as the first beachhead and do not chase {deferred} "
+            "yet; the tighter lane is more product-specific and easier to turn into "
+            "the official cited + buyable route."
+        )
+    return (
+        f"Start with {query} as the first beachhead because it is product-specific "
+        "and already shows third-party-controlled demand."
+    )
+
+
 def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     product = _as_mapping(evidence.get("product"))
     title = _clean_str(product.get("title")) or "this SKU"
@@ -1184,6 +1217,8 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
     )
     vacuum_strategy = is_canonical_source_vacuum(lead_profile)
     source_authority_strategy = _clean_str(lead_profile.get("strategy")) == "source_authority_gap"
+    sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
+    wedge_decision = _deterministic_wedge_decision(sideways_wedge)
 
     if vacuum_strategy:
         first_moves = [
@@ -1304,6 +1339,43 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             "Keep price, stock, returns, reviews, and product facts fresh.",
         ]
 
+    traffic_strategy = []
+    defer_queries = {
+        _clean_str(item.get("query")).lower(): item
+        for item in _as_list(sideways_wedge.get("do_not_chase_yet"))
+        if isinstance(item, Mapping) and _clean_str(item.get("query"))
+    }
+    for item in opportunities[:3]:
+        item_query = _clean_str(item.get("query"))
+        how = _deterministic_traffic_how(
+            item,
+            page_label=page_label,
+            default_how=traffic_how_default,
+        )
+        deferred = defer_queries.get(item_query.lower())
+        if isinstance(deferred, Mapping):
+            beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
+            beachhead_query = _clean_str(beachhead.get("query")) or query
+            how = (
+                f"Do not start here yet; use {beachhead_query} first because it is "
+                "more product-specific and easier to make the official page the best "
+                "cited + buyable route."
+            )
+        traffic_strategy.append({
+            "where": item_query,
+            "who_controls": _controller_phrase(
+                _unique_host_roles(
+                    controller
+                    for controller in _as_list(item.get("controlled_by"))
+                    if isinstance(controller, Mapping)
+                )
+            ),
+            "how": how,
+        })
+
+    if wedge_decision:
+        core_decision = f"{wedge_decision} {core_decision}"
+
     return {
         "position": position,
         "core_decision": core_decision,
@@ -1312,26 +1384,7 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
             f"Use the evidenced product angle — {angle_terms} — as the reason the "
             "merchant-controlled page deserves to be cited and bought from."
         ),
-        "traffic_strategy": [
-            {
-                "where": _clean_str(item.get("query")),
-                "who_controls": _controller_phrase(
-                    _unique_host_roles(
-                        controller
-                        for controller in _as_list(item.get("controlled_by"))
-                        if isinstance(controller, Mapping)
-                    )
-                ),
-                "how": (
-                    _deterministic_traffic_how(
-                        item,
-                        page_label=page_label,
-                        default_how=traffic_how_default,
-                    )
-                ),
-            }
-            for item in opportunities[:3]
-        ],
+        "traffic_strategy": traffic_strategy,
         "substitution_play": _deterministic_substitution_play(evidence, page_label),
         "first_moves": first_moves[:5],
         "diy_vs_pivota": {
@@ -1559,6 +1612,28 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         for controller in _as_list(opportunity.get("controlled_by")):
             if isinstance(controller, Mapping):
                 add_domain(controller.get("host"))
+
+    sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
+    for lane in (
+        _as_mapping(sideways_wedge.get("recommended_beachhead_lane")),
+        _as_mapping(sideways_wedge.get("canonical_page_play")),
+    ):
+        add_term(lane.get("query"))
+        add_term(lane.get("lane"))
+        for controller in _as_list(lane.get("controllers")):
+            add_domain(controller)
+    for key in ("head_prompt_pressure", "sideways_wedge_lanes", "do_not_chase_yet"):
+        for lane in _as_list(sideways_wedge.get(key)):
+            if not isinstance(lane, Mapping):
+                continue
+            add_term(lane.get("query"))
+            add_term(lane.get("source_route"))
+            for reason in _as_str_list(lane.get("merchant_fit_reasons")):
+                add_term(reason)
+                for word in re.findall(r"[a-z0-9]+", reason.lower()):
+                    add_attribute_word(word)
+            for controller in _as_list(lane.get("controllers")):
+                add_domain(controller)
 
     grounded_words = set(attribute_words)
     for value in allowed_terms | allowed_phrases:

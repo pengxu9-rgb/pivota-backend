@@ -16,6 +16,7 @@ from services.buyer_path_controller_quality import (
     is_canonical_source_vacuum,
 )
 from services.sku_lane_priority import (
+    build_sideways_wedge,
     has_lane_demand,
     is_third_party_controlled_lane,
     prioritize_lanes,
@@ -303,6 +304,10 @@ def _build_sku_evidence_used(
     identity: Mapping[str, Any],
     sku_title: Optional[str],
 ) -> Dict[str, Any]:
+    sideways_wedge = _as_mapping(opportunity.get("sideways_wedge")) or build_sideways_wedge(
+        _as_list(opportunity.get("per_prompt")),
+        product_evidence=_as_mapping(opportunity.get("product_evidence")),
+    )
     return {
         "sku_title": _sku_title(identity=identity, sku_title=sku_title),
         "identity": dict(identity),
@@ -315,6 +320,7 @@ def _build_sku_evidence_used(
         "coverage": dict(_as_mapping(opportunity.get("confidence"))),
         "demand_state_summary": opportunity.get("demand_state_summary"),
         "intent_ladder": dict(_as_mapping(opportunity.get("intent_ladder"))),
+        "sideways_wedge": dict(sideways_wedge),
         "failing_prompt_examples": [
             _sku_failing_prompt_chip(prompt)
             for prompt in failing_prompts[:5]
@@ -335,6 +341,7 @@ def _sku_prescription_for_gap(
     content_gap = _as_mapping(evidence.get("content_gap"))
     route_prompt = _as_mapping(evidence.get("source_route_prompt"))
     merchant_path = _as_mapping(evidence.get("merchant_path"))
+    sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
     first_pivota_path = _sku_pivota_path(sku_title)
 
     if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
@@ -418,6 +425,7 @@ def _sku_prescription_for_gap(
     if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
         query = _sku_query_phrase(route_prompt.get("query"))
         hosts = _phrase(_host_names(route_prompt.get("sources")), "other sites")
+        wedge_reason = _sku_sideways_wedge_reason(sideways_wedge)
         return _base_payload(
             primary_gap=primary_gap,
             prescription_class="operational_efficiency",
@@ -435,6 +443,7 @@ def _sku_prescription_for_gap(
                 f"This lane isn't empty, AI is citing {hosts} for it. Treat that as "
                 f"exposed demand: make {_merchant_destination(merchant_path)} the "
                 "better place to buy, then work the source that already shapes the answer."
+                f"{wedge_reason}"
             ),
             first_move=_sku_source_route_first_move(route_prompt, merchant_path),
             self_serve_actions=[
@@ -443,6 +452,7 @@ def _sku_prescription_for_gap(
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
+            sideways_wedge=sideways_wedge,
             cta=_sku_cta("Win back the cited buying path"),
         )
 
@@ -970,6 +980,14 @@ def _sku_source_route_follow_up(
         "Then update the source trail that AI cites so the comparison points back "
         f"to {_merchant_destination(merchant_path)}."
     )
+
+
+def _sku_sideways_wedge_reason(sideways_wedge: Mapping[str, Any]) -> str:
+    beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
+    why = str(sideways_wedge.get("why_this_lane_not_the_head_prompt") or "").strip()
+    if not beachhead or not why:
+        return ""
+    return f" {why}"
 
 
 def _sku_operator_moves(
@@ -1661,6 +1679,7 @@ def _base_payload(
     merchant_path: Optional[Mapping[str, Any]] = None,
     operator_moves: Optional[List[Mapping[str, Any]]] = None,
     canonical_page_play: Optional[Mapping[str, Any]] = None,
+    sideways_wedge: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     out = {
         "primary_gap": primary_gap,
@@ -1681,6 +1700,8 @@ def _base_payload(
         out["operator_moves"] = [dict(move) for move in operator_moves]
     if canonical_page_play:
         out["canonical_page_play"] = dict(canonical_page_play)
+    if sideways_wedge:
+        out["sideways_wedge"] = dict(sideways_wedge)
     return out
 
 

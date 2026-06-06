@@ -679,6 +679,84 @@ def test_sku_nba_bb_lab_brand_path_ties_operational_moves_to_retailer_exposure()
     assert "%" not in copy and "$" not in copy
 
 
+def test_sku_nba_bb_lab_sideways_wedge_prefers_halal_before_bed_over_head_pressure():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 2, "prompts_with_demand": 2}
+    opportunity["product_evidence"] = build_lane_product_evidence(
+        product={
+            "title": "BB LAB The Collagen Low Molecular Fish Collagen Stick",
+            "category": "collagen supplement",
+            "tags": ["halal", "collagen", "stick"],
+            "description": "Halal low molecular fish collagen sticks before bed.",
+        },
+        attribute_graph={
+            "classes": {
+                "category": ["collagen supplement"],
+                "format": ["stick"],
+                "ingredient": ["collagen"],
+                "certification_constraint": ["halal"],
+                "use_case": ["before bed"],
+            }
+        },
+    )
+    opportunity["per_prompt"] = [
+        {
+            "query": "best collagen sticks",
+            "axis": "category",
+            "query_class": "head",
+            "ownership_state": "marketplace-owned",
+            "source_route": "marketplace",
+            "opportunity_score": 44.0,
+            "demand_signal": 1.0,
+            "source_summary": {
+                "top_cited_hosts": [
+                    {"host": "amazon.com", "times_cited": 3},
+                    {"host": "walmart.com", "times_cited": 2},
+                ]
+            },
+        },
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "query_class": "sidewalk",
+            "ownership_state": "retailer-owned",
+            "source_route": "retailer",
+            "opportunity_score": 18.0,
+            "demand_signal": 1.0,
+            "attribute_basis": ["halal", "collagen", "stick", "before bed"],
+            "source_summary": {
+                "top_cited_hosts": [
+                    {"host": "sayweee.com", "times_cited": 2},
+                    {"host": "dubuypk.com", "times_cited": 1},
+                    {"host": "koreancare.net", "times_cited": 1},
+                ]
+            },
+        },
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(82),
+        identity={
+            "name": "BB LAB The Collagen Low Molecular Fish Collagen Stick",
+            "anchors": {"brand": "BB Lab"},
+            "merchant_type": "brand",
+            "unresolved": False,
+        },
+        sku_title="BB LAB The Collagen Low Molecular Fish Collagen Stick",
+    )
+
+    selected = nba["evidence_used"]["source_route_prompt"]
+    wedge = nba["sideways_wedge"]
+    assert selected["query"] == "halal collagen sticks before bed"
+    assert wedge["recommended_beachhead_lane"]["query"] == "halal collagen sticks before bed"
+    assert "best collagen sticks" in {item["query"] for item in wedge["do_not_chase_yet"]}
+    assert "Start with \"halal collagen sticks before bed\"" in nba["why_this_first"]
+    assert nba["canonical_page_play"]["controller_strategy"] == "canonical_source_vacuum"
+    assert "source of truth" in json.dumps(nba["canonical_page_play"]).lower()
+    assert "%" not in _nba_strings(nba) and "$" not in _nba_strings(nba)
+
+
 def test_sku_nba_ownist_brand_path_ties_offer_bundle_to_real_exposed_lane():
     opportunity = _sku_base_opportunity()
     opportunity["confidence"] = {"prompt_count": 5, "prompts_with_demand": 5}
@@ -814,6 +892,17 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
     assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
     assert selected["query"] == "vitamin c collagen jelly"
     assert selected["lane_priority_score"] > 0
+    wedge = nba["sideways_wedge"]
+    assert wedge["recommended_beachhead_lane"]["query"] == "vitamin c collagen jelly"
+    assert wedge["sideways_wedge_lanes"][0]["query"] == "vitamin c collagen jelly"
+    assert "healthy snacks collagen jelly" in {
+        item["query"] for item in wedge["do_not_chase_yet"]
+    }
+    assert "Start with \"vitamin c collagen jelly\"" in (
+        wedge["why_this_lane_not_the_head_prompt"]
+    )
+    assert "Start with \"vitamin c collagen jelly\"" in nba["why_this_first"]
+    assert wedge["canonical_page_play"]["lane"] == "vitamin c collagen jelly"
     assert "vitamin c collagen jelly" in copy
     assert "healthy snacks collagen jelly" not in nba["first_move"]
     assert "cited + buyable" in copy
@@ -872,6 +961,9 @@ def test_sku_nba_ownist_allows_healthy_snacks_when_explicitly_supported():
     selected = nba["evidence_used"]["source_route_prompt"]
     assert selected["query"] == "healthy snacks collagen jelly"
     assert selected["fit_penalties"] == []
+    wedge = nba["sideways_wedge"]
+    assert wedge["recommended_beachhead_lane"]["query"] == "healthy snacks collagen jelly"
+    assert wedge["do_not_chase_yet"] == []
 
 
 def test_sku_nba_channel_path_drives_to_channel_site_when_explicit():

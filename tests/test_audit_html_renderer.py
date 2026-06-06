@@ -130,7 +130,22 @@ def _gruns_fixture_audit():
                         "checkout_readiness": (
                             "Make the official brand PDP cited, buyable, and agent-checkout ready."
                         ),
-                    }
+                    },
+                    "sideways_wedge": {
+                        "recommended_beachhead_lane": {
+                            "query": "vitamin c collagen jelly",
+                        },
+                        "why_this_lane_not_the_head_prompt": (
+                            "Start with \"vitamin c collagen jelly\" before "
+                            "\"healthy snacks collagen jelly\" because it is "
+                            "product-specific, commercially useful, and easier "
+                            "to make the official page the best cited + buyable route."
+                        ),
+                        "do_not_chase_yet": [
+                            {"query": "healthy snacks collagen jelly"},
+                            {"query": "best collagen supplements"},
+                        ],
+                    },
                 },
             },
             "implementation_roadmap": {
@@ -249,6 +264,10 @@ def test_html_renderer_emits_owned_buyer_path_play_with_controller_strategy():
     assert "Canonical-source vacuum" in html
     assert "vitamin c collagen jelly" in html
     assert "cogentsteps.net" in html
+    assert "Sideways demand wedge" in html
+    assert "Beachhead lane" in html
+    assert "healthy snacks collagen jelly" in html
+    assert "Do not chase yet" in html
     assert "official source of truth" in html
     assert "Economics guard" in html
     assert "beat cogentsteps" not in html.lower()

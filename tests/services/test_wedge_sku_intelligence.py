@@ -563,5 +563,19 @@ def test_sku_intelligence_ownist_live_like_sparse_product_prefers_vitamin_c_lane
     assert out["next_best_action"]["evidence_used"]["source_route_prompt"]["query"] == (
         "vitamin c collagen jelly"
     )
+    wedge = out["sideways_wedge"]
+    assert wedge["recommended_beachhead_lane"]["query"] == "vitamin c collagen jelly"
+    assert wedge["sideways_wedge_lanes"][0]["query"] == "vitamin c collagen jelly"
+    assert "healthy snacks collagen jelly" in {
+        item["query"] for item in wedge["do_not_chase_yet"]
+    }
+    assert "Start with \"vitamin c collagen jelly\"" in (
+        wedge["why_this_lane_not_the_head_prompt"]
+    )
+    assert wedge["canonical_page_play"]["lane"] == "vitamin c collagen jelly"
+    assert "agent-checkout readiness" in wedge["canonical_page_play"]["pivota_path"]
+    nba_wedge = out["next_best_action"]["sideways_wedge"]
+    assert nba_wedge["recommended_beachhead_lane"]["query"] == "vitamin c collagen jelly"
+    assert "Start with \"vitamin c collagen jelly\"" in out["next_best_action"]["why_this_first"]
     assert buyer_path["primary_lane"] == "vitamin c collagen jelly"
     assert buyer_path["state"] == "third_party_controlled"

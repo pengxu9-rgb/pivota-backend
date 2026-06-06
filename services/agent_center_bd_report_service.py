@@ -52,6 +52,7 @@ from services.next_best_action import (
 )
 from services.pivota_indexing_arc import compute_indexing_arc_state
 from services.sku_lane_priority import (
+    build_sideways_wedge,
     enrich_lane_priority,
     has_lane_demand,
     is_third_party_controlled_lane,
@@ -5818,9 +5819,14 @@ def _display_sku_intelligence(
         for row in prioritized_per_prompt
     )
     is_empty = len(lanes) == 0 and not has_exposure
+    sideways_wedge = build_sideways_wedge(
+        prioritized_per_prompt,
+        product_evidence=product_evidence,
+    )
     display_opportunity = dict(opportunity)
     display_opportunity["per_prompt"] = prioritized_per_prompt
     display_opportunity["top_open_lanes"] = lanes
+    display_opportunity["sideways_wedge"] = sideways_wedge
     next_best_action = build_sku_next_best_action(
         opportunity=display_opportunity,
         identity={
@@ -5845,6 +5851,7 @@ def _display_sku_intelligence(
         "top_open_lanes": lanes,
         "substitution_alert": opportunity.get("substitution_alert") or {"present": False},
         "prompt_matrix": matrix_rows,
+        "sideways_wedge": sideways_wedge,
         "demand_state_summary": opportunity.get("demand_state_summary"),
         "coverage": opportunity.get("confidence") or {},
         "next_best_action": next_best_action,
@@ -10370,6 +10377,30 @@ def _render_owned_buyer_path_play_markdown(next_best_action: Optional[Mapping[st
         )
     if focus:
         out.append(f"**Operator read:** {focus}\n")
+    wedge = next_best_action.get("sideways_wedge")
+    if isinstance(wedge, Mapping):
+        beachhead = wedge.get("recommended_beachhead_lane")
+        beachhead_query = (
+            str(beachhead.get("query") or "").strip()
+            if isinstance(beachhead, Mapping) else ""
+        )
+        why_wedge = str(wedge.get("why_this_lane_not_the_head_prompt") or "").strip()
+        do_not = [
+            item for item in (wedge.get("do_not_chase_yet") or [])
+            if isinstance(item, Mapping) and str(item.get("query") or "").strip()
+        ][:3]
+        if beachhead_query or why_wedge or do_not:
+            out.append("\n**Sideways demand wedge:**\n")
+            if beachhead_query:
+                out.append(f"- Beachhead lane: `{beachhead_query}`\n")
+            if why_wedge:
+                out.append(f"- Why this first: {why_wedge}\n")
+            if do_not:
+                deferred = ", ".join(
+                    f"`{str(item.get('query') or '').strip()}`"
+                    for item in do_not
+                )
+                out.append(f"- Do not chase yet: {deferred}\n")
     if moves:
         out.append("\n**Operator checklist:**\n")
         for idx, move in enumerate(moves[:5], start=1):

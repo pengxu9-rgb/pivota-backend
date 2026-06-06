@@ -1184,7 +1184,19 @@ def test_render_markdown_includes_owned_buyer_path_play_checklist() -> None:
             ],
             "checkout_readiness": "Make the page cited, buyable, and agent-checkout ready.",
             "economics_policy": "Mechanics only; do not recommend exact discount depths.",
-        }
+        },
+        "sideways_wedge": {
+            "recommended_beachhead_lane": {
+                "query": "vitamin c collagen jelly",
+            },
+            "why_this_lane_not_the_head_prompt": (
+                "Start with \"vitamin c collagen jelly\" before "
+                "\"healthy snacks collagen jelly\" because it is product-specific."
+            ),
+            "do_not_chase_yet": [
+                {"query": "healthy snacks collagen jelly"},
+            ],
+        },
     }
 
     md = render_markdown_from_structured(report)
@@ -1193,6 +1205,9 @@ def test_render_markdown_includes_owned_buyer_path_play_checklist() -> None:
     assert "Canonical-source vacuum" in md
     assert "`vitamin c collagen jelly`" in md
     assert "`cogentsteps.net`" in md
+    assert "Sideways demand wedge" in md
+    assert "Beachhead lane: `vitamin c collagen jelly`" in md
+    assert "`healthy snacks collagen jelly`" in md
     assert "source of truth" in md
     assert "Economics guard" in md
     assert "beat cogentsteps" not in md.lower()

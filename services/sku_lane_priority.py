@@ -19,6 +19,10 @@ THIRD_PARTY_OWNERSHIP = {
     "retailer-owned",
 }
 THIRD_PARTY_ROUTES = {"brand", "forum", "marketplace", "publisher", "retailer"}
+SIDEWAYS_QUERY_CLASSES = {"attribute", "objection", "sidewalk"}
+SIDEWAYS_AXES = {"attribute", "objection", "sidewalk"}
+HEAD_QUERY_CLASSES = {"category", "head"}
+HEAD_AXES = {"category", "head"}
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _PHRASE_CLEAN_RE = re.compile(r"[^a-z0-9]+")
@@ -56,6 +60,12 @@ _LOW_UTILITY_PHRASES = (
     "trending",
     "what is",
     "top collagen",
+)
+_BROAD_HEAD_PHRASES = (
+    "best ",
+    "top ",
+    "popular ",
+    "what is ",
 )
 _BRANDED_INTENT_WORDS = {"where", "shop", "buy", "sale", "online"}
 _HIGH_SIGNAL_SOURCES = {
@@ -186,6 +196,85 @@ def lane_priority_sort_key(row: Mapping[str, Any]) -> Tuple[float, float, float,
     )
 
 
+def build_sideways_wedge(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    product_evidence: Optional[Mapping[str, Any]] = None,
+    limit: int = 4,
+) -> Dict[str, Any]:
+    """Summarize the first merchant-fit lane to win before broad prompt fights.
+
+    This is intentionally evidence-only: it ranks measured, third-party-controlled
+    rows and never invents a sideways prompt that was not in the prompt matrix.
+    """
+    candidates = [
+        row for row in rows
+        if isinstance(row, Mapping)
+        and str(row.get("query") or "").strip()
+        and is_third_party_controlled_lane(row)
+        and has_lane_demand(row)
+    ]
+    if not candidates:
+        return {
+            "head_prompt_pressure": [],
+            "sideways_wedge_lanes": [],
+            "recommended_beachhead_lane": None,
+            "why_this_lane_not_the_head_prompt": None,
+            "canonical_page_play": None,
+            "do_not_chase_yet": [],
+        }
+
+    prioritized = prioritize_lanes(
+        candidates,
+        product_evidence=product_evidence,
+    )
+    head_pressure = [
+        _sideways_wedge_lane_chip(row, lane_type="head_prompt")
+        for row in prioritized
+        if _is_head_prompt_pressure(row)
+    ][:max(0, limit)]
+    sideways = [
+        _sideways_wedge_lane_chip(row, lane_type="sideways_wedge")
+        for row in prioritized
+        if _is_sideways_wedge_lane(row)
+    ][:max(0, limit)]
+    beachhead = sideways[0] if sideways else None
+
+    do_not: List[Dict[str, Any]] = []
+    if beachhead:
+        beachhead_query = _clean(beachhead.get("query"))
+        for item in head_pressure:
+            if _clean(item.get("query")) != beachhead_query:
+                deferred = dict(item)
+                deferred["reason"] = (
+                    "Broad category prompts are usually a higher-cost first fight "
+                    "when third-party controllers already shape the route."
+                )
+                do_not.append(deferred)
+        for row in prioritized:
+            if not _is_sideways_wedge_lane(row):
+                continue
+            if _clean(row.get("query")) == beachhead_query:
+                continue
+            penalties = _raw_str_list(row.get("fit_penalties"))
+            if any(penalty.startswith("lifestyle_drift:") for penalty in penalties):
+                deferred = _sideways_wedge_lane_chip(row, lane_type="defer")
+                deferred["reason"] = (
+                    "Ranked lower until product evidence explicitly supports this "
+                    "lifestyle positioning."
+                )
+                do_not.append(deferred)
+    why = _sideways_wedge_why(beachhead=beachhead, do_not=do_not)
+    return {
+        "head_prompt_pressure": head_pressure,
+        "sideways_wedge_lanes": sideways,
+        "recommended_beachhead_lane": beachhead,
+        "why_this_lane_not_the_head_prompt": why,
+        "canonical_page_play": _sideways_wedge_canonical_play(beachhead),
+        "do_not_chase_yet": do_not[:max(0, limit)],
+    }
+
+
 def lane_priority(
     row: Mapping[str, Any],
     *,
@@ -288,6 +377,136 @@ def lane_priority(
     }
 
 
+def _is_sideways_wedge_lane(row: Mapping[str, Any]) -> bool:
+    query_class = _state(row.get("query_class"))
+    axis = _state(row.get("axis"))
+    return query_class in SIDEWAYS_QUERY_CLASSES or axis in SIDEWAYS_AXES
+
+
+def _is_head_prompt_pressure(row: Mapping[str, Any]) -> bool:
+    query_class = _state(row.get("query_class"))
+    axis = _state(row.get("axis"))
+    if query_class in HEAD_QUERY_CLASSES or axis in HEAD_AXES:
+        return True
+    query = _clean(row.get("query"))
+    return any(query.startswith(phrase.strip()) or phrase in query for phrase in _BROAD_HEAD_PHRASES)
+
+
+def _sideways_wedge_lane_chip(row: Mapping[str, Any], *, lane_type: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "query": row.get("query"),
+        "lane_type": lane_type,
+        "axis": row.get("axis"),
+        "query_class": row.get("query_class"),
+        "ownership_state": row.get("ownership_state"),
+        "source_route": row.get("source_route"),
+        "controllers": _lane_controllers(row),
+        "opportunity_score": row.get("opportunity_score"),
+        "demand_signal": row.get("demand_signal"),
+    }
+    for key in (
+        "lane_priority_score",
+        "merchant_fit_score",
+        "conversion_fit_score",
+        "merchant_fit_reasons",
+        "fit_penalties",
+        "selection_reason",
+    ):
+        if key in row:
+            out[key] = row.get(key)
+    return out
+
+
+def _sideways_wedge_why(
+    *,
+    beachhead: Optional[Mapping[str, Any]],
+    do_not: List[Mapping[str, Any]],
+) -> Optional[str]:
+    if not beachhead:
+        return None
+    query = str(beachhead.get("query") or "").strip()
+    if not query:
+        return None
+    deferred_query = next(
+        (
+            str(item.get("query") or "").strip()
+            for item in do_not
+            if str(item.get("query") or "").strip()
+        ),
+        "",
+    )
+    if deferred_query:
+        return (
+            f"Start with \"{query}\" before \"{deferred_query}\" because it is "
+            "product-specific, commercially useful, and easier to make the official "
+            "page the best cited + buyable route."
+        )
+    return (
+        f"Start with \"{query}\" as the beachhead because it is product-specific, "
+        "commercially useful, and already shows third-party-controlled demand."
+    )
+
+
+def _sideways_wedge_canonical_play(
+    beachhead: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not beachhead:
+        return None
+    query = str(beachhead.get("query") or "").strip()
+    if not query:
+        return None
+    return {
+        "lane": query,
+        "play": (
+            f"Make the official product page the cited + buyable canonical page for {query}."
+        ),
+        "operator_moves": [
+            "first-order offer",
+            "starter + replenishment bundle",
+            "subscription incentive",
+            "why-buy-direct proof",
+        ],
+        "pivota_path": (
+            "Serve and monitor the cited + buyable canonical page with agent-checkout readiness."
+        ),
+        "economics_policy": (
+            "Mechanics only: no exact discount depths, bundle prices, savings "
+            "percentages, or margin claims without audited promo or margin evidence."
+        ),
+    }
+
+
+def _lane_controllers(row: Mapping[str, Any]) -> List[str]:
+    hosts: List[str] = []
+    summary = _as_mapping(row.get("source_summary"))
+    for source in _as_list(summary.get("top_cited_hosts")):
+        host = _host_from_any(source)
+        if host:
+            hosts.append(host)
+    for source in _as_list(row.get("source_roles")):
+        host = _host_from_any(source)
+        if host:
+            hosts.append(host)
+    for source in _as_list(row.get("sources")):
+        host = _host_from_any(source)
+        if host:
+            hosts.append(host)
+    return _unique(hosts)[:3]
+
+
+def _host_from_any(value: Any) -> str:
+    if isinstance(value, Mapping):
+        raw = value.get("host") or value.get("domain") or value.get("url") or value.get("uri")
+    else:
+        raw = value
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^https?://", "", text)
+    text = text.split("/", 1)[0]
+    return text if "." in text else ""
+
+
 def _selection_reason(*, query: str, reasons: List[str], penalties: List[str]) -> str:
     clean_reasons = _unique(reasons)
     clean_penalties = _unique(penalties)
@@ -383,6 +602,20 @@ def _clean_list(value: Any) -> List[str]:
     return _unique(_clean(item) for item in values if _clean(item))
 
 
+def _raw_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, Mapping):
+        values = list(value.values())
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    return _unique(str(item or "").strip() for item in values if str(item or "").strip())
+
+
 def _clean(value: Any) -> str:
     text = str(value or "").strip().lower()
     text = text.replace("&", " and ")
@@ -419,6 +652,10 @@ def _float(value: Any) -> float:
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _unique(values: Iterable[str]) -> List[str]:

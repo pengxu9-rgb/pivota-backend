@@ -389,6 +389,31 @@ def _render_owned_buyer_path_play(next_best_action: Optional[Dict[str, Any]]) ->
         out.append(f"**Controllers evidenced:** {', '.join(f'`{h}`' for h in controllers)}\n\n")
     if focus:
         out.append(f"**Operator read:** {focus}\n\n")
+    wedge = next_best_action.get("sideways_wedge")
+    if isinstance(wedge, dict):
+        beachhead = wedge.get("recommended_beachhead_lane")
+        beachhead_query = (
+            str(beachhead.get("query") or "").strip()
+            if isinstance(beachhead, dict) else ""
+        )
+        why_wedge = str(wedge.get("why_this_lane_not_the_head_prompt") or "").strip()
+        do_not = [
+            item for item in (wedge.get("do_not_chase_yet") or [])
+            if isinstance(item, dict) and str(item.get("query") or "").strip()
+        ][:3]
+        if beachhead_query or why_wedge or do_not:
+            out.append("**Sideways demand wedge:**\n\n")
+            if beachhead_query:
+                out.append(f"- Beachhead lane: `{beachhead_query}`\n")
+            if why_wedge:
+                out.append(f"- Why this first: {why_wedge}\n")
+            if do_not:
+                deferred = ", ".join(
+                    f"`{str(item.get('query') or '').strip()}`"
+                    for item in do_not
+                )
+                out.append(f"- Do not chase yet: {deferred}\n")
+            out.append("\n")
     if moves:
         out.append("**Operator checklist:**\n\n")
         for idx, move in enumerate(moves[:5], start=1):

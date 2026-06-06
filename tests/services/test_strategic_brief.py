@@ -598,6 +598,29 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
     assert "official source of truth" in opportunities[0]["recommended_moves"][0]
     assert "weak third-party reseller trail" in opportunities[0]["recommended_moves"][1]
     assert len(opportunities[0]["controlled_by"]) == 3
+    wedge = evidence["sideways_wedge"]
+    assert wedge["recommended_beachhead_lane"]["query"] == "vitamin c collagen jelly"
+    assert wedge["sideways_wedge_lanes"][0]["query"] == "vitamin c collagen jelly"
+    assert "healthy snacks collagen jelly" in {
+        item["query"] for item in wedge["do_not_chase_yet"]
+    }
+    assert "Start with \"vitamin c collagen jelly\"" in (
+        wedge["why_this_lane_not_the_head_prompt"]
+    )
+    assert wedge["canonical_page_play"]["lane"] == "vitamin c collagen jelly"
+
+    brief = strategic_brief._deterministic_brief(evidence)
+    assert brief is not None
+    assert "Start with vitamin c collagen jelly as the first beachhead" in (
+        brief["core_decision"]
+    )
+    snack_strategy = next(
+        item for item in brief["traffic_strategy"]
+        if item["where"] == "healthy snacks collagen jelly"
+    )
+    assert "Do not start here yet" in snack_strategy["how"]
+    assert "vitamin c collagen jelly" in snack_strategy["how"]
+    assert strategic_brief.validate_grounding(brief, evidence) is True
 
 
 def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabricated_economics():

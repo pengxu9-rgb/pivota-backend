@@ -569,6 +569,33 @@ def _render_owned_buyer_path_play_html(next_best_action: Optional[Dict[str, Any]
         out.append(f"<p><strong>Controllers evidenced:</strong> {controller_html}</p>\n")
     if focus:
         out.append(f"<p><strong>Operator read:</strong> {_escape(focus)}</p>\n")
+    wedge = next_best_action.get("sideways_wedge")
+    if isinstance(wedge, dict):
+        beachhead = wedge.get("recommended_beachhead_lane")
+        beachhead_query = (
+            str(beachhead.get("query") or "").strip()
+            if isinstance(beachhead, dict) else ""
+        )
+        why_wedge = str(wedge.get("why_this_lane_not_the_head_prompt") or "").strip()
+        do_not = [
+            item for item in (wedge.get("do_not_chase_yet") or [])
+            if isinstance(item, dict) and str(item.get("query") or "").strip()
+        ][:3]
+        if beachhead_query or why_wedge or do_not:
+            out.append("<p><strong>Sideways demand wedge:</strong></p>\n<ul>\n")
+            if beachhead_query:
+                out.append(
+                    f"<li>Beachhead lane: <code>{_escape(beachhead_query)}</code></li>\n"
+                )
+            if why_wedge:
+                out.append(f"<li>Why this first: {_escape(why_wedge)}</li>\n")
+            if do_not:
+                deferred = ", ".join(
+                    f"<code>{_escape(str(item.get('query') or '').strip())}</code>"
+                    for item in do_not
+                )
+                out.append(f"<li>Do not chase yet: {deferred}</li>\n")
+            out.append("</ul>\n")
     if moves:
         out.append("<p><strong>Operator checklist:</strong></p>\n<ol>\n")
         for move in moves[:5]:
