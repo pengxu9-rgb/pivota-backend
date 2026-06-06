@@ -767,6 +767,8 @@ def test_sku_nba_bb_lab_sideways_wedge_prefers_halal_before_bed_over_head_pressu
     play_blob = json.dumps(nba["canonical_page_play"]).lower()
     assert "official source ai can cite" in play_blob
     assert "not proof that material buyer traffic" in play_blob
+    assert '"confidence": "fallback"' not in play_blob
+    assert '"confidence": "inferred"' in play_blob
     assert "%" not in _nba_strings(nba) and "$" not in _nba_strings(nba)
 
 

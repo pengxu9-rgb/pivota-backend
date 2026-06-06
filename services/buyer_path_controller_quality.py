@@ -58,7 +58,7 @@ def controller_profile(controllers: Iterable[Any]) -> Dict[str, Any]:
             "input_role": input_role or None,
             "subtype": details.get("subtype"),
             "tier": details.get("tier"),
-            "confidence": details.get("confidence"),
+            "confidence": _public_confidence(details.get("confidence")),
             "times_cited": _times_cited(input_row.get("times_cited")),
         })
 
@@ -200,6 +200,13 @@ def _times_cited(value: Any) -> int:
         return max(0, int(float(value or 0)))
     except (TypeError, ValueError):
         return 0
+
+
+def _public_confidence(value: Any) -> str:
+    confidence = str(value or "").strip().lower()
+    if confidence == "fallback":
+        return "inferred"
+    return confidence or "inferred"
 
 
 def _exposure_confidence(classified: List[Mapping[str, Any]]) -> str:
