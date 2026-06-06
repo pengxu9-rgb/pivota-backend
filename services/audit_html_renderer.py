@@ -532,6 +532,68 @@ def _render_recommendations_html(action_items: Optional[List[Dict[str, Any]]]) -
     return "".join(out)
 
 
+def _render_owned_buyer_path_play_html(next_best_action: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(next_best_action, dict):
+        return ""
+    play = next_best_action.get("canonical_page_play")
+    if not isinstance(play, dict):
+        return ""
+    lane = (play.get("lane") or "").strip()
+    moves = [
+        move for move in (play.get("moves") or [])
+        if isinstance(move, dict) and (move.get("operator_action") or "").strip()
+    ]
+    if not lane and not moves:
+        return ""
+
+    strategy = (
+        play.get("controller_strategy_label")
+        or play.get("controller_strategy")
+        or "Buyer-path repair"
+    )
+    controllers = [
+        str(controller).strip()
+        for controller in (play.get("controllers") or [])
+        if str(controller).strip()
+    ][:3]
+    profile = play.get("controller_profile") if isinstance(play.get("controller_profile"), dict) else {}
+    focus = (profile.get("operator_focus") or "").strip()
+
+    out: List[str] = [_h(2, "Owned Buyer Path Play")]
+    out.append('<div class="summary-box no-break">\n')
+    out.append(f"<p><strong>Strategy:</strong> {_escape(strategy)}</p>\n")
+    if lane:
+        out.append(f"<p><strong>Lane to win back:</strong> <code>{_escape(lane)}</code></p>\n")
+    if controllers:
+        controller_html = ", ".join(f"<code>{_escape(host)}</code>" for host in controllers)
+        out.append(f"<p><strong>Controllers evidenced:</strong> {controller_html}</p>\n")
+    if focus:
+        out.append(f"<p><strong>Operator read:</strong> {_escape(focus)}</p>\n")
+    if moves:
+        out.append("<p><strong>Operator checklist:</strong></p>\n<ol>\n")
+        for move in moves[:5]:
+            action = (move.get("operator_action") or "").strip()
+            why = (move.get("why") or "").strip()
+            move_type = (move.get("type") or "move").replace("_", " ").title()
+            out.append(
+                f"<li><strong>{_escape(move_type)}</strong> — {_escape(action)}"
+            )
+            if why:
+                out.append(f"<br><em>Why:</em> {_escape(why)}")
+            out.append("</li>\n")
+        out.append("</ol>\n")
+    checkout = (play.get("checkout_readiness") or "").strip()
+    if checkout:
+        out.append(
+            f"<p><strong>Agent-checkout readiness:</strong> {_escape(checkout)}</p>\n"
+        )
+    economics = (play.get("economics_policy") or "").strip()
+    if economics:
+        out.append(f"<p><strong>Economics guard:</strong> {_escape(economics)}</p>\n")
+    out.append("</div>\n")
+    return "".join(out)
+
+
 def _render_implementation_roadmap_html(roadmap: Optional[Dict[str, Any]]) -> str:
     if not roadmap:
         return ""
@@ -703,6 +765,9 @@ def render_brand_html_v2(
     body_sections.append(_render_publisher_analysis_html(primary))
     mv = primary.get("merchant_view") or {}
     body_sections.append(_render_recommendations_html(mv.get("actions")))
+    body_sections.append(_render_owned_buyer_path_play_html(
+        mv.get("next_best_action")
+    ))
     body_sections.append(_render_implementation_roadmap_html(
         primary.get("implementation_roadmap")
     ))

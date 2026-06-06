@@ -355,6 +355,59 @@ def _render_recommendations(action_items: Optional[List[Dict[str, Any]]]) -> str
     return "".join(out)
 
 
+def _render_owned_buyer_path_play(next_best_action: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(next_best_action, dict):
+        return ""
+    play = next_best_action.get("canonical_page_play")
+    if not isinstance(play, dict):
+        return ""
+    lane = (play.get("lane") or "").strip()
+    moves = [
+        move for move in (play.get("moves") or [])
+        if isinstance(move, dict) and (move.get("operator_action") or "").strip()
+    ]
+    if not lane and not moves:
+        return ""
+
+    strategy = (
+        play.get("controller_strategy_label")
+        or play.get("controller_strategy")
+        or "Buyer-path repair"
+    )
+    controllers = [
+        str(controller).strip()
+        for controller in (play.get("controllers") or [])
+        if str(controller).strip()
+    ][:3]
+    profile = play.get("controller_profile") if isinstance(play.get("controller_profile"), dict) else {}
+    focus = (profile.get("operator_focus") or "").strip()
+    out: List[str] = [_section_title("Owned Buyer Path Play")]
+    out.append(f"**Strategy:** {strategy}\n\n")
+    if lane:
+        out.append(f"**Lane to win back:** `{lane}`\n\n")
+    if controllers:
+        out.append(f"**Controllers evidenced:** {', '.join(f'`{h}`' for h in controllers)}\n\n")
+    if focus:
+        out.append(f"**Operator read:** {focus}\n\n")
+    if moves:
+        out.append("**Operator checklist:**\n\n")
+        for idx, move in enumerate(moves[:5], start=1):
+            action = (move.get("operator_action") or "").strip()
+            why = (move.get("why") or "").strip()
+            move_type = (move.get("type") or f"move_{idx}").replace("_", " ")
+            out.append(f"{idx}. **{move_type.title()}** — {action}\n")
+            if why:
+                out.append(f"   - Why: {why}\n")
+        out.append("\n")
+    checkout = (play.get("checkout_readiness") or "").strip()
+    if checkout:
+        out.append(f"**Agent-checkout readiness:** {checkout}\n\n")
+    economics = (play.get("economics_policy") or "").strip()
+    if economics:
+        out.append(f"**Economics guard:** {economics}\n\n")
+    return "".join(out)
+
+
 def _render_implementation_roadmap(roadmap: Optional[Dict[str, Any]]) -> str:
     if not roadmap:
         return ""
@@ -532,17 +585,19 @@ def render_brand_markdown_v2(
     # 8. Recommendations (action items v2 from PR-8b)
     mv = primary.get("merchant_view") or {}
     sections.append(_render_recommendations(mv.get("actions")))
-    # 9. Implementation Roadmap (PR-8c)
+    # 9. Owned buyer-path play (canonical page + route strategy)
+    sections.append(_render_owned_buyer_path_play(mv.get("next_best_action")))
+    # 10. Implementation Roadmap (PR-8c)
     sections.append(_render_implementation_roadmap(
         primary.get("implementation_roadmap")
     ))
-    # 10. Pivota Commitments (PR-8d)
+    # 11. Pivota Commitments (PR-8d)
     sections.append(_render_pivota_commitments(
         primary.get("pivota_commitments")
     ))
-    # 11. Methodology
+    # 12. Methodology
     sections.append(_render_methodology(primary))
-    # 12. Appendix
+    # 13. Appendix
     sections.append(_render_appendix(primary))
 
     return "".join(sections)

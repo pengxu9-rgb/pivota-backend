@@ -10332,6 +10332,63 @@ def build_structured_report(
     }
 
 
+def _render_owned_buyer_path_play_markdown(next_best_action: Optional[Mapping[str, Any]]) -> str:
+    if not isinstance(next_best_action, Mapping):
+        return ""
+    play = next_best_action.get("canonical_page_play")
+    if not isinstance(play, Mapping):
+        return ""
+    lane = str(play.get("lane") or "").strip()
+    moves = [
+        move for move in (play.get("moves") or [])
+        if isinstance(move, Mapping) and str(move.get("operator_action") or "").strip()
+    ]
+    if not lane and not moves:
+        return ""
+
+    strategy = str(
+        play.get("controller_strategy_label")
+        or play.get("controller_strategy")
+        or "Buyer-path repair"
+    ).strip()
+    controllers = [
+        str(controller).strip()
+        for controller in (play.get("controllers") or [])
+        if str(controller).strip()
+    ][:3]
+    profile = play.get("controller_profile") if isinstance(play.get("controller_profile"), Mapping) else {}
+    focus = str(profile.get("operator_focus") or "").strip()
+    out: List[str] = ["## Owned buyer path play\n"]
+    out.append(f"**Strategy:** {strategy}\n")
+    if lane:
+        out.append(f"**Lane to win back:** `{lane}`\n")
+    if controllers:
+        out.append(
+            "**Controllers evidenced:** "
+            + ", ".join(f"`{host}`" for host in controllers)
+            + "\n"
+        )
+    if focus:
+        out.append(f"**Operator read:** {focus}\n")
+    if moves:
+        out.append("\n**Operator checklist:**\n")
+        for idx, move in enumerate(moves[:5], start=1):
+            action = str(move.get("operator_action") or "").strip()
+            why = str(move.get("why") or "").strip()
+            move_type = str(move.get("type") or f"move_{idx}").replace("_", " ").title()
+            out.append(f"{idx}. **{move_type}** — {action}\n")
+            if why:
+                out.append(f"   - Why: {why}\n")
+    checkout = str(play.get("checkout_readiness") or "").strip()
+    if checkout:
+        out.append(f"\n**Agent-checkout readiness:** {checkout}\n")
+    economics = str(play.get("economics_policy") or "").strip()
+    if economics:
+        out.append(f"**Economics guard:** {economics}\n")
+    out.append("\n")
+    return "".join(out)
+
+
 def render_markdown_from_structured(report: Dict[str, Any]) -> str:
     """Convert the structured report into the BD-ready markdown output
     the CLI produces. Kept here so the script and any future markdown
@@ -10419,6 +10476,13 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             title = action.get("title") or "(untitled)"
             body = action.get("body") or ""
             sections.append(f"**{idx}. {title}** _(severity: {sev})_  \n{body}\n")
+
+    mv_for_play = report.get("merchant_view") if isinstance(report.get("merchant_view"), dict) else {}
+    sections.append(
+        _render_owned_buyer_path_play_markdown(
+            mv_for_play.get("next_best_action") if isinstance(mv_for_play, dict) else None
+        )
+    )
 
     # Competitive pressure — direct peer-vs-merchant first-party
     # visibility comparison. Sharpest BD framing: a merchant might

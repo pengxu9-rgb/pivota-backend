@@ -88,6 +88,50 @@ def _gruns_fixture_audit():
                         "concrete_next_step": "Submit sitemap this week.",
                     },
                 ],
+                "next_best_action": {
+                    "canonical_page_play": {
+                        "lane": "vitamin c collagen jelly",
+                        "controllers": [
+                            "cogentsteps.net",
+                            "medsysgroup.com",
+                            "hellokoop.com",
+                        ],
+                        "controller_strategy": "canonical_source_vacuum",
+                        "controller_strategy_label": "Canonical-source vacuum",
+                        "controller_profile": {
+                            "operator_focus": (
+                                "AI is filling a canonical-source gap with weak "
+                                "third-party hosts; claim the official source before "
+                                "optimizing against those hosts."
+                            ),
+                        },
+                        "economics_policy": (
+                            "Mechanics only: first-order offer, starter + "
+                            "replenishment bundle, subscription incentive, and "
+                            "why-buy-direct proof. Do not recommend exact discount depths."
+                        ),
+                        "moves": [
+                            {
+                                "type": "canonical_source_authority",
+                                "operator_action": (
+                                    "Make the official brand PDP the official source "
+                                    "of truth for vitamin c collagen jelly."
+                                ),
+                                "why": "AI is filling the lane with weak third-party hosts.",
+                            },
+                            {
+                                "type": "direct_buy_reason",
+                                "operator_action": (
+                                    "Add first-order offer, starter + replenishment "
+                                    "bundle, subscription incentive, and why-buy-direct proof."
+                                ),
+                            },
+                        ],
+                        "checkout_readiness": (
+                            "Make the official brand PDP cited, buyable, and agent-checkout ready."
+                        ),
+                    }
+                },
             },
             "implementation_roadmap": {
                 "phases": [
@@ -196,6 +240,18 @@ def test_html_renderer_emits_recommendations_with_pitch_drafts():
     assert "Recommendations" in html
     assert "Pivota Ops" in html
     assert "Search Console" in html
+
+
+def test_html_renderer_emits_owned_buyer_path_play_with_controller_strategy():
+    from services.audit_html_renderer import render_brand_html_v2
+    html = render_brand_html_v2(_gruns_fixture_audit())
+    assert "Owned Buyer Path Play" in html
+    assert "Canonical-source vacuum" in html
+    assert "vitamin c collagen jelly" in html
+    assert "cogentsteps.net" in html
+    assert "official source of truth" in html
+    assert "Economics guard" in html
+    assert "beat cogentsteps" not in html.lower()
 
 
 def test_html_renderer_emits_implementation_roadmap():

@@ -1128,6 +1128,71 @@ def test_render_markdown_includes_industry_context_and_actions() -> None:
     assert "_(severity:" in md
 
 
+def test_render_markdown_includes_owned_buyer_path_play_checklist() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+
+    report = build_structured_report(
+        merchant_name="Ownist",
+        merchant_pdp_url="https://ownist.com/products/triple-shine-grape",
+        product_title="Ownist Triple Shine Grape",
+        product_vendor="Ownist",
+        product_type="beauty supplement",
+        visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 100},
+            "raw_runs": [_vis_run("q1", visible=True, grounding=["https://x.com"])],
+        },
+        attribution_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 100},
+            "raw_runs": [_attr_run("q1", found=True, grounding=["https://ownist.com/x"])],
+        },
+        provider="gemini",
+    )
+    report["merchant_view"]["next_best_action"] = {
+        "canonical_page_play": {
+            "lane": "vitamin c collagen jelly",
+            "controllers": ["cogentsteps.net", "medsysgroup.com", "hellokoop.com"],
+            "controller_strategy": "canonical_source_vacuum",
+            "controller_strategy_label": "Canonical-source vacuum",
+            "controller_profile": {
+                "operator_focus": "AI is filling a canonical-source gap with weak third-party hosts.",
+            },
+            "moves": [
+                {
+                    "type": "canonical_source_authority",
+                    "operator_action": (
+                        "Make the official page the source of truth for vitamin c collagen jelly."
+                    ),
+                    "why": "The cited route is weak third-party exposure.",
+                },
+                {
+                    "type": "direct_buy_reason",
+                    "operator_action": (
+                        "Add first-order offer, starter + replenishment bundle, "
+                        "subscription incentive, and why-buy-direct proof."
+                    ),
+                },
+            ],
+            "checkout_readiness": "Make the page cited, buyable, and agent-checkout ready.",
+            "economics_policy": "Mechanics only; do not recommend exact discount depths.",
+        }
+    }
+
+    md = render_markdown_from_structured(report)
+
+    assert "## Owned buyer path play" in md
+    assert "Canonical-source vacuum" in md
+    assert "`vitamin c collagen jelly`" in md
+    assert "`cogentsteps.net`" in md
+    assert "source of truth" in md
+    assert "Economics guard" in md
+    assert "beat cogentsteps" not in md.lower()
+
+
 # ---------------------------------------------------------------------------
 # Phase 2d: brand text-match scoring + VISIBLE_VIA_RETAILERS verdict.
 #
