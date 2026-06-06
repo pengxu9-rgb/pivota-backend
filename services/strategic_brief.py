@@ -133,6 +133,7 @@ _FORBIDDEN_PATTERNS = (
     re.compile(r"/100", re.IGNORECASE),
     re.compile(r"\$\s?\d", re.IGNORECASE),
     re.compile(r"\b\d+(?:\.\d+)?\s?%", re.IGNORECASE),
+    re.compile(r"\b\d+(?:\.\d+)?\s*x\b", re.IGNORECASE),
     re.compile(
         r"\b\d[\d,]*\+?\s*(?:reviews?|ratings?|stars?|customers?|users?|sales?|followers?|subscribers?)\b",
         re.IGNORECASE,

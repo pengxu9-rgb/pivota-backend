@@ -918,3 +918,12 @@ def test_validate_grounding_rejects_overwide_controller_lists():
     ]
 
     assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+def test_validate_grounding_rejects_unsupported_multiplier_claims():
+    brief = _grounded_brief()
+    brief["traffic_strategy"] = [
+        "Do not chase generic collagen queries because incumbents have 10x the authority."
+    ]
+
+    assert strategic_brief.validate_grounding(brief, _evidence()) is False
