@@ -569,7 +569,26 @@ main() {
     local payment_intent_status
     payment_intent_status="$(request_json POST "$BASE_URL/internal/readiness/merchants/$MERCHANT_ID/checkout-sessions/$checkout_id/payment-intent" "$payment_intent_json" "$payment_intent_payload_json")"
     expect_status "$payment_intent_status" "200" "Payment intent creation" "$payment_intent_json"
-    jq '{checkout_id,order_id,status,payment_status,payment_intent_id,psp_used,payment_intent_status,bridged_to_paid,replayed,payment_action}' "$payment_intent_json"
+    jq '{
+      checkout_id,
+      order_id,
+      status,
+      payment_status,
+      payment_intent_id,
+      psp_used,
+      payment_intent_status,
+      bridged_to_paid,
+      replayed,
+      payment_action: (
+        (.payment_action // {})
+        | with_entries(
+            if (.key | ascii_downcase | test("secret|token|url"))
+            then .value = "[REDACTED]"
+            else .
+            end
+          )
+      )
+    }' "$payment_intent_json"
     jq -e '(.payment_intent_id // "") != ""' "$payment_intent_json" >/dev/null || die "Payment intent response did not include payment_intent_id"
   fi
 

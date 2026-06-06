@@ -182,7 +182,7 @@ def _redact(obj: Any) -> Any:
         redacted: Dict[str, Any] = {}
         for key, value in obj.items():
             key_str = str(key).lower()
-            if "secret" in key_str:
+            if any(marker in key_str for marker in ("secret", "token", "url")):
                 redacted[key] = "[REDACTED]"
             else:
                 redacted[key] = _redact(value)
