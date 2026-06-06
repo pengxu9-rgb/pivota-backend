@@ -96,7 +96,7 @@ async def test_writer_audit_log_records_counts_and_reasons() -> None:
 
     class FakeDb:
         async def execute(self, sql, values):
-            calls.append({"sql": str(sql), "values": dict(values)})
+            calls.append({"sql": sql, "values": dict(values)})
 
     audit = WriterAuditAccumulator(writer_name="shopify_products_sync", batch_id="batch_1")
     audit.record_applied(2)
@@ -105,6 +105,8 @@ async def test_writer_audit_log_records_counts_and_reasons() -> None:
     await write_writer_audit_log(audit, actor="test_actor", db=FakeDb())
 
     assert len(calls) == 1
+    assert isinstance(calls[0]["sql"], str)
+    assert "INSERT INTO writer_audit_log" in calls[0]["sql"]
     values = calls[0]["values"]
     assert values["writer_name"] == "shopify_products_sync"
     assert values["batch_id"] == "batch_1"

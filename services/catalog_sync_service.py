@@ -1473,7 +1473,7 @@ async def ingest_standard_products(
         )
 
     if audit is not None:
-        await write_writer_audit_log(audit)
+        await write_writer_audit_log(audit, db=database)
 
     # Stage 2a (mig 084): bump catalog_merchants.last_full_sync_at on
     # successful sync completion. The sweep

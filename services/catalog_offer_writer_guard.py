@@ -9,8 +9,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
-from sqlalchemy import text
-
 from db.database import database
 
 ZERO_OR_MISSING_PRICE = "zero_or_missing_price"
@@ -143,8 +141,7 @@ async def write_writer_audit_log(
 ) -> None:
     write_db = db or database
     await write_db.execute(
-        text(
-            """
+        """
             INSERT INTO writer_audit_log (
               writer_name, batch_id, dry_run_report_hash,
               applied_rows, skipped_rows, reasons, actor
@@ -152,8 +149,7 @@ async def write_writer_audit_log(
               :writer_name, :batch_id, :dry_run_report_hash,
               :applied_rows, :skipped_rows, CAST(:reasons AS jsonb), :actor
             )
-            """
-        ),
+            """,
         {
             "writer_name": audit.writer_name,
             "batch_id": audit.batch_id,
