@@ -24,6 +24,7 @@ from services.agent_center_bd_report_service import (
     normalize_host,
 )
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
+from services.buyer_path_stable_controllers import stable_buyer_path_controllers
 from services.cited_host_classifier import classify_host
 from services.sku_lane_priority import build_lane_product_evidence
 
@@ -118,6 +119,7 @@ def build_sku_opportunity(
         sku_ctx=sku_ctx,
         attribute_graph=graph,
     )
+
     return {
         "per_prompt": per_prompt,
         "sku_aggregate": aggregate,
@@ -274,6 +276,17 @@ def _score_prompt_group(
         open_lane=open_lane,
         ownership_state=ownership_state,
     )
+    top_cited_hosts = [
+        {"host": host, "times_cited": count}
+        for host, count in cited_counter.most_common(5)
+    ]
+    buyer_path_controllers = stable_buyer_path_controllers(
+        who_owns=who_owns,
+        top_cited_hosts=top_cited_hosts,
+        source_roles=source_roles,
+        source_route=source_route,
+        ownership_state=ownership_state,
+    )
 
     return {
         "query": _display_query(runs, query),
@@ -289,10 +302,8 @@ def _score_prompt_group(
         "source_summary": {
             "merchant_cited_runs": merchant_cited_runs,
             "runs_with_citations": runs_with_citations,
-            "top_cited_hosts": [
-                {"host": host, "times_cited": count}
-                for host, count in cited_counter.most_common(5)
-            ],
+            "top_cited_hosts": top_cited_hosts,
+            "buyer_path_controllers": buyer_path_controllers,
         },
         "competitors": competitors,
         "competitor_count": len(competitors),

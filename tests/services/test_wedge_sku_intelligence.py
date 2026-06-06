@@ -214,24 +214,23 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     assert head["ownership_state"] != "merchant-owned"
     assert head["buyer_path_action"]["prescription_class"] == "operational_efficiency"
     assert head["buyer_path_action"]["lane"] == "best collagen supplements for skin"
-    assert "weak citation trail" in head["buyer_path_action"]["move"]
-    assert "structured product data" in head["buyer_path_action"]["move"]
-    assert "first-order offer" not in head["buyer_path_action"]["move"]
-    assert "starter + replenishment bundle" not in head["buyer_path_action"]["move"]
+    assert "direct buyer path against amazon.com" in head["buyer_path_action"]["move"]
+    assert "first-order offer" in head["buyer_path_action"]["move"]
+    assert "starter + replenishment bundle" in head["buyer_path_action"]["move"]
     play = head["buyer_path_action"]["canonical_page_play"]
     assert play["lane"] == "best collagen supplements for skin"
-    assert play["controller_strategy"] == "canonical_source_vacuum"
+    assert play["controller_strategy"] == "leading_retailer_competition"
     assert {move["type"] for move in play["moves"]} == {
-        "canonical_source_authority",
-        "authorized_distribution_or_reseller_cleanup",
-        "direct_buy_reason",
+        "first_order_offer",
+        "starter_replenishment_bundle",
+        "subscription_or_why_buy_direct",
     }
     play_blob = json.dumps(play).lower()
-    assert "after the official page is source-ready" in play_blob
+    assert "after it is source-ready" in play_blob
     assert "first-order offer" in play_blob
     assert "starter + replenishment bundle" in play_blob
     assert "exposure_read" in play_blob
-    assert "verify material traffic" in play_blob or "not proof that material buyer traffic" in play_blob
+    assert "credible retail controllers" in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "agent-checkout ready" in play["checkout_readiness"]
     assert out["coverage"]["prompt_count"] == 4
@@ -616,4 +615,5 @@ def test_sku_intelligence_ownist_live_like_sparse_product_prefers_vitamin_c_lane
     assert nba_wedge["recommended_beachhead_lane"]["query"] == "vitamin c collagen jelly"
     assert "Start with \"vitamin c collagen jelly\"" in out["next_best_action"]["why_this_first"]
     assert buyer_path["primary_lane"] == "vitamin c collagen jelly"
-    assert buyer_path["state"] == "third_party_controlled"
+    assert buyer_path["state"] == "fragmented_source_trail"
+    assert buyer_path["top_controllers"] == []

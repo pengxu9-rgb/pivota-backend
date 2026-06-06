@@ -11,6 +11,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from services.buyer_path_stable_controllers import (
+    stable_buyer_path_controllers_for_row,
+)
 from services.buyer_path_controller_quality import (
     controller_profile as build_controller_profile,
     is_canonical_source_vacuum,
@@ -424,7 +427,10 @@ def _sku_prescription_for_gap(
 
     if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
         query = _sku_query_phrase(route_prompt.get("query"))
-        hosts = _phrase(_host_names(route_prompt.get("sources")), "other sites")
+        hosts = _phrase(
+            _host_names(route_prompt.get("sources")),
+            "fragmented sources with no single cited site",
+        )
         wedge_reason = _sku_sideways_wedge_reason(sideways_wedge)
         route_profile = _route_prompt_controller_profile(route_prompt)
         if is_canonical_source_vacuum(route_profile):
@@ -706,13 +712,15 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     if not prompt:
         return {}
     source_summary = _as_mapping(prompt.get("source_summary"))
+    stable_sources = stable_buyer_path_controllers_for_row(prompt)
     out = {
         "query": prompt.get("query"),
         "ownership_state": prompt.get("ownership_state"),
         "source_route": prompt.get("source_route"),
         "opportunity_score": prompt.get("opportunity_score"),
         "why_fit": prompt.get("attribute_basis") or prompt.get("evidence"),
-        "sources": _as_list(source_summary.get("top_cited_hosts"))[:3],
+        "sources": stable_sources[:3],
+        "raw_top_cited_hosts": _as_list(source_summary.get("top_cited_hosts"))[:3],
         "competitors": _as_list(prompt.get("competitors"))[:5],
     }
     for key in (
@@ -941,7 +949,10 @@ def _sku_source_route_self_serve(
 ) -> str:
     route = str(prompt.get("source_route") or "").strip().lower()
     ownership = str(prompt.get("ownership_state") or "").strip().lower()
-    sources = _phrase(_host_names(prompt.get("sources")), "the cited sources")
+    sources = _phrase(
+        _host_names(prompt.get("sources")),
+        "fragmented sources with no single cited site",
+    )
     query = _sku_query_phrase(prompt.get("query"))
     page = _merchant_page_label(merchant_path)
     profile = _route_prompt_controller_profile(prompt)
@@ -985,7 +996,10 @@ def _sku_source_route_follow_up(
 ) -> str:
     route = str(prompt.get("source_route") or "").strip().lower()
     ownership = str(prompt.get("ownership_state") or "").strip().lower()
-    sources = _phrase(_host_names(prompt.get("sources")), "the cited sources")
+    sources = _phrase(
+        _host_names(prompt.get("sources")),
+        "fragmented sources with no single cited site",
+    )
     profile = _route_prompt_controller_profile(prompt)
     if is_canonical_source_vacuum(profile):
         return (
@@ -1039,7 +1053,7 @@ def _sku_operator_moves(
     page = _merchant_page_label(merchant_path)
     destination = _merchant_destination(merchant_path)
     lane = query or "the exposed lane"
-    controller = _phrase(sources, "the cited sources")
+    controller = _phrase(sources, "fragmented sources with no single cited site")
     profile = _route_prompt_controller_profile(route_prompt)
     if is_canonical_source_vacuum(profile):
         return [
@@ -1163,7 +1177,7 @@ def _canonical_page_play(
     goal: str,
     controller_profile: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    controller = _phrase(controllers, "the cited third-party route")
+    controller = _phrase(controllers, "fragmented sources with no single cited site")
     profile = dict(controller_profile or build_controller_profile(controllers))
     if is_canonical_source_vacuum(profile):
         moves = [

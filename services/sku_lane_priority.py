@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from services.buyer_path_stable_controllers import stable_buyer_path_controller_hosts
+
 
 THIRD_PARTY_OWNERSHIP = {
     "competitor-owned",
@@ -477,21 +479,7 @@ def _sideways_wedge_canonical_play(
 
 
 def _lane_controllers(row: Mapping[str, Any]) -> List[str]:
-    hosts: List[str] = []
-    summary = _as_mapping(row.get("source_summary"))
-    for source in _as_list(summary.get("top_cited_hosts")):
-        host = _host_from_any(source)
-        if host:
-            hosts.append(host)
-    for source in _as_list(row.get("source_roles")):
-        host = _host_from_any(source)
-        if host:
-            hosts.append(host)
-    for source in _as_list(row.get("sources")):
-        host = _host_from_any(source)
-        if host:
-            hosts.append(host)
-    return _unique(hosts)[:3]
+    return stable_buyer_path_controller_hosts(row)[:3]
 
 
 def _host_from_any(value: Any) -> str:

@@ -13,6 +13,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from config.settings import settings
+from services.buyer_path_stable_controllers import (
+    stable_buyer_path_controllers_for_row,
+)
 from services.buyer_path_controller_quality import (
     controller_profile as build_controller_profile,
     is_canonical_source_vacuum,
@@ -715,7 +718,7 @@ def _category_battle(rows: List[Mapping[str, Any]]) -> Dict[str, Any]:
             prompts.append(query)
         row_competitors = _as_str_list(row.get("competitors"))
         winners.extend(row_competitors)
-        source_roles = _source_role_chips(row)
+        source_roles = _stable_source_role_chips(row)
         ranked_by.extend(source_roles)
         prompt_details.append({
             "query": query,
@@ -790,8 +793,6 @@ def _buyer_path_opportunities(
             continue
         if not has_lane_demand(row):
             continue
-        if not _buyer_path_controllers(row):
-            continue
         rows.append(row)
     prioritized = prioritize_lanes(
         rows,
@@ -842,22 +843,7 @@ def _buyer_path_opportunity(
 
 
 def _buyer_path_controllers(row: Mapping[str, Any]) -> List[Dict[str, str]]:
-    source_summary = _as_mapping(row.get("source_summary"))
-    summarized: List[Dict[str, str]] = []
-    route = _clean_str(row.get("source_route")) or "unclassified"
-    for source in _as_list(source_summary.get("top_cited_hosts")):
-        if not isinstance(source, Mapping):
-            continue
-        host = _normalize_host(source.get("host"))
-        if host:
-            summarized.append({
-                "host": host,
-                "role": route,
-                "times_cited": source.get("times_cited"),
-            })
-    if summarized:
-        return _unique_host_roles(summarized)[:3]
-    return _unique_host_roles(_source_role_chips(row))[:3]
+    return _unique_host_roles(stable_buyer_path_controllers_for_row(row))[:3]
 
 
 def _buyer_path_moves(
@@ -905,7 +891,7 @@ def _channel_map(
     for lane in top_open_lanes:
         query = _clean_str(lane.get("query"))
         row = rows_by_query.get(_norm_phrase(query)) or {}
-        controlled_by = _unique_host_roles(_source_role_chips(row))
+        controlled_by = _unique_host_roles(_stable_source_role_chips(row))
         source_route = _clean_str(row.get("source_route") or lane.get("source_route")).lower()
         role = (
             "open"
@@ -1011,7 +997,7 @@ def _first_present(payload: Mapping[str, Any], keys: Tuple[str, ...]) -> Any:
 def _substitution_source_roles(opportunity: Mapping[str, Any]) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     alert = _as_mapping(opportunity.get("substitution_alert"))
-    rows.extend(_source_role_chips(alert))
+    rows.extend(_stable_source_role_chips(alert))
     alert_prompt = _norm_phrase(alert.get("prompt") or alert.get("on_prompt"))
     for row in _as_list(opportunity.get("per_prompt")):
         if not isinstance(row, Mapping):
@@ -1022,9 +1008,23 @@ def _substitution_source_roles(opportunity: Mapping[str, Any]) -> List[Dict[str,
             not alert_prompt or row_prompt != alert_prompt
         ):
             continue
-        rows.extend(_source_role_chips(row))
-        rows.extend(_source_role_chips(substitution))
+        rows.extend(_stable_source_role_chips(row))
+        rows.extend(_stable_source_role_chips(substitution))
     return _unique_host_roles(rows)
+
+
+def _stable_source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    stable = stable_buyer_path_controllers_for_row(row)
+    if stable:
+        return stable
+    source_summary = _as_mapping(row.get("source_summary"))
+    if "buyer_path_controllers" in source_summary:
+        return []
+    repeated: List[Dict[str, Any]] = []
+    for source in _source_role_chips(row):
+        if int(source.get("times_cited") or 0) >= 2:
+            repeated.append(source)
+    return repeated
 
 
 def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -1286,7 +1286,7 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
                 "loyalty, returns, stock, and fresh facts."
             ),
         ]
-    if controller_phrase != "the cited sources":
+    if controllers:
         first_moves.append(
             f"Update the source trail around {controller_phrase} only after {page_label} "
             "has the direct buying reason."
@@ -1427,7 +1427,7 @@ def _controller_phrase(controllers: List[Mapping[str, Any]]) -> str:
     ]
     hosts = _unique(host for host in hosts if host)
     if not hosts:
-        return "the cited sources"
+        return "fragmented sources with no single site owning the lane"
     if len(hosts) == 1:
         return hosts[0]
     return ", ".join(hosts[:-1]) + f", and {hosts[-1]}"

@@ -581,6 +581,10 @@ def test_branded_prompt_with_retailer_citations_names_retailer_owner():
 
     assert row["ownership_state"] == "retailer-owned"
     assert row["who_owns"] == ["ulta.com", "walmart.com"]
+    assert row["source_summary"]["buyer_path_controllers"] == [
+        {"host": "ulta.com", "role": "retailer", "times_cited": 2},
+        {"host": "walmart.com", "role": "retailer", "times_cited": 2},
+    ]
 
 
 def test_merchant_owned_requires_dominant_first_party_citation():

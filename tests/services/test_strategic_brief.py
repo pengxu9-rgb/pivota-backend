@@ -6,7 +6,11 @@ from typing import Any, Dict, List, Mapping
 import pytest
 
 from services import strategic_brief
-from services.next_best_action import attach_sku_strategic_brief
+from services.agent_center_bd_report_service import _sku_intelligence_headline
+from services.next_best_action import (
+    attach_sku_strategic_brief,
+    build_sku_next_best_action,
+)
 
 
 def _attribute_graph() -> Dict[str, Any]:
@@ -43,8 +47,8 @@ def _opportunity() -> Dict[str, Any]:
                 "opportunity_score": 14.2,
                 "competitors": ["Vital Proteins", "NeoCell", "Sports Research"],
                 "source_roles": [
-                    {"host": "forbes.com", "role": "publisher"},
-                    {"host": "amazon.com", "role": "marketplace"},
+                    {"host": "forbes.com", "role": "publisher", "times_cited": 2},
+                    {"host": "amazon.com", "role": "marketplace", "times_cited": 2},
                 ],
             },
             {
@@ -58,8 +62,8 @@ def _opportunity() -> Dict[str, Any]:
                 "opportunity_score": 55.0,
                 "attribute_basis": ["halal", "collagen", "stick", "before bed"],
                 "source_roles": [
-                    {"host": "wellness-notes.example", "role": "publisher"},
-                    {"host": "halal-beauty.example", "role": "publisher"},
+                    {"host": "wellness-notes.example", "role": "publisher", "times_cited": 2},
+                    {"host": "halal-beauty.example", "role": "publisher", "times_cited": 2},
                 ],
             },
             {
@@ -100,6 +104,75 @@ def _identity() -> Dict[str, Any]:
     return {
         "name": "BB Lab Good Night Collagen",
         "anchors": {"brand": "BB Lab", "category": "collagen supplement"},
+    }
+
+
+def _controller_opportunity(
+    top_cited_hosts: List[Mapping[str, Any]],
+    *,
+    who_owns: Any = "reddit.com",
+    source_route: str = "forum",
+    ownership_state: str = "forum-owned",
+    source_roles: List[Mapping[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "query": "halal collagen sticks before bed",
+        "axis": "sidewalk",
+        "query_class": "sidewalk",
+        "ownership_state": ownership_state,
+        "source_route": source_route,
+        "who_owns": who_owns,
+        "demand_signal": 1.0,
+        "opportunity_score": 42.0,
+        "attribute_basis": ["halal", "collagen", "stick", "before bed"],
+        "source_summary": {"top_cited_hosts": list(top_cited_hosts)},
+    }
+    if source_roles is not None:
+        row["source_roles"] = source_roles
+    return {
+        "intent_ladder": {},
+        "per_prompt": [row],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+        "demand_state_summary": "third-party source route detected",
+    }
+
+
+def _controller_surfaces(opportunity: Mapping[str, Any]) -> Dict[str, Any]:
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph=_attribute_graph(),
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+    brief = strategic_brief._deterministic_brief(evidence)
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+    return {
+        "brief_why_you_lose": (brief or {}).get("why_you_lose"),
+        "buyer_path_controllers": (
+            evidence.get("buyer_path_opportunities") or [{}]
+        )[0].get("controlled_by"),
+        "brief_traffic_controller": ((brief or {}).get("traffic_strategy") or [{}])[0].get("who_controls"),
+        "sku_headline": _sku_intelligence_headline(
+            opportunity=opportunity,
+            title="BB Lab Good Night Collagen",
+            product_type="collagen supplement",
+        ),
+        "nba_headline": nba.get("headline"),
+        "canonical_page_controllers": (
+            nba.get("canonical_page_play") or {}
+        ).get("controllers"),
+        "controller_strategy": (
+            evidence.get("buyer_path_opportunities") or [{}]
+        )[0].get("controller_strategy"),
     }
 
 
@@ -302,8 +375,8 @@ def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
         "NeoCell",
         "Sports Research",
     ]
-    assert {"host": "forbes.com", "role": "publisher"} in evidence["category_battle"]["ranked_by"]
-    assert {"host": "amazon.com", "role": "marketplace"} in evidence["category_battle"]["ranked_by"]
+    assert {"host": "forbes.com", "role": "publisher", "times_cited": 2} in evidence["category_battle"]["ranked_by"]
+    assert {"host": "amazon.com", "role": "marketplace", "times_cited": 2} in evidence["category_battle"]["ranked_by"]
     assert evidence["substitution"]["on_prompt"] == "bb lab collagen alternatives"
     assert evidence["substitution"]["handed_to"] == "Vital Proteins"
     assert evidence["open_lanes"][0] == {
@@ -313,15 +386,15 @@ def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
         "channel_role": "open",
     }
     assert evidence["channel_map"][0]["controlled_by"] == [
-        {"host": "wellness-notes.example", "role": "publisher"},
-        {"host": "halal-beauty.example", "role": "publisher"},
+        {"host": "halal-beauty.example", "role": "publisher", "times_cited": 2},
+        {"host": "wellness-notes.example", "role": "publisher", "times_cited": 2},
     ]
     assert evidence["buyer_path_opportunities"][0]["query"] == "best collagen supplements for skin"
     assert evidence["buyer_path_opportunities"][0]["merchant_archetype"] == "brand"
     assert "first-order offer" in " ".join(
         evidence["buyer_path_opportunities"][0]["recommended_moves"]
     )
-    assert {"host": "forbes.com", "role": "publisher"} in (
+    assert {"host": "forbes.com", "role": "publisher", "times_cited": 2} in (
         evidence["buyer_path_opportunities"][0]["controlled_by"]
     )
     grounding_notes = evidence["grounding_notes"]
@@ -332,20 +405,134 @@ def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
     }
     assert grounding_notes["competitor_attributes"] == "not_assessed"
     assert grounding_notes["merchant_channels"] == "unknown"
-    assert {"host": "forbes.com", "role": "publisher"} in grounding_notes["evidenced_channels"]
-    assert {"host": "amazon.com", "role": "marketplace"} in grounding_notes["evidenced_channels"]
-    assert {"host": "wellness-notes.example", "role": "publisher"} in grounding_notes["evidenced_channels"]
-    assert {"host": "halal-beauty.example", "role": "publisher"} in grounding_notes["evidenced_channels"]
+    assert {"host": "forbes.com", "role": "publisher", "times_cited": 2} in grounding_notes["evidenced_channels"]
+    assert {"host": "amazon.com", "role": "marketplace", "times_cited": 2} in grounding_notes["evidenced_channels"]
+    assert {"host": "wellness-notes.example", "role": "publisher", "times_cited": 2} in grounding_notes["evidenced_channels"]
+    assert {"host": "halal-beauty.example", "role": "publisher", "times_cited": 2} in grounding_notes["evidenced_channels"]
+
+
+def test_stable_controller_surfaces_ignore_run_to_run_one_off_citation_tails():
+    run_a = _controller_opportunity(
+        [
+            {"host": "sayweee.com", "times_cited": 1},
+            {"host": "dubuypk.com", "times_cited": 1},
+            {"host": "koreancare.net", "times_cited": 1},
+        ],
+        who_owns="reddit.com",
+        source_roles=[{"host": "reddit.com", "role": "forum", "times_cited": 2}],
+    )
+    run_b = _controller_opportunity(
+        [
+            {"host": "shop.tiktok.com", "times_cited": 1},
+            {"host": "ramuskin.com", "times_cited": 1},
+            {"host": "reddit.com", "times_cited": 1},
+        ],
+        who_owns="reddit.com",
+        source_roles=[{"host": "reddit.com", "role": "forum", "times_cited": 2}],
+    )
+
+    surfaces_a = _controller_surfaces(run_a)
+    surfaces_b = _controller_surfaces(run_b)
+    blob = json.dumps(surfaces_a).lower()
+
+    assert surfaces_a == surfaces_b
+    assert surfaces_a["buyer_path_controllers"] == [
+        {"host": "reddit.com", "role": "forum", "times_cited": 2}
+    ]
+    assert surfaces_a["canonical_page_controllers"] == ["reddit.com"]
+    assert "reddit.com" in surfaces_a["brief_why_you_lose"]
+    assert "reddit.com" in surfaces_a["sku_headline"]
+    for one_off in (
+        "sayweee.com",
+        "dubuypk.com",
+        "koreancare.net",
+        "shop.tiktok.com",
+        "ramuskin.com",
+    ):
+        assert one_off not in blob
+
+
+def test_stable_controller_threshold_excludes_one_offs_and_allows_repeated_hosts():
+    opportunity = _controller_opportunity(
+        [
+            {"host": "sayweee.com", "times_cited": 1},
+            {"host": "healthline.com", "times_cited": 2},
+        ],
+        who_owns=None,
+        source_route="publisher",
+        ownership_state="publisher-owned",
+    )
+
+    surfaces = _controller_surfaces(opportunity)
+    blob = json.dumps(surfaces).lower()
+
+    assert surfaces["buyer_path_controllers"] == [
+        {"host": "healthline.com", "role": "publisher", "times_cited": 2}
+    ]
+    assert "healthline.com" in blob
+    assert "sayweee.com" not in blob
+
+
+def test_fragmented_controller_lanes_are_framed_without_naming_one_off_hosts():
+    opportunity = _controller_opportunity(
+        [
+            {"host": "sayweee.com", "times_cited": 1},
+            {"host": "dubuypk.com", "times_cited": 1},
+        ],
+        who_owns=None,
+        source_route="publisher",
+        ownership_state="publisher-owned",
+    )
+
+    surfaces = _controller_surfaces(opportunity)
+    blob = json.dumps(surfaces).lower()
+
+    assert surfaces["buyer_path_controllers"] == []
+    assert surfaces["canonical_page_controllers"] == []
+    assert surfaces["controller_strategy"] == "canonical_source_vacuum"
+    assert "fragmented sources" in surfaces["brief_why_you_lose"]
+    assert "no single site owning the lane" in surfaces["brief_why_you_lose"]
+    assert "fragmented" in surfaces["sku_headline"]
+    assert "sayweee.com" not in blob
+    assert "dubuypk.com" not in blob
+
+
+def test_controller_quality_strategy_uses_stable_controllers_not_one_off_tail():
+    retailer = _controller_opportunity(
+        [{"host": "reddit.com", "times_cited": 1}],
+        who_owns="oliveyoung.com",
+        source_route="retailer",
+        ownership_state="retailer-owned",
+    )
+    forum = _controller_opportunity(
+        [{"host": "oliveyoung.com", "times_cited": 1}],
+        who_owns="reddit.com",
+        source_route="forum",
+        ownership_state="forum-owned",
+    )
+
+    retailer_surfaces = _controller_surfaces(retailer)
+    forum_surfaces = _controller_surfaces(forum)
+
+    assert retailer_surfaces["buyer_path_controllers"][0]["host"] == "oliveyoung.com"
+    assert retailer_surfaces["controller_strategy"] == "leading_retailer_competition"
+    assert forum_surfaces["buyer_path_controllers"][0]["host"] == "reddit.com"
+    assert forum_surfaces["controller_strategy"] != "leading_retailer_competition"
+    assert "oliveyoung.com" not in json.dumps(forum_surfaces["buyer_path_controllers"])
 
 
 def test_assemble_sku_brief_evidence_grounding_notes_use_real_evidenced_channels():
     opportunity = _opportunity()
     opportunity["per_prompt"][0]["source_roles"] = [
-        {"host": "https://www.healthline.com/nutrition/collagen", "role": "publisher"},
-        {"host": "amazon.com", "role": "marketplace"},
+        {
+            "host": "https://www.healthline.com/nutrition/collagen",
+            "role": "publisher",
+            "times_cited": 2,
+        },
+        {"host": "amazon.com", "role": "marketplace", "times_cited": 2},
     ]
     opportunity["per_prompt"][2]["substitution"]["source_roles"] = [
-        {"host": "comparison.example", "role": "publisher"},
+        {"host": "comparison.example", "role": "publisher", "times_cited": 2},
     ]
 
     evidence = strategic_brief.assemble_sku_brief_evidence(
@@ -361,11 +548,11 @@ def test_assemble_sku_brief_evidence_grounding_notes_use_real_evidenced_channels
         "competitor_attributes": "not_assessed",
         "merchant_channels": "unknown",
         "evidenced_channels": [
-            {"host": "healthline.com", "role": "publisher"},
-            {"host": "amazon.com", "role": "marketplace"},
-            {"host": "wellness-notes.example", "role": "publisher"},
-            {"host": "halal-beauty.example", "role": "publisher"},
-            {"host": "comparison.example", "role": "publisher"},
+            {"host": "amazon.com", "role": "marketplace", "times_cited": 2},
+            {"host": "healthline.com", "role": "publisher", "times_cited": 2},
+            {"host": "halal-beauty.example", "role": "publisher", "times_cited": 2},
+            {"host": "wellness-notes.example", "role": "publisher", "times_cited": 2},
+            {"host": "comparison.example", "role": "publisher", "times_cited": 2},
         ],
     }
 
@@ -469,8 +656,8 @@ def test_assemble_sku_brief_evidence_supports_ownist_brand_path_exposure():
                 "demand_signal": 1.0,
                 "opportunity_score": 38.0,
                 "source_roles": [
-                    {"host": "walmart.com", "role": "retailer"},
-                    {"host": "amazon.com", "role": "marketplace"},
+                    {"host": "walmart.com", "role": "retailer", "times_cited": 2},
+                    {"host": "amazon.com", "role": "marketplace", "times_cited": 2},
                 ],
             }
         ],
@@ -507,8 +694,8 @@ def test_assemble_sku_brief_evidence_supports_ownist_brand_path_exposure():
     assert ownist_path["exposure"] == "retailer-owned"
     assert ownist_path["route"] == "retailer"
     assert ownist_path["controlled_by"] == [
-        {"host": "walmart.com", "role": "retailer"},
-        {"host": "amazon.com", "role": "marketplace"},
+        {"host": "amazon.com", "role": "marketplace", "times_cited": 2},
+        {"host": "walmart.com", "role": "retailer", "times_cited": 2},
     ]
     assert ownist_path["destination"] == "the brand's own website"
     assert ownist_path["merchant_archetype"] == "brand"
@@ -540,9 +727,9 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
                 "opportunity_score": 18.0,
                 "attribute_basis": ["healthy snacks", "collagen", "jelly"],
                 "source_roles": [
-                    {"host": "cogentsteps.net", "role": "publisher"},
-                    {"host": "medsysgroup.com", "role": "publisher"},
-                    {"host": "hellokoop.com", "role": "retailer"},
+                    {"host": "cogentsteps.net", "role": "publisher", "times_cited": 2},
+                    {"host": "medsysgroup.com", "role": "publisher", "times_cited": 2},
+                    {"host": "hellokoop.com", "role": "retailer", "times_cited": 2},
                 ],
             },
             {
@@ -555,9 +742,9 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
                 "opportunity_score": 5.45,
                 "attribute_basis": ["vitamin c", "collagen", "jelly"],
                 "source_roles": [
-                    {"host": "cogentsteps.net", "role": "publisher"},
-                    {"host": "medsysgroup.com", "role": "publisher"},
-                    {"host": "hellokoop.com", "role": "retailer"},
+                    {"host": "cogentsteps.net", "role": "publisher", "times_cited": 2},
+                    {"host": "medsysgroup.com", "role": "publisher", "times_cited": 2},
+                    {"host": "hellokoop.com", "role": "retailer", "times_cited": 2},
                 ],
             },
         ],
@@ -590,9 +777,9 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
     assert opportunities[0]["query"] == "vitamin c collagen jelly"
     assert opportunities[0]["lane_priority_score"] > opportunities[1]["lane_priority_score"]
     assert opportunities[0]["controlled_by"] == [
-        {"host": "cogentsteps.net", "role": "publisher"},
-        {"host": "medsysgroup.com", "role": "publisher"},
-        {"host": "hellokoop.com", "role": "retailer"},
+        {"host": "cogentsteps.net", "role": "publisher", "times_cited": 2},
+        {"host": "hellokoop.com", "role": "retailer", "times_cited": 2},
+        {"host": "medsysgroup.com", "role": "publisher", "times_cited": 2},
     ]
     assert opportunities[0]["controller_strategy"] == "canonical_source_vacuum"
     assert "official source AI can cite" in opportunities[0]["recommended_moves"][0]

@@ -766,7 +766,7 @@ def test_sku_nba_bb_lab_sideways_wedge_prefers_halal_before_bed_over_head_pressu
     assert nba["canonical_page_play"]["controller_strategy"] == "canonical_source_vacuum"
     play_blob = json.dumps(nba["canonical_page_play"]).lower()
     assert "official source ai can cite" in play_blob
-    assert "not proof that material buyer traffic" in play_blob
+    assert "weak third-party trail" in play_blob
     assert '"confidence": "fallback"' not in play_blob
     assert '"confidence": "inferred"' in play_blob
     assert "%" not in _nba_strings(nba) and "$" not in _nba_strings(nba)
@@ -858,7 +858,7 @@ def _ownist_lane(
         "attribute_basis": attribute_basis,
         "source_summary": {
             "top_cited_hosts": [
-                {"host": host, "times_cited": 1}
+                {"host": host, "times_cited": 2}
                 for host in controllers
             ]
         },
@@ -925,7 +925,7 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
     play = nba["canonical_page_play"]
     play_blob = json.dumps(play).lower()
     assert play["lane"] == "vitamin c collagen jelly"
-    assert play["controllers"] == ["cogentsteps.net", "medsysgroup.com", "hellokoop.com"]
+    assert play["controllers"] == ["cogentsteps.net", "hellokoop.com", "medsysgroup.com"]
     assert play["controller_strategy"] == "canonical_source_vacuum"
     assert {move["type"] for move in play["moves"]} == {
         "canonical_source_authority",
@@ -941,7 +941,7 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
     assert "why-buy-direct" in play_blob
     assert "first-order offer" not in nba["first_move"].lower()
     assert "starter + replenishment bundle" not in nba["first_move"].lower()
-    assert "not proof that material buyer traffic" in play_blob
+    assert "weak third-party trail" in play_blob
     assert "beat cogentsteps" not in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "%" not in copy and "$" not in copy

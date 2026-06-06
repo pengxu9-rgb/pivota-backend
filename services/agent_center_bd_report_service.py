@@ -36,6 +36,10 @@ from urllib.parse import urlparse
 from services import agent_center_llm_client as llm_client
 from services.audit_playbook_engine import select_playbooks
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
+from services.buyer_path_stable_controllers import (
+    stable_buyer_path_controller_hosts,
+    stable_buyer_path_controllers_for_row,
+)
 from services.buyer_path_controller_quality import (
     controller_profile as build_controller_profile,
     is_canonical_source_vacuum,
@@ -5072,22 +5076,14 @@ def _sku_intelligence_ladder_layer(row: Mapping[str, Any]) -> Optional[str]:
 def _who_owns_prompt(row: Mapping[str, Any]) -> Optional[Any]:
     if row.get("who_owns"):
         return row.get("who_owns")
-    ownership = str(row.get("ownership_state") or "").lower()
-    competitors = row.get("competitors")
-    source_summary = row.get("source_summary") if isinstance(row.get("source_summary"), dict) else {}
-    top_hosts = source_summary.get("top_cited_hosts") or []
-    if ownership in {"competitor-owned", "retailer-owned", "publisher-owned", "forum-owned"}:
-        if competitors:
-            return competitors[0] if isinstance(competitors, list) else competitors
-        if top_hosts and isinstance(top_hosts[0], dict):
-            return top_hosts[0].get("host")
+    controllers = stable_buyer_path_controller_hosts(row)
+    if controllers:
+        return controllers[0] if len(controllers) == 1 else controllers
     return None
 
 
 def _prompt_sources(row: Mapping[str, Any]) -> List[Any]:
-    source_summary = row.get("source_summary") if isinstance(row.get("source_summary"), dict) else {}
-    sources = source_summary.get("top_cited_hosts") or []
-    return sources[:3] if isinstance(sources, list) else []
+    return stable_buyer_path_controllers_for_row(row)[:3]
 
 
 def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -5103,7 +5099,11 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
         if isinstance(source, dict) and str(source.get("host") or "").strip()
     ]
     controllers = hosts[:3]
-    controller_phrase = ", ".join(controllers) if controllers else "the cited sources"
+    controller_phrase = (
+        ", ".join(controllers)
+        if controllers
+        else "fragmented sources with no single cited site"
+    )
     lane = query or "this exposed lane"
     profile = build_controller_profile(
         {
@@ -5505,6 +5505,18 @@ def summarize_sku_buyer_path(sku_intelligence: Mapping[str, Any]) -> Dict[str, A
             f"{merchant_owned_count}/{prompt_count} evidenced prompt lanes are "
             f"merchant-owned{lane_clause}."
         )
+    elif third_party_controlled_count > 0:
+        state = "fragmented_source_trail"
+        label = "Fragmented buyer path"
+        lane_clause = (
+            f"; the first exposed lane is \"{primary_lane}\""
+            if primary_lane else ""
+        )
+        explanation = (
+            f"{third_party_controlled_count}/{prompt_count} evidenced prompt lanes "
+            "show third-party exposure, but the cited hosts are fragmented with no "
+            f"single site owning the buyer path{lane_clause}."
+        )
     else:
         state = "not_measured"
         label = "Buyer path not measured"
@@ -5547,12 +5559,14 @@ def _combined_buyer_path_label(raw_label: str, raw_display: str, buyer_path: Map
         return f"{ai_label}, weak owned buyer path"
     if state == "mixed":
         return f"{ai_label}, mixed owned buyer path"
+    if state == "fragmented_source_trail":
+        return f"{ai_label}, fragmented buyer path"
     return None
 
 
 def _combined_buyer_path_explanation(raw_label: str, buyer_path: Mapping[str, Any]) -> Optional[str]:
     state = _buyer_path_clean_str(buyer_path.get("state"))
-    if state not in {"third_party_controlled", "mixed"}:
+    if state not in {"third_party_controlled", "mixed", "fragmented_source_trail"}:
         return None
     prompt_count = int(buyer_path.get("prompt_count") or 0)
     merchant_owned_count = int(buyer_path.get("merchant_owned_count") or 0)
@@ -5576,6 +5590,14 @@ def _combined_buyer_path_explanation(raw_label: str, buyer_path: Mapping[str, An
             f"evidenced prompt lanes are merchant-owned; {third_party_count} still "
             f"route through third-party sources{lane_clause}. Read this as a buyer-path "
             "repair, not a finished owned-channel win."
+        )
+    if state == "fragmented_source_trail":
+        lane_clause = f"; the first exposed lane is \"{lane}\"" if lane else ""
+        return (
+            f"{visibility_clause}, and {third_party_count}/{prompt_count} evidenced "
+            "prompt lanes show third-party exposure, but the cited hosts are fragmented "
+            f"with no single site owning the buyer path{lane_clause}. Read this as an "
+            "official-source opening before naming a conversion opponent."
         )
     lane_clause = (
         f"; the first exposed lane is \"{lane}\", controlled by {controller_phrase}"
@@ -5622,7 +5644,7 @@ def apply_buyer_path_verdict_to_brand_report(
         executive_summary = per_product[0].get("executive_summary")
         if (
             isinstance(executive_summary, dict)
-            and buyer_path.get("state") in {"third_party_controlled", "mixed"}
+            and buyer_path.get("state") in {"third_party_controlled", "mixed", "fragmented_source_trail"}
         ):
             executive_summary["verdict_pill_text"] = (
                 combined_display
@@ -5635,7 +5657,7 @@ def apply_buyer_path_verdict_to_brand_report(
         )
         if (
             isinstance(headline, dict)
-            and buyer_path.get("state") in {"third_party_controlled", "mixed"}
+            and buyer_path.get("state") in {"third_party_controlled", "mixed", "fragmented_source_trail"}
         ):
             headline["verdict_label_display"] = combined_display
             headline["one_liner"] = combined_explanation
@@ -5709,20 +5731,7 @@ def _top_exposed_lane(per_prompt: List[Mapping[str, Any]]) -> Optional[Dict[str,
         )
     )
     row = rows[0]
-    who = row.get("who_owns")
-    if isinstance(who, str) and who.strip():
-        controllers = [who.strip()]
-    elif isinstance(who, list):
-        controllers = [str(h).strip() for h in who if str(h).strip()]
-    else:
-        controllers = []
-    if not controllers:
-        summary = row.get("source_summary") if isinstance(row.get("source_summary"), Mapping) else {}
-        controllers = [
-            str((h or {}).get("host") or "").strip()
-            for h in (summary.get("top_cited_hosts") or [])
-            if str((h or {}).get("host") or "").strip()
-        ]
+    controllers = stable_buyer_path_controller_hosts(row)
     return {"lane": str(row.get("query") or "").strip(), "controllers": controllers}
 
 
@@ -5743,6 +5752,12 @@ def _sku_intelligence_headline(
             return (
                 f"AI recommends `{exposed['lane']}`, but routes buyers to "
                 f"{controllers} — not your site. Here's how to win the buyer path back."
+            )
+        if exposed and exposed["lane"]:
+            return (
+                f"AI recommends `{exposed['lane']}`, but the source trail is "
+                "fragmented with no single site owning the lane yet. Make your "
+                "official page the cited and buyable source first."
             )
         prompt_count = len(opportunity.get("per_prompt") or [])
         return (
