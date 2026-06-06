@@ -763,6 +763,13 @@ async def _replace_child_rows_multi(table: Any, where_clauses: List[Any], rows: 
 async def _append_snapshot(table: Any, values: Dict[str, Any]) -> None:
     payload = dict(values)
     payload.setdefault("observed_at", _utcnow())
+    offer_id = str(payload.get("offer_id") or "").strip()
+    source_system = str(payload.get("source_system") or "").strip()
+    if table in (catalog_inventory_snapshots, catalog_price_snapshots) and offer_id:
+        delete_stmt = table.delete().where(table.c.offer_id == offer_id)
+        if source_system:
+            delete_stmt = delete_stmt.where(table.c.source_system == source_system)
+        await database.execute(delete_stmt)
     await database.execute(table.insert().values(**payload))
 
 

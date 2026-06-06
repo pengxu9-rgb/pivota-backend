@@ -259,6 +259,34 @@ async def test_upsert_field_fact_uses_logical_key_and_prunes_run_duplicates(
 
 
 @pytest.mark.asyncio
+async def test_append_snapshot_keeps_latest_offer_source_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executed_sql: list[str] = []
+
+    async def fake_execute(query, values=None):
+        executed_sql.append(str(query))
+        return None
+
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+
+    await module._append_snapshot(
+        module.catalog_price_snapshots,
+        {
+            "offer_id": "offer_1",
+            "sku_key": "sku_1",
+            "merchant_id": "merch_1",
+            "source_system": "shopify_products_sync",
+            "currency": "USD",
+        },
+    )
+
+    assert len(executed_sql) == 2
+    assert "DELETE FROM catalog_price_snapshots" in executed_sql[0]
+    assert "INSERT INTO catalog_price_snapshots" in executed_sql[1]
+
+
+@pytest.mark.asyncio
 async def test_resolve_catalog_sku_key_preserves_existing_source_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
