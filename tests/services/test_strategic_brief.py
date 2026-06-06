@@ -283,6 +283,12 @@ def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
 
     assert evidence["product"]["title"] == "BB Lab Good Night Collagen"
     assert evidence["product"]["brand"] == "BB Lab"
+    assert evidence["product"]["merchant_path"] == {
+        "archetype": "brand",
+        "destination": "the brand's own website",
+        "page_label": "the official brand PDP",
+        "goal": "drive buyers to the brand's own website",
+    }
     assert evidence["product"]["attributes"]["certification"] == ["halal"]
     assert evidence["product"]["attributes"]["format"] == ["stick"]
     assert evidence["position"] == {
@@ -310,6 +316,14 @@ def test_assemble_sku_brief_evidence_is_traceable_to_audit_inputs():
         {"host": "wellness-notes.example", "role": "publisher"},
         {"host": "halal-beauty.example", "role": "publisher"},
     ]
+    assert evidence["buyer_path_opportunities"][0]["query"] == "best collagen supplements for skin"
+    assert evidence["buyer_path_opportunities"][0]["merchant_archetype"] == "brand"
+    assert "first-order offer" in " ".join(
+        evidence["buyer_path_opportunities"][0]["recommended_moves"]
+    )
+    assert {"host": "forbes.com", "role": "publisher"} in (
+        evidence["buyer_path_opportunities"][0]["controlled_by"]
+    )
     grounding_notes = evidence["grounding_notes"]
     assert set(grounding_notes.keys()) == {
         "competitor_attributes",
@@ -406,12 +420,107 @@ def test_system_prompt_contains_claim_discipline_rules():
     assert "CLAIM DISCIPLINE" in system
     assert "competitor" in system.lower()
     assert "grounding_notes.evidenced_channels" in system
+    assert "MERCHANT PATH" in system
+    assert "OPERATIONAL ECONOMICS" in system
     assert "EXACT wording" in system
     assert "inference" in system.lower()
 
 
 def test_validate_grounding_accepts_fully_grounded_brief():
     assert strategic_brief.validate_grounding(_grounded_brief(), _evidence()) is True
+
+
+def test_validate_grounding_accepts_evidenced_operational_moves():
+    evidence = _evidence()
+    brief = _grounded_brief()
+    brief["first_moves"] = [
+        (
+            "For halal collagen sticks before bed, add a first-order offer "
+            "and starter + replenishment bundle to the official brand PDP."
+        ),
+        (
+            "Add a subscription incentive and why-buy-direct proof to the "
+            "official brand PDP before pitching wellness-notes.example."
+        ),
+        "Track amazon.com and forbes.com because they are evidenced controllers.",
+    ]
+    brief["diy_vs_pivota"]["self_serve"] = [
+        "Add the first-order offer.",
+        "Publish the bundle and why-buy-direct proof.",
+    ]
+
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
+def test_assemble_sku_brief_evidence_supports_ownist_brand_path_exposure():
+    opportunity = {
+        "intent_ladder": {
+            "branded_transactional": {"score": 100},
+            "head_category": {"score": 20},
+        },
+        "per_prompt": [
+            {
+                "query": "best beauty supplement for glow",
+                "axis": "category",
+                "query_class": "head",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "demand_signal": 1.0,
+                "opportunity_score": 38.0,
+                "source_roles": [
+                    {"host": "walmart.com", "role": "retailer"},
+                    {"host": "amazon.com", "role": "marketplace"},
+                ],
+            }
+        ],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+    }
+
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph={
+            "classes": {
+                "category": ["beauty supplement"],
+                "format": ["drink stick"],
+                "ingredient": ["grape"],
+            }
+        },
+        primary_gaps=[],
+        scores={},
+        identity={
+            "name": "Ownist Triple Shine Grape",
+            "anchors": {"brand": "Ownist"},
+            "merchant_type": "brand",
+        },
+        sku_title="Ownist Triple Shine Grape",
+    )
+
+    assert evidence["product"]["brand"] == "Ownist"
+    assert evidence["product"]["merchant_path"]["goal"] == (
+        "drive buyers to the brand's own website"
+    )
+    assert evidence["buyer_path_opportunities"] == [
+        {
+            "query": "best beauty supplement for glow",
+            "exposure": "retailer-owned",
+            "route": "retailer",
+            "controlled_by": [
+                {"host": "walmart.com", "role": "retailer"},
+                {"host": "amazon.com", "role": "marketplace"},
+            ],
+            "destination": "the brand's own website",
+            "merchant_archetype": "brand",
+            "recommended_moves": [
+                "Make the official brand PDP the canonical cited page for this lane.",
+                "Add a first-order offer without inventing a discount depth.",
+                "Add a starter + replenishment bundle.",
+                "Add a subscription incentive where the product supports replenishment.",
+                "Add why-buy-direct proof: guarantee, samples, loyalty, returns, stock, and fresh facts.",
+            ],
+        }
+    ]
 
 
 def test_validation_fix_accepts_grounded_bb_lab_brief_without_false_positives():

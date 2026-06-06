@@ -300,6 +300,7 @@ def _build_sku_evidence_used(
     return {
         "sku_title": _sku_title(identity=identity, sku_title=sku_title),
         "identity": dict(identity),
+        "merchant_path": _merchant_path(identity=identity, opportunity=opportunity),
         "scores": _sku_scores(scores),
         "top_open_lane": _sku_lane_chip(_sku_top_open_lane(opportunity)),
         "substitution_alert": dict(_as_mapping(opportunity.get("substitution_alert"))),
@@ -327,6 +328,7 @@ def _sku_prescription_for_gap(
     substitution = _as_mapping(evidence.get("substitution_alert"))
     content_gap = _as_mapping(evidence.get("content_gap"))
     route_prompt = _as_mapping(evidence.get("source_route_prompt"))
+    merchant_path = _as_mapping(evidence.get("merchant_path"))
     first_pivota_path = _sku_pivota_path(sku_title)
 
     if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
@@ -412,20 +414,26 @@ def _sku_prescription_for_gap(
         hosts = _phrase(_host_names(route_prompt.get("sources")), "other sites")
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"For {query}, AI leans on {hosts}, not you.",
-            why_this_first=(
-                f"This lane isn't empty, AI is just citing {hosts} for it. You win "
-                "it by getting into the source that already shapes the answer, then "
-                "making your own page the better one."
+            prescription_class="operational_efficiency",
+            merchant_path=merchant_path,
+            operator_moves=_sku_operator_moves(
+                route_prompt=route_prompt,
+                merchant_path=merchant_path,
             ),
-            first_move=_sku_source_route_first_move(route_prompt),
+            headline=f"For {query}, AI leans on {hosts}, not your buying path.",
+            why_this_first=(
+                f"This lane isn't empty, AI is citing {hosts} for it. Treat that as "
+                f"exposed demand: make {_merchant_destination(merchant_path)} the "
+                "better place to buy, then work the source that already shapes the answer."
+            ),
+            first_move=_sku_source_route_first_move(route_prompt, merchant_path),
             self_serve_actions=[
-                _sku_source_route_self_serve(route_prompt),
-                "Then make your own page the better answer: clearer facts, proof, and a few reviews.",
+                _sku_source_route_self_serve(route_prompt, merchant_path),
+                _sku_source_route_follow_up(route_prompt, merchant_path),
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
-            cta=_sku_cta("Win back the cited answer"),
+            cta=_sku_cta("Win back the cited buying path"),
         )
 
     if primary_gap == PRIMARY_SKU_PROTECTED_MONITORING:
@@ -688,48 +696,268 @@ def _sku_gap_label(gap: Mapping[str, Any]) -> str:
     return bucket.replace("_", " ")
 
 
+def _merchant_path(
+    *,
+    identity: Optional[Mapping[str, Any]] = None,
+    opportunity: Optional[Mapping[str, Any]] = None,
+    merchant_view: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
+    archetype = _merchant_archetype(
+        identity=identity,
+        opportunity=opportunity,
+        merchant_view=merchant_view,
+    )
+    if archetype == "channel":
+        return {
+            "archetype": "channel",
+            "destination": "your channel's website",
+            "page_label": "your channel PDP or category page",
+            "goal": "drive buyers to the channel's website",
+        }
+    return {
+        "archetype": "brand",
+        "destination": "the brand's own website",
+        "page_label": "your official PDP",
+        "goal": "drive buyers to the brand's own website",
+    }
+
+
+def _merchant_archetype(
+    *,
+    identity: Optional[Mapping[str, Any]],
+    opportunity: Optional[Mapping[str, Any]],
+    merchant_view: Optional[Mapping[str, Any]],
+) -> str:
+    for payload in (identity, opportunity, merchant_view):
+        data = _as_mapping(payload)
+        raw = _first_present(
+            data,
+            (
+                "merchant_archetype",
+                "merchant_type",
+                "business_model",
+                "commerce_role",
+                "seller_type",
+                "retailer_type",
+            ),
+        )
+        normalized = _normalize_merchant_archetype(raw)
+        if normalized:
+            return normalized
+        anchors = _as_mapping(data.get("anchors"))
+        normalized = _normalize_merchant_archetype(
+            _first_present(
+                anchors,
+                (
+                    "merchant_archetype",
+                    "merchant_type",
+                    "business_model",
+                    "commerce_role",
+                    "seller_type",
+                ),
+            )
+        )
+        if normalized:
+            return normalized
+    return "brand"
+
+
+def _normalize_merchant_archetype(value: Any) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if any(token in text for token in ("channel", "retailer", "marketplace", "multi-brand", "multibrand")):
+        return "channel"
+    if any(token in text for token in ("brand", "dtc", "d2c", "manufacturer", "maker")):
+        return "brand"
+    return None
+
+
+def _first_present(payload: Mapping[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _merchant_destination(merchant_path: Mapping[str, Any]) -> str:
+    return str(merchant_path.get("destination") or "the merchant-controlled website")
+
+
+def _merchant_page_label(merchant_path: Mapping[str, Any]) -> str:
+    return str(merchant_path.get("page_label") or "the merchant-controlled page")
+
+
 def _sku_query_phrase(value: Any) -> str:
     text = str(value or "").strip()
     return f'"{text}"' if text else "the tested SKU prompt"
 
 
-def _sku_source_route_first_move(prompt: Mapping[str, Any]) -> str:
+def _sku_source_route_first_move(
+    prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> str:
     route = str(prompt.get("source_route") or "").strip().lower()
     ownership = str(prompt.get("ownership_state") or "").strip().lower()
     query = _sku_query_phrase(prompt.get("query"))
     competitors = _phrase(_as_str_list(prompt.get("competitors")), "the named competitor")
+    page = _merchant_page_label(merchant_path)
     if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
-        return f"Fix the cited retailer/marketplace listing for {query}"
+        return (
+            f"Make {page} the better buying path for {query}: first-order offer, "
+            "starter + replenishment bundle, subscription incentive, and why-buy-direct "
+            "proof; then fix the cited retailer/marketplace listings."
+        )
     if ownership == "publisher-owned" or route == "publisher":
-        return f"Pitch the cited publisher for roundup inclusion around {query}"
+        return (
+            f"Publish the canonical {page} for {query} with a clear buying reason, "
+            "then pitch the cited publisher for roundup inclusion."
+        )
     if ownership == "forum-owned" or route == "forum":
-        return f"Build reviews/UGC that answer {query}"
-    return f"Publish comparison proof for {query} against {competitors}"
+        return (
+            f"Build review/UGC proof that answers {query}, and point it back to "
+            f"{page} with the direct buying reason."
+        )
+    return (
+        f"Publish comparison proof for {query} against {competitors}, then make "
+        f"{page} the better place to buy."
+    )
 
 
-def _sku_source_route_self_serve(prompt: Mapping[str, Any]) -> str:
+def _sku_source_route_self_serve(
+    prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> str:
+    route = str(prompt.get("source_route") or "").strip().lower()
+    ownership = str(prompt.get("ownership_state") or "").strip().lower()
+    sources = _phrase(_host_names(prompt.get("sources")), "the cited sources")
+    query = _sku_query_phrase(prompt.get("query"))
+    page = _merchant_page_label(merchant_path)
+    if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
+        return (
+            f"On {page}, tie {query} to a first-order offer, starter + replenishment "
+            "bundle, subscription incentive, and why-buy-direct block so buyers have "
+            f"a reason to choose you over {sources}."
+        )
+    if ownership == "publisher-owned" or route == "publisher":
+        return (
+            f"On {page}, answer {query} with proof, reviews, offer mechanics, "
+            "bundle/subscription options, and a why-buy-direct block before pitching "
+            f"{sources}."
+        )
+    if ownership == "forum-owned" or route == "forum":
+        return (
+            f"Collect reviews/UGC that answer {query}, then link the proof back to "
+            f"{page} with the direct buying reason."
+        )
+    return (
+        f"On {page}, add comparison content for {query} with substantiated differences, "
+        "proof, and the offer/bundle/subscription reason to buy from you."
+    )
+
+
+def _sku_source_route_follow_up(
+    prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> str:
     route = str(prompt.get("source_route") or "").strip().lower()
     ownership = str(prompt.get("ownership_state") or "").strip().lower()
     sources = _phrase(_host_names(prompt.get("sources")), "the cited sources")
     if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
         return (
-            f"Audit {sources} for title, images, claims, variants, price, "
-            "availability, authorization, and SKU facts."
+            f"Then audit {sources} for wrong titles, images, variants, price, stock, "
+            "authorization, and SKU facts so third-party exposure stops outranking "
+            f"{_merchant_destination(merchant_path)}."
         )
     if ownership == "publisher-owned" or route == "publisher":
         return (
-            f"Pitch {sources} with SKU facts, proof assets, images, pricing, "
-            "availability, and a specific comparison angle."
+            f"Then pitch {sources} with the exact SKU facts, proof assets, images, "
+            "pricing/availability, and comparison angle from your canonical page."
         )
     if ownership == "forum-owned" or route == "forum":
         return (
-            f"Build review and UGC proof that can show up near {sources}, "
-            "then link it back to the official PDP."
+            f"Then seed the review proof where {sources} can discover it, without "
+            "claiming a community placement until it is actually evidenced."
         )
     return (
-        "Add comparison content naming the competitor, with substantiated "
-        "differences, use cases, specs/ingredients, and review proof."
+        "Then update the source trail that AI cites so the comparison points back "
+        f"to {_merchant_destination(merchant_path)}."
     )
+
+
+def _sku_operator_moves(
+    *,
+    route_prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    query = str(route_prompt.get("query") or "").strip()
+    sources = _host_names(route_prompt.get("sources"))
+    page = _merchant_page_label(merchant_path)
+    destination = _merchant_destination(merchant_path)
+    lane = query or "the exposed lane"
+    controller = _phrase(sources, "the cited sources")
+    return [
+        {
+            "type": "first_order_offer",
+            "lane": lane,
+            "move": f"Attach a first-order offer to {page} for {lane}.",
+            "why": f"The answer is already exposed through {controller}; buyers need a reason to choose {destination}.",
+            "evidence": {"controllers": sources[:3]},
+        },
+        {
+            "type": "bundle_or_replenishment",
+            "lane": lane,
+            "move": f"Create a starter + replenishment bundle on {page} for {lane}.",
+            "why": "A bundle gives AI and shoppers a concrete value reason to prefer the merchant-controlled path.",
+            "evidence": {"controllers": sources[:3]},
+        },
+        {
+            "type": "subscription_or_why_buy_direct",
+            "lane": lane,
+            "move": (
+                "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
+                "loyalty, returns, stock, and fresh product facts."
+            ),
+            "why": f"Those details make {destination} materially different from the cited third-party route.",
+            "evidence": {"controllers": sources[:3]},
+        },
+    ]
+
+
+def _brand_operator_moves(
+    evidence: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    queries = _query_examples(evidence.get("failed_query_examples"))
+    hosts = _host_names(evidence.get("retailer_hosts"))
+    lane = queries[0] if queries else "the retailer-routed questions"
+    page = _merchant_page_label(merchant_path)
+    destination = _merchant_destination(merchant_path)
+    controller = _phrase(hosts, "the cited retailers")
+    return [
+        {
+            "type": "first_order_offer",
+            "lane": lane,
+            "move": f"Put a first-order offer on {page} for the retailer-routed demand.",
+            "why": f"AI already points shoppers to {controller}; the merchant path needs a better conversion reason.",
+            "evidence": {"controllers": hosts[:3]},
+        },
+        {
+            "type": "bundle_subscription",
+            "lane": lane,
+            "move": "Add starter + replenishment bundle and subscription incentive to the same page.",
+            "why": f"Bundle/subscription value gives shoppers a concrete reason to choose {destination}.",
+            "evidence": {"controllers": hosts[:3]},
+        },
+        {
+            "type": "why_buy_direct",
+            "lane": lane,
+            "move": "Add a why-buy-direct block: guarantee, samples, loyalty, returns, stock, and fresh facts.",
+            "why": "These are merchant-controlled promises; do not invent retailer facts or unsupported economics.",
+            "evidence": {"controllers": hosts[:3]},
+        },
+    ]
 
 
 def _sku_secondary_moves(
@@ -789,6 +1017,7 @@ def _prescription_for_gap(
     cited_phrase = _phrase(_host_names(evidence.get("cited_hosts")), "no high-confidence cited hosts")
     competitor_phrase = _phrase(_as_str_list(evidence.get("competitors_named")), "no repeated named competitors")
     failed_query_phrase = _phrase(_query_examples(evidence.get("failed_query_examples")), "no failed-query examples")
+    merchant_path = _as_mapping(evidence.get("merchant_path"))
 
     if primary_gap == PRIMARY_INTEGRATION_COMPLETION:
         missing = _integration_missing_labels(evidence.get("integration_missing_pieces"))
@@ -866,20 +1095,25 @@ def _prescription_for_gap(
     if primary_gap == PRIMARY_RETAILER_ROUTE_LEAK:
         return _base_payload(
             primary_gap=primary_gap,
-            headline="AI sends your buyers to retailers — take that path back.",
+            prescription_class="operational_efficiency",
+            merchant_path=merchant_path,
+            operator_moves=_brand_operator_moves(evidence, merchant_path),
+            headline="AI sends your buyers to retailers — give them a better buying path.",
             why_this_first=(
                 f"Shoppers can find you, but AI points them to {retailer_phrase} "
-                "instead of your own page. That's lost margin and customer data, "
+                f"instead of {_merchant_destination(merchant_path)}. That's lost margin and customer data, "
                 "not a PR problem."
             ),
             first_move=(
-                "Make your own page the best place to buy, then fix the retailer "
-                "listings AI is citing."
+                f"Make {_merchant_page_label(merchant_path)} the best place to buy: "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof; then fix the retailer listings AI is citing."
             ),
             self_serve_actions=[
                 (
-                    "Make your product page beat the retailer pages: full details, "
-                    "proof, reviews, current price, stock, and returns."
+                    f"Make {_merchant_page_label(merchant_path)} beat the retailer pages: "
+                    "full facts, proof, reviews, current price/stock, first-order offer, "
+                    "bundle, subscription option, and returns."
                 ),
                 (
                     f"Check the cited retailer listings ({retailer_phrase}) for wrong "
@@ -1024,8 +1258,11 @@ def _base_payload(
     pivota_path: str,
     evidence_used: Mapping[str, Any],
     cta: Mapping[str, str],
+    prescription_class: Optional[str] = None,
+    merchant_path: Optional[Mapping[str, Any]] = None,
+    operator_moves: Optional[List[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    return {
+    out = {
         "primary_gap": primary_gap,
         "headline": headline,
         "why_this_first": why_this_first,
@@ -1036,6 +1273,13 @@ def _base_payload(
         "secondary_moves": [],
         "cta": dict(cta),
     }
+    if prescription_class:
+        out["prescription_class"] = prescription_class
+    if merchant_path:
+        out["merchant_path"] = dict(merchant_path)
+    if operator_moves:
+        out["operator_moves"] = [dict(move) for move in operator_moves]
+    return out
 
 
 def _build_evidence_used(
@@ -1054,6 +1298,7 @@ def _build_evidence_used(
 
     return {
         "verdict_label": headline.get("verdict_label"),
+        "merchant_path": _merchant_path(merchant_view=merchant_view),
         "scores": {
             "visibility": _score(scores.get("visibility")),
             "attribution": _score(scores.get("attribution")),

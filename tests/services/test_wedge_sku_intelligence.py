@@ -204,6 +204,15 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     )
     assert sidewalk["intent_ladder_layer"] == "sidewalk_opportunity"
     assert sidewalk["ownership_state"] == "open-lane"
+    head = next(
+        row for row in out["prompt_matrix"]
+        if row["query"] == "best collagen supplements for skin"
+    )
+    assert head["ownership_state"] != "merchant-owned"
+    assert head["buyer_path_action"]["prescription_class"] == "operational_efficiency"
+    assert head["buyer_path_action"]["lane"] == "best collagen supplements for skin"
+    assert "first-order offer" in head["buyer_path_action"]["move"]
+    assert "starter + replenishment bundle" in head["buyer_path_action"]["move"]
     assert out["coverage"]["prompt_count"] == 4
 
 

@@ -565,8 +565,8 @@ def test_sku_nba_content_gap_references_content_richness_bucket():
 
 def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
     for route, ownership, expected in [
-        ("retailer", "retailer-owned", "retailer/marketplace listing"),
-        ("publisher", "publisher-owned", "Pitch the cited publisher"),
+        ("retailer", "retailer-owned", "first-order offer"),
+        ("publisher", "publisher-owned", "pitch the cited publisher"),
     ]:
         opportunity = _sku_base_opportunity()
         opportunity["per_prompt"] = [
@@ -590,9 +590,143 @@ def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
         )
 
         assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
-        assert expected in nba["first_move"]
+        blob = _nba_strings(nba)
+        assert expected in nba["first_move"].lower()
+        assert nba["prescription_class"] == "operational_efficiency"
+        assert nba["merchant_path"]["archetype"] == "brand"
+        assert "bundle" in blob
+        assert "subscription" in blob or "buying reason" in blob
         assert nba["evidence_used"]["source_route_prompt"]["source_route"] == route
         _assert_70_30(nba)
+
+
+def test_sku_nba_bb_lab_brand_path_ties_operational_moves_to_retailer_exposure():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 4, "prompts_with_demand": 4}
+    opportunity["per_prompt"] = [
+        {
+            "query": "best collagen sticks",
+            "axis": "category",
+            "query_class": "head",
+            "ownership_state": "marketplace-owned",
+            "who_owns": ["amazon.com"],
+            "source_route": "marketplace",
+            "opportunity_score": 44.0,
+            "demand_signal": 1.0,
+            "source_summary": {
+                "top_cited_hosts": [
+                    {"host": "amazon.com", "times_cited": 3},
+                    {"host": "walmart.com", "times_cited": 2},
+                ]
+            },
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(82),
+        identity={
+            "name": "BB LAB The Collagen Low Molecular Fish Collagen Stick",
+            "anchors": {"brand": "BB Lab"},
+            "merchant_type": "brand",
+            "unresolved": False,
+        },
+        sku_title="BB LAB The Collagen Low Molecular Fish Collagen Stick",
+    )
+
+    copy = _nba_strings(nba)
+    assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
+    assert nba["prescription_class"] == "operational_efficiency"
+    assert nba["merchant_path"]["archetype"] == "brand"
+    assert nba["merchant_path"]["goal"] == "drive buyers to the brand's own website"
+    assert "best collagen sticks" in copy
+    assert "first-order offer" in copy
+    assert "starter + replenishment bundle" in copy
+    assert "subscription incentive" in copy
+    assert "why-buy-direct" in copy
+    assert nba["operator_moves"][0]["lane"] == "best collagen sticks"
+    assert "amazon.com" in nba["operator_moves"][0]["evidence"]["controllers"]
+    assert nba["evidence_used"]["source_route_prompt"]["sources"][0]["host"] == "amazon.com"
+    assert "%" not in copy and "$" not in copy
+
+
+def test_sku_nba_ownist_brand_path_ties_offer_bundle_to_real_exposed_lane():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 5, "prompts_with_demand": 5}
+    opportunity["per_prompt"] = [
+        {
+            "query": "best beauty supplement for glow",
+            "axis": "category",
+            "query_class": "head",
+            "ownership_state": "retailer-owned",
+            "who_owns": ["walmart.com", "amazon.com"],
+            "source_route": "retailer",
+            "opportunity_score": 39.0,
+            "demand_signal": 1.0,
+            "source_summary": {
+                "top_cited_hosts": [
+                    {"host": "walmart.com", "times_cited": 2},
+                    {"host": "amazon.com", "times_cited": 2},
+                ]
+            },
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(80),
+        identity={
+            "name": "Ownist Triple Shine Grape",
+            "anchors": {"brand": "Ownist"},
+            "merchant_type": "brand",
+            "unresolved": False,
+        },
+        sku_title="Ownist Triple Shine Grape",
+    )
+
+    copy = _nba_strings(nba)
+    assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
+    assert nba["merchant_path"]["archetype"] == "brand"
+    assert "brand's own website" in nba["merchant_path"]["goal"]
+    assert "best beauty supplement for glow" in copy
+    assert "walmart.com" in nba["operator_moves"][0]["evidence"]["controllers"]
+    assert "first-order offer" in copy
+    assert "bundle" in copy
+    assert "subscription incentive" in copy
+    assert "why-buy-direct" in copy
+
+
+def test_sku_nba_channel_path_drives_to_channel_site_when_explicit():
+    opportunity = _sku_base_opportunity()
+    opportunity["per_prompt"] = [
+        {
+            "query": "best Korean collagen sticks",
+            "ownership_state": "publisher-owned",
+            "source_route": "publisher",
+            "opportunity_score": 28.0,
+            "demand_signal": 1.0,
+            "source_summary": {
+                "top_cited_hosts": [{"host": "beautyeditorial.example", "times_cited": 2}]
+            },
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(78),
+        identity={
+            "name": "Retailer Collagen Listing",
+            "merchant_type": "retailer",
+            "unresolved": False,
+        },
+        sku_title="Retailer Collagen Listing",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
+    assert nba["merchant_path"]["archetype"] == "channel"
+    assert nba["merchant_path"]["goal"] == "drive buyers to the channel's website"
+    assert "channel PDP or category page" in nba["first_move"]
+    assert "brand's own website" not in _nba_strings(nba)
 
 
 def test_sku_nba_resolved_coverage_with_exposure_never_returns_insufficient_data():

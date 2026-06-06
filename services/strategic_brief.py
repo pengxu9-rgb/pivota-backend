@@ -54,6 +54,13 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   is "own your own page/site for this lane first." You may suggest a marketplace/community move only
   CONDITIONALLY: "if you already sell on <evidenced channel>, …". Do NOT invent communities, subreddits,
   influencers, or platforms.
+- MERCHANT PATH: respect product.merchant_path. If archetype is "brand", the commercial goal is to drive
+  buyers to the brand's own website. If archetype is "channel", the commercial goal is to drive buyers to the
+  channel's own website. Do not blur those paths.
+- OPERATIONAL ECONOMICS: when buyer_path_opportunities exist, include concrete merchant-owned moves tied to
+  those exact lanes: first-order offer, starter + replenishment bundle, subscription incentive, and
+  why-buy-direct proof. Do NOT invent discount depths, prices, savings percentages, review counts, retailer
+  facts, or margin claims unless they appear in EVIDENCE.
 - LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
   singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
   — just don't present it as the searched lane.)
@@ -87,7 +94,9 @@ WRITE the brief as JSON with these fields — each must be specific to THIS prod
   the named substitute), else null.
 - first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
   strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so AI has your
-  answer to cite for the lane you're claiming").
+  answer to cite for the lane you're claiming"). When EVIDENCE shows retailer/marketplace/publisher-controlled
+  exposure, at least one first move must name the exact lane and the operational reason to buy from the
+  merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
 
@@ -235,6 +244,7 @@ _INTERNAL_ALLOWED_ENTITIES = {
     "copilot",
     "d2c",
     "deepseek",
+    "dtc",
     "diy",
     "faq",
     "faqs",
@@ -507,6 +517,7 @@ def assemble_sku_brief_evidence(
     title = _clean_str(sku_title) or _clean_str(identity_map.get("name")) or "this SKU"
     anchors = _as_mapping(identity_map.get("anchors"))
     brand = _clean_str(anchors.get("brand"))
+    merchant_path = _merchant_path(identity=identity_map, opportunity=opportunity_map)
 
     category_rows = _category_battle_rows(opportunity_map)
     category_battle = _category_battle(category_rows)
@@ -525,6 +536,7 @@ def assemble_sku_brief_evidence(
         "product": {
             "title": title,
             "brand": brand or None,
+            "merchant_path": merchant_path,
             "attributes": attributes,
         },
         "position": _position_from_ladder(opportunity_map),
@@ -532,6 +544,10 @@ def assemble_sku_brief_evidence(
         "substitution": _substitution_evidence(opportunity_map),
         "open_lanes": [_open_lane_evidence(lane) for lane in top_open_lanes],
         "channel_map": channel_map,
+        "buyer_path_opportunities": _buyer_path_opportunities(
+            opportunity=opportunity_map,
+            merchant_path=merchant_path,
+        ),
         "grounding_notes": grounding_notes,
         "demand_state": opportunity_map.get("demand_state_summary"),
         "notes": {
@@ -728,6 +744,75 @@ def _open_lane_evidence(lane: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _buyer_path_opportunities(
+    *,
+    opportunity: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    rows: List[Mapping[str, Any]] = []
+    for row in _as_list(opportunity.get("per_prompt")):
+        if not isinstance(row, Mapping):
+            continue
+        query = _clean_str(row.get("query"))
+        if not query:
+            continue
+        ownership = _clean_str(row.get("ownership_state")).lower()
+        route = _clean_str(row.get("source_route")).lower()
+        if ownership not in _LOST_CATEGORY_OWNERSHIP and route not in {
+            "retailer",
+            "marketplace",
+            "publisher",
+            "forum",
+        }:
+            continue
+        if float(row.get("demand_signal") or 0) <= 0 and float(row.get("opportunity_score") or 0) <= 0:
+            continue
+        if not _source_role_chips(row):
+            continue
+        rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            -float(row.get("opportunity_score") or 0),
+            -float(row.get("demand_signal") or 0),
+            _clean_str(row.get("query")).lower(),
+        )
+    )
+    return [
+        _buyer_path_opportunity(row, merchant_path)
+        for row in rows[:5]
+    ]
+
+
+def _buyer_path_opportunity(
+    row: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> Dict[str, Any]:
+    controllers = _source_role_chips(row)
+    route = _clean_str(row.get("source_route")).lower()
+    ownership = _clean_str(row.get("ownership_state")).lower()
+    route_label = route or ownership.replace("-owned", "") or "third-party"
+    return {
+        "query": _clean_str(row.get("query")),
+        "exposure": ownership or None,
+        "route": route_label,
+        "controlled_by": controllers,
+        "destination": _clean_str(merchant_path.get("destination")),
+        "merchant_archetype": _clean_str(merchant_path.get("archetype")),
+        "recommended_moves": _buyer_path_moves(merchant_path),
+    }
+
+
+def _buyer_path_moves(merchant_path: Mapping[str, Any]) -> List[str]:
+    page = _clean_str(merchant_path.get("page_label")) or "merchant-controlled page"
+    return [
+        f"Make {page} the canonical cited page for this lane.",
+        "Add a first-order offer without inventing a discount depth.",
+        "Add a starter + replenishment bundle.",
+        "Add a subscription incentive where the product supports replenishment.",
+        "Add why-buy-direct proof: guarantee, samples, loyalty, returns, stock, and fresh facts.",
+    ]
+
+
 def _channel_map(
     *,
     top_open_lanes: List[Mapping[str, Any]],
@@ -780,6 +865,69 @@ def _grounding_notes(
         "merchant_channels": "unknown",
         "evidenced_channels": _unique_host_roles(evidenced_channels),
     }
+
+
+def _merchant_path(
+    *,
+    identity: Mapping[str, Any],
+    opportunity: Mapping[str, Any],
+) -> Dict[str, str]:
+    archetype = _merchant_archetype(identity=identity, opportunity=opportunity)
+    if archetype == "channel":
+        return {
+            "archetype": "channel",
+            "destination": "the channel's own website",
+            "page_label": "the channel PDP or category page",
+            "goal": "drive buyers to the channel's website",
+        }
+    return {
+        "archetype": "brand",
+        "destination": "the brand's own website",
+        "page_label": "the official brand PDP",
+        "goal": "drive buyers to the brand's own website",
+    }
+
+
+def _merchant_archetype(
+    *,
+    identity: Mapping[str, Any],
+    opportunity: Mapping[str, Any],
+) -> str:
+    for payload in (identity, opportunity, _as_mapping(identity.get("anchors"))):
+        raw = _first_present(
+            payload,
+            (
+                "merchant_archetype",
+                "merchant_type",
+                "business_model",
+                "commerce_role",
+                "seller_type",
+                "retailer_type",
+            ),
+        )
+        normalized = _normalize_merchant_archetype(raw)
+        if normalized:
+            return normalized
+    return "brand"
+
+
+def _normalize_merchant_archetype(value: Any) -> Optional[str]:
+    text = _clean_str(value).lower()
+    if not text:
+        return None
+    if any(token in text for token in ("channel", "retailer", "marketplace", "multi-brand", "multibrand")):
+        return "channel"
+    if any(token in text for token in ("brand", "dtc", "d2c", "manufacturer", "maker")):
+        return "brand"
+    return None
+
+
+def _first_present(payload: Mapping[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and _clean_str(value):
+            return value
+    return None
 
 
 def _substitution_source_roles(opportunity: Mapping[str, Any]) -> List[Dict[str, str]]:
@@ -1002,6 +1150,9 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     product = _as_mapping(evidence.get("product"))
     add_term(product.get("title"))
     add_term(product.get("brand"))
+    merchant_path = _as_mapping(product.get("merchant_path"))
+    for value in merchant_path.values():
+        add_term(value)
     attributes = _as_mapping(product.get("attributes"))
     for field, values in attributes.items():
         for attr in _as_str_list(values):
@@ -1045,6 +1196,22 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         add_term(lane.get("lane"))
         add_term(lane.get("query"))
         for controller in _as_list(lane.get("controlled_by")):
+            if isinstance(controller, Mapping):
+                add_domain(controller.get("host"))
+
+    for opportunity in _as_list(evidence.get("buyer_path_opportunities")):
+        if not isinstance(opportunity, Mapping):
+            continue
+        add_term(opportunity.get("query"))
+        add_term(opportunity.get("exposure"))
+        add_term(opportunity.get("route"))
+        add_term(opportunity.get("destination"))
+        add_term(opportunity.get("merchant_archetype"))
+        for move in _as_str_list(opportunity.get("recommended_moves")):
+            add_term(move)
+            for word in re.findall(r"[a-z0-9]+", move.lower()):
+                add_attribute_word(word)
+        for controller in _as_list(opportunity.get("controlled_by")):
             if isinstance(controller, Mapping):
                 add_domain(controller.get("host"))
 

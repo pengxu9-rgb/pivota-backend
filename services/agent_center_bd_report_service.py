@@ -5041,9 +5041,45 @@ def _prompt_sources(row: Mapping[str, Any]) -> List[Any]:
     return sources[:3] if isinstance(sources, list) else []
 
 
+def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    ownership = str(row.get("ownership_state") or "").strip().lower()
+    route = str(row.get("source_route") or "").strip().lower()
+    if ownership == "merchant-owned":
+        return None
+    if ownership not in {
+        "retailer-owned",
+        "marketplace-owned",
+        "publisher-owned",
+        "forum-owned",
+        "competitor-owned",
+    } and route not in {"retailer", "marketplace", "publisher", "forum", "brand"}:
+        return None
+    if float(row.get("demand_signal") or 0) <= 0 and float(row.get("opportunity_score") or 0) <= 0:
+        return None
+    query = str(row.get("query") or "").strip()
+    sources = _prompt_sources(row)
+    hosts = [
+        str(source.get("host") or "").strip()
+        for source in sources
+        if isinstance(source, dict) and str(source.get("host") or "").strip()
+    ]
+    controllers = hosts[:3]
+    controller_phrase = ", ".join(controllers) if controllers else "the cited sources"
+    return {
+        "prescription_class": "operational_efficiency",
+        "lane": query,
+        "controllers": controllers,
+        "move": (
+            f"Use the official page for {query or 'this exposed lane'} to beat "
+            f"{controller_phrase}: first-order offer, starter + replenishment bundle, "
+            "subscription incentive, and why-buy-direct proof."
+        ),
+    }
+
+
 def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
     verdicts = row.get("provider_verdicts") if isinstance(row.get("provider_verdicts"), dict) else {}
-    return {
+    out = {
         "query": row.get("query"),
         "intent_ladder_layer": _sku_intelligence_ladder_layer(row),
         "gemini": verdicts.get("gemini", "absent"),
@@ -5056,6 +5092,10 @@ def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
         "sources": _prompt_sources(row),
         "opportunity_score": row.get("opportunity_score"),
     }
+    buyer_path_action = _sku_intelligence_buyer_path_action(row)
+    if buyer_path_action:
+        out["buyer_path_action"] = buyer_path_action
+    return out
 
 
 def _lost_head_category_for_money_shot(
