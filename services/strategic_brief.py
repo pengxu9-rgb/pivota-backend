@@ -1260,6 +1260,15 @@ def _grounding_failures(
         ):
             failures.append(f"safety-sensitive:{term}")
 
+    for leaf in _iter_leaf_text(brief):
+        leaf_domains = _unique(
+            _normalize_host(domain)
+            for domain in _DOMAIN_RE.findall(leaf)
+            if _normalize_host(domain) in allowed["domains"]
+        )
+        if len(leaf_domains) > 3:
+            failures.append("overwide-controller-list")
+
     for domain in _DOMAIN_RE.findall(text):
         normalized = _normalize_host(domain)
         if normalized and normalized not in allowed["domains"]:

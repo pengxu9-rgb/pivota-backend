@@ -893,3 +893,28 @@ def test_deterministic_brief_caps_overall_controller_phrase_to_top_three():
     assert "ubuy.mq" not in brief["position"]
     assert "cogentsteps.net" not in brief["position"]
     assert len(brief["traffic_strategy"][0]["who_controls"].split(",")) <= 3
+
+
+def test_validate_grounding_rejects_overwide_controller_lists():
+    evidence = _evidence()
+    evidence["buyer_path_opportunities"] = [
+        {
+            "query": "halal collagen sticks",
+            "controlled_by": [
+                {"host": "moodarabia.com", "role": "publisher"},
+                {"host": "beautyandthebrows.co", "role": "publisher"},
+                {"host": "sayweee.com", "role": "retailer"},
+                {"host": "krunbeauty.re", "role": "retailer"},
+            ],
+            "recommended_moves": ["Add a first-order offer."],
+        }
+    ]
+    brief = _grounded_brief()
+    brief["traffic_strategy"] = [
+        (
+            "Own halal collagen sticks against moodarabia.com, "
+            "beautyandthebrows.co, sayweee.com, and krunbeauty.re."
+        )
+    ]
+
+    assert strategic_brief.validate_grounding(brief, evidence) is False
