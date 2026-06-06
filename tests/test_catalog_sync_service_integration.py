@@ -208,6 +208,57 @@ def test_catalog_stale_suppression_migration_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upsert_field_fact_uses_logical_key_and_prunes_run_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executed_sql: list[str] = []
+    upsert_rows: list[dict] = []
+
+    async def fake_execute(query, values=None):
+        executed_sql.append(str(query))
+        return None
+
+    async def fake_upsert_by_pk(table, pk_name, values):
+        upsert_rows.append(dict(values))
+        return None
+
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+
+    common = {
+        "entity_type": "sku",
+        "entity_id": "sku_1",
+        "field_family": "inventory",
+        "field_key": "availability",
+        "source_system": "shopify_products_sync",
+        "observed_at": datetime(2026, 6, 6, 12, 0, 0),
+    }
+    await module._upsert_field_fact(
+        **common,
+        source_ref="shopify_products_sync:merch_1:2026-06-06T12:00:00",
+        value={"available": True},
+    )
+    await module._upsert_field_fact(
+        **common,
+        source_ref="shopify_products_sync:merch_1:2026-06-06T12:05:00",
+        value={"available": False},
+    )
+
+    expected_fact_id = module._stable_key(
+        "fact",
+        "sku",
+        "sku_1",
+        "inventory",
+        "availability",
+        "shopify_products_sync",
+    )
+    assert [row["fact_id"] for row in upsert_rows] == [expected_fact_id, expected_fact_id]
+    assert upsert_rows[0]["source_ref"] != upsert_rows[1]["source_ref"]
+    assert len(executed_sql) == 2
+    assert all("DELETE FROM catalog_field_facts" in sql for sql in executed_sql)
+
+
+@pytest.mark.asyncio
 async def test_resolve_catalog_sku_key_preserves_existing_source_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

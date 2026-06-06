@@ -707,18 +707,30 @@ async def _resolve_catalog_sku_key(
     return make_catalog_sku_key(product_key, source_variant_id)
 
 
+def _table_debug_name(table: Any) -> str:
+    return str(getattr(table, "name", None) or type(table).__name__)
+
+
 async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    pk_value = values[pk_name]
-    existing = await _fetch_one_by_pk(table, pk_name, pk_value)
-    payload = dict(values)
-    _preserve_non_stale_suppression(existing, payload)
-    payload["updated_at"] = _utcnow()
-    if existing:
-        await database.execute(table.update().where(getattr(table.c, pk_name) == pk_value).values(**payload))
-        return existing
-    payload.setdefault("created_at", _utcnow())
-    await database.execute(table.insert().values(**payload))
-    return None
+    table_name = _table_debug_name(table)
+    try:
+        pk_value = values[pk_name]
+        existing = await _fetch_one_by_pk(table, pk_name, pk_value)
+        payload = dict(values)
+        _preserve_non_stale_suppression(existing, payload)
+        payload["updated_at"] = _utcnow()
+        if existing:
+            await database.execute(
+                table.update().where(getattr(table.c, pk_name) == pk_value).values(**payload)
+            )
+            return existing
+        payload.setdefault("created_at", _utcnow())
+        await database.execute(table.insert().values(**payload))
+        return None
+    except Exception as exc:
+        raise RuntimeError(
+            f"catalog upsert failed table={table_name} pk={pk_name}: {exc}"
+        ) from exc
 
 
 async def _replace_child_rows(table: Any, match_column: str, match_value: Any, rows: Iterable[Dict[str, Any]]) -> int:
@@ -768,14 +780,15 @@ async def _upsert_field_fact(
     confidence: Optional[Decimal] = None,
     review_state: str = "observed",
 ) -> None:
-    fact_id = _stable_key(
-        "fact",
-        entity_type,
-        entity_id,
-        field_family,
-        field_key,
-        source_system,
-        source_ref or "",
+    fact_id = _stable_key("fact", entity_type, entity_id, field_family, field_key, source_system)
+    await database.execute(
+        catalog_field_facts.delete()
+        .where(catalog_field_facts.c.entity_type == entity_type)
+        .where(catalog_field_facts.c.entity_id == entity_id)
+        .where(catalog_field_facts.c.field_family == field_family)
+        .where(catalog_field_facts.c.field_key == field_key)
+        .where(catalog_field_facts.c.source_system == source_system)
+        .where(catalog_field_facts.c.fact_id != fact_id)
     )
     await _upsert_by_pk(
         catalog_field_facts,
