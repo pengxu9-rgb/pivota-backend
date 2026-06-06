@@ -767,7 +767,7 @@ def _buyer_path_opportunities(
             continue
         if float(row.get("demand_signal") or 0) <= 0 and float(row.get("opportunity_score") or 0) <= 0:
             continue
-        if not _source_role_chips(row):
+        if not _buyer_path_controllers(row):
             continue
         rows.append(row)
     rows.sort(
@@ -787,7 +787,7 @@ def _buyer_path_opportunity(
     row: Mapping[str, Any],
     merchant_path: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    controllers = _source_role_chips(row)
+    controllers = _buyer_path_controllers(row)
     route = _clean_str(row.get("source_route")).lower()
     ownership = _clean_str(row.get("ownership_state")).lower()
     route_label = route or ownership.replace("-owned", "") or "third-party"
@@ -800,6 +800,21 @@ def _buyer_path_opportunity(
         "merchant_archetype": _clean_str(merchant_path.get("archetype")),
         "recommended_moves": _buyer_path_moves(merchant_path),
     }
+
+
+def _buyer_path_controllers(row: Mapping[str, Any]) -> List[Dict[str, str]]:
+    source_summary = _as_mapping(row.get("source_summary"))
+    summarized: List[Dict[str, str]] = []
+    route = _clean_str(row.get("source_route")) or "unclassified"
+    for source in _as_list(source_summary.get("top_cited_hosts")):
+        if not isinstance(source, Mapping):
+            continue
+        host = _normalize_host(source.get("host"))
+        if host:
+            summarized.append({"host": host, "role": route})
+    if summarized:
+        return _unique_host_roles(summarized)[:3]
+    return _unique_host_roles(_source_role_chips(row))[:3]
 
 
 def _buyer_path_moves(merchant_path: Mapping[str, Any]) -> List[str]:
