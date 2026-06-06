@@ -5598,6 +5598,61 @@ def _lost_head_category_for_money_shot(
     return str(candidates[0].get("query") or "").strip() or f"the broad {product_type or 'product'} category"
 
 
+_BUYER_PATH_OWNED_STATES = {
+    "retailer-owned",
+    "marketplace-owned",
+    "publisher-owned",
+    "forum-owned",
+}
+
+
+def _headline_join(hosts: List[str]) -> str:
+    hosts = [h for h in hosts if h][:3]
+    if not hosts:
+        return ""
+    if len(hosts) == 1:
+        return hosts[0]
+    if len(hosts) == 2:
+        return f"{hosts[0]} and {hosts[1]}"
+    return f"{hosts[0]}, {hosts[1]} and {hosts[2]}"
+
+
+def _top_exposed_lane(per_prompt: List[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The highest-value lane where demand exists but a third-party source/retailer
+    controls the buyer path (the de-inflated EXPOSURE — not an open lane)."""
+    rows = [
+        row for row in per_prompt
+        if str(row.get("ownership_state") or "").lower() in _BUYER_PATH_OWNED_STATES
+        and float(row.get("demand_signal") or 0) > 0
+        and str(row.get("query") or "").strip()
+    ]
+    if not rows:
+        return None
+    rows.sort(
+        key=lambda row: (
+            -float(row.get("opportunity_score") or 0),
+            -float(row.get("demand_signal") or 0),
+            str(row.get("query") or "").lower(),
+        )
+    )
+    row = rows[0]
+    who = row.get("who_owns")
+    if isinstance(who, str) and who.strip():
+        controllers = [who.strip()]
+    elif isinstance(who, list):
+        controllers = [str(h).strip() for h in who if str(h).strip()]
+    else:
+        controllers = []
+    if not controllers:
+        summary = row.get("source_summary") if isinstance(row.get("source_summary"), Mapping) else {}
+        controllers = [
+            str((h or {}).get("host") or "").strip()
+            for h in (summary.get("top_cited_hosts") or [])
+            if str((h or {}).get("host") or "").strip()
+        ]
+    return {"lane": str(row.get("query") or "").strip(), "controllers": controllers}
+
+
 def _sku_intelligence_headline(
     *,
     opportunity: Mapping[str, Any],
@@ -5606,6 +5661,16 @@ def _sku_intelligence_headline(
 ) -> str:
     top_open_lanes = opportunity.get("top_open_lanes") or []
     if not top_open_lanes:
+        # Before falling back, lead with the buyer-path EXPOSURE if the demand is
+        # real but controlled by third-party sources/retailers (the de-inflated
+        # story). "No open lane" is the wrong frame when the lanes are owned.
+        exposed = _top_exposed_lane(list(opportunity.get("per_prompt") or []))
+        if exposed and exposed["lane"] and exposed["controllers"]:
+            controllers = _headline_join(exposed["controllers"])
+            return (
+                f"AI recommends `{exposed['lane']}`, but routes buyers to "
+                f"{controllers} — not your site. Here's how to win the buyer path back."
+            )
         prompt_count = len(opportunity.get("per_prompt") or [])
         return (
             f"We tested {prompt_count} buyer prompts for {title}. "

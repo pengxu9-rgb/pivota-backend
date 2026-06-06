@@ -332,8 +332,12 @@ async def test_run_wedge_hero_sku_intelligence_empty_state_without_attributes(mo
     assert out["is_empty"] is True
     assert out["top_open_lanes"] == []
     assert "next_best_action" in out
-    assert "We tested 3 buyer prompts for BB Lab Good Night Collagen" in out["headline"]
-    assert "No open lane stood out this run" in out["headline"]
+    # The fixture's category lane is third-party (amazon.com) controlled with
+    # real demand, so the headline must LEAD with the buyer-path exposure, not
+    # the stale "no open lane stood out" frame.
+    assert "routes buyers to" in out["headline"]
+    assert "buyer path" in out["headline"].lower()
+    assert "amazon.com" in out["headline"]
     assert out["intent_ladder"]
     assert len(out["prompt_matrix"]) == 3
     assert out["substitution_alert"]["present"] is True
