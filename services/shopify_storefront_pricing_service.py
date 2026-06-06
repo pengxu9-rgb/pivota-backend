@@ -1153,6 +1153,19 @@ query($ids: [ID!]!) {
 
                 raise err
 
+        if cart is None:
+            vid = _first_item_variant_id(items or [])
+            raise ShopifyPricingError(
+                "SHOPIFY_PRICING_UNAVAILABLE",
+                "Storefront cartCreate returned no cart",
+                debug_id,
+                details={
+                    "shop_domain": shop_domain,
+                    "variant_id": vid,
+                    "item_count": len(items or []),
+                },
+            )
+
         # Inventory enforcement (best-effort): Shopify Admin inventoryPolicy=DENY must not be oversold.
         # This is critical because we create Shopify orders via Admin API (not Shopify checkout),
         # which can otherwise bypass storefront "sold out" restrictions.

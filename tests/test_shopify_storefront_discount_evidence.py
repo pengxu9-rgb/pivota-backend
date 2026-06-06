@@ -16,6 +16,7 @@ from services.shopify_storefront_pricing_service import (
     _shopify_cart_buyer_identity_input,
     _shopify_cart_selectable_address_input,
 )
+from services.shopify_pricing_service import ShopifyPricingError
 
 
 def test_storefront_discount_parser_uses_line_allocations_not_total_delta():
@@ -289,6 +290,50 @@ def test_derive_shipping_fee_uses_net_shipping_after_shipping_discount():
     )
 
     assert shipping_fee == Decimal("0.00")
+
+
+@pytest.mark.asyncio
+async def test_preview_cart_quote_fails_closed_when_cart_create_returns_no_cart(monkeypatch):
+    service = ShopifyStorefrontPricingService()
+
+    async def fake_primary_store(_merchant_id):
+        return {
+            "platform": "shopify",
+            "domain": "example.myshopify.com",
+            "api_credentials": {"storefront_access_token": "sf_token"},
+        }
+
+    async def fake_admin_token(**_kwargs):
+        return None, None
+
+    async def fake_create_cart(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "services.shopify_storefront_pricing_service.get_primary_store",
+        fake_primary_store,
+    )
+    monkeypatch.setattr(
+        "services.shopify_storefront_pricing_service.resolve_shopify_admin_access_token",
+        fake_admin_token,
+    )
+    monkeypatch.setattr(service, "_create_cart", fake_create_cart)
+
+    with pytest.raises(ShopifyPricingError) as excinfo:
+        await service.preview_cart_quote(
+            merchant_id="merch_test",
+            items=[{"product_id": "prod_1", "variant_id": "123", "quantity": 1}],
+            discount_codes=[],
+            customer_email=None,
+            shipping_address={"country": "US", "postal_code": "94102"},
+            selected_delivery_option=None,
+        )
+
+    err = excinfo.value
+    assert err.code == "SHOPIFY_PRICING_UNAVAILABLE"
+    assert err.message == "Storefront cartCreate returned no cart"
+    assert err.details["variant_id"] == "123"
+    assert err.details["item_count"] == 1
 
 
 def test_unverified_shipping_evidence_downgrades_pricing_confidence():
