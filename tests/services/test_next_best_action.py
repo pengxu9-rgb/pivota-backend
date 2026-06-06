@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 from services.next_best_action import (
@@ -168,6 +169,19 @@ def test_retailer_route_leak_prescribes_direct_attribution_not_generic_pr():
     assert "margin and customer data" in nba["why_this_first"]
     assert "pr problem" in nba["why_this_first"].lower()  # not generic PR
     assert "sephora.com" in nba["self_serve_actions"][1]
+    play = nba["canonical_page_play"]
+    play_blob = json.dumps(play).lower()
+    assert play["lane"] == "best serum for dry skin"
+    assert play["controllers"] == ["sephora.com", "amazon.com"]
+    assert {move["type"] for move in play["moves"]} == {
+        "first_order_offer",
+        "starter_replenishment_bundle",
+        "subscription_or_why_buy_direct",
+    }
+    assert "exact discount depths" in play["economics_policy"]
+    assert "agent-checkout ready" in play["checkout_readiness"]
+    assert "%" not in play_blob and "$" not in play_blob
+    assert "proves whether direct sales rise" not in json.dumps(nba).lower()
     _assert_70_30(nba)
 
 
@@ -648,6 +662,19 @@ def test_sku_nba_bb_lab_brand_path_ties_operational_moves_to_retailer_exposure()
     assert nba["operator_moves"][0]["lane"] == "best collagen sticks"
     assert "amazon.com" in nba["operator_moves"][0]["evidence"]["controllers"]
     assert nba["evidence_used"]["source_route_prompt"]["sources"][0]["host"] == "amazon.com"
+    play = nba["canonical_page_play"]
+    play_blob = json.dumps(play).lower()
+    assert play["lane"] == "best collagen sticks"
+    assert play["controllers"] == ["amazon.com", "walmart.com"]
+    assert play["page"] == "your official PDP"
+    assert {move["type"] for move in play["moves"]} == {
+        "first_order_offer",
+        "starter_replenishment_bundle",
+        "subscription_or_why_buy_direct",
+    }
+    assert "exact discount depths" in play["economics_policy"]
+    assert "agent-checkout ready" in play["checkout_readiness"]
+    assert "%" not in play_blob and "$" not in play_blob
     assert "%" not in copy and "$" not in copy
 
 
@@ -695,6 +722,9 @@ def test_sku_nba_ownist_brand_path_ties_offer_bundle_to_real_exposed_lane():
     assert "bundle" in copy
     assert "subscription incentive" in copy
     assert "why-buy-direct" in copy
+    assert nba["canonical_page_play"]["lane"] == "best beauty supplement for glow"
+    assert "walmart.com" in nba["canonical_page_play"]["controllers"]
+    assert "exact discount depths" in nba["canonical_page_play"]["economics_policy"]
 
 
 def _ownist_product_evidence(*, snack_positioning: bool = False) -> Dict[str, Any]:
@@ -790,6 +820,10 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
     assert "starter + replenishment bundle" in copy
     assert "subscription incentive" in copy
     assert "why-buy-direct" in copy
+    play = nba["canonical_page_play"]
+    assert play["lane"] == "vitamin c collagen jelly"
+    assert play["controllers"] == ["cogentsteps.net", "medsysgroup.com", "oliveyoung.com"]
+    assert "exact discount depths" in play["economics_policy"]
     assert "%" not in copy and "$" not in copy
 
 

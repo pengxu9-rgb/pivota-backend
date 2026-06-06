@@ -213,6 +213,15 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     assert head["buyer_path_action"]["lane"] == "best collagen supplements for skin"
     assert "first-order offer" in head["buyer_path_action"]["move"]
     assert "starter + replenishment bundle" in head["buyer_path_action"]["move"]
+    play = head["buyer_path_action"]["canonical_page_play"]
+    assert play["lane"] == "best collagen supplements for skin"
+    assert {move["type"] for move in play["moves"]} == {
+        "first_order_offer",
+        "starter_replenishment_bundle",
+        "subscription_or_why_buy_direct",
+    }
+    assert "exact discount depths" in play["economics_policy"]
+    assert "agent-checkout ready" in play["checkout_readiness"]
     assert out["coverage"]["prompt_count"] == 4
 
 

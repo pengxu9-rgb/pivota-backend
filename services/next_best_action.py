@@ -39,6 +39,12 @@ _VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
 _VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
 _VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY = "CATEGORY MENTION, NO FIRST-PARTY"
 _VERDICT_STRONG = "STRONG"
+_OFFER_ECONOMICS_POLICY = (
+    "Mechanics only: first-order offer, starter + replenishment bundle, "
+    "subscription incentive, and why-buy-direct proof. Do not recommend exact "
+    "discount depths, bundle prices, savings percentages, or margin claims "
+    "without audited margin or promo evidence."
+)
 
 _RETAIL_HOST_TYPES = {"retailer", "marketplace"}
 _SOURCE_HOST_TYPES = {
@@ -413,6 +419,10 @@ def _sku_prescription_for_gap(
             prescription_class="operational_efficiency",
             merchant_path=merchant_path,
             operator_moves=_sku_operator_moves(
+                route_prompt=route_prompt,
+                merchant_path=merchant_path,
+            ),
+            canonical_page_play=_sku_canonical_page_play(
                 route_prompt=route_prompt,
                 merchant_path=merchant_path,
             ),
@@ -922,6 +932,92 @@ def _sku_operator_moves(
     ]
 
 
+def _canonical_page_play(
+    *,
+    lane: str,
+    controllers: List[str],
+    page: str,
+    destination: str,
+    goal: str,
+) -> Dict[str, Any]:
+    controller = _phrase(controllers, "the cited third-party route")
+    return {
+        "lane": lane,
+        "controllers": controllers[:3],
+        "page": page,
+        "destination": destination,
+        "goal": goal,
+        "economics_policy": _OFFER_ECONOMICS_POLICY,
+        "moves": [
+            {
+                "type": "first_order_offer",
+                "operator_action": (
+                    f"Attach a first-order offer to {page} for {lane}."
+                ),
+                "why": (
+                    f"AI already exposes the lane through {controller}; the owned "
+                    "page needs a direct buying reason."
+                ),
+            },
+            {
+                "type": "starter_replenishment_bundle",
+                "operator_action": (
+                    f"Add a starter + replenishment bundle on {page} for {lane}."
+                ),
+                "why": (
+                    "The bundle gives the answer and the shopper a concrete value "
+                    "reason to prefer the merchant-controlled path."
+                ),
+            },
+            {
+                "type": "subscription_or_why_buy_direct",
+                "operator_action": (
+                    "Add subscription incentive and why-buy-direct proof: guarantee, "
+                    "samples, loyalty, returns, stock, and fresh product facts."
+                ),
+                "why": (
+                    f"Those are merchant-owned promises {controller} cannot safely "
+                    "represent as the direct buying path."
+                ),
+            },
+        ],
+        "checkout_readiness": (
+            f"Make {page} cited, buyable, and agent-checkout ready before trying "
+            "to redirect the cited source trail."
+        ),
+    }
+
+
+def _sku_canonical_page_play(
+    *,
+    route_prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> Dict[str, Any]:
+    query = str(route_prompt.get("query") or "").strip()
+    return _canonical_page_play(
+        lane=query or "the exposed lane",
+        controllers=_host_names(route_prompt.get("sources")),
+        page=_merchant_page_label(merchant_path),
+        destination=_merchant_destination(merchant_path),
+        goal=str(merchant_path.get("goal") or ""),
+    )
+
+
+def _brand_canonical_page_play(
+    evidence: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> Dict[str, Any]:
+    queries = _query_examples(evidence.get("failed_query_examples"))
+    lane = (queries[0].strip("\"") if queries else "") or "the retailer-routed demand"
+    return _canonical_page_play(
+        lane=lane,
+        controllers=_host_names(evidence.get("retailer_hosts")),
+        page=_merchant_page_label(merchant_path),
+        destination=_merchant_destination(merchant_path),
+        goal=str(merchant_path.get("goal") or ""),
+    )
+
+
 def _brand_operator_moves(
     evidence: Mapping[str, Any],
     merchant_path: Mapping[str, Any],
@@ -1095,6 +1191,7 @@ def _prescription_for_gap(
             prescription_class="operational_efficiency",
             merchant_path=merchant_path,
             operator_moves=_brand_operator_moves(evidence, merchant_path),
+            canonical_page_play=_brand_canonical_page_play(evidence, merchant_path),
             headline="AI sends your buyers to retailers — give them a better buying path.",
             why_this_first=(
                 f"Shoppers can find you, but AI points them to {retailer_phrase} "
@@ -1119,14 +1216,16 @@ def _prescription_for_gap(
             ],
             pivota_path=(
                 "Pivota can make your own page the one AI cites and buys from, and "
-                "show you whether direct sales rise against those retailer-won questions."
+                "measure whether those retailer-won questions start moving toward "
+                "the owned buyer path."
             ),
             evidence_used=evidence,
             cta={
                 "label": "Win back the buying path",
                 "trust_note": (
                     "Fixing retailer listings is yours to do; Pivota makes your own "
-                    "page the cited, buyable one and proves whether direct sales rise."
+                    "page the cited, buyable one and measures whether the owned buyer "
+                    "path improves."
                 ),
             },
         )
@@ -1258,6 +1357,7 @@ def _base_payload(
     prescription_class: Optional[str] = None,
     merchant_path: Optional[Mapping[str, Any]] = None,
     operator_moves: Optional[List[Mapping[str, Any]]] = None,
+    canonical_page_play: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     out = {
         "primary_gap": primary_gap,
@@ -1276,6 +1376,8 @@ def _base_payload(
         out["merchant_path"] = dict(merchant_path)
     if operator_moves:
         out["operator_moves"] = [dict(move) for move in operator_moves]
+    if canonical_page_play:
+        out["canonical_page_play"] = dict(canonical_page_play)
     return out
 
 

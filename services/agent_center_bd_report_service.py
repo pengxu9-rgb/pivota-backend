@@ -5099,15 +5099,48 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
     ]
     controllers = hosts[:3]
     controller_phrase = ", ".join(controllers) if controllers else "the cited sources"
+    lane = query or "this exposed lane"
     return {
         "prescription_class": "operational_efficiency",
         "lane": query,
         "controllers": controllers,
         "move": (
-            f"Use the cited + buyable official page for {query or 'this exposed lane'} "
+            f"Use the cited + buyable official page for {lane} "
             f"to beat {controller_phrase}: first-order offer, starter + replenishment "
             "bundle, subscription incentive, and why-buy-direct proof."
         ),
+        "canonical_page_play": {
+            "lane": lane,
+            "controllers": controllers,
+            "page": "the official page",
+            "economics_policy": (
+                "Mechanics only: first-order offer, starter + replenishment bundle, "
+                "subscription incentive, and why-buy-direct proof. Do not recommend "
+                "exact discount depths, bundle prices, savings percentages, or margin "
+                "claims without audited margin or promo evidence."
+            ),
+            "moves": [
+                {
+                    "type": "first_order_offer",
+                    "operator_action": f"Attach a first-order offer to the official page for {lane}.",
+                },
+                {
+                    "type": "starter_replenishment_bundle",
+                    "operator_action": f"Add a starter + replenishment bundle on the official page for {lane}.",
+                },
+                {
+                    "type": "subscription_or_why_buy_direct",
+                    "operator_action": (
+                        "Add subscription incentive and why-buy-direct proof: guarantee, "
+                        "samples, loyalty, returns, stock, and fresh product facts."
+                    ),
+                },
+            ],
+            "checkout_readiness": (
+                "Make the page cited, buyable, and agent-checkout ready before trying "
+                "to redirect the cited source trail."
+            ),
+        },
     }
 
 
