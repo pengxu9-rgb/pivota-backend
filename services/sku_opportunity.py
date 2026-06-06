@@ -235,6 +235,12 @@ def _score_prompt_group(
         open_lane=open_lane,
         demand_signal=demand_signal,
     )
+    who_owns = _who_owns_state(
+        ownership_state=ownership_state,
+        source_roles=source_roles,
+        sku_ctx=sku_ctx,
+        durable_competitor=durable_competitor,
+    )
     substitution = _substitution(
         query=query,
         axis=axis,
@@ -270,6 +276,7 @@ def _score_prompt_group(
         "provider_verdicts": provider_verdicts,
         "engine_agreement": engine_agreement,
         "ownership_state": ownership_state,
+        "who_owns": who_owns,
         "source_roles": source_roles,
         "source_route": source_route,
         "source_summary": {
@@ -405,27 +412,17 @@ def _run_visibility_verdict(
 
     canonical_url = product.get("canonical_url") or sku_ctx.get("canonical_url")
     pivota_url = product.get("pivota_canonical_url") or sku_ctx.get("pivota_canonical_url")
-    grounded_first_party = bool(url_match.get("in_grounding")) or _url_in_sources(
-        run,
-        [canonical_url, pivota_url],
-    )
     source_identifiers = _run_source_identifiers(run)
     source_hosts = [
         str(identifier.get("host") or "")
         for identifier in source_identifiers
         if identifier.get("host")
     ]
-    grounded_first_party = bool(
-        grounded_first_party
-        or any(_is_first_party_host(host, sku_ctx or {}) for host in source_hosts)
-        or any(
-            _source_label_matches_merchant(
-                str(identifier.get("label") or ""),
-                sku_ctx=sku_ctx,
-                product=product,
-            )
-            for identifier in source_identifiers
-        )
+    grounded_first_party = _first_party_grounding_primary_for_run(
+        run,
+        sku_ctx=sku_ctx,
+        product=product,
+        source_identifiers=source_identifiers,
     )
     grounded_any = bool(
         run.get("grounding_sources")
@@ -537,6 +534,53 @@ def _run_source_identifiers(run: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         add(host=host, label=host, is_redirector=False)
     return out
+
+
+def _first_party_grounding_primary_for_run(
+    run: Dict[str, Any],
+    *,
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+    source_identifiers: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    identifiers = (
+        source_identifiers
+        if source_identifiers is not None
+        else _run_source_identifiers(run)
+    )
+    if not identifiers:
+        return False
+    first_party = 0
+    external = 0
+    for identifier in identifiers:
+        host = identifier.get("host")
+        label = str(identifier.get("label") or "").lower()
+        if (
+            _is_first_party_host(host, sku_ctx or {})
+            or _label_contains_first_party_host(label, sku_ctx=sku_ctx, product=product)
+        ):
+            first_party += 1
+        else:
+            external += 1
+    return first_party > 0 and first_party >= external
+
+
+def _label_contains_first_party_host(
+    label: str,
+    *,
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> bool:
+    if not label:
+        return False
+    hosts = {
+        normalize_host(product.get("canonical_url") or ""),
+        normalize_host(product.get("pivota_canonical_url") or ""),
+        normalize_host(sku_ctx.get("canonical_url") or ""),
+        normalize_host(sku_ctx.get("pivota_canonical_url") or ""),
+    }
+    hosts.discard(None)
+    return any(host and host in label for host in hosts)
 
 
 def _host_from_source_label(label: str) -> Optional[str]:
@@ -674,16 +718,31 @@ def _source_owned_state(
     source_roles: List[Dict[str, Any]],
     sku_ctx: Dict[str, Any],
 ) -> Optional[str]:
-    if source_route == "fragmented":
-        return None
     role_counts: Counter = Counter()
     for row in source_roles:
         if _is_first_party_host(row.get("host"), sku_ctx or {}):
             continue
         role_counts[row.get("role") or "unclassified"] += int(row.get("times_cited") or 1)
     role = _dominant_role(role_counts)
-    if role in {"retailer", "marketplace"} or source_route in {"retailer", "marketplace"}:
+    if role in {None, "unclassified"} and role_counts:
+        non_generic = {
+            key: count
+            for key, count in role_counts.items()
+            if key not in {"unclassified", "first-party"}
+        }
+        if non_generic:
+            role = sorted(
+                non_generic.items(),
+                key=lambda item: (
+                    -int(item[1]),
+                    -_ROLE_PRIORITY.get(str(item[0]), 0),
+                    str(item[0]),
+                ),
+            )[0][0]
+    if role == "retailer" or source_route == "retailer":
         return "retailer-owned"
+    if role == "marketplace" or source_route == "marketplace":
+        return "marketplace-owned"
     if role == "publisher" or source_route == "publisher":
         return "publisher-owned"
     if role == "forum" or source_route == "forum":
@@ -691,6 +750,97 @@ def _source_owned_state(
     if role == "brand":
         return "competitor-owned"
     return None
+
+
+def _first_party_source_share(
+    source_roles: List[Dict[str, Any]],
+    sku_ctx: Dict[str, Any],
+) -> Tuple[int, int, int]:
+    first_party = 0
+    external_total = 0
+    max_external = 0
+    for row in source_roles:
+        count = int(row.get("times_cited") or 1)
+        if _is_first_party_host(row.get("host"), sku_ctx or {}):
+            first_party += count
+        else:
+            external_total += count
+            max_external = max(max_external, count)
+    return first_party, external_total, max_external
+
+
+def _first_party_dominates_sources(
+    source_roles: List[Dict[str, Any]],
+    sku_ctx: Dict[str, Any],
+) -> bool:
+    first_party, external_total, max_external = _first_party_source_share(
+        source_roles,
+        sku_ctx,
+    )
+    if first_party <= 0:
+        return False
+    return first_party >= max_external and first_party >= external_total
+
+
+def _owner_role_for_state(ownership_state: str) -> Optional[str]:
+    return {
+        "publisher-owned": "publisher",
+        "retailer-owned": "retailer",
+        "marketplace-owned": "marketplace",
+        "forum-owned": "forum",
+        "competitor-owned": "brand",
+    }.get(str(ownership_state or "").strip().lower())
+
+
+def _dominant_owner_hosts(
+    *,
+    ownership_state: str,
+    source_roles: List[Dict[str, Any]],
+    sku_ctx: Dict[str, Any],
+) -> List[str]:
+    role = _owner_role_for_state(ownership_state)
+    if not role:
+        return []
+    candidates = [
+        row for row in source_roles
+        if not _is_first_party_host(row.get("host"), sku_ctx or {})
+        and str(row.get("role") or "") == role
+        and row.get("host")
+    ]
+    if not candidates:
+        return []
+    candidates.sort(
+        key=lambda row: (
+            -int(row.get("times_cited") or 0),
+            str(row.get("host") or ""),
+        )
+    )
+    top_count = int(candidates[0].get("times_cited") or 0)
+    hosts = [
+        str(row.get("host"))
+        for row in candidates
+        if int(row.get("times_cited") or 0) == top_count
+    ]
+    return hosts[:3]
+
+
+def _who_owns_state(
+    *,
+    ownership_state: str,
+    source_roles: List[Dict[str, Any]],
+    sku_ctx: Dict[str, Any],
+    durable_competitor: Optional[str],
+) -> Optional[Any]:
+    if ownership_state == "competitor-owned" and durable_competitor:
+        return durable_competitor
+    hosts = _dominant_owner_hosts(
+        ownership_state=ownership_state,
+        source_roles=source_roles,
+        sku_ctx=sku_ctx,
+    )
+    if not hosts:
+        return None
+    return hosts[0] if len(hosts) == 1 else hosts
 
 
 def _first_move_for_lane(lane: Mapping[str, Any]) -> str:
@@ -961,7 +1111,8 @@ def _ownership_state(
 ) -> str:
     if demand_signal <= 0:
         return "no-demand"
-    first_party_positive = any(
+    first_party_primary = _first_party_dominates_sources(source_roles, sku_ctx)
+    first_party_positive = first_party_primary and any(
         row.get("grounded_first_party") and row.get("verdict") == "win"
         for row in provider_analysis.values()
     )
@@ -972,11 +1123,6 @@ def _ownership_state(
     )
     if first_party_positive and wins >= 1:
         return "merchant-owned"
-    if durable_competitor:
-        return "competitor-owned"
-    if merchant_mentions:
-        return "merchant-mentioned"
-
     source_owner = _source_owned_state(
         source_route=source_route,
         source_roles=source_roles,
@@ -984,6 +1130,10 @@ def _ownership_state(
     )
     if source_owner:
         return source_owner
+    if durable_competitor:
+        return "competitor-owned"
+    if merchant_mentions:
+        return "merchant-mentioned"
     if open_lane:
         return "open-lane"
     return "open-lane"
@@ -1119,8 +1269,6 @@ def _intent_ladder(per_prompt: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
                 1
                 for row in rows
                 if row.get("ownership_state") == "merchant-owned"
-                or row.get("provider_verdicts", {}).values()
-                and any(v == "win" for v in row.get("provider_verdicts", {}).values())
             )
             answerable = sum(1 for row in rows if row.get("demand_signal", 0) > 0)
             denominator = len(rows)

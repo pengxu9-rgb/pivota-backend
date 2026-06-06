@@ -277,6 +277,13 @@ def _classify_sku_primary_gap(
     ):
         return PRIMARY_SKU_PROTECTED_MONITORING
 
+    if _sku_has_resolved_coverage(
+        opportunity=opportunity,
+        identity=identity,
+        require_demand=True,
+    ):
+        return PRIMARY_SKU_PROTECTED_MONITORING
+
     return PRIMARY_SKU_INSUFFICIENT_DATA
 
 
@@ -538,6 +545,28 @@ def _sku_source_route_prompt(opportunity: Mapping[str, Any]) -> Optional[Mapping
         )
     )
     return candidates[0]
+
+
+def _sku_has_resolved_coverage(
+    *,
+    opportunity: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    require_demand: bool,
+) -> bool:
+    if identity.get("unresolved"):
+        return False
+    coverage = _as_mapping(opportunity.get("confidence"))
+    if _score(coverage.get("prompt_count")) <= 0:
+        return False
+    if not require_demand:
+        return True
+    if _score(coverage.get("prompts_with_demand")) > 0:
+        return True
+    return any(
+        isinstance(row, Mapping)
+        and float(row.get("demand_signal") or 0) > 0
+        for row in _as_list(opportunity.get("per_prompt"))
+    )
 
 
 def _sku_is_protected(

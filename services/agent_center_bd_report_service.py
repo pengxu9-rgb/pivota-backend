@@ -2428,6 +2428,65 @@ def _url_in_sources(run: Dict[str, Any], targets: List[str]) -> bool:
     return False
 
 
+def _source_identifier_is_first_party(
+    source: Mapping[str, Any],
+    *,
+    target_urls: List[str],
+    first_party_hosts: set[str],
+) -> bool:
+    key = str(source.get("key") or "").strip().lower().rstrip("/")
+    label = str(source.get("label") or "").strip().lower().rstrip("/")
+    if not key and not label:
+        return False
+    for host in first_party_hosts:
+        if host and (host in key or host in label):
+            return True
+    for target in target_urls:
+        normalized_target = target.strip().lower().rstrip("/")
+        if normalized_target and (
+            normalized_target in key
+            or key in normalized_target
+            or normalized_target in label
+        ):
+            return True
+    return False
+
+
+def _first_party_grounding_primary_for_run(
+    run: Dict[str, Any],
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> bool:
+    target_urls = [
+        product.get("canonical_url") or sku_ctx.get("canonical_url") or "",
+        product.get("pivota_canonical_url") or sku_ctx.get("pivota_canonical_url") or "",
+    ]
+    first_party_hosts = {
+        host
+        for host in (
+            normalize_host(target_urls[0]),
+            normalize_host(target_urls[1]),
+        )
+        if host
+    }
+    sources = _identify_run_sources(run)
+    if not sources:
+        return False
+    first_party = sum(
+        1
+        for source in sources
+        if _source_identifier_is_first_party(
+            source,
+            target_urls=target_urls,
+            first_party_hosts=first_party_hosts,
+        )
+    )
+    if first_party <= 0:
+        return False
+    external = max(0, len(sources) - first_party)
+    return first_party >= external
+
+
 def _run_text(run: Dict[str, Any]) -> str:
     parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
     return " ".join(
@@ -2945,12 +3004,14 @@ def compute_citation_score(
             or llm_report.get("correct_sku") is False
         )
 
-        # first_party: merchant-domain grounding counts only when the answer is
-        # not denying the product (domain-grounding inside a "not the product"
-        # answer is not THIS SKU being cited).
-        grounded_first_party = (
-            bool(url_match.get("in_grounding"))
-            or _url_in_sources(run, [canonical_url, pivota_url])
+        # first_party: the merchant PDP must be a primary grounding source.
+        # `url_match.in_grounding` can be true on branded prompts where the
+        # brand is merely mentioned while publishers/retailers carry the
+        # citations; that is visibility, not first-party control.
+        grounded_first_party = _first_party_grounding_primary_for_run(
+            run,
+            sku_ctx or {},
+            product,
         )
         if grounded_first_party and not negative_verdict:
             first_party_hits += 1
@@ -4160,6 +4221,99 @@ def _dedupe_query_specs(specs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return out
 
 
+def _clean_prompt_term(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return text.strip(" \t\r\n,.;:/")
+
+
+def _graph_class_values(graph: Mapping[str, Any], class_name: str) -> List[str]:
+    classes = graph.get("classes") if isinstance(graph.get("classes"), dict) else {}
+    values = classes.get(class_name) if isinstance(classes, dict) else []
+    out: List[str] = []
+    seen = set()
+    for value in values or []:
+        cleaned = _clean_prompt_term(value)
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
+
+
+def _category_for_unbranded_prompts(
+    product: Mapping[str, Any],
+    product_type: str,
+    graph: Mapping[str, Any],
+) -> str:
+    direct = _clean_prompt_term(
+        product_type
+        or product.get("product_type")
+        or product.get("category")
+    )
+    if direct and direct not in {"product", "products", "item", "items"}:
+        return direct
+    for category in _graph_class_values(graph, "category"):
+        if category and category not in {"product", "products", "item", "items"}:
+            return category
+    return "product"
+
+
+def _unbranded_category_specs(
+    *,
+    category: str,
+    graph: Mapping[str, Any],
+    topics: List[str],
+    bullets: List[str],
+) -> List[Tuple[str, str]]:
+    specs: List[Tuple[str, str]] = [
+        (f"best {category}", "category"),
+        (f"what is the best {category}", "category"),
+        (f"top {category}", "category"),
+        (f"best {category} to buy online", "category"),
+    ]
+    audiences = _graph_class_values(graph, "audience")
+    for audience in audiences[:3]:
+        specs.extend([
+            (f"best {category} for {audience}", "category"),
+            (f"{category} for {audience}", "category"),
+        ])
+
+    attrs: List[str] = []
+    for class_name in (
+        "certification_constraint",
+        "exclusion",
+        "ingredient",
+        "proof",
+        "use_case",
+    ):
+        attrs.extend(_graph_class_values(graph, class_name))
+    for attr in attrs[:6]:
+        if category in attr:
+            continue
+        specs.append((f"best {attr} {category}", "attribute"))
+
+    for topic in topics[:4]:
+        cleaned = _clean_prompt_term(topic)
+        if cleaned:
+            specs.extend([
+                (f"best {category} for {cleaned}", "category"),
+                (f"{cleaned} {category}", "attribute"),
+            ])
+    for bullet in bullets[:4]:
+        cleaned = _clean_prompt_term(bullet)
+        if cleaned:
+            specs.append((f"{cleaned} {category}", "attribute"))
+
+    specs.extend([
+        (f"recommended {category}", "category"),
+        (f"best rated {category}", "category"),
+        (f"{category} buying guide", "category"),
+        (f"compare {category} options", "category"),
+        (f"popular {category}", "category"),
+        (f"what {category} should I buy", "category"),
+    ])
+    return _dedupe_query_specs(specs)
+
+
 def _build_per_sku_base_query_specs(
     sku_ctx: Dict[str, Any],
 ) -> Tuple[List[Tuple[str, str]], str, str]:
@@ -4191,6 +4345,12 @@ def _build_per_sku_base_query_specs(
         or product.get("category")
         or "product"
     )
+    attribute_graph = build_sku_attribute_graph(product)
+    unbranded_category = _category_for_unbranded_prompts(
+        product,
+        str(product_type or "product"),
+        attribute_graph,
+    )
     enrichment = (
         sku_ctx.get("product_enrichment")
         if isinstance(sku_ctx.get("product_enrichment"), dict)
@@ -4216,24 +4376,15 @@ def _build_per_sku_base_query_specs(
         (f"where can I buy {title}", "intent"),
         (f"shop {title} online", "intent"),
         (f"{title} for sale", "intent"),
-        (f"best price for {title}", "price"),
-        (f"{title} discount", "price"),
-        (f"{title} reviews", "review"),
-        (f"is {title} worth it", "review"),
-        (f"{title} alternatives", "comparison"),
-        (f"{title} vs competitors", "comparison"),
-        (f"best {product_type} for shoppers considering {title}", "category"),
-        (f"top {product_type} like {title}", "category"),
-        (f"what is the best {product_type} to buy online", "category"),
     ]
-    if brand:
-        specs.extend([
-            # `title` is the de-duplicated brand+product identity, so this never
-            # doubles the brand even when product_title already starts with it.
-            (title, "brand"),
-            (f"buy {brand} {product_type} online", "brand"),
-            (f"best {product_type} from {brand}", "brand"),
-        ])
+    specs.extend(
+        _unbranded_category_specs(
+            category=unbranded_category,
+            graph=attribute_graph,
+            topics=topics,
+            bullets=bullets,
+        )
+    )
     if variant_label and variant_label.lower() not in title.lower():
         # Use the human variant label (e.g. "14 Servings, 2-Week Routine") with
         # the full identity, not the opaque variant id.
@@ -4241,13 +4392,6 @@ def _build_per_sku_base_query_specs(
             (f"{title} {variant_label}", "identity"),
             (f"buy {title} ({variant_label}) online", "identity"),
         ])
-    for topic in topics:
-        specs.extend([
-            (f"best {product_type} for {topic}", "category"),
-            (f"{title} for {topic}", "intent"),
-        ])
-    for bullet in bullets:
-        specs.append((f"{title} {bullet}", "content"))
 
     specs = _dedupe_query_specs(specs)
     return specs, title, str(product_type or "product")
@@ -4392,7 +4536,7 @@ def _sidewalk_budget(target: int, available: int) -> int:
     if available <= 0:
         return 0
     if target >= 14:
-        desired = min(6, max(4, target - 10))
+        desired = 6
     elif target >= 12:
         desired = 4
     else:
@@ -4425,7 +4569,7 @@ def _budgeted_wedge_query_records(
     _append_records(
         selected,
         _take_axis_records(
-            base_records, {"category"}, count=3, selected=selected,
+            base_records, {"category", "attribute"}, count=4, selected=selected,
         ),
         limit=target,
     )
@@ -4434,15 +4578,16 @@ def _budgeted_wedge_query_records(
         sidewalk_records[:_sidewalk_budget(target, len(sidewalk_records))],
         limit=target,
     )
-    _append_records(
-        selected,
-        _take_axis_records(
-            base_records, {"brand", "objection", "identity"},
-            count=2,
-            selected=selected,
-        ),
-        limit=target,
-    )
+    if target > 16:
+        _append_records(
+            selected,
+            _take_axis_records(
+                base_records, {"brand", "objection", "identity"},
+                count=2,
+                selected=selected,
+            ),
+            limit=target,
+        )
 
     selected_keys = {
         str(record.get("query") or "").strip().lower()
@@ -4876,6 +5021,8 @@ def _sku_intelligence_ladder_layer(row: Mapping[str, Any]) -> Optional[str]:
 
 
 def _who_owns_prompt(row: Mapping[str, Any]) -> Optional[Any]:
+    if row.get("who_owns"):
+        return row.get("who_owns")
     ownership = str(row.get("ownership_state") or "").lower()
     competitors = row.get("competitors")
     source_summary = row.get("source_summary") if isinstance(row.get("source_summary"), dict) else {}

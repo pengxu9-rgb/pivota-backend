@@ -49,7 +49,8 @@ def test_prompts_name_brand_product_identity_not_variant_label() -> None:
 
     # Generic shopper prompts now name the full identity.
     assert "where can I buy Ownist Triple Shine Grape" in qs
-    assert any("Ownist Triple Shine Grape reviews" == q for q in qs)
+    assert "best beauty supplement" in qs
+    assert not any("shoppers considering Ownist Triple Shine Grape" in q for q in qs)
 
     # The opaque variant id must not leak into prompts.
     assert not any("42327845699767" in q for q in qs)

@@ -394,7 +394,9 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     report = await bd.build_per_sku_report("sku-1", "m-1", "audit-1")
     assert report["sku_key"] == "sku-1"
     assert set(report["scores"]) == {"identity", "content_richness", "routability", "citation"}
-    assert report["scores"]["citation"]["score"] == 100
+    assert report["scores"]["citation"]["score"] == 78
+    assert report["scores"]["citation"]["breakdown"]["first_party_rate"]["numerator"] == 1
+    assert report["scores"]["citation"]["breakdown"]["sku_mention_rate"]["numerator"] == 2
     assert report["scores"]["citation"]["breakdown"]["aggregation_rule"].startswith("any_profile_provider")
     assert set(report["citation_by_provider"]) == {"gemini", "chatgpt"}
     assert report["citation_by_provider"]["gemini"]["score"] == 50

@@ -595,6 +595,38 @@ def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
         _assert_70_30(nba)
 
 
+def test_sku_nba_resolved_coverage_with_exposure_never_returns_insufficient_data():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 14, "prompts_with_demand": 14}
+    opportunity["per_prompt"] = [
+        {
+            "query": "best multivitamin",
+            "ownership_state": "publisher-owned",
+            "source_route": "publisher",
+            "opportunity_score": 4.2,
+            "demand_signal": 1.0,
+            "source_summary": {
+                "top_cited_hosts": [
+                    {"host": "medicalnewstoday.com", "times_cited": 2}
+                ]
+            },
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        primary_gaps=[],
+        scores={},
+        identity=_sku_identity(unresolved=False),
+        sku_title="Ritual Essential for Women 18+ Multivitamin",
+    )
+
+    assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
+    assert nba["primary_gap"] != PRIMARY_SKU_INSUFFICIENT_DATA
+    assert "medicalnewstoday.com" in nba["headline"]
+    _assert_70_30(nba)
+
+
 def test_sku_nba_protected_monitoring_has_no_fake_urgency():
     opportunity = _sku_base_opportunity()
     opportunity["per_prompt"] = [
