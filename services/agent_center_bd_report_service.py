@@ -4262,7 +4262,24 @@ def _category_for_unbranded_prompts(
             and not _noisy_prompt_category(category)
         ):
             return category
-    return "product"
+    attrs = product.get("attributes_raw")
+    attrs_text = ""
+    if isinstance(attrs, Mapping):
+        attrs_text = " ".join(
+            str(value)
+            for value in attrs.values()
+            if isinstance(value, (str, int, float))
+        ).lower()
+        tag_values = attrs.get("tags")
+        if isinstance(tag_values, list):
+            attrs_text += " " + " ".join(str(tag).lower() for tag in tag_values)
+    title_text = str(product.get("title") or product.get("raw_title") or "").lower()
+    combined = f"{title_text} {attrs_text}"
+    if any(token in combined for token in ("collagen", "vitamin c", "niacin")):
+        return "beauty supplement"
+    if any(token in combined for token in ("supplement", "gummy", "gummies")):
+        return "supplement"
+    return ""
 
 
 def _noisy_prompt_category(value: str) -> bool:
@@ -4282,6 +4299,9 @@ def _unbranded_category_specs(
     topics: List[str],
     bullets: List[str],
 ) -> List[Tuple[str, str]]:
+    category = _clean_prompt_term(category)
+    if not category or category in {"product", "products", "item", "items"}:
+        return []
     specs: List[Tuple[str, str]] = [
         (f"best {category}", "category"),
         (f"what is the best {category}", "category"),
@@ -4361,12 +4381,12 @@ def _build_per_sku_base_query_specs(
     product_type = (
         product.get("product_type")
         or product.get("category")
-        or "product"
+        or ""
     )
     attribute_graph = build_sku_attribute_graph(product)
     unbranded_category = _category_for_unbranded_prompts(
         product,
-        str(product_type or "product"),
+        str(product_type or ""),
         attribute_graph,
     )
     enrichment = (
@@ -4412,7 +4432,7 @@ def _build_per_sku_base_query_specs(
         ])
 
     specs = _dedupe_query_specs(specs)
-    return specs, title, str(product_type or "product")
+    return specs, title, str(product_type or unbranded_category or "product")
 
 
 def _query_tuple_records(
@@ -4992,7 +5012,7 @@ def _wedge_hero_sku_ctx(
     product_type = str(
         hero_product.get("product_type")
         or hero_product.get("category")
-        or "product"
+        or ""
     ).strip()
     attributes_raw = hero_product.get("attributes_raw")
     product = {
