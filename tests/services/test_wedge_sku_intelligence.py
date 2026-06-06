@@ -442,3 +442,126 @@ def test_sku_intelligence_headline_uses_merchant_fit_lane_priority_for_ownist_ex
     assert action["controller_strategy"] == "canonical_source_vacuum"
     assert "source of truth" in action["move"]
     assert "beat cogentsteps" not in action["move"].lower()
+
+
+def test_sku_intelligence_ownist_live_like_sparse_product_prefers_vitamin_c_lane():
+    product = {
+        "title": "Triple Shine Grape",
+        "raw_title": "Triple Shine Grape",
+        "vendor": "Ownist",
+        "brand": "Ownist",
+        "product_type": "Belight grape jelly",
+        "category": "Belight grape jelly",
+        "canonical_url": "https://ownist.com/products/triple-shine-1-box",
+        "attributes_raw": {},
+    }
+    product_evidence = build_lane_product_evidence(
+        product=product,
+        sku_ctx={"product": product},
+        attribute_graph=bd.build_sku_attribute_graph(product),
+        sku_title="Triple Shine Grape",
+    )
+    base = {
+        "axis": "sidewalk",
+        "query_class": "sidewalk",
+        "demand_signal": 1.0,
+    }
+    opportunity = {
+        "per_prompt": [
+            {
+                **base,
+                "query": "healthy snacks collagen jelly",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "opportunity_score": 13.87,
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "cogentsteps.net", "times_cited": 1},
+                        {"host": "medsysgroup.com", "times_cited": 1},
+                        {"host": "hellokoop.com", "times_cited": 1},
+                    ]
+                },
+            },
+            {
+                **base,
+                "query": "anti age collagen jelly",
+                "ownership_state": "publisher-owned",
+                "source_route": "publisher",
+                "opportunity_score": 13.68,
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "ubuy.mq", "times_cited": 1},
+                        {"host": "genomicsworkshop.isr.umich.edu", "times_cited": 1},
+                        {"host": "shop.tiktok.com", "times_cited": 1},
+                    ]
+                },
+            },
+            {
+                **base,
+                "query": "healthy skin collagen jelly",
+                "ownership_state": "publisher-owned",
+                "source_route": "publisher",
+                "opportunity_score": 13.63,
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "ubuy.mq", "times_cited": 1},
+                        {"host": "truehuebeauty.com", "times_cited": 1},
+                        {"host": "dodoskin.com", "times_cited": 1},
+                    ]
+                },
+            },
+            {
+                **base,
+                "query": "korean collagen jelly",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "opportunity_score": 12.74,
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "cogentsteps.net", "times_cited": 1},
+                        {"host": "medsysgroup.com", "times_cited": 1},
+                        {"host": "dodoskin.com", "times_cited": 1},
+                    ]
+                },
+            },
+            {
+                **base,
+                "query": "vitamin c collagen jelly",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "opportunity_score": 5.45,
+                "source_summary": {
+                    "top_cited_hosts": [
+                        {"host": "cogentsteps.net", "times_cited": 1},
+                        {"host": "medsysgroup.com", "times_cited": 1},
+                        {"host": "oliveyoung.com", "times_cited": 1},
+                    ]
+                },
+            },
+        ],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+        "demand_state_summary": "third-party exposure",
+        "intent_ladder": {},
+        "confidence": {"prompt_count": 5, "prompts_with_demand": 5},
+        "product_evidence": product_evidence,
+    }
+
+    out = bd._display_sku_intelligence(
+        sku_ctx={"sku_key": "ownist", "product": product},
+        opportunity=opportunity,
+    )
+    buyer_path = bd.summarize_sku_buyer_path(out)
+
+    assert out["is_empty"] is False
+    assert "vitamin c collagen jelly" in out["headline"]
+    assert "healthy snacks collagen jelly" not in out["headline"]
+    assert out["prompt_matrix"][0]["query"] == "vitamin c collagen jelly"
+    assert out["prompt_matrix"][0]["fit_penalties"] == []
+    snack = next(row for row in out["prompt_matrix"] if row["query"] == "healthy snacks collagen jelly")
+    assert "lifestyle_drift:healthy snacks" in snack["fit_penalties"]
+    assert out["next_best_action"]["evidence_used"]["source_route_prompt"]["query"] == (
+        "vitamin c collagen jelly"
+    )
+    assert buyer_path["primary_lane"] == "vitamin c collagen jelly"
+    assert buyer_path["state"] == "third_party_controlled"
