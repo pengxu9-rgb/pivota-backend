@@ -5106,23 +5106,27 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
     controller_phrase = ", ".join(controllers) if controllers else "the cited sources"
     lane = query or "this exposed lane"
     profile = build_controller_profile(
-        {"host": host, "role": row.get("source_route") or row.get("ownership_state")}
-        for host in controllers
+        {
+            "host": str(source.get("host") or "").strip(),
+            "role": row.get("source_route") or row.get("ownership_state"),
+            "times_cited": source.get("times_cited"),
+        }
+        for source in sources
+        if isinstance(source, dict) and str(source.get("host") or "").strip()
     )
     if is_canonical_source_vacuum(profile):
         move = (
-            f"Use the cited + buyable official page for {lane} as the source of truth "
-            f"and replace the weak third-party reseller trail from {controller_phrase}: "
-            "canonical SKU facts, proof, stock, authorized where-to-buy, plus first-order "
-            "offer, starter + replenishment bundle, subscription incentive, and "
-            "why-buy-direct proof."
+            f"Read {controller_phrase} as a weak citation trail for {lane}, not proven "
+            "lost buyer traffic. Make the official page citable first: exact SKU facts, "
+            "structured product data, proof, stock, and authorized where-to-buy; then "
+            "audit the reseller/source trail."
         )
         moves = [
             {
                 "type": "canonical_source_authority",
                 "operator_action": (
-                    f"Make the official page the source of truth for {lane}: exact SKU "
-                    "facts, proof, stock, returns, and authorized where-to-buy."
+                    f"Make the official page the source AI can cite for {lane}: exact SKU "
+                    "facts, structured product data, proof, stock, returns, and authorized where-to-buy."
                 ),
             },
             {
@@ -5130,22 +5134,22 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
                 "operator_action": (
                     "Audit the weak third-party trail for wrong titles, images, variants, "
                     "stock, authorization, and stale SKU facts; decide which real authorized "
-                    "retail routes deserve attention."
+                    "retail routes deserve attention and whether the citations are material."
                 ),
             },
             {
                 "type": "direct_buy_reason",
                 "operator_action": (
-                    "Add first-order offer, starter + replenishment bundle, subscription "
-                    "incentive, and why-buy-direct proof."
+                    "After the official page is source-ready, add first-order offer, starter + "
+                    "replenishment bundle, subscription incentive, and why-buy-direct proof."
                 ),
             },
         ]
     elif str(profile.get("strategy") or "") == "source_authority_gap":
         move = (
-            f"Use the cited + buyable official page for {lane} as the source of truth "
-            f"before pitching {controller_phrase}: proof, availability, images, offer "
-            "mechanics, bundle/subscription options, and why-buy-direct proof."
+            f"Use the cited + buyable official page for {lane} as the source AI can cite "
+            f"before pitching {controller_phrase}: official proof, availability, images, "
+            "and source-consistent facts."
         )
         moves = [
             {
@@ -5194,6 +5198,8 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
         "controller_strategy": profile.get("strategy"),
         "controller_strategy_label": profile.get("label"),
         "controller_profile": profile,
+        "exposure_confidence": profile.get("exposure_confidence"),
+        "exposure_read": profile.get("exposure_read"),
         "move": move,
         "canonical_page_play": {
             "lane": lane,
@@ -5201,6 +5207,8 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
             "controller_strategy": profile.get("strategy"),
             "controller_strategy_label": profile.get("label"),
             "controller_profile": profile,
+            "exposure_confidence": profile.get("exposure_confidence"),
+            "exposure_read": profile.get("exposure_read"),
             "page": "the official page",
             "economics_policy": (
                 "Mechanics only: first-order offer, starter + replenishment bundle, "
@@ -5210,8 +5218,8 @@ def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict
             ),
             "moves": moves,
             "checkout_readiness": (
-                "Make the page cited, buyable, and agent-checkout ready before trying "
-                "to redirect the cited source trail."
+                "Make the page cited, buyable, and agent-checkout ready after it is "
+                "source-ready for this lane."
             ),
         },
     }
@@ -5566,7 +5574,7 @@ def _combined_buyer_path_explanation(raw_label: str, buyer_path: Mapping[str, An
         return (
             f"{visibility_clause}, but only {merchant_owned_count}/{prompt_count} "
             f"evidenced prompt lanes are merchant-owned; {third_party_count} still "
-            f"route through third-party sources{lane_clause}. Treat this as a buyer-path "
+            f"route through third-party sources{lane_clause}. Read this as a buyer-path "
             "repair, not a finished owned-channel win."
         )
     lane_clause = (
@@ -5575,7 +5583,7 @@ def _combined_buyer_path_explanation(raw_label: str, buyer_path: Mapping[str, An
     )
     return (
         f"{visibility_clause}, but {merchant_owned_count}/{prompt_count} evidenced "
-        f"prompt lanes are merchant-owned{lane_clause}. Treat the existing exposure "
+        f"prompt lanes are merchant-owned{lane_clause}. Read the existing exposure "
         "as demand to redirect, not as a finished owned-channel win."
     )
 
@@ -10367,6 +10375,9 @@ def _render_owned_buyer_path_play_markdown(next_best_action: Optional[Mapping[st
     ][:3]
     profile = play.get("controller_profile") if isinstance(play.get("controller_profile"), Mapping) else {}
     focus = str(profile.get("operator_focus") or "").strip()
+    exposure_read = str(
+        play.get("exposure_read") or profile.get("exposure_read") or ""
+    ).strip()
     out: List[str] = ["## Owned buyer path play\n"]
     out.append(f"**Strategy:** {strategy}\n")
     if lane:
@@ -10379,6 +10390,8 @@ def _render_owned_buyer_path_play_markdown(next_best_action: Optional[Mapping[st
         )
     if focus:
         out.append(f"**Operator read:** {focus}\n")
+    if exposure_read:
+        out.append(f"**Exposure read:** {exposure_read}\n")
     wedge = next_best_action.get("sideways_wedge")
     if isinstance(wedge, Mapping):
         beachhead = wedge.get("recommended_beachhead_lane")

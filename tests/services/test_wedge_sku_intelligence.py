@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import Any, Dict, List
 
 import pytest
@@ -212,8 +214,10 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     assert head["ownership_state"] != "merchant-owned"
     assert head["buyer_path_action"]["prescription_class"] == "operational_efficiency"
     assert head["buyer_path_action"]["lane"] == "best collagen supplements for skin"
-    assert "first-order offer" in head["buyer_path_action"]["move"]
-    assert "starter + replenishment bundle" in head["buyer_path_action"]["move"]
+    assert "weak citation trail" in head["buyer_path_action"]["move"]
+    assert "structured product data" in head["buyer_path_action"]["move"]
+    assert "first-order offer" not in head["buyer_path_action"]["move"]
+    assert "starter + replenishment bundle" not in head["buyer_path_action"]["move"]
     play = head["buyer_path_action"]["canonical_page_play"]
     assert play["lane"] == "best collagen supplements for skin"
     assert play["controller_strategy"] == "canonical_source_vacuum"
@@ -222,6 +226,12 @@ async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
         "authorized_distribution_or_reseller_cleanup",
         "direct_buy_reason",
     }
+    play_blob = json.dumps(play).lower()
+    assert "after the official page is source-ready" in play_blob
+    assert "first-order offer" in play_blob
+    assert "starter + replenishment bundle" in play_blob
+    assert "exposure_read" in play_blob
+    assert "verify material traffic" in play_blob or "not proof that material buyer traffic" in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "agent-checkout ready" in play["checkout_readiness"]
     assert out["coverage"]["prompt_count"] == 4
@@ -465,7 +475,10 @@ def test_sku_intelligence_headline_uses_merchant_fit_lane_priority_for_ownist_ex
     assert out["prompt_matrix"][0]["query"] == "vitamin c collagen jelly"
     action = out["prompt_matrix"][0]["buyer_path_action"]
     assert action["controller_strategy"] == "canonical_source_vacuum"
-    assert "source of truth" in action["move"]
+    assert "weak citation trail" in action["move"]
+    assert "structured product data" in action["move"]
+    assert "first-order offer" not in action["move"]
+    assert "not proof that material buyer traffic" in json.dumps(action).lower()
     assert "beat cogentsteps" not in action["move"].lower()
 
 

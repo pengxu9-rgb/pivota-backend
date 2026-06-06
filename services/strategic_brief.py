@@ -68,14 +68,16 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
 - MERCHANT PATH: respect product.merchant_path. If archetype is "brand", the commercial goal is to drive
   buyers to the brand's own website. If archetype is "channel", the commercial goal is to drive buyers to the
   channel's own website. Do not blur those paths.
-- OPERATIONAL ECONOMICS: when buyer_path_opportunities exist, include concrete merchant-owned moves tied to
-  those exact lanes: first-order offer, starter + replenishment bundle, subscription incentive, and
-  why-buy-direct proof. Do NOT invent discount depths, prices, savings percentages, review counts, retailer
-  facts, or margin claims unless they appear in EVIDENCE.
+- OPERATIONAL ECONOMICS: when buyer_path_opportunities exist, match the prescription to the controller
+  strategy. For canonical_source_vacuum or source_authority_gap, lead with authority/citability/source-trail
+  repair first; first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct
+  proof are downstream once the official page is source-ready. For leading retailer/marketplace competition,
+  include those direct-buy mechanics as the click-winning play. Do NOT invent discount depths, prices, savings
+  percentages, review counts, retailer facts, or margin claims unless they appear in EVIDENCE.
 - LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
   singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
   — just don't present it as the searched lane.)
-- SIDEWAYS DEMAND: if sideways_wedge.recommended_beachhead_lane exists, treat that lane as the first
+- SIDEWAYS DEMAND: if sideways_wedge.recommended_beachhead_lane exists, frame that lane as the first
   beachhead before broad/high-pressure prompts. Explain which broad or weak-fit lanes to not chase yet, using
   only sideways_wedge.head_prompt_pressure and sideways_wedge.do_not_chase_yet.
 - FACT vs INFERENCE: only "AI's answers show…/EVIDENCE shows…" statements are facts. Everything else is your
@@ -108,9 +110,10 @@ WRITE the brief as JSON with these fields — each must be specific to THIS prod
   the named substitute), else null.
 - first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
   strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so AI has your
-  answer to cite for the lane you're claiming"). When EVIDENCE shows retailer/marketplace/publisher-controlled
-  exposure, at least one first move must name the exact lane and the operational reason to buy from the
-  merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
+  answer to cite for the lane you're claiming"). When EVIDENCE shows weak reseller/source-route exposure, at
+  least one first move must name the exact lane and source-authority repair. When EVIDENCE shows credible
+  retailer/marketplace competition, at least one first move must name the exact lane and the operational reason
+  to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
 
@@ -829,6 +832,8 @@ def _buyer_path_opportunity(
         "controller_strategy": profile.get("strategy"),
         "controller_strategy_label": profile.get("label"),
         "controller_profile": profile,
+        "exposure_confidence": profile.get("exposure_confidence"),
+        "exposure_read": profile.get("exposure_read"),
         "destination": _clean_str(merchant_path.get("destination")),
         "merchant_archetype": _clean_str(merchant_path.get("archetype")),
         "recommended_moves": _buyer_path_moves(merchant_path, profile),
@@ -845,7 +850,11 @@ def _buyer_path_controllers(row: Mapping[str, Any]) -> List[Dict[str, str]]:
             continue
         host = _normalize_host(source.get("host"))
         if host:
-            summarized.append({"host": host, "role": route})
+            summarized.append({
+                "host": host,
+                "role": route,
+                "times_cited": source.get("times_cited"),
+            })
     if summarized:
         return _unique_host_roles(summarized)[:3]
     return _unique_host_roles(_source_role_chips(row))[:3]
@@ -859,10 +868,11 @@ def _buyer_path_moves(
     profile = _as_mapping(controller_profile)
     if is_canonical_source_vacuum(profile):
         return [
-            f"Make {page} the official source of truth for this lane before treating it as a retailer value fight.",
-            "Audit the weak third-party reseller trail for wrong SKU facts, stock, authorization, and stale listings.",
+            f"Make {page} the official source AI can cite for this lane before framing it as a retailer value fight.",
+            "Publish exact product naming, structured product data, proof, stock, and authorized where-to-buy.",
+            "Audit the weak third-party reseller trail for wrong SKU facts, stock, authorization, and stale listings; verify materiality before calling it lost traffic.",
             "Decide which real authorized retail or marketplace routes deserve attention.",
-            "Add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof on the official page.",
+            "After the official page is source-ready, add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof.",
             "Keep exact offer economics mechanics-only until audited promo or margin evidence exists.",
         ]
     if _clean_str(profile.get("strategy")) == "source_authority_gap":
@@ -1017,8 +1027,8 @@ def _substitution_source_roles(opportunity: Mapping[str, Any]) -> List[Dict[str,
     return _unique_host_roles(rows)
 
 
-def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:
-    chips: List[Dict[str, str]] = []
+def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    chips: List[Dict[str, Any]] = []
     for source in _as_list(row.get("source_roles")):
         if not isinstance(source, Mapping):
             continue
@@ -1026,7 +1036,10 @@ def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:
         if not host:
             continue
         role = _clean_str(source.get("role")) or "unclassified"
-        chips.append({"host": host, "role": role})
+        chip: Dict[str, Any] = {"host": host, "role": role}
+        if source.get("times_cited") is not None:
+            chip["times_cited"] = source.get("times_cited")
+        chips.append(chip)
     if chips:
         return chips
 
@@ -1036,12 +1049,15 @@ def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:
             continue
         host = _normalize_host(source.get("host"))
         if host:
-            chips.append({"host": host, "role": "unclassified"})
+            chip = {"host": host, "role": "unclassified"}
+            if source.get("times_cited") is not None:
+                chip["times_cited"] = source.get("times_cited")
+            chips.append(chip)
     return chips
 
 
-def _unique_host_roles(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
+def _unique_host_roles(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, str]] = set()
     for row in rows:
         host = _normalize_host(row.get("host"))
@@ -1052,7 +1068,10 @@ def _unique_host_roles(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, str]
         if key in seen:
             continue
         seen.add(key)
-        out.append({"host": host, "role": role})
+        item: Dict[str, Any] = {"host": host, "role": role}
+        if row.get("times_cited") is not None:
+            item["times_cited"] = row.get("times_cited")
+        out.append(item)
     return out
 
 
@@ -1152,9 +1171,9 @@ def _deterministic_traffic_how(
     )
     if is_canonical_source_vacuum(profile):
         return (
-            f"Make {page_label} the official source of truth first, audit the weak "
-            "third-party reseller trail, then add offer, bundle, subscription, and "
-            "why-buy-direct proof."
+            f"Make {page_label} the official source AI can cite first, audit the weak "
+            "third-party reseller trail, verify materiality, then add offer, bundle, "
+            "subscription, and why-buy-direct proof after the page is source-ready."
         )
     if _clean_str(profile.get("strategy")) == "source_authority_gap":
         return (
@@ -1223,16 +1242,17 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
     if vacuum_strategy:
         first_moves = [
             (
-                f"Make {page_label} the official source of truth for {query}: exact "
-                "SKU facts, proof, stock, returns, and authorized where-to-buy."
+                f"Make {page_label} the official source AI can cite for {query}: exact "
+                "SKU facts, structured product data, proof, stock, returns, and authorized where-to-buy."
             ),
             (
                 f"Audit {controller_phrase} for wrong titles, images, variants, stock, "
-                "authorization, and stale facts before treating this as a retailer value fight."
+                "authorization, and stale facts; verify whether this citation trail is material "
+                "before framing it as a retailer value fight."
             ),
             (
-                "Add first-order offer, starter + replenishment bundle, subscription "
-                "incentive, and why-buy-direct proof once the official page is source-ready."
+                "After the official page is source-ready, add first-order offer, starter + replenishment bundle, "
+                "subscription incentive, and why-buy-direct proof."
             ),
         ]
     elif source_authority_strategy:
@@ -1274,25 +1294,26 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
 
     if vacuum_strategy:
         position = (
-            f"{title} has real demand in AI answers, but AI is filling the buying path "
-            f"with {controller_phrase}, not {destination}."
+            f"{title} has AI answer exposure for {query}, but the grounded source trail leans on "
+            f"{controller_phrase}, not {destination}."
         )
         core_decision = (
-            f"Fix the official-source gap for {query} first; appearing in AI answers "
-            "is not the win while third-party hosts define where buyers go."
+            f"Fix the official-source gap for {query} and verify materiality first; do not frame "
+            "obscure cited hosts as a conversion fight before the official page is the citable source."
         )
         why_you_lose = (
-            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
-            f"{destination} is not yet the strongest official source for this lane."
+            f"AI's answers show {controller_phrase} shaping the citation trail for {query}. "
+            f"That suggests {destination} is not yet the strongest official source for this lane."
         )
         traffic_how_default = (
-            f"Make {page_label} the official source of truth first, audit the weak "
-            "third-party reseller trail, then add offer, bundle, subscription, and "
-            "why-buy-direct proof."
+            f"Make {page_label} the official source AI can cite first, audit the weak "
+            "third-party reseller trail, verify materiality, then add offer, bundle, "
+            "subscription, and why-buy-direct proof after the page is source-ready."
         )
         self_serve = [
-            "Publish official SKU facts, proof, stock, returns, and authorized where-to-buy.",
-            "Audit weak third-party reseller listings and add the direct-buy mechanics.",
+            "Publish official SKU facts, structured product data, proof, stock, returns, and authorized where-to-buy.",
+            "Audit weak third-party reseller listings and verify whether those citations are material.",
+            "Add direct-buy mechanics after the official page is source-ready.",
         ]
     elif source_authority_strategy:
         position = (

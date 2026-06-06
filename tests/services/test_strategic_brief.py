@@ -595,8 +595,11 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
         {"host": "hellokoop.com", "role": "retailer"},
     ]
     assert opportunities[0]["controller_strategy"] == "canonical_source_vacuum"
-    assert "official source of truth" in opportunities[0]["recommended_moves"][0]
-    assert "weak third-party reseller trail" in opportunities[0]["recommended_moves"][1]
+    assert "official source AI can cite" in opportunities[0]["recommended_moves"][0]
+    assert "structured product data" in opportunities[0]["recommended_moves"][1]
+    assert "weak third-party reseller trail" in opportunities[0]["recommended_moves"][2]
+    assert "verify materiality" in opportunities[0]["recommended_moves"][2]
+    assert "After the official page is source-ready" in opportunities[0]["recommended_moves"][4]
     assert len(opportunities[0]["controlled_by"]) == 3
     wedge = evidence["sideways_wedge"]
     assert wedge["recommended_beachhead_lane"]["query"] == "vitamin c collagen jelly"
@@ -678,7 +681,7 @@ def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacu
                 "label": "Canonical-source vacuum",
             },
             "recommended_moves": [
-                "Make the official brand PDP the official source of truth for this lane before treating it as a retailer value fight.",
+                    "Make the official brand PDP the official source AI can cite for this lane before framing it as a retailer value fight.",
                 "Audit the weak third-party reseller trail for wrong SKU facts, stock, authorization, and stale listings.",
                 "Add first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof on the official page.",
             ],
@@ -689,13 +692,16 @@ def test_deterministic_brief_branches_obscure_resellers_to_canonical_source_vacu
     blob = json.dumps(brief).lower()
 
     assert brief is not None
-    assert "official source of truth" in blob
+    assert "official source ai can cite" in blob
     assert "weak third-party reseller trail" in blob
+    assert "verify materiality" in blob
+    assert "citable source" in blob
     assert "canonical-source gap" not in blob
     assert "beat cogentsteps" not in blob
     assert "first-order offer" in blob
     assert "starter + replenishment bundle" in blob
     assert "why-buy-direct" in blob
+    assert "obscure cited hosts as a conversion fight" in blob
     assert "%" not in blob and "$" not in blob
     assert strategic_brief.validate_grounding(brief, evidence) is True
 

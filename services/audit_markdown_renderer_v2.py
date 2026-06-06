@@ -381,6 +381,9 @@ def _render_owned_buyer_path_play(next_best_action: Optional[Dict[str, Any]]) ->
     ][:3]
     profile = play.get("controller_profile") if isinstance(play.get("controller_profile"), dict) else {}
     focus = (profile.get("operator_focus") or "").strip()
+    exposure_read = (
+        str(play.get("exposure_read") or profile.get("exposure_read") or "").strip()
+    )
     out: List[str] = [_section_title("Owned Buyer Path Play")]
     out.append(f"**Strategy:** {strategy}\n\n")
     if lane:
@@ -389,6 +392,8 @@ def _render_owned_buyer_path_play(next_best_action: Optional[Dict[str, Any]]) ->
         out.append(f"**Controllers evidenced:** {', '.join(f'`{h}`' for h in controllers)}\n\n")
     if focus:
         out.append(f"**Operator read:** {focus}\n\n")
+    if exposure_read:
+        out.append(f"**Exposure read:** {exposure_read}\n\n")
     wedge = next_best_action.get("sideways_wedge")
     if isinstance(wedge, dict):
         beachhead = wedge.get("recommended_beachhead_lane")

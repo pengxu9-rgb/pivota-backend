@@ -580,7 +580,7 @@ def test_sku_nba_content_gap_references_content_richness_bucket():
 
 def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
     for route, ownership, expected in [
-        ("retailer", "retailer-owned", "official source of truth"),
+        ("retailer", "retailer-owned", "official source ai can cite"),
         ("publisher", "publisher-owned", "pitch the cited source trail"),
     ]:
         opportunity = _sku_base_opportunity()
@@ -607,10 +607,21 @@ def test_sku_nba_source_route_repair_uses_retailer_and_publisher_roles():
         assert nba["primary_gap"] == PRIMARY_SKU_SOURCE_ROUTE_REPAIR
         blob = _nba_strings(nba)
         assert expected in nba["first_move"].lower()
+        if route == "retailer":
+            assert "first-order offer" not in nba["first_move"].lower()
+            assert "starter + replenishment bundle" not in nba["first_move"].lower()
         assert nba["prescription_class"] == "operational_efficiency"
         assert nba["merchant_path"]["archetype"] == "brand"
-        assert "bundle" in blob
-        assert "subscription" in blob or "buying reason" in blob
+        if route == "retailer":
+            play_blob = json.dumps(nba["canonical_page_play"]).lower()
+            assert "after the official page is source-ready" in play_blob
+            assert "first-order offer" in play_blob
+            assert "starter + replenishment bundle" in play_blob
+        else:
+            play_blob = json.dumps(nba["canonical_page_play"]).lower()
+            assert "direct_buy_reason" in play_blob
+            assert "first-order offer" in play_blob
+            assert "starter + replenishment bundle" in play_blob
         assert nba["evidence_used"]["source_route_prompt"]["source_route"] == route
         _assert_70_30(nba)
 
@@ -753,7 +764,9 @@ def test_sku_nba_bb_lab_sideways_wedge_prefers_halal_before_bed_over_head_pressu
     assert "best collagen sticks" in {item["query"] for item in wedge["do_not_chase_yet"]}
     assert "Start with \"halal collagen sticks before bed\"" in nba["why_this_first"]
     assert nba["canonical_page_play"]["controller_strategy"] == "canonical_source_vacuum"
-    assert "source of truth" in json.dumps(nba["canonical_page_play"]).lower()
+    play_blob = json.dumps(nba["canonical_page_play"]).lower()
+    assert "official source ai can cite" in play_blob
+    assert "not proof that material buyer traffic" in play_blob
     assert "%" not in _nba_strings(nba) and "$" not in _nba_strings(nba)
 
 
@@ -907,10 +920,6 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
     assert "healthy snacks collagen jelly" not in nba["first_move"]
     assert "cited + buyable" in copy
     assert "agent-checkout ready" in copy
-    assert "first-order offer" in copy
-    assert "starter + replenishment bundle" in copy
-    assert "subscription incentive" in copy
-    assert "why-buy-direct" in copy
     play = nba["canonical_page_play"]
     play_blob = json.dumps(play).lower()
     assert play["lane"] == "vitamin c collagen jelly"
@@ -921,7 +930,16 @@ def test_sku_nba_ownist_prioritizes_conversion_fit_over_healthy_snacks_drift():
         "authorized_distribution_or_reseller_cleanup",
         "direct_buy_reason",
     }
-    assert "source of truth" in play_blob
+    assert "official source ai can cite" in play_blob
+    assert "citation trail" in play_blob
+    assert "after the official page is source-ready" in play_blob
+    assert "first-order offer" in play_blob
+    assert "starter + replenishment bundle" in play_blob
+    assert "subscription incentive" in play_blob
+    assert "why-buy-direct" in play_blob
+    assert "first-order offer" not in nba["first_move"].lower()
+    assert "starter + replenishment bundle" not in nba["first_move"].lower()
+    assert "not proof that material buyer traffic" in play_blob
     assert "beat cogentsteps" not in play_blob
     assert "exact discount depths" in play["economics_policy"]
     assert "%" not in copy and "$" not in copy

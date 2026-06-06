@@ -59,6 +59,7 @@ def controller_profile(controllers: Iterable[Any]) -> Dict[str, Any]:
             "subtype": details.get("subtype"),
             "tier": details.get("tier"),
             "confidence": details.get("confidence"),
+            "times_cited": _times_cited(input_row.get("times_cited")),
         })
 
     leading = [row["host"] for row in classified if row["host"] in LEADING_RETAIL_HOSTS]
@@ -78,14 +79,21 @@ def controller_profile(controllers: Iterable[Any]) -> Dict[str, Any]:
             "Win the click against credible retail routes with a cited + buyable "
             "owned page and a concrete direct-buy reason."
         )
+        exposure_confidence = "high"
+        exposure_read = (
+            "Credible retail controllers are present, so read this as buyer-path "
+            "competition as well as citation repair."
+        )
     elif known_retail:
         strategy = "canonical_source_vacuum"
         label = "Canonical-source vacuum"
         operator_focus = (
-            "AI is filling the buyer path with weak or secondary retail sources; "
-            "make the official page the source of truth before treating this as "
-            "a retailer price/value fight."
+            "AI grounding is leaning on weak or secondary retail sources; make the "
+            "official page the citable source before framing this as a retailer "
+            "price/value fight."
         )
+        exposure_confidence = _exposure_confidence(classified)
+        exposure_read = _citation_trail_read(exposure_confidence)
     elif source_authority:
         strategy = "source_authority_gap"
         label = "Source authority gap"
@@ -93,18 +101,27 @@ def controller_profile(controllers: Iterable[Any]) -> Dict[str, Any]:
             "AI is relying on third-party sources; strengthen the official page, "
             "then work the evidenced source trail."
         )
+        exposure_confidence = _exposure_confidence(classified)
+        exposure_read = (
+            "The cited sources are evidence of authority shaping the answer, not "
+            "proof of downstream traffic."
+        )
     else:
         strategy = "canonical_source_vacuum"
         label = "Canonical-source vacuum"
         operator_focus = (
-            "AI is filling a canonical-source gap with weak third-party hosts; "
-            "claim the official source before optimizing against those hosts."
+            "AI grounding is filling a canonical-source gap with weak third-party "
+            "hosts; claim the official source before optimizing against those hosts."
         )
+        exposure_confidence = _exposure_confidence(classified)
+        exposure_read = _citation_trail_read(exposure_confidence)
 
     return {
         "strategy": strategy,
         "label": label,
         "operator_focus": operator_focus,
+        "exposure_confidence": exposure_confidence,
+        "exposure_read": exposure_read,
         "controllers": hosts[:3],
         "leading_controllers": leading[:3],
         "known_retail_controllers": known_retail[:3],
@@ -156,8 +173,8 @@ def _normalize_role(value: Any) -> str:
     return ""
 
 
-def _unique_controller_rows(values: Iterable[Any]) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
+def _unique_controller_rows(values: Iterable[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     seen = set()
     for value in values:
         host = _host_from_any(value)
@@ -168,8 +185,43 @@ def _unique_controller_rows(values: Iterable[Any]) -> List[Dict[str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        out.append({"host": host, "role": role})
+        out.append({"host": host, "role": role, "times_cited": _times_cited_from_any(value)})
     return out
+
+
+def _times_cited_from_any(value: Any) -> int:
+    if not isinstance(value, Mapping):
+        return 0
+    return _times_cited(value.get("times_cited") or value.get("count") or value.get("citations"))
+
+
+def _times_cited(value: Any) -> int:
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _exposure_confidence(classified: List[Mapping[str, Any]]) -> str:
+    if not classified:
+        return "low"
+    total = sum(_times_cited(row.get("times_cited")) for row in classified)
+    repeated = sum(1 for row in classified if _times_cited(row.get("times_cited")) >= 2)
+    if total >= 5 or repeated >= 2:
+        return "medium"
+    return "low"
+
+
+def _citation_trail_read(confidence: str) -> str:
+    if confidence == "medium":
+        return (
+            "Read this as an evidenced citation trail and canonical-source gap; "
+            "verify material traffic before framing it as lost demand."
+        )
+    return (
+        "Read this as a weak citation trail and canonical-source vacuum, not "
+        "proof that material buyer traffic is going to those hosts."
+    )
 
 
 def _unique(values: Iterable[str]) -> List[str]:

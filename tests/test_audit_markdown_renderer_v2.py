@@ -123,11 +123,19 @@ def _gruns_fixture_audit():
                         "controller_strategy_label": "Canonical-source vacuum",
                         "controller_profile": {
                             "operator_focus": (
-                                "AI is filling a canonical-source gap with weak "
+                                "AI grounding is filling a canonical-source gap with weak "
                                 "third-party hosts; claim the official source before "
                                 "optimizing against those hosts."
                             ),
+                            "exposure_read": (
+                                "Read this as a weak citation trail and canonical-source "
+                                "vacuum, not proof that material buyer traffic is going to those hosts."
+                            ),
                         },
+                        "exposure_read": (
+                            "Read this as a weak citation trail and canonical-source "
+                            "vacuum, not proof that material buyer traffic is going to those hosts."
+                        ),
                         "economics_policy": (
                             "Mechanics only: first-order offer, starter + "
                             "replenishment bundle, subscription incentive, and "
@@ -138,14 +146,14 @@ def _gruns_fixture_audit():
                                 "type": "canonical_source_authority",
                                 "operator_action": (
                                     "Make the official brand PDP the official source "
-                                    "of truth for vitamin c collagen jelly."
+                                    "AI can cite for vitamin c collagen jelly."
                                 ),
-                                "why": "AI is filling the lane with weak third-party hosts.",
+                                "why": "AI grounding is leaning on weak third-party hosts.",
                             },
                             {
                                 "type": "direct_buy_reason",
                                 "operator_action": (
-                                    "Add first-order offer, starter + replenishment "
+                                    "After the official page is source-ready, add first-order offer, starter + replenishment "
                                     "bundle, subscription incentive, and why-buy-direct proof."
                                 ),
                             },
@@ -286,7 +294,8 @@ def test_renders_owned_buyer_path_play_with_controller_strategy():
     assert "Beachhead lane: `vitamin c collagen jelly`" in md
     assert "`healthy snacks collagen jelly`" in md
     assert "Do not chase yet" in md
-    assert "official source of truth" in md
+    assert "official source AI can cite" in md
+    assert "Exposure read" in md
     assert "Economics guard" in md
     assert "beat cogentsteps" not in md.lower()
 

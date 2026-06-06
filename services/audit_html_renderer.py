@@ -558,6 +558,9 @@ def _render_owned_buyer_path_play_html(next_best_action: Optional[Dict[str, Any]
     ][:3]
     profile = play.get("controller_profile") if isinstance(play.get("controller_profile"), dict) else {}
     focus = (profile.get("operator_focus") or "").strip()
+    exposure_read = (
+        str(play.get("exposure_read") or profile.get("exposure_read") or "").strip()
+    )
 
     out: List[str] = [_h(2, "Owned Buyer Path Play")]
     out.append('<div class="summary-box no-break">\n')
@@ -569,6 +572,8 @@ def _render_owned_buyer_path_play_html(next_best_action: Optional[Dict[str, Any]
         out.append(f"<p><strong>Controllers evidenced:</strong> {controller_html}</p>\n")
     if focus:
         out.append(f"<p><strong>Operator read:</strong> {_escape(focus)}</p>\n")
+    if exposure_read:
+        out.append(f"<p><strong>Exposure read:</strong> {_escape(exposure_read)}</p>\n")
     wedge = next_best_action.get("sideways_wedge")
     if isinstance(wedge, dict):
         beachhead = wedge.get("recommended_beachhead_lane")

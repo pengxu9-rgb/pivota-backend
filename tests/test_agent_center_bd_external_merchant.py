@@ -1164,20 +1164,28 @@ def test_render_markdown_includes_owned_buyer_path_play_checklist() -> None:
             "controller_strategy": "canonical_source_vacuum",
             "controller_strategy_label": "Canonical-source vacuum",
             "controller_profile": {
-                "operator_focus": "AI is filling a canonical-source gap with weak third-party hosts.",
+                "operator_focus": "AI grounding is filling a canonical-source gap with weak third-party hosts.",
+                "exposure_read": (
+                    "Read this as a weak citation trail and canonical-source vacuum, "
+                    "not proof that material buyer traffic is going to those hosts."
+                ),
             },
+            "exposure_read": (
+                "Read this as a weak citation trail and canonical-source vacuum, "
+                "not proof that material buyer traffic is going to those hosts."
+            ),
             "moves": [
                 {
                     "type": "canonical_source_authority",
                     "operator_action": (
-                        "Make the official page the source of truth for vitamin c collagen jelly."
+                        "Make the official page the source AI can cite for vitamin c collagen jelly."
                     ),
-                    "why": "The cited route is weak third-party exposure.",
+                    "why": "The cited route is weak third-party citation evidence.",
                 },
                 {
                     "type": "direct_buy_reason",
                     "operator_action": (
-                        "Add first-order offer, starter + replenishment bundle, "
+                        "After the official page is source-ready, add first-order offer, starter + replenishment bundle, "
                         "subscription incentive, and why-buy-direct proof."
                     ),
                 },
@@ -1208,7 +1216,8 @@ def test_render_markdown_includes_owned_buyer_path_play_checklist() -> None:
     assert "Sideways demand wedge" in md
     assert "Beachhead lane: `vitamin c collagen jelly`" in md
     assert "`healthy snacks collagen jelly`" in md
-    assert "source of truth" in md
+    assert "source AI can cite" in md
+    assert "Exposure read" in md
     assert "Economics guard" in md
     assert "beat cogentsteps" not in md.lower()
 
