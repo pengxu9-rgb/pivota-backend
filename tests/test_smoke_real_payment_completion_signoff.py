@@ -141,7 +141,11 @@ def test_phase_b_status_sync_wrapper_fails_when_payment_is_not_terminal(monkeypa
                 "payment_intent_id": "pi_test_123",
                 "psp_used": "stripe",
                 "payment_intent_status": "requires_payment_method",
-                "payment_action": {"client_secret": "pi_secret_123"},
+                "payment_action": {
+                    "client_secret": "pi_secret_123",
+                    "url": "https://checkout.stripe.test/session",
+                    "type": "redirect_url",
+                },
             },
         )
         _write_json(
@@ -176,6 +180,8 @@ def test_phase_b_status_sync_wrapper_fails_when_payment_is_not_terminal(monkeypa
     assert payload["summary"]["paid_terminal_ok"] is False
     assert payload["summary"]["overall_ok"] is False
     assert payload["artifacts"]["payment_intent"]["payment_action"]["client_secret"] == "[REDACTED]"
+    assert payload["artifacts"]["payment_intent"]["payment_action"]["url"] == "[REDACTED]"
+    assert payload["artifacts"]["payment_intent"]["payment_action"]["type"] == "redirect_url"
     internal_key_index = payload["command"].index("--internal-key")
     assert payload["command"][internal_key_index + 1] == "[REDACTED]"
 
