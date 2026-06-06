@@ -80,6 +80,55 @@ jobs:
         run: |
           ./scripts/run_agent_reliability_suite.sh quick
 
+  checkout-payment-safety:
+    name: Checkout Payment Safety
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.run_shopify_discount_validation }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify release source
+        shell: bash
+        env:
+          EXPECTED_REPO_NAME: pivota-backend
+          ALLOWED_BRANCH_REGEX: "^main$"
+        run: |
+          bash scripts/verify_release_source.sh
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run checkout payment safety suite
+        run: |
+          pytest -q \
+            tests/test_agent_external_platform_checkout.py \
+            tests/test_order_routes_platform_checkout_fallback.py \
+            tests/test_agent_payment_sdk_existing_surface.py \
+            tests/test_agent_confirm_payment_contract.py \
+            tests/test_order_payment_verification.py \
+            tests/test_payment_execution_routes.py \
+            tests/test_order_routes_psp_resolution.py \
+            tests/test_psp_payment_finalizer.py \
+            tests/test_stripe_webhook_contract.py \
+            tests/test_adyen_webhook_contract.py \
+            tests/test_checkout_webhook_contract.py \
+            tests/test_stripe_idempotency_keys.py \
+            tests/test_merchant_payment_initiation_service.py \
+            tests/test_multi_psp_orchestrator_preferred_subset.py
+
   shopify-discount-dev-store:
     name: Shopify discount validation
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shopify_discount_validation }}
