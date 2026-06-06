@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -60,6 +61,51 @@ _SNAPSHOT_CACHE_METRICS: dict[str, int] = {
 
 class UnsupportedMerchantError(KeyError):
     pass
+
+
+def _coerce_readiness_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    token = str(value or "").strip().lower()
+    if token in {"1", "true", "yes", "y", "on"}:
+        return True
+    if token in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _test_psp_probe_enabled() -> bool:
+    return str(os.getenv("ALLOW_TEST_PSP_PROBE", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _test_psp_probe_merchants() -> set[str]:
+    raw = os.getenv("TEST_PSP_PROBE_MERCHANTS", "") or ""
+    return {m.strip().lower() for m in raw.split(",") if m.strip()}
+
+
+def _explicit_readiness_test_psp_probe_requested(
+    *,
+    psp_mode: Optional[str],
+    test_psp_probe: Any = None,
+) -> bool:
+    if _coerce_readiness_bool(test_psp_probe) is True:
+        return True
+    return str(psp_mode or "").strip().lower() in {"test_psp_probe", "psp_test_probe"}
+
+
+def _resolve_checkout_live_readiness_requirement(
+    *,
+    merchant_id: str,
+    psp_mode: Optional[str] = None,
+    test_psp_probe: Any = None,
+) -> bool:
+    if (
+        _explicit_readiness_test_psp_probe_requested(psp_mode=psp_mode, test_psp_probe=test_psp_probe)
+        and _test_psp_probe_enabled()
+        and str(merchant_id or "").strip().lower() in _test_psp_probe_merchants()
+    ):
+        return False
+    return True
 
 
 def _snapshot_cache_key(merchant_id: str, channel: str) -> str:
@@ -1613,6 +1659,7 @@ async def create_payment_intent_for_checkout(
     *,
     preferred_psps: Optional[List[str]] = None,
     psp_mode: Optional[str] = None,
+    test_psp_probe: bool = False,
 ) -> Dict[str, Any]:
     journal = get_default_journal()
     checkout = await journal.get_checkout_session(checkout_id)
@@ -1683,6 +1730,12 @@ async def create_payment_intent_for_checkout(
     if psp_mode:
         metadata["psp_mode"] = str(psp_mode).strip()
 
+    enforce_live_readiness = _resolve_checkout_live_readiness_requirement(
+        merchant_id=merchant_id,
+        psp_mode=psp_mode,
+        test_psp_probe=test_psp_probe,
+    )
+
     success, payment_intent, error, psp_used = await create_payment_with_failover(
         merchant_id=merchant_id,
         amount=amount,
@@ -1690,7 +1743,7 @@ async def create_payment_intent_for_checkout(
         metadata=metadata,
         preferred_psps=preferred_psps,
         canonical_psp_required=True,
-        enforce_live_readiness=True,
+        enforce_live_readiness=enforce_live_readiness,
     )
     if not success or payment_intent is None:
         raise ValueError(

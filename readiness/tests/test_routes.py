@@ -1946,6 +1946,7 @@ def test_real_merchant_payment_intent_creation_is_idempotent(monkeypatch):
     assert intent_1_json["bridged_to_paid"] is False
     assert intent_1_json["replayed"] is False
     assert create_calls[0]["preferred_psps"] == ["stripe"]
+    assert create_calls[0]["enforce_live_readiness"] is True
 
     intent_2 = client.post(
         f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/payment-intent",
@@ -1962,6 +1963,217 @@ def test_real_merchant_payment_intent_creation_is_idempotent(monkeypatch):
     payload = checkout_view.json()["checkout"]["session_payload"]
     assert payload["payment_intent_id"] == "pi_alpha_intent_1"
     assert payload["payment_intent_status"] == "requires_action"
+
+
+def test_payment_intent_route_passes_test_probe_flag(monkeypatch):
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+
+    captured = {}
+
+    class Checkout:
+        checkout_id = "rdchk_route_probe"
+        order_id = "ORD_ROUTE_PROBE"
+        status = "state_synced"
+        session_payload = {"merchant_alpha_mode": "real_merchant_alpha"}
+
+    async def fake_create_payment_intent_for_checkout(
+        merchant_id: str,
+        checkout_id: str,
+        *,
+        preferred_psps=None,
+        psp_mode=None,
+        test_psp_probe=False,
+    ):
+        captured.update(
+            {
+                "merchant_id": merchant_id,
+                "checkout_id": checkout_id,
+                "preferred_psps": preferred_psps,
+                "psp_mode": psp_mode,
+                "test_psp_probe": test_psp_probe,
+            }
+        )
+        return {
+            "checkout": Checkout(),
+            "events": [],
+            "order": {"payment_status": "awaiting_payment"},
+            "payment_intent_id": "pi_route_probe",
+            "client_secret": "cs_route_probe",
+            "psp_used": "stripe",
+            "payment_intent_status": "requires_action",
+            "payment_action": {"type": "stripe_client_secret", "client_secret": "cs_route_probe"},
+            "bridged_to_paid": False,
+            "replayed": False,
+        }
+
+    monkeypatch.setattr(
+        readiness_service,
+        "create_payment_intent_for_checkout",
+        fake_create_payment_intent_for_checkout,
+    )
+
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/rdchk_route_probe/payment-intent",
+        json={
+            "preferred_psps": ["stripe"],
+            "psp_mode": "stripe_checkout",
+            "test_psp_probe": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["payment_intent_id"] == "pi_route_probe"
+    assert captured == {
+        "merchant_id": DEFAULT_ALPHA_MERCHANT_ID,
+        "checkout_id": "rdchk_route_probe",
+        "preferred_psps": ["stripe"],
+        "psp_mode": "stripe_checkout",
+        "test_psp_probe": True,
+    }
+
+
+async def _exercise_readiness_payment_intent_probe(
+    monkeypatch,
+    *,
+    merchant_id: str,
+    allowlist: str,
+    test_psp_probe: bool,
+):
+    from adapters.psp_adapter import PaymentIntent
+    from readiness import order_sync as readiness_order_sync
+    from readiness import service as readiness_service
+
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", allowlist)
+
+    journal = InMemoryReadinessJournal()
+    readiness_order_sync._default_journal = journal
+    checkout = await journal.create_checkout_session(
+        merchant_id=merchant_id,
+        channel="ucp",
+        variant_id="431000000001",
+        quantity=1,
+        payment_mode="external",
+        session_payload={
+            "merchant_alpha_mode": "real_merchant_alpha",
+            "product_title": "Alpha Serum",
+            "price": {"amount": 29, "currency": "USD"},
+        },
+        continue_url=None,
+        idempotency_key=None,
+    )
+    await journal.update_checkout_session(checkout.checkout_id, order_id="ORD_ALPHA_PROBE")
+
+    order_state = {
+        "id": "ORD_ALPHA_PROBE",
+        "total": 29,
+        "currency": "USD",
+        "payment_status": "pending",
+        "payment_intent_id": None,
+        "client_secret": None,
+        "psp_used": None,
+    }
+    create_calls = []
+
+    async def fake_get_order(order_id: str):
+        assert order_id == "ORD_ALPHA_PROBE"
+        return dict(order_state)
+
+    async def fake_update_payment_info(order_id: str, payment_intent_id: str, client_secret: str, payment_status: str = "processing", psp_used=None):
+        assert order_id == "ORD_ALPHA_PROBE"
+        order_state["payment_intent_id"] = payment_intent_id
+        order_state["client_secret"] = client_secret
+        order_state["payment_status"] = payment_status
+        order_state["psp_used"] = psp_used
+        return True
+
+    async def fake_log_order_event(**_kwargs):
+        return None
+
+    async def fake_create_payment_with_failover(
+        *,
+        merchant_id: str,
+        amount,
+        currency: str,
+        metadata,
+        preferred_psps=None,
+        canonical_psp_required=False,
+        enforce_live_readiness=False,
+    ):
+        create_calls.append(
+            {
+                "merchant_id": merchant_id,
+                "amount": str(amount),
+                "currency": currency,
+                "metadata": metadata,
+                "preferred_psps": preferred_psps,
+                "canonical_psp_required": canonical_psp_required,
+                "enforce_live_readiness": enforce_live_readiness,
+            }
+        )
+        if enforce_live_readiness:
+            return False, None, "live readiness required", "stripe"
+        return (
+            True,
+            PaymentIntent(
+                id="pi_alpha_probe_1",
+                client_secret="cs_alpha_probe_1",
+                amount=2900,
+                currency="USD",
+                status="requires_action",
+                psp_type="stripe",
+                raw_response={},
+            ),
+            None,
+            "stripe",
+        )
+
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_payment_info", fake_update_payment_info)
+    monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(readiness_service, "create_payment_with_failover", fake_create_payment_with_failover)
+
+    result = await readiness_service.create_payment_intent_for_checkout(
+        merchant_id,
+        checkout.checkout_id,
+        preferred_psps=["stripe"],
+        psp_mode="stripe_checkout",
+        test_psp_probe=test_psp_probe,
+    )
+    return result, create_calls
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_allowlisted_test_probe_bypasses_live_readiness(monkeypatch):
+    result, create_calls = await _exercise_readiness_payment_intent_probe(
+        monkeypatch,
+        merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+        allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
+        test_psp_probe=True,
+    )
+
+    assert result["payment_intent_id"] == "pi_alpha_probe_1"
+    assert create_calls[0]["enforce_live_readiness"] is False
+    assert create_calls[0]["canonical_psp_required"] is True
+    assert create_calls[0]["preferred_psps"] == ["stripe"]
+    assert create_calls[0]["metadata"]["psp_mode"] == "stripe_checkout"
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_non_allowlisted_test_probe_fails_closed(monkeypatch):
+    with pytest.raises(ValueError) as exc:
+        await _exercise_readiness_payment_intent_probe(
+            monkeypatch,
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            allowlist="merch_other",
+            test_psp_probe=True,
+        )
+
+    detail = exc.value.args[0]
+    assert detail["code"] == "PAYMENT_FAILED"
+    assert "live readiness required" in detail["message"]
 
 
 def test_payment_status_sync_requires_existing_payment_intent(monkeypatch):
