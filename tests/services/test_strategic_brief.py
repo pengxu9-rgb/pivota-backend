@@ -864,3 +864,32 @@ async def test_attach_sku_strategic_brief_leaves_nba_unchanged_on_failure(monkey
 
     assert attached == nba
     assert "strategic_brief" not in attached
+
+
+def test_deterministic_brief_caps_overall_controller_phrase_to_top_three():
+    evidence = _evidence()
+    evidence["buyer_path_opportunities"] = [
+        {
+            "query": "vitamin c collagen jelly",
+            "controlled_by": [
+                {"host": "oliveyoung.com", "role": "retailer"},
+                {"host": "costco.com", "role": "retailer"},
+                {"host": "flyairseoul.com", "role": "publisher"},
+            ],
+        },
+        {
+            "query": "vitamin c collagen",
+            "controlled_by": [
+                {"host": "ubuy.mq", "role": "marketplace"},
+                {"host": "cogentsteps.net", "role": "publisher"},
+            ],
+        },
+    ]
+
+    brief = strategic_brief._deterministic_brief(evidence)
+
+    assert brief is not None
+    assert "oliveyoung.com, costco.com, and flyairseoul.com" in brief["position"]
+    assert "ubuy.mq" not in brief["position"]
+    assert "cogentsteps.net" not in brief["position"]
+    assert len(brief["traffic_strategy"][0]["who_controls"].split(",")) <= 3

@@ -65,6 +65,7 @@ from db.merchant_audit_runs import (
 )
 from db.merchant_onboarding import get_merchant_onboarding
 from services.agent_center_bd_report_service import (
+    apply_buyer_path_verdict_to_brand_report,
     run_brand_report,
     run_wedge_hero_sku_intelligence,
 )
@@ -1390,6 +1391,8 @@ async def _run_wedge_audit_background(
             "is_empty": True,
             "error_note": str(exc)[:500],
         }
+
+    apply_buyer_path_verdict_to_brand_report(brand_report, sku_intelligence)
 
     agg = brand_report.get("aggregate") or {}
     verdict_labels = [

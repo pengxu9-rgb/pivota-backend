@@ -5116,6 +5116,364 @@ def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+_BUYER_PATH_THIRD_PARTY_OWNERSHIP = {
+    "competitor-owned",
+    "forum-owned",
+    "marketplace-owned",
+    "publisher-owned",
+    "retailer-owned",
+}
+_BUYER_PATH_THIRD_PARTY_ROUTES = {
+    "brand",
+    "forum",
+    "marketplace",
+    "publisher",
+    "retailer",
+}
+
+
+def _buyer_path_clean_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _buyer_path_unique(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        cleaned = _buyer_path_clean_str(value).lower()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+    return out
+
+
+def _buyer_path_hosts_from_any(value: Any) -> List[str]:
+    hosts: List[str] = []
+    if isinstance(value, str):
+        normalized = normalize_host(value) or value.strip().lower()
+        if "." in normalized:
+            hosts.append(normalized)
+    elif isinstance(value, Mapping):
+        if value.get("controllers"):
+            hosts.extend(_buyer_path_hosts_from_any(value.get("controllers")))
+        evidence = value.get("evidence")
+        if isinstance(evidence, Mapping) and evidence.get("controllers"):
+            hosts.extend(_buyer_path_hosts_from_any(evidence.get("controllers")))
+        raw = value.get("host") or value.get("domain") or value.get("url")
+        if raw:
+            normalized = normalize_host(str(raw)) or str(raw).strip().lower()
+            if "." in normalized:
+                hosts.append(normalized)
+    elif isinstance(value, list):
+        for item in value:
+            hosts.extend(_buyer_path_hosts_from_any(item))
+    return _buyer_path_unique(hosts)
+
+
+def _buyer_path_row_controllers(row: Mapping[str, Any]) -> List[str]:
+    hosts: List[str] = []
+    action = row.get("buyer_path_action")
+    if isinstance(action, Mapping):
+        hosts.extend(_buyer_path_hosts_from_any(action.get("controllers")))
+    hosts.extend(_buyer_path_hosts_from_any(row.get("sources")))
+    hosts.extend(_buyer_path_hosts_from_any(row.get("who_owns")))
+    return _buyer_path_unique(hosts)[:3]
+
+
+def _buyer_path_rows(sku_intelligence: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    matrix = sku_intelligence.get("prompt_matrix")
+    if not isinstance(matrix, list):
+        return []
+    return [row for row in matrix if isinstance(row, Mapping)]
+
+
+def _buyer_path_is_merchant_owned(row: Mapping[str, Any]) -> bool:
+    return _buyer_path_clean_str(row.get("ownership_state")).lower() == "merchant-owned"
+
+
+def _buyer_path_is_third_party(row: Mapping[str, Any]) -> bool:
+    ownership = _buyer_path_clean_str(row.get("ownership_state")).lower()
+    route = _buyer_path_clean_str(row.get("source_route")).lower()
+    if ownership == "merchant-owned":
+        return False
+    return (
+        ownership in _BUYER_PATH_THIRD_PARTY_OWNERSHIP
+        or route in _BUYER_PATH_THIRD_PARTY_ROUTES
+        or bool(_buyer_path_row_controllers(row))
+    )
+
+
+def _buyer_path_prompt_count(rows: List[Mapping[str, Any]]) -> int:
+    count = 0
+    for row in rows:
+        ownership = _buyer_path_clean_str(row.get("ownership_state")).lower()
+        if ownership and ownership != "no-demand":
+            count += 1
+    return count
+
+
+def _buyer_path_primary_row(rows: List[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
+    candidates = [
+        row for row in rows
+        if _buyer_path_is_third_party(row) and _buyer_path_clean_str(row.get("query"))
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda row: (
+            -float(row.get("opportunity_score") or 0),
+            _buyer_path_clean_str(row.get("query")).lower(),
+        )
+    )
+    return candidates[0]
+
+
+def _buyer_path_fallback_controllers(next_best_action: Mapping[str, Any]) -> List[str]:
+    hosts: List[str] = []
+    evidence = next_best_action.get("evidence_used")
+    if isinstance(evidence, Mapping):
+        prompt = evidence.get("source_route_prompt")
+        if isinstance(prompt, Mapping):
+            hosts.extend(_buyer_path_hosts_from_any(prompt.get("sources")))
+    hosts.extend(_buyer_path_hosts_from_any(next_best_action.get("operator_moves")))
+    return _buyer_path_unique(hosts)[:3]
+
+
+def _buyer_path_controller_phrase(controllers: List[str]) -> str:
+    cleaned = _buyer_path_unique(controllers)[:3]
+    if not cleaned:
+        return "the cited third-party sources"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+
+
+def summarize_sku_buyer_path(sku_intelligence: Mapping[str, Any]) -> Dict[str, Any]:
+    """Summarize who controls evidenced SKU-level buyer paths.
+
+    This deliberately does not change the raw AI visibility / attribution
+    verdict. It creates the missing merchant-facing dimension: whether the
+    demand lanes are controlled by the merchant or by the cited route.
+    """
+    if not isinstance(sku_intelligence, Mapping):
+        sku_intelligence = {}
+    rows = _buyer_path_rows(sku_intelligence)
+    prompt_count = _buyer_path_prompt_count(rows)
+    if prompt_count <= 0:
+        return {
+            "state": "not_measured",
+            "label_display": "Buyer path not measured",
+            "explanation": "SKU-level buyer-path ownership was not measured for this report.",
+            "prompt_count": 0,
+            "merchant_owned_count": 0,
+            "third_party_controlled_count": 0,
+            "primary_lane": None,
+            "top_controllers": [],
+        }
+
+    merchant_owned_count = sum(1 for row in rows if _buyer_path_is_merchant_owned(row))
+    third_party_rows = [row for row in rows if _buyer_path_is_third_party(row)]
+    third_party_controlled_count = len(third_party_rows)
+    primary_row = _buyer_path_primary_row(rows)
+    primary_lane = (
+        _buyer_path_clean_str(primary_row.get("query")) if primary_row else None
+    )
+    controllers: List[str] = []
+    for row in third_party_rows:
+        controllers.extend(_buyer_path_row_controllers(row))
+    next_best_action = sku_intelligence.get("next_best_action")
+    if not controllers and isinstance(next_best_action, Mapping):
+        controllers.extend(_buyer_path_fallback_controllers(next_best_action))
+    top_controllers = _buyer_path_unique(controllers)[:3]
+    controller_phrase = _buyer_path_controller_phrase(top_controllers)
+
+    if merchant_owned_count > prompt_count / 2:
+        state = "merchant_controlled"
+        label = "Merchant-owned buyer path"
+        explanation = (
+            f"{merchant_owned_count}/{prompt_count} evidenced prompt lanes are "
+            "merchant-owned, so the owned path is the dominant route."
+        )
+    elif merchant_owned_count > 0 and third_party_controlled_count > 0:
+        state = "mixed"
+        label = "Mixed owned buyer path"
+        lane_clause = (
+            f"; the first exposed third-party lane is \"{primary_lane}\", "
+            f"controlled by {controller_phrase}"
+            if primary_lane else f"; third-party controllers include {controller_phrase}"
+        )
+        explanation = (
+            f"{merchant_owned_count}/{prompt_count} evidenced prompt lanes are "
+            f"merchant-owned, but {third_party_controlled_count} still route through "
+            f"third-party sources{lane_clause}."
+        )
+    elif third_party_controlled_count > 0 and top_controllers:
+        state = "third_party_controlled"
+        label = "Weak owned buyer path"
+        lane_clause = (
+            f"; the first exposed lane is \"{primary_lane}\", controlled by "
+            f"{controller_phrase}"
+            if primary_lane else f"; controllers include {controller_phrase}"
+        )
+        explanation = (
+            f"{merchant_owned_count}/{prompt_count} evidenced prompt lanes are "
+            f"merchant-owned{lane_clause}."
+        )
+    else:
+        state = "not_measured"
+        label = "Buyer path not measured"
+        explanation = (
+            "SKU-level prompts were present, but no controlled buyer path could be "
+            "classified from the evidence."
+        )
+
+    return {
+        "state": state,
+        "label_display": label,
+        "explanation": explanation,
+        "prompt_count": prompt_count,
+        "merchant_owned_count": merchant_owned_count,
+        "third_party_controlled_count": third_party_controlled_count,
+        "primary_lane": primary_lane,
+        "top_controllers": top_controllers,
+    }
+
+
+def _ai_visibility_display(label: str, label_display: str) -> str:
+    raw = _buyer_path_clean_str(label).upper()
+    if raw == VERDICT_STRONG:
+        return "Strong AI visibility"
+    if raw == VERDICT_VIA_RETAILERS:
+        return "Visible through third parties"
+    if raw == VERDICT_MISATTRIBUTED:
+        return "Visible but misattributed"
+    if raw == VERDICT_PARTIAL:
+        return "Partial AI visibility"
+    if raw == VERDICT_INVISIBLE:
+        return "Low AI visibility"
+    return label_display or label or "AI visibility"
+
+
+def _combined_buyer_path_label(raw_label: str, raw_display: str, buyer_path: Mapping[str, Any]) -> Optional[str]:
+    state = _buyer_path_clean_str(buyer_path.get("state"))
+    ai_label = _ai_visibility_display(raw_label, raw_display)
+    if state == "third_party_controlled":
+        return f"{ai_label}, weak owned buyer path"
+    if state == "mixed":
+        return f"{ai_label}, mixed owned buyer path"
+    return None
+
+
+def _combined_buyer_path_explanation(raw_label: str, buyer_path: Mapping[str, Any]) -> Optional[str]:
+    state = _buyer_path_clean_str(buyer_path.get("state"))
+    if state not in {"third_party_controlled", "mixed"}:
+        return None
+    prompt_count = int(buyer_path.get("prompt_count") or 0)
+    merchant_owned_count = int(buyer_path.get("merchant_owned_count") or 0)
+    third_party_count = int(buyer_path.get("third_party_controlled_count") or 0)
+    lane = _buyer_path_clean_str(buyer_path.get("primary_lane"))
+    controllers = _buyer_path_hosts_from_any(buyer_path.get("top_controllers"))
+    controller_phrase = _buyer_path_controller_phrase(controllers)
+    visibility_clause = (
+        "AI answer visibility is strong"
+        if _buyer_path_clean_str(raw_label).upper() == VERDICT_STRONG
+        else "AI answer visibility exists"
+    )
+    if state == "mixed":
+        lane_clause = (
+            f"; the first exposed third-party lane is \"{lane}\", controlled by "
+            f"{controller_phrase}"
+            if lane else f"; third-party controllers include {controller_phrase}"
+        )
+        return (
+            f"{visibility_clause}, but only {merchant_owned_count}/{prompt_count} "
+            f"evidenced prompt lanes are merchant-owned; {third_party_count} still "
+            f"route through third-party sources{lane_clause}. Treat this as a buyer-path "
+            "repair, not a finished owned-channel win."
+        )
+    lane_clause = (
+        f"; the first exposed lane is \"{lane}\", controlled by {controller_phrase}"
+        if lane else f"; controllers include {controller_phrase}"
+    )
+    return (
+        f"{visibility_clause}, but {merchant_owned_count}/{prompt_count} evidenced "
+        f"prompt lanes are merchant-owned{lane_clause}. Treat the existing exposure "
+        "as demand to redirect, not as a finished owned-channel win."
+    )
+
+
+def _enrich_verdict_with_buyer_path(verdict: Dict[str, Any], buyer_path: Mapping[str, Any]) -> None:
+    raw_label = _buyer_path_clean_str(verdict.get("label"))
+    raw_display = _buyer_path_clean_str(verdict.get("label_display")) or _verdict_display_label(raw_label)
+    raw_explanation = _buyer_path_clean_str(verdict.get("explanation"))
+    verdict.setdefault("ai_attribution_label", raw_label)
+    verdict.setdefault("ai_attribution_label_display", raw_display)
+    verdict.setdefault("ai_attribution_explanation", raw_explanation)
+    verdict["buyer_path_verdict"] = dict(buyer_path)
+    combined_label = _combined_buyer_path_label(raw_label, raw_display, buyer_path)
+    combined_explanation = _combined_buyer_path_explanation(raw_label, buyer_path)
+    if combined_label and combined_explanation:
+        verdict["label_display"] = combined_label
+        verdict["explanation"] = combined_explanation
+
+
+def apply_buyer_path_verdict_to_brand_report(
+    brand_report: Dict[str, Any],
+    sku_intelligence: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Attach owned-buyer-path verdicts without changing raw verdict enums."""
+    if not isinstance(brand_report, dict):
+        return brand_report
+    buyer_path = summarize_sku_buyer_path(sku_intelligence)
+    per_product = [
+        product for product in (brand_report.get("per_product") or [])
+        if isinstance(product, dict)
+    ]
+    if per_product and isinstance(per_product[0].get("verdict"), dict):
+        _enrich_verdict_with_buyer_path(per_product[0]["verdict"], buyer_path)
+        combined_display = per_product[0]["verdict"].get("label_display")
+        combined_explanation = per_product[0]["verdict"].get("explanation")
+        executive_summary = per_product[0].get("executive_summary")
+        if (
+            isinstance(executive_summary, dict)
+            and buyer_path.get("state") in {"third_party_controlled", "mixed"}
+        ):
+            executive_summary["verdict_pill_text"] = (
+                combined_display
+                or executive_summary.get("verdict_pill_text")
+            )
+        merchant_view = per_product[0].get("merchant_view")
+        headline = (
+            merchant_view.get("headline")
+            if isinstance(merchant_view, dict) else None
+        )
+        if (
+            isinstance(headline, dict)
+            and buyer_path.get("state") in {"third_party_controlled", "mixed"}
+        ):
+            headline["verdict_label_display"] = combined_display
+            headline["one_liner"] = combined_explanation
+            headline["plain_summary"] = combined_explanation
+
+    aggregate = brand_report.get("aggregate")
+    if isinstance(aggregate, dict):
+        raw_label = _buyer_path_clean_str(aggregate.get("brand_verdict_label"))
+        raw_explanation = _buyer_path_clean_str(aggregate.get("brand_verdict_explanation"))
+        raw_display = _verdict_display_label(raw_label) if raw_label else raw_label
+        aggregate.setdefault("ai_attribution_label", raw_label)
+        aggregate.setdefault("ai_attribution_explanation", raw_explanation)
+        aggregate["buyer_path_verdict"] = dict(buyer_path)
+        combined_label = _combined_buyer_path_label(raw_label, raw_display, buyer_path)
+        combined_explanation = _combined_buyer_path_explanation(raw_label, buyer_path)
+        if combined_label and combined_explanation:
+            aggregate["brand_verdict_label_display"] = combined_label
+            aggregate["brand_verdict_explanation"] = combined_explanation
+        elif raw_label and not aggregate.get("brand_verdict_label_display"):
+            aggregate["brand_verdict_label_display"] = raw_display
+    return brand_report
+
+
 def _lost_head_category_for_money_shot(
     per_prompt: List[Dict[str, Any]],
     product_type: str,
@@ -9768,7 +10126,8 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
     sections.append("\n".join(bullets) + "\n")
 
     v = report["verdict"]
-    sections.append(f"## Verdict: **{v['label']}**\n")
+    verdict_display = v.get("label_display") or v.get("label")
+    sections.append(f"## Verdict: **{verdict_display}**\n")
     sections.append(v["explanation"] + "\n")
     sections.append(
         f"- **AI visibility score:** **{v['visibility_score']}/100**  "
@@ -10248,7 +10607,11 @@ def render_brand_markdown(
 
     if aggregate:
         sections.append("\n## Brand-level summary\n")
-        verdict_label = aggregate.get("brand_verdict_label") or "(unknown)"
+        verdict_label = (
+            aggregate.get("brand_verdict_label_display")
+            or aggregate.get("brand_verdict_label")
+            or "(unknown)"
+        )
         sections.append(f"**Aggregate verdict:** {verdict_label}\n")
         if aggregate.get("brand_verdict_explanation"):
             sections.append(aggregate["brand_verdict_explanation"] + "\n")

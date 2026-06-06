@@ -319,3 +319,23 @@ def test_html_renderer_substantive_output():
     html = render_brand_html_v2(_gruns_fixture_audit())
     assert len(html) > 4000  # HTML overhead vs markdown
     assert html.count("Grüns") >= 3
+
+
+def test_html_renderer_surfaces_combined_buyer_path_verdict():
+    from services.audit_html_renderer import render_brand_html_v2
+
+    audit = _gruns_fixture_audit()
+    primary = audit["per_product"][0]
+    primary["executive_summary"]["verdict_pill_text"] = (
+        "Strong AI visibility, weak owned buyer path"
+    )
+    primary["verdict"]["label"] = "STRONG"
+    primary["verdict"]["label_display"] = "Strong AI visibility, weak owned buyer path"
+    primary["verdict"]["explanation"] = (
+        "AI answer visibility is strong, but 0/2 evidenced prompt lanes are merchant-owned."
+    )
+
+    html = render_brand_html_v2(audit)
+
+    assert "Strong AI visibility, weak owned buyer path" in html
+    assert "0/2 evidenced prompt lanes are merchant-owned" in html

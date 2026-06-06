@@ -1107,7 +1107,7 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         for opportunity in opportunities[:3]
         for controller in _as_list(opportunity.get("controlled_by"))
         if isinstance(controller, Mapping)
-    )
+    )[:3]
     controller_phrase = _controller_phrase(controllers)
     attributes = _as_mapping(product.get("attributes"))
     angle_terms = _brief_angle_terms(attributes)

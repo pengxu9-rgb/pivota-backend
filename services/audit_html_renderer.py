@@ -253,6 +253,9 @@ def _render_headline_metrics_html(report: Dict[str, Any]) -> str:
     )
     out: List[str] = [_h(2, "Headline Metrics")]
     out.append(f'<p><strong>Verdict:</strong> {_escape(headline)}</p>\n')
+    explanation = (verdict.get("explanation") or "").strip()
+    if explanation:
+        out.append(f"<p>{_escape(explanation)}</p>\n")
     rows: List[str] = []
     rows.append(
         "<table><thead><tr><th>Dimension</th><th>Score</th>"

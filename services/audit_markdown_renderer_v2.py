@@ -107,6 +107,9 @@ def _render_headline_metrics(report: Dict[str, Any]) -> str:
     headline = verdict.get("label_display") or verdict.get("label") or "(unknown)"
     out: List[str] = [_section_title("Headline Metrics")]
     out.append(f"**Verdict:** {headline}\n\n")
+    explanation = (verdict.get("explanation") or "").strip()
+    if explanation:
+        out.append(explanation + "\n\n")
     rows = [
         "| Dimension | Score | Notes |",
         "|---|---|---|",

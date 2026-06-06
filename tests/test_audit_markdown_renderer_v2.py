@@ -339,3 +339,23 @@ def test_full_render_substantive_output():
     assert "Unilever" in md
     assert "gummy" in md
     assert "Search Console" in md
+
+
+def test_markdown_renderer_surfaces_combined_buyer_path_verdict():
+    from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
+
+    audit = _gruns_fixture_audit()
+    primary = audit["per_product"][0]
+    primary["executive_summary"]["verdict_pill_text"] = (
+        "Strong AI visibility, weak owned buyer path"
+    )
+    primary["verdict"]["label"] = "STRONG"
+    primary["verdict"]["label_display"] = "Strong AI visibility, weak owned buyer path"
+    primary["verdict"]["explanation"] = (
+        "AI answer visibility is strong, but 0/2 evidenced prompt lanes are merchant-owned."
+    )
+
+    md = render_brand_markdown_v2(audit)
+
+    assert "Strong AI visibility, weak owned buyer path" in md
+    assert "0/2 evidenced prompt lanes are merchant-owned" in md
