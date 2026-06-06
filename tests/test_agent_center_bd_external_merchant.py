@@ -229,8 +229,13 @@ def test_render_markdown_smoke() -> None:
 
     # Top-level structure
     assert "# AI Commerce Readiness Report — Glossier" in report
-    # Verdict picked
-    assert "VISIBLE BUT MISATTRIBUTED" in report or "INVISIBLE" in report or "PARTIAL" in report
+    # Verdict picked (rendered Title-Case in the heading now, so match case-insensitively)
+    report_upper = report.upper()
+    assert (
+        "VISIBLE BUT MISATTRIBUTED" in report_upper
+        or "INVISIBLE" in report_upper
+        or "PARTIAL" in report_upper
+    )
     # Score values appear
     assert "30/100" in report
     assert "0/100" in report
