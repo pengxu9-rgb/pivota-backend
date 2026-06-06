@@ -57,6 +57,11 @@ def _parse_args() -> argparse.Namespace:
         help="Optional psp_mode passed through to readiness payment-intent creation.",
     )
     parser.add_argument(
+        "--payment-intent-test-psp-probe",
+        action="store_true",
+        help="Explicitly request the allowlisted test PSP probe path for readiness payment-intent creation.",
+    )
+    parser.add_argument(
         "--refund",
         action="store_true",
         help="After paid-state convergence, attempt readiness refund validation.",
@@ -128,6 +133,8 @@ def _build_smoke_command(args: argparse.Namespace, run_id: str, work_dir: Path) 
             cmd.extend(["--payment-intent-preferred-psps", str(args.payment_intent_preferred_psps)])
         if args.payment_intent_psp_mode:
             cmd.extend(["--payment-intent-psp-mode", str(args.payment_intent_psp_mode)])
+        if args.payment_intent_test_psp_probe:
+            cmd.append("--payment-intent-test-psp-probe")
     if args.refund:
         cmd.append("--refund")
     return cmd

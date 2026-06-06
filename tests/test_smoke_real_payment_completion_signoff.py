@@ -24,6 +24,7 @@ def _build_args(tmp_path: Path, *, mode: str, refund: bool = False, payment_refe
         payment_psp="stripe",
         payment_intent_preferred_psps=None,
         payment_intent_psp_mode=None,
+        payment_intent_test_psp_probe=False,
         refund=refund,
         subprocess_timeout_seconds=180.0,
         run_id="20260330T000000Z",
@@ -121,6 +122,7 @@ def test_phase_b_status_sync_wrapper_fails_when_payment_is_not_terminal(monkeypa
     args = _build_args(tmp_path, mode="payment_status_sync")
 
     def _fake_run(cmd: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
+        assert "--payment-intent-test-psp-probe" not in cmd
         work_dir = Path(args.work_dir)
         _write_json(work_dir / "order_sync.json", {"checkout_id": "chk_1", "status": "state_synced", "order_id": "ORD_1", "replayed": False})
         _write_json(
@@ -176,6 +178,60 @@ def test_phase_b_status_sync_wrapper_fails_when_payment_is_not_terminal(monkeypa
     assert payload["artifacts"]["payment_intent"]["payment_action"]["client_secret"] == "[REDACTED]"
     internal_key_index = payload["command"].index("--internal-key")
     assert payload["command"][internal_key_index + 1] == "[REDACTED]"
+
+
+def test_phase_b_status_sync_wrapper_passes_test_psp_probe_flag(monkeypatch, tmp_path: Path) -> None:
+    args = _build_args(tmp_path, mode="payment_status_sync")
+    args.payment_intent_preferred_psps = "stripe"
+    args.payment_intent_psp_mode = "stripe_checkout"
+    args.payment_intent_test_psp_probe = True
+    captured_cmd = []
+
+    def _fake_run(cmd: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
+        captured_cmd.extend(cmd)
+        work_dir = Path(args.work_dir)
+        _write_json(work_dir / "order_sync.json", {"checkout_id": "chk_1", "status": "state_synced", "order_id": "ORD_1", "replayed": False})
+        _write_json(
+            work_dir / "order_sync_audit.json",
+            {
+                "checkout_id": "chk_1",
+                "order_id": "ORD_1",
+                "sync_signals": {"merchant_writeback": {"status": "ready"}},
+            },
+        )
+        _write_json(
+            work_dir / "payment_intent.json",
+            {
+                "checkout_id": "chk_1",
+                "order_id": "ORD_1",
+                "payment_intent_id": "pi_test_123",
+                "psp_used": "stripe",
+                "payment_intent_status": "requires_payment_method",
+                "payment_action": {"client_secret": "pi_secret_123"},
+            },
+        )
+        _write_json(
+            work_dir / "payment_status_sync.json",
+            {
+                "checkout_id": "chk_1",
+                "order_id": "ORD_1",
+                "payment_intent_id": "pi_test_123",
+                "payment_intent_status": "requires_payment_method",
+                "normalized_payment_status": "requires_payment_method",
+                "psp_used": "stripe",
+            },
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(module, "_parse_args", lambda: args)
+    monkeypatch.setattr(module, "_run_smoke_command", _fake_run)
+
+    exit_code = module.main()
+
+    assert exit_code == 1
+    assert "--payment-intent-test-psp-probe" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--payment-intent-preferred-psps") + 1] == "stripe"
+    assert captured_cmd[captured_cmd.index("--payment-intent-psp-mode") + 1] == "stripe_checkout"
 
 
 def test_phase_b_wrapper_reports_timeout_as_structured_failure(monkeypatch, tmp_path: Path) -> None:
