@@ -803,25 +803,18 @@ def _sku_source_route_first_move(
     query = _sku_query_phrase(prompt.get("query"))
     competitors = _phrase(_as_str_list(prompt.get("competitors")), "the named competitor")
     page = _merchant_page_label(merchant_path)
+    direct_play = (
+        f"Make {page} the better buying path for {query}: first-order offer, "
+        "starter + replenishment bundle, subscription incentive, and why-buy-direct proof"
+    )
     if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
-        return (
-            f"Make {page} the better buying path for {query}: first-order offer, "
-            "starter + replenishment bundle, subscription incentive, and why-buy-direct "
-            "proof; then fix the cited retailer/marketplace listings."
-        )
+        return f"{direct_play}; then fix the cited retailer/marketplace listings."
     if ownership == "publisher-owned" or route == "publisher":
-        return (
-            f"Publish the canonical {page} for {query} with a clear buying reason, "
-            "then pitch the cited publisher for roundup inclusion."
-        )
+        return f"{direct_play}; then pitch the cited publisher for roundup inclusion."
     if ownership == "forum-owned" or route == "forum":
-        return (
-            f"Build review/UGC proof that answers {query}, and point it back to "
-            f"{page} with the direct buying reason."
-        )
+        return f"{direct_play}; then build review/UGC proof that points back to it."
     return (
-        f"Publish comparison proof for {query} against {competitors}, then make "
-        f"{page} the better place to buy."
+        f"{direct_play}; then publish comparison proof against {competitors}."
     )
 
 

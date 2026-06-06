@@ -76,6 +76,40 @@ def test_identity_does_not_double_brand_when_title_already_branded() -> None:
     assert "where can I buy Ownist Triple Collagen Orange" in qs
 
 
+def test_unbranded_prompts_reject_noisy_fetched_product_type() -> None:
+    sku_ctx = {
+        "product": {
+            "title": "Triple Shine Grape",
+            "brand": "Ownist",
+            # Live structured data returned this as product_type; it should not
+            # turn a beauty supplement audit into mass-market grape jelly lanes.
+            "product_type": "Belight grape jelly",
+            "attributes_raw": {
+                "tags": [
+                    "collagen",
+                    "belight collagen",
+                    "vitamin c",
+                    "grape",
+                    "k-beauty",
+                    "skin radiance",
+                ],
+                "description": (
+                    "Ownist Triple Shine Grape is a K-beauty supplement with "
+                    "Belight collagen and vitamin C."
+                ),
+            },
+        },
+        "sku": {"title": "14 Servings, 2-Week Routine"},
+    }
+
+    qs = _queries(sku_ctx, 14)
+
+    assert not any("grape jelly" in q for q in qs)
+    assert not any("belight grape jelly" in q for q in qs)
+    assert "best collagen" in qs
+    assert "best collagen to buy online" in qs
+
+
 def test_falls_back_to_product_then_sku_when_no_product_title() -> None:
     # No product title -> fall back chain still yields a usable identity, never
     # crashes, and prefixes brand when available.

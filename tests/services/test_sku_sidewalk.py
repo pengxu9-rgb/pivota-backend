@@ -104,6 +104,38 @@ def test_sku_attribute_graph_uses_merchant_type_and_tags_for_multivitamin():
     assert "traceable" in classes["proof"]
 
 
+def test_sku_attribute_graph_filters_flavor_noise_from_direct_attrs():
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    product = {
+        "title": "Triple Shine Grape",
+        "vendor": "Ownist",
+        "product_type": "Belight grape jelly",
+        "attributes_raw": {
+            "tags": [
+                "collagen",
+                "belight collagen",
+                "vitamin c",
+                "grape",
+                "k-beauty",
+                "skin radiance",
+            ],
+            "description": (
+                "Ownist Triple Shine Grape is a K-beauty supplement with "
+                "Belight collagen and vitamin C."
+            ),
+        },
+    }
+
+    graph = build_sku_attribute_graph(product)
+    classes = graph["classes"]
+
+    assert "belight grape jelly" not in classes["category"]
+    assert "grape" not in classes["use_case"]
+    assert "collagen" in classes["category"]
+    assert "vitamin c" in classes["ingredient"]
+
+
 def test_sidewalk_generation_bb_lab():
     from services.sku_sidewalk import (
         build_sku_attribute_graph,

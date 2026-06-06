@@ -766,7 +766,7 @@ async def test_generate_sku_strategic_brief_returns_grounded_mocked_brief(monkey
 
 
 @pytest.mark.asyncio
-async def test_generate_sku_strategic_brief_retries_then_returns_none_for_ungrounded(monkeypatch):
+async def test_generate_sku_strategic_brief_retries_then_returns_deterministic_fallback(monkeypatch):
     monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
     monkeypatch.setattr(strategic_brief.settings, "deepseek_api_key", "sk-test")
     calls: List[Mapping[str, Any]] = []
@@ -784,12 +784,16 @@ async def test_generate_sku_strategic_brief_retries_then_returns_none_for_ungrou
 
     monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
 
-    assert await strategic_brief.generate_sku_strategic_brief(_evidence()) is None
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
+
+    assert brief is not None
+    assert strategic_brief.validate_grounding(brief, _evidence()) is True
+    assert "first-order offer" in " ".join(brief["first_moves"])
     assert len(calls) == 3
 
 
 @pytest.mark.asyncio
-async def test_generate_sku_strategic_brief_returns_none_on_synthesis_error(monkeypatch):
+async def test_generate_sku_strategic_brief_returns_fallback_on_synthesis_error(monkeypatch):
     from services.llm_synthesis import LLMSynthesisError
 
     monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
@@ -800,7 +804,10 @@ async def test_generate_sku_strategic_brief_returns_none_on_synthesis_error(monk
 
     monkeypatch.setattr(strategic_brief, "synthesize", fake_synthesize)
 
-    assert await strategic_brief.generate_sku_strategic_brief(_evidence()) is None
+    brief = await strategic_brief.generate_sku_strategic_brief(_evidence())
+
+    assert brief is not None
+    assert strategic_brief.validate_grounding(brief, _evidence()) is True
 
 
 @pytest.mark.asyncio

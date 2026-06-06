@@ -603,13 +603,13 @@ async def generate_sku_strategic_brief(
                 max_tokens=1200,
             )
         except LLMSynthesisError:
-            return None
+            return _validated_deterministic_brief(evidence)
         brief = _parse_brief_json(result.get("text"))
         if not isinstance(brief, dict) or not _has_required_shape(brief):
             continue
         if validate_grounding(brief, evidence):
             return brief
-    return None
+    return _validated_deterministic_brief(evidence)
 
 
 def validate_grounding(brief: Mapping[str, Any], evidence: Mapping[str, Any]) -> bool:
@@ -1064,6 +1064,165 @@ def _has_required_shape(brief: Mapping[str, Any]) -> bool:
     if not isinstance(diy.get("pivota"), str):
         return False
     return True
+
+
+def _validated_deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    brief = _deterministic_brief(evidence)
+    if brief and validate_grounding(brief, evidence):
+        return brief
+    return None
+
+
+def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    product = _as_mapping(evidence.get("product"))
+    title = _clean_str(product.get("title")) or "this SKU"
+    merchant_path = _as_mapping(product.get("merchant_path"))
+    page_label = _clean_str(merchant_path.get("page_label")) or "the merchant-controlled page"
+    destination = _clean_str(merchant_path.get("destination")) or "the merchant-controlled website"
+    opportunities = [
+        item for item in _as_list(evidence.get("buyer_path_opportunities"))
+        if isinstance(item, Mapping) and _clean_str(item.get("query"))
+    ]
+    if not opportunities:
+        return None
+    lead = opportunities[0]
+    query = _clean_str(lead.get("query"))
+    controllers = _unique_host_roles(
+        controller
+        for opportunity in opportunities[:3]
+        for controller in _as_list(opportunity.get("controlled_by"))
+        if isinstance(controller, Mapping)
+    )
+    controller_phrase = _controller_phrase(controllers)
+    attributes = _as_mapping(product.get("attributes"))
+    angle_terms = _brief_angle_terms(attributes)
+
+    first_moves = [
+        (
+            f"Make {page_label} the canonical cited page for {query}, then add "
+            "a first-order offer so buyers have a reason to choose the merchant path."
+        ),
+        (
+            f"Add a starter + replenishment bundle on {page_label} for {query}, "
+            "so the page has a concrete value reason beyond third-party exposure."
+        ),
+        (
+            "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
+            "loyalty, returns, stock, and fresh facts."
+        ),
+    ]
+    if controller_phrase != "the cited sources":
+        first_moves.append(
+            f"Update the source trail around {controller_phrase} only after {page_label} "
+            "has the direct buying reason."
+        )
+
+    return {
+        "position": (
+            f"{title} has real demand in AI answers, but the buying path is controlled "
+            f"by {controller_phrase}, not {destination}."
+        ),
+        "core_decision": (
+            f"Make {page_label} the better place to buy for {query}; stop treating "
+            "third-party exposure as a win until buyers have a reason to choose the "
+            "merchant-controlled page."
+        ),
+        "why_you_lose": (
+            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
+            "source and distribution authority are capturing the buyer path before "
+            f"{destination} does."
+        ),
+        "your_angle": (
+            f"Use the evidenced product angle — {angle_terms} — as the reason the "
+            "merchant-controlled page deserves to be cited and bought from."
+        ),
+        "traffic_strategy": [
+            {
+                "where": _clean_str(item.get("query")),
+                "who_controls": _controller_phrase(
+                    _unique_host_roles(
+                        controller
+                        for controller in _as_list(item.get("controlled_by"))
+                        if isinstance(controller, Mapping)
+                    )
+                ),
+                "how": (
+                    f"Make {page_label} the canonical page first, then add the "
+                    "offer, bundle, subscription, and why-buy-direct proof."
+                ),
+            }
+            for item in opportunities[:3]
+        ],
+        "substitution_play": _deterministic_substitution_play(evidence, page_label),
+        "first_moves": first_moves[:5],
+        "diy_vs_pivota": {
+            "self_serve": [
+                "Add the offer, bundle, subscription, and why-buy-direct proof.",
+                "Keep price, stock, returns, reviews, and product facts fresh.",
+            ],
+            "pivota": (
+                "Pivota makes the page cited and buyable, then monitors whether "
+                "these same lanes move toward the merchant-controlled path."
+            ),
+        },
+    }
+
+
+def _controller_phrase(controllers: List[Mapping[str, Any]]) -> str:
+    hosts = [
+        _normalize_host(controller.get("host"))
+        for controller in controllers
+        if isinstance(controller, Mapping)
+    ]
+    hosts = _unique(host for host in hosts if host)
+    if not hosts:
+        return "the cited sources"
+    if len(hosts) == 1:
+        return hosts[0]
+    return ", ".join(hosts[:-1]) + f", and {hosts[-1]}"
+
+
+def _brief_angle_terms(attributes: Mapping[str, Any]) -> str:
+    terms: List[str] = []
+    for key in ("certification", "ingredient", "format", "use_case", "category"):
+        terms.extend(_as_str_list(attributes.get(key)))
+    return _phrase_join(_unique(terms[:5]), "the evidenced product attributes")
+
+
+def _phrase_join(values: List[str], fallback: str) -> str:
+    cleaned = [value for value in values if _clean_str(value)]
+    if not cleaned:
+        return fallback
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+
+
+def _deterministic_substitution_play(
+    evidence: Mapping[str, Any],
+    page_label: str,
+) -> Optional[str]:
+    substitution = _as_mapping(evidence.get("substitution"))
+    if not substitution.get("present"):
+        return None
+    prompt = _clean_str(substitution.get("on_prompt"))
+    handed_to = _clean_str(substitution.get("handed_to"))
+    if not prompt and not handed_to:
+        return None
+    if prompt and handed_to:
+        return (
+            f"Answer {prompt} on {page_label} with a factual comparison against "
+            f"{handed_to}, then connect the comparison to the direct buying reason."
+        )
+    if prompt:
+        return (
+            f"Answer {prompt} on {page_label}, then connect the comparison to the "
+            "direct buying reason."
+        )
+    return (
+        f"Publish a factual comparison against {handed_to} on {page_label}, then "
+        "connect it to the direct buying reason."
+    )
 
 
 def _grounding_failures(

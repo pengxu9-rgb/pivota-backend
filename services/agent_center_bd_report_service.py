@@ -4249,12 +4249,30 @@ def _category_for_unbranded_prompts(
         or product.get("product_type")
         or product.get("category")
     )
-    if direct and direct not in {"product", "products", "item", "items"}:
+    if (
+        direct
+        and direct not in {"product", "products", "item", "items"}
+        and not _noisy_prompt_category(direct)
+    ):
         return direct
     for category in _graph_class_values(graph, "category"):
-        if category and category not in {"product", "products", "item", "items"}:
+        if (
+            category
+            and category not in {"product", "products", "item", "items"}
+            and not _noisy_prompt_category(category)
+        ):
             return category
     return "product"
+
+
+def _noisy_prompt_category(value: str) -> bool:
+    cleaned = _clean_prompt_term(value)
+    if not cleaned:
+        return True
+    tokens = set(re.findall(r"[a-z0-9]+", cleaned))
+    if tokens & {"glow", "grape", "jelly", "orange", "shine"}:
+        return True
+    return False
 
 
 def _unbranded_category_specs(

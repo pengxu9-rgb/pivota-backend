@@ -215,6 +215,30 @@ _DIRECT_TAG_STOPWORDS = {
     "subscribe",
     "trial",
 }
+_DIRECT_TAG_NOISE = {
+    "berry",
+    "blueberry",
+    "cherry",
+    "flavor",
+    "flavoured",
+    "flavored",
+    "garden",
+    "glow",
+    "grape",
+    "lemon",
+    "mango",
+    "orange",
+    "shine",
+    "strawberry",
+    "vanilla",
+}
+_CATEGORY_MARKETING_NOISE = {
+    "glow",
+    "grape",
+    "jelly",
+    "orange",
+    "shine",
+}
 _DIRECT_INGREDIENT_HINT_RE = re.compile(
     r"\b(?:omega|dha|epa|vitamin|b12|d3|folate|iron|magnesium|boron|calcium)\b",
     re.IGNORECASE,
@@ -506,6 +530,8 @@ def _direct_tag_class(term: str) -> Optional[str]:
     cleaned = _safe_direct_attr(term)
     if not cleaned:
         return None
+    if cleaned in _DIRECT_TAG_NOISE:
+        return None
     for _phrase, attr in _CATEGORY_TERMS:
         if cleaned == attr or _has_phrase(cleaned, attr):
             return "category"
@@ -530,7 +556,25 @@ def _direct_tag_class(term: str) -> Optional[str]:
         return "proof"
     if cleaned.endswith("vitamin") or cleaned.endswith("vitamins") or "multivitamin" in searchable:
         return "category"
+    if len(cleaned.split()) == 1:
+        return None
     return "use_case"
+
+
+def _direct_category_allowed(value: str) -> bool:
+    cleaned = _safe_direct_attr(value)
+    if not cleaned:
+        return False
+    searchable = _search_text(cleaned)
+    tokens = set(_context_tokens(cleaned))
+    if tokens & _CATEGORY_MARKETING_NOISE:
+        return False
+    if " supplement " in searchable or " vitamin " in searchable or " multivitamin " in searchable:
+        return True
+    return any(
+        cleaned == attr or _has_phrase(cleaned, attr)
+        for _phrase, attr in _CATEGORY_TERMS
+    )
 
 
 def _add_direct_merchant_attrs(
@@ -548,7 +592,11 @@ def _add_direct_merchant_attrs(
         ("product_type", attrs.get("category")),
     ):
         direct = _safe_direct_attr(value)
-        if direct and direct not in {"beauty", "wellness", "supplements"}:
+        if (
+            direct
+            and direct not in {"beauty", "wellness", "supplements"}
+            and _direct_category_allowed(direct)
+        ):
             _add_attr(classes, evidence, "category", direct, source)
 
     for tag in _tags_from_raw(attrs.get("tags") or product.get("tags")):
