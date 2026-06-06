@@ -1078,7 +1078,25 @@ def test_sku_nba_thin_coverage_returns_insufficient_data():
     )
 
     assert nba["primary_gap"] == PRIMARY_SKU_INSUFFICIENT_DATA
-    assert "won't invent" in nba["why_this_first"]
+    copy = _nba_strings(nba)
+    assert "Build the product evidence foundation" in nba["headline"]
+    assert "complete canonical PDP" in nba["first_move"]
+    assert "first-order offer" in copy
+    assert "starter + replenishment bundle" in copy
+    assert "subscription incentive" in copy
+    assert "why-buy-direct" in copy
+    assert not any(
+        bad in copy
+        for bad in (
+            "fallback",
+            "re-run",
+            "rerun",
+            "try again",
+            "not enough signal",
+            "couldn't",
+            "won't invent",
+        )
+    )
     _assert_70_30(nba)
 
 

@@ -484,29 +484,39 @@ def _sku_prescription_for_gap(
         )
 
     identity = _as_mapping(evidence.get("identity"))
-    reason = (
-        "we couldn't pin down exactly which product this is"
+    evidence_focus = (
+        "product identity"
         if bool(identity.get("unresolved"))
-        else "there wasn't enough signal this run"
+        else "validated product and prompt evidence"
     )
     return _base_payload(
         primary_gap=PRIMARY_SKU_INSUFFICIENT_DATA,
-        headline=f"We need a bit more to go on for {sku_title}.",
+        headline=f"Build the product evidence foundation for {sku_title}.",
         why_this_first=(
-            f"We won't invent a recommendation, {reason}. Tighten the product "
-            "details and we'll give you a real next move."
+            f"The next useful move is to make {sku_title}'s canonical page strong "
+            f"on {evidence_focus}, so AI has official facts and a buyable route "
+            "to cite before broader demand work starts."
         ),
-        first_move="Make sure the product details are complete, then re-run the audit.",
+        first_move=(
+            "Publish a complete canonical PDP with exact product naming, category, "
+            "variants, price/stock, images, usage, proof, shipping/returns, and "
+            "the direct-buy reason."
+        ),
         self_serve_actions=[
             (
-                "Complete the basics: title, brand, category, variants, price, "
-                "images, and a clear description."
+                "Fill the page with buyer-usable facts: who it is for, what it is, "
+                "how to use it, ingredients/materials, format, proof, price, stock, "
+                "shipping, returns, and any authorized where-to-buy path."
             ),
-            "Then re-run, so we can test it as a real product with real demand.",
+            (
+                "Add the direct-site conversion mechanics to the same page: "
+                "first-order offer, starter + replenishment bundle where relevant, "
+                "subscription incentive, and why-buy-direct proof."
+            ),
         ],
         pivota_path=first_pivota_path,
         evidence_used=evidence,
-        cta=_sku_cta("Complete the details and retest"),
+        cta=_sku_cta("Build the canonical product evidence"),
     )
 
 

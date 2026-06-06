@@ -285,8 +285,8 @@ async def test_run_wedge_hero_sku_intelligence_tri_prober_includes_chatgpt(monke
 @pytest.mark.asyncio
 async def test_run_wedge_hero_sku_intelligence_mock_upstream_is_honest(monkeypatch):
     # Per-SKU honesty parity with the brand-report mock guard: if the upstream
-    # returns fallback/mock data, do NOT fabricate a money-shot on synthetic
-    # runs — return the honest empty-state with a clear note.
+    # returns mock data, do NOT fabricate a money-shot on synthetic runs and do
+    # not expose fallback language as merchant-facing copy.
     monkeypatch.setattr(bd, "_build_per_sku_audit_query_records", _four_money_shot_records)
 
     async def fake_mock_probe(**kwargs):
@@ -312,7 +312,32 @@ async def test_run_wedge_hero_sku_intelligence_mock_upstream_is_honest(monkeypat
     assert out["is_empty"] is True
     assert out["top_open_lanes"] == []
     assert out["next_best_action"]["primary_gap"] == "insufficient_data"
-    assert "fallback data" in out.get("note", "")
+    assert out["quality_gate"] == {
+        "shareable": False,
+        "reason": "live_sku_probe_not_real",
+        "merchant_copy_allowed": False,
+    }
+    copy = " ".join(
+        [
+            out.get("headline", ""),
+            out.get("note", ""),
+            out["next_best_action"].get("headline", ""),
+            out["next_best_action"].get("why_this_first", ""),
+            out["next_best_action"].get("first_move", ""),
+        ]
+    ).lower()
+    assert "live ai evidence" in out.get("note", "").lower()
+    assert not any(
+        bad in copy
+        for bad in (
+            "fallback",
+            "try again",
+            "couldn't",
+            "re-run",
+            "rerun",
+            "not enough signal",
+        )
+    )
     # The synthetic runs must NOT produce a money-shot.
     assert "You lost" not in out["headline"]
     assert "nobody owns" not in out["headline"]

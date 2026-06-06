@@ -1176,9 +1176,9 @@ def _explain_verdict(
             return base
         return (
             "Across the queries we tested, your URL did not appear in any "
-            "grounded source. We did not gather enough additional data "
-            "in this run to characterize what was cited; re-run the "
-            "audit or check the action items for next steps."
+            "grounded source. The next step is to strengthen indexing, "
+            "canonical product evidence, and the direct-buy path using "
+            "the action items below."
         )
 
     if label == VERDICT_MISATTRIBUTED:
@@ -1241,8 +1241,8 @@ def _explain_verdict(
                 )
             else:
                 signal_phrase = (
-                    "your brand's category presence couldn't be tied to "
-                    "specific grounded sources in this run"
+                    "your brand's category presence was not tied to "
+                    "specific grounded sources in this analysis"
                 )
             base = (
                 f"Your category-visibility score is {cs}/100; your "
@@ -5726,7 +5726,7 @@ def _sku_intelligence_headline(
 ) -> str:
     top_open_lanes = opportunity.get("top_open_lanes") or []
     if not top_open_lanes:
-        # Before falling back, lead with the buyer-path EXPOSURE if the demand is
+        # Lead with the buyer-path EXPOSURE if the demand is
         # real but controlled by third-party sources/retailers (the de-inflated
         # story). "No open lane" is the wrong frame when the lanes are owned.
         exposed = _top_exposed_lane(list(opportunity.get("per_prompt") or []))
@@ -5738,15 +5738,17 @@ def _sku_intelligence_headline(
             )
         prompt_count = len(opportunity.get("per_prompt") or [])
         return (
-            f"We tested {prompt_count} buyer prompts for {title}. "
-            "No open lane stood out this run — here's how AI sees you today."
+            f"We tested {prompt_count} buyer prompts for {title}. The next move is "
+            "product-evidence depth: keep the canonical page complete, buyable, "
+            "and ready for product-specific demand."
         )
     top_open_lane = str((top_open_lanes[0] or {}).get("query") or "").strip()
     if not top_open_lane:
         prompt_count = len(opportunity.get("per_prompt") or [])
         return (
-            f"We tested {prompt_count} buyer prompts for {title}. "
-            "No open lane stood out this run — here's how AI sees you today."
+            f"We tested {prompt_count} buyer prompts for {title}. The next move is "
+            "product-evidence depth: keep the canonical page complete, buyable, "
+            "and ready for product-specific demand."
         )
     lost_head_category = _lost_head_category_for_money_shot(
         list(opportunity.get("per_prompt") or []),
@@ -5863,6 +5865,7 @@ def _empty_sku_intelligence(
     sku_ctx: Optional[Dict[str, Any]] = None,
     *,
     note: Optional[str] = None,
+    quality_gate: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Honest empty-state SKU intelligence: hero context + a clear reason, never
     a fabricated lane. Used when the per-SKU upstream is mock/unavailable."""
@@ -5888,9 +5891,7 @@ def _empty_sku_intelligence(
             "pdp_url": product.get("canonical_url") or product.get("pdp_url"),
             "vendor": product.get("vendor") or product.get("brand"),
         },
-        "headline": note or (
-            "No open lane stood out this run — here's how AI sees you today."
-        ),
+        "headline": note or "Build the product evidence foundation before chasing AI demand.",
         "intent_ladder": {},
         "top_open_lanes": [],
         "substitution_alert": {"present": False},
@@ -5902,6 +5903,8 @@ def _empty_sku_intelligence(
     }
     if note:
         out["note"] = note
+    if quality_gate:
+        out["quality_gate"] = dict(quality_gate)
     return out
 
 
@@ -5927,10 +5930,7 @@ async def run_wedge_hero_sku_intelligence(
         )
         return {
             "hero_sku": {"title": None, "pdp_url": None, "vendor": None},
-            "headline": (
-                "We tested 0 buyer prompts for this product. No open lane "
-                "stood out this run — here's how AI sees you today."
-            ),
+            "headline": "Build the product evidence foundation before chasing AI demand.",
             "intent_ladder": {},
             "top_open_lanes": [],
             "substitution_alert": {"present": False},
@@ -5965,10 +5965,12 @@ async def run_wedge_hero_sku_intelligence(
     if probe_runs and not real_runs:
         return _empty_sku_intelligence(
             sku_ctx,
-            note=(
-                "We couldn't verify this product against live AI search this "
-                "run — the upstream returned fallback data. Try again shortly."
-            ),
+            note="SKU intelligence is gated until live AI evidence is available.",
+            quality_gate={
+                "shareable": False,
+                "reason": "live_sku_probe_not_real",
+                "merchant_copy_allowed": False,
+            },
         )
 
     from services.sku_opportunity import build_sku_opportunity
@@ -11069,25 +11071,23 @@ def render_brand_markdown(
         # Failure-reason surfacing: map a sub-call's failure token to a
         # merchant-readable one-liner. When a sub-section is empty AND
         # a reason exists, the renderer shows this instead of silently
-        # omitting — so the operator knows the lookup ran and WHY it
-        # came back empty (vs. "was this even checked?").
+        # omitting — so the operator knows whether the evidence was verified.
         _failure_reasons = social.get("failure_reasons") or {}
         _FAILURE_TEXT = {
             "ungrounded": (
-                "the lookup couldn't ground its answer in a live source "
-                "(suppressed to avoid unverified numbers)"
+                "not verified in a live source; suppressed to avoid unverified numbers"
             ),
-            "parse_error": "the lookup returned an unparseable response",
-            "rate_limited": "the lookup was rate-limited — retry later",
-            "transport_error": "the lookup failed to reach the data source",
-            "no_data": "the lookup ran but found nothing for this brand",
+            "parse_error": "not verified from the returned source evidence",
+            "rate_limited": "not verified because the source check was rate-limited",
+            "transport_error": "not verified because the source check did not complete",
+            "no_data": "no live source evidence found for this brand",
         }
 
         def _failure_note(label: str, reason: Optional[str]) -> Optional[str]:
             if not reason:
                 return None
-            text = _FAILURE_TEXT.get(reason, f"unavailable ({reason})")
-            return f"_{label} unavailable — {text}._\n"
+            text = _FAILURE_TEXT.get(reason, f"not verified ({reason})")
+            return f"_{label}: {text}._\n"
 
         def _own_presence_line(platform_label: str, p: Dict[str, Any]) -> str:
             # PR-9: when the sub-call was ungrounded, every metric is
@@ -11098,8 +11098,7 @@ def render_brand_markdown(
             if p.get("grounding") == "ungrounded":
                 return (
                     f"- {platform_label}: `@{handle}` — follower / engagement "
-                    f"data not verified (the lookup couldn't ground its "
-                    f"answer in a live source). Operator to confirm manually.\n"
+                    "data not verified in live sources. Operator to confirm manually.\n"
                 )
             followers = p.get("follower_estimate") or p.get("follower_band") or "?"
             focus = p.get("content_focus") or "mixed"
@@ -11163,8 +11162,7 @@ def render_brand_markdown(
             sections.append(
                 "\n**Brand vs. competitor social benchmark:** "
                 "_(follower counts measured by the same grounded lookup "
-                "for every brand — blank = the lookup couldn't ground a "
-                "verified number)_\n"
+                "for every brand — blank = not verified in live sources)_\n"
             )
 
             def _followers(p: Optional[Dict[str, Any]]) -> str:

@@ -1774,8 +1774,8 @@ def test_via_retailers_explanation_is_pitch_free_diagnostic() -> None:
         (
             [],
             (
-                "Your brand's category presence couldn't be tied to specific "
-                "grounded sources in this run"
+                "Your brand's category presence was not tied to specific "
+                "grounded sources in this analysis"
             ),
         ),
     ],
