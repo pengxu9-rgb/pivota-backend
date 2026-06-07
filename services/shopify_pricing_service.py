@@ -8,11 +8,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncio
 import hashlib
 import httpx
+import json
 import os
 
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from utils.logger import logger
+
+
+def _log_shopify_warning(event: str, fields: Dict[str, Any]) -> None:
+    logger.warning("%s %s", event, json.dumps(fields, sort_keys=True, default=str))
 
 
 @dataclass(frozen=True)
@@ -127,9 +132,9 @@ class ShopifyPricingService:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 resp = await client.post(url, headers=headers, json=checkout_payload)
         except Exception as e:
-            logger.warning(
-                {"debug_id": debug_id, "merchant_id": merchant_id, "error": str(e)},
+            _log_shopify_warning(
                 "Shopify checkout pricing request failed",
+                {"debug_id": debug_id, "merchant_id": merchant_id, "error": str(e)},
             )
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
@@ -139,14 +144,14 @@ class ShopifyPricingService:
 
         if resp.status_code not in (200, 201):
             # Do not log response bodies here: they may include customer email/address.
-            logger.warning(
+            _log_shopify_warning(
+                "Shopify checkout pricing error response",
                 {
                     "debug_id": debug_id,
                     "merchant_id": merchant_id,
                     "status_code": resp.status_code,
                     "x_request_id": resp.headers.get("x-request-id"),
                 },
-                "Shopify checkout pricing error response",
             )
             hint = None
             if resp.status_code == 403:

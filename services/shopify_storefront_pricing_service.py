@@ -27,6 +27,14 @@ def _d(v: Any) -> Decimal:
         return Decimal("0.00")
 
 
+def _log_shopify_warning(event: str, fields: Dict[str, Any]) -> None:
+    logger.warning("%s %s", event, json.dumps(fields, sort_keys=True, default=str))
+
+
+def _log_shopify_info(event: str, fields: Dict[str, Any]) -> None:
+    logger.info("%s %s", event, json.dumps(fields, sort_keys=True, default=str))
+
+
 def _gid(kind: str, numeric_id: str) -> str:
     return f"gid://shopify/{kind}/{numeric_id}"
 
@@ -732,23 +740,23 @@ class ShopifyStorefrontPricingService:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 resp = await client.post(url, headers=headers, json=payload)
         except Exception as e:
-            logger.warning({"debug_id": debug_id, "error": str(e)}, "Shopify Admin GraphQL request failed")
+            _log_shopify_warning("Shopify Admin GraphQL request failed", {"debug_id": debug_id, "error": str(e)})
             return {}
 
         if resp.status_code >= 400:
-            logger.warning(
+            _log_shopify_warning(
+                "Shopify Admin GraphQL HTTP error",
                 {
                     "debug_id": debug_id,
                     "status_code": resp.status_code,
                     "x_request_id": resp.headers.get("x-request-id"),
                 },
-                "Shopify Admin GraphQL HTTP error",
             )
             return {}
 
         data = resp.json() or {}
         if data.get("errors"):
-            logger.warning({"debug_id": debug_id, "errors": data.get("errors")[:3]}, "Shopify Admin GraphQL errors")
+            _log_shopify_warning("Shopify Admin GraphQL errors", {"debug_id": debug_id, "errors": data.get("errors")[:3]})
             return {}
         return data.get("data") or {}
 
@@ -1330,17 +1338,17 @@ query($ids: [ID!]!) {
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 resp = await client.post(url, headers=headers, json=payload)
         except Exception as e:
-            logger.warning({"debug_id": debug_id, "error": str(e)}, "Shopify Storefront request failed")
+            _log_shopify_warning("Shopify Storefront request failed", {"debug_id": debug_id, "error": str(e)})
             raise ShopifyPricingError("SHOPIFY_PRICING_UNAVAILABLE", "Storefront request failed", debug_id)
 
         if resp.status_code >= 400:
-            logger.warning(
+            _log_shopify_warning(
+                "Shopify Storefront HTTP error",
                 {
                     "debug_id": debug_id,
                     "status_code": resp.status_code,
                     "x_request_id": resp.headers.get("x-request-id"),
                 },
-                "Shopify Storefront HTTP error",
             )
             hint = None
             if resp.status_code == 401:
@@ -1370,7 +1378,7 @@ query($ids: [ID!]!) {
                         "path": err.get("path"),
                     }
                 )
-            logger.warning({"debug_id": debug_id, "errors": safe_errors[:5]}, "Shopify Storefront GraphQL errors")
+            _log_shopify_warning("Shopify Storefront GraphQL errors", {"debug_id": debug_id, "errors": safe_errors[:5]})
             required_access: List[str] = []
             for e in safe_errors:
                 msg = str(e.get("message") or "")
@@ -1597,6 +1605,15 @@ query($ids: [ID!]!) {
                         "code": err.get("code"),
                     }
                 )
+            _log_shopify_warning(
+                "Shopify Storefront cartCreate userErrors",
+                {
+                    "debug_id": debug_id,
+                    "item_count": len(lines),
+                    "variant_ids": [str(it.get("variant_id") or "").strip() for it in items or [] if str(it.get("variant_id") or "").strip()][:5],
+                    "user_errors": safe_user_errors[:5],
+                },
+            )
             msg = (safe_user_errors[0].get("message") if safe_user_errors else None) or "cartCreate failed"
             raise ShopifyPricingError(
                 "SHOPIFY_PRICING_UNAVAILABLE",
@@ -1610,6 +1627,16 @@ query($ids: [ID!]!) {
 
         cart_id = cart.get("id") or ""
         checkout_url = cart.get("checkoutUrl") or None
+        if not cart_id:
+            _log_shopify_warning(
+                "Shopify Storefront cartCreate returned no cart",
+                {
+                    "debug_id": debug_id,
+                    "item_count": len(lines),
+                    "variant_ids": [str(it.get("variant_id") or "").strip() for it in items or [] if str(it.get("variant_id") or "").strip()][:5],
+                    "cart_keys": sorted(cart.keys())[:20] if isinstance(cart, dict) else [],
+                },
+            )
 
         parsed_discount_state = _parse_storefront_cart_discounts(
             cart=cart,
@@ -1721,9 +1748,9 @@ query($ids: [ID!]!) {
                     parsed_discount_state["discount_evidence"] = refreshed.discount_evidence
             except asyncio.TimeoutError:
                 delivery_diagnostics = {"delivery_timeout": True, "timeout_seconds": delivery_timeout_s}
-                logger.info(
-                    {"debug_id": debug_id, "timeout_seconds": delivery_timeout_s},
+                _log_shopify_info(
                     "Storefront delivery options timed out; continuing without delivery selection",
+                    {"debug_id": debug_id, "timeout_seconds": delivery_timeout_s},
                 )
             except ShopifyPricingError as e:
                 delivery_diagnostics = {
@@ -1735,9 +1762,9 @@ query($ids: [ID!]!) {
                 }
                 # Delivery address/options are best-effort; keep the quote usable even if
                 # the Storefront schema differs across shops/versions.
-                logger.info(
-                    {"debug_id": debug_id, "code": e.code, "message": e.message, "details": getattr(e, "details", {})},
+                _log_shopify_info(
                     "Storefront delivery options unavailable; continuing without delivery selection",
+                    {"debug_id": debug_id, "code": e.code, "message": e.message, "details": getattr(e, "details", {})},
                 )
 
         return StorefrontCartResult(
