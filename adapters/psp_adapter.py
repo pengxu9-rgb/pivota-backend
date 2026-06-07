@@ -4,6 +4,7 @@ PSP (Payment Service Provider) 适配器
 """
 
 import asyncio
+import hashlib
 import os
 from typing import Dict, Any, Optional, Tuple
 from decimal import Decimal
@@ -174,6 +175,21 @@ class StripeAdapter(PSPAdapter):
             return capture_method
         return None
 
+    def _resolve_create_request_options(self, metadata: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        order_id = str(metadata.get("order_id") or "").strip()
+        if order_id:
+            raw_key = f"agent_payment:{order_id}"
+        else:
+            raw_key = str(metadata.get("idempotency_key") or "").strip()
+        if not raw_key:
+            return None
+        if len(raw_key) <= 255:
+            return {"idempotency_key": raw_key}
+
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        suffix = f":sha256:{digest}"
+        return {"idempotency_key": f"{raw_key[:255 - len(suffix)]}{suffix}"}
+
     async def _resolve_payment_intent_ref(self, payment_reference: str) -> Tuple[Optional[str], Optional[str]]:
         payment_reference = str(payment_reference or "").strip()
         if not payment_reference:
@@ -213,7 +229,7 @@ class StripeAdapter(PSPAdapter):
         try:
             psp_mode = (metadata.get("psp_mode") or "").lower()
             stripe_mode = "checkout_session" if psp_mode == "stripe_checkout" else self.mode
-            request_options = None
+            request_options = self._resolve_create_request_options(metadata)
 
             # Agent / Checkout 场景：返回可跳转的支付链接
             if stripe_mode == "checkout_session":
