@@ -536,6 +536,83 @@ def test_controller_quality_strategy_uses_stable_controllers_not_one_off_tail():
     assert "oliveyoung.com" not in json.dumps(forum_surfaces["buyer_path_controllers"])
 
 
+def test_aggregate_controller_profile_stable_when_hero_lane_sources_flip():
+    """Run-to-run probe variance flips the hero lane's cited sources
+    (retailers one run, a forum the next). The SKU-level aggregate must hold the
+    same merchant-facing archetype because the SKU's other lanes are retail-
+    dominant either way. This is the credibility-killer the wave fixes."""
+    from services.buyer_path_controller_quality import aggregate_controller_profile
+
+    retail_dominant_tail = [
+        [{"host": "walmart.com", "times_cited": 5}],
+        [{"host": "walmart.com", "times_cited": 2}, {"host": "target.com", "times_cited": 2}],
+        [
+            {"host": "iherb.com", "times_cited": 2},
+            {"host": "target.com", "times_cited": 2},
+            {"host": "walmart.com", "times_cited": 2},
+        ],
+    ]
+    run_retail_hero = [
+        [{"host": "iherb.com", "times_cited": 2}, {"host": "yesstyle.com", "times_cited": 2}],
+        *retail_dominant_tail,
+    ]
+    run_forum_hero = [
+        [{"host": "reddit.com", "times_cited": 2}],
+        *retail_dominant_tail,
+    ]
+
+    profile_a = aggregate_controller_profile(run_retail_hero)
+    profile_b = aggregate_controller_profile(run_forum_hero)
+
+    assert profile_a["strategy"] == "leading_retailer_competition"
+    assert profile_b["strategy"] == profile_a["strategy"]
+    # The stable #1 controller (cited across many lanes) leads both runs.
+    assert profile_a["controllers"][0] == "walmart.com"
+    assert profile_b["controllers"][0] == "walmart.com"
+
+
+def test_aggregate_controller_profile_stable_authority_when_retail_volume_spikes():
+    """An authority-led SKU (a forum cited every run) must stay source_authority_gap
+    even when a known-retailer's citation volume spikes on one run, so the brief
+    archetype does not wobble into the canonical-vacuum/retail framing."""
+    from services.buyer_path_controller_quality import aggregate_controller_profile
+
+    run_authority_heavy = [
+        [{"host": "reddit.com", "times_cited": 5}],
+        [{"host": "goodhousekeeping.com", "times_cited": 4}],
+        [{"host": "healthline.com", "times_cited": 2}],
+        [{"host": "yesstyle.com", "times_cited": 4}],
+    ]
+    run_retail_volume_spike = [
+        [{"host": "reddit.com", "times_cited": 5}],
+        [{"host": "yesstyle.com", "times_cited": 8}],
+        [{"host": "yesstyle.com", "times_cited": 1}],
+    ]
+
+    profile_a = aggregate_controller_profile(run_authority_heavy)
+    profile_b = aggregate_controller_profile(run_retail_volume_spike)
+
+    assert profile_a["strategy"] == "source_authority_gap"
+    assert profile_b["strategy"] == "source_authority_gap"
+    assert profile_a["controllers"][0] == "reddit.com"
+    assert profile_b["controllers"][0] == "reddit.com"
+
+
+def test_aggregate_controller_profile_excludes_merchant_own_host():
+    """The merchant's own site, even if heavily cited across lanes, must never be
+    named as a buyer-path controller."""
+    from services.buyer_path_controller_quality import aggregate_controller_profile
+
+    groups = [
+        [{"host": "reddit.com", "times_cited": 5}],
+        [{"host": "bblab.shop", "times_cited": 6}],
+        [{"host": "yesstyle.com", "times_cited": 3}],
+    ]
+    profile = aggregate_controller_profile(groups, exclude_hosts=["https://bblab.shop/products/x"])
+    assert "bblab.shop" not in profile["controllers"]
+    assert profile["controllers"][0] == "reddit.com"
+
+
 def test_assemble_sku_brief_evidence_grounding_notes_use_real_evidenced_channels():
     opportunity = _opportunity()
     opportunity["per_prompt"][0]["source_roles"] = [
@@ -798,12 +875,17 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
     opportunities = evidence["buyer_path_opportunities"]
     assert opportunities[0]["query"] == "vitamin c collagen jelly"
     assert opportunities[0]["lane_priority_score"] > opportunities[1]["lane_priority_score"]
+    # The lead opportunity's controller archetype is aggregated across the SKU's
+    # lanes (not anchored to one noisy hero prompt). Publishers dominate this
+    # SKU's controllers, so the stable lead archetype is source_authority_gap
+    # (still the authority playbook) and the named controllers lead with the
+    # authority hosts.
     assert opportunities[0]["controlled_by"] == [
         {"host": "cogentsteps.net", "role": "publisher", "times_cited": 2},
-        {"host": "hellokoop.com", "role": "retailer", "times_cited": 2},
         {"host": "medsysgroup.com", "role": "publisher", "times_cited": 2},
+        {"host": "hellokoop.com", "role": "retailer", "times_cited": 2},
     ]
-    assert opportunities[0]["controller_strategy"] == "canonical_source_vacuum"
+    assert opportunities[0]["controller_strategy"] == "source_authority_gap"
     assert "rank for the exact lane vitamin c collagen jelly" in opportunities[0]["recommended_moves"][0]
     assert "product/offer/review/FAQ schema" in opportunities[0]["recommended_moves"][1]
     assert "vitamin c, collagen, and jelly in plain page text" in opportunities[0]["recommended_moves"][2]

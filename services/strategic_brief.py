@@ -18,6 +18,7 @@ from services.buyer_path_stable_controllers import (
 )
 from services.buyer_path_controller_quality import (
     controller_profile as build_controller_profile,
+    aggregate_controller_profile,
     is_canonical_source_vacuum,
 )
 from services.llm_synthesis import (
@@ -545,6 +546,7 @@ def assemble_sku_brief_evidence(
     scores: Optional[Mapping[str, Any]] = None,
     identity: Optional[Mapping[str, Any]] = None,
     sku_title: Optional[str] = None,
+    merchant_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     del primary_gaps, scores
     opportunity_map = _as_mapping(opportunity)
@@ -590,6 +592,7 @@ def assemble_sku_brief_evidence(
             opportunity=opportunity_map,
             merchant_path=merchant_path,
             product_evidence=product_evidence,
+            merchant_host=merchant_host,
         ),
         "sideways_wedge": _as_mapping(opportunity_map.get("sideways_wedge")) or build_sideways_wedge(
             _as_list(opportunity_map.get("per_prompt")),
@@ -796,6 +799,7 @@ def _buyer_path_opportunities(
     opportunity: Mapping[str, Any],
     merchant_path: Mapping[str, Any],
     product_evidence: Mapping[str, Any],
+    merchant_host: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Mapping[str, Any]] = []
     for row in _as_list(opportunity.get("per_prompt")):
@@ -813,7 +817,71 @@ def _buyer_path_opportunities(
         rows,
         product_evidence=product_evidence,
     )
-    return [_buyer_path_opportunity(row, merchant_path) for row in prioritized[:5]]
+    opportunities = [_buyer_path_opportunity(row, merchant_path) for row in prioritized[:5]]
+    if opportunities:
+        _apply_lead_aggregate_profile(opportunities, prioritized, merchant_host=merchant_host)
+    return opportunities
+
+
+def _apply_lead_aggregate_profile(
+    opportunities: List[Dict[str, Any]],
+    prioritized: List[Mapping[str, Any]],
+    *,
+    merchant_host: Optional[str] = None,
+) -> None:
+    """Stabilize the lead opportunity's controller archetype by aggregating
+    controller evidence across all qualifying lanes (same dominance rule the
+    next-best-action layer uses), so the brief framing does not flip with one
+    noisy hero prompt's cited sources."""
+
+    groups = [
+        chips
+        for row in prioritized
+        if isinstance(row, Mapping)
+        for chips in (stable_buyer_path_controllers_for_row(row),)
+        if chips
+    ]
+    if not groups:
+        return
+    lead_profile = aggregate_controller_profile(
+        groups,
+        exclude_hosts=[merchant_host] if merchant_host else None,
+    )
+    if not _as_list(lead_profile.get("classified_controllers")):
+        return
+    lead = opportunities[0]
+    lead["controller_profile"] = lead_profile
+    lead["controller_strategy"] = lead_profile.get("strategy")
+    lead["controller_strategy_label"] = lead_profile.get("label")
+    lead["exposure_read"] = lead_profile.get("exposure_read")
+    named = [host for host in _as_list(lead_profile.get("controllers")) if host]
+    if named:
+        existing = {
+            _clean_str(_as_mapping(ctrl).get("host")): _as_mapping(ctrl)
+            for ctrl in _as_list(lead.get("controlled_by"))
+        }
+        role_by_host = _aggregate_role_by_host(lead_profile)
+        lead["controlled_by"] = [
+            dict(
+                existing.get(host)
+                or {"host": host, "role": role_by_host.get(host, "third-party")}
+            )
+            for host in named[:3]
+        ]
+
+
+def _aggregate_role_by_host(profile: Mapping[str, Any]) -> Dict[str, str]:
+    role_by_host: Dict[str, str] = {}
+    for host in _as_list(profile.get("source_authority_controllers")):
+        if host:
+            role_by_host[host] = "publisher"
+    for host in _as_list(profile.get("known_retail_controllers")):
+        if host:
+            role_by_host[host] = "retailer"
+    for host in _as_list(profile.get("leading_controllers")):
+        if host:
+            role_by_host[host] = "retailer"
+    return role_by_host
 
 
 def _lane_priority_fields(row: Mapping[str, Any]) -> Dict[str, Any]:

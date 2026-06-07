@@ -227,6 +227,7 @@ async def attach_sku_strategic_brief(
     sku_title: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    merchant_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Optionally attach an evidence-grounded strategic brief.
 
@@ -249,6 +250,7 @@ async def attach_sku_strategic_brief(
             scores=scores,
             identity=identity,
             sku_title=sku_title,
+            merchant_host=merchant_host,
         )
         brief = await generate_sku_strategic_brief(
             evidence,

@@ -42,6 +42,7 @@ from services.buyer_path_stable_controllers import (
 )
 from services.buyer_path_controller_quality import (
     controller_profile as build_controller_profile,
+    aggregate_controller_profile,
     is_canonical_source_vacuum,
 )
 from services.cited_host_classifier import classify_cited_hosts, classify_host
@@ -3807,6 +3808,7 @@ async def build_per_sku_report(
         scores=scores,
         identity=identity,
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
+        merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
     )
 
     report = {
@@ -5712,9 +5714,18 @@ def _headline_join(hosts: List[str]) -> str:
     return f"{hosts[0]}, {hosts[1]} and {hosts[2]}"
 
 
-def _top_exposed_lane(per_prompt: List[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+def _top_exposed_lane(
+    per_prompt: List[Mapping[str, Any]],
+    *,
+    merchant_host: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """The highest-value lane where demand exists but a third-party source/retailer
-    controls the buyer path (the de-inflated EXPOSURE — not an open lane)."""
+    controls the buyer path (the de-inflated EXPOSURE — not an open lane).
+
+    The lane (query) comes from the top-priority row, but the named controllers
+    are aggregated across every third-party-controlled demand lane so the
+    merchant-facing headline names the SKU's stable controllers instead of one
+    noisy hero prompt's run-to-run cited sources."""
     rows = [
         row for row in per_prompt
         if is_third_party_controlled_lane(row)
@@ -5731,7 +5742,16 @@ def _top_exposed_lane(per_prompt: List[Mapping[str, Any]]) -> Optional[Dict[str,
         )
     )
     row = rows[0]
-    controllers = stable_buyer_path_controller_hosts(row)
+    groups = [
+        chips
+        for candidate in rows
+        for chips in (stable_buyer_path_controllers_for_row(candidate),)
+        if chips
+    ]
+    profile = aggregate_controller_profile(groups, exclude_hosts=[merchant_host] if merchant_host else None)
+    controllers = [host for host in profile.get("controllers") or [] if host]
+    if not controllers:
+        controllers = stable_buyer_path_controller_hosts(row)
     return {"lane": str(row.get("query") or "").strip(), "controllers": controllers}
 
 
@@ -5740,13 +5760,17 @@ def _sku_intelligence_headline(
     opportunity: Mapping[str, Any],
     title: str,
     product_type: str,
+    merchant_host: Optional[str] = None,
 ) -> str:
     top_open_lanes = opportunity.get("top_open_lanes") or []
     if not top_open_lanes:
         # Lead with the buyer-path EXPOSURE if the demand is
         # real but controlled by third-party sources/retailers (the de-inflated
         # story). "No open lane" is the wrong frame when the lanes are owned.
-        exposed = _top_exposed_lane(list(opportunity.get("per_prompt") or []))
+        exposed = _top_exposed_lane(
+            list(opportunity.get("per_prompt") or []),
+            merchant_host=merchant_host,
+        )
         if exposed and exposed["lane"] and exposed["controllers"]:
             controllers = _headline_join(exposed["controllers"])
             return (
@@ -5796,6 +5820,7 @@ def _display_sku_intelligence(
     product = _get_product(sku_ctx or {})
     title = str(product.get("title") or sku_ctx.get("sku_key") or "this product")
     product_type = str(product.get("product_type") or product.get("category") or "product")
+    merchant_host = normalize_host(product.get("canonical_url") or product.get("pdp_url"))
     per_prompt = [
         row for row in (opportunity.get("per_prompt") or [])
         if isinstance(row, dict)
@@ -5871,6 +5896,7 @@ def _display_sku_intelligence(
             opportunity=display_opportunity,
             title=title,
             product_type=product_type,
+            merchant_host=merchant_host,
         ),
         "intent_ladder": opportunity.get("intent_ladder") or {},
         "top_open_lanes": lanes,
@@ -6027,6 +6053,7 @@ async def run_wedge_hero_sku_intelligence(
             },
         },
         sku_title=title,
+        merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
     )
     return display
 
