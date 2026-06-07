@@ -89,6 +89,61 @@ def _gruns_fixture_audit():
                     },
                 ],
                 "next_best_action": {
+                    "headline": (
+                        "Win non-branded collagen discovery before optimizing "
+                        "more named-product visibility."
+                    ),
+                    "why_this_first": (
+                        "AI can find Grüns when named, but category shoppers are "
+                        "still learning from Forbes and competitor-heavy roundups."
+                    ),
+                    "first_move": (
+                        "Add category-intent comparison modules, then pitch the "
+                        "cited sources that already shape AI answers."
+                    ),
+                    "evidence_summary": (
+                        "Named visibility is 88 vs category visibility 52: "
+                        "a 36-point category gap."
+                    ),
+                    "evidence_chips": [
+                        "Visibility 88",
+                        "Attribution 70",
+                        "Category visibility 52",
+                    ],
+                    "self_serve_actions": [
+                        "Answer the failed category questions on the official PDP.",
+                        "Pitch Forbes with the specific competitor comparison angle.",
+                    ],
+                    "pivota_path": (
+                        "Pivota can turn the official PDP into a canonical, "
+                        "buyable AI-channel path and monitor whether attribution moves."
+                    ),
+                    "evidence_used": {
+                        "failed_query_examples": [
+                            {"query": "best daily greens supplements"},
+                        ],
+                        "source_hosts": [
+                            {"host": "forbes.com", "times_cited": 2},
+                        ],
+                        "competitors_named": ["AG1", "Bloom"],
+                    },
+                    "secondary_moves": [
+                        {
+                            "title": "Pitch forbes.com editorial team",
+                            "reason": "forbes.com was cited 2 times.",
+                        }
+                    ],
+                    "tracking_metrics": [
+                        "Category visibility on the failed non-branded questions.",
+                        "Competitor-only answers where the merchant is still absent.",
+                    ],
+                    "cta": {
+                        "label": "Create the owned AI buying path",
+                        "trust_note": (
+                            "You can do the content and PR work yourself; Pivota "
+                            "is for canonical serving, checkout, and monitoring."
+                        ),
+                    },
                     "canonical_page_play": {
                         "lane": "vitamin c collagen jelly",
                         "controllers": [
@@ -263,6 +318,27 @@ def test_html_renderer_emits_recommendations_with_pitch_drafts():
     assert "Recommendations" in html
     assert "Pivota Ops" in html
     assert "Search Console" in html
+
+
+def test_html_renderer_emits_next_best_action_before_recommendations():
+    from services.audit_html_renderer import render_brand_html_v2
+    html = render_brand_html_v2(_gruns_fixture_audit())
+    assert "What Should You Do Next?" in html
+    assert "Win non-branded collagen discovery" in html
+    assert "First move:" in html
+    assert "Why this is the leak" in html
+    assert "36-point category gap" in html
+    assert "Gap read" in html
+    assert "Category visibility 52" in html
+    assert "Do yourself this week" in html
+    assert "Use Pivota for" in html
+    assert "best daily greens supplements" in html
+    assert "forbes.com" in html
+    assert "AG1" in html
+    assert "How to track" in html
+    assert "Category visibility on the failed non-branded questions" in html
+    assert "Create the owned AI buying path" in html
+    assert html.find("What Should You Do Next?") < html.find("Recommendations")
 
 
 def test_html_renderer_emits_owned_buyer_path_play_with_controller_strategy():
