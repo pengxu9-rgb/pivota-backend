@@ -6,7 +6,6 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
 import asyncio
-import base64
 import hashlib
 import httpx
 import json
@@ -33,8 +32,7 @@ def _gid(kind: str, numeric_id: str) -> str:
 
 
 def _storefront_id(kind: str, numeric_id: str) -> str:
-    # Storefront GraphQL IDs are opaque (base64) strings, not raw gid://... URIs.
-    return base64.b64encode(_gid(kind, numeric_id).encode("utf-8")).decode("utf-8")
+    return _gid(kind, numeric_id)
 
 
 def _extract_storefront_token(store: Dict[str, Any]) -> Optional[str]:

@@ -564,6 +564,7 @@ async def test_cart_create_includes_delivery_address_in_cart_input(monkeypatch):
     )
 
     cart_create_variables = calls[0]["variables"]
+    assert cart_create_variables["input"]["lines"][0]["merchandiseId"] == "gid://shopify/ProductVariant/123"
     assert cart_create_variables["input"]["buyerIdentity"] == {
         "email": "buyer@example.com",
         "countryCode": "US",
