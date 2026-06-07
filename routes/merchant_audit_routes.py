@@ -730,6 +730,7 @@ async def run_merchant_self_audit(
                 max_runs=body.max_runs,
                 prior_runs=prior_runs,
                 integration_state=integration_state,
+                merchant_id=merchant_id,
             )
     except ValueError as exc:
         await record_audit_run_completed(
@@ -1343,6 +1344,10 @@ async def _run_wedge_audit_background(
     are recorded as status='failed' so the poller surfaces them cleanly."""
     from services.audit_telemetry_context import audit_telemetry
     try:
+        prior_runs = await recent_runs_for_merchant(
+            merchant_id=merchant_id, limit=5,
+        )
+        prior_runs = [r for r in prior_runs if r.get("run_id") != run_id]
         async with audit_telemetry(run_id=run_id, merchant_id=merchant_id):
             brand_report = await run_brand_report(
                 merchant_name=merchant_name,
@@ -1351,6 +1356,7 @@ async def _run_wedge_audit_background(
                 coverage_profile="pilot_gemini",
                 merchant_id=merchant_id,
                 audit_run_id=run_id,
+                prior_runs=prior_runs,
                 # Bounded concurrency + parallel scan modes still help when the
                 # upstream has spare throughput; async removes the hard ceiling.
                 product_concurrency=min(len(audit_products), 3),

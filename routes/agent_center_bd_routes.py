@@ -562,6 +562,7 @@ async def cold_start_audit(
             include_category_visibility=body.include_category_visibility,
             integration_state=cold_start_integration_state,
             prior_runs=prior_runs,
+            merchant_id=synthetic_merchant_id,
         )
     except Exception as exc:
         await record_audit_run_completed(

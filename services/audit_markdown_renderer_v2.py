@@ -492,6 +492,43 @@ def _render_next_best_action(next_best_action: Optional[Dict[str, Any]]) -> str:
     return "".join(out)
 
 
+def _render_reaudit_delta(delta: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(delta, dict):
+        return ""
+    headline = str(delta.get("headline") or "").strip()
+    if not headline:
+        return ""
+    out: List[str] = [_section_title("Since your last audit")]
+    out.append(headline + "\n\n")
+    material = [
+        movement for movement in (delta.get("movements") or [])
+        if isinstance(movement, dict) and movement.get("is_material")
+    ]
+    if material:
+        out.append("**Material movement:**\n\n")
+        for movement in material:
+            label = str(movement.get("label") or movement.get("signal") or "").strip()
+            direction = str(movement.get("direction") or "changed").strip()
+            out.append(
+                f"- {label}: {movement.get('from')} → {movement.get('to')} ({direction})\n"
+            )
+        out.append("\n")
+    tracked = [
+        row for row in (delta.get("tracked_metric_results") or [])
+        if isinstance(row, dict) and str(row.get("metric") or "").strip()
+    ]
+    if tracked:
+        out.append("**Tracking read:**\n\n")
+        for row in tracked:
+            metric = str(row.get("metric") or "").strip()
+            status = str(row.get("status") or "").strip() or "not_measurable"
+            note = str(row.get("note") or "").strip()
+            suffix = f" — {note}" if note else ""
+            out.append(f"- {metric}: {status}{suffix}\n")
+        out.append("\n")
+    return "".join(out)
+
+
 def _render_owned_buyer_path_play(next_best_action: Optional[Dict[str, Any]]) -> str:
     if not isinstance(next_best_action, dict):
         return ""
@@ -751,6 +788,7 @@ def render_brand_markdown_v2(
     sections.append(_render_publisher_analysis(primary))
     mv = primary.get("merchant_view") or {}
     # 8. What should you do next? (merchant-facing decision layer)
+    sections.append(_render_reaudit_delta(mv.get("reaudit_delta")))
     sections.append(_render_next_best_action(mv.get("next_best_action")))
     # 9. Recommendations (action items v2 from PR-8b)
     sections.append(_render_recommendations(mv.get("actions")))

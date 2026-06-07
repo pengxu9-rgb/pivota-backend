@@ -17,8 +17,9 @@ Why factor this out:
     already covers the analysis functions; route tests just exercise the
     HTTP wrapper.
 
-This module has no DB dependencies — all data comes from `llm_client.probe`
-results passed in by the caller.
+Most report projection remains pure over `llm_client.probe` results passed in
+by the caller. The re-audit delta layer has one best-effort DB read for the
+full prior audit report when the caller provides persisted history context.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
+from services.audit_delta import build_reaudit_delta
 from services.audit_playbook_engine import select_playbooks
 from services.brand_alias import derive_brand_aliases, text_mentions_brand
 from services.buyer_path_stable_controllers import (
@@ -6580,6 +6582,11 @@ async def run_brand_report(
             structured["citation_by_provider"] = citation_by_provider
             if provider_failures:
                 structured["provider_failures"] = provider_failures
+            await _attach_reaudit_delta(
+                structured,
+                merchant_id=merchant_id,
+                prior_runs=prior_runs,
+            )
             return ("ok", structured)
         except Exception as exc:  # noqa: BLE001 — per-product isolation
             return ("fail", {
@@ -9001,6 +9008,65 @@ def _build_history_trend(
     }
 
 
+async def _attach_reaudit_delta(
+    report: Dict[str, Any],
+    *,
+    merchant_id: Optional[str],
+    prior_runs: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Attach the honest material-change layer, best-effort.
+
+    ``prior_runs`` comes from recent_runs_for_merchant before the current run is
+    marked succeeded. ``None`` means the caller did not provide history context,
+    so omit the section. An empty list means a real first audit baseline.
+    """
+    if not isinstance(report, dict):
+        return report
+    merchant_view = report.get("merchant_view")
+    if not isinstance(merchant_view, dict):
+        return report
+    if prior_runs is None:
+        return report
+    succeeded = [
+        row for row in prior_runs
+        if isinstance(row, dict) and row.get("status") == "succeeded"
+    ]
+    if not succeeded:
+        merchant_view["reaudit_delta"] = build_reaudit_delta(
+            current_report=report,
+            prior_report=None,
+            prior_row=None,
+            days_since=None,
+        )
+        return report
+    prior_row = succeeded[0]
+    prior_run_id = str(prior_row.get("run_id") or "").strip()
+    if not prior_run_id or not merchant_id:
+        return report
+    try:
+        from db.merchant_audit_runs import fetch_audit_run_by_id
+
+        prior_full = await fetch_audit_run_by_id(run_id=prior_run_id)
+        prior_report = (
+            prior_full.get("report_jsonb")
+            if isinstance(prior_full, dict) else None
+        )
+        if not isinstance(prior_report, dict):
+            return report
+        merchant_view["reaudit_delta"] = build_reaudit_delta(
+            current_report=report,
+            prior_report=prior_report,
+            prior_row=prior_row,
+            days_since=_days_between(prior_row.get("requested_at")),
+        )
+    except Exception as exc:  # noqa: BLE001 - audit must not fail on history
+        logger.warning(
+            "reaudit_delta attach failed merchant_id=%s prior_run_id=%s: %s",
+            merchant_id, prior_run_id, str(exc)[:200],
+        )
+    return report
+
+
 def _days_between(iso_timestamp: Optional[str]) -> Optional[int]:
     """Return integer days from `iso_timestamp` to now (UTC). None when
     the input isn't parseable. Helper for trend delta rendering — the
@@ -10532,6 +10598,42 @@ def _render_next_best_action_markdown(next_best_action: Optional[Mapping[str, An
     return "".join(out)
 
 
+def _render_reaudit_delta_markdown(delta: Optional[Mapping[str, Any]]) -> str:
+    if not isinstance(delta, Mapping):
+        return ""
+    headline = str(delta.get("headline") or "").strip()
+    if not headline:
+        return ""
+    out: List[str] = ["## Since your last audit\n"]
+    out.append(headline + "\n")
+    material = [
+        movement for movement in (delta.get("movements") or [])
+        if isinstance(movement, Mapping) and movement.get("is_material")
+    ]
+    if material:
+        out.append("\n**Material movement:**\n")
+        for movement in material:
+            label = str(movement.get("label") or movement.get("signal") or "").strip()
+            direction = str(movement.get("direction") or "changed").strip()
+            before = movement.get("from")
+            after = movement.get("to")
+            out.append(f"- {label}: {before} → {after} ({direction})\n")
+    tracked = [
+        row for row in (delta.get("tracked_metric_results") or [])
+        if isinstance(row, Mapping) and str(row.get("metric") or "").strip()
+    ]
+    if tracked:
+        out.append("\n**Tracking read:**\n")
+        for row in tracked:
+            metric = str(row.get("metric") or "").strip()
+            status = str(row.get("status") or "").strip() or "not_measurable"
+            note = str(row.get("note") or "").strip()
+            suffix = f" — {note}" if note else ""
+            out.append(f"- {metric}: {status}{suffix}\n")
+    out.append("\n")
+    return "".join(out)
+
+
 def _render_owned_buyer_path_play_markdown(next_best_action: Optional[Mapping[str, Any]]) -> str:
     if not isinstance(next_best_action, Mapping):
         return ""
@@ -10696,6 +10798,11 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             )
 
     mv_for_play = report.get("merchant_view") if isinstance(report.get("merchant_view"), dict) else {}
+    sections.append(
+        _render_reaudit_delta_markdown(
+            mv_for_play.get("reaudit_delta") if isinstance(mv_for_play, dict) else None
+        )
+    )
     sections.append(
         _render_next_best_action_markdown(
             mv_for_play.get("next_best_action") if isinstance(mv_for_play, dict) else None

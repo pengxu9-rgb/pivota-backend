@@ -359,6 +359,23 @@ def test_renders_next_best_action_before_recommendations():
     assert md.find("## What Should You Do Next?") < md.find("## Recommendations")
 
 
+def test_renders_reaudit_delta_before_next_best_action():
+    from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
+    audit = _gruns_fixture_audit()
+    audit["per_product"][0]["merchant_view"]["reaudit_delta"] = {
+        "is_first_audit": True,
+        "headline": "Baseline established — re-audit in ~30 days to see movement.",
+        "movements": [],
+        "tracked_metric_results": [],
+    }
+
+    md = render_brand_markdown_v2(audit)
+
+    assert "## Since your last audit" in md
+    assert "Baseline established" in md
+    assert md.find("## Since your last audit") < md.find("## What Should You Do Next?")
+
+
 def test_renders_owned_buyer_path_play_with_controller_strategy():
     from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
     md = render_brand_markdown_v2(_gruns_fixture_audit())
