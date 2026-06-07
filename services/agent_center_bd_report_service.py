@@ -5774,8 +5774,9 @@ def _sku_intelligence_headline(
         if exposed and exposed["lane"] and exposed["controllers"]:
             controllers = _headline_join(exposed["controllers"])
             return (
-                f"AI recommends `{exposed['lane']}`, but routes buyers to "
-                f"{controllers} — not your site. Here's how to win the buyer path back."
+                f"AI shows demand for `{exposed['lane']}`; across tested buyer paths "
+                f"for this SKU, cited routes point to {controllers} - not your site. "
+                "Here's how to win the buyer path back."
             )
         if exposed and exposed["lane"]:
             return (

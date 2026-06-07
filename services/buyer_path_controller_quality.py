@@ -41,11 +41,12 @@ _RETAIL_TYPES = {"marketplace", "retailer"}
 # share-based for the leading-retailer gate (the credibility-killer direction):
 # a lone stray retailer citation among many authority lanes cannot flip to
 # "retail competition", while a single retailer that owns the only lane still
-# does (100% share). Genuine source-authority is recognized by presence (a
-# stable signal) so an authority SKU does not wobble into the canonical-vacuum
-# label when a known-retail host's citation volume happens to spike.
+# does (100% share). Repeated source-authority is recognized unless retail is
+# already dominant and the authority tail is too small to describe the SKU's
+# lead controller archetype honestly.
 AGGREGATE_DOMINANCE_SHARE = 0.30
 AGGREGATE_AUTHORITY_MIN_CITATIONS = 2
+AGGREGATE_AUTHORITY_RETAIL_SHARE_FLOOR = 0.20
 
 
 def controller_profile(controllers: Iterable[Any]) -> Dict[str, Any]:
@@ -99,7 +100,7 @@ def aggregate_controller_profile(
     excluded = {h for h in (_host_from_any(x) for x in _as_list(exclude_hosts)) if h}
     summed_rows = [
         row for row in _sum_controller_groups(controller_groups)
-        if _host_from_any(row.get("host")) not in excluded
+        if not _host_excluded(_host_from_any(row.get("host")), excluded)
     ]
     classified = _classify_controllers(summed_rows)
     leading, known_retail, source_authority = _category_hosts(classified)
@@ -110,10 +111,23 @@ def aggregate_controller_profile(
     w_known = _category_weight(classified, known_retail)
     threshold = max(total, 1) * AGGREGATE_DOMINANCE_SHARE
 
+    authority_share = w_authority / max(total, 1)
+    retail_weight = max(w_leading, w_known)
+    authority_present = (
+        w_authority >= threshold
+        or (
+            w_authority >= AGGREGATE_AUTHORITY_MIN_CITATIONS
+            and (
+                retail_weight < threshold
+                or authority_share >= AGGREGATE_AUTHORITY_RETAIL_SHARE_FLOOR
+            )
+        )
+    )
+
     if w_leading >= threshold:
         strategy = "leading_retailer_competition"
         winning = leading
-    elif w_authority >= AGGREGATE_AUTHORITY_MIN_CITATIONS or w_authority >= threshold:
+    elif authority_present:
         strategy = "source_authority_gap"
         winning = source_authority
     elif w_known >= threshold:
@@ -138,6 +152,15 @@ def aggregate_controller_profile(
         source_authority=source_authority,
         classified=classified,
     )
+
+
+def _host_excluded(host: str, excluded: set) -> bool:
+    """True if host equals or is a subdomain of any excluded host, so a
+    merchant's own site is never named as a buyer-path controller even when AI
+    cites a subdomain (e.g. shop.bblab.shop for merchant bblab.shop)."""
+    if not host:
+        return False
+    return any(host == e or host.endswith("." + e) for e in excluded)
 
 
 def _classify_controllers(input_rows: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:

@@ -819,7 +819,12 @@ def _buyer_path_opportunities(
     )
     opportunities = [_buyer_path_opportunity(row, merchant_path) for row in prioritized[:5]]
     if opportunities:
-        _apply_lead_aggregate_profile(opportunities, prioritized, merchant_host=merchant_host)
+        _apply_lead_aggregate_profile(
+            opportunities,
+            prioritized,
+            merchant_path=merchant_path,
+            merchant_host=merchant_host,
+        )
     return opportunities
 
 
@@ -827,6 +832,7 @@ def _apply_lead_aggregate_profile(
     opportunities: List[Dict[str, Any]],
     prioritized: List[Mapping[str, Any]],
     *,
+    merchant_path: Mapping[str, Any],
     merchant_host: Optional[str] = None,
 ) -> None:
     """Stabilize the lead opportunity's controller archetype by aggregating
@@ -850,9 +856,11 @@ def _apply_lead_aggregate_profile(
     if not _as_list(lead_profile.get("classified_controllers")):
         return
     lead = opportunities[0]
+    lead_row = prioritized[0] if prioritized else {}
     lead["controller_profile"] = lead_profile
     lead["controller_strategy"] = lead_profile.get("strategy")
     lead["controller_strategy_label"] = lead_profile.get("label")
+    lead["exposure_confidence"] = lead_profile.get("exposure_confidence")
     lead["exposure_read"] = lead_profile.get("exposure_read")
     named = [host for host in _as_list(lead_profile.get("controllers")) if host]
     if named:
@@ -868,13 +876,26 @@ def _apply_lead_aggregate_profile(
             )
             for host in named[:3]
         ]
+    lead["recommended_moves"] = _buyer_path_moves(
+        merchant_path,
+        lead_profile,
+        row=lead_row,
+        controllers=_as_list(lead.get("controlled_by")),
+    )
 
 
 def _aggregate_role_by_host(profile: Mapping[str, Any]) -> Dict[str, str]:
     role_by_host: Dict[str, str] = {}
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        host = _clean_str(row.get("host"))
+        role = _clean_str(row.get("input_role")) or _clean_str(row.get("type"))
+        if host and role:
+            role_by_host[host] = role
     for host in _as_list(profile.get("source_authority_controllers")):
         if host:
-            role_by_host[host] = "publisher"
+            role_by_host.setdefault(host, "publisher")
     for host in _as_list(profile.get("known_retail_controllers")):
         if host:
             role_by_host[host] = "retailer"

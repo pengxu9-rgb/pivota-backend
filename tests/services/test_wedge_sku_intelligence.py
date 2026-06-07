@@ -371,7 +371,7 @@ async def test_run_wedge_hero_sku_intelligence_empty_state_without_attributes(mo
     # The fixture's category lane is third-party (amazon.com) controlled with
     # real demand, so the headline must LEAD with the buyer-path exposure, not
     # the stale "no open lane stood out" frame.
-    assert "routes buyers to" in out["headline"]
+    assert "cited routes point to" in out["headline"]
     assert "buyer path" in out["headline"].lower()
     assert "amazon.com" in out["headline"]
     assert out["intent_ladder"]

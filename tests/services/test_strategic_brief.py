@@ -598,6 +598,21 @@ def test_aggregate_controller_profile_stable_authority_when_retail_volume_spikes
     assert profile_b["controllers"][0] == "reddit.com"
 
 
+def test_aggregate_controller_profile_does_not_let_tiny_authority_tail_beat_retail():
+    """A small repeated authority tail should not relabel a retail-dominant SKU
+    as authority-led. Absolute citation count alone is not enough when the
+    retail share is overwhelming."""
+    from services.buyer_path_controller_quality import aggregate_controller_profile
+
+    profile = aggregate_controller_profile([
+        [{"host": "yesstyle.com", "times_cited": 38}],
+        [{"host": "reddit.com", "role": "forum", "times_cited": 2}],
+    ])
+
+    assert profile["strategy"] == "canonical_source_vacuum"
+    assert profile["controllers"][0] == "yesstyle.com"
+
+
 def test_aggregate_controller_profile_excludes_merchant_own_host():
     """The merchant's own site, even if heavily cited across lanes, must never be
     named as a buyer-path controller."""
@@ -611,6 +626,68 @@ def test_aggregate_controller_profile_excludes_merchant_own_host():
     profile = aggregate_controller_profile(groups, exclude_hosts=["https://bblab.shop/products/x"])
     assert "bblab.shop" not in profile["controllers"]
     assert profile["controllers"][0] == "reddit.com"
+
+
+def test_aggregate_controller_profile_excludes_merchant_subdomains_only():
+    """A subdomain of the merchant's own host is excluded, but a different brand
+    whose name merely ends similarly is kept (no false eTLD match)."""
+    from services.buyer_path_controller_quality import aggregate_controller_profile
+
+    profile = aggregate_controller_profile(
+        [
+            [{"host": "shop.bblab.shop", "times_cited": 6}],
+            [{"host": "notbblab.shop", "times_cited": 5}],
+            [{"host": "reddit.com", "times_cited": 3}],
+        ],
+        exclude_hosts=["bblab.shop"],
+    )
+    assert "shop.bblab.shop" not in profile["controllers"]
+    assert "notbblab.shop" in profile["controllers"]
+
+
+def test_exposure_headline_marks_aggregate_controllers_as_sku_level_not_lane_specific():
+    opportunity = {
+        "top_open_lanes": [],
+        "per_prompt": [
+            {
+                "query": "vitamin c collagen jelly",
+                "axis": "sidewalk",
+                "query_class": "sidewalk",
+                "ownership_state": "forum-owned",
+                "source_route": "forum",
+                "demand_signal": 1.0,
+                "opportunity_score": 99.0,
+                "who_owns": "reddit.com",
+                "source_summary": {
+                    "top_cited_hosts": [{"host": "reddit.com", "times_cited": 2}]
+                },
+            },
+            {
+                "query": "best collagen supplement",
+                "axis": "category",
+                "query_class": "head",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "demand_signal": 1.0,
+                "opportunity_score": 1.0,
+                "who_owns": "walmart.com",
+                "source_summary": {
+                    "top_cited_hosts": [{"host": "walmart.com", "times_cited": 5}]
+                },
+            },
+        ],
+    }
+
+    headline = _sku_intelligence_headline(
+        opportunity=opportunity,
+        title="Ownist Triple Shine Grape",
+        product_type="collagen jelly",
+    )
+
+    assert "AI shows demand for `vitamin c collagen jelly`" in headline
+    assert "across tested buyer paths for this SKU" in headline
+    assert "walmart.com" in headline
+    assert "routes buyers to walmart.com" not in headline
 
 
 def test_assemble_sku_brief_evidence_grounding_notes_use_real_evidenced_channels():
@@ -890,7 +967,7 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
     assert "product/offer/review/FAQ schema" in opportunities[0]["recommended_moves"][1]
     assert "vitamin c, collagen, and jelly in plain page text" in opportunities[0]["recommended_moves"][2]
     assert "verified review and proof signals" in opportunities[0]["recommended_moves"][3]
-    assert "Pitch cogentsteps.net, hellokoop.com, and medsysgroup.com" in opportunities[0]["recommended_moves"][4]
+    assert "Pitch cogentsteps.net, medsysgroup.com, and hellokoop.com" in opportunities[0]["recommended_moves"][4]
     assert "consistent across" in opportunities[0]["recommended_moves"][5]
     assert "Re-audit vitamin c collagen jelly" in opportunities[0]["recommended_moves"][6]
     assert "material buyer traffic" in opportunities[0]["recommended_moves"][6]
@@ -920,6 +997,84 @@ def test_assemble_sku_brief_evidence_prioritizes_ownist_conversion_lane_over_sna
     assert "vitamin c collagen jelly" in snack_strategy["how"]
     assert strategic_brief.validate_grounding(brief, evidence) is True
     _assert_no_overpromise_payload(brief)
+
+
+def test_aggregate_lead_profile_recomputes_recommended_moves_with_aggregate_controllers():
+    opportunity = {
+        "intent_ladder": {},
+        "per_prompt": [
+            {
+                "query": "vitamin c collagen jelly",
+                "axis": "sidewalk",
+                "query_class": "sidewalk",
+                "ownership_state": "forum-owned",
+                "source_route": "forum",
+                "demand_signal": 1.0,
+                "opportunity_score": 99.0,
+                "attribute_basis": ["vitamin c", "collagen", "jelly"],
+                "who_owns": "reddit.com",
+                "source_summary": {
+                    "top_cited_hosts": [{"host": "reddit.com", "times_cited": 2}]
+                },
+            },
+            {
+                "query": "best collagen supplement",
+                "axis": "category",
+                "query_class": "head",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "demand_signal": 1.0,
+                "opportunity_score": 1.0,
+                "who_owns": "walmart.com",
+                "source_summary": {
+                    "top_cited_hosts": [{"host": "walmart.com", "times_cited": 5}]
+                },
+            },
+            {
+                "query": "top collagen brands",
+                "axis": "category",
+                "query_class": "head",
+                "ownership_state": "retailer-owned",
+                "source_route": "retailer",
+                "demand_signal": 1.0,
+                "opportunity_score": 1.0,
+                "who_owns": "walmart.com",
+                "source_summary": {
+                    "top_cited_hosts": [{"host": "walmart.com", "times_cited": 5}]
+                },
+            },
+        ],
+        "top_open_lanes": [],
+        "substitution_alert": {"present": False},
+    }
+    evidence = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=opportunity,
+        attribute_graph={
+            "classes": {
+                "category": ["collagen jelly"],
+                "ingredient": ["vitamin c", "collagen"],
+                "format": ["jelly"],
+            }
+        },
+        primary_gaps=[],
+        scores={},
+        identity={
+            "name": "Ownist Triple Shine Grape",
+            "anchors": {"brand": "Ownist"},
+            "merchant_type": "brand",
+        },
+        sku_title="Ownist Triple Shine Grape",
+    )
+
+    lead = evidence["buyer_path_opportunities"][0]
+    moves_blob = " ".join(lead["recommended_moves"]).lower()
+
+    assert lead["query"] == "vitamin c collagen jelly"
+    assert lead["controller_strategy"] == "leading_retailer_competition"
+    assert lead["controlled_by"][0]["host"] == "walmart.com"
+    assert "first-order offer" in moves_blob
+    assert "why-buy-direct proof" in moves_blob
+    assert "reddit.com discussion" not in moves_blob
 
 
 def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabricated_economics():
