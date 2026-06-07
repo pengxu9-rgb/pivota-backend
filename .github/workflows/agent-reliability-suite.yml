@@ -130,6 +130,12 @@ jobs:
             tests/test_merchant_payment_initiation_service.py \
             tests/test_multi_psp_orchestrator_preferred_subset.py
 
+      - name: Run payment aftercare gate
+        env:
+          PIVOTA_BACKEND_REPO: ${{ github.workspace }}
+        run: |
+          bash scripts/run_payment_aftercare_gate.sh
+
   shopify-discount-dev-store:
     name: Shopify discount validation
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shopify_discount_validation }}
