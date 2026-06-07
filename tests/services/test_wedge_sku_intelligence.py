@@ -162,6 +162,143 @@ def _install_probe(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
     return calls
 
 
+def _competitor_attribute_opportunity() -> Dict[str, Any]:
+    return {
+        "per_prompt": [
+            {
+                "query": "best collagen supplements for skin",
+                "competitors": ["Vital Proteins", "NeoCell"],
+                "density": {"features": {"repeated_owner": "Vital Proteins"}},
+            },
+            {
+                "query": "BB Lab collagen alternatives",
+                "competitors": ["Vital Proteins", "Sports Research"],
+            },
+            {
+                "query": "collagen powder",
+                "competitors": ["NeoCell"],
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_competitor_attribute_probe_default_off_noops(monkeypatch):
+    calls: List[Dict[str, Any]] = []
+
+    async def fake_probe(**kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(bd.llm_client, "probe", fake_probe)
+    monkeypatch.setattr(bd, "_strategic_brief_live_probe_enabled", lambda: False)
+
+    out = await bd._probe_durable_competitor_attributes_for_brief(
+        opportunity=_competitor_attribute_opportunity(),
+        product={"product_type": "collagen supplement"},
+        merchant_id="merch-A",
+        run_id="run-1",
+        coverage={"providers": ["gemini", "chatgpt"]},
+        provider_model_metadata={},
+    )
+
+    assert out == "not_assessed"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_competitor_attribute_probe_single_durable_competitor_cost_guard(monkeypatch):
+    calls: List[Dict[str, Any]] = []
+
+    async def fake_probe(**kwargs):
+        calls.append(kwargs)
+        return {
+            "provider": kwargs["provider"],
+            "raw_runs": [
+                {
+                    "query": (kwargs.get("context") or {}).get("queries", [""])[0],
+                    "raw": (
+                        "Vital Proteins is known for collagen peptides, "
+                        "grass-fed collagen, and powder formats."
+                    ),
+                    "parsed": {
+                        "evidence_excerpt": "Vital Proteins collagen peptides powder"
+                    },
+                    "grounding_sources": [
+                        {
+                            "uri": "https://vitalproteins.com/products/collagen-peptides",
+                            "title": "Vital Proteins Collagen Peptides Powder",
+                        }
+                    ],
+                    "grounding_chunks": [
+                        "https://vitalproteins.com/products/collagen-peptides"
+                    ],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(bd.llm_client, "probe", fake_probe)
+    monkeypatch.setattr(bd, "_strategic_brief_live_probe_enabled", lambda: True)
+
+    out = await bd._probe_durable_competitor_attributes_for_brief(
+        opportunity=_competitor_attribute_opportunity(),
+        product={"product_type": "collagen supplement"},
+        merchant_id="merch-A",
+        run_id="run-1",
+        coverage={"providers": ["gemini", "deepseek", "chatgpt"]},
+        provider_model_metadata={
+            "gemini": {"model": "gemini-test"},
+            "chatgpt": {"model": "chatgpt-test"},
+        },
+    )
+
+    assert [call["provider"] for call in calls] == ["gemini", "chatgpt"]
+    assert all(call["max_runs"] == 1 for call in calls)
+    assert all(len((call["context"] or {}).get("queries") or []) == 1 for call in calls)
+    assert all("Vital Proteins" in call["context"]["queries"][0] for call in calls)
+    assert all("NeoCell" not in call["context"]["queries"][0] for call in calls)
+    assert out["status"] == "assessed"
+    assert out["competitor"] == "Vital Proteins"
+    assert set(out["attributes_present"]) >= {
+        "collagen peptides",
+        "grass-fed collagen",
+        "powder",
+    }
+    assert all(row["provider"] in {"gemini", "chatgpt"} for row in out["evidence"])
+
+
+@pytest.mark.asyncio
+async def test_competitor_attribute_probe_mock_or_ungrounded_fails_closed(monkeypatch):
+    async def fake_probe(**kwargs):
+        return {
+            "provider": "mock_fallback_no_gemini_key",
+            "raw_runs": [
+                {
+                    "query": (kwargs.get("context") or {}).get("queries", [""])[0],
+                    "raw": "Vital Proteins is known for collagen peptides.",
+                    "grounding_sources": [
+                        {"uri": "https://example.com/vital", "title": "Vital Proteins"}
+                    ],
+                    "grounding_chunks": ["https://example.com/vital"],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(bd.llm_client, "probe", fake_probe)
+    monkeypatch.setattr(bd, "_strategic_brief_live_probe_enabled", lambda: True)
+
+    out = await bd._probe_durable_competitor_attributes_for_brief(
+        opportunity=_competitor_attribute_opportunity(),
+        product={"product_type": "collagen supplement"},
+        merchant_id="merch-A",
+        run_id="run-1",
+        coverage={"providers": ["gemini"]},
+        provider_model_metadata={},
+    )
+
+    assert out == "not_assessed"
+
+
 @pytest.mark.asyncio
 async def test_run_wedge_hero_sku_intelligence_builds_money_shot(monkeypatch):
     monkeypatch.setattr(bd, "_build_per_sku_audit_query_records", _four_money_shot_records)

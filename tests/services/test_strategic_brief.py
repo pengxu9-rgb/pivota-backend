@@ -312,6 +312,35 @@ def _validation_fix_evidence() -> Dict[str, Any]:
     }
 
 
+def _validation_fix_evidence_with_competitor_attributes(
+    attrs: List[str] | None = None,
+) -> Dict[str, Any]:
+    attrs = attrs or ["collagen peptides", "grass-fed collagen"]
+    evidence = _validation_fix_evidence()
+    evidence["grounding_notes"] = {
+        "competitor_attributes": {
+            "status": "assessed",
+            "competitor": "Vital Proteins",
+            "attributes_present": attrs,
+            "evidence": [
+                {
+                    "attribute": attr,
+                    "provider": "gemini",
+                    "verbatim": f"Vital Proteins is associated with {attr}.",
+                }
+                for attr in attrs
+            ],
+            "note": "Grounded presence only - not a claim the competitor lacks anything else.",
+        },
+        "merchant_channels": "unknown",
+        "evidenced_channels": [
+            {"host": "healthline.com", "role": "publisher"},
+            {"host": "amazon.com", "role": "marketplace"},
+        ],
+    }
+    return evidence
+
+
 def _validation_fix_grounded_brief() -> Dict[str, Any]:
     return {
         "position": (
@@ -1331,6 +1360,116 @@ def test_validation_fix_allows_cited_source_names_but_rejects_unknown_sources():
     failures = strategic_brief._grounding_failures(brief, evidence)
 
     assert any("Forbes" in failure for failure in failures)
+
+
+def test_competitor_attributes_default_placeholder_is_byte_identical():
+    base = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=_opportunity(),
+        attribute_graph=_attribute_graph(),
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+    explicit = strategic_brief.assemble_sku_brief_evidence(
+        opportunity=_opportunity(),
+        attribute_graph=_attribute_graph(),
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+        competitor_attributes="not_assessed",
+    )
+
+    assert json.dumps(base, sort_keys=True) == json.dumps(explicit, sort_keys=True)
+    assert base["grounding_notes"]["competitor_attributes"] == "not_assessed"
+
+
+def test_validation_allows_grounded_competitor_presence_attribute():
+    evidence = _validation_fix_evidence_with_competitor_attributes()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = (
+        "Vital Proteins is known for collagen peptides, while BB Lab can "
+        "differentiate around the halal bedtime stick."
+    )
+
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
+def test_validation_rejects_competitor_lack_claim_even_when_merchant_has_attribute():
+    evidence = _validation_fix_evidence_with_competitor_attributes()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = "Vital Proteins lacks halal collagen positioning."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert "competitor-lack-claim" in failures
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+def test_validation_rejects_standalone_market_exclusivity_claim():
+    """"You are the only one with <attr>" is a disguised competitor-deficiency
+    claim (it asserts everyone else lacks it) and must fail even when no
+    competitor is named — while merchant-self "only your page offers X" passes."""
+    evidence = _validation_fix_evidence_with_competitor_attributes()
+
+    deficiency = _validation_fix_grounded_brief()
+    deficiency["your_angle"] = "You are the only brand with halal collagen."
+    failures = strategic_brief._grounding_failures(deficiency, evidence)
+    assert "competitor-exclusive-claim" in failures
+    assert strategic_brief.validate_grounding(deficiency, evidence) is False
+
+    merchant_self = _validation_fix_grounded_brief()
+    merchant_self["your_angle"] = (
+        "Only your official page can offer the guarantee and fresh facts for halal."
+    )
+    assert strategic_brief.validate_grounding(merchant_self, evidence) is True
+
+
+def test_validation_rejects_invented_competitor_attribute():
+    evidence = _validation_fix_evidence_with_competitor_attributes()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = "Vital Proteins is known for keto collagen."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert "ungrounded-competitor-attribute:keto" in failures
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+def test_validation_rejects_unassessed_competitor_attribute_claim():
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = "Vital Proteins is known for marine collagen."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert "unassessed-competitor-attribute:marine" in failures
+    assert strategic_brief.validate_grounding(brief, evidence) is False
+
+
+def test_validation_allows_unassessed_broad_category_positioning_inference():
+    evidence = _validation_fix_evidence()
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = (
+        "Incumbents are generally positioned as broad collagen supplement; "
+        "a dedicated halal bedtime stick looks like an opening worth confirming."
+    )
+
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+
+
+def test_competitor_attributes_do_not_loosen_safety_sensitive_terms():
+    evidence = _validation_fix_evidence_with_competitor_attributes(["clinical collagen"])
+    brief = _validation_fix_grounded_brief()
+    brief["why_you_lose"] = "Vital Proteins is known for clinical collagen."
+
+    failures = strategic_brief._grounding_failures(brief, evidence)
+
+    assert "safety-sensitive:clinical" in failures
+    assert strategic_brief.validate_grounding(brief, evidence) is False
 
 
 @pytest.mark.parametrize(

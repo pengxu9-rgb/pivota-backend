@@ -57,12 +57,14 @@ ABSOLUTE GROUNDING RULES (this is a trust product — violating these is worse t
 - When you mention a search lane/query, use the EVIDENCE wording for it.
 
 CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a trust product):
-- COMPETITORS: EVIDENCE names which competitors win, but NOT their product attributes
-  (grounding_notes.competitor_attributes = "not_assessed"). NEVER state as fact that a competitor lacks,
-  is missing, or does not have a feature. You MAY note a likely positioning gap as YOUR INFERENCE, marked as
-  such: "incumbents are generally positioned as broad <category>; a dedicated <your differentiator> looks like
-  an opening — worth confirming." Your differentiation is YOUR attributes; the WEDGE is real, the competitor
-  comparison is an inference to verify.
+- COMPETITORS: EVIDENCE names which competitors win. If grounding_notes.competitor_attributes is
+  "not_assessed", EVIDENCE does NOT support competitor product attributes. If it is assessed, you may use ONLY
+  attributes_present as competitor PRESENCE facts for the named competitor. NEVER state as fact that a
+  competitor lacks, is missing, does not have, is the only one without, or fails to offer a feature. Do not turn
+  merchant attributes into competitor deficiencies. You MAY note a likely positioning gap as YOUR INFERENCE,
+  marked as such: "incumbents are generally positioned as broad <category>; a dedicated <your differentiator>
+  looks like an opening — worth confirming." Your differentiation is YOUR attributes; competitor contrast is
+  presence-only when assessed, otherwise an inference to verify.
 - CHANNELS: recommend a specific marketplace, retailer, community, forum, social platform, or publisher ONLY
   if it appears in grounding_notes.evidenced_channels. Do NOT assume the merchant already sells on Amazon or
   any marketplace (grounding_notes.merchant_channels = "unknown"). If a lane has no evidenced channel, the move
@@ -494,6 +496,74 @@ _COMMON_PROSE_WORDS = {
     "site",
     "terms",
 }
+_COMPETITOR_GENERIC_TERMS = {
+    "category winners",
+    "competitor",
+    "competitors",
+    "incumbent",
+    "incumbents",
+    "rival",
+    "rivals",
+    "substitute",
+    "substitutes",
+    "winner",
+    "winners",
+}
+_COMPETITOR_LACK_PATTERNS = (
+    re.compile(r"\b(?:lacks?|lack of|missing)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:doesn['’]?t|does not|don['’]?t|do not)\s+"
+        r"(?:offer|have|carry|include|feature)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bwithout\s+(?:a|an|the)?\s*[a-z0-9][a-z0-9-]*", re.IGNORECASE),
+    re.compile(r"\bno\s+(?:evident\s+)?[a-z0-9][a-z0-9-]*", re.IGNORECASE),
+)
+_COMPETITOR_EXCLUSIVE_RE = re.compile(
+    r"\bonly\b[^.!?\n]{0,80}\b(?:has|have|offers?|with|for|featuring)\b",
+    re.IGNORECASE,
+)
+# Market-exclusivity ("the only one/brand/seller with <attr>") is a disguised
+# competitor-deficiency claim — it asserts everyone else lacks the attribute — so
+# it must fail on its own, even when no competitor is named. Restricted to
+# market-noun subjects so merchant-self "only your page offers X" stays allowed.
+_COMPETITOR_MARKET_EXCLUSIVE_RE = re.compile(
+    r"\bonly\s+(?:one|brand|brands|company|companies|seller|sellers|"
+    r"player|players|option|options|maker|makers|vendor|vendors|"
+    r"retailer|retailers|store|stores|name|names|product|products)\b",
+    re.IGNORECASE,
+)
+_COMPETITOR_ATTRIBUTE_CLAIM_RE = re.compile(
+    r"\b(?P<verb>known for|associated with|built around|positioned as|"
+    r"positioned around|positioned for|features?|offers?|has|have|carries|"
+    r"uses|leans on|centers on|centered on)\s+"
+    r"(?P<attrs>[^.;:\n,]{2,120})",
+    re.IGNORECASE,
+)
+_COMPETITOR_CLAIM_COMMON_WORDS = {
+    "also",
+    "answer",
+    "answers",
+    "authority",
+    "broad",
+    "category",
+    "distribution",
+    "general",
+    "line",
+    "mainstream",
+    "market",
+    "position",
+    "positioning",
+    "product",
+    "products",
+    "publisher",
+    "retail",
+    "retailer",
+    "review",
+    "reviews",
+    "source",
+    "sources",
+}
 _ALLCAPS_FUNCTION_WORDS = _QUOTE_STOPWORDS | {
     "chase",
     "keep",
@@ -547,6 +617,7 @@ def assemble_sku_brief_evidence(
     identity: Optional[Mapping[str, Any]] = None,
     sku_title: Optional[str] = None,
     merchant_host: Optional[str] = None,
+    competitor_attributes: Optional[Any] = None,
 ) -> Dict[str, Any]:
     del primary_gaps, scores
     opportunity_map = _as_mapping(opportunity)
@@ -574,6 +645,7 @@ def assemble_sku_brief_evidence(
         category_battle=category_battle,
         channel_map=channel_map,
         opportunity=opportunity_map,
+        competitor_attributes=competitor_attributes,
     )
 
     return {
@@ -1159,6 +1231,7 @@ def _grounding_notes(
     category_battle: Mapping[str, Any],
     channel_map: List[Mapping[str, Any]],
     opportunity: Mapping[str, Any],
+    competitor_attributes: Optional[Any] = None,
 ) -> Dict[str, Any]:
     evidenced_channels: List[Mapping[str, Any]] = []
     for ranked in _as_list(_as_mapping(category_battle).get("ranked_by")):
@@ -1172,9 +1245,46 @@ def _grounding_notes(
                 evidenced_channels.append(controller)
     evidenced_channels.extend(_substitution_source_roles(opportunity))
     return {
-        "competitor_attributes": "not_assessed",
+        "competitor_attributes": _competitor_attributes_note(competitor_attributes),
         "merchant_channels": "unknown",
         "evidenced_channels": _unique_host_roles(evidenced_channels),
+    }
+
+
+def _competitor_attributes_note(value: Optional[Any]) -> Any:
+    if value == "not_assessed" or value is None:
+        return "not_assessed"
+    if not isinstance(value, Mapping):
+        return "not_assessed"
+    if _clean_str(value.get("status")).lower() != "assessed":
+        return "not_assessed"
+    competitor = _clean_str(value.get("competitor"))
+    attributes = _unique(_as_str_list(value.get("attributes_present")))[:8]
+    if not competitor or not attributes:
+        return "not_assessed"
+    attr_by_norm = {_norm_phrase(attr): attr for attr in attributes}
+    evidence_rows: List[Dict[str, str]] = []
+    for item in _as_list(value.get("evidence")):
+        if not isinstance(item, Mapping):
+            continue
+        attr = attr_by_norm.get(_norm_phrase(item.get("attribute")))
+        provider = _clean_str(item.get("provider"))
+        verbatim = _clean_str(item.get("verbatim"))
+        if not attr or not provider or not verbatim:
+            continue
+        evidence_rows.append({
+            "attribute": attr,
+            "provider": provider,
+            "verbatim": verbatim[:240],
+        })
+    if not evidence_rows:
+        return "not_assessed"
+    return {
+        "status": "assessed",
+        "competitor": competitor,
+        "attributes_present": attributes,
+        "evidence": evidence_rows[:8],
+        "note": "Grounded presence only - not a claim the competitor lacks anything else.",
     }
 
 
@@ -1768,6 +1878,8 @@ def _grounding_failures(
         if pattern.search(text)
     ]
     allowed = _allowed_grounding(evidence)
+    failures.extend(_competitor_lack_claim_failures(text, allowed))
+    failures.extend(_competitor_attribute_claim_failures(text, allowed))
 
     for term in sorted(_SAFETY_SENSITIVE_TERMS):
         if term not in allowed["safety_words"] and re.search(
@@ -1818,6 +1930,9 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     allowed_domains: Set[str] = set()
     allowed_phrases: Set[str] = set()
     attribute_words: Set[str] = set()
+    category_words: Set[str] = set()
+    competitor_terms: Set[str] = set()
+    competitor_attribute_words: Set[str] = set()
     safety_words: Set[str] = set()
 
     def add_term(value: Any) -> None:
@@ -1840,6 +1955,22 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         elif not normalized.endswith("s"):
             attribute_words.add(f"{normalized}s")
 
+    def add_competitor_attribute_word(word: str) -> None:
+        normalized = word.lower()
+        if not normalized:
+            return
+        competitor_attribute_words.add(normalized)
+        attribute_words.add(normalized)
+        if normalized == "stick":
+            competitor_attribute_words.add("sticks")
+            attribute_words.add("sticks")
+        elif normalized.endswith("y"):
+            competitor_attribute_words.add(f"{normalized[:-1]}ies")
+            attribute_words.add(f"{normalized[:-1]}ies")
+        elif not normalized.endswith("s"):
+            competitor_attribute_words.add(f"{normalized}s")
+            attribute_words.add(f"{normalized}s")
+
     def add_domain(value: Any) -> None:
         host = _normalize_host(value)
         if host:
@@ -1859,6 +1990,8 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
             add_term(attr)
             for word in re.findall(r"[a-z0-9]+", attr.lower()):
                 add_attribute_word(word)
+                if field == "category":
+                    category_words.add(word)
             attr_words = set(re.findall(r"[a-z0-9]+", attr.lower()))
             if {"before", "bed"}.issubset(attr_words):
                 attribute_words.add("bedtime")
@@ -1870,12 +2003,15 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         add_term(prompt)
     for winner in _as_str_list(category_battle.get("winners")):
         add_term(winner)
+        competitor_terms.add(_norm_phrase(winner))
     for ranked in _as_list(category_battle.get("ranked_by")):
         if isinstance(ranked, Mapping):
             add_domain(ranked.get("host"))
 
     substitution = _as_mapping(evidence.get("substitution"))
     add_term(substitution.get("handed_to"))
+    if substitution.get("handed_to"):
+        competitor_terms.add(_norm_phrase(substitution.get("handed_to")))
     add_term(substitution.get("on_prompt"))
 
     for lane in _as_list(evidence.get("open_lanes")):
@@ -1937,6 +2073,18 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
             for controller in _as_list(lane.get("controllers")):
                 add_domain(controller)
 
+    grounding_notes = _as_mapping(evidence.get("grounding_notes"))
+    competitor_attributes = _as_mapping(grounding_notes.get("competitor_attributes"))
+    if _clean_str(competitor_attributes.get("status")).lower() == "assessed":
+        competitor = _clean_str(competitor_attributes.get("competitor"))
+        if competitor:
+            add_term(competitor)
+            competitor_terms.add(_norm_phrase(competitor))
+        for attr in _as_str_list(competitor_attributes.get("attributes_present")):
+            add_term(attr)
+            for word in re.findall(r"[a-z0-9]+", attr.lower()):
+                add_competitor_attribute_word(word)
+
     grounded_words = set(attribute_words)
     for value in allowed_terms | allowed_phrases:
         grounded_words.update(re.findall(r"[a-z0-9]+", value))
@@ -1949,9 +2097,154 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         "domains": allowed_domains,
         "phrases": {phrase for phrase in allowed_phrases if phrase},
         "attribute_words": attribute_words,
+        "category_words": category_words,
+        "competitor_terms": {term for term in competitor_terms if term},
+        "competitor_attribute_words": competitor_attribute_words,
         "grounded_words": grounded_words,
         "safety_words": safety_words,
     }
+
+
+def _validation_sentences(text: str) -> List[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text or "")
+        if sentence and sentence.strip()
+    ]
+
+
+def _competitor_context_sentence(sentence: str, allowed: Mapping[str, Any]) -> bool:
+    normalized = _norm_phrase(sentence)
+    if not normalized:
+        return False
+    for term in _COMPETITOR_GENERIC_TERMS:
+        if _phrase_contains(normalized, term):
+            return True
+    for term in allowed.get("competitor_terms") or set():
+        if _phrase_contains(normalized, term):
+            return True
+    return False
+
+
+def _attribute_context_sentence(sentence: str, allowed: Mapping[str, Any]) -> bool:
+    words = set(re.findall(r"[a-z0-9]+", sentence.lower()))
+    return bool(
+        words
+        & (
+            set(allowed.get("attribute_words") or set())
+            | set(allowed.get("competitor_attribute_words") or set())
+        )
+    )
+
+
+def _competitor_lack_claim_failures(
+    text: str,
+    allowed: Mapping[str, Any],
+) -> List[str]:
+    failures: List[str] = []
+    for sentence in _validation_sentences(text):
+        competitor_context = _competitor_context_sentence(sentence, allowed)
+        exclusive_context = (
+            bool(_COMPETITOR_EXCLUSIVE_RE.search(sentence))
+            and _attribute_context_sentence(sentence, allowed)
+        )
+        if not competitor_context and not exclusive_context:
+            continue
+        if any(pattern.search(sentence) for pattern in _COMPETITOR_LACK_PATTERNS):
+            failures.append("competitor-lack-claim")
+            continue
+        # Market-exclusivity ("the only brand with <attr>") is a disguised
+        # deficiency claim about the whole field, so it fails even with no
+        # competitor named. The broader only-with form still needs competitor
+        # context so merchant-self "only your page offers X" stays allowed.
+        market_exclusive = (
+            bool(_COMPETITOR_MARKET_EXCLUSIVE_RE.search(sentence))
+            and _attribute_context_sentence(sentence, allowed)
+        )
+        if market_exclusive or (exclusive_context and competitor_context):
+            failures.append("competitor-exclusive-claim")
+    return failures
+
+
+def _competitor_attribute_claim_failures(
+    text: str,
+    allowed: Mapping[str, Any],
+) -> List[str]:
+    competitor_attribute_words = set(allowed.get("competitor_attribute_words") or set())
+    failures: List[str] = []
+    for sentence in _validation_sentences(text):
+        if not _competitor_context_sentence(sentence, allowed):
+            continue
+        for match in _COMPETITOR_ATTRIBUTE_CLAIM_RE.finditer(sentence):
+            verb = _norm_phrase(match.group("verb"))
+            phrase = _norm_phrase(match.group("attrs"))
+            if not phrase:
+                continue
+            tokens = _competitor_claim_attribute_tokens(phrase)
+            if not competitor_attribute_words:
+                if _unassessed_competitor_positioning_allowed(
+                    verb=verb,
+                    phrase=phrase,
+                    tokens=tokens,
+                    allowed=allowed,
+                ):
+                    continue
+                if tokens:
+                    failures.append(f"unassessed-competitor-attribute:{tokens[0]}")
+                continue
+            unknown = [
+                token
+                for token in tokens
+                if not _competitor_claim_token_allowed(
+                    token,
+                    competitor_attribute_words,
+                )
+            ]
+            if unknown:
+                failures.append(f"ungrounded-competitor-attribute:{unknown[0]}")
+    return failures
+
+
+def _unassessed_competitor_positioning_allowed(
+    *,
+    verb: str,
+    phrase: str,
+    tokens: List[str],
+    allowed: Mapping[str, Any],
+) -> bool:
+    if not verb.startswith("positioned"):
+        return False
+    words = set(re.findall(r"[a-z0-9]+", phrase.lower()))
+    if not (words & {"broad", "general", "mainstream"}):
+        return False
+    category_words = set(allowed.get("category_words") or set())
+    return all(
+        _word_grounded(token, category_words)
+        or _competitor_claim_token_allowed(token, set())
+        for token in tokens
+    )
+
+
+def _competitor_claim_attribute_tokens(phrase: str) -> List[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", phrase.lower())
+        if token not in _CONNECTOR_WORDS
+        and token not in _QUOTE_STOPWORDS
+        and token not in _COMMON_PROSE_WORDS
+        and token not in _COMMON_WORDS
+        and token not in _COMPETITOR_GENERIC_TERMS
+        and token not in _COMPETITOR_CLAIM_COMMON_WORDS
+    ]
+
+
+def _competitor_claim_token_allowed(
+    token: str,
+    competitor_attribute_words: Set[str],
+) -> bool:
+    if token in _COMPETITOR_CLAIM_COMMON_WORDS or _is_common_entity_word(token):
+        return True
+    return _word_grounded(token, competitor_attribute_words)
 
 
 def _extract_named_entities(text: str) -> List[Tuple[str, bool]]:
