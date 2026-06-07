@@ -373,6 +373,13 @@ async def _process_one_audit_run_inner(
                     or "us_shopper"
                 )
                 prompts_per_sku = _launch_prompts_per_sku(launch_options)
+                prior_runs = await mar.recent_runs_for_merchant(
+                    merchant_id=merchant_id, limit=5,
+                )
+                prior_runs = [
+                    row for row in prior_runs
+                    if row.get("run_id") != run_id
+                ]
                 if audit_mode == "per_sku":
                     probe_runs_by_sku = await run_per_sku_audit_probe_fanout(
                         merchant_id=merchant_id,
@@ -411,6 +418,7 @@ async def _process_one_audit_run_inner(
                         audit_mode="per_sku",
                         merchant_id=merchant_id,
                         audit_run_id=run_id,
+                        prior_runs=prior_runs,
                         verify_providers=launch_options.get("verify_providers"),
                     )
                 else:
@@ -424,6 +432,10 @@ async def _process_one_audit_run_inner(
                         prompts_per_sku=launch_options.get("prompts_per_sku"),
                         max_runs=3,
                         integration_state=integration_state,
+                        audit_mode=audit_mode,
+                        merchant_id=merchant_id,
+                        audit_run_id=run_id,
+                        prior_runs=prior_runs,
                     )
             finally:
                 heartbeat_task.cancel()

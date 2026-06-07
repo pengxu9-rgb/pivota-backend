@@ -685,6 +685,51 @@ def _render_next_best_action_html(next_best_action: Optional[Dict[str, Any]]) ->
     return "".join(out)
 
 
+def _render_reaudit_delta_html(delta: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(delta, dict):
+        return ""
+    headline = str(delta.get("headline") or "").strip()
+    if not headline:
+        return ""
+    out: List[str] = [_h(2, "Since your last audit")]
+    out.append('<div class="summary-box no-break">\n')
+    out.append(f"<p>{_escape(headline)}</p>\n")
+    material = [
+        movement for movement in (delta.get("movements") or [])
+        if isinstance(movement, dict) and movement.get("is_material")
+    ]
+    if material:
+        out.append("<p><strong>Material movement:</strong></p>\n<ul>\n")
+        for movement in material:
+            label = str(movement.get("label") or movement.get("signal") or "").strip()
+            direction = str(movement.get("direction") or "changed").strip()
+            out.append(
+                "<li>"
+                f"{_escape(label)}: {_escape(str(movement.get('from')))} "
+                f"&rarr; {_escape(str(movement.get('to')))} "
+                f"({_escape(direction)})"
+                "</li>\n"
+            )
+        out.append("</ul>\n")
+    tracked = [
+        row for row in (delta.get("tracked_metric_results") or [])
+        if isinstance(row, dict) and str(row.get("metric") or "").strip()
+    ]
+    if tracked:
+        out.append("<p><strong>Tracking read:</strong></p>\n<ul>\n")
+        for row in tracked:
+            metric = str(row.get("metric") or "").strip()
+            status = str(row.get("status") or "").strip() or "not_measurable"
+            note = str(row.get("note") or "").strip()
+            suffix = f" — {note}" if note else ""
+            out.append(
+                f"<li>{_escape(metric)}: {_escape(status + suffix)}</li>\n"
+            )
+        out.append("</ul>\n")
+    out.append("</div>\n")
+    return "".join(out)
+
+
 def _render_owned_buyer_path_play_html(next_best_action: Optional[Dict[str, Any]]) -> str:
     if not isinstance(next_best_action, dict):
         return ""
@@ -949,6 +994,7 @@ def render_brand_html_v2(
     body_sections.append(_render_competitive_analysis_html(primary))
     body_sections.append(_render_publisher_analysis_html(primary))
     mv = primary.get("merchant_view") or {}
+    body_sections.append(_render_reaudit_delta_html(mv.get("reaudit_delta")))
     body_sections.append(_render_next_best_action_html(mv.get("next_best_action")))
     body_sections.append(_render_recommendations_html(mv.get("actions")))
     body_sections.append(_render_owned_buyer_path_play_html(

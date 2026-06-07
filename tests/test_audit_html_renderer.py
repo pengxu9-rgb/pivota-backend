@@ -341,6 +341,41 @@ def test_html_renderer_emits_next_best_action_before_recommendations():
     assert html.find("What Should You Do Next?") < html.find("Recommendations")
 
 
+def test_html_renderer_emits_reaudit_delta_before_next_best_action_and_escapes():
+    from services.audit_html_renderer import render_brand_html_v2
+    audit = _gruns_fixture_audit()
+    audit["per_product"][0]["merchant_view"]["reaudit_delta"] = {
+        "is_first_audit": False,
+        "headline": "No material change <script>alert(1)</script>",
+        "movements": [
+            {
+                "signal": "attribution",
+                "label": "First-party <citation>",
+                "from": 40,
+                "to": 58,
+                "direction": "improved",
+                "is_material": True,
+            }
+        ],
+        "tracked_metric_results": [
+            {
+                "metric": "First-party citation <rate>",
+                "status": "moved",
+                "note": "Mapped to attribution <ok>.",
+            }
+        ],
+    }
+
+    html = render_brand_html_v2(audit)
+
+    assert "Since your last audit" in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "First-party &lt;citation&gt;" in html
+    assert "First-party citation &lt;rate&gt;" in html
+    assert "summary-box no-break" in html
+    assert html.find("Since your last audit") < html.find("What Should You Do Next?")
+
+
 def test_html_renderer_emits_owned_buyer_path_play_with_controller_strategy():
     from services.audit_html_renderer import render_brand_html_v2
     html = render_brand_html_v2(_gruns_fixture_audit())

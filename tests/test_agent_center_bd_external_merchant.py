@@ -1142,6 +1142,30 @@ def test_render_markdown_includes_industry_context_and_actions() -> None:
     assert "_(severity:" in md
 
 
+def test_render_markdown_includes_reaudit_delta_before_next_best_action() -> None:
+    from services.agent_center_bd_report_service import render_markdown_from_structured
+    report = _basic_report()
+    report["merchant_view"]["reaudit_delta"] = {
+        "is_first_audit": False,
+        "headline": "No material change since your last audit 14 days ago — keep the current plan running.",
+        "movements": [],
+        "tracked_metric_results": [
+            {
+                "metric": "First-party citation rate on the same failed buyer questions.",
+                "status": "unchanged",
+                "note": "Mapped to First-party citation; no material movement.",
+            }
+        ],
+    }
+
+    md = render_markdown_from_structured(report)
+
+    assert "## Since your last audit" in md
+    assert "No material change since your last audit 14 days ago" in md
+    assert "First-party citation rate on the same failed buyer questions" in md
+    assert md.find("## Since your last audit") < md.find("## What should you do next?")
+
+
 def test_render_markdown_includes_owned_buyer_path_play_checklist() -> None:
     from services.agent_center_bd_report_service import (
         build_structured_report,
@@ -2146,6 +2170,42 @@ def _basic_report() -> Dict[str, Any]:
         attribution_result={"provider": "gemini", "scores": {"visibility_score": 33}, "raw_runs": []},
         provider="gemini",
     )
+
+
+@pytest.mark.asyncio
+async def test_attach_reaudit_delta_fetches_full_prior_report(monkeypatch) -> None:
+    from db import merchant_audit_runs as mar
+    from services.agent_center_bd_report_service import _attach_reaudit_delta
+
+    prior = _basic_report()
+    current = _basic_report()
+    prior["merchant_view"]["headline"]["scores"]["attribution"] = 35
+    prior["verdict"]["attribution_score"] = 35
+    current["merchant_view"]["headline"]["scores"]["attribution"] = 55
+    current["verdict"]["attribution_score"] = 55
+
+    async def fake_fetch(*, run_id: str) -> Dict[str, Any]:
+        assert run_id == "prior-run"
+        return {"report_jsonb": {"per_product": [prior]}}
+
+    monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+
+    await _attach_reaudit_delta(
+        current,
+        merchant_id="merchant_123",
+        prior_runs=[
+            {
+                "run_id": "prior-run",
+                "status": "succeeded",
+                "requested_at": "2026-05-01T00:00:00+00:00",
+            }
+        ],
+    )
+
+    delta = current["merchant_view"]["reaudit_delta"]
+    movement = next(m for m in delta["movements"] if m["signal"] == "attribution")
+    assert movement["direction"] == "improved"
+    assert movement["is_material"] is True
 
 
 def test_discovery_lift_layer1_pivota_status_points_to_pdp_baseline_artifact() -> None:
