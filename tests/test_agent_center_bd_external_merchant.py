@@ -1128,6 +1128,15 @@ def test_render_markdown_includes_industry_context_and_actions() -> None:
     # Industry context section + concrete category figure
     assert "## Industry context" in md
     assert "12%" in md
+    # Distilled NBA appears before the longer action queue.
+    assert "## What should you do next?" in md
+    assert "**First move:**" in md
+    assert "Why this is the leak" in md
+    assert "Gap read" in md
+    assert "Do yourself this week" in md
+    assert "Use Pivota for" in md
+    assert "How to track" in md
+    assert md.find("## What should you do next?") < md.find("## Recommended actions")
     # Recommended actions section + at least one severity-tagged item
     assert "## Recommended actions" in md
     assert "_(severity:" in md

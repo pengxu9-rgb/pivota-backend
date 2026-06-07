@@ -355,6 +355,143 @@ def _render_recommendations(action_items: Optional[List[Dict[str, Any]]]) -> str
     return "".join(out)
 
 
+def _chip_values(items: Any, *, key: str, limit: int = 4) -> List[str]:
+    values: List[str] = []
+    if not isinstance(items, list):
+        return values
+    for item in items:
+        value = ""
+        if isinstance(item, dict):
+            value = str(item.get(key) or "").strip()
+        else:
+            value = str(item or "").strip()
+        if value and value not in values:
+            values.append(value)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def _render_next_best_action(next_best_action: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(next_best_action, dict):
+        return ""
+    headline = str(next_best_action.get("headline") or "").strip()
+    why = str(next_best_action.get("why_this_first") or "").strip()
+    first_move = str(next_best_action.get("first_move") or "").strip()
+    evidence_summary = str(next_best_action.get("evidence_summary") or "").strip()
+    evidence_chips = [
+        str(chip).strip()
+        for chip in (next_best_action.get("evidence_chips") or [])
+        if str(chip).strip()
+    ][:4]
+    self_serve = [
+        str(action).strip()
+        for action in (
+            next_best_action.get("self_serve")
+            or next_best_action.get("self_serve_actions")
+            or []
+        )
+        if str(action).strip()
+    ][:2]
+    pivota_items = [
+        str(action).strip()
+        for action in (
+            next_best_action.get("pivota_assisted")
+            or [next_best_action.get("pivota_path")]
+        )
+        if str(action).strip()
+    ][:1]
+    if not any([headline, why, first_move, self_serve, pivota_items]):
+        return ""
+
+    evidence = (
+        next_best_action.get("evidence")
+        if isinstance(next_best_action.get("evidence"), dict)
+        else next_best_action.get("evidence_used")
+    )
+    evidence = evidence if isinstance(evidence, dict) else {}
+    hosts = _chip_values(
+        (
+            evidence.get("retailer_hosts")
+            or evidence.get("source_hosts")
+            or evidence.get("cited_hosts")
+        ),
+        key="host",
+    )
+    competitors = _chip_values(evidence.get("competitors_named"), key="name")
+    queries = _chip_values(evidence.get("failed_query_examples"), key="query", limit=3)
+    secondary_moves = [
+        move for move in (next_best_action.get("secondary_moves") or [])
+        if isinstance(move, dict) and str(move.get("title") or "").strip()
+    ][:2]
+    tracking_metrics = [
+        str(metric).strip()
+        for metric in (
+            next_best_action.get("tracking_metrics")
+            or next_best_action.get("how_to_track")
+            or []
+        )
+        if str(metric).strip()
+    ][:3]
+
+    out: List[str] = [_section_title("What Should You Do Next?")]
+    if headline:
+        out.append(f"**{headline}**\n\n")
+    if why:
+        out.append(why + "\n\n")
+    if first_move:
+        out.append(f"**First move:** {first_move}\n\n")
+    if evidence_summary:
+        out.append(f"**Why this is the leak:** {evidence_summary}\n\n")
+    if evidence_chips:
+        out.append("**Gap read:** " + " · ".join(evidence_chips) + "\n\n")
+    evidence_bits: List[str] = []
+    if queries:
+        evidence_bits.append("queries: " + ", ".join(f"`{q}`" for q in queries))
+    if hosts:
+        evidence_bits.append("cited hosts: " + ", ".join(f"`{h}`" for h in hosts))
+    if competitors:
+        evidence_bits.append("competitors: " + ", ".join(competitors))
+    if evidence_bits:
+        out.append("**Evidence:** " + " · ".join(evidence_bits) + "\n\n")
+    if self_serve:
+        out.append("**Do yourself this week:**\n\n")
+        for action in self_serve:
+            out.append(f"- {action}\n")
+        out.append("\n")
+    if pivota_items:
+        out.append("**Use Pivota for:**\n\n")
+        for action in pivota_items:
+            out.append(f"- {action}\n")
+        out.append("\n")
+    if secondary_moves:
+        out.append("**Secondary moves:**\n\n")
+        for move in secondary_moves:
+            reason = str(move.get("reason") or "").strip()
+            out.append(f"- {move['title']}")
+            if reason:
+                out.append(f" — {reason}")
+            out.append("\n")
+        out.append("\n")
+    if tracking_metrics:
+        out.append("**How to track:**\n\n")
+        for metric in tracking_metrics:
+            out.append(f"- {metric}\n")
+        out.append("\n")
+    cta = next_best_action.get("cta")
+    if isinstance(cta, dict):
+        label = str(cta.get("label") or "").strip()
+        trust_note = str(cta.get("trust_note") or "").strip()
+        if label or trust_note:
+            out.append("**CTA:** ")
+            if label:
+                out.append(label)
+            if trust_note:
+                out.append(f" — {trust_note}")
+            out.append("\n\n")
+    return "".join(out)
+
+
 def _render_owned_buyer_path_play(next_best_action: Optional[Dict[str, Any]]) -> str:
     if not isinstance(next_best_action, dict):
         return ""
@@ -612,22 +749,24 @@ def render_brand_markdown_v2(
     sections.append(_render_competitive_analysis(primary))
     # 7. Editorial Publisher Analysis (publisher tier/cadence from PR-7c)
     sections.append(_render_publisher_analysis(primary))
-    # 8. Recommendations (action items v2 from PR-8b)
     mv = primary.get("merchant_view") or {}
+    # 8. What should you do next? (merchant-facing decision layer)
+    sections.append(_render_next_best_action(mv.get("next_best_action")))
+    # 9. Recommendations (action items v2 from PR-8b)
     sections.append(_render_recommendations(mv.get("actions")))
-    # 9. Owned buyer-path play (canonical page + route strategy)
+    # 10. Owned buyer-path play (canonical page + route strategy)
     sections.append(_render_owned_buyer_path_play(mv.get("next_best_action")))
-    # 10. Implementation Roadmap (PR-8c)
+    # 11. Implementation Roadmap (PR-8c)
     sections.append(_render_implementation_roadmap(
         primary.get("implementation_roadmap")
     ))
-    # 11. Pivota Commitments (PR-8d)
+    # 12. Pivota Commitments (PR-8d)
     sections.append(_render_pivota_commitments(
         primary.get("pivota_commitments")
     ))
-    # 12. Methodology
+    # 13. Methodology
     sections.append(_render_methodology(primary))
-    # 13. Appendix
+    # 14. Appendix
     sections.append(_render_appendix(primary))
 
     return "".join(sections)

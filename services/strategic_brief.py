@@ -1074,22 +1074,24 @@ def _controller_source_route_action(
     move_type = _controller_source_route_move_type(profile)
     if move_type == "community_source_participation":
         forum, publisher, other = _split_controllers_by_move_type(profile)
-        if publisher:
-            # Mixed forum + publisher controllers: address each by its own play
-            # instead of calling a publisher part of "the discussion".
+        if publisher or other:
+            # Mixed controller sets: address each by its own play instead of
+            # calling non-community sources part of "the discussion".
             clauses: List[str] = []
             if forum:
                 clauses.append(
                     f"participate in or seed accurate product info in the "
                     f"{_phrase_join(forum, controller_phrase)} discussion"
                 )
-            clauses.append(
-                f"pitch {_phrase_join(publisher, controller_phrase)} with exact SKU "
-                "facts, proof assets, images, and availability"
-            )
+            if publisher:
+                clauses.append(
+                    f"pitch {_phrase_join(publisher, controller_phrase)} with exact SKU "
+                    "facts, proof assets, images, and availability"
+                )
             if other:
                 clauses.append(
-                    f"fix the {_phrase_join(other, controller_phrase)} listing facts"
+                    f"work the evidenced source trail around "
+                    f"{_phrase_join(other, controller_phrase)}"
                 )
             return (
                 f"{_phrase_join(clauses, '')} for {lane}, using only facts already "

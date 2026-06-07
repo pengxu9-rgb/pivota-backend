@@ -532,6 +532,159 @@ def _render_recommendations_html(action_items: Optional[List[Dict[str, Any]]]) -
     return "".join(out)
 
 
+def _chip_values(items: Any, *, key: str, limit: int = 4) -> List[str]:
+    values: List[str] = []
+    if not isinstance(items, list):
+        return values
+    for item in items:
+        value = ""
+        if isinstance(item, dict):
+            value = str(item.get(key) or "").strip()
+        else:
+            value = str(item or "").strip()
+        if value and value not in values:
+            values.append(value)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def _render_next_best_action_html(next_best_action: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(next_best_action, dict):
+        return ""
+    headline = str(next_best_action.get("headline") or "").strip()
+    why = str(next_best_action.get("why_this_first") or "").strip()
+    first_move = str(next_best_action.get("first_move") or "").strip()
+    evidence_summary = str(next_best_action.get("evidence_summary") or "").strip()
+    evidence_chips = [
+        str(chip).strip()
+        for chip in (next_best_action.get("evidence_chips") or [])
+        if str(chip).strip()
+    ][:4]
+    self_serve = [
+        str(action).strip()
+        for action in (
+            next_best_action.get("self_serve")
+            or next_best_action.get("self_serve_actions")
+            or []
+        )
+        if str(action).strip()
+    ][:2]
+    pivota_items = [
+        str(action).strip()
+        for action in (
+            next_best_action.get("pivota_assisted")
+            or [next_best_action.get("pivota_path")]
+        )
+        if str(action).strip()
+    ][:1]
+    if not any([headline, why, first_move, self_serve, pivota_items]):
+        return ""
+
+    evidence = (
+        next_best_action.get("evidence")
+        if isinstance(next_best_action.get("evidence"), dict)
+        else next_best_action.get("evidence_used")
+    )
+    evidence = evidence if isinstance(evidence, dict) else {}
+    hosts = _chip_values(
+        (
+            evidence.get("retailer_hosts")
+            or evidence.get("source_hosts")
+            or evidence.get("cited_hosts")
+        ),
+        key="host",
+    )
+    competitors = _chip_values(evidence.get("competitors_named"), key="name")
+    queries = _chip_values(evidence.get("failed_query_examples"), key="query", limit=3)
+    secondary_moves = [
+        move for move in (next_best_action.get("secondary_moves") or [])
+        if isinstance(move, dict) and str(move.get("title") or "").strip()
+    ][:2]
+    tracking_metrics = [
+        str(metric).strip()
+        for metric in (
+            next_best_action.get("tracking_metrics")
+            or next_best_action.get("how_to_track")
+            or []
+        )
+        if str(metric).strip()
+    ][:3]
+
+    out: List[str] = [_h(2, "What Should You Do Next?")]
+    out.append('<div class="summary-box no-break">\n')
+    if headline:
+        out.append(f"<p><strong>{_escape(headline)}</strong></p>\n")
+    if why:
+        out.append(f"<p>{_escape(why)}</p>\n")
+    if first_move:
+        out.append(f"<p><strong>First move:</strong> {_escape(first_move)}</p>\n")
+    if evidence_summary:
+        out.append(
+            f"<p><strong>Why this is the leak:</strong> {_escape(evidence_summary)}</p>\n"
+        )
+    if evidence_chips:
+        out.append(
+            "<p><strong>Gap read:</strong> "
+            + " &middot; ".join(_escape(chip) for chip in evidence_chips)
+            + "</p>\n"
+        )
+    evidence_bits: List[str] = []
+    if queries:
+        evidence_bits.append(
+            "queries: " + ", ".join(f"<code>{_escape(q)}</code>" for q in queries)
+        )
+    if hosts:
+        evidence_bits.append(
+            "cited hosts: " + ", ".join(f"<code>{_escape(h)}</code>" for h in hosts)
+        )
+    if competitors:
+        evidence_bits.append(
+            "competitors: " + ", ".join(_escape(name) for name in competitors)
+        )
+    if evidence_bits:
+        out.append(
+            f"<p><strong>Evidence:</strong> {' &middot; '.join(evidence_bits)}</p>\n"
+        )
+    if self_serve:
+        out.append("<p><strong>Do yourself this week:</strong></p>\n<ul>\n")
+        for action in self_serve:
+            out.append(f"<li>{_escape(action)}</li>\n")
+        out.append("</ul>\n")
+    if pivota_items:
+        out.append("<p><strong>Use Pivota for:</strong></p>\n<ul>\n")
+        for action in pivota_items:
+            out.append(f"<li>{_escape(action)}</li>\n")
+        out.append("</ul>\n")
+    if secondary_moves:
+        out.append("<p><strong>Secondary moves:</strong></p>\n<ul>\n")
+        for move in secondary_moves:
+            reason = str(move.get("reason") or "").strip()
+            out.append(f"<li>{_escape(move['title'])}")
+            if reason:
+                out.append(f" — {_escape(reason)}")
+            out.append("</li>\n")
+        out.append("</ul>\n")
+    if tracking_metrics:
+        out.append("<p><strong>How to track:</strong></p>\n<ul>\n")
+        for metric in tracking_metrics:
+            out.append(f"<li>{_escape(metric)}</li>\n")
+        out.append("</ul>\n")
+    cta = next_best_action.get("cta")
+    if isinstance(cta, dict):
+        label = str(cta.get("label") or "").strip()
+        trust_note = str(cta.get("trust_note") or "").strip()
+        if label or trust_note:
+            out.append("<p><strong>CTA:</strong> ")
+            if label:
+                out.append(_escape(label))
+            if trust_note:
+                out.append(f" — {_escape(trust_note)}")
+            out.append("</p>\n")
+    out.append("</div>\n")
+    return "".join(out)
+
+
 def _render_owned_buyer_path_play_html(next_best_action: Optional[Dict[str, Any]]) -> str:
     if not isinstance(next_best_action, dict):
         return ""
@@ -796,6 +949,7 @@ def render_brand_html_v2(
     body_sections.append(_render_competitive_analysis_html(primary))
     body_sections.append(_render_publisher_analysis_html(primary))
     mv = primary.get("merchant_view") or {}
+    body_sections.append(_render_next_best_action_html(mv.get("next_best_action")))
     body_sections.append(_render_recommendations_html(mv.get("actions")))
     body_sections.append(_render_owned_buyer_path_play_html(
         mv.get("next_best_action")

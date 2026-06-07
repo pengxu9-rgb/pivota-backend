@@ -112,6 +112,61 @@ def _gruns_fixture_audit():
                     },
                 ],
                 "next_best_action": {
+                    "headline": (
+                        "Win non-branded collagen discovery before optimizing "
+                        "more named-product visibility."
+                    ),
+                    "why_this_first": (
+                        "AI can find Grüns when named, but category shoppers are "
+                        "still learning from Forbes and competitor-heavy roundups."
+                    ),
+                    "first_move": (
+                        "Add category-intent comparison modules, then pitch the "
+                        "cited sources that already shape AI answers."
+                    ),
+                    "evidence_summary": (
+                        "Named visibility is 88 vs category visibility 52: "
+                        "a 36-point category gap."
+                    ),
+                    "evidence_chips": [
+                        "Visibility 88",
+                        "Attribution 70",
+                        "Category visibility 52",
+                    ],
+                    "self_serve_actions": [
+                        "Answer the failed category questions on the official PDP.",
+                        "Pitch Forbes with the specific competitor comparison angle.",
+                    ],
+                    "pivota_path": (
+                        "Pivota can turn the official PDP into a canonical, "
+                        "buyable AI-channel path and monitor whether attribution moves."
+                    ),
+                    "evidence_used": {
+                        "failed_query_examples": [
+                            {"query": "best daily greens supplements"},
+                        ],
+                        "source_hosts": [
+                            {"host": "forbes.com", "times_cited": 2},
+                        ],
+                        "competitors_named": ["AG1", "Bloom"],
+                    },
+                    "secondary_moves": [
+                        {
+                            "title": "Pitch forbes.com editorial team",
+                            "reason": "forbes.com was cited 2 times.",
+                        }
+                    ],
+                    "tracking_metrics": [
+                        "Category visibility on the failed non-branded questions.",
+                        "Competitor-only answers where the merchant is still absent.",
+                    ],
+                    "cta": {
+                        "label": "Create the owned AI buying path",
+                        "trust_note": (
+                            "You can do the content and PR work yourself; Pivota "
+                            "is for canonical serving, checkout, and monitoring."
+                        ),
+                    },
                     "canonical_page_play": {
                         "lane": "vitamin c collagen jelly",
                         "controllers": [
@@ -283,6 +338,27 @@ def test_renders_recommendations_with_owner_kpi_outcome():
     assert "Suggested outreach" in md
 
 
+def test_renders_next_best_action_before_recommendations():
+    from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
+    md = render_brand_markdown_v2(_gruns_fixture_audit())
+    assert "## What Should You Do Next?" in md
+    assert "Win non-branded collagen discovery" in md
+    assert "**First move:** Add category-intent comparison modules" in md
+    assert "Why this is the leak" in md
+    assert "36-point category gap" in md
+    assert "Gap read" in md
+    assert "Category visibility 52" in md
+    assert "Do yourself this week" in md
+    assert "Use Pivota for" in md
+    assert "`best daily greens supplements`" in md
+    assert "`forbes.com`" in md
+    assert "AG1" in md
+    assert "How to track" in md
+    assert "Category visibility on the failed non-branded questions" in md
+    assert "Create the owned AI buying path" in md
+    assert md.find("## What Should You Do Next?") < md.find("## Recommendations")
+
+
 def test_renders_owned_buyer_path_play_with_controller_strategy():
     from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
     md = render_brand_markdown_v2(_gruns_fixture_audit())
@@ -343,7 +419,9 @@ def test_section_ordering_matches_polished_pdf():
         "## Evidence Quotes",
         "## Competitive Analysis",
         "## Editorial Publisher Analysis",
+        "## What Should You Do Next?",
         "## Recommendations",
+        "## Owned Buyer Path Play",
         "## Implementation Roadmap",
         "## Pivota's Commitment",
         "## Methodology",

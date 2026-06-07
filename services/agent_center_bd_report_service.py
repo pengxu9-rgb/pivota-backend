@@ -3799,6 +3799,7 @@ async def build_per_sku_report(
         verify_summary=verify_summary_out,
         identity=identity,
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
+        merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
     )
     next_best_action = await attach_sku_strategic_brief(
         next_best_action,
@@ -5886,6 +5887,7 @@ def _display_sku_intelligence(
             "unresolved": not bool(title and title != "this product"),
         },
         sku_title=title,
+        merchant_host=merchant_host,
     )
     return {
         "hero_sku": {
@@ -10392,6 +10394,144 @@ def build_structured_report(
     }
 
 
+def _markdown_chip_values(items: Any, *, key: str, limit: int = 4) -> List[str]:
+    values: List[str] = []
+    if not isinstance(items, list):
+        return values
+    for item in items:
+        value = ""
+        if isinstance(item, Mapping):
+            value = str(item.get(key) or "").strip()
+        else:
+            value = str(item or "").strip()
+        if value and value not in values:
+            values.append(value)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def _render_next_best_action_markdown(next_best_action: Optional[Mapping[str, Any]]) -> str:
+    if not isinstance(next_best_action, Mapping):
+        return ""
+    headline = str(next_best_action.get("headline") or "").strip()
+    why = str(next_best_action.get("why_this_first") or "").strip()
+    first_move = str(next_best_action.get("first_move") or "").strip()
+    evidence_summary = str(next_best_action.get("evidence_summary") or "").strip()
+    evidence_chips = [
+        str(chip).strip()
+        for chip in (next_best_action.get("evidence_chips") or [])
+        if str(chip).strip()
+    ][:4]
+    self_serve = [
+        str(action).strip()
+        for action in (
+            next_best_action.get("self_serve")
+            or next_best_action.get("self_serve_actions")
+            or []
+        )
+        if str(action).strip()
+    ][:2]
+    pivota_items = [
+        str(action).strip()
+        for action in (
+            next_best_action.get("pivota_assisted")
+            or [next_best_action.get("pivota_path")]
+        )
+        if str(action).strip()
+    ][:1]
+    if not any([headline, why, first_move, self_serve, pivota_items]):
+        return ""
+
+    evidence = (
+        next_best_action.get("evidence")
+        if isinstance(next_best_action.get("evidence"), Mapping)
+        else next_best_action.get("evidence_used")
+    )
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    hosts = _markdown_chip_values(
+        (
+            evidence.get("retailer_hosts")
+            or evidence.get("source_hosts")
+            or evidence.get("cited_hosts")
+        ),
+        key="host",
+    )
+    competitors = _markdown_chip_values(evidence.get("competitors_named"), key="name")
+    queries = _markdown_chip_values(
+        evidence.get("failed_query_examples"),
+        key="query",
+        limit=3,
+    )
+    secondary_moves = [
+        move for move in (next_best_action.get("secondary_moves") or [])
+        if isinstance(move, Mapping) and str(move.get("title") or "").strip()
+    ][:2]
+    tracking_metrics = [
+        str(metric).strip()
+        for metric in (
+            next_best_action.get("tracking_metrics")
+            or next_best_action.get("how_to_track")
+            or []
+        )
+        if str(metric).strip()
+    ][:3]
+
+    out: List[str] = ["## What should you do next?\n"]
+    if headline:
+        out.append(f"**{headline}**\n")
+    if why:
+        out.append(f"{why}\n")
+    if first_move:
+        out.append(f"**First move:** {first_move}\n")
+    if evidence_summary:
+        out.append(f"**Why this is the leak:** {evidence_summary}\n")
+    if evidence_chips:
+        out.append("**Gap read:** " + " · ".join(evidence_chips) + "\n")
+    evidence_bits: List[str] = []
+    if queries:
+        evidence_bits.append("queries: " + ", ".join(f"`{query}`" for query in queries))
+    if hosts:
+        evidence_bits.append("cited hosts: " + ", ".join(f"`{host}`" for host in hosts))
+    if competitors:
+        evidence_bits.append("competitors: " + ", ".join(competitors))
+    if evidence_bits:
+        out.append("**Evidence:** " + " · ".join(evidence_bits) + "\n")
+    if self_serve:
+        out.append("\n**Do yourself this week:**\n")
+        for action in self_serve:
+            out.append(f"- {action}\n")
+    if pivota_items:
+        out.append("\n**Use Pivota for:**\n")
+        for action in pivota_items:
+            out.append(f"- {action}\n")
+    if secondary_moves:
+        out.append("\n**Secondary moves:**\n")
+        for move in secondary_moves:
+            reason = str(move.get("reason") or "").strip()
+            out.append(f"- {move['title']}")
+            if reason:
+                out.append(f" — {reason}")
+            out.append("\n")
+    if tracking_metrics:
+        out.append("\n**How to track:**\n")
+        for metric in tracking_metrics:
+            out.append(f"- {metric}\n")
+    cta = next_best_action.get("cta")
+    if isinstance(cta, Mapping):
+        label = str(cta.get("label") or "").strip()
+        trust_note = str(cta.get("trust_note") or "").strip()
+        if label or trust_note:
+            out.append("\n**CTA:** ")
+            if label:
+                out.append(label)
+            if trust_note:
+                out.append(f" — {trust_note}")
+            out.append("\n")
+    out.append("\n")
+    return "".join(out)
+
+
 def _render_owned_buyer_path_play_markdown(next_best_action: Optional[Mapping[str, Any]]) -> str:
     if not isinstance(next_best_action, Mapping):
         return ""
@@ -10555,6 +10695,13 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
                 f"_24-month projection:_ {industry['forward_projection']}\n"
             )
 
+    mv_for_play = report.get("merchant_view") if isinstance(report.get("merchant_view"), dict) else {}
+    sections.append(
+        _render_next_best_action_markdown(
+            mv_for_play.get("next_best_action") if isinstance(mv_for_play, dict) else None
+        )
+    )
+
     # Recommended actions — derived from the merchant's actual failed
     # queries / cited competitors, not generic prose.
     actions = report.get("action_items") or []
@@ -10566,7 +10713,6 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             body = action.get("body") or ""
             sections.append(f"**{idx}. {title}** _(severity: {sev})_  \n{body}\n")
 
-    mv_for_play = report.get("merchant_view") if isinstance(report.get("merchant_view"), dict) else {}
     sections.append(
         _render_owned_buyer_path_play_markdown(
             mv_for_play.get("next_best_action") if isinstance(mv_for_play, dict) else None

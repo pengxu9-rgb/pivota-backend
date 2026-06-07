@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controllers_for_row,
@@ -42,7 +43,6 @@ PRIMARY_SKU_SOURCE_ROUTE_REPAIR = "source_route_repair"
 PRIMARY_SKU_PROTECTED_MONITORING = "protected_monitoring"
 PRIMARY_SKU_INSUFFICIENT_DATA = "insufficient_data"
 
-_VERDICT_INVISIBLE = "INVISIBLE"
 _VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
 _VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
 _VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY = "CATEGORY MENTION, NO FIRST-PARTY"
@@ -70,6 +70,8 @@ _PUBLISHER_CONTROLLER_TYPES = {"editorial", "publisher", "video"}
 _LISTING_CONTROLLER_TYPES = {"marketplace", "retailer"}
 _REQUIRED_INTEGRATION_PIECES = {"store_platform", "psp"}
 _SEVERITY_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2}
+
+
 def classify_primary_gap(
     *,
     merchant_view: Mapping[str, Any],
@@ -81,7 +83,6 @@ def classify_primary_gap(
     headline = _as_mapping(merchant_view.get("headline"))
     receipts = _as_mapping(merchant_view.get("receipts"))
     scores = _as_mapping(headline.get("scores"))
-    verdict_label = str(headline.get("verdict_label") or "").strip().upper()
 
     visibility = _score(scores.get("visibility"))
     attribution = _score(scores.get("attribution"))
@@ -106,11 +107,13 @@ def classify_primary_gap(
     ):
         return PRIMARY_INTEGRATION_COMPLETION
 
-    if (
-        verdict_label == _VERDICT_INVISIBLE
-        and attribution < 30
-        and visibility < 30
-    ):
+    # Weak first-party retrieval no longer requires the verdict label to be
+    # exactly INVISIBLE, but it must not preempt the category-visible stories
+    # (retailer route leak / category discovery both need best_visibility >= 50).
+    # Without the best_visibility gate, a merchant strong in category but weak on
+    # branded queries would be told to "get indexed" instead of winning the
+    # click back from the retailers AI already cites.
+    if attribution < 30 and visibility < 30 and best_visibility < 50:
         return PRIMARY_RETRIEVAL_FOUNDATION
 
     if (
@@ -134,6 +137,9 @@ def classify_primary_gap(
         and (len(competitor_names) >= 3 or repeated_competitor)
     ):
         return PRIMARY_COMPETITOR_SOURCE
+
+    if attribution < 30 and visibility < 30:
+        return PRIMARY_RETRIEVAL_FOUNDATION
 
     return PRIMARY_FIRST_PARTY_DEFENSE
 
@@ -180,6 +186,7 @@ def build_sku_next_best_action(
     verify_summary: Optional[Mapping[str, Any]] = None,
     identity: Optional[Mapping[str, Any]] = None,
     sku_title: Optional[str] = None,
+    merchant_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a deterministic per-SKU next-best-action prescription."""
 
@@ -203,6 +210,7 @@ def build_sku_next_best_action(
         verify_summary=_as_mapping(verify_summary),
         identity=_as_mapping(identity),
         sku_title=sku_title,
+        merchant_host=merchant_host,
     )
     prescription = _sku_prescription_for_gap(
         primary_gap=primary_gap,
@@ -311,6 +319,7 @@ def _build_sku_evidence_used(
     verify_summary: Mapping[str, Any],
     identity: Mapping[str, Any],
     sku_title: Optional[str],
+    merchant_host: Optional[str],
 ) -> Dict[str, Any]:
     sideways_wedge = _as_mapping(opportunity.get("sideways_wedge")) or build_sideways_wedge(
         _as_list(opportunity.get("per_prompt")),
@@ -324,7 +333,10 @@ def _build_sku_evidence_used(
         "top_open_lane": _sku_lane_chip(_sku_top_open_lane(opportunity)),
         "substitution_alert": dict(_as_mapping(opportunity.get("substitution_alert"))),
         "content_gap": _sku_gap_chip(_sku_top_content_gap(primary_gaps)),
-        "source_route_prompt": _sku_prompt_chip(_sku_source_route_prompt(opportunity)),
+        "source_route_prompt": _sku_prompt_chip(
+            _sku_source_route_prompt(opportunity),
+            merchant_host=merchant_host,
+        ),
         "coverage": dict(_as_mapping(opportunity.get("confidence"))),
         "demand_state_summary": opportunity.get("demand_state_summary"),
         "intent_ladder": dict(_as_mapping(opportunity.get("intent_ladder"))),
@@ -713,11 +725,18 @@ def _sku_gap_chip(gap: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+def _sku_prompt_chip(
+    prompt: Optional[Mapping[str, Any]],
+    *,
+    merchant_host: Optional[str] = None,
+) -> Dict[str, Any]:
     if not prompt:
         return {}
     source_summary = _as_mapping(prompt.get("source_summary"))
-    stable_sources = stable_buyer_path_controllers_for_row(prompt)
+    stable_sources = _exclude_merchant_host_sources(
+        stable_buyer_path_controllers_for_row(prompt),
+        merchant_host=merchant_host,
+    )
     out = {
         "query": prompt.get("query"),
         "ownership_state": prompt.get("ownership_state"),
@@ -725,7 +744,10 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         "opportunity_score": prompt.get("opportunity_score"),
         "why_fit": prompt.get("attribute_basis") or prompt.get("evidence"),
         "sources": stable_sources[:3],
-        "raw_top_cited_hosts": _as_list(source_summary.get("top_cited_hosts"))[:3],
+        "raw_top_cited_hosts": _exclude_merchant_host_sources(
+            source_summary.get("top_cited_hosts"),
+            merchant_host=merchant_host,
+        )[:3],
         "competitors": _as_list(prompt.get("competitors"))[:5],
     }
     for key in (
@@ -739,6 +761,45 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         if key in prompt:
             out[key] = prompt.get(key)
     return out
+
+
+def _exclude_merchant_host_sources(
+    sources: Any,
+    *,
+    merchant_host: Optional[str],
+) -> List[Any]:
+    excluded = _normalize_host_value(merchant_host)
+    if not excluded:
+        return list(_as_list(sources))
+    out: List[Any] = []
+    for row in _as_list(sources):
+        host = ""
+        if isinstance(row, Mapping):
+            host = _normalize_host_value(
+                row.get("host") or row.get("domain") or row.get("url") or row.get("uri")
+            )
+        else:
+            host = _normalize_host_value(row)
+        if host and _same_or_subdomain(host, excluded):
+            continue
+        out.append(row)
+    return out
+
+
+def _same_or_subdomain(host: str, parent: str) -> bool:
+    return bool(host and parent and (host == parent or host.endswith("." + parent)))
+
+
+def _normalize_host_value(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    parsed = urlsplit(text if "://" in text else f"//{text}")
+    host = parsed.netloc or parsed.path.split("/", 1)[0]
+    host = host.rsplit("@", 1)[-1].split(":", 1)[0].strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host if "." in host else ""
 
 
 def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
@@ -1012,14 +1073,14 @@ def _sku_source_route_follow_up(
     profile = _route_prompt_controller_profile(prompt)
     if is_canonical_source_vacuum(profile):
         return (
-            f"Then {_controller_source_route_action(profile, sources, query, page)} "
+            f"Then {_controller_source_route_action(profile, sources, query, page)}. "
             "Keep SKU name, attributes, availability, and images consistent across "
             f"{page} and {sources}; re-audit the lane and verify materiality before "
             "treating exposure as lost buyer traffic."
         )
     if str(profile.get("strategy") or "") == "source_authority_gap":
         return (
-            f"Then {_controller_source_route_action(profile, sources, query, page)} "
+            f"Then {_controller_source_route_action(profile, sources, query, page)}. "
             "Keep SKU name, attributes, availability, and images consistent across "
             f"{page} and {sources}; re-audit the lane and verify materiality before "
             "treating exposure as lost buyer traffic."
@@ -1109,21 +1170,24 @@ def _controller_source_route_action(
     move_type = _controller_source_route_move_type(profile)
     if move_type == "community_source_participation":
         forum, publisher, other = _split_controllers_by_move_type(profile)
-        if publisher:
-            # Mixed forum + publisher controllers: address each by its own play
-            # instead of calling a publisher part of "the discussion".
+        if publisher or other:
+            # Mixed controller sets: address each by its own play instead of
+            # calling non-community sources part of "the discussion".
             clauses: List[str] = []
             if forum:
                 clauses.append(
                     f"participate in or seed accurate product info in the "
                     f"{_phrase(forum, controller)} discussion"
                 )
-            clauses.append(
-                f"pitch {_phrase(publisher, controller)} with exact SKU facts, "
-                "proof assets, images, and availability"
-            )
+            if publisher:
+                clauses.append(
+                    f"pitch {_phrase(publisher, controller)} with exact SKU facts, "
+                    "proof assets, images, and availability"
+                )
             if other:
-                clauses.append(f"fix the {_phrase(other, controller)} listing facts")
+                clauses.append(
+                    f"work the evidenced source trail around {_phrase(other, controller)}"
+                )
             return (
                 f"{_phrase(clauses, '')} for {lane}, using only facts already "
                 f"published on {page}"
@@ -1953,6 +2017,14 @@ def _base_payload(
     canonical_page_play: Optional[Mapping[str, Any]] = None,
     sideways_wedge: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    tracking_metrics = _tracking_metrics_for_gap(
+        primary_gap=primary_gap,
+        evidence=evidence_used,
+    )
+    evidence_read = _evidence_read_for_gap(
+        primary_gap=primary_gap,
+        evidence=evidence_used,
+    )
     out = {
         "primary_gap": primary_gap,
         "headline": headline,
@@ -1961,6 +2033,13 @@ def _base_payload(
         "self_serve_actions": list(self_serve_actions[:2]),
         "pivota_path": pivota_path,
         "evidence_used": dict(evidence_used),
+        "evidence": dict(evidence_used),
+        "evidence_summary": evidence_read["summary"],
+        "evidence_chips": evidence_read["chips"],
+        "self_serve": list(self_serve_actions[:2]),
+        "pivota_assisted": [pivota_path],
+        "tracking_metrics": tracking_metrics,
+        "how_to_track": list(tracking_metrics),
         "secondary_moves": [],
         "cta": dict(cta),
     }
@@ -1975,6 +2054,302 @@ def _base_payload(
     if sideways_wedge:
         out["sideways_wedge"] = dict(sideways_wedge)
     return out
+
+
+def _evidence_read_for_gap(
+    *,
+    primary_gap: str,
+    evidence: Mapping[str, Any],
+) -> Dict[str, Any]:
+    scores = _as_mapping(evidence.get("scores"))
+    visibility = _optional_score(scores.get("visibility"))
+    attribution = _optional_score(scores.get("attribution"))
+    category_visibility = _optional_score(scores.get("category_visibility"))
+    sku_score_chips = _sku_score_evidence_chips(scores)
+
+    if primary_gap == PRIMARY_INTEGRATION_COMPLETION:
+        missing = _integration_missing_labels(evidence.get("integration_missing_pieces"))
+        missing_phrase = _phrase(missing, "required setup pieces")
+        return {
+            "summary": f"Setup is incomplete: {missing_phrase} still needs to be connected.",
+            "chips": [f"Missing: {missing_phrase}"],
+        }
+
+    if primary_gap == PRIMARY_RETRIEVAL_FOUNDATION:
+        chips = _brand_score_chips(
+            visibility=visibility,
+            attribution=attribution,
+            category_visibility=category_visibility,
+        )
+        if visibility is not None and attribution is not None:
+            summary = (
+                f"Visibility is {visibility} and first-party attribution is {attribution}, "
+                "so the official path is not yet reliably retrievable."
+            )
+        else:
+            summary = "The official path is not yet reliably retrievable in this audit."
+        return {"summary": summary, "chips": chips}
+
+    if primary_gap == PRIMARY_RETAILER_ROUTE_LEAK:
+        best_visibility = max(
+            visibility if visibility is not None else 0,
+            category_visibility if category_visibility is not None else 0,
+        )
+        route_gap = best_visibility - (attribution if attribution is not None else 0)
+        visibility_label = (
+            "Category visibility"
+            if category_visibility is not None and category_visibility >= (visibility or 0)
+            else "Visibility"
+        )
+        summary = (
+            f"{visibility_label} is {best_visibility} while first-party "
+            f"attribution is {attribution if attribution is not None else 0}: "
+            f"a {route_gap}-point route gap."
+        )
+        chips = _brand_score_chips(
+            visibility=visibility,
+            attribution=attribution,
+            category_visibility=category_visibility,
+        )
+        hosts = _host_names(evidence.get("retailer_hosts"))
+        if hosts:
+            chips.append("Retailer routes: " + _phrase(hosts, "retailers"))
+        return {"summary": summary, "chips": chips[:4]}
+
+    if primary_gap == PRIMARY_CATEGORY_DISCOVERY:
+        category_gap = (
+            (visibility if visibility is not None else 0)
+            - (category_visibility if category_visibility is not None else 0)
+        )
+        summary = (
+            f"Named visibility is {visibility if visibility is not None else 0} "
+            f"vs category visibility {category_visibility if category_visibility is not None else 0}: "
+            f"a {category_gap}-point category gap."
+        )
+        chips = _brand_score_chips(
+            visibility=visibility,
+            attribution=attribution,
+            category_visibility=category_visibility,
+        )
+        competitors = _as_str_list(evidence.get("competitors_named"))[:4]
+        if competitors:
+            chips.append("Competitors named: " + _phrase(competitors, "competitors"))
+        return {"summary": summary, "chips": chips[:4]}
+
+    if primary_gap == PRIMARY_COMPETITOR_SOURCE:
+        source_hosts = _host_names(evidence.get("source_hosts"))
+        competitors = _as_str_list(evidence.get("competitors_named"))[:4]
+        summary = (
+            f"The same source trail is teaching AI to name {_phrase(competitors, 'competitors')} "
+            f"on {_tracking_lane(evidence)}."
+        )
+        chips = []
+        if source_hosts:
+            chips.append("Sources: " + _phrase(source_hosts, "cited sources"))
+        if competitors:
+            chips.append("Competitors named: " + _phrase(competitors, "competitors"))
+        return {"summary": summary, "chips": chips}
+
+    if primary_gap == PRIMARY_FIRST_PARTY_DEFENSE:
+        chips = _brand_score_chips(
+            visibility=visibility,
+            attribution=attribution,
+            category_visibility=category_visibility,
+        )
+        summary = "The tested surface is healthy; the job is to defend it and watch drift."
+        return {"summary": summary, "chips": chips}
+
+    if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
+        lane = _as_mapping(evidence.get("top_open_lane"))
+        summary = f"Open lane found: {_sku_query_phrase(lane.get('query') or '')}."
+        return {"summary": summary, "chips": sku_score_chips}
+
+    if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
+        substitution = _as_mapping(evidence.get("substitution_alert"))
+        substitute = str(substitution.get("substituted_by") or "a substitute").strip()
+        prompt = _sku_query_phrase(substitution.get("prompt") or "")
+        return {
+            "summary": f"On {prompt}, AI substitutes {substitute} for this SKU.",
+            "chips": sku_score_chips,
+        }
+
+    if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP:
+        content_gap = _sku_gap_label(_as_mapping(evidence.get("content_gap")))
+        return {
+            "summary": f"The first SKU repair is page evidence: {content_gap}.",
+            "chips": sku_score_chips,
+        }
+
+    if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
+        lane = _tracking_source_lane(evidence)
+        hosts = _tracking_source_hosts(evidence)
+        summary = f"AI is routing {lane} through {hosts}, not the official path."
+        chips = list(sku_score_chips)
+        if hosts:
+            chips.append(f"Controllers: {hosts}")
+        return {"summary": summary, "chips": chips[:4]}
+
+    if primary_gap == PRIMARY_SKU_PROTECTED_MONITORING:
+        return {
+            "summary": "This SKU is protected on the tested surface; monitor for drift.",
+            "chips": sku_score_chips,
+        }
+
+    return {
+        "summary": "The first job is to complete the product evidence foundation.",
+        "chips": sku_score_chips,
+    }
+
+
+def _brand_score_chips(
+    *,
+    visibility: Optional[int],
+    attribution: Optional[int],
+    category_visibility: Optional[int],
+) -> List[str]:
+    chips: List[str] = []
+    if visibility is not None:
+        chips.append(f"Visibility {visibility}")
+    if attribution is not None:
+        chips.append(f"Attribution {attribution}")
+    if category_visibility is not None:
+        chips.append(f"Category visibility {category_visibility}")
+    return chips
+
+
+def _sku_score_evidence_chips(scores: Mapping[str, Any]) -> List[str]:
+    labels = {
+        "identity": "Identity",
+        "content_richness": "Page content",
+        "routability": "Buying path",
+        "citation": "Citation",
+    }
+    chips: List[str] = []
+    for key, label in labels.items():
+        value = _optional_score(scores.get(key))
+        if value is not None:
+            chips.append(f"{label} {value}")
+    return chips
+
+
+def _tracking_metrics_for_gap(
+    *,
+    primary_gap: str,
+    evidence: Mapping[str, Any],
+) -> List[str]:
+    lane = _tracking_lane(evidence)
+    cited_hosts = _tracking_hosts(evidence)
+    competitors = _tracking_competitors(evidence)
+    source_lane = _tracking_source_lane(evidence)
+    source_hosts = _tracking_source_hosts(evidence)
+    open_lane = _tracking_top_lane(evidence)
+    substitute = str(
+        _as_mapping(evidence.get("substitution_alert")).get("substituted_by")
+        or "the substitute"
+    ).strip()
+    content_gap = _sku_gap_label(_as_mapping(evidence.get("content_gap")))
+
+    if primary_gap == PRIMARY_INTEGRATION_COMPLETION:
+        return [
+            "Store and payment setup marked complete.",
+            f"Same audit compared after setup, with first-party citation rate on {lane} measured against this baseline.",
+        ]
+    if primary_gap == PRIMARY_RETRIEVAL_FOUNDATION:
+        return [
+            "Official URLs indexed for the top pages tested in this audit.",
+            f"First-party citation rate on {lane}.",
+            f"Fewer answers routing to {cited_hosts} before the merchant page appears.",
+        ]
+    if primary_gap == PRIMARY_RETAILER_ROUTE_LEAK:
+        return [
+            f"First-party citation rate on {lane}.",
+            f"Share of cited buying paths going to the merchant-owned page versus {cited_hosts}.",
+            "Checkout starts or orders from the owned agent-ready path once instrumented.",
+        ]
+    if primary_gap == PRIMARY_CATEGORY_DISCOVERY:
+        return [
+            f"Category visibility on {lane}.",
+            f"Competitor-only answers naming {competitors} where the merchant is still absent.",
+            f"New citations from {cited_hosts}.",
+        ]
+    if primary_gap == PRIMARY_COMPETITOR_SOURCE:
+        return [
+            f"Inclusion in {cited_hosts}.",
+            f"Competitor-only answer count on {lane}.",
+            "Citations that point back to the official page or comparison proof.",
+        ]
+    if primary_gap == PRIMARY_FIRST_PARTY_DEFENSE:
+        return [
+            "First-party citation rate on the protected prompt set.",
+            "New retailer, marketplace, or competitor hosts entering the top cited list.",
+            "Citation movement after major PDP, catalog, or theme changes.",
+        ]
+    if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
+        return [
+            f"Repeat check of {open_lane} after the PDP section ships.",
+            "Answers citing the official SKU page instead of leaving the lane unowned.",
+        ]
+    if primary_gap == PRIMARY_SKU_SUBSTITUTION_LEAK:
+        return [
+            f"Alternative prompts that name this SKU instead of {substitute}.",
+            "Answers citing the official comparison page or product proof.",
+        ]
+    if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP:
+        return [
+            f"Product-page {content_gap} completeness after the missing facts are added.",
+            "Failed SKU prompts that now answer from the official PDP facts.",
+        ]
+    if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
+        return [
+            f"First-party citation rate on {source_lane}.",
+            f"{source_hosts} losing share to the official PDP or canonical buying path.",
+            "Checkout starts or orders from the owned agent-ready path once instrumented.",
+        ]
+    if primary_gap == PRIMARY_SKU_PROTECTED_MONITORING:
+        return [
+            "First-party citation rate on the protected SKU prompt set.",
+            "New competitor or retailer hosts entering the top cited list.",
+        ]
+    return [
+        "Validated SKU facts present on the official page.",
+        "Same prompt set checked after product evidence is complete.",
+    ]
+
+
+def _tracking_lane(evidence: Mapping[str, Any]) -> str:
+    queries = _query_examples(evidence.get("failed_query_examples"))
+    return _phrase(queries, "the same failed buyer questions")
+
+
+def _tracking_hosts(evidence: Mapping[str, Any]) -> str:
+    hosts = (
+        _host_names(evidence.get("retailer_hosts"))
+        or _host_names(evidence.get("source_hosts"))
+        or _host_names(evidence.get("cited_hosts"))
+    )
+    return _phrase(hosts, "the cited third-party hosts")
+
+
+def _tracking_competitors(evidence: Mapping[str, Any]) -> str:
+    return _phrase(_as_str_list(evidence.get("competitors_named"))[:4], "named competitors")
+
+
+def _tracking_source_lane(evidence: Mapping[str, Any]) -> str:
+    prompt = _as_mapping(evidence.get("source_route_prompt"))
+    query = str(prompt.get("query") or "").strip()
+    return _sku_query_phrase(query or "the exposed SKU lane")
+
+
+def _tracking_source_hosts(evidence: Mapping[str, Any]) -> str:
+    prompt = _as_mapping(evidence.get("source_route_prompt"))
+    hosts = _host_names(prompt.get("sources"))
+    return _phrase(hosts, "cited third-party hosts")
+
+
+def _tracking_top_lane(evidence: Mapping[str, Any]) -> str:
+    lane = _as_mapping(evidence.get("top_open_lane"))
+    query = str(lane.get("query") or "").strip()
+    return _sku_query_phrase(query or "the exact open-lane query")
 
 
 def _build_evidence_used(

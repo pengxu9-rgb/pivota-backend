@@ -1077,6 +1077,28 @@ def test_aggregate_lead_profile_recomputes_recommended_moves_with_aggregate_cont
     assert "reddit.com discussion" not in moves_blob
 
 
+def test_controller_source_route_action_splits_forum_and_unclassified_sources():
+    profile = {
+        "classified_controllers": [
+            {"host": "reddit.com", "input_role": "forum", "type": "forum"},
+            {"host": "moodarabia.com", "input_role": "unclassified", "type": "unclassified"},
+        ]
+    }
+
+    action = strategic_brief._controller_source_route_action(
+        profile,
+        "reddit.com and moodarabia.com",
+        "halal collagen sticks before bed",
+        "your PDP",
+    )
+
+    assert "in the reddit.com discussion" in action
+    assert "work the evidenced source trail around moodarabia.com" in action
+    assert "pitch reddit.com and moodarabia.com" not in action
+    assert "moodarabia.com discussion" not in action
+    assert "reddit.com and moodarabia.com discussion" not in action
+
+
 def test_deterministic_brief_mentions_cited_buyable_agent_checkout_without_fabricated_economics():
     evidence = _evidence()
     evidence["buyer_path_opportunities"] = [
