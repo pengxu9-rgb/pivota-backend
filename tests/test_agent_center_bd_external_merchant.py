@@ -229,8 +229,13 @@ def test_render_markdown_smoke() -> None:
 
     # Top-level structure
     assert "# AI Commerce Readiness Report — Glossier" in report
-    # Verdict picked
-    assert "VISIBLE BUT MISATTRIBUTED" in report or "INVISIBLE" in report or "PARTIAL" in report
+    # Verdict picked (rendered Title-Case in the heading now, so match case-insensitively)
+    report_upper = report.upper()
+    assert (
+        "VISIBLE BUT MISATTRIBUTED" in report_upper
+        or "INVISIBLE" in report_upper
+        or "PARTIAL" in report_upper
+    )
     # Score values appear
     assert "30/100" in report
     assert "0/100" in report
@@ -1128,6 +1133,95 @@ def test_render_markdown_includes_industry_context_and_actions() -> None:
     assert "_(severity:" in md
 
 
+def test_render_markdown_includes_owned_buyer_path_play_checklist() -> None:
+    from services.agent_center_bd_report_service import (
+        build_structured_report,
+        render_markdown_from_structured,
+    )
+
+    report = build_structured_report(
+        merchant_name="Ownist",
+        merchant_pdp_url="https://ownist.com/products/triple-shine-grape",
+        product_title="Ownist Triple Shine Grape",
+        product_vendor="Ownist",
+        product_type="beauty supplement",
+        visibility_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 100},
+            "raw_runs": [_vis_run("q1", visible=True, grounding=["https://x.com"])],
+        },
+        attribution_result={
+            "provider": "gemini",
+            "scores": {"visibility_score": 100},
+            "raw_runs": [_attr_run("q1", found=True, grounding=["https://ownist.com/x"])],
+        },
+        provider="gemini",
+    )
+    report["merchant_view"]["next_best_action"] = {
+        "canonical_page_play": {
+            "lane": "vitamin c collagen jelly",
+            "controllers": ["cogentsteps.net", "medsysgroup.com", "hellokoop.com"],
+            "controller_strategy": "canonical_source_vacuum",
+            "controller_strategy_label": "Canonical-source vacuum",
+            "controller_profile": {
+                "operator_focus": "AI grounding is filling a canonical-source gap with weak third-party hosts.",
+                "exposure_read": (
+                    "Read this as a weak citation trail and canonical-source vacuum, "
+                    "not proof that material buyer traffic is going to those hosts."
+                ),
+            },
+            "exposure_read": (
+                "Read this as a weak citation trail and canonical-source vacuum, "
+                "not proof that material buyer traffic is going to those hosts."
+            ),
+            "moves": [
+                {
+                    "type": "canonical_source_authority",
+                    "operator_action": (
+                        "Make the official page the source AI can cite for vitamin c collagen jelly."
+                    ),
+                    "why": "The cited route is weak third-party citation evidence.",
+                },
+                {
+                    "type": "direct_buy_reason",
+                    "operator_action": (
+                        "After the official page is source-ready, add first-order offer, starter + replenishment bundle, "
+                        "subscription incentive, and why-buy-direct proof."
+                    ),
+                },
+            ],
+            "checkout_readiness": "Make the page cited, buyable, and agent-checkout ready.",
+            "economics_policy": "Mechanics only; do not recommend exact discount depths.",
+        },
+        "sideways_wedge": {
+            "recommended_beachhead_lane": {
+                "query": "vitamin c collagen jelly",
+            },
+            "why_this_lane_not_the_head_prompt": (
+                "Start with \"vitamin c collagen jelly\" before "
+                "\"healthy snacks collagen jelly\" because it is product-specific."
+            ),
+            "do_not_chase_yet": [
+                {"query": "healthy snacks collagen jelly"},
+            ],
+        },
+    }
+
+    md = render_markdown_from_structured(report)
+
+    assert "## Owned buyer path play" in md
+    assert "Canonical-source vacuum" in md
+    assert "`vitamin c collagen jelly`" in md
+    assert "`cogentsteps.net`" in md
+    assert "Sideways demand wedge" in md
+    assert "Beachhead lane: `vitamin c collagen jelly`" in md
+    assert "`healthy snacks collagen jelly`" in md
+    assert "source AI can cite" in md
+    assert "Exposure read" in md
+    assert "Economics guard" in md
+    assert "beat cogentsteps" not in md.lower()
+
+
 # ---------------------------------------------------------------------------
 # Phase 2d: brand text-match scoring + VISIBLE_VIA_RETAILERS verdict.
 #
@@ -1689,8 +1783,8 @@ def test_via_retailers_explanation_is_pitch_free_diagnostic() -> None:
         (
             [],
             (
-                "Your brand's category presence couldn't be tied to specific "
-                "grounded sources in this run"
+                "Your brand's category presence was not tied to specific "
+                "grounded sources in this analysis"
             ),
         ),
     ],
@@ -2528,3 +2622,273 @@ def test_render_markdown_includes_competitive_pressure_section() -> None:
     assert "first-party in" in md.lower() or "their own .com" in md.lower()
     assert "Origins" in md
     assert "origins.com" in md
+
+
+def _strong_brand_report_for_buyer_path() -> Dict[str, Any]:
+    return {
+        "merchant_name": "BB Lab",
+        "merchant_domain": "bblab.shop",
+        "aggregate": {
+            "avg_visibility": 100.0,
+            "avg_attribution": 100.0,
+            "avg_category_visibility": 67.0,
+            "brand_verdict_label": "STRONG",
+            "brand_verdict_explanation": (
+                "AI agents cite your URL in 3 of 3 buyer-intent queries. "
+                "Both discovery and attribution are at goal state."
+            ),
+        },
+        "per_product": [
+            {
+                "executive_summary": {
+                    "verdict_pill_text": "Strong AI-channel attribution",
+                },
+                "verdict": {
+                    "label": "STRONG",
+                    "label_display": "Strong AI-channel attribution",
+                    "explanation": (
+                        "AI agents cite your URL in 3 of 3 buyer-intent queries. "
+                        "Both discovery and attribution are at goal state."
+                    ),
+                    "visibility_score": 100,
+                    "attribution_score": 100,
+                    "category_visibility_score": 67,
+                },
+                "merchant_view": {
+                    "headline": {
+                        "verdict_label": "STRONG",
+                        "verdict_label_display": "Strong AI-channel attribution",
+                        "one_liner": "Both discovery and attribution are at goal state.",
+                        "plain_summary": "Both discovery and attribution are at goal state.",
+                    },
+                },
+            },
+        ],
+    }
+
+
+def _sku_intelligence_with_prompt_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "prompt_matrix": rows,
+        "next_best_action": {
+            "primary_gap": "source_route_repair",
+            "prescription_class": "operational_efficiency",
+        },
+    }
+
+
+def test_buyer_path_postprocessor_preserves_raw_strong_but_changes_bblab_display() -> None:
+    from services.agent_center_bd_report_service import (
+        apply_buyer_path_verdict_to_brand_report,
+    )
+
+    brand_report = _strong_brand_report_for_buyer_path()
+    sku_intelligence = _sku_intelligence_with_prompt_rows([
+        {
+            "query": "halal collagen sticks before bed",
+            "ownership_state": "forum-owned",
+            "sources": [
+                {"host": "beautyandthebrows.co", "times_cited": 1},
+                {"host": "kona.ng", "times_cited": 1},
+                {"host": "moodarabia.com", "times_cited": 1},
+            ],
+            "buyer_path_action": {
+                "controllers": [
+                    "beautyandthebrows.co",
+                    "kona.ng",
+                    "moodarabia.com",
+                ],
+            },
+            "opportunity_score": 20.5,
+        },
+        {
+            "query": "fish collagen sticks",
+            "ownership_state": "retailer-owned",
+            "sources": [{"host": "yesstyle.com", "times_cited": 1}],
+            "buyer_path_action": {"controllers": ["yesstyle.com"]},
+            "opportunity_score": 12,
+        },
+    ])
+
+    out = apply_buyer_path_verdict_to_brand_report(brand_report, sku_intelligence)
+    verdict = out["per_product"][0]["verdict"]
+
+    assert verdict["label"] == "STRONG"
+    assert verdict["ai_attribution_label"] == "STRONG"
+    assert verdict["label_display"] == "Strong AI visibility, weak owned buyer path"
+    assert "0/2 evidenced prompt lanes are merchant-owned" in verdict["explanation"]
+    assert '"halal collagen sticks before bed"' in verdict["explanation"]
+    assert "beautyandthebrows.co" in verdict["explanation"]
+    assert "goal state" not in verdict["explanation"].lower()
+    assert verdict["buyer_path_verdict"]["merchant_owned_count"] == 0
+    assert verdict["buyer_path_verdict"]["top_controllers"] == [
+        "beautyandthebrows.co",
+        "kona.ng",
+        "moodarabia.com",
+    ]
+    assert out["aggregate"]["brand_verdict_label"] == "STRONG"
+    assert (
+        out["aggregate"]["brand_verdict_label_display"]
+        == "Strong AI visibility, weak owned buyer path"
+    )
+    headline = out["per_product"][0]["merchant_view"]["headline"]
+    assert headline["verdict_label"] == "STRONG"
+    assert headline["verdict_label_display"] == "Strong AI visibility, weak owned buyer path"
+    assert out["per_product"][0]["executive_summary"]["verdict_pill_text"] == (
+        "Strong AI visibility, weak owned buyer path"
+    )
+
+
+def test_buyer_path_postprocessor_caps_ownist_controllers_and_avoids_grape_jelly_drift() -> None:
+    from services.agent_center_bd_report_service import (
+        apply_buyer_path_verdict_to_brand_report,
+    )
+
+    brand_report = _strong_brand_report_for_buyer_path()
+    brand_report["merchant_name"] = "Ownist"
+    sku_intelligence = _sku_intelligence_with_prompt_rows([
+        {
+            "query": "healthy snacks collagen jelly",
+            "ownership_state": "retailer-owned",
+            "sources": [
+                {"host": "cogentsteps.net", "times_cited": 1},
+                {"host": "medsysgroup.com", "times_cited": 1},
+                {"host": "hellokoop.com", "times_cited": 1},
+            ],
+            "buyer_path_action": {
+                "controllers": ["cogentsteps.net", "medsysgroup.com", "hellokoop.com"],
+            },
+            "opportunity_score": 18.0,
+            "lane_priority_score": 0.21,
+            "fit_penalties": ["lifestyle_drift:healthy snacks"],
+        },
+        {
+            "query": "vitamin c collagen jelly",
+            "ownership_state": "retailer-owned",
+            "sources": [
+                {"host": "oliveyoung.com", "times_cited": 1},
+                {"host": "costco.com", "times_cited": 1},
+                {"host": "flyairseoul.com", "times_cited": 1},
+            ],
+            "buyer_path_action": {
+                "controllers": ["oliveyoung.com", "costco.com", "flyairseoul.com"],
+            },
+            "opportunity_score": 14.82,
+            "lane_priority_score": 0.74,
+        },
+        {
+            "query": "anti age collagen jelly",
+            "ownership_state": "retailer-owned",
+            "sources": [
+                {"host": "en.healthyskin.ee", "times_cited": 1},
+                {"host": "kaigoro.com", "times_cited": 1},
+            ],
+            "buyer_path_action": {
+                "controllers": ["en.healthyskin.ee", "kaigoro.com"],
+            },
+            "opportunity_score": 10.1,
+        },
+    ])
+    sku_intelligence["next_best_action"]["evidence_used"] = {
+        "source_route_prompt": {
+            "query": "vitamin c collagen jelly",
+            "sources": [
+                {"host": "oliveyoung.com", "times_cited": 1},
+                {"host": "costco.com", "times_cited": 1},
+                {"host": "flyairseoul.com", "times_cited": 1},
+            ],
+        }
+    }
+
+    assert all("grape jelly" not in row["query"].lower() for row in sku_intelligence["prompt_matrix"])
+    out = apply_buyer_path_verdict_to_brand_report(brand_report, sku_intelligence)
+    buyer_path = out["per_product"][0]["verdict"]["buyer_path_verdict"]
+
+    assert buyer_path["state"] == "third_party_controlled"
+    assert buyer_path["primary_lane"] == "vitamin c collagen jelly"
+    assert buyer_path["top_controllers"] == [
+        "oliveyoung.com",
+        "costco.com",
+        "flyairseoul.com",
+    ]
+    assert len(buyer_path["top_controllers"]) == 3
+    assert "grape jelly" not in out["per_product"][0]["verdict"]["explanation"].lower()
+    assert "healthy snacks collagen jelly" not in out["per_product"][0]["verdict"]["explanation"]
+
+
+def test_buyer_path_postprocessor_keeps_strong_display_when_path_is_merchant_controlled() -> None:
+    from services.agent_center_bd_report_service import (
+        apply_buyer_path_verdict_to_brand_report,
+    )
+
+    brand_report = _strong_brand_report_for_buyer_path()
+    sku_intelligence = _sku_intelligence_with_prompt_rows([
+        {"query": "buy bb lab collagen", "ownership_state": "merchant-owned"},
+        {"query": "bb lab collagen price", "ownership_state": "merchant-owned"},
+        {
+            "query": "fish collagen sticks",
+            "ownership_state": "retailer-owned",
+            "sources": [{"host": "yesstyle.com", "times_cited": 1}],
+            "buyer_path_action": {"controllers": ["yesstyle.com"]},
+        },
+    ])
+
+    out = apply_buyer_path_verdict_to_brand_report(brand_report, sku_intelligence)
+    verdict = out["per_product"][0]["verdict"]
+    assert verdict["buyer_path_verdict"]["state"] == "merchant_controlled"
+    assert verdict["label_display"] == "Strong AI-channel attribution"
+    assert "goal state" in verdict["explanation"].lower()
+
+
+def test_buyer_path_postprocessor_shows_mixed_path_without_changing_raw_verdict() -> None:
+    from services.agent_center_bd_report_service import (
+        apply_buyer_path_verdict_to_brand_report,
+    )
+
+    brand_report = _strong_brand_report_for_buyer_path()
+    sku_intelligence = _sku_intelligence_with_prompt_rows([
+        {"query": "buy bb lab collagen", "ownership_state": "merchant-owned"},
+        {
+            "query": "best collagen sticks",
+            "ownership_state": "publisher-owned",
+            "sources": [{"host": "healthline.com", "times_cited": 1}],
+            "buyer_path_action": {"controllers": ["healthline.com"]},
+            "opportunity_score": 9,
+        },
+    ])
+
+    out = apply_buyer_path_verdict_to_brand_report(brand_report, sku_intelligence)
+    verdict = out["per_product"][0]["verdict"]
+    assert verdict["label"] == "STRONG"
+    assert verdict["buyer_path_verdict"]["state"] == "mixed"
+    assert verdict["label_display"] == "Strong AI visibility, mixed owned buyer path"
+    assert "only 1/2 evidenced prompt lanes are merchant-owned" in verdict["explanation"]
+
+
+def test_buyer_path_postprocessor_leaves_display_when_sku_intelligence_missing() -> None:
+    from services.agent_center_bd_report_service import (
+        apply_buyer_path_verdict_to_brand_report,
+    )
+
+    brand_report = _strong_brand_report_for_buyer_path()
+    out = apply_buyer_path_verdict_to_brand_report(brand_report, {})
+    verdict = out["per_product"][0]["verdict"]
+
+    assert verdict["buyer_path_verdict"]["state"] == "not_measured"
+    assert verdict["label_display"] == "Strong AI-channel attribution"
+    assert "goal state" in verdict["explanation"].lower()
+
+
+def test_legacy_markdown_uses_combined_verdict_display() -> None:
+    from services.agent_center_bd_report_service import render_markdown_from_structured
+
+    report = _report_with_competitive_data([])
+    report["verdict"]["label"] = "STRONG"
+    report["verdict"]["label_display"] = "Strong AI visibility, weak owned buyer path"
+    report["verdict"]["explanation"] = (
+        "AI answer visibility is strong, but 0/2 evidenced prompt lanes are merchant-owned."
+    )
+    md = render_markdown_from_structured(report)
+
+    assert "## Verdict: **Strong AI visibility, weak owned buyer path**" in md
+    assert "## Verdict: **STRONG**" not in md

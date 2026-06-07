@@ -49,7 +49,8 @@ def test_prompts_name_brand_product_identity_not_variant_label() -> None:
 
     # Generic shopper prompts now name the full identity.
     assert "where can I buy Ownist Triple Shine Grape" in qs
-    assert any("Ownist Triple Shine Grape reviews" == q for q in qs)
+    assert "best beauty supplement" in qs
+    assert not any("shoppers considering Ownist Triple Shine Grape" in q for q in qs)
 
     # The opaque variant id must not leak into prompts.
     assert not any("42327845699767" in q for q in qs)
@@ -73,6 +74,84 @@ def test_identity_does_not_double_brand_when_title_already_branded() -> None:
     qs = _queries(sku_ctx)
     assert not any("Ownist Ownist" in q for q in qs)
     assert "where can I buy Ownist Triple Collagen Orange" in qs
+
+
+def test_unbranded_prompts_reject_noisy_fetched_product_type() -> None:
+    sku_ctx = {
+        "product": {
+            "title": "Triple Shine Grape",
+            "brand": "Ownist",
+            # Live structured data returned this as product_type; it should not
+            # turn a beauty supplement audit into mass-market grape jelly lanes.
+            "product_type": "Belight grape jelly",
+            "attributes_raw": {
+                "tags": [
+                    "collagen",
+                    "belight collagen",
+                    "vitamin c",
+                    "grape",
+                    "k-beauty",
+                    "skin radiance",
+                ],
+                "description": (
+                    "Ownist Triple Shine Grape is a K-beauty supplement with "
+                    "Belight collagen and vitamin C."
+                ),
+            },
+        },
+        "sku": {"title": "14 Servings, 2-Week Routine"},
+    }
+
+    qs = _queries(sku_ctx, 14)
+
+    assert not any("grape jelly" in q for q in qs)
+    assert not any("belight grape jelly" in q for q in qs)
+    assert "best collagen" in qs
+    assert "best collagen to buy online" in qs
+
+
+def test_missing_product_type_uses_attributes_not_literal_product_category() -> None:
+    sku_ctx = {
+        "product": {
+            "title": "Triple Shine Grape",
+            "brand": "Ownist",
+            "product_type": None,
+            "attributes_raw": {
+                "tags": ["collagen", "vitamin c", "niacin", "beauty supplement"],
+                "description": (
+                    "Ownist Triple Shine Grape is a K-beauty supplement with "
+                    "collagen, vitamin C, and niacin."
+                ),
+            },
+        },
+        "sku": {"title": "14 Servings, 2-Week Routine"},
+    }
+
+    qs = _queries(sku_ctx, 14)
+
+    assert "best collagen" in qs
+    assert "best collagen to buy online" in qs
+    assert not any(q in {"best product", "top product", "recommended product"} for q in qs)
+    assert not any("product buying guide" in q for q in qs)
+    assert not any("compare product options" in q for q in qs)
+
+
+def test_missing_product_type_without_attributes_stays_branded_not_best_product() -> None:
+    sku_ctx = {
+        "product": {
+            "title": "Triple Shine Grape",
+            "brand": "Ownist",
+            "product_type": None,
+        },
+        "sku": {"title": "14 Servings, 2-Week Routine"},
+    }
+
+    qs = _queries(sku_ctx, 14)
+
+    assert "where can I buy Ownist Triple Shine Grape" in qs
+    assert "best product" not in qs
+    assert "top product" not in qs
+    assert "compare product options" not in qs
 
 
 def test_falls_back_to_product_then_sku_when_no_product_title() -> None:

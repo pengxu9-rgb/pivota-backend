@@ -13,12 +13,27 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from config.settings import settings
+from services.buyer_path_stable_controllers import (
+    stable_buyer_path_controllers_for_row,
+)
+from services.buyer_path_controller_quality import (
+    controller_profile as build_controller_profile,
+    aggregate_controller_profile,
+    is_canonical_source_vacuum,
+)
 from services.llm_synthesis import (
     LLMSynthesisError,
     configured_key_for_provider,
     default_model_for_provider,
     normalize_provider,
     synthesize,
+)
+from services.sku_lane_priority import (
+    build_lane_product_evidence,
+    build_sideways_wedge,
+    has_lane_demand,
+    is_third_party_controlled_lane,
+    prioritize_lanes,
 )
 
 _STRATEGIC_BRIEF_SYSTEM_PROMPT = """You are a senior D2C brand & growth strategist — the merchant's marketing director — writing the
@@ -54,9 +69,32 @@ CLAIM DISCIPLINE (do not let confident prose outrun the EVIDENCE — this is a t
   is "own your own page/site for this lane first." You may suggest a marketplace/community move only
   CONDITIONALLY: "if you already sell on <evidenced channel>, …". Do NOT invent communities, subreddits,
   influencers, or platforms.
+- MERCHANT PATH: respect product.merchant_path. If archetype is "brand", the commercial goal is to drive
+  buyers to the brand's own website. If archetype is "channel", the commercial goal is to drive buyers to the
+  channel's own website. Do not blur those paths.
+- OPERATIONAL ECONOMICS: when buyer_path_opportunities exist, match the prescription to the controller
+  strategy. For canonical_source_vacuum or source_authority_gap, write a mechanism-level authority playbook
+  in this order: (1) make the merchant page more retrievable by targeting the exact evidenced lane, (2) make it
+  more extractable with product/offer/review/FAQ schema, (3) state the lane's evidenced attributes in plain page
+  text, (4) build verified reviews/proof to close the authority gap, (5) work the cited source by controller
+  type: forum/community = participate in or seed accurate product info in the evidenced discussion; publisher/
+  listicle = pitch the evidenced publisher with exact SKU facts and proof; retailer/marketplace = claim or fix
+  the evidenced listing, (6) keep SKU facts consistent across the merchant page and cited sources, (7) re-audit
+  the same lane and verify materiality before treating exposure as lost buyer traffic. Only after that, add
+  first-order offer, starter + replenishment bundle, subscription incentive, and why-buy-direct proof. For
+  leading retailer/marketplace competition, keep listing fixes and direct-buy mechanics as the click-winning
+  play, with only a light retrieval/schema layer. Do NOT invent discount depths, prices, savings percentages,
+  review counts, retailer facts, or margin claims unless they appear in EVIDENCE.
+- AUTHORITY HONESTY: never promise that ChatGPT, Gemini, or any AI engine will cite, rank, or route to the
+  merchant page. Phrase the work as making the page more retrievable, extractable, citable, and authoritative
+  for the evidenced lane. Keep the materiality caveat: exposure is citation evidence, not proven buyer traffic,
+  until the lane is re-audited and verified.
 - LANES: when you name a search lane or query, reuse the EXACT wording from EVIDENCE. Do not rephrase,
   singularize/pluralize, reorder, or coin a variant. (A positioning phrase for your brand is fine and separate
   — just don't present it as the searched lane.)
+- SIDEWAYS DEMAND: if sideways_wedge.recommended_beachhead_lane exists, frame that lane as the first
+  beachhead before broad/high-pressure prompts. Explain which broad or weak-fit lanes to not chase yet, using
+  only sideways_wedge.head_prompt_pressure and sideways_wedge.do_not_chase_yet.
 - FACT vs INFERENCE: only "AI's answers show…/EVIDENCE shows…" statements are facts. Everything else is your
   read — phrase it as inference. Do not use the word "locked" or absolutes like "you cannot do this alone";
   say a query is "owned/controlled by <evidenced source>" and frame Pivota's help as the specific service it
@@ -86,8 +124,12 @@ WRITE the brief as JSON with these fields — each must be specific to THIS prod
 - substitution_play: if a substitution is present, how to win those buyers back (comparison/positioning vs
   the named substitute), else null.
 - first_moves: 3-5 concrete actions that EXECUTE the strategy above, in priority order, each tied to a
-  strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so AI has your
-  answer to cite for the lane you're claiming").
+  strategic reason (not generic "add an FAQ" — "add the halal + bedtime story to your page so it is more
+  citable for the lane you're claiming"). When EVIDENCE shows weak reseller/source-route exposure, at
+  least one first move must name the exact lane and source-authority repair, using the mechanism order above
+  and controller-type source route. When EVIDENCE shows credible retailer/marketplace competition, at least
+  one first move must name the exact lane, listing fix, light retrieval/schema layer, and the operational reason
+  to buy from the merchant-controlled page (offer, bundle, subscription, or why-buy-direct proof).
 - diy_vs_pivota: {self_serve:[2-3 merchant-owned moves], pivota:"one honest line on what only Pivota does
   — cited+buyable canonical page, serving, monitoring"}.   # the 70/30, honest, no cold-audit hard-sell"""
 
@@ -110,6 +152,9 @@ _LOST_CATEGORY_OWNERSHIP = {
     "forum-owned",
 }
 _NO_CONTROL_ROUTES = {"", "none", "unclassified", "fragmented", "open-lane"}
+_COMMUNITY_CONTROLLER_TYPES = {"community", "forum", "reddit", "social"}
+_PUBLISHER_CONTROLLER_TYPES = {"editorial", "publisher", "video"}
+_LISTING_CONTROLLER_TYPES = {"marketplace", "retailer"}
 _REQUIRED_BRIEF_KEYS = {
     "position",
     "core_decision",
@@ -124,6 +169,7 @@ _FORBIDDEN_PATTERNS = (
     re.compile(r"/100", re.IGNORECASE),
     re.compile(r"\$\s?\d", re.IGNORECASE),
     re.compile(r"\b\d+(?:\.\d+)?\s?%", re.IGNORECASE),
+    re.compile(r"\b\d+(?:\.\d+)?\s*x\b", re.IGNORECASE),
     re.compile(
         r"\b\d[\d,]*\+?\s*(?:reviews?|ratings?|stars?|customers?|users?|sales?|followers?|subscribers?)\b",
         re.IGNORECASE,
@@ -235,6 +281,7 @@ _INTERNAL_ALLOWED_ENTITIES = {
     "copilot",
     "d2c",
     "deepseek",
+    "dtc",
     "diy",
     "faq",
     "faqs",
@@ -499,6 +546,7 @@ def assemble_sku_brief_evidence(
     scores: Optional[Mapping[str, Any]] = None,
     identity: Optional[Mapping[str, Any]] = None,
     sku_title: Optional[str] = None,
+    merchant_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     del primary_gaps, scores
     opportunity_map = _as_mapping(opportunity)
@@ -507,6 +555,13 @@ def assemble_sku_brief_evidence(
     title = _clean_str(sku_title) or _clean_str(identity_map.get("name")) or "this SKU"
     anchors = _as_mapping(identity_map.get("anchors"))
     brand = _clean_str(anchors.get("brand"))
+    merchant_path = _merchant_path(identity=identity_map, opportunity=opportunity_map)
+    product_evidence = _as_mapping(opportunity_map.get("product_evidence")) or build_lane_product_evidence(
+        product={"title": title, "brand": brand, "category": anchors.get("category")},
+        attribute_graph=attribute_graph,
+        identity=identity_map,
+        sku_title=title,
+    )
 
     category_rows = _category_battle_rows(opportunity_map)
     category_battle = _category_battle(category_rows)
@@ -525,6 +580,7 @@ def assemble_sku_brief_evidence(
         "product": {
             "title": title,
             "brand": brand or None,
+            "merchant_path": merchant_path,
             "attributes": attributes,
         },
         "position": _position_from_ladder(opportunity_map),
@@ -532,6 +588,16 @@ def assemble_sku_brief_evidence(
         "substitution": _substitution_evidence(opportunity_map),
         "open_lanes": [_open_lane_evidence(lane) for lane in top_open_lanes],
         "channel_map": channel_map,
+        "buyer_path_opportunities": _buyer_path_opportunities(
+            opportunity=opportunity_map,
+            merchant_path=merchant_path,
+            product_evidence=product_evidence,
+            merchant_host=merchant_host,
+        ),
+        "sideways_wedge": _as_mapping(opportunity_map.get("sideways_wedge")) or build_sideways_wedge(
+            _as_list(opportunity_map.get("per_prompt")),
+            product_evidence=product_evidence,
+        ),
         "grounding_notes": grounding_notes,
         "demand_state": opportunity_map.get("demand_state_summary"),
         "notes": {
@@ -587,13 +653,13 @@ async def generate_sku_strategic_brief(
                 max_tokens=1200,
             )
         except LLMSynthesisError:
-            return None
+            return _validated_deterministic_brief(evidence)
         brief = _parse_brief_json(result.get("text"))
         if not isinstance(brief, dict) or not _has_required_shape(brief):
             continue
         if validate_grounding(brief, evidence):
             return brief
-    return None
+    return _validated_deterministic_brief(evidence)
 
 
 def validate_grounding(brief: Mapping[str, Any], evidence: Mapping[str, Any]) -> bool:
@@ -670,7 +736,7 @@ def _category_battle(rows: List[Mapping[str, Any]]) -> Dict[str, Any]:
             prompts.append(query)
         row_competitors = _as_str_list(row.get("competitors"))
         winners.extend(row_competitors)
-        source_roles = _source_role_chips(row)
+        source_roles = _stable_source_role_chips(row)
         ranked_by.extend(source_roles)
         prompt_details.append({
             "query": query,
@@ -728,6 +794,334 @@ def _open_lane_evidence(lane: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _buyer_path_opportunities(
+    *,
+    opportunity: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+    product_evidence: Mapping[str, Any],
+    merchant_host: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Mapping[str, Any]] = []
+    for row in _as_list(opportunity.get("per_prompt")):
+        if not isinstance(row, Mapping):
+            continue
+        query = _clean_str(row.get("query"))
+        if not query:
+            continue
+        if not is_third_party_controlled_lane(row):
+            continue
+        if not has_lane_demand(row):
+            continue
+        rows.append(row)
+    prioritized = prioritize_lanes(
+        rows,
+        product_evidence=product_evidence,
+    )
+    opportunities = [_buyer_path_opportunity(row, merchant_path) for row in prioritized[:5]]
+    if opportunities:
+        _apply_lead_aggregate_profile(
+            opportunities,
+            prioritized,
+            merchant_path=merchant_path,
+            merchant_host=merchant_host,
+        )
+    return opportunities
+
+
+def _apply_lead_aggregate_profile(
+    opportunities: List[Dict[str, Any]],
+    prioritized: List[Mapping[str, Any]],
+    *,
+    merchant_path: Mapping[str, Any],
+    merchant_host: Optional[str] = None,
+) -> None:
+    """Stabilize the lead opportunity's controller archetype by aggregating
+    controller evidence across all qualifying lanes (same dominance rule the
+    next-best-action layer uses), so the brief framing does not flip with one
+    noisy hero prompt's cited sources."""
+
+    groups = [
+        chips
+        for row in prioritized
+        if isinstance(row, Mapping)
+        for chips in (stable_buyer_path_controllers_for_row(row),)
+        if chips
+    ]
+    if not groups:
+        return
+    lead_profile = aggregate_controller_profile(
+        groups,
+        exclude_hosts=[merchant_host] if merchant_host else None,
+    )
+    if not _as_list(lead_profile.get("classified_controllers")):
+        return
+    lead = opportunities[0]
+    lead_row = prioritized[0] if prioritized else {}
+    lead["controller_profile"] = lead_profile
+    lead["controller_strategy"] = lead_profile.get("strategy")
+    lead["controller_strategy_label"] = lead_profile.get("label")
+    lead["exposure_confidence"] = lead_profile.get("exposure_confidence")
+    lead["exposure_read"] = lead_profile.get("exposure_read")
+    named = [host for host in _as_list(lead_profile.get("controllers")) if host]
+    if named:
+        existing = {
+            _clean_str(_as_mapping(ctrl).get("host")): _as_mapping(ctrl)
+            for ctrl in _as_list(lead.get("controlled_by"))
+        }
+        role_by_host = _aggregate_role_by_host(lead_profile)
+        lead["controlled_by"] = [
+            dict(
+                existing.get(host)
+                or {"host": host, "role": role_by_host.get(host, "third-party")}
+            )
+            for host in named[:3]
+        ]
+    lead["recommended_moves"] = _buyer_path_moves(
+        merchant_path,
+        lead_profile,
+        row=lead_row,
+        controllers=_as_list(lead.get("controlled_by")),
+    )
+
+
+def _aggregate_role_by_host(profile: Mapping[str, Any]) -> Dict[str, str]:
+    role_by_host: Dict[str, str] = {}
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        host = _clean_str(row.get("host"))
+        role = _clean_str(row.get("input_role")) or _clean_str(row.get("type"))
+        if host and role:
+            role_by_host[host] = role
+    for host in _as_list(profile.get("source_authority_controllers")):
+        if host:
+            role_by_host.setdefault(host, "publisher")
+    for host in _as_list(profile.get("known_retail_controllers")):
+        if host:
+            role_by_host[host] = "retailer"
+    for host in _as_list(profile.get("leading_controllers")):
+        if host:
+            role_by_host[host] = "retailer"
+    return role_by_host
+
+
+def _lane_priority_fields(row: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in (
+        "lane_priority_score",
+        "merchant_fit_score",
+        "conversion_fit_score",
+        "merchant_fit_reasons",
+        "fit_penalties",
+        "selection_reason",
+    ):
+        if key in row:
+            out[key] = row.get(key)
+    return out
+
+
+def _buyer_path_opportunity(
+    row: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> Dict[str, Any]:
+    controllers = _buyer_path_controllers(row)
+    profile = build_controller_profile(controllers)
+    route = _clean_str(row.get("source_route")).lower()
+    ownership = _clean_str(row.get("ownership_state")).lower()
+    route_label = route or ownership.replace("-owned", "") or "third-party"
+    return {
+        "query": _clean_str(row.get("query")),
+        "exposure": ownership or None,
+        "route": route_label,
+        "controlled_by": controllers,
+        "controller_strategy": profile.get("strategy"),
+        "controller_strategy_label": profile.get("label"),
+        "controller_profile": profile,
+        "exposure_confidence": profile.get("exposure_confidence"),
+        "exposure_read": profile.get("exposure_read"),
+        "destination": _clean_str(merchant_path.get("destination")),
+        "merchant_archetype": _clean_str(merchant_path.get("archetype")),
+        "recommended_moves": _buyer_path_moves(
+            merchant_path,
+            profile,
+            row=row,
+            controllers=controllers,
+        ),
+        **_lane_priority_fields(row),
+    }
+
+
+def _buyer_path_controllers(row: Mapping[str, Any]) -> List[Dict[str, str]]:
+    return _unique_host_roles(stable_buyer_path_controllers_for_row(row))[:3]
+
+
+def _buyer_path_moves(
+    merchant_path: Mapping[str, Any],
+    controller_profile: Optional[Mapping[str, Any]] = None,
+    *,
+    row: Optional[Mapping[str, Any]] = None,
+    controllers: Optional[List[Mapping[str, Any]]] = None,
+) -> List[str]:
+    page = _clean_str(merchant_path.get("page_label")) or "merchant-controlled page"
+    profile = _as_mapping(controller_profile)
+    lane = _clean_str(_as_mapping(row).get("query")) or "this lane"
+    controller_phrase = _controller_phrase(list(controllers or []))
+    attributes = _buyer_path_attribute_phrase(_as_mapping(row))
+    if is_canonical_source_vacuum(profile) or _clean_str(profile.get("strategy")) == "source_authority_gap":
+        return [
+            (
+                f"Build {page} to rank for the exact lane {lane}: use the lane wording "
+                "in title, H1, metadata, and body copy so it is more retrievable and citable."
+            ),
+            (
+                f"Add product/offer/review/FAQ schema on {page} for {lane}, covering "
+                "price, availability, reviews, and decision questions."
+            ),
+            (
+                f"State {attributes} in plain page text for {lane}, not only in images, "
+                "PDFs, or variant labels."
+            ),
+            (
+                f"Build verified review and proof signals on {page} so it is more "
+                f"authoritative for {lane}."
+            ),
+            _sentence(
+                _controller_source_route_action(profile, controller_phrase, lane, page)
+            ),
+            (
+                f"Keep SKU name, {attributes}, images, availability, and canonical URL "
+                f"consistent across {page} and {controller_phrase}."
+            ),
+            (
+                f"Re-audit {lane} after the changes; verify whether exposure becomes "
+                "more citable through the merchant path before treating it as material buyer traffic."
+            ),
+            (
+                "After the page is more retrievable, extractable, and authoritative, add "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof."
+            ),
+        ]
+    return [
+        f"Make {page} the more citable + buyable canonical page for this lane.",
+        "Add a first-order offer without inventing a discount depth.",
+        "Add a starter + replenishment bundle.",
+        "Add a subscription incentive where the product supports replenishment.",
+        "Add why-buy-direct proof: guarantee, samples, loyalty, returns, stock, and fresh facts.",
+    ]
+
+
+def _buyer_path_attribute_phrase(row: Mapping[str, Any]) -> str:
+    values = (
+        _as_str_list(row.get("attribute_basis"))
+        or _as_str_list(row.get("why_fit"))
+        or _as_str_list(row.get("evidence"))
+    )
+    return _phrase_join(values[:5], "the evidenced lane attributes")
+
+
+def _controller_types(profile: Mapping[str, Any]) -> List[str]:
+    out: List[str] = []
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        for key in ("input_role", "type"):
+            value = _clean_str(row.get(key)).lower()
+            if value:
+                out.append(value)
+    return out
+
+
+def _controller_source_route_move_type(profile: Mapping[str, Any]) -> str:
+    types = set(_controller_types(profile))
+    if types & _COMMUNITY_CONTROLLER_TYPES:
+        return "community_source_participation"
+    if types & _PUBLISHER_CONTROLLER_TYPES:
+        return "publisher_source_pitch"
+    if types & _LISTING_CONTROLLER_TYPES:
+        return "retailer_listing_accuracy"
+    return "evidenced_source_update"
+
+
+def _split_controllers_by_move_type(profile: Mapping[str, Any]):
+    forum: List[str] = []
+    publisher: List[str] = []
+    other: List[str] = []
+    seen: set = set()
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        host = _clean_str(row.get("host"))
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        role = (_clean_str(row.get("input_role")) or _clean_str(row.get("type"))).lower()
+        if role in _COMMUNITY_CONTROLLER_TYPES:
+            forum.append(host)
+        elif role in _PUBLISHER_CONTROLLER_TYPES:
+            publisher.append(host)
+        else:
+            other.append(host)
+    return forum, publisher, other
+
+
+def _controller_source_route_action(
+    profile: Mapping[str, Any],
+    controller_phrase: str,
+    lane: str,
+    page: str,
+) -> str:
+    move_type = _controller_source_route_move_type(profile)
+    if move_type == "community_source_participation":
+        forum, publisher, other = _split_controllers_by_move_type(profile)
+        if publisher:
+            # Mixed forum + publisher controllers: address each by its own play
+            # instead of calling a publisher part of "the discussion".
+            clauses: List[str] = []
+            if forum:
+                clauses.append(
+                    f"participate in or seed accurate product info in the "
+                    f"{_phrase_join(forum, controller_phrase)} discussion"
+                )
+            clauses.append(
+                f"pitch {_phrase_join(publisher, controller_phrase)} with exact SKU "
+                "facts, proof assets, images, and availability"
+            )
+            if other:
+                clauses.append(
+                    f"fix the {_phrase_join(other, controller_phrase)} listing facts"
+                )
+            return (
+                f"{_phrase_join(clauses, '')} for {lane}, using only facts already "
+                f"published on {page}"
+            )
+        return (
+            f"participate in or seed accurate product info in the {controller_phrase} "
+            f"discussion for {lane}, using only facts already published on {page}"
+        )
+    if move_type == "publisher_source_pitch":
+        return (
+            f"pitch {controller_phrase} for {lane} with exact SKU facts, proof "
+            f"assets, images, availability, and the canonical page at {page}"
+        )
+    if move_type == "retailer_listing_accuracy":
+        return (
+            f"claim or fix the {controller_phrase} listing for {lane}: title, "
+            "images, variant, stock, authorization, and SKU facts"
+        )
+    return (
+        f"work the evidenced source trail around {controller_phrase} for {lane} "
+        f"with the same facts published on {page}"
+    )
+
+
+def _sentence(text: str) -> str:
+    cleaned = _clean_str(text)
+    if not cleaned:
+        return ""
+    return cleaned[:1].upper() + cleaned[1:].rstrip(".") + "."
+
+
 def _channel_map(
     *,
     top_open_lanes: List[Mapping[str, Any]],
@@ -742,7 +1136,7 @@ def _channel_map(
     for lane in top_open_lanes:
         query = _clean_str(lane.get("query"))
         row = rows_by_query.get(_norm_phrase(query)) or {}
-        controlled_by = _unique_host_roles(_source_role_chips(row))
+        controlled_by = _unique_host_roles(_stable_source_role_chips(row))
         source_route = _clean_str(row.get("source_route") or lane.get("source_route")).lower()
         role = (
             "open"
@@ -782,10 +1176,73 @@ def _grounding_notes(
     }
 
 
+def _merchant_path(
+    *,
+    identity: Mapping[str, Any],
+    opportunity: Mapping[str, Any],
+) -> Dict[str, str]:
+    archetype = _merchant_archetype(identity=identity, opportunity=opportunity)
+    if archetype == "channel":
+        return {
+            "archetype": "channel",
+            "destination": "the channel's own website",
+            "page_label": "the channel PDP or category page",
+            "goal": "drive buyers to the channel's website",
+        }
+    return {
+        "archetype": "brand",
+        "destination": "the brand's own website",
+        "page_label": "the official brand PDP",
+        "goal": "drive buyers to the brand's own website",
+    }
+
+
+def _merchant_archetype(
+    *,
+    identity: Mapping[str, Any],
+    opportunity: Mapping[str, Any],
+) -> str:
+    for payload in (identity, opportunity, _as_mapping(identity.get("anchors"))):
+        raw = _first_present(
+            payload,
+            (
+                "merchant_archetype",
+                "merchant_type",
+                "business_model",
+                "commerce_role",
+                "seller_type",
+                "retailer_type",
+            ),
+        )
+        normalized = _normalize_merchant_archetype(raw)
+        if normalized:
+            return normalized
+    return "brand"
+
+
+def _normalize_merchant_archetype(value: Any) -> Optional[str]:
+    text = _clean_str(value).lower()
+    if not text:
+        return None
+    if any(token in text for token in ("channel", "retailer", "marketplace", "multi-brand", "multibrand")):
+        return "channel"
+    if any(token in text for token in ("brand", "dtc", "d2c", "manufacturer", "maker")):
+        return "brand"
+    return None
+
+
+def _first_present(payload: Mapping[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and _clean_str(value):
+            return value
+    return None
+
+
 def _substitution_source_roles(opportunity: Mapping[str, Any]) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     alert = _as_mapping(opportunity.get("substitution_alert"))
-    rows.extend(_source_role_chips(alert))
+    rows.extend(_stable_source_role_chips(alert))
     alert_prompt = _norm_phrase(alert.get("prompt") or alert.get("on_prompt"))
     for row in _as_list(opportunity.get("per_prompt")):
         if not isinstance(row, Mapping):
@@ -796,13 +1253,27 @@ def _substitution_source_roles(opportunity: Mapping[str, Any]) -> List[Dict[str,
             not alert_prompt or row_prompt != alert_prompt
         ):
             continue
-        rows.extend(_source_role_chips(row))
-        rows.extend(_source_role_chips(substitution))
+        rows.extend(_stable_source_role_chips(row))
+        rows.extend(_stable_source_role_chips(substitution))
     return _unique_host_roles(rows)
 
 
-def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:
-    chips: List[Dict[str, str]] = []
+def _stable_source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    stable = stable_buyer_path_controllers_for_row(row)
+    if stable:
+        return stable
+    source_summary = _as_mapping(row.get("source_summary"))
+    if "buyer_path_controllers" in source_summary:
+        return []
+    repeated: List[Dict[str, Any]] = []
+    for source in _source_role_chips(row):
+        if int(source.get("times_cited") or 0) >= 2:
+            repeated.append(source)
+    return repeated
+
+
+def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    chips: List[Dict[str, Any]] = []
     for source in _as_list(row.get("source_roles")):
         if not isinstance(source, Mapping):
             continue
@@ -810,7 +1281,10 @@ def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:
         if not host:
             continue
         role = _clean_str(source.get("role")) or "unclassified"
-        chips.append({"host": host, "role": role})
+        chip: Dict[str, Any] = {"host": host, "role": role}
+        if source.get("times_cited") is not None:
+            chip["times_cited"] = source.get("times_cited")
+        chips.append(chip)
     if chips:
         return chips
 
@@ -820,12 +1294,15 @@ def _source_role_chips(row: Mapping[str, Any]) -> List[Dict[str, str]]:
             continue
         host = _normalize_host(source.get("host"))
         if host:
-            chips.append({"host": host, "role": "unclassified"})
+            chip = {"host": host, "role": "unclassified"}
+            if source.get("times_cited") is not None:
+                chip["times_cited"] = source.get("times_cited")
+            chips.append(chip)
     return chips
 
 
-def _unique_host_roles(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
+def _unique_host_roles(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, str]] = set()
     for row in rows:
         host = _normalize_host(row.get("host"))
@@ -836,7 +1313,10 @@ def _unique_host_roles(rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, str]
         if key in seen:
             continue
         seen.add(key)
-        out.append({"host": host, "role": role})
+        item: Dict[str, Any] = {"host": host, "role": role}
+        if row.get("times_cited") is not None:
+            item["times_cited"] = row.get("times_cited")
+        out.append(item)
     return out
 
 
@@ -918,6 +1398,363 @@ def _has_required_shape(brief: Mapping[str, Any]) -> bool:
     return True
 
 
+def _validated_deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    brief = _deterministic_brief(evidence)
+    if brief and validate_grounding(brief, evidence):
+        return brief
+    return None
+
+
+def _deterministic_traffic_how(
+    opportunity: Mapping[str, Any],
+    *,
+    page_label: str,
+    default_how: str,
+) -> str:
+    profile = _as_mapping(opportunity.get("controller_profile")) or build_controller_profile(
+        _as_list(opportunity.get("controlled_by"))
+    )
+    if is_canonical_source_vacuum(profile):
+        return (
+            f"Make {page_label} more retrievable and extractable for the exact lane, "
+            "state the evidenced attributes in text, build reviews/proof, work the "
+            "cited source by controller type, keep source facts consistent, re-audit "
+            "and verify materiality, then add offer, bundle, subscription, and "
+            "why-buy-direct proof last."
+        )
+    if _clean_str(profile.get("strategy")) == "source_authority_gap":
+        return (
+            f"Make {page_label} more retrievable, extractable, and authoritative for "
+            "the exact lane, work the evidenced source trail by controller type, keep "
+            "facts consistent, re-audit and verify materiality, then add direct-buy "
+            "mechanics last."
+        )
+    return default_how
+
+
+def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
+    beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
+    query = _clean_str(beachhead.get("query"))
+    if not query:
+        return ""
+    deferred = next(
+        (
+            _clean_str(item.get("query"))
+            for item in _as_list(sideways_wedge.get("do_not_chase_yet"))
+            if isinstance(item, Mapping) and _clean_str(item.get("query"))
+        ),
+        "",
+    )
+    if deferred:
+        return (
+            f"Start with {query} as the first beachhead and do not chase {deferred} "
+            "yet; the tighter lane is more product-specific and easier to turn into "
+            "the official more citable + buyable route."
+        )
+    return (
+        f"Start with {query} as the first beachhead because it is product-specific "
+        "and already shows third-party-controlled demand."
+    )
+
+
+def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    product = _as_mapping(evidence.get("product"))
+    title = _clean_str(product.get("title")) or "this SKU"
+    merchant_path = _as_mapping(product.get("merchant_path"))
+    page_label = _clean_str(merchant_path.get("page_label")) or "the merchant-controlled page"
+    destination = _clean_str(merchant_path.get("destination")) or "the merchant-controlled website"
+    opportunities = [
+        item for item in _as_list(evidence.get("buyer_path_opportunities"))
+        if isinstance(item, Mapping) and _clean_str(item.get("query"))
+    ]
+    if not opportunities:
+        return None
+    lead = opportunities[0]
+    query = _clean_str(lead.get("query"))
+    controllers = _unique_host_roles(
+        controller
+        for opportunity in opportunities[:3]
+        for controller in _as_list(opportunity.get("controlled_by"))
+        if isinstance(controller, Mapping)
+    )[:3]
+    controller_phrase = _controller_phrase(controllers)
+    attributes = _as_mapping(product.get("attributes"))
+    angle_terms = _brief_angle_terms(attributes)
+    lead_profile = _as_mapping(lead.get("controller_profile"))
+    if not _as_list(lead_profile.get("classified_controllers")):
+        lead_profile = build_controller_profile(_as_list(lead.get("controlled_by")))
+    vacuum_strategy = is_canonical_source_vacuum(lead_profile)
+    source_authority_strategy = _clean_str(lead_profile.get("strategy")) == "source_authority_gap"
+    sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
+    wedge_decision = _deterministic_wedge_decision(sideways_wedge)
+    source_action = _sentence(
+        _controller_source_route_action(lead_profile, controller_phrase, query, page_label)
+    )
+
+    if vacuum_strategy:
+        first_moves = [
+            (
+                f"Build {page_label} to rank for the exact lane {query} and add "
+                "product/offer/review/FAQ schema, so it is more retrievable and "
+                "extractable before any conversion play."
+            ),
+            (
+                f"State {angle_terms} in plain page text for {query}, then build "
+                "verified reviews and proof so the official page is more authoritative."
+            ),
+            (
+                source_action
+            ),
+            (
+                f"Keep SKU name, {angle_terms}, images, availability, and canonical URL "
+                f"consistent across {page_label} and {controller_phrase}; re-audit {query} "
+                "and verify materiality before treating exposure as lost buyer traffic."
+            ),
+            (
+                "After the page is more retrievable, extractable, and authoritative, add "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof."
+            ),
+        ]
+    elif source_authority_strategy:
+        first_moves = [
+            (
+                f"Build {page_label} to rank for the exact lane {query} and add "
+                "product/offer/review/FAQ schema, so it is more retrievable and "
+                "extractable before outreach."
+            ),
+            (
+                f"State {angle_terms} in plain page text for {query}, then build "
+                "verified reviews and proof so the official page is more authoritative."
+            ),
+            (
+                source_action
+            ),
+            (
+                f"Keep SKU name, {angle_terms}, images, availability, and canonical URL "
+                f"consistent across {page_label} and {controller_phrase}; re-audit {query} "
+                "and verify materiality before treating exposure as lost buyer traffic."
+            ),
+            (
+                "After the page is more retrievable, extractable, and authoritative, add "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof."
+            ),
+        ]
+    else:
+        first_moves = [
+            (
+                f"Make {page_label} the more citable + buyable canonical page for {query}, "
+                "then add a first-order offer so buyers have a reason to choose the "
+                "merchant path."
+            ),
+            (
+                f"Add a starter + replenishment bundle on {page_label} for {query}, "
+                "so the page has a concrete value reason beyond third-party exposure."
+            ),
+            (
+                "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
+                "loyalty, returns, stock, and fresh facts."
+            ),
+        ]
+    if controllers:
+        first_moves.append(
+            f"Update the source trail around {controller_phrase} only after {page_label} "
+            "has the direct buying reason."
+        )
+
+    if vacuum_strategy:
+        position = (
+            f"{title} has AI answer exposure for {query}, but the grounded source trail leans on "
+            f"{controller_phrase}, not {destination}."
+        )
+        core_decision = (
+            f"Make {page_label} more retrievable, extractable, citable, and authoritative for "
+            f"{query}, then verify materiality; do not frame obscure cited hosts as a conversion "
+            "fight before the authority mechanism is in place."
+        )
+        why_you_lose = (
+            f"AI's answers show {controller_phrase} shaping the citation trail for {query}. "
+            f"That suggests {destination} is not yet the most authoritative fact-bearing source "
+            "for this lane."
+        )
+        traffic_how_default = (
+            f"Make {page_label} more retrievable and extractable for {query}, state "
+            f"{angle_terms} in text, build reviews/proof, work {controller_phrase} by "
+            "controller type, keep facts consistent, re-audit and verify materiality, "
+            "then add offer, bundle, subscription, and why-buy-direct proof last."
+        )
+        self_serve = [
+            f"Build {page_label} around the exact lane, schema, and plain-text attributes.",
+            f"Work {controller_phrase} by controller type and keep facts consistent.",
+            "Re-audit the lane and verify materiality before adding direct-buy mechanics.",
+        ]
+    elif source_authority_strategy:
+        position = (
+            f"{title} has real demand in AI answers, but the buying path is shaped by "
+            f"{controller_phrase}, not {destination}."
+        )
+        core_decision = (
+            f"Make {page_label} more retrievable, extractable, citable, and authoritative "
+            f"for {query}, then work the cited source trail by controller type with the "
+            "same facts."
+        )
+        why_you_lose = (
+            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
+            "third-party source authority is carrying the facts and trust before the "
+            "official page does."
+        )
+        traffic_how_default = (
+            f"Make {page_label} more retrievable and extractable for {query}, state "
+            f"{angle_terms} in text, build reviews/proof, work {controller_phrase} by "
+            "controller type, keep facts consistent, re-audit and verify materiality, "
+            "then add direct-buy mechanics last."
+        )
+        self_serve = [
+            f"Build {page_label} around the exact lane, schema, and plain-text attributes.",
+            f"Work {controller_phrase} by controller type and keep facts consistent.",
+            "Re-audit the lane and verify materiality before adding direct-buy mechanics.",
+        ]
+    else:
+        position = (
+            f"{title} has real demand in AI answers, but the buying path is controlled "
+            f"by {controller_phrase}, not {destination}."
+        )
+        core_decision = (
+            f"Make {page_label} the better place to buy for {query}; appearing in "
+            "AI answers is not the win until buyers have a reason to choose the "
+            "merchant-controlled path."
+        )
+        why_you_lose = (
+            f"AI's answers show {controller_phrase} shaping {query}. That suggests "
+            "source and distribution authority are capturing the buyer path before "
+            f"{destination} does."
+        )
+        traffic_how_default = (
+            f"Make {page_label} the more citable + buyable canonical page first, "
+            "then add the offer, bundle, subscription, and why-buy-direct proof."
+        )
+        self_serve = [
+            "Add the offer, bundle, subscription, and why-buy-direct proof.",
+            "Keep price, stock, returns, reviews, and product facts fresh.",
+        ]
+
+    traffic_strategy = []
+    defer_queries = {
+        _clean_str(item.get("query")).lower(): item
+        for item in _as_list(sideways_wedge.get("do_not_chase_yet"))
+        if isinstance(item, Mapping) and _clean_str(item.get("query"))
+    }
+    for item in opportunities[:3]:
+        item_query = _clean_str(item.get("query"))
+        how = _deterministic_traffic_how(
+            item,
+            page_label=page_label,
+            default_how=traffic_how_default,
+        )
+        deferred = defer_queries.get(item_query.lower())
+        if isinstance(deferred, Mapping):
+            beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
+            beachhead_query = _clean_str(beachhead.get("query")) or query
+            how = (
+                f"Do not start here yet; use {beachhead_query} first because it is "
+                "more product-specific and easier to make the official page the best "
+                "more citable + buyable route."
+            )
+        traffic_strategy.append({
+            "where": item_query,
+            "who_controls": _controller_phrase(
+                _unique_host_roles(
+                    controller
+                    for controller in _as_list(item.get("controlled_by"))
+                    if isinstance(controller, Mapping)
+                )
+            ),
+            "how": how,
+        })
+
+    if wedge_decision:
+        core_decision = f"{wedge_decision} {core_decision}"
+
+    return {
+        "position": position,
+        "core_decision": core_decision,
+        "why_you_lose": why_you_lose,
+        "your_angle": (
+            f"Use the evidenced product angle — {angle_terms} — as the reason the "
+            "merchant-controlled page deserves to be cited and bought from."
+        ),
+        "traffic_strategy": traffic_strategy,
+        "substitution_play": _deterministic_substitution_play(evidence, page_label),
+        "first_moves": first_moves[:5],
+        "diy_vs_pivota": {
+            "self_serve": self_serve,
+            "pivota": (
+                "Pivota makes the canonical page more citable, buyable, and agent-checkout "
+                "ready, then monitors whether these same lanes move toward the "
+                "merchant-controlled path."
+            ),
+        },
+    }
+
+
+def _controller_phrase(controllers: List[Mapping[str, Any]]) -> str:
+    hosts = [
+        _normalize_host(controller.get("host"))
+        for controller in controllers
+        if isinstance(controller, Mapping)
+    ]
+    hosts = _unique(host for host in hosts if host)
+    if not hosts:
+        return "fragmented sources with no single site owning the lane"
+    if len(hosts) == 1:
+        return hosts[0]
+    return ", ".join(hosts[:-1]) + f", and {hosts[-1]}"
+
+
+def _brief_angle_terms(attributes: Mapping[str, Any]) -> str:
+    terms: List[str] = []
+    for key in ("certification", "ingredient", "format", "use_case", "category"):
+        terms.extend(_as_str_list(attributes.get(key)))
+    return _phrase_join(_unique(terms[:5]), "the evidenced product attributes")
+
+
+def _phrase_join(values: List[str], fallback: str) -> str:
+    cleaned = [value for value in values if _clean_str(value)]
+    if not cleaned:
+        return fallback
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+
+
+def _deterministic_substitution_play(
+    evidence: Mapping[str, Any],
+    page_label: str,
+) -> Optional[str]:
+    substitution = _as_mapping(evidence.get("substitution"))
+    if not substitution.get("present"):
+        return None
+    prompt = _clean_str(substitution.get("on_prompt"))
+    handed_to = _clean_str(substitution.get("handed_to"))
+    if not prompt and not handed_to:
+        return None
+    if prompt and handed_to:
+        return (
+            f"Answer {prompt} on {page_label} with a factual comparison against "
+            f"{handed_to}, then connect the comparison to the direct buying reason."
+        )
+    if prompt:
+        return (
+            f"Answer {prompt} on {page_label}, then connect the comparison to the "
+            "direct buying reason."
+        )
+    return (
+        f"Publish a factual comparison against {handed_to} on {page_label}, then "
+        "connect it to the direct buying reason."
+    )
+
+
 def _grounding_failures(
     brief: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -937,6 +1774,15 @@ def _grounding_failures(
             re.IGNORECASE,
         ):
             failures.append(f"safety-sensitive:{term}")
+
+    for leaf in _iter_leaf_text(brief):
+        leaf_domains = _unique(
+            _normalize_host(domain)
+            for domain in _DOMAIN_RE.findall(leaf)
+            if _normalize_host(domain) in allowed["domains"]
+        )
+        if len(leaf_domains) > 3:
+            failures.append("overwide-controller-list")
 
     for domain in _DOMAIN_RE.findall(text):
         normalized = _normalize_host(domain)
@@ -1002,6 +1848,9 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     product = _as_mapping(evidence.get("product"))
     add_term(product.get("title"))
     add_term(product.get("brand"))
+    merchant_path = _as_mapping(product.get("merchant_path"))
+    for value in merchant_path.values():
+        add_term(value)
     attributes = _as_mapping(product.get("attributes"))
     for field, values in attributes.items():
         for attr in _as_str_list(values):
@@ -1047,6 +1896,44 @@ def _allowed_grounding(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         for controller in _as_list(lane.get("controlled_by")):
             if isinstance(controller, Mapping):
                 add_domain(controller.get("host"))
+
+    for opportunity in _as_list(evidence.get("buyer_path_opportunities")):
+        if not isinstance(opportunity, Mapping):
+            continue
+        add_term(opportunity.get("query"))
+        add_term(opportunity.get("exposure"))
+        add_term(opportunity.get("route"))
+        add_term(opportunity.get("destination"))
+        add_term(opportunity.get("merchant_archetype"))
+        for move in _as_str_list(opportunity.get("recommended_moves")):
+            add_term(move)
+            for word in re.findall(r"[a-z0-9]+", move.lower()):
+                add_attribute_word(word)
+        for controller in _as_list(opportunity.get("controlled_by")):
+            if isinstance(controller, Mapping):
+                add_domain(controller.get("host"))
+
+    sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
+    for lane in (
+        _as_mapping(sideways_wedge.get("recommended_beachhead_lane")),
+        _as_mapping(sideways_wedge.get("canonical_page_play")),
+    ):
+        add_term(lane.get("query"))
+        add_term(lane.get("lane"))
+        for controller in _as_list(lane.get("controllers")):
+            add_domain(controller)
+    for key in ("head_prompt_pressure", "sideways_wedge_lanes", "do_not_chase_yet"):
+        for lane in _as_list(sideways_wedge.get(key)):
+            if not isinstance(lane, Mapping):
+                continue
+            add_term(lane.get("query"))
+            add_term(lane.get("source_route"))
+            for reason in _as_str_list(lane.get("merchant_fit_reasons")):
+                add_term(reason)
+                for word in re.findall(r"[a-z0-9]+", reason.lower()):
+                    add_attribute_word(word)
+            for controller in _as_list(lane.get("controllers")):
+                add_domain(controller)
 
     grounded_words = set(attribute_words)
     for value in allowed_terms | allowed_phrases:

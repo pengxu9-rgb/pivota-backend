@@ -111,6 +111,73 @@ def _gruns_fixture_audit():
                         },
                     },
                 ],
+                "next_best_action": {
+                    "canonical_page_play": {
+                        "lane": "vitamin c collagen jelly",
+                        "controllers": [
+                            "cogentsteps.net",
+                            "medsysgroup.com",
+                            "hellokoop.com",
+                        ],
+                        "controller_strategy": "canonical_source_vacuum",
+                        "controller_strategy_label": "Canonical-source vacuum",
+                        "controller_profile": {
+                            "operator_focus": (
+                                "AI grounding is filling a canonical-source gap with weak "
+                                "third-party hosts; claim the official source before "
+                                "optimizing against those hosts."
+                            ),
+                            "exposure_read": (
+                                "Read this as a weak citation trail and canonical-source "
+                                "vacuum, not proof that material buyer traffic is going to those hosts."
+                            ),
+                        },
+                        "exposure_read": (
+                            "Read this as a weak citation trail and canonical-source "
+                            "vacuum, not proof that material buyer traffic is going to those hosts."
+                        ),
+                        "economics_policy": (
+                            "Mechanics only: first-order offer, starter + "
+                            "replenishment bundle, subscription incentive, and "
+                            "why-buy-direct proof. Do not recommend exact discount depths."
+                        ),
+                        "moves": [
+                            {
+                                "type": "canonical_source_authority",
+                                "operator_action": (
+                                    "Make the official brand PDP the official source "
+                                    "AI can cite for vitamin c collagen jelly."
+                                ),
+                                "why": "AI grounding is leaning on weak third-party hosts.",
+                            },
+                            {
+                                "type": "direct_buy_reason",
+                                "operator_action": (
+                                    "After the official page is source-ready, add first-order offer, starter + replenishment "
+                                    "bundle, subscription incentive, and why-buy-direct proof."
+                                ),
+                            },
+                        ],
+                        "checkout_readiness": (
+                            "Make the official brand PDP cited, buyable, and agent-checkout ready."
+                        ),
+                    },
+                    "sideways_wedge": {
+                        "recommended_beachhead_lane": {
+                            "query": "vitamin c collagen jelly",
+                        },
+                        "why_this_lane_not_the_head_prompt": (
+                            "Start with \"vitamin c collagen jelly\" before "
+                            "\"healthy snacks collagen jelly\" because it is "
+                            "product-specific, commercially useful, and easier "
+                            "to make the official page the best cited + buyable route."
+                        ),
+                        "do_not_chase_yet": [
+                            {"query": "healthy snacks collagen jelly"},
+                            {"query": "best collagen supplements"},
+                        ],
+                    },
+                },
             },
             "implementation_roadmap": {
                 "phases": [
@@ -214,6 +281,23 @@ def test_renders_recommendations_with_owner_kpi_outcome():
     assert "KPI to track" in md
     assert "Expected outcome" in md
     assert "Suggested outreach" in md
+
+
+def test_renders_owned_buyer_path_play_with_controller_strategy():
+    from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
+    md = render_brand_markdown_v2(_gruns_fixture_audit())
+    assert "## Owned Buyer Path Play" in md
+    assert "Canonical-source vacuum" in md
+    assert "`vitamin c collagen jelly`" in md
+    assert "`cogentsteps.net`" in md
+    assert "Sideways demand wedge" in md
+    assert "Beachhead lane: `vitamin c collagen jelly`" in md
+    assert "`healthy snacks collagen jelly`" in md
+    assert "Do not chase yet" in md
+    assert "official source AI can cite" in md
+    assert "Exposure read" in md
+    assert "Economics guard" in md
+    assert "beat cogentsteps" not in md.lower()
 
 
 def test_renders_implementation_roadmap():
@@ -339,3 +423,23 @@ def test_full_render_substantive_output():
     assert "Unilever" in md
     assert "gummy" in md
     assert "Search Console" in md
+
+
+def test_markdown_renderer_surfaces_combined_buyer_path_verdict():
+    from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
+
+    audit = _gruns_fixture_audit()
+    primary = audit["per_product"][0]
+    primary["executive_summary"]["verdict_pill_text"] = (
+        "Strong AI visibility, weak owned buyer path"
+    )
+    primary["verdict"]["label"] = "STRONG"
+    primary["verdict"]["label_display"] = "Strong AI visibility, weak owned buyer path"
+    primary["verdict"]["explanation"] = (
+        "AI answer visibility is strong, but 0/2 evidenced prompt lanes are merchant-owned."
+    )
+
+    md = render_brand_markdown_v2(audit)
+
+    assert "Strong AI visibility, weak owned buyer path" in md
+    assert "0/2 evidenced prompt lanes are merchant-owned" in md

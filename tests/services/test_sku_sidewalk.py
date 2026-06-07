@@ -78,6 +78,64 @@ def test_sku_attribute_graph():
     assert evidence["stick"] in {"title", "body", "variant"}
 
 
+def test_sku_attribute_graph_uses_merchant_type_and_tags_for_multivitamin():
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    product = {
+        "title": "Ritual Essential for Women 18+ Multivitamin",
+        "vendor": "Ritual",
+        "product_type": "Multivitamin",
+        "attributes_raw": {
+            "tags": ["Vegan", "Iron-Free", "Omega-3 DHA", "Traceable"],
+            "description": (
+                "Vegan capsules with omega-3 DHA, methylated folate, "
+                "and traceable nutrients."
+            ),
+        },
+    }
+
+    graph = build_sku_attribute_graph(product)
+    classes = graph["classes"]
+
+    assert "multivitamin" in classes["category"]
+    assert "iron-free" in classes["exclusion"]
+    assert "omega-3 dha" in classes["ingredient"]
+    assert "vegan" in classes["certification_constraint"]
+    assert "traceable" in classes["proof"]
+
+
+def test_sku_attribute_graph_filters_flavor_noise_from_direct_attrs():
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    product = {
+        "title": "Triple Shine Grape",
+        "vendor": "Ownist",
+        "product_type": "Belight grape jelly",
+        "attributes_raw": {
+            "tags": [
+                "collagen",
+                "belight collagen",
+                "vitamin c",
+                "grape",
+                "k-beauty",
+                "skin radiance",
+            ],
+            "description": (
+                "Ownist Triple Shine Grape is a K-beauty supplement with "
+                "Belight collagen and vitamin C."
+            ),
+        },
+    }
+
+    graph = build_sku_attribute_graph(product)
+    classes = graph["classes"]
+
+    assert "belight grape jelly" not in classes["category"]
+    assert "grape" not in classes["use_case"]
+    assert "collagen" in classes["category"]
+    assert "vitamin c" in classes["ingredient"]
+
+
 def test_sidewalk_generation_bb_lab():
     from services.sku_sidewalk import (
         build_sku_attribute_graph,
@@ -337,21 +395,17 @@ def test_per_sku_budget_mix():
         ("where can I buy BB Lab Good Night Collagen", "intent"),
         ("shop BB Lab Good Night Collagen online", "intent"),
         ("BB Lab Good Night Collagen for sale", "intent"),
-        ("best price for BB Lab Good Night Collagen", "price"),
-        ("BB Lab Good Night Collagen discount", "price"),
-        ("BB Lab Good Night Collagen reviews", "review"),
-        ("is BB Lab Good Night Collagen worth it", "review"),
-        ("BB Lab Good Night Collagen alternatives", "comparison"),
-        ("BB Lab Good Night Collagen vs competitors", "comparison"),
-        (
-            "best collagen supplement for shoppers considering "
-            "BB Lab Good Night Collagen",
-            "category",
-        ),
-        ("top collagen supplement like BB Lab Good Night Collagen", "category"),
-        ("what is the best collagen supplement to buy online", "category"),
-        ("BB Lab Good Night Collagen", "brand"),
-        ("buy BB Lab collagen supplement online", "brand"),
+        ("best collagen supplement", "category"),
+        ("what is the best collagen supplement", "category"),
+        ("top collagen supplement", "category"),
+        ("best collagen supplement to buy online", "category"),
+        ("best before bed collagen supplement", "attribute"),
+        ("best collagen supplement for skin routine", "category"),
+        ("skin routine collagen supplement", "attribute"),
+        ("mixed berry collagen supplement", "attribute"),
+        ("recommended collagen supplement", "category"),
+        ("best rated collagen supplement", "category"),
+        ("collagen supplement buying guide", "category"),
     ]
 
     no_attrs = _build_per_sku_audit_query_specs(_sku_ctx(attributes=False), 14)
@@ -361,6 +415,7 @@ def test_per_sku_budget_mix():
     assert len(wedge) == 14
     assert 4 <= sum(1 for _query, axis in wedge if axis == "sidewalk") <= 6
     assert any(query == "collagen stick no water travel" for query, _axis in wedge)
+    assert not any("shoppers considering" in query for query, _axis in wedge)
 
     metadata = _build_per_sku_audit_query_metadata(_sku_ctx(attributes=True), 14)
     assert metadata["collagen stick no water travel"]["attribute_basis"]
@@ -371,6 +426,35 @@ def test_per_sku_budget_mix():
     assert sum(1 for _query, axis in large if axis == "sidewalk") > 0
     for spec in no_attrs_expected:
         assert spec in large
+
+
+def test_per_sku_prompts_include_unbranded_multivitamin_discovery():
+    from services.agent_center_bd_report_service import _build_per_sku_audit_query_specs
+
+    product = {
+        "title": "Ritual Essential for Women 18+ Multivitamin",
+        "brand": "Ritual",
+        "vendor": "Ritual",
+        "product_type": "Multivitamin",
+        "canonical_url": "https://ritual.com/products/essential-for-women-multivitamin-18",
+        "attributes_raw": {
+            "tags": ["Vegan", "Sugar-Free", "Iron-Free", "Omega-3 DHA", "Traceable"],
+        },
+    }
+    ctx = {
+        "sku_key": "ritual-women",
+        "product": product,
+        "sku": {"title": "60 capsules"},
+    }
+
+    specs = _build_per_sku_audit_query_specs(ctx, 14)
+    queries = [query for query, _axis in specs]
+
+    assert "best multivitamin" in queries
+    assert "best multivitamin for women" in queries
+    assert "iron-free multivitamin" in queries
+    assert "vegan multivitamin" in queries
+    assert sum("Ritual" in query for query in queries) == 3
 
 
 @pytest.mark.asyncio

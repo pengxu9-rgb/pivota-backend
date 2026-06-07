@@ -36,6 +36,8 @@ _CATEGORY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("sunscreen", "sunscreen"),
     ("sun screen", "sunscreen"),
     ("deodorant", "deodorant"),
+    ("multivitamin", "multivitamin"),
+    ("multi vitamin", "multivitamin"),
     ("serum", "serum"),
     ("hair vitamins", "hair vitamin"),
     ("hair vitamin", "hair vitamin"),
@@ -61,6 +63,18 @@ _INGREDIENT_TERMS: Tuple[Tuple[str, str], ...] = (
     ("marine collagen", "marine collagen"),
     ("low molecular collagen", "low molecular collagen"),
     ("vitamin c", "vitamin c"),
+    ("omega-3 dha", "omega-3 dha"),
+    ("omega 3 dha", "omega-3 dha"),
+    ("omega-3", "omega-3"),
+    ("omega 3", "omega-3"),
+    ("dha", "dha"),
+    ("vitamin d3", "vitamin d3"),
+    ("vitamin d", "vitamin d"),
+    ("vitamin b12", "vitamin b12"),
+    ("b12", "vitamin b12"),
+    ("methylated folate", "methylated folate"),
+    ("folate", "folate"),
+    ("iron", "iron"),
     ("glycine", "glycine"),
     ("zinc oxide", "zinc oxide"),
     ("titanium dioxide", "titanium dioxide"),
@@ -89,6 +103,9 @@ _AUDIENCE_TERMS: Tuple[Tuple[str, str], ...] = (
     ("baby", "kids"),
     ("postpartum", "postpartum"),
     ("men", "men"),
+    ("women", "women"),
+    ("woman", "women"),
+    ("prenatal", "prenatal"),
     ("sensitive skin", "sensitive skin"),
     ("eczema prone", "sensitive skin"),
     ("eczema-prone", "sensitive skin"),
@@ -139,6 +156,10 @@ _PROOF_TERMS: Tuple[Tuple[str, str], ...] = (
     ("dermatologist tested", "dermatologist-tested"),
     ("dermatologist-tested", "dermatologist-tested"),
     ("clinically tested", "clinically tested"),
+    ("traceable", "traceable"),
+    ("traceability", "traceable"),
+    ("usp verified", "usp verified"),
+    ("verified", "verified"),
     ("award", "award"),
     ("reviews", "reviews"),
     ("low molecular", "low molecular"),
@@ -179,11 +200,49 @@ _NEGATION_TOKENS = {
 _NEGATION_AWARE_CLASSES = {
     "certification_constraint",
     "exclusion",
+    "ingredient",
     "proof",
     "audience",
 }
 _HIGH_CARE_AUDIENCES = {"pregnancy", "kids"}
 _HIGH_CARE_POSITIVE_SOURCES = {"product_type", "tag", "title", "variant"}
+_DIRECT_TAG_STOPWORDS = {
+    "best seller",
+    "bestseller",
+    "new",
+    "sale",
+    "subscription",
+    "subscribe",
+    "trial",
+}
+_DIRECT_TAG_NOISE = {
+    "berry",
+    "blueberry",
+    "cherry",
+    "flavor",
+    "flavoured",
+    "flavored",
+    "garden",
+    "glow",
+    "grape",
+    "lemon",
+    "mango",
+    "orange",
+    "shine",
+    "strawberry",
+    "vanilla",
+}
+_CATEGORY_MARKETING_NOISE = {
+    "glow",
+    "grape",
+    "jelly",
+    "orange",
+    "shine",
+}
+_DIRECT_INGREDIENT_HINT_RE = re.compile(
+    r"\b(?:omega|dha|epa|vitamin|b12|d3|folate|iron|magnesium|boron|calcium)\b",
+    re.IGNORECASE,
+)
 
 
 def _clean_attr(value: Any) -> str:
@@ -254,6 +313,10 @@ def _match_is_negated(
         return True
     if len(lookback) >= 3 and lookback[-3:] == ["doesnt", "contain"]:
         return True
+    if class_name == "ingredient":
+        lookahead = tokens[end:min(len(tokens), end + 2)]
+        if lookahead[:1] == ["free"]:
+            return True
     if class_name == "certification_constraint":
         lookahead = tokens[end:min(len(tokens), end + 4)]
         if "not" in lookahead and any(token.startswith("certif") for token in lookahead):
@@ -451,6 +514,98 @@ def _add_lexicon_matches(
             _add_attr(classes, evidence, class_name, attr, source)
 
 
+def _safe_direct_attr(value: Any) -> str:
+    cleaned = _clean_attr(value)
+    if (
+        not cleaned
+        or len(cleaned) < 3
+        or cleaned in _DIRECT_TAG_STOPWORDS
+        or cleaned in _GENERIC_CATEGORIES
+    ):
+        return ""
+    return cleaned
+
+
+def _direct_tag_class(term: str) -> Optional[str]:
+    cleaned = _safe_direct_attr(term)
+    if not cleaned:
+        return None
+    if cleaned in _DIRECT_TAG_NOISE:
+        return None
+    for _phrase, attr in _CATEGORY_TERMS:
+        if cleaned == attr or _has_phrase(cleaned, attr):
+            return "category"
+    for _phrase, attr in _FORMAT_TERMS:
+        if cleaned == attr or _has_phrase(cleaned, attr):
+            return "format"
+    searchable = _search_text(cleaned)
+    if (
+        re.search(r"\b(?:no|without)\b", searchable)
+        or cleaned.endswith("-free")
+        or cleaned.endswith(" free")
+        or " free " in searchable
+    ):
+        return "exclusion"
+    if any(word in searchable for word in (" vegan ", " halal ", " cruelty free ", " reef safe ")):
+        return "certification_constraint"
+    if any(word in searchable for word in (" women ", " woman ", " men ", " prenatal ", " postpartum ", " kids ")):
+        return "audience"
+    if _DIRECT_INGREDIENT_HINT_RE.search(cleaned):
+        return "ingredient"
+    if any(word in searchable for word in (" traceable ", " verified ", " clinically tested ", " award ")):
+        return "proof"
+    if cleaned.endswith("vitamin") or cleaned.endswith("vitamins") or "multivitamin" in searchable:
+        return "category"
+    if len(cleaned.split()) == 1:
+        return None
+    return "use_case"
+
+
+def _direct_category_allowed(value: str) -> bool:
+    cleaned = _safe_direct_attr(value)
+    if not cleaned:
+        return False
+    searchable = _search_text(cleaned)
+    tokens = set(_context_tokens(cleaned))
+    if tokens & _CATEGORY_MARKETING_NOISE:
+        return False
+    if " supplement " in searchable or " vitamin " in searchable or " multivitamin " in searchable:
+        return True
+    return any(
+        cleaned == attr or _has_phrase(cleaned, attr)
+        for _phrase, attr in _CATEGORY_TERMS
+    )
+
+
+def _add_direct_merchant_attrs(
+    product: Mapping[str, Any],
+    classes: Dict[str, List[str]],
+    evidence: Dict[str, str],
+) -> None:
+    attrs = product.get("attributes_raw")
+    attrs = attrs if isinstance(attrs, dict) else {}
+
+    for source, value in (
+        ("product_type", product.get("product_type")),
+        ("product_type", product.get("category")),
+        ("product_type", attrs.get("product_type")),
+        ("product_type", attrs.get("category")),
+    ):
+        direct = _safe_direct_attr(value)
+        if (
+            direct
+            and direct not in {"beauty", "wellness", "supplements"}
+            and _direct_category_allowed(direct)
+        ):
+            _add_attr(classes, evidence, "category", direct, source)
+
+    for tag in _tags_from_raw(attrs.get("tags") or product.get("tags")):
+        cleaned = _safe_direct_attr(tag)
+        class_name = _direct_tag_class(cleaned)
+        if class_name:
+            _add_attr(classes, evidence, class_name, cleaned, "tag")
+
+
 def _add_offer_and_proof_attrs(
     product: Mapping[str, Any],
     classes: Dict[str, List[str]],
@@ -576,6 +731,7 @@ def build_sku_attribute_graph(product: dict) -> dict:
             lexicon=_PROOF_TERMS,
         )
 
+    _add_direct_merchant_attrs(safe_product, classes, evidence)
     _add_offer_and_proof_attrs(safe_product, classes, evidence)
     _add_quantity_attrs(sources, classes, evidence)
 
@@ -759,6 +915,7 @@ def generate_sidewalk_query_specs(
     geographies = list(classes.get("geography") or [])
     ingredients = list(classes.get("ingredient") or [])
     exclusions = list(classes.get("exclusion") or [])
+    proofs = list(classes.get("proof") or [])
 
     candidates: List[Dict[str, Any]] = []
 
@@ -775,6 +932,7 @@ def generate_sidewalk_query_specs(
     primary_constraint = constraints[0] if constraints else ""
 
     for constraint in constraints[:3]:
+        add(f"{constraint} {category}", [constraint, category], 0.9)
         if plural_format:
             add(
                 f"{constraint} {category} {plural_format}",
@@ -808,6 +966,7 @@ def generate_sidewalk_query_specs(
             )
 
     for exclusion in exclusions[:3]:
+        add(f"{exclusion} {category}", [exclusion, category], 0.9)
         if primary_format:
             lane_use_cases = use_cases[:2]
             if exclusion == "no water" and "travel" in use_cases:
@@ -853,6 +1012,7 @@ def generate_sidewalk_query_specs(
 
     benefit = _benefit_for_category(category)
     for ingredient in ingredients[:4]:
+        add(f"{ingredient} {category}", [ingredient, category], 0.88)
         if plural_format:
             category_text = "" if category in ingredient else f" {category}"
             add(
@@ -867,6 +1027,9 @@ def generate_sidewalk_query_specs(
                 else f"{ingredient} {category} {benefit}"
             )
             add(query, [ingredient, category], 0.83)
+
+    for proof in proofs[:3]:
+        add(f"{proof} {category}", [proof, category], 0.82)
 
     deduped: Dict[str, Dict[str, Any]] = {}
     for item in candidates:

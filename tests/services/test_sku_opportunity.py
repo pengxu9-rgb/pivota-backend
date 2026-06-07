@@ -243,7 +243,12 @@ def test_sku_opportunity_scores_bb_lab_prompt_cases():
 
     head = rows["best collagen supplements for skin"]
     assert head["provider_verdicts"] == {"gemini": "loss", "deepseek": "loss"}
-    assert head["ownership_state"] in {"competitor-owned", "publisher-owned", "retailer-owned"}
+    assert head["ownership_state"] in {
+        "competitor-owned",
+        "marketplace-owned",
+        "publisher-owned",
+        "retailer-owned",
+    }
     assert head["density"]["band"] == "high"
     assert head["open_lane"] is False
     assert head["demand_state"] == "contested"
@@ -491,6 +496,142 @@ def test_redirector_retailer_owned():
     assert row["open_lane"] is False
 
 
+def test_branded_prompt_with_publisher_citations_is_not_merchant_owned():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = {
+        "sku_key": "sku-ritual",
+        "merchant_id": "m-ritual",
+        "product": {
+            "title": "Ritual Essential for Women 18+ Multivitamin",
+            "raw_title": "Ritual Essential for Women 18+ Multivitamin",
+            "brand": "Ritual",
+            "vendor": "Ritual",
+            "product_type": "Multivitamin",
+            "canonical_url": "https://ritual.com/products/essential-for-women-multivitamin-18",
+            "attributes_raw": {"tags": ["vegan", "iron-free"]},
+        },
+    }
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "Ritual Essential for Women 18+ Multivitamin reviews",
+            "axis": "intent",
+            "parsed": {
+                "product_visible": True,
+                "correct_sku": True,
+                "sku_mentioned": True,
+            },
+            "sources": [
+                {"uri": "https://medicalnewstoday.com/best-multivitamins", "title": "Medical News Today"},
+                {"uri": "https://healthline.com/nutrition/best-multivitamins", "title": "Healthline"},
+                {"uri": "https://ulta.com/p/ritual", "title": "Ulta"},
+            ],
+            "raw": "Ritual is mentioned in publisher reviews and retailer listings.",
+        },
+    ])
+
+    row = _by_query(build_sku_opportunity(ctx, runs, attribute_graph=graph))[
+        "ritual essential for women 18+ multivitamin reviews"
+    ]
+
+    assert row["provider_verdicts"] == {"gemini": "win", "deepseek": "win"}
+    assert row["ownership_state"] == "publisher-owned"
+    assert row["who_owns"] == ["healthline.com", "medicalnewstoday.com"]
+
+
+def test_branded_prompt_with_retailer_citations_names_retailer_owner():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = {
+        "sku_key": "sku-ritual",
+        "merchant_id": "m-ritual",
+        "product": {
+            "title": "Ritual Essential for Women 18+ Multivitamin",
+            "brand": "Ritual",
+            "vendor": "Ritual",
+            "product_type": "Multivitamin",
+            "canonical_url": "https://ritual.com/products/essential-for-women-multivitamin-18",
+            "attributes_raw": {"tags": ["vegan"]},
+        },
+    }
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "where can I buy Ritual Essential for Women 18+ Multivitamin",
+            "axis": "intent",
+            "parsed": {
+                "product_visible": True,
+                "correct_sku": True,
+                "sku_mentioned": True,
+            },
+            "sources": [
+                {"uri": "https://ulta.com/p/ritual", "title": "Ulta"},
+                {"uri": "https://walmart.com/ip/ritual", "title": "Walmart"},
+            ],
+            "raw": "Ritual is available at Ulta and Walmart.",
+        },
+    ])
+
+    row = _by_query(build_sku_opportunity(ctx, runs, attribute_graph=graph))[
+        "where can i buy ritual essential for women 18+ multivitamin"
+    ]
+
+    assert row["ownership_state"] == "retailer-owned"
+    assert row["who_owns"] == ["ulta.com", "walmart.com"]
+    assert row["source_summary"]["buyer_path_controllers"] == [
+        {"host": "ulta.com", "role": "retailer", "times_cited": 2},
+        {"host": "walmart.com", "role": "retailer", "times_cited": 2},
+    ]
+
+
+def test_merchant_owned_requires_dominant_first_party_citation():
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = {
+        "sku_key": "sku-ritual",
+        "merchant_id": "m-ritual",
+        "product": {
+            "title": "Ritual Essential for Women 18+ Multivitamin",
+            "brand": "Ritual",
+            "vendor": "Ritual",
+            "product_type": "Multivitamin",
+            "canonical_url": "https://ritual.com/products/essential-for-women-multivitamin-18",
+            "attributes_raw": {"tags": ["vegan"]},
+        },
+    }
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "where can I buy Ritual Essential for Women 18+ Multivitamin",
+            "axis": "intent",
+            "parsed": {
+                "product_visible": True,
+                "correct_sku": True,
+                "sku_mentioned": True,
+            },
+            "sources": [
+                {
+                    "uri": "https://ritual.com/products/essential-for-women-multivitamin-18",
+                    "title": "Ritual PDP",
+                },
+                {"uri": "https://medicalnewstoday.com/best-multivitamins", "title": "Medical News Today"},
+            ],
+            "raw": "Ritual's PDP and Medical News Today are cited.",
+        },
+    ])
+
+    row = _by_query(build_sku_opportunity(ctx, runs, attribute_graph=graph))[
+        "where can i buy ritual essential for women 18+ multivitamin"
+    ]
+
+    assert row["ownership_state"] == "merchant-owned"
+    assert row["who_owns"] is None
+
+
 def test_redirector_first_party():
     from services.sku_opportunity import build_sku_opportunity
     from services.sku_sidewalk import build_sku_attribute_graph
@@ -502,7 +643,7 @@ def test_redirector_first_party():
             "query": "halal collagen sticks before bed",
             "axis": "sidewalk",
             "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
-            "sources": [_redirector_source("BB Lab official PDP", "bblab-pdp")],
+            "sources": [_redirector_source("bblab.shop official PDP", "bblab-pdp")],
             "raw": "BB Lab Good Night Collagen is cited from the BB Lab official PDP.",
             "axis_metadata": _sidewalk_meta(),
         },

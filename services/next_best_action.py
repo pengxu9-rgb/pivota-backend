@@ -11,6 +11,20 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from services.buyer_path_stable_controllers import (
+    stable_buyer_path_controllers_for_row,
+)
+from services.buyer_path_controller_quality import (
+    controller_profile as build_controller_profile,
+    is_canonical_source_vacuum,
+)
+from services.sku_lane_priority import (
+    build_sideways_wedge,
+    has_lane_demand,
+    is_third_party_controlled_lane,
+    prioritize_lanes,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +47,12 @@ _VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
 _VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
 _VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY = "CATEGORY MENTION, NO FIRST-PARTY"
 _VERDICT_STRONG = "STRONG"
+_OFFER_ECONOMICS_POLICY = (
+    "Mechanics only: first-order offer, starter + replenishment bundle, "
+    "subscription incentive, and why-buy-direct proof. Do not recommend exact "
+    "discount depths, bundle prices, savings percentages, or margin claims "
+    "without audited margin or promo evidence."
+)
 
 _RETAIL_HOST_TYPES = {"retailer", "marketplace"}
 _SOURCE_HOST_TYPES = {
@@ -45,18 +65,11 @@ _SOURCE_HOST_TYPES = {
     "video",
 }
 _LOW_CONFIDENCE_HOST_TYPES = {"cdn", "unclassified"}
+_COMMUNITY_CONTROLLER_TYPES = {"community", "forum", "reddit", "social"}
+_PUBLISHER_CONTROLLER_TYPES = {"editorial", "publisher", "video"}
+_LISTING_CONTROLLER_TYPES = {"marketplace", "retailer"}
 _REQUIRED_INTEGRATION_PIECES = {"store_platform", "psp"}
 _SEVERITY_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2}
-_SKU_REPAIR_OWNERSHIP = {
-    "retailer-owned",
-    "marketplace-owned",
-    "publisher-owned",
-    "forum-owned",
-    "competitor-owned",
-}
-_SKU_REPAIR_ROUTES = {"retailer", "marketplace", "publisher", "forum", "brand"}
-
-
 def classify_primary_gap(
     *,
     merchant_view: Mapping[str, Any],
@@ -214,6 +227,7 @@ async def attach_sku_strategic_brief(
     sku_title: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    merchant_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Optionally attach an evidence-grounded strategic brief.
 
@@ -236,6 +250,7 @@ async def attach_sku_strategic_brief(
             scores=scores,
             identity=identity,
             sku_title=sku_title,
+            merchant_host=merchant_host,
         )
         brief = await generate_sku_strategic_brief(
             evidence,
@@ -277,6 +292,13 @@ def _classify_sku_primary_gap(
     ):
         return PRIMARY_SKU_PROTECTED_MONITORING
 
+    if _sku_has_resolved_coverage(
+        opportunity=opportunity,
+        identity=identity,
+        require_demand=True,
+    ):
+        return PRIMARY_SKU_PROTECTED_MONITORING
+
     return PRIMARY_SKU_INSUFFICIENT_DATA
 
 
@@ -290,9 +312,14 @@ def _build_sku_evidence_used(
     identity: Mapping[str, Any],
     sku_title: Optional[str],
 ) -> Dict[str, Any]:
+    sideways_wedge = _as_mapping(opportunity.get("sideways_wedge")) or build_sideways_wedge(
+        _as_list(opportunity.get("per_prompt")),
+        product_evidence=_as_mapping(opportunity.get("product_evidence")),
+    )
     return {
         "sku_title": _sku_title(identity=identity, sku_title=sku_title),
         "identity": dict(identity),
+        "merchant_path": _merchant_path(identity=identity, opportunity=opportunity),
         "scores": _sku_scores(scores),
         "top_open_lane": _sku_lane_chip(_sku_top_open_lane(opportunity)),
         "substitution_alert": dict(_as_mapping(opportunity.get("substitution_alert"))),
@@ -301,6 +328,7 @@ def _build_sku_evidence_used(
         "coverage": dict(_as_mapping(opportunity.get("confidence"))),
         "demand_state_summary": opportunity.get("demand_state_summary"),
         "intent_ladder": dict(_as_mapping(opportunity.get("intent_ladder"))),
+        "sideways_wedge": dict(sideways_wedge),
         "failing_prompt_examples": [
             _sku_failing_prompt_chip(prompt)
             for prompt in failing_prompts[:5]
@@ -320,6 +348,8 @@ def _sku_prescription_for_gap(
     substitution = _as_mapping(evidence.get("substitution_alert"))
     content_gap = _as_mapping(evidence.get("content_gap"))
     route_prompt = _as_mapping(evidence.get("source_route_prompt"))
+    merchant_path = _as_mapping(evidence.get("merchant_path"))
+    sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
     first_pivota_path = _sku_pivota_path(sku_title)
 
     if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
@@ -402,23 +432,54 @@ def _sku_prescription_for_gap(
 
     if primary_gap == PRIMARY_SKU_SOURCE_ROUTE_REPAIR:
         query = _sku_query_phrase(route_prompt.get("query"))
-        hosts = _phrase(_host_names(route_prompt.get("sources")), "other sites")
+        hosts = _phrase(
+            _host_names(route_prompt.get("sources")),
+            "fragmented sources with no single cited site",
+        )
+        wedge_reason = _sku_sideways_wedge_reason(sideways_wedge)
+        route_profile = _route_prompt_controller_profile(route_prompt)
+        if is_canonical_source_vacuum(route_profile):
+            why_this_first = (
+                f"This lane isn't empty; AI is citing {hosts}. "
+                f"{route_profile.get('exposure_read')} Make {_merchant_destination(merchant_path)} "
+                "more retrievable, extractable, and citable before framing this as a retailer value fight."
+                f"{wedge_reason}"
+            )
+        elif str(route_profile.get("strategy") or "") == "source_authority_gap":
+            why_this_first = (
+                f"This lane isn't empty; AI is citing {hosts}. Read that as source-authority "
+                f"evidence: make {_merchant_destination(merchant_path)} the official page those "
+                f"sources can reference, then work the cited source trail.{wedge_reason}"
+            )
+        else:
+            why_this_first = (
+                f"This lane isn't empty; AI is citing {hosts}. Read that as exposed demand: "
+                f"make {_merchant_destination(merchant_path)} the better place to buy, then "
+                f"work the source that already shapes the answer.{wedge_reason}"
+            )
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"For {query}, AI leans on {hosts}, not you.",
-            why_this_first=(
-                f"This lane isn't empty, AI is just citing {hosts} for it. You win "
-                "it by getting into the source that already shapes the answer, then "
-                "making your own page the better one."
+            prescription_class="operational_efficiency",
+            merchant_path=merchant_path,
+            operator_moves=_sku_operator_moves(
+                route_prompt=route_prompt,
+                merchant_path=merchant_path,
             ),
-            first_move=_sku_source_route_first_move(route_prompt),
+            canonical_page_play=_sku_canonical_page_play(
+                route_prompt=route_prompt,
+                merchant_path=merchant_path,
+            ),
+            headline=f"For {query}, AI leans on {hosts}, not your buying path.",
+            why_this_first=why_this_first,
+            first_move=_sku_source_route_first_move(route_prompt, merchant_path),
             self_serve_actions=[
-                _sku_source_route_self_serve(route_prompt),
-                "Then make your own page the better answer: clearer facts, proof, and a few reviews.",
+                _sku_source_route_self_serve(route_prompt, merchant_path),
+                _sku_source_route_follow_up(route_prompt, merchant_path),
             ],
             pivota_path=first_pivota_path,
             evidence_used=evidence,
-            cta=_sku_cta("Win back the cited answer"),
+            sideways_wedge=sideways_wedge,
+            cta=_sku_cta("Win back the cited buying path"),
         )
 
     if primary_gap == PRIMARY_SKU_PROTECTED_MONITORING:
@@ -449,36 +510,47 @@ def _sku_prescription_for_gap(
         )
 
     identity = _as_mapping(evidence.get("identity"))
-    reason = (
-        "we couldn't pin down exactly which product this is"
+    evidence_focus = (
+        "product identity"
         if bool(identity.get("unresolved"))
-        else "there wasn't enough signal this run"
+        else "validated product and prompt evidence"
     )
     return _base_payload(
         primary_gap=PRIMARY_SKU_INSUFFICIENT_DATA,
-        headline=f"We need a bit more to go on for {sku_title}.",
+        headline=f"Build the product evidence foundation for {sku_title}.",
         why_this_first=(
-            f"We won't invent a recommendation, {reason}. Tighten the product "
-            "details and we'll give you a real next move."
+            f"The next useful move is to make {sku_title}'s canonical page strong "
+            f"on {evidence_focus}, so AI has official facts and a buyable route "
+            "to cite before broader demand work starts."
         ),
-        first_move="Make sure the product details are complete, then re-run the audit.",
+        first_move=(
+            "Publish a complete canonical PDP with exact product naming, category, "
+            "variants, price/stock, images, usage, proof, shipping/returns, and "
+            "the direct-buy reason."
+        ),
         self_serve_actions=[
             (
-                "Complete the basics: title, brand, category, variants, price, "
-                "images, and a clear description."
+                "Fill the page with buyer-usable facts: who it is for, what it is, "
+                "how to use it, ingredients/materials, format, proof, price, stock, "
+                "shipping, returns, and any authorized where-to-buy path."
             ),
-            "Then re-run, so we can test it as a real product with real demand.",
+            (
+                "Add the direct-site conversion mechanics to the same page: "
+                "first-order offer, starter + replenishment bundle where relevant, "
+                "subscription incentive, and why-buy-direct proof."
+            ),
         ],
         pivota_path=first_pivota_path,
         evidence_used=evidence,
-        cta=_sku_cta("Complete the details and retest"),
+        cta=_sku_cta("Build the canonical product evidence"),
     )
 
 
 def _sku_pivota_path(sku_title: str) -> str:
     return (
-        f"Pivota can make {sku_title}'s page the one AI cites and lets shoppers "
-        "buy, and tell you when these prompts start naming you."
+        f"Pivota can make {sku_title}'s canonical page more citable, buyable, and "
+        "agent-checkout ready, then tell you when these prompts start routing "
+        "toward your owned path."
     )
 
 
@@ -487,7 +559,8 @@ def _sku_cta(label: str) -> Dict[str, str]:
         "label": label,
         "trust_note": (
             "The merchant can make the PDP, listing, content, and outreach fixes "
-            "directly; Pivota is for canonical SKU serving, checkout, and monitoring."
+            "directly; Pivota is for more citable + buyable canonical SKU serving, "
+            "agent-checkout readiness, and monitoring."
         ),
     }
 
@@ -520,24 +593,40 @@ def _sku_source_route_prompt(opportunity: Mapping[str, Any]) -> Optional[Mapping
     for row in _as_list(opportunity.get("per_prompt")):
         if not isinstance(row, Mapping):
             continue
-        ownership = str(row.get("ownership_state") or "").strip().lower()
-        source_route = str(row.get("source_route") or "").strip().lower()
-        if ownership not in _SKU_REPAIR_OWNERSHIP and source_route not in _SKU_REPAIR_ROUTES:
+        if not is_third_party_controlled_lane(row):
             continue
-        if ownership == "merchant-owned":
-            continue
-        if _score(row.get("opportunity_score")) <= 0 and float(row.get("demand_signal") or 0) <= 0:
+        if not has_lane_demand(row):
             continue
         candidates.append(row)
     if not candidates:
         return None
-    candidates.sort(
-        key=lambda row: (
-            -float(row.get("opportunity_score") or 0),
-            str(row.get("query") or "").lower(),
-        )
+    prioritized = prioritize_lanes(
+        candidates,
+        product_evidence=_as_mapping(opportunity.get("product_evidence")),
     )
-    return candidates[0]
+    return prioritized[0]
+
+
+def _sku_has_resolved_coverage(
+    *,
+    opportunity: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    require_demand: bool,
+) -> bool:
+    if identity.get("unresolved"):
+        return False
+    coverage = _as_mapping(opportunity.get("confidence"))
+    if _score(coverage.get("prompt_count")) <= 0:
+        return False
+    if not require_demand:
+        return True
+    if _score(coverage.get("prompts_with_demand")) > 0:
+        return True
+    return any(
+        isinstance(row, Mapping)
+        and float(row.get("demand_signal") or 0) > 0
+        for row in _as_list(opportunity.get("per_prompt"))
+    )
 
 
 def _sku_is_protected(
@@ -628,15 +717,28 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     if not prompt:
         return {}
     source_summary = _as_mapping(prompt.get("source_summary"))
-    return {
+    stable_sources = stable_buyer_path_controllers_for_row(prompt)
+    out = {
         "query": prompt.get("query"),
         "ownership_state": prompt.get("ownership_state"),
         "source_route": prompt.get("source_route"),
         "opportunity_score": prompt.get("opportunity_score"),
         "why_fit": prompt.get("attribute_basis") or prompt.get("evidence"),
-        "sources": _as_list(source_summary.get("top_cited_hosts"))[:3],
+        "sources": stable_sources[:3],
+        "raw_top_cited_hosts": _as_list(source_summary.get("top_cited_hosts"))[:3],
         "competitors": _as_list(prompt.get("competitors"))[:5],
     }
+    for key in (
+        "lane_priority_score",
+        "merchant_fit_score",
+        "conversion_fit_score",
+        "merchant_fit_reasons",
+        "fit_penalties",
+        "selection_reason",
+    ):
+        if key in prompt:
+            out[key] = prompt.get(key)
+    return out
 
 
 def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
@@ -659,48 +761,841 @@ def _sku_gap_label(gap: Mapping[str, Any]) -> str:
     return bucket.replace("_", " ")
 
 
+def _merchant_path(
+    *,
+    identity: Optional[Mapping[str, Any]] = None,
+    opportunity: Optional[Mapping[str, Any]] = None,
+    merchant_view: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
+    archetype = _merchant_archetype(
+        identity=identity,
+        opportunity=opportunity,
+        merchant_view=merchant_view,
+    )
+    if archetype == "channel":
+        return {
+            "archetype": "channel",
+            "destination": "your channel's website",
+            "page_label": "your channel PDP or category page",
+            "goal": "drive buyers to the channel's website",
+        }
+    return {
+        "archetype": "brand",
+        "destination": "the brand's own website",
+        "page_label": "your official PDP",
+        "goal": "drive buyers to the brand's own website",
+    }
+
+
+def _merchant_archetype(
+    *,
+    identity: Optional[Mapping[str, Any]],
+    opportunity: Optional[Mapping[str, Any]],
+    merchant_view: Optional[Mapping[str, Any]],
+) -> str:
+    for payload in (identity, opportunity, merchant_view):
+        data = _as_mapping(payload)
+        raw = _first_present(
+            data,
+            (
+                "merchant_archetype",
+                "merchant_type",
+                "business_model",
+                "commerce_role",
+                "seller_type",
+                "retailer_type",
+            ),
+        )
+        normalized = _normalize_merchant_archetype(raw)
+        if normalized:
+            return normalized
+        anchors = _as_mapping(data.get("anchors"))
+        normalized = _normalize_merchant_archetype(
+            _first_present(
+                anchors,
+                (
+                    "merchant_archetype",
+                    "merchant_type",
+                    "business_model",
+                    "commerce_role",
+                    "seller_type",
+                ),
+            )
+        )
+        if normalized:
+            return normalized
+    return "brand"
+
+
+def _normalize_merchant_archetype(value: Any) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if any(token in text for token in ("channel", "retailer", "marketplace", "multi-brand", "multibrand")):
+        return "channel"
+    if any(token in text for token in ("brand", "dtc", "d2c", "manufacturer", "maker")):
+        return "brand"
+    return None
+
+
+def _first_present(payload: Mapping[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _merchant_destination(merchant_path: Mapping[str, Any]) -> str:
+    return str(merchant_path.get("destination") or "the merchant-controlled website")
+
+
+def _merchant_page_label(merchant_path: Mapping[str, Any]) -> str:
+    return str(merchant_path.get("page_label") or "the merchant-controlled page")
+
+
+def _controller_chips(
+    controllers: Any,
+    *,
+    default_role: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    chips: List[Dict[str, Any]] = []
+    role = str(default_role or "").strip().lower()
+    for row in _as_list(controllers):
+        host = ""
+        row_role = role
+        times_cited = None
+        if isinstance(row, Mapping):
+            host = str(row.get("host") or "").strip()
+            row_role = str(row.get("role") or row.get("type") or role).strip().lower()
+            times_cited = row.get("times_cited") or row.get("count") or row.get("citations")
+        elif isinstance(row, str):
+            host = row.strip()
+        if not host:
+            continue
+        chip = {"host": host}
+        if row_role:
+            chip["role"] = row_role
+        if times_cited is not None:
+            chip["times_cited"] = times_cited
+        chips.append(chip)
+    return chips
+
+
+def _route_prompt_controller_profile(prompt: Mapping[str, Any]) -> Dict[str, Any]:
+    route = str(prompt.get("source_route") or "").strip().lower()
+    ownership = str(prompt.get("ownership_state") or "").strip().lower()
+    default_role = route or ownership
+    return build_controller_profile(
+        _controller_chips(prompt.get("sources"), default_role=default_role)
+    )
+
+
+def _brand_controller_profile(evidence: Mapping[str, Any]) -> Dict[str, Any]:
+    hosts = [
+        {
+            "host": str(row.get("host") or ""),
+            "role": str(row.get("type") or "retailer"),
+            "times_cited": row.get("times_cited"),
+        }
+        for row in _as_list(evidence.get("retailer_hosts"))
+        if isinstance(row, Mapping)
+    ]
+    return build_controller_profile(hosts)
+
+
 def _sku_query_phrase(value: Any) -> str:
     text = str(value or "").strip()
     return f'"{text}"' if text else "the tested SKU prompt"
 
 
-def _sku_source_route_first_move(prompt: Mapping[str, Any]) -> str:
+def _sku_source_route_first_move(
+    prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> str:
     route = str(prompt.get("source_route") or "").strip().lower()
     ownership = str(prompt.get("ownership_state") or "").strip().lower()
     query = _sku_query_phrase(prompt.get("query"))
     competitors = _phrase(_as_str_list(prompt.get("competitors")), "the named competitor")
+    page = _merchant_page_label(merchant_path)
+    profile = _route_prompt_controller_profile(prompt)
+    direct_play = (
+        f"Make {page} the more citable + buyable canonical path for {query}: first-order "
+        "offer, starter + replenishment bundle, subscription incentive, and "
+        "why-buy-direct proof"
+    )
+    if is_canonical_source_vacuum(profile):
+        return (
+            f"Make {page} more retrievable and extractable for {query}: target "
+            "the exact lane wording, add product/offer/review/FAQ schema, state "
+            f"{_authority_attribute_phrase(prompt)} in page text, and keep "
+            "direct-buy mechanics until after the authority work."
+        )
+    if str(profile.get("strategy") or "") == "source_authority_gap":
+        return (
+            f"Make {page} more retrievable, extractable, and authoritative for "
+            f"{query}: target the exact lane wording, add product/offer/review/FAQ "
+            f"schema, state {_authority_attribute_phrase(prompt)} in page text, "
+            "then work the cited source by controller type."
+        )
     if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
-        return f"Fix the cited retailer/marketplace listing for {query}"
+        return f"{direct_play}; then fix the cited retailer/marketplace listings."
     if ownership == "publisher-owned" or route == "publisher":
-        return f"Pitch the cited publisher for roundup inclusion around {query}"
+        return f"{direct_play}; then pitch the cited publisher for roundup inclusion."
     if ownership == "forum-owned" or route == "forum":
-        return f"Build reviews/UGC that answer {query}"
-    return f"Publish comparison proof for {query} against {competitors}"
+        return f"{direct_play}; then build review/UGC proof that points back to it."
+    return (
+        f"{direct_play}; then publish comparison proof against {competitors}."
+    )
 
 
-def _sku_source_route_self_serve(prompt: Mapping[str, Any]) -> str:
+def _sku_source_route_self_serve(
+    prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> str:
     route = str(prompt.get("source_route") or "").strip().lower()
     ownership = str(prompt.get("ownership_state") or "").strip().lower()
-    sources = _phrase(_host_names(prompt.get("sources")), "the cited sources")
+    sources = _phrase(
+        _host_names(prompt.get("sources")),
+        "fragmented sources with no single cited site",
+    )
+    query = _sku_query_phrase(prompt.get("query"))
+    page = _merchant_page_label(merchant_path)
+    profile = _route_prompt_controller_profile(prompt)
+    if is_canonical_source_vacuum(profile):
+        return (
+            f"On {page}, make {query} more retrievable and extractable: use the "
+            "exact lane wording, add product/offer/review/FAQ schema, and state "
+            f"{_authority_attribute_phrase(prompt)} in plain page text."
+        )
+    if str(profile.get("strategy") or "") == "source_authority_gap":
+        return (
+            f"On {page}, answer {query} with official proof, reviews, availability, "
+            "images, product/offer/review/FAQ schema, and source-consistent facts "
+            f"before working {sources}."
+        )
     if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
         return (
-            f"Audit {sources} for title, images, claims, variants, price, "
-            "availability, authorization, and SKU facts."
+            f"On {page}, tie {query} to a first-order offer, starter + replenishment "
+            "bundle, subscription incentive, and why-buy-direct block so the cited "
+            f"page gives buyers a reason to choose you over {sources}."
         )
     if ownership == "publisher-owned" or route == "publisher":
         return (
-            f"Pitch {sources} with SKU facts, proof assets, images, pricing, "
-            "availability, and a specific comparison angle."
+            f"On {page}, answer {query} with proof, reviews, offer mechanics, "
+            "bundle/subscription options, and a why-buy-direct block so the canonical "
+            f"page is worth sending buyers to before pitching {sources}."
         )
     if ownership == "forum-owned" or route == "forum":
         return (
-            f"Build review and UGC proof that can show up near {sources}, "
-            "then link it back to the official PDP."
+            f"Collect reviews/UGC that answer {query}, then link the proof back to "
+            f"{page} with the direct buying reason."
         )
     return (
-        "Add comparison content naming the competitor, with substantiated "
-        "differences, use cases, specs/ingredients, and review proof."
+        f"On {page}, add comparison content for {query} with substantiated differences, "
+        "proof, and the offer/bundle/subscription reason to buy from you."
     )
+
+
+def _sku_source_route_follow_up(
+    prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> str:
+    route = str(prompt.get("source_route") or "").strip().lower()
+    ownership = str(prompt.get("ownership_state") or "").strip().lower()
+    sources = _phrase(
+        _host_names(prompt.get("sources")),
+        "fragmented sources with no single cited site",
+    )
+    query = _sku_query_phrase(prompt.get("query"))
+    page = _merchant_page_label(merchant_path)
+    profile = _route_prompt_controller_profile(prompt)
+    if is_canonical_source_vacuum(profile):
+        return (
+            f"Then {_controller_source_route_action(profile, sources, query, page)} "
+            "Keep SKU name, attributes, availability, and images consistent across "
+            f"{page} and {sources}; re-audit the lane and verify materiality before "
+            "treating exposure as lost buyer traffic."
+        )
+    if str(profile.get("strategy") or "") == "source_authority_gap":
+        return (
+            f"Then {_controller_source_route_action(profile, sources, query, page)} "
+            "Keep SKU name, attributes, availability, and images consistent across "
+            f"{page} and {sources}; re-audit the lane and verify materiality before "
+            "treating exposure as lost buyer traffic."
+        )
+    if ownership in {"retailer-owned", "marketplace-owned"} or route in {"retailer", "marketplace"}:
+        return (
+            f"Then audit {sources} for wrong titles, images, variants, price, stock, "
+            "authorization, and SKU facts so third-party exposure stops outranking "
+            f"{_merchant_destination(merchant_path)}."
+        )
+    if ownership == "publisher-owned" or route == "publisher":
+        return (
+            f"Then pitch {sources} with the exact SKU facts, proof assets, images, "
+            "pricing/availability, and comparison angle from your canonical page."
+        )
+    if ownership == "forum-owned" or route == "forum":
+        return (
+            f"Then seed the review proof where {sources} can discover it, without "
+            "claiming a community placement until it is actually evidenced."
+        )
+    return (
+        "Then update the source trail that AI cites so the comparison points back "
+        f"to {_merchant_destination(merchant_path)}."
+    )
+
+
+def _authority_attribute_phrase(prompt: Mapping[str, Any]) -> str:
+    values = (
+        _as_str_list(prompt.get("why_fit"))
+        or _as_str_list(prompt.get("attribute_basis"))
+        or _as_str_list(prompt.get("evidence"))
+    )
+    return _phrase(values[:5], "the evidenced lane attributes")
+
+
+def _controller_types(profile: Mapping[str, Any]) -> List[str]:
+    out: List[str] = []
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        for key in ("input_role", "type"):
+            value = str(row.get(key) or "").strip().lower()
+            if value:
+                out.append(value)
+    return out
+
+
+def _controller_source_route_move_type(profile: Mapping[str, Any]) -> str:
+    types = set(_controller_types(profile))
+    if types & _COMMUNITY_CONTROLLER_TYPES:
+        return "community_source_participation"
+    if types & _PUBLISHER_CONTROLLER_TYPES:
+        return "publisher_source_pitch"
+    if types & _LISTING_CONTROLLER_TYPES:
+        return "retailer_listing_accuracy"
+    return "evidenced_source_update"
+
+
+def _split_controllers_by_move_type(profile: Mapping[str, Any]):
+    forum: List[str] = []
+    publisher: List[str] = []
+    other: List[str] = []
+    seen: set[str] = set()
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        host = str(row.get("host") or "").strip()
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        role = str(row.get("input_role") or row.get("type") or "").strip().lower()
+        if role in _COMMUNITY_CONTROLLER_TYPES:
+            forum.append(host)
+        elif role in _PUBLISHER_CONTROLLER_TYPES:
+            publisher.append(host)
+        else:
+            other.append(host)
+    return forum, publisher, other
+
+
+def _controller_source_route_action(
+    profile: Mapping[str, Any],
+    controller: str,
+    lane: str,
+    page: str,
+) -> str:
+    move_type = _controller_source_route_move_type(profile)
+    if move_type == "community_source_participation":
+        forum, publisher, other = _split_controllers_by_move_type(profile)
+        if publisher:
+            # Mixed forum + publisher controllers: address each by its own play
+            # instead of calling a publisher part of "the discussion".
+            clauses: List[str] = []
+            if forum:
+                clauses.append(
+                    f"participate in or seed accurate product info in the "
+                    f"{_phrase(forum, controller)} discussion"
+                )
+            clauses.append(
+                f"pitch {_phrase(publisher, controller)} with exact SKU facts, "
+                "proof assets, images, and availability"
+            )
+            if other:
+                clauses.append(f"fix the {_phrase(other, controller)} listing facts")
+            return (
+                f"{_phrase(clauses, '')} for {lane}, using only facts already "
+                f"published on {page}"
+            )
+        return (
+            f"participate in or seed accurate product info in the {controller} "
+            f"discussion for {lane}, using only facts already published on {page}"
+        )
+    if move_type == "publisher_source_pitch":
+        return (
+            f"pitch {controller} for {lane} with exact SKU facts, proof assets, "
+            f"images, availability, and the canonical page at {page}"
+        )
+    if move_type == "retailer_listing_accuracy":
+        return (
+            f"claim or fix the {controller} listing for {lane}: title, images, "
+            "variant, stock, authorization, and SKU facts"
+        )
+    return (
+        f"work the evidenced source trail around {controller} for {lane} with "
+        f"the same facts published on {page}"
+    )
+
+
+def _sentence(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    return cleaned[:1].upper() + cleaned[1:].rstrip(".") + "."
+
+
+def _authority_mechanism_steps(
+    *,
+    lane: str,
+    page: str,
+    destination: str,
+    controller: str,
+    profile: Mapping[str, Any],
+    attributes: str,
+) -> List[Dict[str, str]]:
+    source_action = _controller_source_route_action(profile, controller, lane, page)
+    source_move_type = _controller_source_route_move_type(profile)
+    return [
+        {
+            "type": "retrieval_lane_rank",
+            "action": (
+                f"Build {page} to rank for the exact lane {lane}: use the lane "
+                "wording in the title, H1, metadata, and body copy so the page is "
+                "more retrievable and citable."
+            ),
+            "why": (
+                f"Grounded shopping engines retrieve web results before extracting "
+                f"facts, so {page} has to surface for {lane}."
+            ),
+        },
+        {
+            "type": "structured_extraction_schema",
+            "action": (
+                f"Add product/offer/review/FAQ schema on {page} for {lane}, "
+                "covering price, availability, reviews, and the decision questions."
+            ),
+            "why": (
+                "Structured data makes the official facts easier to extract without "
+                "inventing prices, review counts, or claims."
+            ),
+        },
+        {
+            "type": "facts_in_page_text",
+            "action": (
+                f"State {attributes} in plain page text for {lane}, not only in "
+                "images, PDFs, or variant labels."
+            ),
+            "why": (
+                "Grounded answers lift readable text; page assets alone do not give "
+                "the engine stable lane facts."
+            ),
+        },
+        {
+            "type": "reviews_authority_gap",
+            "action": (
+                f"Build verified review and proof signals on {page} so the page is "
+                f"more authoritative for {lane}."
+            ),
+            "why": (
+                f"{controller} currently carries the trust signal; the official "
+                "page needs its own review/proof layer."
+            ),
+        },
+        {
+            "type": source_move_type,
+            "action": _sentence(source_action),
+            "why": (
+                "Work only the evidenced controller path; the source move changes "
+                "by controller type and does not invent new channels."
+            ),
+        },
+        {
+            "type": "source_fact_consistency",
+            "action": (
+                f"Keep SKU name, {attributes}, images, availability, and canonical "
+                f"URL consistent across {page} and {controller}."
+            ),
+            "why": (
+                "Consistent facts help the engine trust one version of the SKU "
+                "instead of a third-party variant."
+            ),
+        },
+        {
+            "type": "measure_reaudit_materiality",
+            "action": (
+                f"Re-audit {lane} after the changes; verify whether exposure becomes "
+                f"more citable through {destination} before treating it as material "
+                "buyer traffic."
+            ),
+            "why": (
+                "Exposure is citation evidence, not proof of downstream buyer traffic "
+                "until the lane is measured again."
+            ),
+        },
+        {
+            "type": "direct_buy_reason",
+            "action": (
+                "After the page is more retrievable, extractable, and authoritative, "
+                "add first-order offer, starter + replenishment bundle, subscription "
+                "incentive, and why-buy-direct proof."
+            ),
+            "why": (
+                f"Conversion mechanics belong last; they give {destination} a buying "
+                "reason after the source-authority work is credible."
+            ),
+        },
+    ]
+
+
+def _sku_sideways_wedge_reason(sideways_wedge: Mapping[str, Any]) -> str:
+    beachhead = _as_mapping(sideways_wedge.get("recommended_beachhead_lane"))
+    why = str(sideways_wedge.get("why_this_lane_not_the_head_prompt") or "").strip()
+    if not beachhead or not why:
+        return ""
+    return f" {why}"
+
+
+def _sku_operator_moves(
+    *,
+    route_prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    query = str(route_prompt.get("query") or "").strip()
+    sources = _host_names(route_prompt.get("sources"))
+    page = _merchant_page_label(merchant_path)
+    destination = _merchant_destination(merchant_path)
+    lane = query or "the exposed lane"
+    controller = _phrase(sources, "fragmented sources with no single cited site")
+    profile = _route_prompt_controller_profile(route_prompt)
+    if is_canonical_source_vacuum(profile) or str(profile.get("strategy") or "") == "source_authority_gap":
+        steps = _authority_mechanism_steps(
+            lane=lane,
+            page=page,
+            destination=destination,
+            controller=controller,
+            profile=profile,
+            attributes=_authority_attribute_phrase(route_prompt),
+        )
+        return [
+            {
+                "type": step["type"],
+                "lane": lane,
+                "move": step["action"],
+                "why": step["why"],
+                "evidence": {
+                    "controllers": sources[:3],
+                    "controller_strategy": profile.get("strategy"),
+                    "exposure_confidence": profile.get("exposure_confidence"),
+                    "exposure_read": profile.get("exposure_read"),
+                },
+            }
+            for step in steps
+        ]
+    return [
+        {
+            "type": "retail_listing_accuracy",
+            "lane": lane,
+            "move": (
+                f"Claim or fix the {controller} listing for {lane}: title, images, "
+                "variant, price, stock, authorization, and SKU facts."
+            ),
+            "why": (
+                f"Credible retail controllers are present, so keep the listing facts "
+                f"accurate while {destination} competes for the click."
+            ),
+            "evidence": {
+                "controllers": sources[:3],
+                "controller_strategy": profile.get("strategy"),
+            },
+        },
+        {
+            "type": "light_retrieval_schema_layer",
+            "lane": lane,
+            "move": (
+                f"Make {page} more retrievable for {lane} and add product/offer "
+                "schema, without treating credible retailers like weak citation "
+                "sources."
+            ),
+            "why": (
+                "The authority layer helps extraction, but the main fight is still "
+                "listing accuracy plus a better direct-buy reason."
+            ),
+            "evidence": {
+                "controllers": sources[:3],
+                "controller_strategy": profile.get("strategy"),
+            },
+        },
+        {
+            "type": "first_order_offer",
+            "lane": lane,
+            "move": f"Attach a first-order offer to the more citable + buyable {page} for {lane}.",
+            "why": f"The answer is already exposed through {controller}; buyers need a reason to choose {destination}.",
+            "evidence": {"controllers": sources[:3]},
+        },
+        {
+            "type": "bundle_or_replenishment",
+            "lane": lane,
+            "move": f"Create a starter + replenishment bundle on the more citable + buyable {page} for {lane}.",
+            "why": "A bundle gives AI and shoppers a concrete value reason to prefer the merchant-controlled path.",
+            "evidence": {"controllers": sources[:3]},
+        },
+        {
+            "type": "subscription_or_why_buy_direct",
+            "lane": lane,
+            "move": (
+                "Add subscription incentive and why-buy-direct proof: guarantee, samples, "
+                "loyalty, returns, stock, and fresh product facts."
+            ),
+            "why": f"Those details make {destination} materially different from the cited third-party route and ready for agent checkout.",
+            "evidence": {"controllers": sources[:3]},
+        },
+    ]
+
+
+def _canonical_page_play(
+    *,
+    lane: str,
+    controllers: List[str],
+    page: str,
+    destination: str,
+    goal: str,
+    controller_profile: Optional[Mapping[str, Any]] = None,
+    attributes: str = "the evidenced lane attributes",
+) -> Dict[str, Any]:
+    controller = _phrase(controllers, "fragmented sources with no single cited site")
+    profile = dict(controller_profile or build_controller_profile(controllers))
+    if is_canonical_source_vacuum(profile) or str(profile.get("strategy") or "") == "source_authority_gap":
+        steps = _authority_mechanism_steps(
+            lane=lane,
+            page=page,
+            destination=destination,
+            controller=controller,
+            profile=profile,
+            attributes=attributes,
+        )
+        moves = [
+            {
+                "type": step["type"],
+                "operator_action": step["action"],
+                "why": step["why"],
+            }
+            for step in steps
+        ]
+        checkout_readiness = (
+            f"Make {page} more retrievable, extractable, authoritative, buyable, "
+            "and agent-checkout ready, then re-audit this same lane."
+        )
+    else:
+        moves = [
+            {
+                "type": "retail_listing_accuracy",
+                "operator_action": (
+                    f"Claim or fix {controller} listings for {lane}: title, images, "
+                    "variant, price, stock, authorization, and SKU facts."
+                ),
+                "why": (
+                    "Credible retail controllers are present, so the merchant should "
+                    "repair listing facts while competing for the direct-buy click."
+                ),
+            },
+            {
+                "type": "light_retrieval_schema_layer",
+                "operator_action": (
+                    f"Make {page} more retrievable for {lane} and add product/offer "
+                    "schema as a light authority layer."
+                ),
+                "why": (
+                    "This supports extraction from the merchant page without treating "
+                    "credible retailers like weak citation sources."
+                ),
+            },
+            {
+                "type": "first_order_offer",
+                "operator_action": (
+                    f"Attach a first-order offer to {page} for {lane}."
+                ),
+                "why": (
+                    f"AI already exposes the lane through {controller}; the owned "
+                    "page needs a direct buying reason."
+                ),
+            },
+            {
+                "type": "starter_replenishment_bundle",
+                "operator_action": (
+                    f"Add a starter + replenishment bundle on {page} for {lane}."
+                ),
+                "why": (
+                    "The bundle gives the answer and the shopper a concrete value "
+                    "reason to prefer the merchant-controlled path."
+                ),
+            },
+            {
+                "type": "subscription_or_why_buy_direct",
+                "operator_action": (
+                    "Add subscription incentive and why-buy-direct proof: guarantee, "
+                    "samples, loyalty, returns, stock, and fresh product facts."
+                ),
+                "why": (
+                    f"Those are merchant-owned promises {controller} cannot safely "
+                    "represent as the direct buying path."
+                ),
+            },
+        ]
+        checkout_readiness = (
+            f"Make {page} more citable, buyable, and agent-checkout ready before trying "
+            "to redirect the cited source trail."
+        )
+    return {
+        "lane": lane,
+        "controllers": controllers[:3],
+        "controller_strategy": profile.get("strategy"),
+        "controller_strategy_label": profile.get("label"),
+        "controller_profile": profile,
+        "exposure_confidence": profile.get("exposure_confidence"),
+        "exposure_read": profile.get("exposure_read"),
+        "page": page,
+        "destination": destination,
+        "goal": goal,
+        "economics_policy": _OFFER_ECONOMICS_POLICY,
+        "moves": moves,
+        "checkout_readiness": checkout_readiness,
+    }
+
+
+def _sku_canonical_page_play(
+    *,
+    route_prompt: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> Dict[str, Any]:
+    query = str(route_prompt.get("query") or "").strip()
+    return _canonical_page_play(
+        lane=query or "the exposed lane",
+        controllers=_host_names(route_prompt.get("sources")),
+        page=_merchant_page_label(merchant_path),
+        destination=_merchant_destination(merchant_path),
+        goal=str(merchant_path.get("goal") or ""),
+        controller_profile=_route_prompt_controller_profile(route_prompt),
+        attributes=_authority_attribute_phrase(route_prompt),
+    )
+
+
+def _brand_canonical_page_play(
+    evidence: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> Dict[str, Any]:
+    queries = _query_examples(evidence.get("failed_query_examples"))
+    lane = (queries[0].strip("\"") if queries else "") or "the retailer-routed demand"
+    return _canonical_page_play(
+        lane=lane,
+        controllers=_host_names(evidence.get("retailer_hosts")),
+        page=_merchant_page_label(merchant_path),
+        destination=_merchant_destination(merchant_path),
+        goal=str(merchant_path.get("goal") or ""),
+        controller_profile=_brand_controller_profile(evidence),
+    )
+
+
+def _brand_operator_moves(
+    evidence: Mapping[str, Any],
+    merchant_path: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    queries = _query_examples(evidence.get("failed_query_examples"))
+    hosts = _host_names(evidence.get("retailer_hosts"))
+    lane = queries[0] if queries else "the retailer-routed questions"
+    page = _merchant_page_label(merchant_path)
+    destination = _merchant_destination(merchant_path)
+    controller = _phrase(hosts, "the cited retailers")
+    profile = _brand_controller_profile(evidence)
+    if is_canonical_source_vacuum(profile):
+        return [
+            {
+                "type": "canonical_source_authority",
+                "lane": lane,
+                "move": (
+                    f"Make {page} more retrievable and citable for the retailer-routed demand: "
+                    "exact product naming, canonical URL, structured data, proof, "
+                    "stock, returns, and authorized where-to-buy."
+                ),
+                "why": (
+                    f"AI grounding points to {controller}; that reads as an official-source "
+                    "gap before it is a retailer value fight."
+                ),
+                "evidence": {
+                    "controllers": hosts[:3],
+                    "controller_strategy": profile.get("strategy"),
+                    "exposure_confidence": profile.get("exposure_confidence"),
+                    "exposure_read": profile.get("exposure_read"),
+                },
+            },
+            {
+                "type": "authorized_distribution_or_reseller_cleanup",
+                "lane": lane,
+                "move": (
+                    "Audit the weak third-party trail for wrong titles, images, variants, "
+                    "stock, authorization, and stale facts; decide which real authorized "
+                    "retail routes deserve investment."
+                ),
+                "why": (
+                    "Random reseller exposure should not be the source AI trusts; "
+                    "verify materiality before framing it as lost buyer traffic."
+                ),
+                "evidence": {
+                    "controllers": hosts[:3],
+                    "controller_strategy": profile.get("strategy"),
+                    "exposure_confidence": profile.get("exposure_confidence"),
+                    "exposure_read": profile.get("exposure_read"),
+                },
+            },
+            {
+                "type": "direct_buy_reason",
+                "lane": lane,
+                "move": (
+                    "After the official page is source-ready, add first-order offer, "
+                    "starter + replenishment bundle, subscription incentive, and why-buy-direct proof."
+                ),
+                "why": f"Those mechanics give {destination} a concrete reason to become the buyable route once it is citable.",
+                "evidence": {
+                    "controllers": hosts[:3],
+                    "controller_strategy": profile.get("strategy"),
+                    "exposure_confidence": profile.get("exposure_confidence"),
+                    "exposure_read": profile.get("exposure_read"),
+                },
+            },
+        ]
+    return [
+        {
+            "type": "first_order_offer",
+            "lane": lane,
+            "move": f"Put a first-order offer on {page} for the retailer-routed demand.",
+            "why": f"AI already points shoppers to {controller}; the merchant path needs a better conversion reason.",
+            "evidence": {"controllers": hosts[:3]},
+        },
+        {
+            "type": "bundle_subscription",
+            "lane": lane,
+            "move": "Add starter + replenishment bundle and subscription incentive to the same page.",
+            "why": f"Bundle/subscription value gives shoppers a concrete reason to choose {destination}.",
+            "evidence": {"controllers": hosts[:3]},
+        },
+        {
+            "type": "why_buy_direct",
+            "lane": lane,
+            "move": "Add a why-buy-direct block: guarantee, samples, loyalty, returns, stock, and fresh facts.",
+            "why": "These are merchant-controlled promises; do not invent retailer facts or unsupported economics.",
+            "evidence": {"controllers": hosts[:3]},
+        },
+    ]
 
 
 def _sku_secondary_moves(
@@ -760,6 +1655,8 @@ def _prescription_for_gap(
     cited_phrase = _phrase(_host_names(evidence.get("cited_hosts")), "no high-confidence cited hosts")
     competitor_phrase = _phrase(_as_str_list(evidence.get("competitors_named")), "no repeated named competitors")
     failed_query_phrase = _phrase(_query_examples(evidence.get("failed_query_examples")), "no failed-query examples")
+    merchant_path = _as_mapping(evidence.get("merchant_path"))
+    retailer_profile = _brand_controller_profile(evidence)
 
     if primary_gap == PRIMARY_INTEGRATION_COMPLETION:
         missing = _integration_missing_labels(evidence.get("integration_missing_pieces"))
@@ -835,22 +1732,75 @@ def _prescription_for_gap(
         )
 
     if primary_gap == PRIMARY_RETAILER_ROUTE_LEAK:
+        if is_canonical_source_vacuum(retailer_profile):
+            return _base_payload(
+                primary_gap=primary_gap,
+                prescription_class="operational_efficiency",
+                merchant_path=merchant_path,
+                operator_moves=_brand_operator_moves(evidence, merchant_path),
+                canonical_page_play=_brand_canonical_page_play(evidence, merchant_path),
+                headline="AI cites weak third-party retail routes — make your site the canonical source.",
+                why_this_first=(
+                    f"AI answers show the lane, but grounding points to {retailer_phrase} "
+                    f"instead of {_merchant_destination(merchant_path)}. {retailer_profile.get('exposure_read')} "
+                    "Fix the official-source gap before framing this as a retailer value fight."
+                ),
+                first_move=(
+                    f"Make {_merchant_page_label(merchant_path)} more retrievable and citable: "
+                    "exact product naming, canonical URL, structured data, proof, stock, "
+                    "and authorized where-to-buy; then audit the weak reseller trail."
+                ),
+                self_serve_actions=[
+                    (
+                        f"On {_merchant_page_label(merchant_path)}, publish facts that make the page more citable: "
+                        "exact product naming, canonical URL, structured data, attributes, proof, "
+                        "stock, returns, and authorized where-to-buy."
+                    ),
+                    (
+                        f"Check the cited third-party routes ({retailer_phrase}) for wrong titles, images, "
+                        "variants, stock, authorization, and stale SKU facts before deciding which real "
+                        "authorized retail routes to pursue."
+                    ),
+                    (
+                        "Add the first-order offer, starter + replenishment bundle, subscription incentive, "
+                        "and why-buy-direct proof after the official page is source-ready."
+                    ),
+                ],
+                pivota_path=(
+                    "Pivota can make your own page more citable, buyable, and authoritative, "
+                    "prepare it for agent checkout, and measure whether the owned buyer path improves."
+                ),
+                evidence_used=evidence,
+                cta={
+                    "label": "Claim the canonical buying path",
+                    "trust_note": (
+                        "Reseller cleanup and retail decisions are yours to make; Pivota "
+                        "makes the official page more citable, buyable, and monitored."
+                    ),
+                },
+            )
         return _base_payload(
             primary_gap=primary_gap,
-            headline="AI sends your buyers to retailers — take that path back.",
+            prescription_class="operational_efficiency",
+            merchant_path=merchant_path,
+            operator_moves=_brand_operator_moves(evidence, merchant_path),
+            canonical_page_play=_brand_canonical_page_play(evidence, merchant_path),
+            headline="AI sends your buyers to retailers — give them a better buying path.",
             why_this_first=(
                 f"Shoppers can find you, but AI points them to {retailer_phrase} "
-                "instead of your own page. That's lost margin and customer data, "
+                f"instead of {_merchant_destination(merchant_path)}. That's lost margin and customer data, "
                 "not a PR problem."
             ),
             first_move=(
-                "Make your own page the best place to buy, then fix the retailer "
-                "listings AI is citing."
+                f"Make {_merchant_page_label(merchant_path)} the best place to buy: "
+                "first-order offer, starter + replenishment bundle, subscription incentive, "
+                "and why-buy-direct proof; then fix the retailer listings AI is citing."
             ),
             self_serve_actions=[
                 (
-                    "Make your product page beat the retailer pages: full details, "
-                    "proof, reviews, current price, stock, and returns."
+                    f"Make {_merchant_page_label(merchant_path)} beat the retailer pages: "
+                    "full facts, proof, reviews, current price/stock, first-order offer, "
+                    "bundle, subscription option, and returns."
                 ),
                 (
                     f"Check the cited retailer listings ({retailer_phrase}) for wrong "
@@ -858,15 +1808,17 @@ def _prescription_for_gap(
                 ),
             ],
             pivota_path=(
-                "Pivota can make your own page the one AI cites and buys from, and "
-                "show you whether direct sales rise against those retailer-won questions."
+                "Pivota can make your own page more citable and buyable, and "
+                "measure whether those retailer-won questions start moving toward "
+                "the owned buyer path."
             ),
             evidence_used=evidence,
             cta={
                 "label": "Win back the buying path",
                 "trust_note": (
                     "Fixing retailer listings is yours to do; Pivota makes your own "
-                    "page the cited, buyable one and proves whether direct sales rise."
+                    "page more citable and buyable, and measures whether the owned buyer "
+                    "path improves."
                 ),
             },
         )
@@ -995,8 +1947,13 @@ def _base_payload(
     pivota_path: str,
     evidence_used: Mapping[str, Any],
     cta: Mapping[str, str],
+    prescription_class: Optional[str] = None,
+    merchant_path: Optional[Mapping[str, Any]] = None,
+    operator_moves: Optional[List[Mapping[str, Any]]] = None,
+    canonical_page_play: Optional[Mapping[str, Any]] = None,
+    sideways_wedge: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    out = {
         "primary_gap": primary_gap,
         "headline": headline,
         "why_this_first": why_this_first,
@@ -1007,6 +1964,17 @@ def _base_payload(
         "secondary_moves": [],
         "cta": dict(cta),
     }
+    if prescription_class:
+        out["prescription_class"] = prescription_class
+    if merchant_path:
+        out["merchant_path"] = dict(merchant_path)
+    if operator_moves:
+        out["operator_moves"] = [dict(move) for move in operator_moves]
+    if canonical_page_play:
+        out["canonical_page_play"] = dict(canonical_page_play)
+    if sideways_wedge:
+        out["sideways_wedge"] = dict(sideways_wedge)
+    return out
 
 
 def _build_evidence_used(
@@ -1025,6 +1993,7 @@ def _build_evidence_used(
 
     return {
         "verdict_label": headline.get("verdict_label"),
+        "merchant_path": _merchant_path(merchant_view=merchant_view),
         "scores": {
             "visibility": _score(scores.get("visibility")),
             "attribution": _score(scores.get("attribution")),
