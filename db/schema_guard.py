@@ -3,9 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Set
 
-from sqlalchemy import text
-
 from db.database import IS_POSTGRES, IS_SQLITE, database
+
+
+def text(sql: str) -> str:
+    """Return raw SQL for the databases adapter.
+
+    Railway Postgres uses the `databases` driver path, where SQLAlchemy
+    TextClause values can fail before DDL runs. Keep the existing guard call
+    shape while ensuring startup self-heal statements execute as raw SQL.
+    """
+    return sql
 
 
 @dataclass(frozen=True)
