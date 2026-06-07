@@ -884,6 +884,31 @@ def test_sku_nba_bb_lab_forum_authority_playbook_is_ordered_and_honest():
     _assert_no_overpromise(nba)
 
 
+def test_controller_source_route_action_splits_mixed_forum_and_publisher():
+    """A forum + publisher controller mix must not lump publishers into 'the
+    discussion'; the forum gets the discussion play and publishers get pitched."""
+    from services.next_best_action import _controller_source_route_action
+
+    profile = {
+        "classified_controllers": [
+            {"host": "reddit.com", "input_role": "forum", "type": "forum"},
+            {"host": "goodhousekeeping.com", "type": "publisher"},
+            {"host": "whowhatwear.com", "type": "editorial"},
+        ]
+    }
+    action = _controller_source_route_action(
+        profile,
+        "reddit.com, goodhousekeeping.com and whowhatwear.com",
+        "halal collagen sticks before bed",
+        "your PDP",
+    )
+    assert "in the reddit.com discussion" in action
+    assert "pitch goodhousekeeping.com and whowhatwear.com with exact SKU facts" in action
+    # publishers are never called part of "the discussion"
+    assert "goodhousekeeping.com discussion" not in action
+    assert "whowhatwear.com discussion" not in action
+
+
 def test_sku_nba_publisher_authority_move_pitches_the_evidenced_publisher():
     opportunity = _sku_base_opportunity()
     opportunity["confidence"] = {"prompt_count": 3, "prompts_with_demand": 3}

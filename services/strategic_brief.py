@@ -1043,6 +1043,28 @@ def _controller_source_route_move_type(profile: Mapping[str, Any]) -> str:
     return "evidenced_source_update"
 
 
+def _split_controllers_by_move_type(profile: Mapping[str, Any]):
+    forum: List[str] = []
+    publisher: List[str] = []
+    other: List[str] = []
+    seen: set = set()
+    for row in _as_list(profile.get("classified_controllers")):
+        if not isinstance(row, Mapping):
+            continue
+        host = _clean_str(row.get("host"))
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        role = (_clean_str(row.get("input_role")) or _clean_str(row.get("type"))).lower()
+        if role in _COMMUNITY_CONTROLLER_TYPES:
+            forum.append(host)
+        elif role in _PUBLISHER_CONTROLLER_TYPES:
+            publisher.append(host)
+        else:
+            other.append(host)
+    return forum, publisher, other
+
+
 def _controller_source_route_action(
     profile: Mapping[str, Any],
     controller_phrase: str,
@@ -1051,6 +1073,28 @@ def _controller_source_route_action(
 ) -> str:
     move_type = _controller_source_route_move_type(profile)
     if move_type == "community_source_participation":
+        forum, publisher, other = _split_controllers_by_move_type(profile)
+        if publisher:
+            # Mixed forum + publisher controllers: address each by its own play
+            # instead of calling a publisher part of "the discussion".
+            clauses: List[str] = []
+            if forum:
+                clauses.append(
+                    f"participate in or seed accurate product info in the "
+                    f"{_phrase_join(forum, controller_phrase)} discussion"
+                )
+            clauses.append(
+                f"pitch {_phrase_join(publisher, controller_phrase)} with exact SKU "
+                "facts, proof assets, images, and availability"
+            )
+            if other:
+                clauses.append(
+                    f"fix the {_phrase_join(other, controller_phrase)} listing facts"
+                )
+            return (
+                f"{_phrase_join(clauses, '')} for {lane}, using only facts already "
+                f"published on {page}"
+            )
         return (
             f"participate in or seed accurate product info in the {controller_phrase} "
             f"discussion for {lane}, using only facts already published on {page}"
