@@ -140,8 +140,9 @@ async def test_payment_aftercare_canary_stripe_refund_timeline_converges_under_r
         ]
     )
 
-    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
-        assert values["payment_intent_id"] == "pi_aftercare_stripe"
+    async def fake_fetch_one(query: str, values: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+        if values:
+            assert values["payment_intent_id"] == "pi_aftercare_stripe"
         return dict(state)
 
     async def fake_update_order_status(order_id: str, status: str, **kwargs: Any) -> None:
@@ -964,8 +965,9 @@ async def test_payment_aftercare_canary_stripe_refund_then_payment_success_repla
         ]
     )
 
-    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
-        assert values["payment_intent_id"] == "pi_aftercare_stripe_replay"
+    async def fake_fetch_one(query: str, values: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+        if values:
+            assert values["payment_intent_id"] == "pi_aftercare_stripe_replay"
         return dict(state)
 
     async def fake_update_order_status(order_id: str, status: str, **kwargs: Any) -> None:
@@ -1064,8 +1066,9 @@ async def test_payment_aftercare_canary_stripe_payment_failed_then_succeeded_rec
         ]
     )
 
-    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
-        assert values["payment_intent_id"] == "pi_aftercare_stripe_recovery"
+    async def fake_fetch_one(query: str, values: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+        if values:
+            assert values["payment_intent_id"] == "pi_aftercare_stripe_recovery"
         return dict(state)
 
     async def fake_update_order_status(order_id: str, status: str) -> None:
