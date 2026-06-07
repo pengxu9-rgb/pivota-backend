@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controllers_for_row,
@@ -185,6 +186,7 @@ def build_sku_next_best_action(
     verify_summary: Optional[Mapping[str, Any]] = None,
     identity: Optional[Mapping[str, Any]] = None,
     sku_title: Optional[str] = None,
+    merchant_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a deterministic per-SKU next-best-action prescription."""
 
@@ -208,6 +210,7 @@ def build_sku_next_best_action(
         verify_summary=_as_mapping(verify_summary),
         identity=_as_mapping(identity),
         sku_title=sku_title,
+        merchant_host=merchant_host,
     )
     prescription = _sku_prescription_for_gap(
         primary_gap=primary_gap,
@@ -316,6 +319,7 @@ def _build_sku_evidence_used(
     verify_summary: Mapping[str, Any],
     identity: Mapping[str, Any],
     sku_title: Optional[str],
+    merchant_host: Optional[str],
 ) -> Dict[str, Any]:
     sideways_wedge = _as_mapping(opportunity.get("sideways_wedge")) or build_sideways_wedge(
         _as_list(opportunity.get("per_prompt")),
@@ -329,7 +333,10 @@ def _build_sku_evidence_used(
         "top_open_lane": _sku_lane_chip(_sku_top_open_lane(opportunity)),
         "substitution_alert": dict(_as_mapping(opportunity.get("substitution_alert"))),
         "content_gap": _sku_gap_chip(_sku_top_content_gap(primary_gaps)),
-        "source_route_prompt": _sku_prompt_chip(_sku_source_route_prompt(opportunity)),
+        "source_route_prompt": _sku_prompt_chip(
+            _sku_source_route_prompt(opportunity),
+            merchant_host=merchant_host,
+        ),
         "coverage": dict(_as_mapping(opportunity.get("confidence"))),
         "demand_state_summary": opportunity.get("demand_state_summary"),
         "intent_ladder": dict(_as_mapping(opportunity.get("intent_ladder"))),
@@ -718,11 +725,18 @@ def _sku_gap_chip(gap: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+def _sku_prompt_chip(
+    prompt: Optional[Mapping[str, Any]],
+    *,
+    merchant_host: Optional[str] = None,
+) -> Dict[str, Any]:
     if not prompt:
         return {}
     source_summary = _as_mapping(prompt.get("source_summary"))
-    stable_sources = stable_buyer_path_controllers_for_row(prompt)
+    stable_sources = _exclude_merchant_host_sources(
+        stable_buyer_path_controllers_for_row(prompt),
+        merchant_host=merchant_host,
+    )
     out = {
         "query": prompt.get("query"),
         "ownership_state": prompt.get("ownership_state"),
@@ -730,7 +744,10 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         "opportunity_score": prompt.get("opportunity_score"),
         "why_fit": prompt.get("attribute_basis") or prompt.get("evidence"),
         "sources": stable_sources[:3],
-        "raw_top_cited_hosts": _as_list(source_summary.get("top_cited_hosts"))[:3],
+        "raw_top_cited_hosts": _exclude_merchant_host_sources(
+            source_summary.get("top_cited_hosts"),
+            merchant_host=merchant_host,
+        )[:3],
         "competitors": _as_list(prompt.get("competitors"))[:5],
     }
     for key in (
@@ -744,6 +761,45 @@ def _sku_prompt_chip(prompt: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         if key in prompt:
             out[key] = prompt.get(key)
     return out
+
+
+def _exclude_merchant_host_sources(
+    sources: Any,
+    *,
+    merchant_host: Optional[str],
+) -> List[Any]:
+    excluded = _normalize_host_value(merchant_host)
+    if not excluded:
+        return list(_as_list(sources))
+    out: List[Any] = []
+    for row in _as_list(sources):
+        host = ""
+        if isinstance(row, Mapping):
+            host = _normalize_host_value(
+                row.get("host") or row.get("domain") or row.get("url") or row.get("uri")
+            )
+        else:
+            host = _normalize_host_value(row)
+        if host and _same_or_subdomain(host, excluded):
+            continue
+        out.append(row)
+    return out
+
+
+def _same_or_subdomain(host: str, parent: str) -> bool:
+    return bool(host and parent and (host == parent or host.endswith("." + parent)))
+
+
+def _normalize_host_value(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    parsed = urlsplit(text if "://" in text else f"//{text}")
+    host = parsed.netloc or parsed.path.split("/", 1)[0]
+    host = host.rsplit("@", 1)[-1].split(":", 1)[0].strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host if "." in host else ""
 
 
 def _sku_failing_prompt_chip(prompt: Any) -> Optional[Dict[str, Any]]:
@@ -1017,14 +1073,14 @@ def _sku_source_route_follow_up(
     profile = _route_prompt_controller_profile(prompt)
     if is_canonical_source_vacuum(profile):
         return (
-            f"Then {_controller_source_route_action(profile, sources, query, page)} "
+            f"Then {_controller_source_route_action(profile, sources, query, page)}. "
             "Keep SKU name, attributes, availability, and images consistent across "
             f"{page} and {sources}; re-audit the lane and verify materiality before "
             "treating exposure as lost buyer traffic."
         )
     if str(profile.get("strategy") or "") == "source_authority_gap":
         return (
-            f"Then {_controller_source_route_action(profile, sources, query, page)} "
+            f"Then {_controller_source_route_action(profile, sources, query, page)}. "
             "Keep SKU name, attributes, availability, and images consistent across "
             f"{page} and {sources}; re-audit the lane and verify materiality before "
             "treating exposure as lost buyer traffic."
@@ -1114,21 +1170,24 @@ def _controller_source_route_action(
     move_type = _controller_source_route_move_type(profile)
     if move_type == "community_source_participation":
         forum, publisher, other = _split_controllers_by_move_type(profile)
-        if publisher:
-            # Mixed forum + publisher controllers: address each by its own play
-            # instead of calling a publisher part of "the discussion".
+        if publisher or other:
+            # Mixed controller sets: address each by its own play instead of
+            # calling non-community sources part of "the discussion".
             clauses: List[str] = []
             if forum:
                 clauses.append(
                     f"participate in or seed accurate product info in the "
                     f"{_phrase(forum, controller)} discussion"
                 )
-            clauses.append(
-                f"pitch {_phrase(publisher, controller)} with exact SKU facts, "
-                "proof assets, images, and availability"
-            )
+            if publisher:
+                clauses.append(
+                    f"pitch {_phrase(publisher, controller)} with exact SKU facts, "
+                    "proof assets, images, and availability"
+                )
             if other:
-                clauses.append(f"fix the {_phrase(other, controller)} listing facts")
+                clauses.append(
+                    f"work the evidenced source trail around {_phrase(other, controller)}"
+                )
             return (
                 f"{_phrase(clauses, '')} for {lane}, using only facts already "
                 f"published on {page}"

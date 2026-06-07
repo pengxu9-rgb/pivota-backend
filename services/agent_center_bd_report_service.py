@@ -3799,6 +3799,7 @@ async def build_per_sku_report(
         verify_summary=verify_summary_out,
         identity=identity,
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
+        merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
     )
     next_best_action = await attach_sku_strategic_brief(
         next_best_action,
@@ -5886,6 +5887,7 @@ def _display_sku_intelligence(
             "unresolved": not bool(title and title != "this product"),
         },
         sku_title=title,
+        merchant_host=merchant_host,
     )
     return {
         "hero_sku": {

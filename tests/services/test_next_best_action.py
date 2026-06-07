@@ -977,6 +977,67 @@ def test_sku_nba_bb_lab_forum_authority_playbook_is_ordered_and_honest():
     _assert_no_overpromise(nba)
 
 
+def test_sku_nba_source_route_excludes_merchant_host_from_controller_copy():
+    opportunity = _sku_base_opportunity()
+    opportunity["confidence"] = {"prompt_count": 4, "prompts_with_demand": 4}
+    opportunity["per_prompt"] = [
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "query_class": "sidewalk",
+            "ownership_state": "forum-owned",
+            "source_route": "unclassified",
+            "opportunity_score": 55.0,
+            "demand_signal": 1.0,
+            "attribute_basis": ["halal", "collagen", "stick", "before bed"],
+            "source_summary": {
+                "buyer_path_controllers": [
+                    {"host": "reddit.com", "role": "forum", "times_cited": 1},
+                    {"host": "bblab.shop", "role": "unclassified", "times_cited": 2},
+                ],
+                "top_cited_hosts": [
+                    {"host": "reddit.com", "times_cited": 1},
+                    {"host": "bblab.shop", "times_cited": 2},
+                ]
+            },
+            "source_roles": [
+                {"host": "reddit.com", "role": "forum", "times_cited": 1},
+                {"host": "bblab.shop", "role": "unclassified", "times_cited": 2},
+            ],
+        }
+    ]
+
+    nba = build_sku_next_best_action(
+        opportunity=opportunity,
+        scores=_sku_scores(84),
+        identity={"name": "BB Lab Good Night Collagen", "anchors": {"brand": "BB Lab"}},
+        sku_title="BB Lab Good Night Collagen",
+        merchant_host="https://bblab.shop/products/good-night-collagen",
+    )
+
+    rendered = json.dumps({
+        "headline": nba["headline"],
+        "why_this_first": nba["why_this_first"],
+        "first_move": nba["first_move"],
+        "self_serve_actions": nba["self_serve_actions"],
+        "operator_moves": nba["operator_moves"],
+        "canonical_page_play": nba["canonical_page_play"],
+        "evidence_summary": nba["evidence_summary"],
+        "evidence_chips": nba["evidence_chips"],
+        "tracking_metrics": nba["tracking_metrics"],
+    }).lower()
+    route_prompt = nba["evidence_used"]["source_route_prompt"]
+    follow_up = nba["self_serve_actions"][1]
+
+    assert [row["host"] for row in route_prompt["sources"]] == ["reddit.com"]
+    assert "reddit.com" in rendered
+    assert "bblab.shop" not in rendered
+    assert "reddit.com discussion" in rendered
+    assert "reddit.com and bblab.shop discussion" not in rendered
+    assert "published on your official PDP. Keep SKU name" in follow_up
+    assert "PDP Keep" not in follow_up
+
+
 def test_controller_source_route_action_splits_mixed_forum_and_publisher():
     """A forum + publisher controller mix must not lump publishers into 'the
     discussion'; the forum gets the discussion play and publishers get pitched."""
@@ -1000,6 +1061,29 @@ def test_controller_source_route_action_splits_mixed_forum_and_publisher():
     # publishers are never called part of "the discussion"
     assert "goodhousekeeping.com discussion" not in action
     assert "whowhatwear.com discussion" not in action
+
+
+def test_controller_source_route_action_does_not_call_unclassified_source_a_discussion():
+    from services.next_best_action import _controller_source_route_action
+
+    profile = {
+        "classified_controllers": [
+            {"host": "reddit.com", "input_role": "forum", "type": "forum"},
+            {"host": "moodarabia.com", "input_role": "unclassified", "type": "unclassified"},
+        ]
+    }
+    action = _controller_source_route_action(
+        profile,
+        "reddit.com and moodarabia.com",
+        "halal collagen sticks before bed",
+        "your PDP",
+    )
+
+    assert "in the reddit.com discussion" in action
+    assert "work the evidenced source trail around moodarabia.com" in action
+    assert "pitch reddit.com and moodarabia.com" not in action
+    assert "moodarabia.com discussion" not in action
+    assert "reddit.com and moodarabia.com discussion" not in action
 
 
 def test_sku_nba_publisher_authority_move_pitches_the_evidenced_publisher():
