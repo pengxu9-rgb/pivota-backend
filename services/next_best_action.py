@@ -137,6 +137,9 @@ def classify_primary_gap(
     ):
         return PRIMARY_COMPETITOR_SOURCE
 
+    if attribution < 30 and visibility < 30:
+        return PRIMARY_RETRIEVAL_FOUNDATION
+
     return PRIMARY_FIRST_PARTY_DEFENSE
 
 

@@ -209,6 +209,25 @@ def test_category_visible_via_retailers_is_route_leak_not_retrieval_foundation()
     assert "sephora.com and amazon.com" in nba["tracking_metrics"][1]
 
 
+def test_low_attribution_boundary_without_route_evidence_is_not_defense():
+    mv = _merchant_view(
+        verdict="PARTIAL",
+        visibility=29,
+        attribution=29,
+        category_visibility=50,
+        cited_hosts=[],
+        failed_queries=[],
+    )
+
+    nba = build_next_best_action(merchant_view=mv)
+
+    assert nba["primary_gap"] == PRIMARY_RETRIEVAL_FOUNDATION
+    assert nba["primary_gap"] != PRIMARY_FIRST_PARTY_DEFENSE
+    assert "Google Search Console" in nba["self_serve_actions"][0]
+    assert "official path is not yet reliably retrievable" in nba["evidence_summary"]
+    _assert_70_30(nba)
+
+
 def test_retailer_route_leak_prescribes_direct_attribution_not_generic_pr():
     mv = _merchant_view(
         verdict="VISIBLE VIA RETAILERS",
