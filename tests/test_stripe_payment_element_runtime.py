@@ -1,4 +1,5 @@
 from decimal import Decimal
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -196,6 +197,45 @@ async def test_stripe_adapter_supports_manual_capture_payment_intents(
 
 
 @pytest.mark.asyncio
+async def test_stripe_payment_intent_create_uses_order_id_idempotency_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from adapters import psp_adapter as module
+
+    requests = []
+
+    class _FakeStripeClient:
+        def __init__(self, *args, **kwargs):
+            self.v1 = SimpleNamespace(
+                payment_intents=_FakePaymentIntentsAPI(requests),
+            )
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(module.stripe, "StripeClient", _FakeStripeClient)
+    monkeypatch.setattr(module.stripe, "RequestsClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(module.asyncio, "to_thread", _run_inline)
+
+    adapter = module.StripeAdapter(api_key="sk_live_test_123")
+
+    success, intent, error = await adapter.create_payment_intent(
+        amount=Decimal("1.00"),
+        currency="USD",
+        metadata={
+            "order_id": "ORD_CREATE_1",
+            "idempotency_key": "caller_supplied_key",
+        },
+    )
+
+    assert success is True
+    assert error is None
+    assert intent is not None
+    assert requests[0]["method"] == "create"
+    assert requests[0]["request_options"]["idempotency_key"] == "agent_payment:ORD_CREATE_1"
+
+
+@pytest.mark.asyncio
 async def test_stripe_checkout_session_supports_manual_capture_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -238,6 +278,91 @@ async def test_stripe_checkout_session_supports_manual_capture_metadata(
     assert requests[0]["method"] == "checkout.sessions.create"
     assert requests[0]["payload"]["payment_intent_data"]["capture_method"] == "manual"
     assert requests[0]["payload"]["payment_intent_data"]["metadata"]["order_id"] == "ORD_AUTH_CHECKOUT"
+    assert requests[0]["request_options"]["idempotency_key"] == "agent_payment:ORD_AUTH_CHECKOUT"
+
+
+@pytest.mark.asyncio
+async def test_stripe_checkout_session_create_uses_order_id_idempotency_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from adapters import psp_adapter as module
+
+    requests = []
+
+    class _FakeStripeClient:
+        def __init__(self, *args, **kwargs):
+            self.v1 = SimpleNamespace(
+                checkout=SimpleNamespace(sessions=_FakeCheckoutSessionsAPI(requests)),
+                payment_intents=_FakePaymentIntentsAPI(requests),
+            )
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(module.stripe, "StripeClient", _FakeStripeClient)
+    monkeypatch.setattr(module.stripe, "RequestsClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(module.asyncio, "to_thread", _run_inline)
+
+    adapter = module.StripeAdapter(api_key="sk_live_test_123")
+
+    success, intent, error = await adapter.create_payment_intent(
+        amount=Decimal("25.00"),
+        currency="USD",
+        metadata={
+            "order_id": "ORD_CREATE_CHECKOUT",
+            "idempotency_key": "caller_supplied_key",
+            "psp_mode": "stripe_checkout",
+        },
+    )
+
+    assert success is True
+    assert error is None
+    assert intent is not None
+    assert requests[0]["method"] == "checkout.sessions.create"
+    assert requests[0]["request_options"]["idempotency_key"] == "agent_payment:ORD_CREATE_CHECKOUT"
+
+
+@pytest.mark.asyncio
+async def test_stripe_create_idempotency_falls_back_and_compacts_long_metadata_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from adapters import psp_adapter as module
+
+    requests = []
+
+    class _FakeStripeClient:
+        def __init__(self, *args, **kwargs):
+            self.v1 = SimpleNamespace(
+                payment_intents=_FakePaymentIntentsAPI(requests),
+            )
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(module.stripe, "StripeClient", _FakeStripeClient)
+    monkeypatch.setattr(module.stripe, "RequestsClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(module.asyncio, "to_thread", _run_inline)
+
+    adapter = module.StripeAdapter(api_key="sk_live_test_123")
+    raw_key = "fallback:" + ("x" * 400)
+
+    success, intent, error = await adapter.create_payment_intent(
+        amount=Decimal("1.00"),
+        currency="USD",
+        metadata={
+            "idempotency_key": raw_key,
+        },
+    )
+
+    compacted_key = requests[0]["request_options"]["idempotency_key"]
+    expected_suffix = f":sha256:{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()}"
+
+    assert success is True
+    assert error is None
+    assert intent is not None
+    assert len(compacted_key) == 255
+    assert compacted_key.endswith(expected_suffix)
+    assert compacted_key.startswith("fallback:")
 
 
 @pytest.mark.asyncio

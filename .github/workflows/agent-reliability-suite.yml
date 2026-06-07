@@ -125,6 +125,7 @@ jobs:
             tests/test_stripe_webhook_contract.py \
             tests/test_adyen_webhook_contract.py \
             tests/test_checkout_webhook_contract.py \
+            tests/test_stripe_payment_element_runtime.py \
             tests/test_stripe_idempotency_keys.py \
             tests/test_merchant_payment_initiation_service.py \
             tests/test_multi_psp_orchestrator_preferred_subset.py
