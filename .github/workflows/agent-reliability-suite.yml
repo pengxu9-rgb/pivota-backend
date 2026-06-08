@@ -44,6 +44,19 @@ on:
       - "docs/ops/SHOPIFY_DISCOUNT_DEV_STORE_VALIDATION.md"
       - "docs/shopify-discount-*.md"
       - ".github/workflows/agent-reliability-suite.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "routes/**"
+      - "services/**"
+      - "db/**"
+      - "models/**"
+      - "tests/**"
+      - "scripts/**"
+      - "docs/ops/SHOPIFY_DISCOUNT_DEV_STORE_VALIDATION.md"
+      - "docs/shopify-discount-*.md"
+      - ".github/workflows/agent-reliability-suite.yml"
 
 jobs:
   quick-reliability:
