@@ -5184,23 +5184,17 @@ def _grounded_attribute_providers(coverage: Mapping[str, Any]) -> List[str]:
 
 
 def _competitor_attribute_run_text(run: Mapping[str, Any]) -> str:
-    parts: List[str] = []
-    raw = run.get("raw")
-    if raw:
-        parts.append(str(raw))
+    parsed_parts: List[str] = []
     parsed = run.get("parsed")
     if isinstance(parsed, Mapping):
         for key in ("evidence_excerpt", "summary", "answer"):
             value = parsed.get(key)
             if value:
-                parts.append(str(value))
-    for source in _list_value(run.get("grounding_sources")):
-        if not isinstance(source, Mapping):
-            continue
-        title = str(source.get("title") or "").strip()
-        if title:
-            parts.append(title)
-    return "\n".join(parts)
+                parsed_parts.append(str(value))
+    if parsed_parts:
+        return "\n".join(parsed_parts)
+    raw = run.get("raw")
+    return str(raw or "")
 
 
 def _normal_text(value: str) -> str:

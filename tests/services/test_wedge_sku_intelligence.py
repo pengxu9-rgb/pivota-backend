@@ -222,7 +222,9 @@ async def test_competitor_attribute_probe_single_durable_competitor_cost_guard(m
                         "grass-fed collagen, and powder formats."
                     ),
                     "parsed": {
-                        "evidence_excerpt": "Vital Proteins collagen peptides powder"
+                        "evidence_excerpt": (
+                            "Vital Proteins collagen peptides grass-fed collagen powder"
+                        )
                     },
                     "grounding_sources": [
                         {
@@ -265,6 +267,44 @@ async def test_competitor_attribute_probe_single_durable_competitor_cost_guard(m
         "powder",
     }
     assert all(row["provider"] in {"gemini", "chatgpt"} for row in out["evidence"])
+
+
+def test_competitor_attribute_extraction_prefers_parsed_evidence_over_noisy_raw():
+    run = {
+        "raw": (
+            "Other collagen products are Halal-certified. The liquid format is "
+            "sometimes contrasted with tablets or powders. Innermost The Glow "
+            "unflavoured sachets also appears in the result set."
+        ),
+        "parsed": {
+            "evidence_excerpt": (
+                "Absolute Collagen Marine Collagen Supplement Drink is known for "
+                "its liquid sachet format, delivering hydrolysed marine collagen "
+                "peptides and vitamin C."
+            )
+        },
+        "grounding_sources": [
+            {
+                "uri": "https://example.com/innermost",
+                "title": "Innermost The Glow unflavoured sachets",
+            }
+        ],
+        "grounding_chunks": ["https://example.com/absolute-collagen"],
+    }
+
+    rows = bd._extract_competitor_attribute_evidence(run, provider="gemini")
+    attributes = {row["attribute"] for row in rows}
+
+    assert {
+        "collagen peptides",
+        "marine collagen",
+        "vitamin c",
+        "liquid",
+        "sachets",
+    } <= attributes
+    assert "halal" not in attributes
+    assert "powder" not in attributes
+    assert "skin" not in attributes
 
 
 @pytest.mark.asyncio
