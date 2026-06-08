@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 
 import pytest
 
 import routes.billing_routes as module
+from utils.auth import create_access_token
 
 
 class _FakeBillingMeDatabase:
@@ -369,6 +372,295 @@ def test_statements_limit_capped_at_36(fake_db: _FakeBillingMeDatabase) -> None:
     assert response.status_code == 200
     assert fake_db.last_statement_limit == 36
     assert len(response.json()["statements"]) == 36
+
+
+# ---------------------------------------------------------------------------
+# require_approved_merchant — dual auth (API key OR merchant JWT).
+# The portal browser only holds a JWT, so the self-serve billing pages depend
+# on the JWT path resolving to the same merchant dict shape.
+# ---------------------------------------------------------------------------
+
+
+def _bearer(token: str) -> HTTPAuthorizationCredentials:
+    return HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+
+def _merchant_jwt(merchant_id: str | None = "merch_jwt", role: str = "merchant") -> str:
+    payload: dict[str, Any] = {"sub": "user_1", "email": "m@example.com", "role": role}
+    if merchant_id is not None:
+        payload["merchant_id"] = merchant_id
+    return create_access_token(payload)
+
+
+def _onboarding_loader(*, status: str | None = "approved", contact_email: str = "m@example.com"):
+    """Build an async stub for module.get_merchant_onboarding.
+
+    status=None simulates an unknown merchant_id (no onboarding row).
+    """
+
+    async def _loader(merchant_id: str):
+        if status is None:
+            return None
+        return {"merchant_id": merchant_id, "status": status, "contact_email": contact_email}
+
+    return _loader
+
+
+def test_require_approved_merchant_accepts_approved_merchant_jwt(monkeypatch) -> None:
+    monkeypatch.setattr(module, "get_merchant_onboarding", _onboarding_loader())
+    result = asyncio.run(
+        module.require_approved_merchant(
+            x_merchant_api_key=None,
+            credentials=_bearer(_merchant_jwt("merch_jwt")),
+        )
+    )
+    assert result["merchant_id"] == "merch_jwt"
+    assert result["status"] == "approved"
+
+
+def test_require_approved_merchant_rejects_non_merchant_jwt() -> None:
+    # Role check happens before any DB lookup.
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.require_approved_merchant(
+                x_merchant_api_key=None,
+                credentials=_bearer(_merchant_jwt("ag_1", role="agent")),
+            )
+        )
+    assert exc.value.status_code == 403
+
+
+def test_require_approved_merchant_jwt_missing_merchant_id_returns_401() -> None:
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.require_approved_merchant(
+                x_merchant_api_key=None,
+                credentials=_bearer(_merchant_jwt(merchant_id=None)),
+            )
+        )
+    assert exc.value.status_code == 401
+
+
+def test_require_approved_merchant_jwt_non_approved_returns_403(monkeypatch) -> None:
+    # A logged-in but pending/rejected merchant must NOT reach billing.
+    monkeypatch.setattr(module, "get_merchant_onboarding", _onboarding_loader(status="pending"))
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.require_approved_merchant(
+                x_merchant_api_key=None,
+                credentials=_bearer(_merchant_jwt("merch_jwt")),
+            )
+        )
+    assert exc.value.status_code == 403
+
+
+def test_require_approved_merchant_jwt_unknown_merchant_returns_404(monkeypatch) -> None:
+    monkeypatch.setattr(module, "get_merchant_onboarding", _onboarding_loader(status=None))
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.require_approved_merchant(
+                x_merchant_api_key=None,
+                credentials=_bearer(_merchant_jwt("merch_jwt")),
+            )
+        )
+    assert exc.value.status_code == 404
+
+
+def test_require_approved_merchant_invalid_jwt_returns_401() -> None:
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.require_approved_merchant(
+                x_merchant_api_key=None,
+                credentials=_bearer("not-a-real-jwt"),
+            )
+        )
+    assert exc.value.status_code == 401
+
+
+def test_require_approved_merchant_no_credentials_returns_401() -> None:
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.require_approved_merchant(x_merchant_api_key=None, credentials=None)
+        )
+    assert exc.value.status_code == 401
+
+
+def test_require_approved_merchant_api_key_takes_precedence(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def _fake_verify(api_key: str) -> dict[str, Any]:
+        captured["api_key"] = api_key
+        return {
+            "merchant_id": "merch_api",
+            "status": "approved",
+            "contact_email": "x@y.com",
+        }
+
+    def _no_jwt_path(_merchant_id):
+        raise AssertionError("JWT path must not run when an API key is present")
+
+    monkeypatch.setattr(module, "verify_merchant_api_key", _fake_verify)
+    monkeypatch.setattr(module, "get_merchant_onboarding", _no_jwt_path)
+    result = asyncio.run(
+        module.require_approved_merchant(
+            x_merchant_api_key="key_123",
+            credentials=_bearer(_merchant_jwt("merch_jwt")),
+        )
+    )
+    # API key wins over JWT when both are present.
+    assert captured["api_key"] == "key_123"
+    assert result["merchant_id"] == "merch_api"
+
+
+def test_require_approved_merchant_invalid_api_key_does_not_fall_back_to_jwt(monkeypatch) -> None:
+    async def _fake_verify(api_key: str) -> dict[str, Any]:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    def _no_jwt_path(_merchant_id):
+        raise AssertionError("must not fall back to JWT on a bad API key")
+
+    monkeypatch.setattr(module, "verify_merchant_api_key", _fake_verify)
+    monkeypatch.setattr(module, "get_merchant_onboarding", _no_jwt_path)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.require_approved_merchant(
+                x_merchant_api_key="bad-key",
+                credentials=_bearer(_merchant_jwt("merch_jwt")),
+            )
+        )
+    assert exc.value.status_code == 401
+
+
+# --- End-to-end through FastAPI's real Authorization: Bearer parsing + routes ---
+
+
+def test_current_period_with_real_merchant_jwt_header(
+    fake_db: _FakeBillingMeDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "get_merchant_onboarding", _onboarding_loader())
+    fake_db.add_subscription()
+    fake_db.add_credit_use(credits=2341)
+    client, app = _build_client(authenticated=False)  # real dependency, no override
+    try:
+        response = client.get(
+            "/api/billing/me/current-period",
+            headers={"Authorization": f"Bearer {_merchant_jwt('merch_1')}"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["tier"] == "starter"
+
+
+def test_current_period_with_non_approved_jwt_header_returns_403(
+    fake_db: _FakeBillingMeDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "get_merchant_onboarding", _onboarding_loader(status="pending"))
+    client, app = _build_client(authenticated=False)
+    try:
+        response = client.get(
+            "/api/billing/me/current-period",
+            headers={"Authorization": f"Bearer {_merchant_jwt('merch_1')}"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 403
+
+
+def test_statements_with_real_merchant_jwt_header(
+    fake_db: _FakeBillingMeDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "get_merchant_onboarding", _onboarding_loader())
+    fake_db.add_statement(calendar_month=date(2026, 5, 1), status="invoiced")
+    client, app = _build_client(authenticated=False)
+    try:
+        response = client.get(
+            "/api/billing/me/statements",
+            headers={"Authorization": f"Bearer {_merchant_jwt('merch_1')}"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert len(response.json()["statements"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# GET /api/billing/plans — mode-scoped active plan catalogue
+# ---------------------------------------------------------------------------
+
+
+class _FakePlansDb:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+        self.params: dict[str, Any] | None = None
+        self.where_sql: str | None = None
+
+    async def fetch_all(self, query: str, values: dict[str, Any] | None = None):
+        self.params = dict(values or {})
+        self.where_sql = _normalize_sql(query)
+        assert "from subscription_plans" in self.where_sql
+        return self._rows
+
+
+def _patch_plans(monkeypatch: pytest.MonkeyPatch, db: _FakePlansDb, *, mode: str = "live") -> None:
+    async def _cols(_db, _table):
+        return {
+            "name", "stripe_price_id", "price_cents",
+            "monthly_credit_allowance", "status", "stripe_mode", "tier_level",
+        }
+
+    monkeypatch.setattr(module, "database", db)
+    monkeypatch.setattr(module, "_table_columns", _cols)
+    monkeypatch.setattr(module, "_platform_stripe_mode", lambda: mode)
+
+
+def test_list_plans_returns_mode_scoped_merchant_safe_plans(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakePlansDb([
+        {"name": "starter", "stripe_price_id": "price_live_starter", "price_cents": 4900, "monthly_credit_allowance": 4000},
+        {"name": "growth", "stripe_price_id": "price_live_growth", "price_cents": 14900, "monthly_credit_allowance": 18000},
+    ])
+    _patch_plans(monkeypatch, db, mode="live")
+    client, app = _build_client()
+    try:
+        response = client.get("/api/billing/plans")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    plans = response.json()["plans"]
+    assert [p["name"] for p in plans] == ["starter", "growth"]
+    assert plans[0]["price_id"] == "price_live_starter"
+    assert plans[0]["price_cents"] == 4900
+    assert plans[0]["monthly_credit_allowance"] == 4000
+    assert plans[0]["currency"] == "usd"
+    # mode filter passed through to SQL params
+    assert db.params == {"mode": "live"}
+    # merchant-safe: no internal columns leak
+    assert "tier_level" not in plans[0]
+    assert "features_json" not in plans[0]
+
+
+def test_list_plans_requires_auth() -> None:
+    client, app = _build_client(authenticated=False)
+    try:
+        response = client.get("/api/billing/plans")
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 401
+
+
+def test_platform_stripe_mode_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(module, "settings", SimpleNamespace(stripe_secret_key="sk_live_abc123"))
+    assert module._platform_stripe_mode() == "live"
+    monkeypatch.setattr(module, "settings", SimpleNamespace(stripe_secret_key="sk_test_abc123"))
+    assert module._platform_stripe_mode() == "test"
+    monkeypatch.setattr(module, "settings", SimpleNamespace(stripe_secret_key=None))
+    assert module._platform_stripe_mode() == "test"
 
 
 def _normalize_sql(query: str) -> str:
