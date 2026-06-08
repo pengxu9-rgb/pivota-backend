@@ -233,6 +233,59 @@ async def handle_stripe_billing_webhook(
     return JSONResponse({"status": "processed"}, status_code=200)
 
 
+def _is_missing_customer_error(exc: Exception) -> bool:
+    """True when a Stripe error indicates the customer no longer exists."""
+
+    if getattr(exc, "code", None) == "resource_missing":
+        return True
+    return "no such customer" in str(getattr(exc, "user_message", None) or exc).lower()
+
+
+async def _create_and_persist_stripe_customer(
+    *, merchant_id: str, contact_email: str, idempotency_key: str
+) -> str:
+    """Create a Stripe customer and persist its id on the merchants row.
+
+    Shared by first-time checkout and the recreate-on-invalid-customer recovery
+    path. Keeps the orphan-customer guard: if no merchants row matches the
+    persist, fail loud rather than leave a Stripe customer our DB can't map.
+    """
+
+    customer = await asyncio.to_thread(
+        stripe_client.v1.customers.create,
+        {"email": contact_email, "metadata": {"merchant_id": merchant_id}},
+        {"idempotency_key": idempotency_key},
+    )
+    stripe_customer_id = _as_text(
+        getattr(customer, "id", None) or _stripe_object_to_dict(customer).get("id")
+    )
+    if not stripe_customer_id:
+        raise HTTPException(status_code=502, detail="Stripe customer creation returned no customer id")
+
+    updated = await _update_merchant_stripe_customer_id(
+        database,
+        merchant_id=merchant_id,
+        contact_email=contact_email,
+        stripe_customer_id=stripe_customer_id,
+    )
+    if not updated:
+        logger.error(
+            "Orphan Stripe customer: created %s for merchant_id=%s but no "
+            "merchants row matched the UPDATE. Provision the merchants + "
+            "user_subscriptions row, then retry.",
+            stripe_customer_id,
+            merchant_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Merchant subscription provisioning incomplete: Stripe customer "
+                "created but local merchants row missing. Retry after provisioning completes."
+            ),
+        )
+    return stripe_customer_id
+
+
 @router.post("/api/billing/checkout-session")
 async def create_billing_checkout_session(
     body: CheckoutSessionRequest,
@@ -274,58 +327,12 @@ async def create_billing_checkout_session(
     stripe_customer_id = _as_text((billing_row or {}).get("stripe_customer_id"))
     if not stripe_customer_id:
         # Deterministic idempotency: at most one Stripe customer per merchant
-        # ever. Stripe caches idempotency keys for 24h, which covers the
-        # typical retry window for a single signup flow. A second legitimate
-        # signup after 24h would hit the (billing_row.stripe_customer_id IS
-        # NOT NULL) guard above and skip this branch entirely.
-        customer = await asyncio.to_thread(
-            stripe_client.v1.customers.create,
-            {
-                "email": contact_email,
-                "metadata": {"merchant_id": merchant_id},
-            },
-            {"idempotency_key": f"merchant_customer:{merchant_id}"},
-        )
-        stripe_customer_id = _as_text(getattr(customer, "id", None) or _stripe_object_to_dict(customer).get("id"))
-        if not stripe_customer_id:
-            raise HTTPException(status_code=502, detail="Stripe customer creation returned no customer id")
-
-        updated = await _update_merchant_stripe_customer_id(
-            database,
+        # in the typical 24h signup/retry window.
+        stripe_customer_id = await _create_and_persist_stripe_customer(
             merchant_id=merchant_id,
             contact_email=contact_email,
-            stripe_customer_id=stripe_customer_id,
+            idempotency_key=f"merchant_customer:{merchant_id}",
         )
-        if not updated:
-            # The merchants row backing this merchant_id is missing — most
-            # likely the merchant was approved at the merchant_onboarding
-            # layer but the merchants/user_subscriptions provisioning never
-            # completed (or got rolled back). Without persisting the
-            # customer id, the returned checkout URL would refer to a Stripe
-            # customer our DB has no record of, and subsequent webhooks for
-            # that customer would not find a matching merchant. Better to
-            # fail loud here than orphan a customer in Stripe.
-            #
-            # Surfaced by staging shakeout 2026-05-23 against
-            # merch_shakeout_* (audit doc §A). Idempotency key
-            # merchant_customer:{merchant_id} ensures a retry returns the
-            # same Stripe customer rather than creating a new one.
-            logger.error(
-                "Orphan Stripe customer: created %s for merchant_id=%s but "
-                "no merchants row matched the UPDATE. Provision the "
-                "merchants + user_subscriptions row, then retry — the "
-                "idempotency key replays cleanly.",
-                stripe_customer_id,
-                merchant_id,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Merchant subscription provisioning incomplete: "
-                    "Stripe customer created but local merchants row "
-                    "missing. Retry after provisioning completes."
-                ),
-            )
 
     metadata = {"merchant_id": merchant_id, "price_id": price_id}
     # Daily idempotency bucket: rapid retries of "subscribe" return the same
@@ -333,22 +340,48 @@ async def create_billing_checkout_session(
     # checkout sessions expire after 24h anyway). Coarser than per-second
     # so transient network retries dedupe naturally.
     idempotency_bucket = datetime.now(timezone.utc).date().isoformat()
-    session = await asyncio.to_thread(
-        stripe_client.v1.checkout.sessions.create,
-        {
+
+    def _session_payload(customer_id: str) -> Dict[str, Any]:
+        return {
             "mode": "subscription",
-            "customer": stripe_customer_id,
+            "customer": customer_id,
             "line_items": [{"price": price_id, "quantity": 1}],
             "success_url": success_url,
             "cancel_url": cancel_url,
             "metadata": metadata,
-        },
-        {
-            "idempotency_key": (
-                f"checkout_session:{merchant_id}:{price_id}:{idempotency_bucket}"
-            ),
-        },
-    )
+        }
+
+    try:
+        session = await asyncio.to_thread(
+            stripe_client.v1.checkout.sessions.create,
+            _session_payload(stripe_customer_id),
+            {"idempotency_key": f"checkout_session:{merchant_id}:{price_id}:{idempotency_bucket}"},
+        )
+    except Exception as exc:
+        # The stored Stripe customer can be invalid for the current account —
+        # created under a different key before a Stripe key rotation, or deleted.
+        # Recreate it (fresh idempotency keys so Stripe doesn't replay the stale
+        # objects) and retry the session once. The recreate persists the new id,
+        # so this self-heals: subsequent checkouts take the normal path.
+        if type(exc).__name__ != "InvalidRequestError" or not _is_missing_customer_error(exc):
+            raise
+        logger.warning(
+            "Stored Stripe customer %s invalid for merchant_id=%s (%s); "
+            "recreating and retrying checkout.",
+            stripe_customer_id,
+            merchant_id,
+            getattr(exc, "code", None),
+        )
+        stripe_customer_id = await _create_and_persist_stripe_customer(
+            merchant_id=merchant_id,
+            contact_email=contact_email,
+            idempotency_key=f"merchant_customer:{merchant_id}:{idempotency_bucket}",
+        )
+        session = await asyncio.to_thread(
+            stripe_client.v1.checkout.sessions.create,
+            _session_payload(stripe_customer_id),
+            {"idempotency_key": f"checkout_session:{merchant_id}:{price_id}:{idempotency_bucket}:recreated"},
+        )
 
     session_id = _as_text(getattr(session, "id", None) or _stripe_object_to_dict(session).get("id"))
     session_url = _as_text(getattr(session, "url", None) or _stripe_object_to_dict(session).get("url"))

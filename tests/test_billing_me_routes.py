@@ -688,3 +688,122 @@ def _flatten_keys(value: Any) -> list[str]:
             keys.extend(_flatten_keys(item))
         return keys
     return []
+
+
+# ---------------------------------------------------------------------------
+# checkout-session: recreate the Stripe customer when the stored one is invalid
+# (e.g. created under a different key before a Stripe key rotation, or deleted).
+# ---------------------------------------------------------------------------
+
+
+class _StripeInvalidRequestError(Exception):
+    pass
+
+
+# The recovery branch matches on the exception class *name*, so expose it as
+# Stripe's class name without depending on the installed SDK version.
+_StripeInvalidRequestError.__name__ = "InvalidRequestError"
+_StripeInvalidRequestError.__qualname__ = "InvalidRequestError"
+
+
+def _mk_err(message, code=None):
+    e = _StripeInvalidRequestError(message)
+    e.code = code
+    e.user_message = message
+    return e
+
+
+class _SObj:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _FakeSessions:
+    def __init__(self, fail_for, error):
+        self.fail_for = fail_for
+        self.error = error
+        self.customers_seen: list[str] = []
+
+    def create(self, params, opts):
+        cust = params["customer"]
+        self.customers_seen.append(cust)
+        if cust == self.fail_for:
+            raise self.error
+        return _SObj(id="cs_new", url="https://stripe.test/cs_new")
+
+
+class _FakeCustomers:
+    def __init__(self):
+        self.created = 0
+
+    def create(self, params, opts):
+        self.created += 1
+        return _SObj(id="cus_new")
+
+
+class _FakeStripeClient:
+    def __init__(self, fail_for, error):
+        self.v1 = _SObj(
+            checkout=_SObj(sessions=_FakeSessions(fail_for, error)),
+            customers=_FakeCustomers(),
+        )
+
+
+def _patch_checkout_deps(monkeypatch, fake_client):
+    monkeypatch.setattr(module, "_require_platform_stripe_key", lambda: None)
+
+    async def _plan(*a, **k):
+        return {"id": 1, "name": "starter", "stripe_price_id": "price_x", "monthly_credit_allowance": 4000}
+
+    async def _billing_row(*a, **k):
+        return {"stripe_customer_id": "cus_stale", "contact_email": "m@example.com"}
+
+    persisted: dict[str, Any] = {}
+
+    async def _persist(db, *, merchant_id, contact_email, stripe_customer_id):
+        persisted["id"] = stripe_customer_id
+        return True
+
+    monkeypatch.setattr(module, "_lookup_subscription_plan", _plan)
+    monkeypatch.setattr(module, "_fetch_merchant_billing_row", _billing_row)
+    monkeypatch.setattr(module, "_update_merchant_stripe_customer_id", _persist)
+    monkeypatch.setattr(module, "stripe_client", fake_client)
+    return persisted
+
+
+def _checkout_body():
+    return module.CheckoutSessionRequest(
+        price_id="price_x", success_url="https://x/s", cancel_url="https://x/c"
+    )
+
+
+def test_checkout_recreates_customer_when_stored_customer_missing(monkeypatch) -> None:
+    fake = _FakeStripeClient("cus_stale", _mk_err("No such customer: cus_stale", code="resource_missing"))
+    persisted = _patch_checkout_deps(monkeypatch, fake)
+
+    result = asyncio.run(
+        module.create_billing_checkout_session(
+            body=_checkout_body(),
+            merchant={"merchant_id": "merch_1", "contact_email": "m@example.com", "status": "approved"},
+        )
+    )
+
+    assert result == {"session_url": "https://stripe.test/cs_new", "session_id": "cs_new"}
+    assert fake.v1.customers.created == 1                       # recreated exactly once
+    assert persisted["id"] == "cus_new"                        # new id persisted → self-heals
+    assert fake.v1.checkout.sessions.customers_seen == ["cus_stale", "cus_new"]  # failed, then retried
+
+
+def test_checkout_does_not_swallow_unrelated_stripe_errors(monkeypatch) -> None:
+    fake = _FakeStripeClient("cus_stale", _mk_err("No such price: price_x", code="resource_missing_price"))
+    _patch_checkout_deps(monkeypatch, fake)
+
+    with pytest.raises(Exception) as exc:
+        asyncio.run(
+            module.create_billing_checkout_session(
+                body=_checkout_body(),
+                merchant={"merchant_id": "merch_1", "contact_email": "m@example.com", "status": "approved"},
+            )
+        )
+    assert type(exc.value).__name__ == "InvalidRequestError"
+    assert fake.v1.customers.created == 0                       # no recreate for unrelated errors
