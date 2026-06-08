@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import html
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
+
+from services.deliverability_report_view import build_deliverability_render_view
 
 logger = logging.getLogger(__name__)
 
@@ -549,6 +551,75 @@ def _chip_values(items: Any, *, key: str, limit: int = 4) -> List[str]:
     return values
 
 
+def _render_deliverability_html(report: Dict[str, Any]) -> str:
+    view = build_deliverability_render_view(report)
+    if not view:
+        return ""
+    out: List[str] = [_h(2, "Servability and Checkout")]
+    out.append('<div class="summary-box no-break">\n')
+    out.append(f"<p><strong>{_escape(view.get('headline'))}</strong></p>\n")
+    definition = str(view.get("definition") or "").strip()
+    if definition:
+        out.append(f"<p><em>{_escape(definition)}</em></p>\n")
+
+    counts = [row for row in (view.get("counts") or []) if isinstance(row, Mapping)]
+    if counts:
+        out.append(
+            "<table><thead><tr><th>Status</th><th>SKUs</th></tr></thead><tbody>\n"
+        )
+        for row in counts:
+            out.append(
+                "<tr>"
+                f"<td>{_escape(row.get('label'))}</td>"
+                f"<td>{_escape(row.get('count'))}</td>"
+                "</tr>\n"
+            )
+        out.append("</tbody></table>\n")
+
+    transactable = [
+        row for row in (view.get("transactable_rows") or [])
+        if isinstance(row, Mapping)
+    ]
+    if transactable:
+        out.append("<p><strong>Confirmed transactable SKUs:</strong></p>\n")
+        out.append(
+            "<table><thead><tr><th>SKU</th><th>Checkout</th><th>Read</th></tr></thead><tbody>\n"
+        )
+        for row in transactable:
+            out.append(
+                "<tr>"
+                f"<td>{_escape(row.get('sku_title'))}</td>"
+                f"<td>{_escape(row.get('checkout_status'))}</td>"
+                f"<td>{_escape(row.get('summary'))}</td>"
+                "</tr>\n"
+            )
+        out.append("</tbody></table>\n")
+
+    attention = [
+        row for row in (view.get("attention_rows") or [])
+        if isinstance(row, Mapping)
+    ]
+    if attention:
+        out.append("<p><strong>Needs attention before checkout:</strong></p>\n")
+        out.append(
+            "<table><thead><tr><th>SKU</th><th>State</th><th>Serving</th>"
+            "<th>Checkout</th><th>Read</th></tr></thead><tbody>\n"
+        )
+        for row in attention:
+            out.append(
+                "<tr>"
+                f"<td>{_escape(row.get('sku_title'))}</td>"
+                f"<td>{_escape(row.get('status_label'))}</td>"
+                f"<td>{_escape(row.get('serving_status'))}</td>"
+                f"<td>{_escape(row.get('checkout_status'))}</td>"
+                f"<td>{_escape(row.get('summary'))}</td>"
+                "</tr>\n"
+            )
+        out.append("</tbody></table>\n")
+    out.append("</div>\n")
+    return "".join(out)
+
+
 def _render_next_best_action_html(next_best_action: Optional[Dict[str, Any]]) -> str:
     if not isinstance(next_best_action, dict):
         return ""
@@ -995,6 +1066,7 @@ def render_brand_html_v2(
     body_sections.append(_render_publisher_analysis_html(primary))
     mv = primary.get("merchant_view") or {}
     body_sections.append(_render_reaudit_delta_html(mv.get("reaudit_delta")))
+    body_sections.append(_render_deliverability_html(brand_report))
     body_sections.append(_render_next_best_action_html(mv.get("next_best_action")))
     body_sections.append(_render_recommendations_html(mv.get("actions")))
     body_sections.append(_render_owned_buyer_path_play_html(

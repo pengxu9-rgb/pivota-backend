@@ -341,6 +341,51 @@ def test_html_renderer_emits_next_best_action_before_recommendations():
     assert html.find("What Should You Do Next?") < html.find("Recommendations")
 
 
+def test_html_renderer_emits_deliverability_before_next_best_action_and_escapes():
+    from services.audit_html_renderer import render_brand_html_v2
+
+    audit = _gruns_fixture_audit()
+    audit["brand_rollup"] = {
+        "deliverability": {
+            "status_counts": {
+                "transactable": 1,
+                "servable_not_transactable": 1,
+            }
+        }
+    }
+    audit["per_sku_reports"] = [
+        {
+            "sku_key": "sku-ready",
+            "sku_title": "Ready <Serum>",
+            "deliverability": {
+                "status": "transactable",
+                "summary": "This SKU is serving eligible and has a ready merchant-checkout path.",
+                "serving": {"status": "ready"},
+                "checkout": {"status": "ready"},
+            },
+        },
+        {
+            "sku_key": "sku-stock",
+            "sku_title": "Unknown Stock Serum",
+            "deliverability": {
+                "status": "servable_not_transactable",
+                "summary": "Needs explicit availability <script>alert(1)</script>",
+                "serving": {"status": "ready"},
+                "checkout": {"status": "blocked"},
+            },
+        },
+    ]
+
+    html = render_brand_html_v2(audit)
+
+    assert "Servability and Checkout" in html
+    assert "1 of 2 audited SKUs is confirmed transactable." in html
+    assert "explicit available-stock signal" in html
+    assert "Ready &lt;Serum&gt;" in html
+    assert "Needs explicit availability &lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert html.find("Servability and Checkout") < html.find("What Should You Do Next?")
+
+
 def test_html_renderer_emits_reaudit_delta_before_next_best_action_and_escapes():
     from services.audit_html_renderer import render_brand_html_v2
     audit = _gruns_fixture_audit()
