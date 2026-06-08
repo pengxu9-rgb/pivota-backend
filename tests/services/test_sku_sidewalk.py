@@ -515,3 +515,105 @@ async def test_fetch_curated_preserves_attributes(monkeypatch):
         "count": 1,
         "first_url": "https://cdn.test/good-night.jpg",
     }
+
+
+# --- tablet-SKU regressions (BB Lab Slimming / White Up Plus live audit) ----
+def _bb_lab_slimming_tablet() -> Dict[str, Any]:
+    """Mirrors the live Slimming Collagen SKU: an 84-tablet product the merchant
+    also tags loosely with 'powder', whose ingredient copy lists titanium
+    dioxide (a tablet-coating colorant)."""
+    return {
+        "title": "Slimming Collagen",
+        "raw_title": "[Bundle] Slimming Collagen 84 tablets x 3box",
+        "product_type": "Debloat",
+        "attributes_raw": {
+            "tags": ["beauty", "collagen", "diet", "powder", "slimming",
+                     "tablets", "weight loss"],
+            "body_html": (
+                "<p>Fish collagen weight loss tablets. Other ingredients: "
+                "titanium dioxide, microcrystalline cellulose, magnesium "
+                "stearate. Low molecular collagen.</p>"
+            ),
+            "variants": [{"title": "84 tablets x 3box"}],
+        },
+    }
+
+
+def _bb_lab_white_up_tablet() -> Dict[str, Any]:
+    return {
+        "title": "White Up Plus",
+        "raw_title": "[Bundle] White Up Plus 30 tablets x 3box",
+        "product_type": "Brightening",
+        "attributes_raw": {
+            "tags": ["Brightening", "Health", "Skin Care", "Tablets", "white"],
+            "body_html": "<p>Vitamin C brightening tablets with glycine and fish collagen.</p>",
+            "variants": [{"title": "30 tablets x 3box"}],
+        },
+    }
+
+
+def _lanes(product):
+    from services.sku_sidewalk import build_sku_attribute_graph, generate_sidewalk_query_specs
+    graph = build_sku_attribute_graph(product)
+    specs = generate_sidewalk_query_specs(
+        graph, title=product["title"],
+        product_type=product.get("product_type") or "", n=10,
+    )
+    return graph, [s["query"] for s in specs]
+
+
+def test_tablet_sku_resolves_to_tablet_form_not_powder():
+    """A tablet SKU loosely tagged 'powder' must read as tablets — the title
+    form wins over the loose tag — so lanes never recommend 'collagen powder'
+    the tablet can't substantiate."""
+    graph, lanes = _lanes(_bb_lab_slimming_tablet())
+    assert graph["classes"]["format"] == ["tablet"]
+    assert not any("powder" in q for q in lanes)
+    assert any("tablets" in q for q in lanes)
+
+
+def test_ingestible_excipient_titanium_dioxide_never_a_lane():
+    """Titanium dioxide is a tablet-coating colorant in an ingestible — it must
+    not be mined as an ingredient or surface as a lane (the live 'titanium
+    dioxide collagen powder' money-shot bug)."""
+    graph, lanes = _lanes(_bb_lab_slimming_tablet())
+    assert "titanium dioxide" not in (graph["classes"]["ingredient"] or [])
+    assert not any("titanium" in q for q in lanes)
+
+
+def test_pure_filler_excipients_never_a_lane():
+    graph, lanes = _lanes(_bb_lab_slimming_tablet())
+    assert not any("magnesium stearate" in q or "microcrystalline" in q
+                   or "stearate" in q for q in lanes)
+
+
+def test_white_up_tablet_lanes_are_clean_and_substantiated():
+    graph, lanes = _lanes(_bb_lab_white_up_tablet())
+    assert graph["classes"]["format"] == ["tablet"]
+    assert not any("powder" in q or "titanium" in q for q in lanes)
+    assert any("vitamin c collagen" in q for q in lanes)
+    assert all(spec for spec in lanes)
+
+
+def test_mineral_sunscreen_keeps_titanium_dioxide():
+    """Context guard: titanium dioxide IS a real mineral-sunscreen active, so it
+    is kept for a sunscreen even though it is stripped for ingestibles."""
+    from services.sku_sidewalk import build_sku_attribute_graph
+    sun = {
+        "title": "Mineral Sunscreen Stick SPF 50",
+        "product_type": "sunscreen",
+        "attributes_raw": {
+            "tags": ["mineral", "reef-safe"],
+            "body_html": "<p>Mineral sunscreen with zinc oxide and titanium dioxide.</p>",
+        },
+    }
+    graph = build_sku_attribute_graph(sun)
+    assert "titanium dioxide" in (graph["classes"]["ingredient"] or [])
+
+
+def test_stick_sku_unchanged_regression():
+    """The original stick SKU must keep producing clean stick lanes."""
+    graph, lanes = _lanes(_bb_lab_product())
+    assert graph["classes"]["format"] == ["stick"]
+    assert any("collagen sticks" in q for q in lanes)
+    assert not any("powder" in q or "tablet" in q for q in lanes)

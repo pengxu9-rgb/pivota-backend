@@ -56,8 +56,21 @@ _FORMAT_TERMS: Tuple[Tuple[str, str], ...] = (
     ("jelly", "jelly"),
     ("capsule", "capsule"),
     ("capsules", "capsule"),
+    ("tablet", "tablet"),
+    ("tablets", "tablet"),
     ("serum", "serum"),
 )
+
+# A product's FORM is a structural fact that lives in its title / product type /
+# variant, not in ingredient prose. Restricting format extraction to these
+# authoritative sources stops e.g. "low molecular collagen powder" in the body
+# copy making a tablet SKU read as a "powder", which then yields
+# "<attr> collagen powder" lanes the tablet can't substantiate.
+_FORM_AUTHORITATIVE_SOURCES = {"title", "product_type", "variant", "tag"}
+# When form signals conflict (merchants tag a tablet SKU with a loose "powder"
+# category tag while the title says "84 tablets"), the most specific source
+# wins. The title/variant name the actual SKU; tags are loose categorization.
+_FORM_SOURCE_PRIORITY = ("title", "variant", "product_type", "tag")
 _INGREDIENT_TERMS: Tuple[Tuple[str, str], ...] = (
     ("fish collagen", "fish collagen"),
     ("marine collagen", "marine collagen"),
@@ -184,6 +197,47 @@ _MEDICAL_BLOCKLIST: Tuple[str, ...] = (
     "safe for kids",
 )
 _GENERIC_CATEGORIES = {"", "product", "products", "item", "items"}
+
+# Tablet/capsule fillers, flow agents and colorants. These are never a
+# selling-point lane in ANY vertical, so a SKU is never pitched on them even if
+# they appear in an ingredient list or tag.
+_EXCIPIENT_BLOCKLIST: Tuple[str, ...] = (
+    "magnesium stearate",
+    "silicon dioxide",
+    "silicon dioxide (anti caking)",
+    "microcrystalline cellulose",
+    "calcium phosphate",
+    "dicalcium phosphate",
+    "croscarmellose",
+    "croscarmellose sodium",
+    "hydroxypropyl methylcellulose",
+    "hypromellose",
+    "carnauba wax",
+    "maltodextrin",
+)
+# Mineral UV filters: a genuine selling point ONLY for mineral sunscreen, but a
+# coating colorant/excipient in an ingestible (e.g. titanium dioxide in a
+# collagen tablet). Kept as a lane attribute only in a mineral-sunscreen context;
+# stripped otherwise so "titanium dioxide collagen powder" can never headline.
+_MINERAL_ACTIVES = {"titanium dioxide", "zinc oxide"}
+_INGESTIBLE_CATEGORIES = {
+    "collagen", "supplement", "multivitamin", "vitamin", "hair vitamin", "gummy",
+}
+_INGESTIBLE_FORMATS = {"tablet", "capsule", "powder", "gummy", "jelly", "stick"}
+
+
+def _is_mineral_sunscreen_context(classes: Mapping[str, List[str]]) -> bool:
+    """True only when the product reads as a mineral sunscreen / topical, where
+    titanium dioxide and zinc oxide are real actives rather than excipients."""
+    cats = {_clean_attr(c) for c in (classes.get("category") or [])}
+    certs = {_clean_attr(c) for c in (classes.get("certification_constraint") or [])}
+    proof = {_clean_attr(c) for c in (classes.get("proof") or [])}
+    if "sunscreen" in cats:
+        return True
+    if "mineral" in certs or "mineral" in proof:
+        return True
+    # An ingestible category/format with no sunscreen signal is never mineral.
+    return False
 _NEGATION_TOKENS = {
     "not",
     "no",
@@ -645,6 +699,24 @@ def _add_quantity_attrs(
             _add_attr(classes, evidence, "offer_variant", match, source)
 
 
+def _resolve_authoritative_form(product: Mapping[str, Any], fallback: List[str]) -> List[str]:
+    """Pick the SKU's real form from the most specific authoritative source that
+    names one (title > variant > product_type > tag), so a loose 'powder' tag on
+    an '84 tablets' SKU does not survive alongside 'tablet'."""
+    by_source: Dict[str, List[str]] = {}
+    for source, text in _iter_product_sources(product):
+        if source not in _FORM_AUTHORITATIVE_SOURCES:
+            continue
+        normalized = _search_text(text)
+        for phrase, attr in _FORMAT_TERMS:
+            if _has_phrase(normalized, phrase):
+                by_source.setdefault(source, []).append(attr)
+    for source in _FORM_SOURCE_PRIORITY:
+        if by_source.get(source):
+            return _dedupe(by_source[source])
+    return fallback
+
+
 def build_sku_attribute_graph(product: dict) -> dict:
     """Normalize substantiated product facts into sidewalk-ready classes.
 
@@ -666,14 +738,15 @@ def build_sku_attribute_graph(product: dict) -> dict:
             class_name="category",
             lexicon=_CATEGORY_TERMS,
         )
-        _add_lexicon_matches(
-            text=text,
-            source=source,
-            classes=classes,
-            evidence=evidence,
-            class_name="format",
-            lexicon=_FORMAT_TERMS,
-        )
+        if source in _FORM_AUTHORITATIVE_SOURCES:
+            _add_lexicon_matches(
+                text=text,
+                source=source,
+                classes=classes,
+                evidence=evidence,
+                class_name="format",
+                lexicon=_FORMAT_TERMS,
+            )
         _add_lexicon_matches(
             text=text,
             source=source,
@@ -744,6 +817,17 @@ def build_sku_attribute_graph(product: dict) -> dict:
             evidence.get("no water") or evidence.get("stick") or "body",
         )
 
+    # Resolve conflicting form signals to the most specific authoritative source.
+    classes["format"] = _resolve_authoritative_form(safe_product, classes.get("format", []))
+
+    # Mineral UV filters are excipients/colorants in an ingestible — never pitch
+    # a collagen tablet on "titanium dioxide". Keep them only for sunscreen.
+    if not _is_mineral_sunscreen_context(classes):
+        classes["ingredient"] = [
+            attr for attr in classes.get("ingredient", [])
+            if _clean_attr(attr) not in _MINERAL_ACTIVES
+        ]
+
     for class_name in ATTRIBUTE_CLASSES:
         classes[class_name] = _dedupe(classes.get(class_name, []))
 
@@ -774,6 +858,8 @@ def _plural_format(value: str) -> str:
         return "gummies"
     if value == "capsule":
         return "capsules"
+    if value == "tablet":
+        return "tablets"
     if value == "refill pod":
         return "refill pods"
     return value
@@ -801,6 +887,12 @@ def _violates_guardrail(query: str, basis: Iterable[str] | None = None) -> bool:
         return True
     for blocked in _MEDICAL_BLOCKLIST:
         if blocked in q:
+            return True
+    # Tablet/capsule fillers and colorants are never a lane, regardless of how
+    # they entered the basis (ingredient list, tag, direct attr).
+    cleaned_basis_for_excipient = {_clean_attr(b) for b in (basis or [])}
+    for excipient in _EXCIPIENT_BLOCKLIST:
+        if excipient in q or excipient in cleaned_basis_for_excipient:
             return True
     if "safe" in q and "reef-safe" not in q:
         return True
