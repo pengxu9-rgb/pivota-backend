@@ -375,6 +375,11 @@ def test_renders_deliverability_before_next_best_action():
         {
             "sku_key": "sku-ready",
             "sku_title": "Ready Serum",
+            "checkout_handoff": {
+                "status": "eligible",
+                "label": "Open buyable Pivota product page",
+                "handoff_url": "https://agent.pivota.cc/checkout/handoff?token=t",
+            },
             "deliverability": {
                 "status": "transactable",
                 "summary": "This SKU is serving eligible and has a ready merchant-checkout path.",
@@ -399,6 +404,7 @@ def test_renders_deliverability_before_next_best_action():
     assert "## Servability and Checkout" in md
     assert "1 of 2 audited SKUs is confirmed transactable." in md
     assert "explicit available-stock signal" in md
+    assert "[Open buyable Pivota product page](https://agent.pivota.cc/checkout/handoff?token=t)" in md
     assert "Unknown Stock Serum" in md
     assert md.find("## Servability and Checkout") < md.find("## What Should You Do Next?")
 
