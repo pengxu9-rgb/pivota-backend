@@ -56,6 +56,7 @@ from services.commerce_execution_policy import (
     SURFACE_PUBLIC_AGENT_PURCHASE,
     resolve_commerce_execution_policy,
 )
+from services.checkout_handoff_descriptor import build_checkout_handoff_descriptor
 from services.deliverability_report_view import build_deliverability_render_view
 from services.next_best_action import (
     attach_sku_strategic_brief,
@@ -4067,6 +4068,13 @@ async def build_per_sku_report(
         merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
     )
 
+    deliverability = build_sku_deliverability_prediction(sku_ctx, scores)
+    checkout_handoff = build_checkout_handoff_descriptor(
+        sku_ctx=sku_ctx,
+        deliverability=deliverability,
+        audit_run_id=audit_run_id,
+    )
+
     report = {
         "sku_key": sku_key,
         "product_key": sku_ctx.get("product_key") or product.get("product_key"),
@@ -4083,7 +4091,7 @@ async def build_per_sku_report(
             if not (sku_ctx.get("missing_inputs") and not product.get("product_key"))
             else {}
         ),
-        "deliverability": build_sku_deliverability_prediction(sku_ctx, scores),
+        "deliverability": deliverability,
         "band": _sku_band(scores),
         "primary_gaps": primary_gaps,
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
@@ -4097,6 +4105,8 @@ async def build_per_sku_report(
         "opportunity": opportunity,
         "next_best_action": next_best_action,
     }
+    if checkout_handoff:
+        report["checkout_handoff"] = checkout_handoff
     return report
 
 
@@ -4203,6 +4213,8 @@ def build_brand_rollup(
             "serving_status": serving.get("status"),
             "checkout_status": checkout.get("status"),
         }
+        if isinstance(report.get("checkout_handoff"), dict):
+            row["checkout_handoff"] = report.get("checkout_handoff")
         if status == "transactable":
             transactable_skus.append(row)
         else:
@@ -11027,6 +11039,19 @@ def _markdown_table_cell(value: Any) -> str:
     return text.replace("|", "\\|") or "-"
 
 
+def _markdown_http_link(label: Any, url: Any) -> str:
+    href = str(url or "").strip()
+    if not href.lower().startswith(("https://", "http://")):
+        return "-"
+    text = re.sub(r"\s+", " ", str(label or HANDOFF_LABEL_FALLBACK).strip())
+    text = text.replace("[", "\\[").replace("]", "\\]").replace("|", "\\|")
+    href = href.replace(")", "%29").replace(" ", "%20")
+    return f"[{text or HANDOFF_LABEL_FALLBACK}]({href})"
+
+
+HANDOFF_LABEL_FALLBACK = "Open buyable Pivota product page"
+
+
 def _render_deliverability_markdown(report: Mapping[str, Any]) -> str:
     view = build_deliverability_render_view(report)
     if not view:
@@ -11052,13 +11077,28 @@ def _render_deliverability_markdown(report: Mapping[str, Any]) -> str:
     ]
     if transactable:
         out.append("\n**Confirmed transactable SKUs:**\n")
-        out.append("| SKU | Checkout | Read |\n|---|---|---|\n")
+        has_handoff = any(
+            str(row.get("handoff_url") or "").strip().lower().startswith(("https://", "http://"))
+            for row in transactable
+        )
+        if has_handoff:
+            out.append("| SKU | Checkout | Handoff | Read |\n|---|---|---|---|\n")
+        else:
+            out.append("| SKU | Checkout | Read |\n|---|---|---|\n")
         for row in transactable:
-            out.append(
-                f"| {_markdown_table_cell(row.get('sku_title'))} "
-                f"| {_markdown_table_cell(row.get('checkout_status'))} "
-                f"| {_markdown_table_cell(row.get('summary'))} |\n"
-            )
+            if has_handoff:
+                out.append(
+                    f"| {_markdown_table_cell(row.get('sku_title'))} "
+                    f"| {_markdown_table_cell(row.get('checkout_status'))} "
+                    f"| {_markdown_http_link(row.get('handoff_label'), row.get('handoff_url'))} "
+                    f"| {_markdown_table_cell(row.get('summary'))} |\n"
+                )
+            else:
+                out.append(
+                    f"| {_markdown_table_cell(row.get('sku_title'))} "
+                    f"| {_markdown_table_cell(row.get('checkout_status'))} "
+                    f"| {_markdown_table_cell(row.get('summary'))} |\n"
+                )
 
     attention = [
         row for row in (view.get("attention_rows") or [])

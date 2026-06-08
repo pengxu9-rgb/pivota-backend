@@ -379,6 +379,19 @@ def _table_cell(value: Any) -> str:
     return text.replace("|", "\\|") or "-"
 
 
+_HANDOFF_LABEL_FALLBACK = "Open buyable Pivota product page"
+
+
+def _markdown_http_link(label: Any, url: Any) -> str:
+    href = str(url or "").strip()
+    if not href.lower().startswith(("https://", "http://")):
+        return "-"
+    text = " ".join(str(label or _HANDOFF_LABEL_FALLBACK).strip().split())
+    text = text.replace("[", "\\[").replace("]", "\\]").replace("|", "\\|")
+    href = href.replace(")", "%29").replace(" ", "%20")
+    return f"[{text or _HANDOFF_LABEL_FALLBACK}]({href})"
+
+
 def _render_deliverability(report: Dict[str, Any]) -> str:
     view = build_deliverability_render_view(report)
     if not view:
@@ -408,13 +421,29 @@ def _render_deliverability(report: Dict[str, Any]) -> str:
     ]
     if transactable:
         out.append("**Confirmed transactable SKUs:**\n\n")
-        rows = ["| SKU | Checkout | Read |", "|---|---|---|"]
+        has_handoff = any(
+            str(row.get("handoff_url") or "").strip().lower().startswith(("https://", "http://"))
+            for row in transactable
+        )
+        rows = (
+            ["| SKU | Checkout | Handoff | Read |", "|---|---|---|---|"]
+            if has_handoff
+            else ["| SKU | Checkout | Read |", "|---|---|---|"]
+        )
         for row in transactable:
-            rows.append(
-                f"| {_table_cell(row.get('sku_title'))} "
-                f"| {_table_cell(row.get('checkout_status'))} "
-                f"| {_table_cell(row.get('summary'))} |"
-            )
+            if has_handoff:
+                rows.append(
+                    f"| {_table_cell(row.get('sku_title'))} "
+                    f"| {_table_cell(row.get('checkout_status'))} "
+                    f"| {_markdown_http_link(row.get('handoff_label'), row.get('handoff_url'))} "
+                    f"| {_table_cell(row.get('summary'))} |"
+                )
+            else:
+                rows.append(
+                    f"| {_table_cell(row.get('sku_title'))} "
+                    f"| {_table_cell(row.get('checkout_status'))} "
+                    f"| {_table_cell(row.get('summary'))} |"
+                )
         out.append("\n".join(rows) + "\n\n")
     if attention:
         out.append("**Needs attention before checkout:**\n\n")

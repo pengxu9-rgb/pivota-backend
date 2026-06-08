@@ -38,10 +38,18 @@ def _sku_display_name(report: Mapping[str, Any]) -> str:
     return "SKU"
 
 
+def _checkout_handoff(report: Mapping[str, Any], prediction: Mapping[str, Any]) -> Dict[str, Any]:
+    handoff = report.get("checkout_handoff")
+    if not isinstance(handoff, Mapping):
+        handoff = prediction.get("checkout_handoff")
+    return dict(handoff) if isinstance(handoff, Mapping) else {}
+
+
 def _row_from_sku_report(report: Mapping[str, Any]) -> Dict[str, Any]:
     prediction = _as_mapping(report.get("deliverability"))
     serving = _as_mapping(prediction.get("serving"))
     checkout = _as_mapping(prediction.get("checkout"))
+    handoff = _checkout_handoff(report, prediction)
     status = str(prediction.get("status") or "not_measured").strip() or "not_measured"
     return {
         "sku_key": report.get("sku_key"),
@@ -54,11 +62,15 @@ def _row_from_sku_report(report: Mapping[str, Any]) -> Dict[str, Any]:
         "checkout_status": checkout.get("status"),
         "checkout_reason": checkout.get("reason"),
         "commerce_path": checkout.get("commerce_path"),
+        "checkout_handoff": handoff or None,
+        "handoff_url": handoff.get("handoff_url"),
+        "handoff_label": handoff.get("label"),
     }
 
 
 def _row_from_rollup(row: Mapping[str, Any]) -> Dict[str, Any]:
     status = str(row.get("status") or "not_measured").strip() or "not_measured"
+    handoff = _as_mapping(row.get("checkout_handoff"))
     return {
         "sku_key": row.get("sku_key"),
         "product_key": row.get("product_key"),
@@ -70,6 +82,9 @@ def _row_from_rollup(row: Mapping[str, Any]) -> Dict[str, Any]:
         "checkout_status": row.get("checkout_status"),
         "checkout_reason": row.get("checkout_reason"),
         "commerce_path": row.get("commerce_path"),
+        "checkout_handoff": dict(handoff) if handoff else None,
+        "handoff_url": handoff.get("handoff_url"),
+        "handoff_label": handoff.get("label"),
     }
 
 

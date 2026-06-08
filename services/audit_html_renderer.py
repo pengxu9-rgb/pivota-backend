@@ -83,6 +83,15 @@ def _escape(text: Any) -> str:
     return html.escape(str(text), quote=False)
 
 
+def _escape_attr(text: Any) -> str:
+    if text is None:
+        return ""
+    return html.escape(str(text), quote=True)
+
+
+_HANDOFF_LABEL_FALLBACK = "Open buyable Pivota product page"
+
+
 def _print_styles() -> str:
     """Print-optimized CSS. Letter paper, page-break-aware section
     dividers, color theme matching the hand-written Grüns PDF."""
@@ -582,17 +591,43 @@ def _render_deliverability_html(report: Dict[str, Any]) -> str:
     ]
     if transactable:
         out.append("<p><strong>Confirmed transactable SKUs:</strong></p>\n")
-        out.append(
-            "<table><thead><tr><th>SKU</th><th>Checkout</th><th>Read</th></tr></thead><tbody>\n"
+        has_handoff = any(
+            str(row.get("handoff_url") or "").strip().lower().startswith(("https://", "http://"))
+            for row in transactable
         )
-        for row in transactable:
+        if has_handoff:
             out.append(
-                "<tr>"
-                f"<td>{_escape(row.get('sku_title'))}</td>"
-                f"<td>{_escape(row.get('checkout_status'))}</td>"
-                f"<td>{_escape(row.get('summary'))}</td>"
-                "</tr>\n"
+                "<table><thead><tr><th>SKU</th><th>Checkout</th><th>Handoff</th><th>Read</th></tr></thead><tbody>\n"
             )
+        else:
+            out.append(
+                "<table><thead><tr><th>SKU</th><th>Checkout</th><th>Read</th></tr></thead><tbody>\n"
+            )
+        for row in transactable:
+            if has_handoff:
+                handoff_url = str(row.get("handoff_url") or "").strip()
+                handoff_label = str(row.get("handoff_label") or _HANDOFF_LABEL_FALLBACK).strip()
+                handoff_link = (
+                    f'<a href="{_escape_attr(handoff_url)}">{_escape(handoff_label)}</a>'
+                    if handoff_url.lower().startswith(("https://", "http://"))
+                    else ""
+                )
+                out.append(
+                    "<tr>"
+                    f"<td>{_escape(row.get('sku_title'))}</td>"
+                    f"<td>{_escape(row.get('checkout_status'))}</td>"
+                    f"<td>{handoff_link}</td>"
+                    f"<td>{_escape(row.get('summary'))}</td>"
+                    "</tr>\n"
+                )
+            else:
+                out.append(
+                    "<tr>"
+                    f"<td>{_escape(row.get('sku_title'))}</td>"
+                    f"<td>{_escape(row.get('checkout_status'))}</td>"
+                    f"<td>{_escape(row.get('summary'))}</td>"
+                    "</tr>\n"
+                )
         out.append("</tbody></table>\n")
 
     attention = [

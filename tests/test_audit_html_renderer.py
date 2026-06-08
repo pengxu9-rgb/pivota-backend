@@ -357,6 +357,11 @@ def test_html_renderer_emits_deliverability_before_next_best_action_and_escapes(
         {
             "sku_key": "sku-ready",
             "sku_title": "Ready <Serum>",
+            "checkout_handoff": {
+                "status": "eligible",
+                "label": "Open <buyable> Pivota product page",
+                "handoff_url": 'https://agent.pivota.cc/checkout/handoff?token="t"',
+            },
             "deliverability": {
                 "status": "transactable",
                 "summary": "This SKU is serving eligible and has a ready merchant-checkout path.",
@@ -382,6 +387,8 @@ def test_html_renderer_emits_deliverability_before_next_best_action_and_escapes(
     assert "1 of 2 audited SKUs is confirmed transactable." in html
     assert "explicit available-stock signal" in html
     assert "Ready &lt;Serum&gt;" in html
+    assert 'href="https://agent.pivota.cc/checkout/handoff?token=&quot;t&quot;"' in html
+    assert "Open &lt;buyable&gt; Pivota product page" in html
     assert "Needs explicit availability &lt;script&gt;alert(1)&lt;/script&gt;" in html
     assert html.find("Servability and Checkout") < html.find("What Should You Do Next?")
 

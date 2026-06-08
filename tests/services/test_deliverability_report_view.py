@@ -16,6 +16,11 @@ def _deliverability_report():
             {
                 "sku_key": "sku-ready",
                 "sku_title": "Ready Serum",
+                "checkout_handoff": {
+                    "status": "eligible",
+                    "label": "Open buyable Pivota product page",
+                    "handoff_url": "https://agent.pivota.cc/checkout/handoff?token=t",
+                },
                 "deliverability": {
                     "status": "transactable",
                     "summary": "This SKU is serving eligible and has a ready merchant-checkout path.",
@@ -64,6 +69,8 @@ def test_build_deliverability_render_view_summarizes_counts_and_rows():
         {"status": "not_publishable", "label": "Not publishable", "count": 1},
     ]
     assert view["transactable_rows"][0]["sku_title"] == "Ready Serum"
+    assert view["transactable_rows"][0]["handoff_url"] == "https://agent.pivota.cc/checkout/handoff?token=t"
+    assert view["transactable_rows"][0]["handoff_label"] == "Open buyable Pivota product page"
     assert [row["sku_title"] for row in view["attention_rows"]] == [
         "Unknown Stock Serum",
         "Gated Serum",

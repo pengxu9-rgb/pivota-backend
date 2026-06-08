@@ -519,6 +519,10 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     assert report["citation_by_provider"]["chatgpt"]["score"] == 50
     assert report["deliverability"]["status"] == "transactable"
     assert report["deliverability"]["checkout"]["commerce_path"] == "pivota_direct_quote_first"
+    assert report["checkout_handoff"]["status"] == "eligible"
+    assert report["checkout_handoff"]["offer_id"] == "offer-1"
+    assert report["checkout_handoff"]["pivota_signature_id"] == "sig_123"
+    assert "handoff_url" not in report["checkout_handoff"]
     assert report["axis_coverage"] == {"intent": 2, "concern": 2}
     assert report["verbatim_grounding_evidence"][0]["probe_run_id"] == "probe-1"
     assert report["failing_prompts"][0]["evidence_run_id"] == "probe-1"
@@ -735,6 +739,11 @@ def test_build_brand_rollup_priority_queue_ordering():
                 "serving": {"status": "ready"},
                 "checkout": {"status": "ready"},
             },
+            "checkout_handoff": {
+                "status": "eligible",
+                "label": "Open buyable Pivota product page",
+                "handoff_url": "https://agent.pivota.cc/checkout/handoff?token=t",
+            },
         },
     ]
     rollup = build_brand_rollup(reports, "m-1")
@@ -748,6 +757,10 @@ def test_build_brand_rollup_priority_queue_ordering():
     }
     assert rollup["deliverability"]["attention_skus"][0]["sku_key"] == "sku-a"
     assert rollup["deliverability"]["transactable_skus"][0]["sku_key"] == "sku-b"
+    assert (
+        rollup["deliverability"]["transactable_skus"][0]["checkout_handoff"]["handoff_url"]
+        == "https://agent.pivota.cc/checkout/handoff?token=t"
+    )
 
 
 def test_default_brand_markdown_surfaces_deliverability_before_detail():
@@ -769,6 +782,11 @@ def test_default_brand_markdown_surfaces_deliverability_before_detail():
             {
                 "sku_key": "sku-ready",
                 "sku_title": "Ready Serum",
+                "checkout_handoff": {
+                    "status": "eligible",
+                    "label": "Open buyable Pivota product page",
+                    "handoff_url": "https://agent.pivota.cc/checkout/handoff?token=t",
+                },
                 "deliverability": {
                     "status": "transactable",
                     "summary": "This SKU is serving eligible and has a ready merchant-checkout path.",
@@ -794,6 +812,7 @@ def test_default_brand_markdown_surfaces_deliverability_before_detail():
     assert "## Servability and checkout" in md
     assert "1 of 2 audited SKUs is confirmed transactable." in md
     assert "explicit available-stock signal" in md
+    assert "[Open buyable Pivota product page](https://agent.pivota.cc/checkout/handoff?token=t)" in md
     assert "Unknown Stock Serum" in md
     assert md.find("## Servability and checkout") < md.find("## Per-product detail")
 
