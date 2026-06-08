@@ -2816,18 +2816,49 @@ def _citation_text_denies_product(text: str) -> bool:
     return any(phrase in haystack for phrase in denial_phrases)
 
 
+def _first_party_url_candidates(
+    sku_ctx: Dict[str, Any],
+    product: Dict[str, Any],
+) -> List[Any]:
+    """Ordered candidate URLs for the merchant's own host. Canonical fields come
+    first so the onboarded path is unchanged; the audited/pasted URL fields
+    (pdp_url/url/audited_url) follow so the cold-start URL audit — which sets the
+    merchant's own URL as pdp_url, NOT canonical_url — still recognizes the
+    merchant's own host as first-party. Single source of truth for both
+    `_is_first_party_host` (set membership) and `_merchant_host` (primary)."""
+    sku_ctx = sku_ctx or {}
+    product = product or {}
+    return [
+        product.get("canonical_url"),
+        product.get("pivota_canonical_url"),
+        sku_ctx.get("canonical_url"),
+        sku_ctx.get("pivota_canonical_url"),
+        product.get("pdp_url"),
+        product.get("url"),
+        sku_ctx.get("pdp_url"),
+        sku_ctx.get("url"),
+        sku_ctx.get("audited_url"),
+    ]
+
+
+def _first_party_hosts(
+    sku_ctx: Dict[str, Any],
+    product: Optional[Dict[str, Any]] = None,
+) -> set:
+    if product is None:
+        product = _get_product(sku_ctx or {})
+    hosts = set()
+    for candidate in _first_party_url_candidates(sku_ctx, product):
+        normalized = normalize_host(candidate or "")
+        if normalized:
+            hosts.add(normalized)
+    return hosts
+
+
 def _is_first_party_host(host: Optional[str], sku_ctx: Dict[str, Any]) -> bool:
     if not host:
         return False
-    product = _get_product(sku_ctx or {})
-    first_party_hosts = {
-        normalize_host(product.get("canonical_url") or ""),
-        normalize_host(product.get("pivota_canonical_url") or ""),
-        normalize_host(sku_ctx.get("canonical_url") or ""),
-        normalize_host(sku_ctx.get("pivota_canonical_url") or ""),
-    }
-    first_party_hosts.discard(None)
-    return host in first_party_hosts
+    return host in _first_party_hosts(sku_ctx)
 
 
 def _answer_quality_positive(run: Dict[str, Any]) -> bool:
