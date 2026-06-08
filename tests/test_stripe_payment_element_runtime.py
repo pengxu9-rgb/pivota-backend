@@ -232,7 +232,7 @@ async def test_stripe_payment_intent_create_uses_per_order_idempotency_key(
     assert intent is not None
     assert requests[0]["method"] == "create"
     assert requests[0]["request_options"] == {
-        "idempotency_key": "agent_payment:ORD_IDEMPOTENT_CREATE",
+        "idempotency_key": "agent_payment:payment_intent:ORD_IDEMPOTENT_CREATE",
     }
 
 
@@ -325,7 +325,58 @@ async def test_stripe_checkout_session_create_uses_per_order_idempotency_key(
     assert intent is not None
     assert requests[0]["method"] == "checkout.sessions.create"
     assert requests[0]["request_options"] == {
-        "idempotency_key": "agent_payment:ORD_IDEMPOTENT_CHECKOUT",
+        "idempotency_key": "agent_payment:checkout_session:ORD_IDEMPOTENT_CHECKOUT",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stripe_create_idempotency_keys_are_endpoint_scoped_for_same_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from adapters import psp_adapter as module
+
+    requests = []
+
+    class _FakeStripeClient:
+        def __init__(self, *args, **kwargs):
+            self.v1 = SimpleNamespace(
+                checkout=SimpleNamespace(sessions=_FakeCheckoutSessionsAPI(requests)),
+                payment_intents=_FakePaymentIntentsAPI(requests),
+            )
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(module.stripe, "StripeClient", _FakeStripeClient)
+    monkeypatch.setattr(module.stripe, "RequestsClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(module.asyncio, "to_thread", _run_inline)
+
+    adapter = module.StripeAdapter(api_key="sk_live_test_123")
+
+    first_ok, first_intent, first_error = await adapter.create_payment_intent(
+        amount=Decimal("1.69"),
+        currency="USD",
+        metadata={"order_id": "ORD_SAME_ORDER"},
+    )
+    second_ok, second_intent, second_error = await adapter.create_payment_intent(
+        amount=Decimal("1.69"),
+        currency="USD",
+        metadata={"order_id": "ORD_SAME_ORDER", "psp_mode": "stripe_checkout"},
+    )
+
+    assert first_ok is True
+    assert first_error is None
+    assert first_intent is not None
+    assert second_ok is True
+    assert second_error is None
+    assert second_intent is not None
+    assert requests[0]["method"] == "create"
+    assert requests[0]["request_options"] == {
+        "idempotency_key": "agent_payment:payment_intent:ORD_SAME_ORDER",
+    }
+    assert requests[1]["method"] == "checkout.sessions.create"
+    assert requests[1]["request_options"] == {
+        "idempotency_key": "agent_payment:checkout_session:ORD_SAME_ORDER",
     }
 
 
