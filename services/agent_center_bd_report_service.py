@@ -52,6 +52,10 @@ from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
 )
+from services.commerce_execution_policy import (
+    SURFACE_PUBLIC_AGENT_PURCHASE,
+    resolve_commerce_execution_policy,
+)
 from services.next_best_action import (
     attach_sku_strategic_brief,
     build_next_best_action,
@@ -86,6 +90,7 @@ _PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 4
 # genuinely down/slow provider doesn't grind through every remaining chunk at
 # the full per-call timeout (which is what stalled prior runs).
 _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES = 2
+_EXPLICIT_AVAILABLE_STATES = {"in_stock", "available"}
 _COMPETITOR_ATTRIBUTE_GROUNDED_PROVIDERS = {"gemini", "chatgpt"}
 _COMPETITOR_ATTRIBUTE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("halal", ("halal",)),
@@ -2259,7 +2264,7 @@ def compute_routability_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, A
     else:
         best = 0
         for offer in offers:
-            availability_ok = str(offer.get("availability") or "").lower() in {"in_stock", "available", "unknown"}
+            availability_ok = str(offer.get("availability") or "").lower() in _EXPLICIT_AVAILABLE_STATES
             inventory = offer.get("inventory_quantity")
             inventory_ok = inventory is None or (_as_number(inventory) or 0) > 0
             mode_ok = (offer.get("offer_mode") or "") == "merchant_checkout"
@@ -2370,6 +2375,219 @@ def compute_routability_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, A
         missing=route_missing or None,
     )
     return _finish_breakdown(breakdown, missing)
+
+
+def _orderable_offer_summary(sku_ctx: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    sku = _get_sku(sku_ctx or {})
+    offers = _get_offers(sku_ctx or {})
+    best_points = -1
+    best_offer: Optional[Dict[str, Any]] = None
+    for offer in offers:
+        availability_ok = str(offer.get("availability") or "").lower() in _EXPLICIT_AVAILABLE_STATES
+        inventory = offer.get("inventory_quantity")
+        inventory_ok = inventory is None or (_as_number(inventory) or 0) > 0
+        mode_ok = (offer.get("offer_mode") or "") == "merchant_checkout"
+        price_ok = (_as_number(offer.get("list_price")) or 0) > 0
+        linked_ok = _nonempty(offer.get("offer_id")) and offer.get("sku_key") == sku.get("sku_key")
+        points = (
+            (5 if linked_ok else 0)
+            + (8 if availability_ok and inventory_ok else 0)
+            + (7 if mode_ok else 0)
+            + (5 if price_ok else 0)
+        )
+        if points > best_points:
+            best_points = points
+            best_offer = offer
+
+    if best_offer is None:
+        return False, {
+            "offer_count": 0,
+            "reason": "no catalog offer found",
+            "missing_inputs": ["catalog_offers"],
+        }
+
+    orderable = best_points == 25
+    missing: List[str] = []
+    if not (_nonempty(best_offer.get("offer_id")) and best_offer.get("sku_key") == sku.get("sku_key")):
+        missing.append("catalog_offers.sku_key")
+    availability_ok = str(best_offer.get("availability") or "").lower() in _EXPLICIT_AVAILABLE_STATES
+    inventory = best_offer.get("inventory_quantity")
+    inventory_ok = inventory is None or (_as_number(inventory) or 0) > 0
+    if not (availability_ok and inventory_ok):
+        missing.append("catalog_offers.availability")
+    if (best_offer.get("offer_mode") or "") != "merchant_checkout":
+        missing.append("catalog_offers.offer_mode")
+    if (_as_number(best_offer.get("list_price")) or 0) <= 0:
+        missing.append("catalog_offers.list_price")
+
+    return orderable, {
+        "offer_count": len(offers),
+        "offer_id": best_offer.get("offer_id"),
+        "offer_mode": best_offer.get("offer_mode"),
+        "availability": best_offer.get("availability"),
+        "inventory_quantity": best_offer.get("inventory_quantity"),
+        "currency": best_offer.get("currency"),
+        "list_price": best_offer.get("list_price"),
+        "points": max(0, best_points),
+        "max": 25,
+        "reason": "orderable merchant-checkout offer" if orderable else "partial offer orderability",
+        "missing_inputs": missing,
+    }
+
+
+def build_sku_deliverability_prediction(
+    sku_ctx: Dict[str, Any],
+    scores: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Predict whether this SKU can be served and transacted from stored facts.
+
+    This is deliberately stricter than the routability score. A high
+    routability score can include partial credit, but this prediction only
+    calls a SKU transactable when serving eligibility, offer orderability, and
+    merchant execute readiness are all explicit.
+    """
+    product = _get_product(sku_ctx or {})
+    state = _get_index_state(sku_ctx or {})
+    commerce = sku_ctx.get("merchant_commerce_readiness_state") or sku_ctx.get("commerce_readiness") or {}
+    commerce = commerce if isinstance(commerce, dict) else {}
+
+    serving_eligible = state.get("serving_eligible")
+    pipeline_stage = str(state.get("pipeline_stage") or product.get("pdp_lifecycle_stage") or "").strip() or None
+    serving_ready = serving_eligible is True
+    serving_known = serving_eligible is not None or pipeline_stage is not None
+    if serving_ready:
+        serving_status = "ready"
+        serving_reason = "index pipeline marks the SKU serving eligible"
+        serving_missing: List[str] = []
+    elif serving_known:
+        serving_status = "blocked"
+        serving_reason = "index pipeline does not mark the SKU serving eligible"
+        serving_missing = ["index_pipeline_state.serving_eligible"]
+    else:
+        serving_status = "unknown"
+        serving_reason = "serving eligibility has not been measured"
+        serving_missing = ["index_pipeline_state.serving_eligible", "index_pipeline_state.pipeline_stage"]
+
+    orderable_offer, offer_summary = _orderable_offer_summary(sku_ctx or {})
+    execute_status = str(commerce.get("execute_status") or "").strip().lower() or None
+    execute_ready = execute_status == "ready"
+    platform = (
+        str(
+            commerce.get("primary_platform")
+            or product.get("platform")
+            or product.get("source_platform")
+            or ""
+        )
+        .strip()
+        .lower()
+        or None
+    )
+    policy = resolve_commerce_execution_policy(
+        platform=platform,
+        surface=SURFACE_PUBLIC_AGENT_PURCHASE,
+    ).as_dict()
+    commerce_blockers = [
+        str(item)
+        for item in _json_list(commerce.get("execute_blockers"))
+        if str(item or "").strip()
+    ]
+
+    checkout_missing: List[str] = []
+    checkout_missing.extend(offer_summary.get("missing_inputs") or [])
+    if execute_status is None:
+        checkout_missing.append("merchant_commerce_readiness_state.execute_status")
+    if not platform:
+        checkout_missing.append("merchant_commerce_readiness_state.primary_platform")
+    checkout_blockers: List[str] = []
+    checkout_blockers.extend(commerce_blockers)
+    if execute_status and not execute_ready:
+        checkout_blockers.append("merchant_commerce_readiness_state.execute_status")
+    if not policy.get("allows_pivota_order"):
+        checkout_blockers.append("commerce_execution_policy.allows_pivota_order=false")
+
+    direct_purchase_ready = (
+        orderable_offer
+        and execute_ready
+        and bool(policy.get("allows_pivota_order"))
+        and bool(policy.get("allows_psp_creation"))
+    )
+
+    if orderable_offer and execute_ready and policy.get("allows_pivota_order"):
+        checkout_status = "ready"
+        checkout_reason = "orderable offer and merchant execute readiness are present"
+    elif orderable_offer and execute_ready:
+        checkout_status = "limited"
+        checkout_reason = "merchant is commerce-ready, but this platform is not enabled for Pivota direct purchase"
+    elif orderable_offer:
+        checkout_status = "blocked"
+        checkout_reason = "orderable offer exists, but merchant execute readiness is not ready"
+    elif execute_ready:
+        checkout_status = "blocked"
+        checkout_reason = "merchant execute readiness is ready, but no orderable SKU offer is present"
+    elif execute_status is None and not orderable_offer:
+        checkout_status = "unknown"
+        checkout_reason = "checkout readiness has not been measured"
+    else:
+        checkout_status = "blocked"
+        checkout_reason = "checkout readiness is blocked"
+
+    if not serving_known and execute_status is None and not offer_summary.get("offer_count"):
+        status = "not_measured"
+        summary = "No stored serving, offer, or checkout facts are available for this SKU yet."
+    elif not serving_ready:
+        status = "not_publishable"
+        if serving_status == "unknown":
+            summary = "This SKU should not be promised to buyers yet because serving eligibility is not confirmed."
+        else:
+            summary = "This SKU should not be promised to buyers yet because it is not serving eligible."
+    elif direct_purchase_ready:
+        status = "transactable"
+        summary = "This SKU is serving eligible and has a ready merchant-checkout path for Pivota direct purchase."
+    elif orderable_offer and execute_ready:
+        status = "servable_not_direct_purchase"
+        summary = "This SKU is servable with an orderable offer, but Pivota direct purchase is not enabled for the platform."
+    else:
+        status = "servable_not_transactable"
+        summary = "This SKU can be served, but checkout is not ready enough to promise a transaction."
+
+    routability = (scores or {}).get("routability") if isinstance(scores, dict) else None
+    routability_score = routability.get("score") if isinstance(routability, dict) else None
+
+    return {
+        "status": status,
+        "summary": summary,
+        "serving": {
+            "status": serving_status,
+            "serving_eligible": serving_eligible if isinstance(serving_eligible, bool) else None,
+            "pipeline_stage": pipeline_stage,
+            "reason": serving_reason,
+            "missing_inputs": serving_missing,
+        },
+        "checkout": {
+            "status": checkout_status,
+            "reason": checkout_reason,
+            "orderable_offer": orderable_offer,
+            "offer": offer_summary,
+            "execute_status": execute_status,
+            "active_psp": commerce.get("active_psp"),
+            "primary_platform": platform,
+            "execute_blockers": commerce_blockers,
+            "commerce_path": policy.get("commerce_path"),
+            "allows_pivota_order": bool(policy.get("allows_pivota_order")),
+            "allows_psp_creation": bool(policy.get("allows_psp_creation")),
+            "validation_authority": policy.get("validation_authority"),
+            "execution_policy_version": policy.get("execution_policy_version"),
+            "policy_reason": policy.get("reason"),
+            "missing_inputs": list(dict.fromkeys(checkout_missing)),
+            "blockers": list(dict.fromkeys(checkout_blockers)),
+        },
+        "score_context": {"routability_score": routability_score},
+        "honesty_note": (
+            "Prediction uses stored serving eligibility, catalog offer orderability, "
+            "merchant commerce readiness, and the public agent purchase execution policy; "
+            "citation score alone never makes a SKU transactable."
+        ),
+    }
 
 
 def _flatten_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
@@ -3864,6 +4082,7 @@ async def build_per_sku_report(
             if not (sku_ctx.get("missing_inputs") and not product.get("product_key"))
             else {}
         ),
+        "deliverability": build_sku_deliverability_prediction(sku_ctx, scores),
         "band": _sku_band(scores),
         "primary_gaps": primary_gaps,
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
@@ -3965,6 +4184,29 @@ def build_brand_rollup(
             "content_richness": (scores.get("content_richness") or {}).get("score"),
         })
 
+    deliverability_counts: Counter[str] = Counter()
+    deliverability_attention: List[Dict[str, Any]] = []
+    transactable_skus: List[Dict[str, Any]] = []
+    for report in per_sku_reports:
+        prediction = report.get("deliverability")
+        prediction = prediction if isinstance(prediction, dict) else {}
+        status = str(prediction.get("status") or "not_measured").strip() or "not_measured"
+        deliverability_counts[status] += 1
+        serving = prediction.get("serving") if isinstance(prediction.get("serving"), dict) else {}
+        checkout = prediction.get("checkout") if isinstance(prediction.get("checkout"), dict) else {}
+        row = {
+            "sku_key": report.get("sku_key"),
+            "product_key": report.get("product_key"),
+            "status": status,
+            "summary": prediction.get("summary"),
+            "serving_status": serving.get("status"),
+            "checkout_status": checkout.get("status"),
+        }
+        if status == "transactable":
+            transactable_skus.append(row)
+        else:
+            deliverability_attention.append(row)
+
     priority_queue: List[Dict[str, Any]] = []
     for report in per_sku_reports:
         impact = _as_number(report.get("impact_proxy")) or 1.0
@@ -4012,6 +4254,11 @@ def build_brand_rollup(
             }
             for r in top_by_band
         ],
+        "deliverability": {
+            "status_counts": dict(deliverability_counts),
+            "transactable_skus": transactable_skus[:10],
+            "attention_skus": deliverability_attention[:25],
+        },
         "blocked_skus": blocked,
         "priority_queue": priority_queue[:25],
     }

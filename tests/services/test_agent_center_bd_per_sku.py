@@ -96,7 +96,12 @@ def _base_sku_ctx() -> Dict[str, Any]:
                 "offer_payload": {"ship_to_market": "US", "shipping": {"domestic": True}},
             }
         ],
-        "merchant_commerce_readiness_state": {"active_psp": "stripe"},
+        "merchant_commerce_readiness_state": {
+            "primary_platform": "shopify",
+            "active_psp": "stripe",
+            "execute_status": "ready",
+            "execute_blockers": [],
+        },
         "merchant": {"merchant_id": "m-1", "country": "US", "verification_status": "verified"},
         "pcs_shop_policies": [
             {"policy_type": "shipping", "url": "https://merchant.test/shipping"},
@@ -326,6 +331,117 @@ def test_routability_score_good_and_missing_offer_data():
     assert breakdown["offer_orderability"]["reason"] == "data unavailable"
 
 
+def test_routability_score_unknown_availability_is_not_orderable():
+    from services.agent_center_bd_report_service import compute_routability_score
+
+    ctx = _base_sku_ctx()
+    ctx["offers"][0]["availability"] = "unknown"
+    ctx["offers"][0]["inventory_quantity"] = None
+
+    score, breakdown = compute_routability_score(ctx)
+
+    assert score < 100
+    assert breakdown["offer_orderability"]["points"] == 17
+    assert breakdown["offer_orderability"]["reason"] == "partial offer orderability"
+    assert "catalog_offers.availability" in breakdown["missing_inputs"]
+
+
+def test_deliverability_prediction_requires_explicit_execute_ready():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    ctx = _base_sku_ctx()
+    ctx["merchant_commerce_readiness_state"] = {
+        "primary_platform": "shopify",
+        "active_psp": "stripe",
+    }
+
+    prediction = build_sku_deliverability_prediction(ctx)
+
+    assert prediction["status"] == "servable_not_transactable"
+    assert prediction["checkout"]["status"] == "blocked"
+    assert "merchant_commerce_readiness_state.execute_status" in prediction["checkout"]["missing_inputs"]
+    assert "active PSP" not in prediction["summary"]
+
+
+def test_deliverability_prediction_requires_explicit_available_stock():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    ctx = _base_sku_ctx()
+    ctx["offers"][0]["availability"] = "unknown"
+    ctx["offers"][0]["inventory_quantity"] = None
+
+    prediction = build_sku_deliverability_prediction(ctx)
+
+    assert prediction["status"] == "servable_not_transactable"
+    assert prediction["checkout"]["status"] == "blocked"
+    assert prediction["checkout"]["orderable_offer"] is False
+    assert prediction["checkout"]["offer"]["points"] == 17
+    assert "catalog_offers.availability" in prediction["checkout"]["missing_inputs"]
+
+
+def test_deliverability_prediction_blocks_unservable_sku_before_checkout():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    ctx = _base_sku_ctx()
+    ctx["index_pipeline_state"] = {
+        "serving_eligible": False,
+        "pipeline_stage": "quality_gated",
+    }
+
+    prediction = build_sku_deliverability_prediction(ctx)
+
+    assert prediction["status"] == "not_publishable"
+    assert prediction["serving"]["status"] == "blocked"
+    assert prediction["checkout"]["status"] == "ready"
+    assert prediction["checkout"]["orderable_offer"] is True
+
+
+def test_deliverability_prediction_softens_unmeasured_serving_summary():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    ctx = _base_sku_ctx()
+    ctx["index_pipeline_state"] = {}
+
+    prediction = build_sku_deliverability_prediction(ctx)
+
+    assert prediction["status"] == "not_publishable"
+    assert prediction["serving"]["status"] == "unknown"
+    assert prediction["checkout"]["status"] == "ready"
+    assert "not confirmed" in prediction["summary"]
+    assert "not serving eligible" not in prediction["summary"]
+
+
+def test_deliverability_prediction_does_not_overclaim_non_direct_platform():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    ctx = _base_sku_ctx()
+    ctx["product"]["platform"] = "woocommerce"
+    ctx["merchant_commerce_readiness_state"] = {
+        "primary_platform": "woocommerce",
+        "active_psp": "stripe",
+        "execute_status": "ready",
+        "execute_blockers": [],
+    }
+
+    prediction = build_sku_deliverability_prediction(ctx)
+
+    assert prediction["status"] == "servable_not_direct_purchase"
+    assert prediction["checkout"]["status"] == "limited"
+    assert prediction["checkout"]["allows_pivota_order"] is False
+    assert prediction["checkout"]["commerce_path"] == "unsupported"
+
+
+def test_deliverability_prediction_calls_ready_shopify_sku_transactable():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    prediction = build_sku_deliverability_prediction(_base_sku_ctx())
+
+    assert prediction["status"] == "transactable"
+    assert prediction["serving"]["status"] == "ready"
+    assert prediction["checkout"]["status"] == "ready"
+    assert prediction["checkout"]["allows_pivota_order"] is True
+
+
 def test_citation_score_weighted_formula_and_missing_runs():
     from services.agent_center_bd_report_service import compute_citation_score
 
@@ -401,6 +517,8 @@ async def test_build_per_sku_report_end_to_end_with_mocked_loaders(monkeypatch):
     assert set(report["citation_by_provider"]) == {"gemini", "chatgpt"}
     assert report["citation_by_provider"]["gemini"]["score"] == 50
     assert report["citation_by_provider"]["chatgpt"]["score"] == 50
+    assert report["deliverability"]["status"] == "transactable"
+    assert report["deliverability"]["checkout"]["commerce_path"] == "pivota_direct_quote_first"
     assert report["axis_coverage"] == {"intent": 2, "concern": 2}
     assert report["verbatim_grounding_evidence"][0]["probe_run_id"] == "probe-1"
     assert report["failing_prompts"][0]["evidence_run_id"] == "probe-1"
@@ -592,6 +710,12 @@ def test_build_brand_rollup_priority_queue_ordering():
                 "citation": {"score": 0},
             },
             "primary_gaps": [{"dimension": "content_richness", "bucket": "answer_shaped_modules", "reason": "missing FAQ"}],
+            "deliverability": {
+                "status": "servable_not_transactable",
+                "summary": "This SKU can be served, but checkout is not ready enough to promise a transaction.",
+                "serving": {"status": "ready"},
+                "checkout": {"status": "blocked"},
+            },
         },
         {
             "sku_key": "sku-b",
@@ -605,6 +729,12 @@ def test_build_brand_rollup_priority_queue_ordering():
                 "citation": {"score": 70},
             },
             "primary_gaps": [{"dimension": "citation", "bucket": "authority_near_variant_rate", "reason": "no authority"}],
+            "deliverability": {
+                "status": "transactable",
+                "summary": "This SKU is serving eligible and has a ready merchant-checkout path for Pivota direct purchase.",
+                "serving": {"status": "ready"},
+                "checkout": {"status": "ready"},
+            },
         },
     ]
     rollup = build_brand_rollup(reports, "m-1")
@@ -612,6 +742,12 @@ def test_build_brand_rollup_priority_queue_ordering():
     assert rollup["priority_queue"][0]["sku_key"] == "sku-a"
     assert rollup["priority_queue"][0]["priority_score"] == 600
     assert rollup["blocked_skus"][0]["sku_key"] == "sku-a"
+    assert rollup["deliverability"]["status_counts"] == {
+        "servable_not_transactable": 1,
+        "transactable": 1,
+    }
+    assert rollup["deliverability"]["attention_skus"][0]["sku_key"] == "sku-a"
+    assert rollup["deliverability"]["transactable_skus"][0]["sku_key"] == "sku-b"
 
 
 def test_build_authority_map_classification_and_reddit_shape():
