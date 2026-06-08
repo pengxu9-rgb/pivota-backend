@@ -86,6 +86,40 @@ _PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 4
 # genuinely down/slow provider doesn't grind through every remaining chunk at
 # the full per-call timeout (which is what stalled prior runs).
 _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES = 2
+_COMPETITOR_ATTRIBUTE_GROUNDED_PROVIDERS = {"gemini", "chatgpt"}
+_COMPETITOR_ATTRIBUTE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("halal", ("halal",)),
+    ("kosher", ("kosher",)),
+    ("vegan", ("vegan",)),
+    ("organic", ("organic",)),
+    ("non-gmo", ("non gmo", "non-gmo")),
+    ("gluten-free", ("gluten free", "gluten-free")),
+    ("cruelty-free", ("cruelty free", "cruelty-free")),
+    ("collagen peptides", ("collagen peptides", "collagen peptide")),
+    ("hydrolyzed collagen", ("hydrolyzed collagen", "hydrolysed collagen")),
+    ("low-molecular collagen", ("low molecular collagen", "low-molecular collagen")),
+    ("marine collagen", ("marine collagen",)),
+    ("fish collagen", ("fish collagen",)),
+    ("bovine collagen", ("bovine collagen",)),
+    ("grass-fed collagen", ("grass fed collagen", "grass-fed collagen")),
+    ("pasture-raised collagen", ("pasture raised collagen", "pasture-raised collagen")),
+    ("vitamin c", ("vitamin c", "vitamin-c")),
+    ("hyaluronic acid", ("hyaluronic acid",)),
+    ("biotin", ("biotin",)),
+    ("glycine", ("glycine",)),
+    ("powder", ("powder", "powders")),
+    ("capsules", ("capsule", "capsules")),
+    ("gummies", ("gummy", "gummies")),
+    ("sticks", ("stick", "sticks")),
+    ("liquid", ("liquid", "liquids")),
+    ("jelly", ("jelly", "jellies")),
+    ("sachets", ("sachet", "sachets")),
+    ("skin", ("skin", "skin health", "skin elasticity")),
+    ("hair and nails", ("hair and nails", "hair & nails", "hair/nails")),
+    ("k-beauty", ("k beauty", "k-beauty")),
+    ("sports nutrition", ("sports nutrition",)),
+    ("beauty-from-within", ("beauty from within", "beauty-from-within")),
+)
 logger = logging.getLogger(__name__)
 _ANSWER_QUALITY_VERIFY_DEWEIGHT_RULE = (
     "Verified citation-positive prompts keep their deterministic "
@@ -5054,6 +5088,256 @@ def _wedge_hero_sku_ctx(
     }
 
 
+def _strategic_brief_live_probe_enabled() -> bool:
+    from config.settings import settings as app_settings
+    from services.llm_synthesis import (
+        LLMSynthesisError,
+        configured_key_for_provider,
+        normalize_provider,
+    )
+
+    if not getattr(app_settings, "strategic_brief_enabled", False):
+        return False
+    try:
+        provider = normalize_provider(app_settings.strategic_brief_provider)
+    except LLMSynthesisError:
+        return False
+    return bool(configured_key_for_provider(provider))
+
+
+def _list_value(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _durable_competitor_for_brief(opportunity: Mapping[str, Any]) -> Optional[str]:
+    counts: Counter = Counter()
+    opportunity_map = opportunity if isinstance(opportunity, Mapping) else {}
+    for row in _list_value(opportunity_map.get("per_prompt")):
+        if not isinstance(row, Mapping):
+            continue
+        competitors = row.get("competitors")
+        if isinstance(competitors, str):
+            competitor_values = [competitors]
+        elif isinstance(competitors, list):
+            competitor_values = competitors
+        else:
+            competitor_values = []
+        for competitor in competitor_values:
+            name = str(competitor or "").strip()
+            if name:
+                counts[name] += 1
+        density = row.get("density") if isinstance(row.get("density"), Mapping) else {}
+        features = (
+            density.get("features")
+            if isinstance(density.get("features"), Mapping)
+            else {}
+        )
+        repeated_owner = str(features.get("repeated_owner") or "").strip()
+        if repeated_owner and repeated_owner.lower() not in {"false", "none"}:
+            counts[repeated_owner] += max(2, counts.get(repeated_owner, 0))
+    if not counts:
+        return None
+    from services.sku_opportunity import _durable_competitor
+
+    return _durable_competitor(counts)
+
+
+def _competitor_attribute_query(competitor: str, category: str) -> str:
+    category_phrase = category or "this product category"
+    return (
+        f"what attributes is {competitor} known for in {category_phrase}, "
+        "including certifications, ingredients, format, use-case, or positioning"
+    )
+
+
+def _competitor_attribute_probe_context(
+    *,
+    competitor: str,
+    category: str,
+    query: str,
+) -> Dict[str, Any]:
+    return {
+        "queries": [query],
+        "product_title": competitor,
+        "product_type": category,
+        "merchant_brand": competitor,
+        "merchant_pdp_url": "",
+        "product": {
+            "title": competitor,
+            "vendor": competitor,
+            "product_type": category,
+        },
+        "analysis_goal": (
+            "Ground only competitor attribute PRESENCE. Do not infer what the "
+            "competitor lacks."
+        ),
+    }
+
+
+def _grounded_attribute_providers(coverage: Mapping[str, Any]) -> List[str]:
+    providers: List[str] = []
+    for provider in list((coverage or {}).get("providers") or []):
+        provider_id = str(provider or "").strip().lower()
+        if provider_id in _COMPETITOR_ATTRIBUTE_GROUNDED_PROVIDERS:
+            providers.append(provider_id)
+    return providers[:2]
+
+
+def _competitor_attribute_run_text(run: Mapping[str, Any]) -> str:
+    parsed_parts: List[str] = []
+    parsed = run.get("parsed")
+    if isinstance(parsed, Mapping):
+        for key in ("evidence_excerpt", "summary", "answer"):
+            value = parsed.get(key)
+            if value:
+                parsed_parts.append(str(value))
+    if parsed_parts:
+        return "\n".join(parsed_parts)
+    raw = run.get("raw")
+    return str(raw or "")
+
+
+def _normal_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _attribute_verbatim(text: str, aliases: Tuple[str, ...]) -> str:
+    sentences = [
+        segment.strip()
+        for segment in re.split(r"(?<=[.!?])\s+|\n+", text or "")
+        if segment.strip()
+    ]
+    for sentence in sentences:
+        normalized = _normal_text(sentence)
+        if any(_normal_text(alias) in normalized for alias in aliases):
+            return sentence[:240]
+    return (text or "").strip()[:240]
+
+
+def _extract_competitor_attribute_evidence(
+    run: Mapping[str, Any],
+    *,
+    provider: str,
+) -> List[Dict[str, str]]:
+    if not (_list_value(run.get("grounding_sources")) or _list_value(run.get("grounding_chunks"))):
+        return []
+    text = _competitor_attribute_run_text(run)
+    normalized = _normal_text(text)
+    if not normalized:
+        return []
+    out: List[Dict[str, str]] = []
+    for canonical, aliases in _COMPETITOR_ATTRIBUTE_ALIASES:
+        if not any(_normal_text(alias) in normalized for alias in aliases):
+            continue
+        out.append({
+            "attribute": canonical,
+            "provider": provider,
+            "verbatim": _attribute_verbatim(text, aliases),
+        })
+    return out
+
+
+def _merge_competitor_attribute_evidence(
+    *,
+    competitor: str,
+    evidence_rows: List[Dict[str, str]],
+) -> Any:
+    by_attribute: Dict[str, Dict[str, str]] = {}
+    for row in evidence_rows:
+        attribute = str(row.get("attribute") or "").strip()
+        provider = str(row.get("provider") or "").strip()
+        verbatim = str(row.get("verbatim") or "").strip()
+        if not attribute or not provider or not verbatim:
+            continue
+        by_attribute.setdefault(attribute, {
+            "attribute": attribute,
+            "provider": provider,
+            "verbatim": verbatim[:240],
+        })
+    if not by_attribute:
+        return "not_assessed"
+    attributes = list(by_attribute)
+    return {
+        "status": "assessed",
+        "competitor": competitor,
+        "attributes_present": attributes[:8],
+        "evidence": [by_attribute[attr] for attr in attributes[:8]],
+        "note": "Grounded presence only - not a claim the competitor lacks anything else.",
+    }
+
+
+async def _probe_durable_competitor_attributes_for_brief(
+    *,
+    opportunity: Mapping[str, Any],
+    product: Mapping[str, Any],
+    merchant_id: str,
+    run_id: str,
+    coverage: Mapping[str, Any],
+    provider_model_metadata: Mapping[str, Any],
+) -> Any:
+    if not _strategic_brief_live_probe_enabled():
+        return "not_assessed"
+    competitor = _durable_competitor_for_brief(opportunity)
+    if not competitor:
+        return "not_assessed"
+    category = str(
+        product.get("product_type")
+        or product.get("category")
+        or ""
+    ).strip()
+    providers = _grounded_attribute_providers(coverage)
+    if not providers:
+        return "not_assessed"
+    query = _competitor_attribute_query(competitor, category)
+    context = _competitor_attribute_probe_context(
+        competitor=competitor,
+        category=category,
+        query=query,
+    )
+    evidence_rows: List[Dict[str, str]] = []
+    safe_competitor = re.sub(r"[^a-z0-9]+", "_", competitor.lower()).strip("_") or "competitor"
+    for provider in providers:
+        model_info = provider_model_metadata.get(provider) or {}
+        try:
+            result = await llm_client.probe(
+                scan_mode=_PER_SKU_AUDIT_PROBE_SCAN_MODE,
+                scan_target_id=(
+                    f"{run_id or 'adhoc'}:competitor_attrs:{safe_competitor}:{provider}"
+                ),
+                merchant_id=str(merchant_id),
+                store_id=f"{merchant_id}_audit",
+                context=context,
+                provider=provider,
+                max_runs=1,
+                model=model_info.get("model"),
+                model_is_override=bool(model_info.get("model_is_override")),
+            )
+        except Exception:  # noqa: BLE001 - optional grounding must fail closed
+            logger.info(
+                "competitor attribute probe failed provider=%s competitor=%s",
+                provider,
+                competitor,
+                exc_info=True,
+            )
+            continue
+        actual_provider = str(result.get("provider") or provider).strip().lower()
+        if not _classify_provider(actual_provider).get("is_real"):
+            continue
+        for run in _list_value(result.get("raw_runs")):
+            if not isinstance(run, Mapping):
+                continue
+            evidence_rows.extend(
+                _extract_competitor_attribute_evidence(
+                    run,
+                    provider=actual_provider,
+                )
+            )
+    return _merge_competitor_attribute_evidence(
+        competitor=competitor,
+        evidence_rows=evidence_rows,
+    )
+
+
 def _sku_intelligence_ladder_layer(row: Mapping[str, Any]) -> Optional[str]:
     axis = str(row.get("axis") or "").lower()
     query_class = str(row.get("query_class") or "").lower()
@@ -6042,13 +6326,20 @@ async def run_wedge_hero_sku_intelligence(
     title = str(product.get("title") or sku_ctx.get("sku_key") or "this product")
     brief_opportunity = dict(opportunity)
     brief_opportunity["top_open_lanes"] = list(display.get("top_open_lanes") or [])
-    display["next_best_action"] = await attach_sku_strategic_brief(
-        display.get("next_best_action") or {},
-        opportunity=brief_opportunity,
-        attribute_graph=attribute_graph,
-        primary_gaps=[],
-        scores={},
-        identity={
+    competitor_attributes = await _probe_durable_competitor_attributes_for_brief(
+        opportunity=opportunity,
+        product=product,
+        merchant_id=str(merchant_id),
+        run_id=run_id,
+        coverage=coverage,
+        provider_model_metadata=provider_model_metadata,
+    )
+    strategic_brief_kwargs = {
+        "opportunity": brief_opportunity,
+        "attribute_graph": attribute_graph,
+        "primary_gaps": [],
+        "scores": {},
+        "identity": {
             "name": title,
             "confidence": "medium" if title and title != "this product" else "low",
             "unresolved": not bool(title and title != "this product"),
@@ -6057,8 +6348,14 @@ async def run_wedge_hero_sku_intelligence(
                 "category": product.get("category") or product.get("product_type"),
             },
         },
-        sku_title=title,
-        merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+        "sku_title": title,
+        "merchant_host": normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+    }
+    if competitor_attributes != "not_assessed":
+        strategic_brief_kwargs["competitor_attributes"] = competitor_attributes
+    display["next_best_action"] = await attach_sku_strategic_brief(
+        display.get("next_best_action") or {},
+        **strategic_brief_kwargs,
     )
     return display
 
