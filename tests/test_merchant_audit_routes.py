@@ -182,6 +182,25 @@ def _install_audit_run_persistence_mocks(monkeypatch: pytest.MonkeyPatch, mar) -
     return history
 
 
+def _install_audit_ready_mock(
+    monkeypatch: pytest.MonkeyPatch,
+    mar,
+    *,
+    catalog_count: int = 1,
+) -> None:
+    async def _audit_ready(_merchant_id: str, _platform: str):
+        return {
+            "ready": True,
+            "blocking_gaps": [],
+            "counts": {
+                "catalog_products": catalog_count,
+                "product_quality_snapshot": catalog_count,
+            },
+        }
+
+    monkeypatch.setattr(mar, "assess_merchant_audit_readiness", _audit_ready)
+
+
 # ---------------------------------------------------------------------------
 # Fixture: a small FastAPI app with just the merchant audit router +
 # overridden auth + fake DB + mocked run_brand_report.
@@ -252,6 +271,9 @@ def env(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
     _install_audit_run_persistence_mocks(monkeypatch, mar)
+    _install_audit_ready_mock(
+        monkeypatch, mar, catalog_count=len(products),
+    )
 
     # Override merchant auth — default to a "merch_self" merchant token.
     async def _override_merchant() -> str:
@@ -375,6 +397,46 @@ def test_404_when_product_owned_by_different_merchant(env):
     assert any(m["source_product_id"] == "p_other" for m in missing)
 
 
+def test_409_when_legacy_sync_audit_readiness_not_ready(
+    env,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Legacy sync path must use the readiness probe, not render an
+    all-blocked first audit while catalog quality backfill is still running."""
+    client, captured_calls, mar_module = env
+
+    async def _not_ready(_merchant_id: str, platform: str):
+        return {
+            "ready": False,
+            "blocking_gaps": [
+                "product_quality_snapshot missing content_quality_score"
+            ],
+            "counts": {
+                "catalog_products": 2,
+                "product_quality_snapshot": 0,
+            },
+            "platform": platform,
+        }
+
+    monkeypatch.setattr(
+        mar_module, "assess_merchant_audit_readiness", _not_ready,
+    )
+
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness",
+        json={"products": [_ref("p1")]},
+    )
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["code"] == "merchant_not_audit_ready"
+    assert detail["platform"] == "shopify"
+    assert detail["retry_after_seconds"] == 60
+    assert "product_quality_snapshot" in str(detail["blocking_gaps"])
+    assert captured_calls == []
+    assert mar_module._audit_run_history == []
+
+
 def test_url_less_product_falls_back_to_pivota_canonical_url(env):
     """A catalog row with no canonical_url AND no handle in
     product_payload now falls back to its Pivota canonical PDP URL
@@ -459,6 +521,9 @@ def test_existing_pivota_canonical_url_is_used_without_lazy_mint(
         }
     monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
     _install_audit_run_persistence_mocks(monkeypatch, mar)
+    _install_audit_ready_mock(
+        monkeypatch, mar, catalog_count=len(products_for_self),
+    )
 
     async def _override_merchant() -> str:
         return "merch_self"
@@ -526,6 +591,7 @@ def test_canonical_url_derived_from_handle_when_catalog_url_missing(
         }
     monkeypatch.setattr(mar, "run_brand_report", _fake_run_brand_report)
     _install_audit_run_persistence_mocks(monkeypatch, mar)
+    _install_audit_ready_mock(monkeypatch, mar, catalog_count=len(products))
 
     async def _override_merchant() -> str:
         return "merch_self"
@@ -632,6 +698,7 @@ def test_legacy_sync_path_wraps_run_brand_report_in_audit_telemetry(
 
     monkeypatch.setattr(mar, "run_brand_report", _capturing_brand_report)
     _install_audit_run_persistence_mocks(monkeypatch, mar)
+    _install_audit_ready_mock(monkeypatch, mar, catalog_count=len(products))
 
     async def _override_merchant() -> str:
         return "merch_self"

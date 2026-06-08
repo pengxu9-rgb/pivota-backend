@@ -111,6 +111,20 @@ def client(compat_stub, monkeypatch):
     monkeypatch.setattr(merchant_audit_routes.database, "fetch_all",
                         fake_fetch_all_simple)
 
+    async def _audit_ready(_merchant_id: str, _platform: str):
+        return {
+            "ready": True,
+            "blocking_gaps": [],
+            "counts": {
+                "catalog_products": len(compat_stub.catalog_rows),
+                "product_quality_snapshot": len(compat_stub.catalog_rows),
+            },
+        }
+
+    monkeypatch.setattr(
+        merchant_audit_routes, "assess_merchant_audit_readiness", _audit_ready,
+    )
+
     # Tighten the poll budget so tests don't wait 30s for in-flight
     # cases. 0.5s budget + 0.05s interval ≈ 10 iterations max.
     monkeypatch.setattr(
@@ -260,6 +274,50 @@ def test_async_pipeline_idempotent_replay_doesnt_enqueue(
     assert body["audit_run_id"] == "run-already-running"
     # No new enqueue happened.
     assert compat_stub.enqueued == []
+
+
+def test_async_pipeline_readiness_gate_blocks_before_enqueue(
+    client,
+    compat_stub,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The legacy async-compat arm must not bypass audit readiness and enqueue
+    a run that will render a false all-blocked first audit."""
+    from routes import merchant_audit_routes
+
+    compat_stub.catalog_rows = [_catalog_row("sp-1", "pk-1"),
+                                _catalog_row("sp-2", "pk-2")]
+
+    async def _not_ready(_merchant_id: str, platform: str):
+        return {
+            "ready": False,
+            "blocking_gaps": [
+                "product_quality_snapshot missing content_quality_score"
+            ],
+            "counts": {
+                "catalog_products": 2,
+                "product_quality_snapshot": 0,
+            },
+            "platform": platform,
+        }
+
+    monkeypatch.setattr(
+        merchant_audit_routes, "assess_merchant_audit_readiness", _not_ready,
+    )
+
+    res = client.post(
+        "/api/merchant-center/audit/ai-commerce-readiness?via=async_pipeline",
+        json=_request_body(),
+    )
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["code"] == "merchant_not_audit_ready"
+    assert detail["platform"] == "shopify"
+    assert "product_quality_snapshot" in str(detail["blocking_gaps"])
+    assert compat_stub.idem_lookups == []
+    assert compat_stub.enqueued == []
+    assert compat_stub.fetch_calls == []
 
 
 def test_async_pipeline_404_for_missing_products(client, compat_stub):

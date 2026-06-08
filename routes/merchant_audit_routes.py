@@ -40,6 +40,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -71,6 +72,7 @@ from services.agent_center_bd_report_service import (
 )
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
+from services.merchant_audit_readiness import assess_merchant_audit_readiness
 from utils.auth import get_current_merchant
 from utils.logger import logger
 
@@ -258,6 +260,51 @@ class MerchantSelfAuditRequest(BaseModel):
     max_runs: int = Field(3, ge=1, le=5)
 
 
+def _dominant_platform_from_catalog_rows(rows: List[Any]) -> str:
+    platforms = []
+    for row in rows or []:
+        try:
+            platform = str(row["platform"] or "").strip()
+        except (KeyError, TypeError):
+            platform = ""
+        if platform:
+            platforms.append(platform)
+    if not platforms:
+        return "shopify"
+    return Counter(platforms).most_common(1)[0][0]
+
+
+async def _enforce_legacy_audit_readiness(
+    *, merchant_id: str, product_rows: List[Any],
+) -> None:
+    """Block legacy merchant audits until the same readiness deps are present.
+
+    The canonical async POST /api/audits already has this gate. This legacy
+    endpoint has two launch arms that must also fail closed so older clients
+    cannot produce the false all-blocked first audit the readiness probe exists
+    to prevent.
+    """
+    platform = _dominant_platform_from_catalog_rows(product_rows)
+    readiness = await assess_merchant_audit_readiness(merchant_id, platform)
+    if readiness.get("ready"):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "merchant_not_audit_ready",
+            "message": (
+                "Your catalog is still being prepared for audit (content "
+                "quality backfill in progress). This usually completes within "
+                "1-2 minutes of a product sync - please try again shortly."
+            ),
+            "blocking_gaps": readiness.get("blocking_gaps") or [],
+            "counts": readiness.get("counts") or {},
+            "platform": platform,
+            "retry_after_seconds": 60,
+        },
+    )
+
+
 class ApmConfigureRequest(BaseModel):
     enabled: bool
     cadence_days: int
@@ -342,6 +389,11 @@ async def _run_async_pipeline_compat(
             },
         )
     product_keys = [r["product_key"] for r in rows]
+
+    await _enforce_legacy_audit_readiness(
+        merchant_id=merchant_id,
+        product_rows=rows,
+    )
 
     # Idempotency: if an in-flight run exists for the same
     # (merchant, product_keys, window) tuple, return its run_id
@@ -546,6 +598,11 @@ async def run_merchant_self_audit(
                 "missing_products": missing,
             },
         )
+
+    await _enforce_legacy_audit_readiness(
+        merchant_id=merchant_id,
+        product_rows=rows,
+    )
 
     # 2. Resolve merchant display name + domain for the report header.
     #    The store_url also drives canonical_url derivation below.
