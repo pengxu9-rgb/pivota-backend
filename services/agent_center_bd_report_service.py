@@ -5835,6 +5835,23 @@ def _lane_priority_output_fields(row: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _demand_label(signal: Any) -> Optional[str]:
+    """Coarse merchant-facing demand strength from the per-lane demand_signal
+    (0-1). None when there's no signal, so the UI shows nothing rather than a
+    fabricated level."""
+    try:
+        value = float(signal)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    if value >= 0.7:
+        return "high"
+    if value >= 0.4:
+        return "moderate"
+    return "low"
+
+
 def _trim_sku_intelligence_prompt(
     row: Mapping[str, Any], merchant_host: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -5855,6 +5872,9 @@ def _trim_sku_intelligence_prompt(
         "cited_evidence": row.get("cited_evidence"),
         "source_route": row.get("source_route"),
         "demand_signal": row.get("demand_signal"),
+        # Coarse, merchant-facing demand strength so "AI shows demand" is
+        # qualified per lane (the raw demand_signal stays for tooling).
+        "demand_label": _demand_label(row.get("demand_signal")),
         "attribute_basis": row.get("attribute_basis"),
         "opportunity_score": row.get("opportunity_score"),
         **_lane_priority_output_fields(row),

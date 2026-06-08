@@ -794,3 +794,19 @@ def test_sku_intelligence_ownist_live_like_sparse_product_prefers_vitamin_c_lane
     assert buyer_path["primary_lane"] == "vitamin c collagen jelly"
     assert buyer_path["state"] == "fragmented_source_trail"
     assert buyer_path["top_controllers"] == []
+
+
+def test_demand_label_bands_and_absence():
+    """Per-lane demand_signal becomes a coarse merchant-facing label; None when
+    there is no signal (UI shows nothing rather than a fabricated level)."""
+    from services.agent_center_bd_report_service import _demand_label, _trim_sku_intelligence_prompt
+    assert _demand_label(1.0) == "high"
+    assert _demand_label(0.7) == "high"
+    assert _demand_label(0.5) == "moderate"
+    assert _demand_label(0.2) == "low"
+    assert _demand_label(0.0) is None
+    assert _demand_label(None) is None
+    assert _demand_label("x") is None
+    trimmed = _trim_sku_intelligence_prompt({"query": "q", "demand_signal": 0.8})
+    assert trimmed["demand_label"] == "high"
+    assert trimmed["demand_signal"] == 0.8
