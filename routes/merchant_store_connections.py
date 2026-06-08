@@ -47,6 +47,7 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
 
 _STOREFRONT_AUTO_CREATE_DENIED_UNTIL: Dict[str, float] = {}
 _STOREFRONT_AUTO_CREATE_DENIED_TTL_SECONDS = 24 * 3600
+_MARKETPLACE_INSTALL_SUCCESS_PATH = "/dashboard/integrations"
 
 
 class ConnectShopifyRequest(BaseModel):
@@ -230,6 +231,237 @@ def _shopify_webhook_callback_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+def _marketplace_merchant_id(platform: str, identity: str) -> str:
+    digest = hashlib.sha256(f"{platform}:{identity}".encode("utf-8")).hexdigest()[:20]
+    return f"merch_{platform}_{digest}"
+
+
+def _append_query_params(url: str, params: Dict[str, Any]) -> str:
+    clean_params = {
+        key: value
+        for key, value in params.items()
+        if value is not None and str(value).strip() != ""
+    }
+    if not clean_params:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{urlencode(clean_params)}"
+
+
+def _marketplace_install_success_url(platform: str) -> str:
+    platform_key = platform.strip().upper()
+    env_url = (
+        os.getenv(f"{platform_key}_POST_INSTALL_REDIRECT_URL")
+        or os.getenv("MARKETPLACE_POST_INSTALL_REDIRECT_URL")
+        or ""
+    ).strip()
+    if env_url:
+        return env_url
+    return f"{settings.merchant_portal_base_url.rstrip('/')}{_MARKETPLACE_INSTALL_SUCCESS_PATH}"
+
+
+async def _ensure_shopify_oauth_tables() -> None:
+    """
+    Best-effort DDL so app-store install routes work in environments where
+    lightweight startup tasks have not created the OAuth state tables yet.
+    """
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopify_oauth_states (
+                state_sha256 VARCHAR(64) PRIMARY KEY,
+                merchant_id VARCHAR(50) NOT NULL,
+                shop_domain VARCHAR(255) NOT NULL,
+                install_source VARCHAR(50),
+                return_to TEXT,
+                host TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                used_at TIMESTAMP WITH TIME ZONE
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopify_install_tokens (
+                jti_sha256 VARCHAR(64) PRIMARY KEY,
+                merchant_id VARCHAR(50) NOT NULL,
+                shop_domain VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                used_at TIMESTAMP WITH TIME ZONE,
+                used_request_id TEXT
+            )
+            """
+        )
+    except Exception:
+        logger.warning("Shopify OAuth table bootstrap failed", exc_info=True)
+        return
+
+    for ddl in (
+        "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS install_source VARCHAR(50)",
+        "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS return_to TEXT",
+        "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS host TEXT",
+    ):
+        try:
+            await database.execute(ddl)
+        except Exception:
+            # Some local SQLite versions do not support ADD COLUMN IF NOT EXISTS.
+            # Existing deployments with the old schema can still use the legacy JSON callback.
+            logger.debug("Shopify OAuth state schema extension skipped: %s", ddl, exc_info=True)
+
+
+async def _insert_shopify_oauth_state(
+    *,
+    state_sha256: str,
+    merchant_id: str,
+    shop_domain: str,
+    expires_at: datetime,
+    install_source: Optional[str] = None,
+    return_to: Optional[str] = None,
+    host: Optional[str] = None,
+) -> None:
+    await _ensure_shopify_oauth_tables()
+    try:
+        await database.execute(
+            """
+            INSERT INTO shopify_oauth_states
+              (state_sha256, merchant_id, shop_domain, expires_at, install_source, return_to, host)
+            VALUES
+              (:state_sha256, :merchant_id, :shop_domain, :expires_at, :install_source, :return_to, :host)
+            """,
+            {
+                "state_sha256": state_sha256,
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "expires_at": expires_at,
+                "install_source": install_source,
+                "return_to": return_to,
+                "host": host,
+            },
+        )
+    except Exception:
+        logger.warning("Shopify OAuth state insert fell back to legacy schema", exc_info=True)
+        await database.execute(
+            """
+            INSERT INTO shopify_oauth_states (state_sha256, merchant_id, shop_domain, expires_at)
+            VALUES (:state_sha256, :merchant_id, :shop_domain, :expires_at)
+            """,
+            {
+                "state_sha256": state_sha256,
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "expires_at": expires_at,
+            },
+        )
+
+
+async def _lookup_shopify_marketplace_merchant(domain: str) -> Optional[str]:
+    try:
+        store_row = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_stores
+            WHERE platform = 'shopify'
+              AND lower(domain) = :domain
+            ORDER BY connected_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {"domain": domain.lower()},
+        )
+        if store_row and store_row.get("merchant_id"):
+            return str(store_row["merchant_id"])
+    except Exception:
+        logger.debug("Shopify marketplace merchant store lookup failed domain=%s", domain, exc_info=True)
+
+    try:
+        onboarding_row = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_onboarding
+            WHERE lower(coalesce(mcp_shop_domain, '')) = :domain
+               OR lower(coalesce(store_url, '')) IN (:domain, :https_domain)
+               OR lower(coalesce(website, '')) IN (:domain, :https_domain)
+            ORDER BY created_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {
+                "domain": domain.lower(),
+                "https_domain": f"https://{domain.lower()}",
+            },
+        )
+        if onboarding_row and onboarding_row.get("merchant_id"):
+            return str(onboarding_row["merchant_id"])
+    except Exception:
+        logger.debug("Shopify marketplace onboarding lookup failed domain=%s", domain, exc_info=True)
+
+    return None
+
+
+async def _ensure_shopify_marketplace_shell_merchant(domain: str) -> str:
+    existing_merchant_id = await _lookup_shopify_marketplace_merchant(domain)
+    if existing_merchant_id:
+        return existing_merchant_id
+
+    merchant_id = _marketplace_merchant_id("shopify", domain)
+    digest = hashlib.sha256(f"shopify:{domain}".encode("utf-8")).hexdigest()[:12]
+    await database.execute(
+        """
+        INSERT INTO merchant_onboarding (
+            merchant_id,
+            business_name,
+            store_url,
+            website,
+            region,
+            contact_email,
+            auto_approved,
+            approval_confidence,
+            status,
+            mcp_connected,
+            mcp_platform,
+            mcp_shop_domain,
+            apm_enabled,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            :merchant_id,
+            :business_name,
+            :store_url,
+            :website,
+            'shopify',
+            :contact_email,
+            FALSE,
+            0.0,
+            'pending_verification',
+            TRUE,
+            'shopify',
+            :domain,
+            FALSE,
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (merchant_id) DO UPDATE
+        SET business_name = COALESCE(merchant_onboarding.business_name, EXCLUDED.business_name),
+            store_url = EXCLUDED.store_url,
+            website = EXCLUDED.website,
+            mcp_connected = TRUE,
+            mcp_platform = EXCLUDED.mcp_platform,
+            mcp_shop_domain = EXCLUDED.mcp_shop_domain,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        {
+            "merchant_id": merchant_id,
+            "business_name": f"Shopify Store {domain}",
+            "store_url": f"https://{domain}",
+            "website": f"https://{domain}",
+            "contact_email": f"shopify-install+{digest}@pivota.invalid",
+            "domain": domain,
+        },
+    )
+    return merchant_id
+
+
 async def _upsert_shopify_store_credentials(
     *,
     merchant_id: str,
@@ -238,6 +470,7 @@ async def _upsert_shopify_store_credentials(
     access_token: str,
     storefront_token: Optional[str],
     webhook_secret: Optional[str] = None,
+    install_source: Optional[str] = None,
 ) -> str:
     existing = await database.fetch_one(
         """
@@ -264,6 +497,8 @@ async def _upsert_shopify_store_credentials(
         token_blob["webhook_secret"] = webhook_secret
     if storefront_token:
         token_blob["storefront_access_token"] = storefront_token
+    if install_source:
+        token_blob["install_source"] = install_source
     # Preserve prior storefront token if we didn't re-create one.
     if not token_blob.get("storefront_access_token"):
         stored = (
@@ -346,34 +581,12 @@ async def shopify_oauth_start(
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
 
-    # Best-effort: ensure table exists (for local/dev environments that skipped startup tasks).
-    try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS shopify_oauth_states (
-                state_sha256 VARCHAR(64) PRIMARY KEY,
-                merchant_id VARCHAR(50) NOT NULL,
-                shop_domain VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                used_at TIMESTAMP WITH TIME ZONE
-            )
-            """
-        )
-    except Exception:
-        pass
-
-    await database.execute(
-        """
-        INSERT INTO shopify_oauth_states (state_sha256, merchant_id, shop_domain, expires_at)
-        VALUES (:state_sha256, :merchant_id, :shop_domain, :expires_at)
-        """,
-        {
-            "state_sha256": state_sha,
-            "merchant_id": target_merchant_id,
-            "shop_domain": shop_domain,
-            "expires_at": expires_at,
-        },
+    await _insert_shopify_oauth_state(
+        state_sha256=state_sha,
+        merchant_id=target_merchant_id,
+        shop_domain=shop_domain,
+        expires_at=expires_at,
+        install_source="merchant_portal",
     )
 
     url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
@@ -436,23 +649,7 @@ async def create_shopify_install_link(
     }
     token = _sign_install_token(payload)
 
-    # Ensure table exists (for dev environments).
-    try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS shopify_install_tokens (
-                jti_sha256 VARCHAR(64) PRIMARY KEY,
-                merchant_id VARCHAR(50) NOT NULL,
-                shop_domain VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                used_at TIMESTAMP WITH TIME ZONE,
-                used_request_id TEXT
-            )
-            """
-        )
-    except Exception:
-        pass
+    await _ensure_shopify_oauth_tables()
 
     await database.execute(
         """
@@ -543,17 +740,12 @@ async def shopify_oauth_start_public(
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
 
-    await database.execute(
-        """
-        INSERT INTO shopify_oauth_states (state_sha256, merchant_id, shop_domain, expires_at)
-        VALUES (:state_sha256, :merchant_id, :shop_domain, :expires_at)
-        """,
-        {
-            "state_sha256": state_sha,
-            "merchant_id": merchant_id,
-            "shop_domain": shop_domain,
-            "expires_at": expires_at,
-        },
+    await _insert_shopify_oauth_state(
+        state_sha256=state_sha,
+        merchant_id=merchant_id,
+        shop_domain=shop_domain,
+        expires_at=expires_at,
+        install_source="public_install_link",
     )
 
     url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
@@ -566,6 +758,54 @@ async def shopify_oauth_start_public(
         "authorization_url": url,
         "state_sha256_prefix": state_sha[:10],
         "expires_in_seconds": _SHOPIFY_OAUTH_STATE_TTL_SECONDS,
+    }
+
+
+@router.get("/shopify/app")
+@router.get("/shopify/install")
+async def shopify_app_store_install(
+    request: Request,
+    shop: str = Query(..., description="Shop domain provided by Shopify, e.g. your-shop.myshopify.com"),
+    host: Optional[str] = Query(None),
+    embedded: Optional[str] = Query(None),
+    redirect: bool = Query(True, description="If true, 302 redirect to Shopify OAuth"),
+):
+    """
+    Public Shopify App Store entrypoint.
+    Shopify calls this without a Pivota JWT, so we bind OAuth state to an
+    existing merchant for that shop when present or create a shell merchant.
+    """
+    shop_domain = _validate_myshopify_domain(shop)
+    merchant_id = await _ensure_shopify_marketplace_shell_merchant(shop_domain)
+
+    state = secrets.token_urlsafe(32)
+    state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
+    return_to = _marketplace_install_success_url("shopify")
+
+    await _insert_shopify_oauth_state(
+        state_sha256=state_sha,
+        merchant_id=merchant_id,
+        shop_domain=shop_domain,
+        expires_at=expires_at,
+        install_source="app_store",
+        return_to=return_to,
+        host=host,
+    )
+
+    url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
+    if redirect:
+        return RedirectResponse(url=url, status_code=302)
+    return {
+        "status": "success",
+        "merchant_id": merchant_id,
+        "shop_domain": shop_domain,
+        "install_source": "app_store",
+        "authorization_url": url,
+        "state_sha256_prefix": state_sha[:10],
+        "expires_in_seconds": _SHOPIFY_OAUTH_STATE_TTL_SECONDS,
+        "host_present": bool(host),
+        "embedded": embedded,
     }
 
 
@@ -584,15 +824,27 @@ async def shopify_oauth_callback(request: Request):
     if not _shopify_oauth_verify_hmac(request=request, secret=app_secret):
         raise HTTPException(status_code=401, detail="Invalid Shopify OAuth signature")
 
+    await _ensure_shopify_oauth_tables()
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
-    state_row = await database.fetch_one(
-        """
-        SELECT merchant_id, shop_domain, expires_at, used_at
-        FROM shopify_oauth_states
-        WHERE state_sha256 = :state_sha256
-        """,
-        {"state_sha256": state_sha},
-    )
+    try:
+        state_row = await database.fetch_one(
+            """
+            SELECT merchant_id, shop_domain, expires_at, used_at, install_source, return_to, host
+            FROM shopify_oauth_states
+            WHERE state_sha256 = :state_sha256
+            """,
+            {"state_sha256": state_sha},
+        )
+    except Exception:
+        logger.warning("Shopify OAuth state lookup fell back to legacy schema", exc_info=True)
+        state_row = await database.fetch_one(
+            """
+            SELECT merchant_id, shop_domain, expires_at, used_at
+            FROM shopify_oauth_states
+            WHERE state_sha256 = :state_sha256
+            """,
+            {"state_sha256": state_sha},
+        )
     if not state_row:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_not_found)")
     state_row = dict(state_row)
@@ -604,6 +856,8 @@ async def shopify_oauth_callback(request: Request):
 
     merchant_id = str(state_row["merchant_id"])
     stored_shop_domain = (state_row.get("shop_domain") or "").strip().lower()
+    install_source = (state_row.get("install_source") or "").strip()
+    return_to = (state_row.get("return_to") or "").strip()
 
     token_url = f"https://{shop_domain}/admin/oauth/access_token"
     token_payload = {
@@ -667,6 +921,7 @@ async def shopify_oauth_callback(request: Request):
         shop_name=shop_name,
         access_token=access_token,
         storefront_token=storefront_token,
+        install_source=install_source or None,
     )
 
     # Register required webhooks right after OAuth.
@@ -694,7 +949,7 @@ async def shopify_oauth_callback(request: Request):
         webhooks_report = {"attempted": True, "error": "webhook_registration_failed"}
 
     access_token_fp = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:10]
-    return {
+    payload = {
         "status": "success",
         "merchant_id": merchant_id,
         "shop_domain": canonical_myshopify_domain,
@@ -703,6 +958,20 @@ async def shopify_oauth_callback(request: Request):
         "storefront_token_present": bool(storefront_token),
         "webhooks": webhooks_report,
     }
+    if install_source == "app_store":
+        return RedirectResponse(
+            url=_append_query_params(
+                return_to or _marketplace_install_success_url("shopify"),
+                {
+                    "installed": "shopify",
+                    "shop": canonical_myshopify_domain,
+                    "store_id": store_id,
+                    "status": "success",
+                },
+            ),
+            status_code=302,
+        )
+    return payload
 
 
 class ShopifySyncRequest(BaseModel):
