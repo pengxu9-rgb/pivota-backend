@@ -23,8 +23,11 @@ plus cross-field numeric consistency.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Shared host normalizer + redirector set — import the SAME ones the audit
 # pipeline scores with so this layer can't disagree on host identity.
@@ -378,6 +381,114 @@ _INVARIANTS = (
     _inv_self_substitution,
     _inv_strong_but_unowned,
 )
+
+
+# ---------------------------------------------------------------------------
+# Runtime adapter — log + degrade (NOT scrub). Founder-locked: a critical
+# violation withholds the contradicted surface (honest fallback) and ships the
+# rest, plus a high-severity alertable log. Mutates the payload in place.
+# ---------------------------------------------------------------------------
+def _degrade_brand_buyer_path(payload: MutableMapping[str, Any]) -> None:
+    agg = _get(payload, "brand_report", "aggregate")
+    if not isinstance(agg, MutableMapping):
+        return
+    prior = agg.get("buyer_path_verdict") if isinstance(agg.get("buyer_path_verdict"), Mapping) else {}
+    agg["buyer_path_verdict"] = {
+        "state": "not_measured",
+        "label_display": "Buyer path not confirmed",
+        "explanation": ("We could not confirm the buyer-path controllers for this "
+                        "audit, so this section is withheld."),
+        "prompt_count": prior.get("prompt_count"),
+        "merchant_owned_count": None,
+        "third_party_controlled_count": None,
+        "primary_lane": None,
+        "top_controllers": [],
+        "quality_gate": {"shareable": False, "reason": "invariant_violation"},
+    }
+
+
+def _suppress_money_shot(payload: MutableMapping[str, Any]) -> None:
+    sku = payload.get("sku_intelligence")
+    if isinstance(sku, MutableMapping):
+        sku["headline"] = None
+
+
+def _degrade_sku_intelligence(payload: MutableMapping[str, Any], codes: Sequence[str]) -> None:
+    existing = payload.get("sku_intelligence")
+    hero = existing.get("hero_sku") if isinstance(existing, Mapping) else None
+    payload["sku_intelligence"] = {
+        "hero_sku": hero or {"title": None, "pdp_url": None, "vendor": None},
+        "headline": None,
+        "intent_ladder": {},
+        "top_open_lanes": [],
+        "prompt_matrix": [],
+        "substitution_alert": {"present": False},
+        "demand_state_summary": None,
+        "coverage": {},
+        "next_best_action": None,
+        "is_empty": True,
+        "quality_gate": {
+            "shareable": False,
+            "reason": "invariant_violation",
+            "violations": list(codes),
+            "merchant_copy_allowed": False,
+        },
+    }
+
+
+def _degrade_strategic_brief(payload: MutableMapping[str, Any]) -> None:
+    nba = _get(payload, "sku_intelligence", "next_best_action")
+    if isinstance(nba, MutableMapping) and "strategic_brief" in nba:
+        nba["strategic_brief"] = None
+
+
+def enforce_audit_invariants(
+    payload: MutableMapping[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    merchant_id: Optional[str] = None,
+    identity: Optional[MerchantIdentity] = None,
+) -> InvariantReport:
+    """Runtime gate. Logs every violation (criticals at ERROR — alertable) and,
+    for each surface with a CRITICAL, degrades that surface to an honest fallback
+    in place (withhold, never scrub-and-ship). Returns the report. Never raises."""
+    if not isinstance(payload, MutableMapping):
+        return InvariantReport(())
+    report = check_audit_invariants(payload, identity)
+    if not report.violations:
+        return report
+
+    base = {"run_id": run_id, "merchant_id": merchant_id}
+    for v in report.warnings():
+        logger.warning(
+            "AUDIT_INVARIANT_WARN code=%s surface=%s msg=%s", v.code, v.surface, v.message,
+            extra={"audit_invariant": {**base, "code": v.code, "surface": v.surface,
+                                       "severity": v.severity, "evidence": v.evidence}},
+        )
+    criticals = report.critical()
+    for v in criticals:
+        logger.error(
+            "AUDIT_INVARIANT_CRITICAL code=%s surface=%s run_id=%s msg=%s",
+            v.code, v.surface, run_id, v.message,
+            extra={"audit_invariant": {**base, "code": v.code, "surface": v.surface,
+                                       "severity": v.severity, "evidence": v.evidence}},
+        )
+    if not criticals:
+        return report
+
+    surfaces = {v.surface for v in criticals}
+    codes = sorted({v.code for v in criticals})
+    try:
+        if SURFACE_BRAND in surfaces:
+            _degrade_brand_buyer_path(payload)
+            _suppress_money_shot(payload)  # money-shot is derived from the buyer path
+        if SURFACE_SKU in surfaces:
+            _degrade_sku_intelligence(payload, codes)
+        if SURFACE_BRIEF in surfaces:
+            _degrade_strategic_brief(payload)
+    except Exception as exc:  # noqa: BLE001 — degrade must never crash the audit
+        logger.error("AUDIT_INVARIANT_DEGRADE_FAILED run_id=%s err=%s", run_id, exc)
+    return report
 
 
 def check_audit_invariants(

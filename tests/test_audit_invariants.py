@@ -7,6 +7,7 @@ import pytest
 
 from services.audit_invariants import (
     check_audit_invariants,
+    enforce_audit_invariants,
     resolve_merchant_identity,
     MerchantIdentity,
     SEVERITY_CRITICAL,
@@ -199,6 +200,65 @@ def test_missing_surfaces_never_crash():
                     {"brand_report": {"aggregate": {}}}):
         report = check_audit_invariants(payload)
         assert "INVARIANT_INTERNAL_ERROR" not in _codes(report)
+
+
+# --- runtime adapter (enforce) -------------------------------------------
+def test_enforce_clean_payload_is_untouched():
+    payload = _base_payload()
+    before = json.dumps(payload, sort_keys=True)
+    report = enforce_audit_invariants(payload, run_id="r", merchant_id="m")
+    assert report.critical() == ()
+    assert json.dumps(payload, sort_keys=True) == before
+
+
+def test_enforce_brand_critical_degrades_buyer_path_and_money_shot():
+    payload = _base_payload(owned=0, state="third_party_controlled",
+                            controllers=["iherb.com", "bblab.shop"])
+    payload["sku_intelligence"]["headline"] = "You lost `best collagen`…"
+    report = enforce_audit_invariants(payload)
+    assert "OWN_HOST_AS_CONTROLLER" in [v.code for v in report.critical()]
+    bpv = payload["brand_report"]["aggregate"]["buyer_path_verdict"]
+    assert bpv["state"] == "not_measured"
+    assert bpv["top_controllers"] == []
+    assert bpv["merchant_owned_count"] is None
+    # money-shot derived from the buyer path is suppressed
+    assert payload["sku_intelligence"]["headline"] is None
+
+
+def test_enforce_sku_critical_degrades_sku_intelligence():
+    payload = _base_payload()
+    payload["sku_intelligence"]["prompt_matrix"] = [{
+        "query": "halal korean collagen sticks",
+        "buyer_path_action": {"controllers": ["m.stylekorean.com", "bblab.shop"]},
+    }]
+    payload["sku_intelligence"]["headline"] = "money shot"
+    enforce_audit_invariants(payload)
+    sku = payload["sku_intelligence"]
+    assert sku["is_empty"] is True
+    assert sku["headline"] is None
+    assert sku["prompt_matrix"] == []
+    assert sku["quality_gate"]["shareable"] is False
+    assert "OWN_HOST_AS_COMPETITOR_SKU" in sku["quality_gate"]["violations"]
+    # hero context preserved for an honest empty state
+    assert "hero_sku" in sku
+
+
+def test_enforce_brief_critical_nulls_brief_only():
+    payload = _base_payload()
+    payload["sku_intelligence"]["next_best_action"] = {
+        "headline": "do this",
+        "strategic_brief": {"grounding_notes": {
+            "competitor_attributes": {"status": "assessed", "competitor": "bblab.shop"}}},
+    }
+    enforce_audit_invariants(payload)
+    nba = payload["sku_intelligence"]["next_best_action"]
+    assert nba["strategic_brief"] is None
+    assert nba["headline"] == "do this"  # the deterministic NBA stays
+
+
+def test_enforce_never_raises_on_garbage():
+    for bad in (None, {}, {"brand_report": 5}, {"sku_intelligence": []}):
+        enforce_audit_invariants(bad)  # must not raise
 
 
 # --- real-artifact characterization --------------------------------------

@@ -1469,6 +1469,14 @@ async def _run_wedge_audit_background(
         "sku_intelligence": sku_intelligence,
         **base_payload,
     }
+    # Layer 1 output-quality gate: fail loud on statable contradictions (e.g. the
+    # merchant's own host as a controller) — log + degrade the affected surface to
+    # an honest fallback before the report is ever persisted/shown. Never raises.
+    try:
+        from services.audit_invariants import enforce_audit_invariants
+        enforce_audit_invariants(full_payload, run_id=run_id, merchant_id=merchant_id)
+    except Exception as exc:  # noqa: BLE001 — the gate must not crash the audit runner
+        logger.warning("audit invariant gate skipped: %s", exc)
     await record_audit_run_completed(
         run_id=run_id, status="succeeded",
         verdict_labels=[v for v in verdict_labels if v],
