@@ -1277,6 +1277,19 @@ async def _record_final_report_fields(
     + report_jsonb so dual-key consumers see a populated row even
     before they migrate to the new fetch shape. Best-effort."""
     try:
+        # Layer 1 output-quality gate before the report is persisted. The
+        # canonical per-SKU report does not currently carry the wedge's
+        # aggregate.buyer_path_verdict / sku_intelligence surfaces, so this is a
+        # safe no-op today that activates (degrade + alert) the moment a
+        # controller/ownership surface is added to this path. Never raises.
+        try:
+            from services.audit_invariants import enforce_audit_invariants
+            enforce_audit_invariants({"brand_report": brand_report}, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 — gate must not block persistence
+            logger.warning(
+                "audit_run_worker: invariant gate skipped for run_id=%s: %s",
+                run_id, exc,
+            )
         from db.merchant_audit_runs import record_audit_run_completed
         aggregate = brand_report.get("aggregate") or {}
         per_product = brand_report.get("per_product") or []

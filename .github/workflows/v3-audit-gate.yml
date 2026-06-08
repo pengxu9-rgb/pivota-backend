@@ -29,6 +29,10 @@ on:
       - "db/merchant_audit_runs.py"
       - "routes/merchant_audit_routes.py"
       - "services/bd_cold_start_service.py"
+      - "services/sku_opportunity.py"
+      - "services/buyer_path_stable_controllers.py"
+      - "services/audit_invariants.py"
+      - "services/audit_review_gate.py"
       - "db/llm_probe_runs.py"
       - "tests/integration/test_audit_v3_end_to_end.py"
       - "tests/services/test_agent_center_bd_per_sku.py"
@@ -50,6 +54,8 @@ on:
       - "tests/services/test_brand_alias.py"
       - "tests/services/test_audit_v3_brand_alias.py"
       - "tests/services/test_audit_v3_product_concurrency.py"
+      - "tests/test_audit_invariants.py"
+      - "tests/test_audit_review_gate.py"
       - ".github/workflows/v3-audit-gate.yml"
 
 jobs:
@@ -102,4 +108,6 @@ jobs:
             tests/services/test_audit_v3_brand_alias.py \
             tests/services/test_audit_v3_product_concurrency.py \
             tests/services/test_audit_v3_sku_ref_resolution.py \
-            tests/services/test_audit_v3_readiness_gate.py
+            tests/services/test_audit_v3_readiness_gate.py \
+            tests/test_audit_invariants.py \
+            tests/test_audit_review_gate.py
