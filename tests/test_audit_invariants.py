@@ -205,23 +205,62 @@ def test_missing_surfaces_never_crash():
 _ARTIFACT = Path.home() / "dev/Markato/p0_verify_bblab.json"
 
 
+def _replay_sku_intelligence(artifact):
+    """Re-score the saved live probe runs through the CURRENT pipeline (no keys,
+    no network) so the golden reflects today's code, not a stale snapshot."""
+    import asyncio
+    import services.agent_center_bd_report_service as bd
+
+    data = json.loads(artifact.read_text())
+    per_q = {}
+    for rec in (data.get("raw_probe_runs") or []):
+        for rr in ((rec.get("response") or {}).get("raw_runs") or []):
+            if isinstance(rr, dict) and rr.get("query"):
+                per_q.setdefault((rec.get("provider"), rr["query"]), rr)
+    if not per_q:
+        return None
+
+    async def _mock_probe(**kwargs):
+        prov = kwargs.get("provider")
+        ctx = kwargs.get("context") if isinstance(kwargs.get("context"), dict) else {}
+        runs = [per_q[(prov, q)] for q in (ctx.get("queries") or []) if (prov, q) in per_q]
+        return {"scan_mode": kwargs.get("scan_mode"), "provider": prov,
+                "runs_count": len(runs), "raw_runs": runs, "scores": {},
+                "findings": [], "model": "replay", "model_is_override": False}
+
+    original = bd.llm_client.probe
+    bd.llm_client.probe = _mock_probe
+    try:
+        product = {
+            "title": "Good Night Collagen Low-Molecular Weight Collagen",
+            "raw_title": "Good Night Collagen Low-Molecular Weight Collagen",
+            "pdp_url": "https://bblab.shop/products/good-night-collagen-low-molecular-weight-collagen-30-packages",
+            "vendor": "BB LAB", "attributes_raw": {},
+        }
+        return asyncio.new_event_loop().run_until_complete(
+            bd.run_wedge_hero_sku_intelligence(
+                hero_product=product, merchant_id="external_bd_bb_lab",
+                run_id="replay", coverage_profile="us_shopper", prompts_per_sku=14,
+            )
+        )
+    finally:
+        bd.llm_client.probe = original
+
+
 @pytest.mark.skipif(not _ARTIFACT.exists(), reason="live BB Lab artifact not present")
-def test_real_artifact_surfaces_residual_per_lane_own_host_bug():
-    """On a real (otherwise-passing) BB Lab payload, the invariant layer catches
-    residual contradictions the merchant-facing acceptance missed: the merchant's
-    own host listed as a PER-LANE controller (the aggregate top_controllers
-    excludes it, but buyer_path_action.controllers does not) and a product title
-    leaked into who_owns. This characterization pins those known findings; once
-    the per-lane controller/who_owns fix lands they should drop to zero and this
-    test gets updated to assert clean."""
-    payload = json.loads(_ARTIFACT.read_text())
+def test_real_data_replay_has_no_per_lane_own_host_leak():
+    """Golden on REAL probe data, re-scored through the current pipeline: the
+    per-lane controller/who_owns fix must leave the merchant's own host and
+    product title out of every controller/owner surface, so the invariant layer
+    reports no own-host/non-host criticals in sku_intelligence."""
+    sku = _replay_sku_intelligence(_ARTIFACT)
+    if sku is None:
+        pytest.skip("artifact has no raw_probe_runs to replay")
+    payload = {
+        "audited_url": "https://bblab.shop/products/good-night-collagen",
+        "sku_intelligence": sku,
+    }
     report = check_audit_invariants(payload)
-    codes = set(_critical_codes(report))
-    # The aggregate top_controllers is clean (own host excluded by #771)...
-    assert not any(
-        v.surface == "brand_report" and v.code == "OWN_HOST_AS_CONTROLLER"
-        for v in report.critical()
-    )
-    # ...but the per-lane controllers / who_owns still leak the merchant.
-    assert "OWN_HOST_AS_COMPETITOR_SKU" in codes
-    assert "REDIRECTOR_OR_NONHOST_CONTROLLER" in codes
+    sku_criticals = [v.code for v in report.critical() if v.surface == "sku_intelligence"]
+    assert "OWN_HOST_AS_COMPETITOR_SKU" not in sku_criticals
+    assert "REDIRECTOR_OR_NONHOST_CONTROLLER" not in sku_criticals

@@ -5653,26 +5653,41 @@ def _sku_intelligence_ladder_layer(row: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def _who_owns_prompt(row: Mapping[str, Any]) -> Optional[Any]:
-    if row.get("who_owns"):
-        return row.get("who_owns")
-    controllers = stable_buyer_path_controller_hosts(row)
+def _who_owns_is_first_party(value: Any, merchant_host: Optional[str]) -> bool:
+    """True when a who_owns value resolves to the merchant's own host. A
+    competitor NAME ("Vital Proteins") never resolves to a host, so it is kept;
+    only the merchant's own domain is dropped."""
+    if not merchant_host:
+        return False
+    host = normalize_host(value) if isinstance(value, str) else None
+    if not host:
+        return False
+    return host == merchant_host or host.endswith("." + merchant_host)
+
+
+def _who_owns_prompt(row: Mapping[str, Any], merchant_host: Optional[str] = None) -> Optional[Any]:
+    who = row.get("who_owns")
+    if who and not _who_owns_is_first_party(who, merchant_host):
+        return who
+    controllers = stable_buyer_path_controller_hosts(row, exclude_hosts=merchant_host)
     if controllers:
         return controllers[0] if len(controllers) == 1 else controllers
     return None
 
 
-def _prompt_sources(row: Mapping[str, Any]) -> List[Any]:
-    return stable_buyer_path_controllers_for_row(row)[:3]
+def _prompt_sources(row: Mapping[str, Any], merchant_host: Optional[str] = None) -> List[Any]:
+    return stable_buyer_path_controllers_for_row(row, exclude_hosts=merchant_host)[:3]
 
 
-def _sku_intelligence_buyer_path_action(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _sku_intelligence_buyer_path_action(
+    row: Mapping[str, Any], merchant_host: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     if not is_third_party_controlled_lane(row):
         return None
     if not has_lane_demand(row):
         return None
     query = str(row.get("query") or "").strip()
-    sources = _prompt_sources(row)
+    sources = _prompt_sources(row, merchant_host)
     hosts = [
         str(source.get("host") or "").strip()
         for source in sources
@@ -5820,7 +5835,9 @@ def _lane_priority_output_fields(row: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
+def _trim_sku_intelligence_prompt(
+    row: Mapping[str, Any], merchant_host: Optional[str] = None,
+) -> Dict[str, Any]:
     verdicts = row.get("provider_verdicts") if isinstance(row.get("provider_verdicts"), dict) else {}
     out = {
         "query": row.get("query"),
@@ -5831,15 +5848,15 @@ def _trim_sku_intelligence_prompt(row: Mapping[str, Any]) -> Dict[str, Any]:
         # are filtered upstream so this stays "absent" until the key is set.
         "chatgpt": verdicts.get("chatgpt", "absent"),
         "ownership_state": row.get("ownership_state"),
-        "who_owns": _who_owns_prompt(row),
-        "sources": _prompt_sources(row),
+        "who_owns": _who_owns_prompt(row, merchant_host),
+        "sources": _prompt_sources(row, merchant_host),
         "source_route": row.get("source_route"),
         "demand_signal": row.get("demand_signal"),
         "attribute_basis": row.get("attribute_basis"),
         "opportunity_score": row.get("opportunity_score"),
         **_lane_priority_output_fields(row),
     }
-    buyer_path_action = _sku_intelligence_buyer_path_action(row)
+    buyer_path_action = _sku_intelligence_buyer_path_action(row, merchant_host)
     if buyer_path_action:
         out["buyer_path_action"] = buyer_path_action
     return out
@@ -6428,7 +6445,7 @@ def _display_sku_intelligence(
     ]
     lanes = [dict(lane) for lane in open_lanes[:3]]
     matrix_rows = [
-        _trim_sku_intelligence_prompt(row)
+        _trim_sku_intelligence_prompt(row, merchant_host)
         for row in prioritized_per_prompt
     ]
     matrix_rows.sort(

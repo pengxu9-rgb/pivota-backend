@@ -755,6 +755,77 @@ def test_category_lane_with_merchant_cited_stays_third_party():
     assert row["ownership_state"] != "merchant-owned"
 
 
+def test_is_merchant_self_recognizes_own_product_not_competitor():
+    """Bug (b) root: the merchant's own product line must never be mined as a
+    competitor (which then surfaced as who_owns)."""
+    from services.sku_opportunity import _is_merchant_self
+    title = "Good Night Collagen Low-Molecular Weight Collagen"
+    assert _is_merchant_self(
+        "Good Night Collagen (Low-Molecular Weight Collagen) Halal 30 sticks",
+        merchant_brand="BB LAB", merchant_title=title) is True
+    assert _is_merchant_self("BB Lab", merchant_brand="BB LAB", merchant_title=title) is True
+    # a real competitor sharing only the generic 'collagen' token is NOT self
+    assert _is_merchant_self(
+        "Vital Proteins Collagen Peptides", merchant_brand="BB LAB",
+        merchant_title=title) is False
+
+
+def test_per_lane_controllers_exclude_merchant_first_party_host():
+    """Bug (a): the merchant's own host is cited in a lane's sources but must NOT
+    be named as a per-lane controller (it was rendered as a 'weak citation
+    trail' against the merchant)."""
+    from services.buyer_path_stable_controllers import (
+        stable_buyer_path_controllers_for_row,
+    )
+    row = {
+        "who_owns": "yesstyle.com",
+        "source_route": "retailer",
+        "ownership_state": "retailer-owned",
+        "source_roles": [
+            {"host": "yesstyle.com", "role": "retailer", "times_cited": 2},
+            {"host": "bblab.shop", "role": "unclassified", "times_cited": 3},
+        ],
+    }
+    hosts = [c["host"] for c in
+             stable_buyer_path_controllers_for_row(row, exclude_hosts="bblab.shop")]
+    assert "bblab.shop" not in hosts
+    assert "yesstyle.com" in hosts
+    # subdomains of the merchant are excluded too; a look-alike is not
+    row["source_roles"].append({"host": "shop.bblab.shop", "times_cited": 4})
+    row["source_roles"].append({"host": "notbblab.shop", "role": "retailer", "times_cited": 2})
+    hosts2 = [c["host"] for c in
+              stable_buyer_path_controllers_for_row(row, exclude_hosts="bblab.shop")]
+    assert "shop.bblab.shop" not in hosts2
+    assert "notbblab.shop" in hosts2
+
+
+def test_merchant_own_product_does_not_become_who_owns():
+    """End-to-end (bug b): a lane whose only 'competitor' is the merchant's own
+    product must not read competitor-owned with the merchant's product title as
+    who_owns."""
+    from services.sku_opportunity import build_sku_opportunity, _merchant_host
+    from services.sku_sidewalk import build_sku_attribute_graph
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([{
+        "query": "low molecular collagen sticks",
+        "axis": "category",
+        "parsed": {
+            "product_visible": True, "correct_sku": True, "sku_mentioned": True,
+            "competitors_listed": ["BB Lab Good Night Collagen Low-Molecular Weight Collagen"],
+        },
+        "sources": [_redirector_source("bblab.shop", "bblab-pdp")],
+        "raw": "BB Lab Good Night Collagen Low-Molecular Weight Collagen.",
+    }])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["low molecular collagen sticks"]
+    who = row.get("who_owns")
+    assert who != "Good Night Collagen Low-Molecular Weight Collagen"
+    # whatever who_owns ends up, it is never the merchant's own product title
+    if isinstance(who, str):
+        assert "good night collagen" not in who.lower()
+
+
 def test_branded_lane_without_merchant_citation_not_merchant_owned():
     """Honesty guard: on a branded query where the merchant's own site is NOT
     cited, the floor must not fire (first-party present is required)."""

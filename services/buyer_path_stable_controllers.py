@@ -9,6 +9,20 @@ from typing import Any, Dict, List, Mapping, Optional
 MIN_STABLE_CONTROLLER_CITATIONS = 2
 
 
+def _excluded_hosts(exclude_hosts: Any) -> set:
+    return {h for h in (_normalize_host(x) for x in _as_list(exclude_hosts)) if h}
+
+
+def _is_excluded(host: str, excluded: set) -> bool:
+    """True if host equals or is a subdomain of any excluded (first-party) host,
+    so the merchant's own site is never named as a buyer-path controller even
+    when AI cites a subdomain (shop.bblab.shop) — without over-matching
+    notbblab.shop."""
+    if not host or not excluded:
+        return False
+    return any(host == e or host.endswith("." + e) for e in excluded)
+
+
 def stable_buyer_path_controllers(
     *,
     who_owns: Any = None,
@@ -17,14 +31,18 @@ def stable_buyer_path_controllers(
     source_route: Any = None,
     ownership_state: Any = None,
     limit: int = 3,
+    exclude_hosts: Any = None,
 ) -> List[Dict[str, Any]]:
     """Return the merchant-facing controller list.
 
     The stable signal is `who_owns` first, then repeated cited hosts only. Raw
     single-citation hosts stay available to debug views but are not named as
-    controller evidence.
+    controller evidence. `exclude_hosts` (the merchant's own first-party hosts)
+    are never named as controllers — they must not be rendered as a third-party
+    "weak citation trail" against the merchant.
     """
 
+    excluded = _excluded_hosts(exclude_hosts)
     role_by_host: Dict[str, str] = {}
     citations_by_host: Dict[str, int] = {}
     default_role = _default_role(source_route, ownership_state)
@@ -59,7 +77,7 @@ def stable_buyer_path_controllers(
     seen: set[str] = set()
 
     def add(host: str, *, role: Optional[str] = None, times_cited: Optional[int] = None) -> None:
-        if not host or host in seen or len(out) >= limit:
+        if not host or host in seen or len(out) >= limit or _is_excluded(host, excluded):
             return
         seen.add(host)
         chip: Dict[str, Any] = {"host": host}
@@ -112,6 +130,7 @@ def stable_buyer_path_controllers_for_row(
     row: Mapping[str, Any],
     *,
     limit: int = 3,
+    exclude_hosts: Any = None,
 ) -> List[Dict[str, Any]]:
     summary = row.get("source_summary") if isinstance(row.get("source_summary"), Mapping) else {}
     if "buyer_path_controllers" in summary:
@@ -120,6 +139,7 @@ def stable_buyer_path_controllers_for_row(
             source_route=row.get("source_route"),
             ownership_state=row.get("ownership_state"),
             limit=limit,
+            exclude_hosts=exclude_hosts,
         )
         if provided:
             return provided
@@ -132,6 +152,7 @@ def stable_buyer_path_controllers_for_row(
         source_route=row.get("source_route"),
         ownership_state=row.get("ownership_state"),
         limit=limit,
+        exclude_hosts=exclude_hosts,
     )
 
 
@@ -139,10 +160,12 @@ def stable_buyer_path_controller_hosts(
     row: Mapping[str, Any],
     *,
     limit: int = 3,
+    exclude_hosts: Any = None,
 ) -> List[str]:
     return [
         str(controller.get("host") or "")
-        for controller in stable_buyer_path_controllers_for_row(row, limit=limit)
+        for controller in stable_buyer_path_controllers_for_row(
+            row, limit=limit, exclude_hosts=exclude_hosts)
         if str(controller.get("host") or "")
     ]
 
@@ -153,15 +176,17 @@ def _controller_rows(
     source_route: Any,
     ownership_state: Any,
     limit: int,
+    exclude_hosts: Any = None,
 ) -> List[Dict[str, Any]]:
     default_role = _default_role(source_route, ownership_state)
+    excluded = _excluded_hosts(exclude_hosts)
     out: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for item in _as_list(controllers):
         if not isinstance(item, Mapping):
             item = {"host": item}
         host = _normalize_host(item)
-        if not host or host in seen:
+        if not host or host in seen or _is_excluded(host, excluded):
             continue
         seen.add(host)
         chip: Dict[str, Any] = {"host": host}

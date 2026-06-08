@@ -190,6 +190,7 @@ def _score_prompt_group(
         merchant_host=merchant_host,
         merchant_brand=str(merchant_brand or ""),
         merchant_vendors=merchant_identities,
+        merchant_title=str(product.get("title") or product.get("raw_title") or ""),
     )
     any_competitor_first_party = _any_competitor_first_party(runs, competitors)
     provider_analysis = _provider_analysis(runs, sku_ctx=sku_ctx, product=product)
@@ -881,9 +882,18 @@ def _competitors_for_runs(
     merchant_host: Optional[str],
     merchant_brand: str,
     merchant_vendors: Tuple[str, ...] = (),
+    merchant_title: str = "",
 ) -> Tuple[List[str], Counter]:
     counter: Counter = Counter()
     first_seen: Dict[str, int] = {}
+
+    def _self(name: str) -> bool:
+        return _is_merchant_self(
+            name,
+            merchant_brand=merchant_brand,
+            merchant_vendors=merchant_vendors,
+            merchant_title=merchant_title,
+        )
 
     def remember(name: str) -> None:
         if name not in first_seen:
@@ -895,7 +905,7 @@ def _competitors_for_runs(
             normalized = _clean_competitor_name(name)
             if not normalized:
                 continue
-            if _same_brand(normalized, merchant_brand):
+            if _self(normalized):
                 continue
             remember(normalized)
 
@@ -907,7 +917,7 @@ def _competitors_for_runs(
     )
     for row in competitor_rows or []:
         normalized = _clean_competitor_name(row.get("name"))
-        if not normalized or _same_brand(normalized, merchant_brand):
+        if not normalized or _self(normalized):
             continue
         if normalized not in first_seen:
             first_seen[normalized] = len(first_seen)
@@ -1866,6 +1876,31 @@ def _same_brand(candidate: str, merchant_brand: str) -> bool:
     if not c or not b:
         return False
     return c == b or c in b or b in c
+
+
+def _is_merchant_self(
+    candidate: str,
+    *,
+    merchant_brand: str = "",
+    merchant_vendors: Tuple[str, ...] = (),
+    merchant_title: str = "",
+) -> bool:
+    """True if an extracted "competitor" is actually the merchant's own product
+    or brand. Guards against the merchant's own product line ("Good Night
+    Collagen ...") being mined as a competitor and then surfaced as `who_owns`.
+    Checks brand + every merchant identity value, plus a high-overlap match
+    against the merchant's own product title (its distinctive tokens contained in
+    the candidate)."""
+    if _same_brand(candidate, merchant_brand):
+        return True
+    for vendor in merchant_vendors or ():
+        if vendor and _same_brand(candidate, vendor):
+            return True
+    name_tokens = set(_norm_query(candidate).split())
+    title_tokens = {tok for tok in _norm_query(merchant_title).split() if len(tok) > 2}
+    if len(title_tokens) >= 2 and len(title_tokens & name_tokens) / len(title_tokens) >= 0.8:
+        return True
+    return False
 
 
 def _why_fit_from_features(row: Dict[str, Any]) -> List[str]:
