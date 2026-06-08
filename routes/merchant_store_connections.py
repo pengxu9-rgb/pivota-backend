@@ -964,6 +964,7 @@ async def shopify_oauth_callback(request: Request):
                 return_to or _marketplace_install_success_url("shopify"),
                 {
                     "installed": "shopify",
+                    "merchant_id": merchant_id,
                     "shop": canonical_myshopify_domain,
                     "store_id": store_id,
                     "status": "success",

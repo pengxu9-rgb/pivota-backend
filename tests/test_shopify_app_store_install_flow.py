@@ -1,4 +1,9 @@
+import hashlib
+import hmac
+from urllib.parse import parse_qs, urlencode, urlparse
+
 import pytest
+from starlette.requests import Request
 
 
 @pytest.mark.asyncio
@@ -40,3 +45,119 @@ async def test_shopify_app_store_install_starts_public_oauth(monkeypatch: pytest
     assert captured_state["install_source"] == "app_store"
     assert captured_state["return_to"] == "https://merchant.example.com/app/install/success"
     assert captured_state["host"] == "admin-host"
+
+
+@pytest.mark.asyncio
+async def test_shopify_app_store_callback_redirect_includes_merchant_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.merchant_store_connections as module
+    import services.shopify_integration_verify as verify_module
+
+    secret = "shopify_secret"
+    state = "oauth-state"
+    state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
+    state_row = {
+        "merchant_id": "merch_shopify_public",
+        "shop_domain": "demo-shop.myshopify.com",
+        "expires_at": module.datetime.now(module.timezone.utc) + module.timedelta(minutes=10),
+        "used_at": None,
+        "install_source": "app_store",
+        "return_to": "https://merchant.example.com/app/install/success",
+        "host": "admin-host",
+    }
+
+    class FakeDatabase:
+        async def fetch_one(self, query: str, values: dict):
+            assert values["state_sha256"] == state_sha
+            if "SELECT merchant_id" in query:
+                return state_row
+            if "UPDATE shopify_oauth_states" in query:
+                return {"merchant_id": "merch_shopify_public"}
+            raise AssertionError(f"unexpected query: {query}")
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url: str, json: dict):
+            assert url == "https://demo-shop.myshopify.com/admin/oauth/access_token"
+            assert json["code"] == "oauth-code"
+            return FakeResponse(200, {"access_token": "admin-token"})
+
+        async def get(self, url: str, headers: dict):
+            assert url == "https://demo-shop.myshopify.com/admin/api/2024-07/shop.json"
+            assert headers["X-Shopify-Access-Token"] == "admin-token"
+            return FakeResponse(
+                200,
+                {"shop": {"myshopify_domain": "demo-shop.myshopify.com", "name": "Demo Shop"}},
+            )
+
+    async def fake_ensure_tables():
+        return None
+
+    async def fake_create_storefront_token(**kwargs):
+        return "storefront-token"
+
+    async def fake_upsert_store(**kwargs):
+        assert kwargs["merchant_id"] == "merch_shopify_public"
+        assert kwargs["myshopify_domain"] == "demo-shop.myshopify.com"
+        return "store_demo"
+
+    async def fake_register_webhooks_best_effort(**kwargs):
+        return {"created": [], "existing": []}
+
+    monkeypatch.setattr(module.settings, "shopify_client_id", "shopify_client_id")
+    monkeypatch.setattr(module.settings, "shopify_client_secret", secret)
+    monkeypatch.setattr(module.settings, "shopify_redirect_uri", "https://api.example.com/integrations/shopify/oauth/callback")
+    monkeypatch.setattr(module, "database", FakeDatabase())
+    monkeypatch.setattr(module, "_ensure_shopify_oauth_tables", fake_ensure_tables)
+    monkeypatch.setattr(module, "_create_storefront_access_token_best_effort", fake_create_storefront_token)
+    monkeypatch.setattr(module, "_upsert_shopify_store_credentials", fake_upsert_store)
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(verify_module, "register_webhooks_best_effort", fake_register_webhooks_best_effort)
+
+    params = {
+        "shop": "demo-shop.myshopify.com",
+        "code": "oauth-code",
+        "state": state,
+    }
+    message = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
+    params["hmac"] = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/integrations/shopify/oauth/callback",
+            "headers": [],
+            "query_string": urlencode(params).encode("utf-8"),
+            "server": ("api.example.com", 443),
+            "scheme": "https",
+        }
+    )
+
+    response = await module.shopify_oauth_callback(request)
+
+    assert response.status_code == 302
+    location = response.headers["location"]
+    assert location.startswith("https://merchant.example.com/app/install/success?")
+    query = parse_qs(urlparse(location).query)
+    assert query["installed"] == ["shopify"]
+    assert query["merchant_id"] == ["merch_shopify_public"]
+    assert query["shop"] == ["demo-shop.myshopify.com"]
+    assert query["store_id"] == ["store_demo"]
+    assert query["status"] == ["success"]
