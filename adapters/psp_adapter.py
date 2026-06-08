@@ -164,6 +164,30 @@ class StripeAdapter(PSPAdapter):
 
         return "never"
 
+    def _build_checkout_session_success_url(self, metadata: Dict[str, Any]) -> str:
+        success_url = str(
+            metadata.get("success_url")
+            or metadata.get("return_url")
+            or ""
+        ).strip()
+        if not success_url:
+            return "https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}"
+        if "{CHECKOUT_SESSION_ID}" in success_url:
+            return success_url
+        separator = "&" if "?" in success_url else "?"
+        if success_url.endswith("?") or success_url.endswith("&"):
+            separator = ""
+        return f"{success_url}{separator}session_id={{CHECKOUT_SESSION_ID}}"
+
+    def _build_checkout_session_cancel_url(self, metadata: Dict[str, Any]) -> str:
+        cancel_url = str(
+            metadata.get("cancel_url")
+            or metadata.get("checkout_cancel_url")
+            or metadata.get("payment_cancel_url")
+            or ""
+        ).strip()
+        return cancel_url or "https://merchant.pivota.cc/payment/cancel"
+
     def _resolve_capture_method(self, metadata: Dict[str, Any]) -> Optional[str]:
         capture_method = str(
             metadata.get("stripe_capture_method")
@@ -175,12 +199,18 @@ class StripeAdapter(PSPAdapter):
             return capture_method
         return None
 
-    def _resolve_create_request_options(self, metadata: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    def _resolve_create_request_options(
+        self,
+        metadata: Dict[str, Any],
+        *,
+        stripe_mode: Optional[str] = None,
+    ) -> Optional[Dict[str, str]]:
         order_id = str(metadata.get("order_id") or "").strip()
-        if order_id:
-            raw_key = f"agent_payment:{order_id}"
-        else:
-            raw_key = str(metadata.get("idempotency_key") or "").strip()
+        request_key = str(metadata.get("idempotency_key") or "").strip()
+        mode = str(stripe_mode or self.mode or "payment_intent").strip().lower()
+        if mode not in {"payment_intent", "checkout_session"}:
+            mode = "payment_intent"
+        raw_key = f"agent_payment:{mode}:{order_id}" if order_id else request_key
         if not raw_key:
             return None
         if len(raw_key) <= 255:
@@ -229,7 +259,10 @@ class StripeAdapter(PSPAdapter):
         try:
             psp_mode = (metadata.get("psp_mode") or "").lower()
             stripe_mode = "checkout_session" if psp_mode == "stripe_checkout" else self.mode
-            request_options = self._resolve_create_request_options(metadata)
+            request_options = self._resolve_create_request_options(
+                metadata,
+                stripe_mode=stripe_mode,
+            )
 
             # Agent / Checkout 场景：返回可跳转的支付链接
             if stripe_mode == "checkout_session":
@@ -257,8 +290,8 @@ class StripeAdapter(PSPAdapter):
                                 },
                             },
                         ],
-                        "success_url": "https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
-                        "cancel_url": "https://merchant.pivota.cc/payment/cancel",
+                        "success_url": self._build_checkout_session_success_url(metadata),
+                        "cancel_url": self._build_checkout_session_cancel_url(metadata),
                         "metadata": metadata,
                         "payment_intent_data": payment_intent_data,
                     },

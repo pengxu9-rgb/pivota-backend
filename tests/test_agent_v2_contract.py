@@ -328,7 +328,10 @@ async def test_agent_v2_order_and_checkout_session_flow(
             debug_id="debug_contract",
         )
 
+    captured_order_request: Dict[str, Any] = {}
+
     async def fake_create_order(**kwargs: Any) -> Dict[str, Any]:
+        captured_order_request["metadata"] = kwargs["order_request"].metadata
         return {
             "status": "success",
             "order_id": "ORD_V2_CONTRACT",
@@ -432,6 +435,12 @@ async def test_agent_v2_order_and_checkout_session_flow(
                         "channel": "agent",
                         "currency": "USD",
                     },
+                    "metadata": {
+                        "agent_v2": {
+                            "checkout_provider": "pivota_hosted_checkout",
+                            "hosted_checkout": True,
+                        },
+                    },
                 },
             )
             checkout_resp = await client.post(
@@ -457,6 +466,9 @@ async def test_agent_v2_order_and_checkout_session_flow(
     assert order_body["order"]["quote_id"] == "q_v2_contract"
     assert order_body["payment"]["payment_action"]["type"] == "stripe_client_secret"
     assert order_body["events"][0]["type"] == "order.created"
+    assert captured_order_request["metadata"]["agent_v2"]["checkout_provider"] == "pivota_hosted_checkout"
+    assert captured_order_request["metadata"]["agent_v2"]["hosted_checkout"] is True
+    assert captured_order_request["metadata"]["agent_v2"]["contract_version"] == "merchant-network-middleware-v1"
 
     assert checkout_resp.status_code == 200
     checkout_body = checkout_resp.json()

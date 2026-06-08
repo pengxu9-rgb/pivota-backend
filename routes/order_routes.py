@@ -165,6 +165,17 @@ def _order_allows_platform_checkout_fallback(metadata: Optional[Dict[str, Any]])
     return _platform_checkout_fallback_enabled() and not _is_pivota_direct_quote_first_order(metadata)
 
 
+def _order_defers_payment_surface(metadata: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    agent_v2 = metadata.get("agent_v2")
+    if not isinstance(agent_v2, dict):
+        return False
+    provider = str(agent_v2.get("checkout_provider") or "").strip().lower()
+    hosted_checkout = agent_v2.get("hosted_checkout") is True
+    return provider == "pivota_hosted_checkout" or hosted_checkout
+
+
 async def _log_fallback_pollution_attempt_best_effort(
     *,
     order_id: str,
@@ -4214,6 +4225,7 @@ async def create_new_order(
         route_id_for_attempt = route_config.get("route_id") if isinstance(route_config, dict) else None
         # Unified payment action for frontends (optional, best-effort)
         payment_action: Dict[str, Any] = {}
+        defer_order_payment_surface = _order_defers_payment_surface(order_metadata)
         
         try:
             # Build preferred PSP ordering from routing config (if available)
@@ -4261,46 +4273,49 @@ async def create_new_order(
                 elif auth_first_psp == "paypal":
                     auth_first_payment_metadata["paypal_intent"] = "AUTHORIZE"
             _t = time.perf_counter()
-            success, payment_intent, error, psp_used = await create_payment_with_failover(
-                merchant_id=order_request.merchant_id,
-                amount=total,
-                currency=order_request.currency,
-                metadata={
-                    "order_id": order_id,
-                    "merchant_id": order_request.merchant_id,
-                    "customer_email": order_request.customer_email,
-                    "route_id": route_id_for_attempt,
-                    "agent_id": agent_id,
-                    **(
-                        {"selected_payment_offer_id": str(order_request.selected_payment_offer_id)}
-                        if getattr(order_request, "selected_payment_offer_id", None)
-                        else {}
-                    ),
-                    **(
-                        {"payment_offer_evidence_hash": str(order_metadata.get("payment_offer_evidence_hash"))}
-                        if order_metadata.get("payment_offer_evidence_hash")
-                        else {}
-                    ),
-                    **(
-                        {
-                            PVT_SURFACE: order_metadata.get(PVT_SURFACE),
-                            PVT_CLICK_ID: order_metadata.get(PVT_CLICK_ID),
-                            PVT_PRODUCT_ID: order_metadata.get(PVT_PRODUCT_ID),
-                            PVT_VARIANT_ID: order_metadata.get(PVT_VARIANT_ID),
-                            PVT_PROMPT_CLUSTER: order_metadata.get(PVT_PROMPT_CLUSTER),
-                        }
-                        if has_attribution_signal(order_metadata)
-                        else {}
-                    ),
-                    **({"psp_mode": psp_mode} if psp_mode else {}),
-                    **auth_first_payment_metadata,
-                    **({"return_url": payment_return_url} if payment_return_url else {}),
-                },
-                preferred_psps=preferred_psps,
-                restrict_to_preferred_psps=bool(explicit_preferred_provider or auth_first_manual_capture),
-                canonical_psp_required=True,
-                enforce_live_readiness=enforce_live_readiness,
-            )
+            if defer_order_payment_surface:
+                success, payment_intent, error, psp_used = True, None, None, psp_type
+            else:
+                success, payment_intent, error, psp_used = await create_payment_with_failover(
+                    merchant_id=order_request.merchant_id,
+                    amount=total,
+                    currency=order_request.currency,
+                    metadata={
+                        "order_id": order_id,
+                        "merchant_id": order_request.merchant_id,
+                        "customer_email": order_request.customer_email,
+                        "route_id": route_id_for_attempt,
+                        "agent_id": agent_id,
+                        **(
+                            {"selected_payment_offer_id": str(order_request.selected_payment_offer_id)}
+                            if getattr(order_request, "selected_payment_offer_id", None)
+                            else {}
+                        ),
+                        **(
+                            {"payment_offer_evidence_hash": str(order_metadata.get("payment_offer_evidence_hash"))}
+                            if order_metadata.get("payment_offer_evidence_hash")
+                            else {}
+                        ),
+                        **(
+                            {
+                                PVT_SURFACE: order_metadata.get(PVT_SURFACE),
+                                PVT_CLICK_ID: order_metadata.get(PVT_CLICK_ID),
+                                PVT_PRODUCT_ID: order_metadata.get(PVT_PRODUCT_ID),
+                                PVT_VARIANT_ID: order_metadata.get(PVT_VARIANT_ID),
+                                PVT_PROMPT_CLUSTER: order_metadata.get(PVT_PROMPT_CLUSTER),
+                            }
+                            if has_attribution_signal(order_metadata)
+                            else {}
+                        ),
+                        **({"psp_mode": psp_mode} if psp_mode else {}),
+                        **auth_first_payment_metadata,
+                        **({"return_url": payment_return_url} if payment_return_url else {}),
+                    },
+                    preferred_psps=preferred_psps,
+                    restrict_to_preferred_psps=bool(explicit_preferred_provider or auth_first_manual_capture),
+                    canonical_psp_required=True,
+                    enforce_live_readiness=enforce_live_readiness,
+                )
             logger.info(
                 "[OrderRoutes][PERF] step=create_payment_with_failover duration_ms=%d order=%s",
                 int((time.perf_counter() - _t) * 1000),
@@ -4314,7 +4329,12 @@ async def create_new_order(
                 f"success={success}, psp_used={final_psp}, has_intent={payment_intent is not None}, error={error}"
             )
 
-            if success and payment_intent:
+            if defer_order_payment_surface:
+                logger.info(
+                    "[OrderRoutes] Payment surface deferred until submit_payment for order %s",
+                    order_id,
+                )
+            elif success and payment_intent:
                 payment_intent_id = payment_intent.id
                 client_secret = getattr(payment_intent, "client_secret", None)
                 psp_type = final_psp

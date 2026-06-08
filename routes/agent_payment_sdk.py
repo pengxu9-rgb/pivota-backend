@@ -734,6 +734,14 @@ async def create_payment(
                 auth_first_payment_metadata["stripe_capture_method"] = "manual"
             elif auth_first_psp == "paypal":
                 auth_first_payment_metadata["paypal_intent"] = "AUTHORIZE"
+        payment_method_type = str(request.payment_method.type or "").strip().lower()
+        requested_psp_mode = (
+            "stripe_checkout"
+            if payment_method_type in {"stripe_checkout", "stripe_checkout_session"}
+            else None
+        )
+        if requested_psp_mode == "stripe_checkout":
+            preferred_psps = ["stripe"]
 
         # Use MultiPSPOrchestrator for real payment creation with failover
         try:
@@ -776,11 +784,12 @@ async def create_payment(
                         "agent_id": context.agent_id,
                         "payment_method_type": request.payment_method.type,
                         "idempotency_key": request.idempotency_key,
+                        **({"psp_mode": requested_psp_mode} if requested_psp_mode else {}),
                         **auth_first_payment_metadata,
                         **({"return_url": request.return_url} if request.return_url else {}),
                     },
                     preferred_psps=preferred_psps,
-                    restrict_to_preferred_psps=bool(auth_first_manual_capture),
+                    restrict_to_preferred_psps=bool(auth_first_manual_capture or requested_psp_mode),
                     canonical_psp_required=True,
                     enforce_live_readiness=True,
                 ),

@@ -244,6 +244,43 @@ async def test_create_new_order_skips_platform_checkout_fallback_by_default(
 
 
 @pytest.mark.asyncio
+async def test_create_new_order_defers_psp_surface_for_agent_v2_hosted_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.order_routes as module
+
+    monkeypatch.delenv("ORDER_PLATFORM_CHECKOUT_FALLBACK_ENABLED", raising=False)
+    events = _install_create_new_order_harness(monkeypatch, module)
+    req = _build_order_request()
+    req.metadata = {
+        "agent_v2": {
+            "contract_version": "merchant-network-middleware-v1",
+            "checkout_provider": "pivota_hosted_checkout",
+            "hosted_checkout": True,
+        },
+    }
+
+    async def fail_create_payment_with_failover(*args, **kwargs):
+        raise AssertionError("hosted checkout order creation must not create a PSP payment surface")
+
+    monkeypatch.setattr(module, "create_payment_with_failover", fail_create_payment_with_failover)
+
+    response = await module.create_new_order(
+        req,
+        BackgroundTasks(),
+        current_user={},
+    )
+
+    assert response.order_id == "ORD_TEST_PLATFORM_FALLBACK"
+    assert response.payment_status == "pending"
+    assert response.payment_intent_id is None
+    assert response.client_secret is None
+    assert response.payment_action is None
+    assert all(event_type != "payment_intent_failed" for event_type, _ in events)
+    assert all(event_type != "payment_fallback_platform_checkout" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
 async def test_create_new_order_allows_platform_checkout_fallback_only_when_explicitly_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -939,10 +939,12 @@ async def create_order_v2(
     shipping_address = _coerce_shipping_address(raw_shipping)
 
     metadata = dict(body.metadata or {})
-    metadata["agent_v2"] = {
+    agent_v2_meta = dict(metadata.get("agent_v2") or {}) if isinstance(metadata.get("agent_v2"), dict) else {}
+    agent_v2_meta.update({
         "contract_version": "merchant-network-middleware-v1",
         "quote_id": body.quote_id,
-    }
+    })
+    metadata["agent_v2"] = agent_v2_meta
     if body.request_context:
         metadata["request_context"] = body.request_context.model_dump(exclude_none=True)
     if body.selected_payment_offer_id:
