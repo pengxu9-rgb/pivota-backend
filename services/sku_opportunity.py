@@ -146,6 +146,43 @@ def build_sku_opportunity(
     }
 
 
+def _lane_cited_evidence(
+    runs: List[Dict[str, Any]],
+    sku_ctx: Dict[str, Any],
+    competitors: List[str],
+) -> Optional[Dict[str, Any]]:
+    """The verbatim AI answer excerpt for a lane plus who it named, so the
+    merchant can SEE what the AI actually said — especially on lanes it LOSES,
+    where the answer routes the buyer to a competitor/retailer rather than the
+    merchant's own site. Prefers a run that cites an external (controller) host."""
+    best: Optional[Dict[str, Any]] = None
+    best_rank: Tuple[int, int] = (-1, -1)
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+        excerpt = str(
+            run.get("evidence_excerpt") or parsed.get("evidence_excerpt") or ""
+        ).strip()
+        if not excerpt:
+            continue
+        external_hosts = [
+            ident.get("host")
+            for ident in _run_source_identifiers(run)
+            if ident.get("host") and not _is_first_party_host(ident.get("host"), sku_ctx or {})
+        ]
+        rank = (1 if external_hosts else 0, len(excerpt))
+        if rank > best_rank:
+            best_rank = rank
+            best = {
+                "provider": run.get("_provider"),
+                "excerpt": excerpt[:400],
+                "cited_hosts": list(dict.fromkeys(h for h in external_hosts if h))[:3],
+                "competitors_named": list(dict.fromkeys(competitors or []))[:5],
+            }
+    return best
+
+
 def _score_prompt_group(
     *,
     sku_ctx: Dict[str, Any],
@@ -326,6 +363,7 @@ def _score_prompt_group(
         "substitution": substitution,
         "attribute_basis": _clean_basis(axis_metadata.get("sidewalk_attribute_basis")),
         "evidence": axis_metadata.get("sidewalk_evidence"),
+        "cited_evidence": _lane_cited_evidence(runs, sku_ctx, competitors),
     }
 
 

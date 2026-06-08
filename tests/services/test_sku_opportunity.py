@@ -1115,3 +1115,54 @@ async def test_build_per_sku_report_attaches_optional_strategic_brief(monkeypatc
     assert len(attach_calls) == 1
     assert attach_calls[0]["opportunity"]["top_open_lanes"][0]["query"] == "halal collagen sticks before bed"
     assert attach_calls[0]["attribute_graph"]["classes"]["certification_constraint"] == ["halal"]
+
+
+def test_lane_captures_verbatim_cited_evidence_for_losing_lane():
+    """The merchant must be able to SEE what AI actually said on a lane it loses
+    — the answer excerpt + who it named — not just the competitor hostname."""
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    excerpt = ("For the best fish collagen tablets, Vital Proteins and NeoCell are "
+               "widely recommended and available at Walmart and Ulta.")
+    runs = _runs_both_providers([{
+        "query": "best fish collagen tablets",
+        "axis": "category",
+        "parsed": {"product_visible": False, "correct_sku": False,
+                   "evidence_excerpt": excerpt,
+                   "competitors_listed": ["Vital Proteins", "NeoCell"]},
+        "sources": [
+            {"uri": "https://walmart.com/best-collagen", "title": "walmart.com"},
+            {"uri": "https://ulta.com/collagen", "title": "ulta.com"},
+        ],
+        "raw": excerpt,
+    }])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["best fish collagen tablets"]
+    ce = row.get("cited_evidence")
+    assert ce is not None
+    assert "fish collagen tablets" in ce["excerpt"].lower()
+    # cited hosts are the external controllers AI named, not the merchant
+    assert "bblab.shop" not in ce["cited_hosts"]
+    assert any(h in ce["cited_hosts"] for h in ("walmart.com", "ulta.com"))
+    assert "Vital Proteins" in ce["competitors_named"]
+
+
+def test_lane_cited_evidence_is_none_without_excerpt():
+    """No answer excerpt -> cited_evidence is absent, never fabricated."""
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([{
+        "query": "halal collagen sticks before bed",
+        "axis": "sidewalk",
+        "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
+        "sources": [_redirector_source("bblab.shop", "bblab")],
+        "raw": "cited",
+        "axis_metadata": _sidewalk_meta(),
+    }])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+    assert row.get("cited_evidence") is None

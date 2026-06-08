@@ -5850,6 +5850,9 @@ def _trim_sku_intelligence_prompt(
         "ownership_state": row.get("ownership_state"),
         "who_owns": _who_owns_prompt(row, merchant_host),
         "sources": _prompt_sources(row, merchant_host),
+        # Verbatim AI answer excerpt + who it named, so the merchant sees what
+        # the AI actually said on the lanes it loses (not just the hostnames).
+        "cited_evidence": row.get("cited_evidence"),
         "source_route": row.get("source_route"),
         "demand_signal": row.get("demand_signal"),
         "attribute_basis": row.get("attribute_basis"),
