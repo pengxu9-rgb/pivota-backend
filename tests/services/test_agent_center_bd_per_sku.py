@@ -750,6 +750,54 @@ def test_build_brand_rollup_priority_queue_ordering():
     assert rollup["deliverability"]["transactable_skus"][0]["sku_key"] == "sku-b"
 
 
+def test_default_brand_markdown_surfaces_deliverability_before_detail():
+    from services.agent_center_bd_report_service import render_brand_markdown
+
+    report = {
+        "merchant_name": "TestBrand",
+        "merchant_domain": "merchant.test",
+        "timestamp": "2026-06-08T00:00:00Z",
+        "brand_rollup": {
+            "deliverability": {
+                "status_counts": {
+                    "transactable": 1,
+                    "servable_not_transactable": 1,
+                }
+            }
+        },
+        "per_sku_reports": [
+            {
+                "sku_key": "sku-ready",
+                "sku_title": "Ready Serum",
+                "deliverability": {
+                    "status": "transactable",
+                    "summary": "This SKU is serving eligible and has a ready merchant-checkout path.",
+                    "serving": {"status": "ready"},
+                    "checkout": {"status": "ready"},
+                },
+            },
+            {
+                "sku_key": "sku-stock",
+                "sku_title": "Unknown Stock Serum",
+                "deliverability": {
+                    "status": "servable_not_transactable",
+                    "summary": "This SKU can be served, but checkout is not ready enough to promise a transaction.",
+                    "serving": {"status": "ready"},
+                    "checkout": {"status": "blocked"},
+                },
+            },
+        ],
+    }
+
+    md = render_brand_markdown(report)
+
+    assert "## Servability and checkout" in md
+    assert "1 of 2 audited SKUs is confirmed transactable." in md
+    assert "explicit available-stock signal" in md
+    assert "Unknown Stock Serum" in md
+    assert md.find("## Servability and checkout") < md.find("## Per-product detail")
+
+
 def test_build_authority_map_classification_and_reddit_shape():
     from services.agent_center_bd_report_service import build_authority_map
 

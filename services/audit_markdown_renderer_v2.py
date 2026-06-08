@@ -40,7 +40,9 @@ renders cleanly without the missing section, no crashes.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
+
+from services.deliverability_report_view import build_deliverability_render_view
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +372,63 @@ def _chip_values(items: Any, *, key: str, limit: int = 4) -> List[str]:
         if len(values) >= limit:
             break
     return values
+
+
+def _table_cell(value: Any) -> str:
+    text = " ".join(str(value or "").strip().split())
+    return text.replace("|", "\\|") or "-"
+
+
+def _render_deliverability(report: Dict[str, Any]) -> str:
+    view = build_deliverability_render_view(report)
+    if not view:
+        return ""
+    out: List[str] = [_section_title("Servability and Checkout")]
+    out.append(str(view.get("headline") or "").strip() + "\n\n")
+    definition = str(view.get("definition") or "").strip()
+    if definition:
+        out.append(f"_{definition}_\n\n")
+
+    counts = [row for row in (view.get("counts") or []) if isinstance(row, Mapping)]
+    if counts:
+        rows = ["| Status | SKUs |", "|---|---:|"]
+        for row in counts:
+            rows.append(
+                f"| {_table_cell(row.get('label'))} | {_table_cell(row.get('count'))} |"
+            )
+        out.append("\n".join(rows) + "\n\n")
+
+    attention = [
+        row for row in (view.get("attention_rows") or [])
+        if isinstance(row, Mapping)
+    ]
+    transactable = [
+        row for row in (view.get("transactable_rows") or [])
+        if isinstance(row, Mapping)
+    ]
+    if transactable:
+        out.append("**Confirmed transactable SKUs:**\n\n")
+        rows = ["| SKU | Checkout | Read |", "|---|---|---|"]
+        for row in transactable:
+            rows.append(
+                f"| {_table_cell(row.get('sku_title'))} "
+                f"| {_table_cell(row.get('checkout_status'))} "
+                f"| {_table_cell(row.get('summary'))} |"
+            )
+        out.append("\n".join(rows) + "\n\n")
+    if attention:
+        out.append("**Needs attention before checkout:**\n\n")
+        rows = ["| SKU | State | Serving | Checkout | Read |", "|---|---|---|---|---|"]
+        for row in attention:
+            rows.append(
+                f"| {_table_cell(row.get('sku_title'))} "
+                f"| {_table_cell(row.get('status_label'))} "
+                f"| {_table_cell(row.get('serving_status'))} "
+                f"| {_table_cell(row.get('checkout_status'))} "
+                f"| {_table_cell(row.get('summary'))} |"
+            )
+        out.append("\n".join(rows) + "\n\n")
+    return "".join(out)
 
 
 def _render_next_best_action(next_best_action: Optional[Dict[str, Any]]) -> str:
@@ -789,6 +848,7 @@ def render_brand_markdown_v2(
     mv = primary.get("merchant_view") or {}
     # 8. What should you do next? (merchant-facing decision layer)
     sections.append(_render_reaudit_delta(mv.get("reaudit_delta")))
+    sections.append(_render_deliverability(brand_report))
     sections.append(_render_next_best_action(mv.get("next_best_action")))
     # 9. Recommendations (action items v2 from PR-8b)
     sections.append(_render_recommendations(mv.get("actions")))

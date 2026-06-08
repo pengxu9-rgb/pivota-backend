@@ -56,6 +56,7 @@ from services.commerce_execution_policy import (
     SURFACE_PUBLIC_AGENT_PURCHASE,
     resolve_commerce_execution_policy,
 )
+from services.deliverability_report_view import build_deliverability_render_view
 from services.next_best_action import (
     attach_sku_strategic_brief,
     build_next_best_action,
@@ -11021,6 +11022,63 @@ def _markdown_chip_values(items: Any, *, key: str, limit: int = 4) -> List[str]:
     return values
 
 
+def _markdown_table_cell(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return text.replace("|", "\\|") or "-"
+
+
+def _render_deliverability_markdown(report: Mapping[str, Any]) -> str:
+    view = build_deliverability_render_view(report)
+    if not view:
+        return ""
+    out: List[str] = ["## Servability and checkout\n"]
+    out.append(str(view.get("headline") or "").strip() + "\n")
+    definition = str(view.get("definition") or "").strip()
+    if definition:
+        out.append(f"_{definition}_\n")
+
+    counts = [row for row in (view.get("counts") or []) if isinstance(row, Mapping)]
+    if counts:
+        out.append("\n| Status | SKUs |\n|---|---:|\n")
+        for row in counts:
+            out.append(
+                f"| {_markdown_table_cell(row.get('label'))} "
+                f"| {_markdown_table_cell(row.get('count'))} |\n"
+            )
+
+    transactable = [
+        row for row in (view.get("transactable_rows") or [])
+        if isinstance(row, Mapping)
+    ]
+    if transactable:
+        out.append("\n**Confirmed transactable SKUs:**\n")
+        out.append("| SKU | Checkout | Read |\n|---|---|---|\n")
+        for row in transactable:
+            out.append(
+                f"| {_markdown_table_cell(row.get('sku_title'))} "
+                f"| {_markdown_table_cell(row.get('checkout_status'))} "
+                f"| {_markdown_table_cell(row.get('summary'))} |\n"
+            )
+
+    attention = [
+        row for row in (view.get("attention_rows") or [])
+        if isinstance(row, Mapping)
+    ]
+    if attention:
+        out.append("\n**Needs attention before checkout:**\n")
+        out.append("| SKU | State | Serving | Checkout | Read |\n|---|---|---|---|---|\n")
+        for row in attention:
+            out.append(
+                f"| {_markdown_table_cell(row.get('sku_title'))} "
+                f"| {_markdown_table_cell(row.get('status_label'))} "
+                f"| {_markdown_table_cell(row.get('serving_status'))} "
+                f"| {_markdown_table_cell(row.get('checkout_status'))} "
+                f"| {_markdown_table_cell(row.get('summary'))} |\n"
+            )
+    out.append("\n")
+    return "".join(out)
+
+
 def _render_next_best_action_markdown(next_best_action: Optional[Mapping[str, Any]]) -> str:
     if not isinstance(next_best_action, Mapping):
         return ""
@@ -11347,6 +11405,7 @@ def render_markdown_from_structured(report: Dict[str, Any]) -> str:
             mv_for_play.get("reaudit_delta") if isinstance(mv_for_play, dict) else None
         )
     )
+    sections.append(_render_deliverability_markdown(report))
     sections.append(
         _render_next_best_action_markdown(
             mv_for_play.get("next_best_action") if isinstance(mv_for_play, dict) else None
@@ -11830,6 +11889,8 @@ def render_brand_markdown(
             f"- Average category discoverability: {cat_line}\n"
             f"- Products audited: {aggregate.get('products_count', len(per_product))}\n"
         )
+
+    sections.append(_render_deliverability_markdown(brand_report))
 
     # P2 (post-#525 codex review): the reconciled competitor view —
     # one row per competitor brand joining what the host rollup,

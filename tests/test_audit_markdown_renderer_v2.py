@@ -359,6 +359,50 @@ def test_renders_next_best_action_before_recommendations():
     assert md.find("## What Should You Do Next?") < md.find("## Recommendations")
 
 
+def test_renders_deliverability_before_next_best_action():
+    from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
+
+    audit = _gruns_fixture_audit()
+    audit["brand_rollup"] = {
+        "deliverability": {
+            "status_counts": {
+                "transactable": 1,
+                "servable_not_transactable": 1,
+            }
+        }
+    }
+    audit["per_sku_reports"] = [
+        {
+            "sku_key": "sku-ready",
+            "sku_title": "Ready Serum",
+            "deliverability": {
+                "status": "transactable",
+                "summary": "This SKU is serving eligible and has a ready merchant-checkout path.",
+                "serving": {"status": "ready"},
+                "checkout": {"status": "ready"},
+            },
+        },
+        {
+            "sku_key": "sku-stock",
+            "sku_title": "Unknown Stock Serum",
+            "deliverability": {
+                "status": "servable_not_transactable",
+                "summary": "This SKU can be served, but checkout is not ready enough to promise a transaction.",
+                "serving": {"status": "ready"},
+                "checkout": {"status": "blocked"},
+            },
+        },
+    ]
+
+    md = render_brand_markdown_v2(audit)
+
+    assert "## Servability and Checkout" in md
+    assert "1 of 2 audited SKUs is confirmed transactable." in md
+    assert "explicit available-stock signal" in md
+    assert "Unknown Stock Serum" in md
+    assert md.find("## Servability and Checkout") < md.find("## What Should You Do Next?")
+
+
 def test_renders_reaudit_delta_before_next_best_action():
     from services.audit_markdown_renderer_v2 import render_brand_markdown_v2
     audit = _gruns_fixture_audit()
