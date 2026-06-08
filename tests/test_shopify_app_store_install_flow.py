@@ -38,5 +38,5 @@ async def test_shopify_app_store_install_starts_public_oauth(monkeypatch: pytest
     assert captured_state["merchant_id"] == "merch_shopify_public"
     assert captured_state["shop_domain"] == "demo-shop.myshopify.com"
     assert captured_state["install_source"] == "app_store"
-    assert captured_state["return_to"] == "https://merchant.example.com/dashboard/integrations"
+    assert captured_state["return_to"] == "https://merchant.example.com/app/install/success"
     assert captured_state["host"] == "admin-host"
