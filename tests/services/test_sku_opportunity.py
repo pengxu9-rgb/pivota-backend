@@ -690,6 +690,96 @@ def test_cold_start_url_audit_pdp_url_only_is_merchant_owned():
     assert row["ownership_state"] == "merchant-owned"
 
 
+def _fragmented_tail():
+    """A long tail of single-citation external hosts — the realistic shape of AI
+    grounding that makes `first_party >= sum(external)` unachievable."""
+    return [
+        {"uri": f"https://shop{i}.example/collagen", "title": f"shop{i}.example"}
+        for i in range(12)
+    ]
+
+
+def test_branded_lane_with_merchant_cited_is_merchant_owned_amid_fragmentation():
+    """Intent-aware ownership: on the merchant's OWN branded buyer-path query, if
+    the merchant's site is cited (>= any single competitor) and the product wins,
+    the merchant owns the lane even when AI grounds the answer in a long tail of
+    external hosts. Pre-fix this returned retailer-owned because the strict gate
+    required first-party to outweigh the SUM of all external sources."""
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    sources = [
+        _redirector_source("bblab.shop", "bblab-1"),
+        {"uri": "https://yesstyle.com/bblab", "title": "YesStyle - BB Lab"},
+    ] + _fragmented_tail()
+    runs = _runs_both_providers([
+        {
+            "query": "where can I buy BB Lab Good Night Collagen",
+            "axis": "intent",
+            "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
+            "sources": sources,
+            "raw": "Available on the BB Lab official site (bblab.shop) and many resellers.",
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["where can i buy bb lab good night collagen"]
+    assert row["ownership_state"] == "merchant-owned"
+
+
+def test_category_lane_with_merchant_cited_stays_third_party():
+    """Honesty guard: the intent-aware floor must NOT extend to category/head
+    lanes. A single merchant citation among a fragmented field of publishers is
+    third-party-controlled, not merchant-owned (no inflation)."""
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    sources = [
+        _redirector_source("bblab.shop", "bblab-1"),
+        {"uri": "https://goodhousekeeping.com/best-collagen", "title": "Good Housekeeping"},
+    ] + _fragmented_tail()
+    runs = _runs_both_providers([
+        {
+            "query": "best collagen",
+            "axis": "category",
+            "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
+            "sources": sources,
+            "raw": "Best collagen roundup naming many brands.",
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["best collagen"]
+    assert row["ownership_state"] != "merchant-owned"
+
+
+def test_branded_lane_without_merchant_citation_not_merchant_owned():
+    """Honesty guard: on a branded query where the merchant's own site is NOT
+    cited, the floor must not fire (first-party present is required)."""
+    from services.sku_opportunity import build_sku_opportunity
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    graph = build_sku_attribute_graph(ctx["product"])
+    sources = [
+        {"uri": "https://yesstyle.com/bblab", "title": "YesStyle - BB Lab"},
+    ] + _fragmented_tail()
+    runs = _runs_both_providers([
+        {
+            "query": "shop BB Lab Good Night Collagen online",
+            "axis": "intent",
+            "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
+            "sources": sources,
+            "raw": "Sold by resellers; the official store is not surfaced.",
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["shop bb lab good night collagen online"]
+    assert row["ownership_state"] != "merchant-owned"
+
+
 def test_weak_merchant_mention_not_open_lane():
     from services.sku_opportunity import build_sku_opportunity
     from services.sku_sidewalk import build_sku_attribute_graph

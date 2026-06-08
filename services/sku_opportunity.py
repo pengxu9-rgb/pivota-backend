@@ -244,6 +244,7 @@ def _score_prompt_group(
         durable_competitor=durable_competitor,
         open_lane=open_lane,
         demand_signal=demand_signal,
+        branded_transactional=_is_branded_transactional(query_class, axis, query),
     )
     who_owns = _who_owns_state(
         ownership_state=ownership_state,
@@ -1116,6 +1117,21 @@ def _opportunity_score(
     )
 
 
+def _is_branded_transactional(query_class: str, axis: str, query: str) -> bool:
+    """The merchant's OWN branded buyer-path lane (e.g. "where can I buy <brand>",
+    "<brand> ... for sale", "shop <brand> online"). Mirrors the
+    `branded_transactional` rule in `_intent_ladder_layer` so ownership and the
+    intent ladder agree on what counts as a branded buy-intent lane. Review /
+    comparison branded lanes are intentionally excluded (not buy-intent)."""
+    if axis in {"intent", "price", "brand", "identity"}:
+        return True
+    if query_class == "branded" and any(
+        token in _norm_query(query) for token in ("buy", "price", "shop", "where")
+    ):
+        return True
+    return False
+
+
 def _ownership_state(
     *,
     runs: List[Dict[str, Any]],
@@ -1127,6 +1143,7 @@ def _ownership_state(
     durable_competitor: Optional[str],
     open_lane: bool,
     demand_signal: float,
+    branded_transactional: bool = False,
 ) -> str:
     if demand_signal <= 0:
         return "no-demand"
@@ -1142,6 +1159,23 @@ def _ownership_state(
     )
     if first_party_positive and wins >= 1:
         return "merchant-owned"
+    # Intent-aware floor (the merchant's OWN branded buyer path). The strict
+    # dominance gate above requires first-party citations to outweigh the SUM of
+    # all external sources — unachievable when AI grounds an answer in a long
+    # tail of 10-20 hosts, so a merchant cited on its own branded query was being
+    # handed to a co-cited retailer/marketplace. On a branded-transactional lane,
+    # if the merchant's own site is cited (first-party present) AND the product
+    # wins, the merchant owns its branded lane even amid fragmentation. Honesty
+    # guard: keep the PAIRWISE check (first-party cited >= any single external
+    # host) so a retailer that genuinely out-cites the merchant on a branded
+    # query still wins — and never extend this to category/sidewalk lanes, where
+    # one citation among many is honestly third-party-controlled, not owned.
+    if branded_transactional and wins >= 1:
+        first_party, _external_total, max_external = _first_party_source_share(
+            source_roles, sku_ctx,
+        )
+        if first_party > 0 and first_party >= max_external:
+            return "merchant-owned"
     source_owner = _source_owned_state(
         source_route=source_route,
         source_roles=source_roles,
