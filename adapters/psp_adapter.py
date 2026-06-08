@@ -164,6 +164,30 @@ class StripeAdapter(PSPAdapter):
 
         return "never"
 
+    def _build_checkout_session_success_url(self, metadata: Dict[str, Any]) -> str:
+        success_url = str(
+            metadata.get("success_url")
+            or metadata.get("return_url")
+            or ""
+        ).strip()
+        if not success_url:
+            return "https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}"
+        if "{CHECKOUT_SESSION_ID}" in success_url:
+            return success_url
+        separator = "&" if "?" in success_url else "?"
+        if success_url.endswith("?") or success_url.endswith("&"):
+            separator = ""
+        return f"{success_url}{separator}session_id={{CHECKOUT_SESSION_ID}}"
+
+    def _build_checkout_session_cancel_url(self, metadata: Dict[str, Any]) -> str:
+        cancel_url = str(
+            metadata.get("cancel_url")
+            or metadata.get("checkout_cancel_url")
+            or metadata.get("payment_cancel_url")
+            or ""
+        ).strip()
+        return cancel_url or "https://merchant.pivota.cc/payment/cancel"
+
     def _resolve_capture_method(self, metadata: Dict[str, Any]) -> Optional[str]:
         capture_method = str(
             metadata.get("stripe_capture_method")
@@ -257,8 +281,8 @@ class StripeAdapter(PSPAdapter):
                                 },
                             },
                         ],
-                        "success_url": "https://merchant.pivota.cc/payment/success?session_id={CHECKOUT_SESSION_ID}",
-                        "cancel_url": "https://merchant.pivota.cc/payment/cancel",
+                        "success_url": self._build_checkout_session_success_url(metadata),
+                        "cancel_url": self._build_checkout_session_cancel_url(metadata),
                         "metadata": metadata,
                         "payment_intent_data": payment_intent_data,
                     },

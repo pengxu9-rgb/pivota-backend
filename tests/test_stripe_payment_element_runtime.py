@@ -267,6 +267,7 @@ async def test_stripe_checkout_session_supports_manual_capture_metadata(
             "psp_mode": "stripe_checkout",
             "payment_flow": "authorization_first",
             "capture_method": "manual",
+            "return_url": "https://agent.pivota.cc/checkout/return?order_id=ORD_AUTH_CHECKOUT",
         },
     )
 
@@ -276,6 +277,10 @@ async def test_stripe_checkout_session_supports_manual_capture_metadata(
     assert intent.id == "cs_test_123"
     assert intent.redirect_url == "https://checkout.stripe.test/cs_test_123"
     assert requests[0]["method"] == "checkout.sessions.create"
+    assert (
+        requests[0]["payload"]["success_url"]
+        == "https://agent.pivota.cc/checkout/return?order_id=ORD_AUTH_CHECKOUT&session_id={CHECKOUT_SESSION_ID}"
+    )
     assert requests[0]["payload"]["payment_intent_data"]["capture_method"] == "manual"
     assert requests[0]["payload"]["payment_intent_data"]["metadata"]["order_id"] == "ORD_AUTH_CHECKOUT"
     assert requests[0]["request_options"]["idempotency_key"] == "agent_payment:ORD_AUTH_CHECKOUT"
@@ -363,6 +368,49 @@ async def test_stripe_create_idempotency_falls_back_and_compacts_long_metadata_k
     assert len(compacted_key) == 255
     assert compacted_key.endswith(expected_suffix)
     assert compacted_key.startswith("fallback:")
+
+
+@pytest.mark.asyncio
+async def test_stripe_checkout_session_create_uses_per_order_idempotency_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from adapters import psp_adapter as module
+
+    requests = []
+
+    class _FakeStripeClient:
+        def __init__(self, *args, **kwargs):
+            self.v1 = SimpleNamespace(
+                checkout=SimpleNamespace(sessions=_FakeCheckoutSessionsAPI(requests)),
+                payment_intents=_FakePaymentIntentsAPI(requests),
+            )
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(module.stripe, "StripeClient", _FakeStripeClient)
+    monkeypatch.setattr(module.stripe, "RequestsClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(module.asyncio, "to_thread", _run_inline)
+
+    adapter = module.StripeAdapter(api_key="sk_live_test_123")
+
+    success, intent, error = await adapter.create_payment_intent(
+        amount=Decimal("25.00"),
+        currency="USD",
+        metadata={
+            "order_id": "ORD_IDEMPOTENT_CHECKOUT",
+            "idempotency_key": "caller_key_should_not_scope_provider_create",
+            "psp_mode": "stripe_checkout",
+        },
+    )
+
+    assert success is True
+    assert error is None
+    assert intent is not None
+    assert requests[0]["method"] == "checkout.sessions.create"
+    assert requests[0]["request_options"] == {
+        "idempotency_key": "agent_payment:ORD_IDEMPOTENT_CHECKOUT",
+    }
 
 
 @pytest.mark.asyncio

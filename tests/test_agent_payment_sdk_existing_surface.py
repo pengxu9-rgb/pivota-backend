@@ -378,6 +378,112 @@ async def test_agent_payments_refreshes_awaiting_stripe_surface_when_return_url_
 
 
 @pytest.mark.asyncio
+async def test_agent_payments_stripe_checkout_request_forces_hosted_stripe_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mvp.events as mvp_events
+    import mvp.governance as mvp_governance
+    import routes.agent_payment_sdk as payment_module
+    from fastapi import BackgroundTasks
+    from db.database import database as database_obj
+
+    class _Context:
+        agent_id = "agent_test"
+        session_id = "sess_test"
+
+        def can_access_merchant(self, merchant_id: Optional[str]) -> bool:
+            return merchant_id == "merch_test_123"
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "merchant_id": "merch_test_123",
+            "payment_status": "unpaid",
+            "total": 25.22,
+            "currency": "USD",
+            "shipping_address": {
+                "country": "US",
+                "postal_code": "94105",
+                "city": "San Francisco",
+                "state": "CA",
+            },
+            "metadata": _live_quote_metadata(),
+        }
+
+    async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+        return {"merchant_id": merchant_id}
+
+    async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
+        return "adyen", {
+            "route_id": "route_prefers_non_stripe",
+            "psp_priority": [
+                {"psp": "adyen", "priority": 1},
+                {"psp": "checkout", "priority": 2},
+            ],
+        }
+
+    async def fake_fetch_one(query: Any, values: Dict[str, Any] | None = None):
+        return None
+
+    async def fake_execute(*args: Any, **kwargs: Any):
+        return 1
+
+    async def fake_update_payment_info(**kwargs: Any) -> bool:
+        return True
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_create_payment_with_failover(*args: Any, **kwargs: Any):
+        captured.update(kwargs)
+        return True, SimpleNamespace(
+            id="cs_agent_checkout_123",
+            client_secret=None,
+            status="requires_action",
+            redirect_url="https://checkout.stripe.test/cs_agent_checkout_123",
+            raw_response={"id": "cs_agent_checkout_123", "object": "checkout.session"},
+            psp_type="stripe_checkout",
+        ), None, "stripe"
+
+    class _Decision:
+        decision = "allow"
+        reason_codes = []
+        required_scopes = []
+        risk_tier = "low"
+
+    monkeypatch.setattr(payment_module, "get_order", fake_get_order)
+    monkeypatch.setattr(payment_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
+    monkeypatch.setattr(payment_module.PaymentRoutingService, "select_psp", fake_select_psp)
+    monkeypatch.setattr(payment_module, "create_payment_with_failover", fake_create_payment_with_failover)
+    monkeypatch.setattr(payment_module, "update_payment_info", fake_update_payment_info)
+    monkeypatch.setattr(database_obj, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(database_obj, "execute", fake_execute)
+    monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+    monkeypatch.setattr(mvp_governance.governance, "evaluate", lambda *_a, **_k: _Decision())
+    monkeypatch.setattr(mvp_governance.governance, "record_audit_event", lambda **_: None)
+
+    response = await payment_module.create_payment(
+        payment_module.PaymentRequest(
+            order_id="ORD_STRIPE_CHECKOUT",
+            payment_method=payment_module.PaymentMethod(type="stripe_checkout"),
+            return_url="https://agent.pivota.cc/checkout/return?order_id=ORD_STRIPE_CHECKOUT",
+            idempotency_key="idem_stripe_checkout_1",
+        ),
+        BackgroundTasks(),
+        context=_Context(),
+    )
+
+    assert captured["metadata"]["psp_mode"] == "stripe_checkout"
+    assert captured["metadata"]["return_url"] == "https://agent.pivota.cc/checkout/return?order_id=ORD_STRIPE_CHECKOUT"
+    assert captured["metadata"]["payment_method_type"] == "stripe_checkout"
+    assert captured["preferred_psps"] == ["stripe"]
+    assert captured["restrict_to_preferred_psps"] is True
+    assert response.payment_intent_id == "cs_agent_checkout_123"
+    assert response.payment_action["type"] == "redirect_url"
+    assert response.payment_action["url"] == "https://checkout.stripe.test/cs_agent_checkout_123"
+    assert response.payment_action["submit_owner"] == "redirect"
+
+
+@pytest.mark.asyncio
 async def test_agent_payments_retries_transient_db_busy_after_psp_without_double_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
