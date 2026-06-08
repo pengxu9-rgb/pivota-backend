@@ -331,6 +331,21 @@ def test_routability_score_good_and_missing_offer_data():
     assert breakdown["offer_orderability"]["reason"] == "data unavailable"
 
 
+def test_routability_score_unknown_availability_is_not_orderable():
+    from services.agent_center_bd_report_service import compute_routability_score
+
+    ctx = _base_sku_ctx()
+    ctx["offers"][0]["availability"] = "unknown"
+    ctx["offers"][0]["inventory_quantity"] = None
+
+    score, breakdown = compute_routability_score(ctx)
+
+    assert score < 100
+    assert breakdown["offer_orderability"]["points"] == 17
+    assert breakdown["offer_orderability"]["reason"] == "partial offer orderability"
+    assert "catalog_offers.availability" in breakdown["missing_inputs"]
+
+
 def test_deliverability_prediction_requires_explicit_execute_ready():
     from services.agent_center_bd_report_service import build_sku_deliverability_prediction
 
@@ -348,6 +363,22 @@ def test_deliverability_prediction_requires_explicit_execute_ready():
     assert "active PSP" not in prediction["summary"]
 
 
+def test_deliverability_prediction_requires_explicit_available_stock():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    ctx = _base_sku_ctx()
+    ctx["offers"][0]["availability"] = "unknown"
+    ctx["offers"][0]["inventory_quantity"] = None
+
+    prediction = build_sku_deliverability_prediction(ctx)
+
+    assert prediction["status"] == "servable_not_transactable"
+    assert prediction["checkout"]["status"] == "blocked"
+    assert prediction["checkout"]["orderable_offer"] is False
+    assert prediction["checkout"]["offer"]["points"] == 17
+    assert "catalog_offers.availability" in prediction["checkout"]["missing_inputs"]
+
+
 def test_deliverability_prediction_blocks_unservable_sku_before_checkout():
     from services.agent_center_bd_report_service import build_sku_deliverability_prediction
 
@@ -363,6 +394,21 @@ def test_deliverability_prediction_blocks_unservable_sku_before_checkout():
     assert prediction["serving"]["status"] == "blocked"
     assert prediction["checkout"]["status"] == "ready"
     assert prediction["checkout"]["orderable_offer"] is True
+
+
+def test_deliverability_prediction_softens_unmeasured_serving_summary():
+    from services.agent_center_bd_report_service import build_sku_deliverability_prediction
+
+    ctx = _base_sku_ctx()
+    ctx["index_pipeline_state"] = {}
+
+    prediction = build_sku_deliverability_prediction(ctx)
+
+    assert prediction["status"] == "not_publishable"
+    assert prediction["serving"]["status"] == "unknown"
+    assert prediction["checkout"]["status"] == "ready"
+    assert "not confirmed" in prediction["summary"]
+    assert "not serving eligible" not in prediction["summary"]
 
 
 def test_deliverability_prediction_does_not_overclaim_non_direct_platform():

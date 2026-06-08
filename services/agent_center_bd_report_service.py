@@ -90,6 +90,7 @@ _PER_SKU_AUDIT_UPSTREAM_CHUNK_SIZE = 4
 # genuinely down/slow provider doesn't grind through every remaining chunk at
 # the full per-call timeout (which is what stalled prior runs).
 _PER_SKU_AUDIT_MAX_CONSECUTIVE_CHUNK_FAILURES = 2
+_EXPLICIT_AVAILABLE_STATES = {"in_stock", "available"}
 _COMPETITOR_ATTRIBUTE_GROUNDED_PROVIDERS = {"gemini", "chatgpt"}
 _COMPETITOR_ATTRIBUTE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("halal", ("halal",)),
@@ -2263,7 +2264,7 @@ def compute_routability_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, A
     else:
         best = 0
         for offer in offers:
-            availability_ok = str(offer.get("availability") or "").lower() in {"in_stock", "available", "unknown"}
+            availability_ok = str(offer.get("availability") or "").lower() in _EXPLICIT_AVAILABLE_STATES
             inventory = offer.get("inventory_quantity")
             inventory_ok = inventory is None or (_as_number(inventory) or 0) > 0
             mode_ok = (offer.get("offer_mode") or "") == "merchant_checkout"
@@ -2382,7 +2383,7 @@ def _orderable_offer_summary(sku_ctx: Dict[str, Any]) -> Tuple[bool, Dict[str, A
     best_points = -1
     best_offer: Optional[Dict[str, Any]] = None
     for offer in offers:
-        availability_ok = str(offer.get("availability") or "").lower() in {"in_stock", "available", "unknown"}
+        availability_ok = str(offer.get("availability") or "").lower() in _EXPLICIT_AVAILABLE_STATES
         inventory = offer.get("inventory_quantity")
         inventory_ok = inventory is None or (_as_number(inventory) or 0) > 0
         mode_ok = (offer.get("offer_mode") or "") == "merchant_checkout"
@@ -2409,7 +2410,7 @@ def _orderable_offer_summary(sku_ctx: Dict[str, Any]) -> Tuple[bool, Dict[str, A
     missing: List[str] = []
     if not (_nonempty(best_offer.get("offer_id")) and best_offer.get("sku_key") == sku.get("sku_key")):
         missing.append("catalog_offers.sku_key")
-    availability_ok = str(best_offer.get("availability") or "").lower() in {"in_stock", "available", "unknown"}
+    availability_ok = str(best_offer.get("availability") or "").lower() in _EXPLICIT_AVAILABLE_STATES
     inventory = best_offer.get("inventory_quantity")
     inventory_ok = inventory is None or (_as_number(inventory) or 0) > 0
     if not (availability_ok and inventory_ok):
@@ -2535,7 +2536,10 @@ def build_sku_deliverability_prediction(
         summary = "No stored serving, offer, or checkout facts are available for this SKU yet."
     elif not serving_ready:
         status = "not_publishable"
-        summary = "This SKU should not be promised to buyers yet because it is not serving eligible."
+        if serving_status == "unknown":
+            summary = "This SKU should not be promised to buyers yet because serving eligibility is not confirmed."
+        else:
+            summary = "This SKU should not be promised to buyers yet because it is not serving eligible."
     elif direct_purchase_ready:
         status = "transactable"
         summary = "This SKU is serving eligible and has a ready merchant-checkout path for Pivota direct purchase."
