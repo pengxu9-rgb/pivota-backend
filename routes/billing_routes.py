@@ -16,13 +16,15 @@ import stripe
 from databases import Database
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from config.settings import settings
 from db.database import IS_POSTGRES, database
+from db.merchant_onboarding import get_merchant_onboarding
 from routes.payment_execution_routes import verify_merchant_api_key
 from services.billing import monthly_brand_statements_service
-from utils.auth import get_current_merchant
+from utils.auth import decode_token, get_current_merchant, optional_security
 from utils.logger import logger
 
 
@@ -50,10 +52,66 @@ class CreditTopUpRequest(BaseModel):
 
 async def require_approved_merchant(
     x_merchant_api_key: Optional[str] = Header(None, alias="X-Merchant-API-Key"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
 ) -> Dict[str, Any]:
-    """Authenticate a merchant API key using the existing payment-route dependency."""
+    """Authenticate a merchant for self-serve billing.
 
-    return await verify_merchant_api_key(x_merchant_api_key or "")
+    Accepts EITHER:
+      - ``X-Merchant-API-Key`` — the merchant payment-execution key. Takes
+        precedence when present, preserving any server-to-server callers.
+      - ``Authorization: Bearer <jwt>`` — a merchant-role portal session JWT.
+
+    The merchant portal browser only ever holds the JWT (the API key is a
+    high-privilege secret that must never reach the client), so the self-serve
+    billing pages ride the JWT path — identical to commission/payouts. Both
+    paths enforce the same approval gate and return a dict carrying
+    ``merchant_id``, ``status`` ("approved"), and ``contact_email``.
+    """
+
+    if x_merchant_api_key:
+        # An explicit API key means API-key auth was intended; a bad key fails
+        # here rather than silently falling back to JWT.
+        return await verify_merchant_api_key(x_merchant_api_key)
+
+    if credentials and credentials.credentials:
+        payload = decode_token(credentials.credentials)
+        if payload.get("role") != "merchant":
+            raise HTTPException(status_code=403, detail="Merchant access required")
+        merchant_id = payload.get("merchant_id")
+        if not merchant_id:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Merchant ID missing from token. Log out and log back in "
+                    "to refresh your session."
+                ),
+            )
+        # Enforce the same approval gate as the API-key path: only approved
+        # merchants may view billing or open a checkout session. Without this,
+        # a pending/rejected/suspended merchant's portal JWT would regress the
+        # gate that verify_merchant_api_key applies.
+        merchant = await get_merchant_onboarding(merchant_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        merchant_status = str(merchant.get("status") or "").lower()
+        if merchant_status != "approved":
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Merchant account is {merchant_status or 'unverified'}. "
+                    "Only approved merchants can manage billing."
+                ),
+            )
+        return {
+            "merchant_id": merchant_id,
+            "status": "approved",
+            "contact_email": merchant.get("contact_email"),
+        }
+
+    raise HTTPException(
+        status_code=401,
+        detail="Missing credentials. Provide an X-Merchant-API-Key header or a Bearer token.",
+    )
 
 
 @router.get("/api/billing/me/current-period")
@@ -84,6 +142,21 @@ async def list_my_billing_statements(
         limit=capped_limit,
     )
     return {"statements": statements}
+
+
+@router.get("/api/billing/plans")
+async def list_billing_plans(
+    merchant: Dict[str, Any] = Depends(require_approved_merchant),
+) -> Dict[str, Any]:
+    """Merchant-safe catalogue of active, checkout-able subscription plans.
+
+    Scoped to the platform's current Stripe mode (live/test), so the portal
+    never needs to know or ship price_ids — the upgrade UI renders whatever
+    this returns and posts the chosen price_id straight back to checkout.
+    """
+
+    plans = await _list_active_paid_plans(database, mode=_platform_stripe_mode())
+    return {"plans": plans}
 
 
 @router.post("/webhooks/stripe/billing")
@@ -920,6 +993,56 @@ async def _handle_billing_handler_error(event_id: str, exc: Exception, db: Datab
     await _mark_event_failed(event_id, db, str(exc))
     logger.exception("Stripe billing webhook handler failed event_id=%s", event_id)
     raise HTTPException(status_code=500, detail="Stripe billing webhook handler failed")
+
+
+def _platform_stripe_mode() -> str:
+    """Return the Stripe mode ('live'/'test') implied by the platform secret key."""
+
+    key = str(settings.stripe_secret_key or "").strip().lower()
+    return "live" if key.startswith("sk_live") or key.startswith("rk_live") else "test"
+
+
+async def _list_active_paid_plans(db: Database, *, mode: str) -> list[Dict[str, Any]]:
+    """Active, checkout-able plans for the given Stripe mode, cheapest first.
+
+    Only merchant-safe fields are returned (no tier_level/features_json). Plans
+    without a stripe_price_id or with price_cents=0 (e.g. 'free') are excluded —
+    they can't be the target of a Checkout session.
+    """
+
+    columns = await _table_columns(db, "subscription_plans")
+    if not columns:
+        return []
+    where = ["status = 'active'", "stripe_price_id IS NOT NULL", "price_cents > 0"]
+    params: Dict[str, Any] = {}
+    if "stripe_mode" in columns:
+        where.append("stripe_mode = :mode")
+        params["mode"] = mode
+    order_by = "tier_level ASC" if "tier_level" in columns else "price_cents ASC"
+    rows = await db.fetch_all(
+        f"""
+        SELECT name, stripe_price_id, price_cents, monthly_credit_allowance
+        FROM subscription_plans
+        WHERE {" AND ".join(where)}
+        ORDER BY {order_by}
+        """,
+        params,
+    )
+    plans: list[Dict[str, Any]] = []
+    for raw in rows or []:
+        row = dict(raw)
+        price_id = _as_text(row.get("stripe_price_id"))
+        plans.append(
+            {
+                "key": price_id,
+                "name": _as_text(row.get("name")),
+                "price_id": price_id,
+                "price_cents": int(row.get("price_cents") or 0),
+                "monthly_credit_allowance": int(row.get("monthly_credit_allowance") or 0),
+                "currency": "usd",
+            }
+        )
+    return plans
 
 
 async def _lookup_subscription_plan(
