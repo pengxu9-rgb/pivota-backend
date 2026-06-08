@@ -483,10 +483,12 @@ async def _upsert_shopify_store_credentials(
         {"merchant_id": merchant_id, "domain": myshopify_domain},
     )
 
+    existing_row = dict(existing) if existing else None
+
     existing_creds: Dict[str, Any] = {}
-    if existing and (existing.get("api_key") or ""):
+    if existing_row and (existing_row.get("api_key") or ""):
         try:
-            parsed = json.loads(existing.get("api_key") or "")
+            parsed = json.loads(existing_row.get("api_key") or "")
             if isinstance(parsed, dict):
                 existing_creds = parsed
         except Exception:
@@ -512,7 +514,7 @@ async def _upsert_shopify_store_credentials(
     token_blob["installed_at"] = datetime.now(timezone.utc).isoformat()
     token_json = json.dumps(token_blob, ensure_ascii=False)
 
-    if existing:
+    if existing_row:
         await database.execute(
             """
             UPDATE merchant_stores
@@ -525,13 +527,13 @@ async def _upsert_shopify_store_credentials(
             WHERE store_id = :store_id
             """,
             {
-                "store_id": existing["store_id"],
+                "store_id": existing_row["store_id"],
                 "name": shop_name,
                 "domain": myshopify_domain,
                 "api_key": token_json,
             },
         )
-        return str(existing["store_id"])
+        return str(existing_row["store_id"])
 
     store_id = f"store_{merchant_id[:8]}_{int(datetime.now().timestamp())}"
     await database.execute(

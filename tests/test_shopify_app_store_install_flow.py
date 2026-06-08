@@ -161,3 +161,49 @@ async def test_shopify_app_store_callback_redirect_includes_merchant_context(
     assert query["shop"] == ["demo-shop.myshopify.com"]
     assert query["store_id"] == ["store_demo"]
     assert query["status"] == ["success"]
+
+
+@pytest.mark.asyncio
+async def test_shopify_store_credential_upsert_handles_mapping_rows_without_get(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.merchant_store_connections as module
+
+    class RowWithoutCallableGet(dict):
+        get = None
+
+    executed = {}
+
+    class FakeDatabase:
+        async def fetch_one(self, query: str, values: dict):
+            assert values == {
+                "merchant_id": "merch_shopify_public",
+                "domain": "demo-shop.myshopify.com",
+            }
+            return RowWithoutCallableGet(
+                {
+                    "store_id": "store_demo",
+                    "api_key": '{"storefront_access_token":"existing-storefront-token"}',
+                }
+            )
+
+        async def execute(self, query: str, values: dict):
+            executed.update(values)
+
+    monkeypatch.setattr(module, "database", FakeDatabase())
+
+    store_id = await module._upsert_shopify_store_credentials(
+        merchant_id="merch_shopify_public",
+        myshopify_domain="demo-shop.myshopify.com",
+        shop_name="Demo Shop",
+        access_token="new-admin-token",
+        storefront_token=None,
+        install_source="app_store",
+    )
+
+    assert store_id == "store_demo"
+    assert executed["store_id"] == "store_demo"
+    token_blob = module.json.loads(executed["api_key"])
+    assert token_blob["access_token"] == "new-admin-token"
+    assert token_blob["storefront_access_token"] == "existing-storefront-token"
+    assert token_blob["install_source"] == "app_store"
