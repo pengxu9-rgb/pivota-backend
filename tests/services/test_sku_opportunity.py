@@ -656,6 +656,40 @@ def test_redirector_first_party():
     assert row["open_lane"] is False
 
 
+def test_cold_start_url_audit_pdp_url_only_is_merchant_owned():
+    """Regression for the URL-audit P0: the cold-start product carries the
+    merchant's own URL as `pdp_url` only (no canonical_url). First-party
+    detection must still recognize the merchant's own host, or the merchant's
+    own domain gets mislabeled third-party and merchant_owned_count is 0 even
+    when AI cites the merchant's site."""
+    from services.sku_opportunity import build_sku_opportunity, _merchant_host
+    from services.sku_sidewalk import build_sku_attribute_graph
+
+    ctx = _bb_lab_sku_ctx()
+    # Real cold-start shape: drop canonical fields, keep only pdp_url.
+    ctx["product"].pop("canonical_url", None)
+    ctx["product"].pop("pivota_canonical_url", None)
+    ctx["product"]["pdp_url"] = "https://bblab.shop/products/good-night-collagen"
+
+    assert _merchant_host(ctx, ctx["product"]) == "bblab.shop"
+
+    graph = build_sku_attribute_graph(ctx["product"])
+    runs = _runs_both_providers([
+        {
+            "query": "halal collagen sticks before bed",
+            "axis": "sidewalk",
+            "parsed": {"product_visible": True, "correct_sku": True, "sku_mentioned": True},
+            "sources": [_redirector_source("bblab.shop official PDP", "bblab-pdp")],
+            "raw": "BB Lab Good Night Collagen is cited from the BB Lab official PDP.",
+            "axis_metadata": _sidewalk_meta(),
+        },
+    ])
+    opp = build_sku_opportunity(ctx, runs, attribute_graph=graph)
+    row = _by_query(opp)["halal collagen sticks before bed"]
+
+    assert row["ownership_state"] == "merchant-owned"
+
+
 def test_weak_merchant_mention_not_open_lane():
     from services.sku_opportunity import build_sku_opportunity
     from services.sku_sidewalk import build_sku_attribute_graph

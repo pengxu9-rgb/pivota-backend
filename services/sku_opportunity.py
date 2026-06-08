@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from services.agent_center_bd_report_service import (
     _VERTEX_REDIRECTOR_HOSTS,
+    _first_party_url_candidates,
     _flatten_probe_runs,
     _is_first_party_host,
     _run_text,
@@ -1705,13 +1706,14 @@ def _mentions_product_category(text: str, product: Dict[str, Any]) -> bool:
 
 
 def _merchant_host(sku_ctx: Dict[str, Any], product: Dict[str, Any]) -> Optional[str]:
-    return normalize_host(
-        product.get("canonical_url")
-        or product.get("pivota_canonical_url")
-        or sku_ctx.get("canonical_url")
-        or sku_ctx.get("pivota_canonical_url")
-        or ""
-    )
+    # Shares the candidate list with _is_first_party_host so the primary host and
+    # the first-party membership set cannot drift. Canonical fields rank first
+    # (onboarded path unchanged); pdp_url/url cover the cold-start URL audit.
+    for candidate in _first_party_url_candidates(sku_ctx, product):
+        normalized = normalize_host(candidate or "")
+        if normalized:
+            return normalized
+    return None
 
 
 def _merchant_identity_values(sku_ctx: Dict[str, Any], product: Dict[str, Any]) -> Tuple[str, ...]:
