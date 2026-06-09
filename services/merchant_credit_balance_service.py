@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
+from core.billing_constants import overage_revenue_cents
 from db.database import database
 from routes.billing_routes import (
     _as_text as _billing_as_text,
@@ -196,6 +197,19 @@ def _credits_to_amount_cents(credits: int) -> int:
 
 def _credits_to_usd_total(credits: int) -> str:
     return f"{(Decimal(int(credits)) * CREDIT_TO_USD):.2f}"
+
+
+def _overage_amount_cents(credits: int) -> int:
+    """USD cents charged for overage credits — applies the documented 30%
+    overage premium (1.3c/credit) via the single rate source in
+    core.billing_constants, so the charger and the /current-period snapshot
+    can't drift. Base credit purchases (top-ups) stay at 1c/credit and keep
+    using _credits_to_amount_cents."""
+    return int(overage_revenue_cents(int(credits)))
+
+
+def _cents_to_usd_total(amount_cents: int) -> str:
+    return f"{(Decimal(int(amount_cents)) / Decimal(100)):.2f}"
 
 
 def _internal_cogs_for_customer_credits(credits: int) -> Decimal:
@@ -602,7 +616,10 @@ async def _charge_direct_overage_increment(
         charged_before_credits=charged_before_credits,
         charge_credits=charge_credits,
     )
-    amount_cents = _credits_to_amount_cents(charge_credits)
+    # Overage carries the documented 30% premium (1.3c/credit), unlike base
+    # credit top-ups (1c/credit). Single rate source: core.billing_constants.
+    amount_cents = _overage_amount_cents(charge_credits)
+    amount_total = _cents_to_usd_total(amount_cents)
     try:
         payment_intent = await _create_direct_payment_intent(
             merchant_id=merchant_id,
@@ -618,7 +635,7 @@ async def _charge_direct_overage_increment(
             },
             description=(
                 f"Pivota direct overage: {charge_credits:,} credits - "
-                f"${_credits_to_usd_total(charge_credits)}"
+                f"${amount_total}"
             ),
         )
     except MissingVerifiedPaymentMethodError:
@@ -650,7 +667,7 @@ async def _charge_direct_overage_increment(
         "overage_increment_id": increment_id,
         "charge_credits": int(charge_credits),
         "amount_cents": amount_cents,
-        "amount_total": _credits_to_usd_total(charge_credits),
+        "amount_total": amount_total,
     }
 
 

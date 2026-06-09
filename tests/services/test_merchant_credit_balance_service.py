@@ -561,7 +561,9 @@ async def test_paid_debit_past_zero_charges_overage_increment(monkeypatch):
     assert balance["overage_pending_credits"] == 0
     assert balance["overage_charged_credits"] == 2000
     assert balance["overage_credits_accrued"] == 100
-    assert payment_intents[0]["amount_cents"] == 2000
+    # 2000 overage credits charged at the 1.3c/credit overage rate (30% premium
+    # over the 1c base credit price): 2000 * 1.3 = 2600 cents = $26.00.
+    assert payment_intents[0]["amount_cents"] == 2600
     assert payment_intents[0]["idempotency_key"] == (
         "direct_overage_payment_intent:"
         "direct_overage:merch-A:000000000001-000000002000"
@@ -577,7 +579,7 @@ async def test_paid_debit_past_zero_charges_overage_increment(monkeypatch):
     assert payload["overage_increment_id"] == (
         "direct_overage:merch-A:000000000001-000000002000"
     )
-    assert payload["amount_cents"] == 2000
+    assert payload["amount_cents"] == 2600
     assert payload["usd_cogs_internal"] == "13.0000"
 
 
