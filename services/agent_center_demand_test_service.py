@@ -29,6 +29,7 @@ from config.settings import settings
 from db.database import database
 from services import agent_center_llm_client as llm_client
 from services import agent_center_service as ac
+from services import credit_consumption_service
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +274,17 @@ async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
         )
         raise
 
-    # 3. Record usage event (first-write-wins idempotent).
+    # 3. Meter the run (V2): debit paid-tier merchants per LLM probe; free-tier
+    # / cold-start prospects and non-priceable providers stay preview_only.
+    meter = await credit_consumption_service.meter_agent_workflow(
+        merchant_id,
+        "agent_demand_test",
+        provider=str(result.get("provider") or "unknown"),
+        units=int(result.get("runs_count") or 1),
+        idempotency_key=f"demand_test:{scan_target_id}:v1",
+    )
+
+    # 4. Record usage event (first-write-wins idempotent).
     usage_event = await ac.record_usage_event(
         idempotency_key=f"demand_test:{scan_target_id}:v1",
         merchant_id=merchant_id,
@@ -284,12 +295,13 @@ async def run_demand_test(scan_target_id: str) -> Dict[str, Any]:
         event_type="demand_test_credit",
         provider=str(result.get("provider") or "unknown"),
         scan_mode=scan_mode,
-        billing_mode="preview_only",
+        billing_mode=meter["billing_mode"],
         billing_status="not_invoiced",
         quantity=int(result.get("runs_count") or 1),
         payload={
             "scores": result.get("scores") or {},
             "usage": result.get("usage") or {},
+            "metering": {k: v for k, v in meter.items() if k != "consume"},
         },
     )
 
