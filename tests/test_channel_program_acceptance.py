@@ -42,7 +42,7 @@ class _FakeFullDatabase:
         self.subscription_plans: list[dict[str, Any]] = []
         self.merchants: list[dict[str, Any]] = []
         self.user_subscriptions: list[dict[str, Any]] = []
-        self.credit_ledger: list[dict[str, Any]] = []
+        self.usage_events: list[dict[str, Any]] = []
         self.commerce_attribution_edges: list[dict[str, Any]] = []
         self.monthly_brand_statements: list[dict[str, Any]] = []
         self.billing_runs: list[dict[str, Any]] = []
@@ -55,7 +55,7 @@ class _FakeFullDatabase:
         self.settlement_files: list[dict[str, Any]] = []
         self._next_plan_id = 1
         self._next_subscription_id = 1
-        self._next_credit_ledger_id = 1
+        self._next_usage_event_id = 1
         self._next_statement_id = 1
         self._next_billing_run_id = 1
         self._next_invoice_id = 1
@@ -106,17 +106,33 @@ class _FakeFullDatabase:
                     )
             return sorted(rows, key=lambda row: row["id"])
 
-        if "from credit_ledger" in sql:
+        if "from agent_center_usage_events" in sql:
             merchant_id = params["merchant_id"]
             period_start = params["period_start"]
             period_end = params["period_end"]
-            rows = [
-                row
-                for row in self.credit_ledger
-                if row["merchant_id"] == merchant_id
-                and row["credits_delta"] < 0
-                and period_start <= _as_date(row["occurred_at"]) < period_end
-            ]
+            debit_types = {
+                "credit_debit_audit",
+                "credit_debit_prompt",
+                "credit_debit_execution",
+            }
+            grant_types = {
+                "credit_grant_audit",
+                "credit_grant_prompt",
+                "credit_grant_execution",
+            }
+            rows = []
+            for ev in self.usage_events:
+                if ev["merchant_id"] != merchant_id:
+                    continue
+                if not (period_start <= _as_date(ev["created_at"]) < period_end):
+                    continue
+                if ev["billing_mode"] == "debit" and ev["event_type"] in debit_types:
+                    delta = -int(ev["quantity"])
+                elif ev["billing_mode"] == "credit" and ev["event_type"] in grant_types:
+                    delta = int(ev["quantity"])
+                else:
+                    continue
+                rows.append({"id": ev["id"], "credits_delta": delta})
             return sorted(rows, key=lambda row: row["id"])
 
         if "from partner_attribution" in sql:
@@ -674,23 +690,22 @@ class _FakeFullDatabase:
         merchant_id: str,
         credits: int,
         occurred_at: datetime,
-    ) -> int:
-        ledger_id = self._next_credit_ledger_id
-        self._next_credit_ledger_id += 1
-        self.credit_ledger.append(
+    ) -> str:
+        # Consumption is metered to agent_center_usage_events by the wired debit
+        # path, which is what assemble_for_month now reads.
+        event_id = f"mcb_{self._next_usage_event_id:09d}"
+        self._next_usage_event_id += 1
+        self.usage_events.append(
             {
-                "id": ledger_id,
+                "id": event_id,
                 "merchant_id": merchant_id,
-                "operation_type": "operation_commit",
-                "operation_id": f"op_{ledger_id}",
-                "credits_delta": -credits,
-                "balance_after": 0,
-                "occurred_at": occurred_at,
-                "source_type": "operation_commit",
-                "metadata": {},
+                "billing_mode": "debit",
+                "event_type": "credit_debit_audit",
+                "quantity": int(credits),
+                "created_at": occurred_at,
             }
         )
-        return ledger_id
+        return event_id
 
     def add_gmv_edge(
         self,
