@@ -4770,25 +4770,6 @@ class RecordPaymentOfferEvidencePayload(BaseModel):
     idempotency_key: Optional[str] = None
 
 
-class CreatePaymentLinkPayload(BaseModel):
-    """Payload for the create_payment_link operation (guest hosted checkout).
-
-    Sent FLAT by the safety-kernel executor (canonicalExecutor.createPaymentLink):
-      { "order_id": "...", "customer_email": "...", "shipping_address": {...},
-        "return_url": "...", "user_ref": "..." }
-
-    Proxied to POST /agent/v2/payments/checkout-sessions, which turns an EXISTING order
-    into a HOSTED Stripe Checkout page the buyer pays on. This path NEVER charges — there
-    is no submit_payment here; the buyer authorizes by paying on the returned page.
-    """
-
-    order_id: str
-    customer_email: Optional[str] = None
-    shipping_address: Optional[Dict[str, Any]] = None
-    return_url: Optional[str] = None
-    user_ref: Optional[str] = None
-
-
 class ShopGatewayRequest(BaseModel):
     operation: str
     payload: Dict[str, Any]
@@ -11446,39 +11427,6 @@ async def _handle_create_order(
     return await _proxy_agent_api("POST", "/agent/v1/orders/create", body, checkout_token=checkout_token)
 
 
-async def _handle_create_payment_link(
-    payload: "CreatePaymentLinkPayload",
-    *,
-    checkout_token: Optional[str],
-) -> Dict[str, Any]:
-    """Proxy create_payment_link to the Agent v2 hosted-checkout endpoint.
-
-    POST /agent/v2/payments/checkout-sessions turns an EXISTING order (created moments
-    earlier by the kernel's create_order) into a HOSTED Stripe Checkout page. The buyer
-    pays on that page and the PSP webhook finalizes the order — so this NEVER charges and
-    needs no payment authorization. The response is the backend's
-    `{ "checkout_session": { "hosted_url", ... } }` shape, which the kernel executor reads
-    verbatim (hosted_url -> checkout_url). order ownership + state are enforced upstream.
-    """
-    body: Dict[str, Any] = {"order_id": payload.order_id}
-    if payload.customer_email:
-        body["customer_email"] = payload.customer_email
-    if isinstance(payload.shipping_address, dict) and payload.shipping_address:
-        body["shipping_address"] = payload.shipping_address
-    if payload.return_url:
-        body["return_url"] = payload.return_url
-    if payload.user_ref:
-        # The hosted-checkout endpoint records the guest buyer reference for the session.
-        body["buyer_ref"] = payload.user_ref
-
-    return await _proxy_agent_api(
-        "POST",
-        "/agent/v2/payments/checkout-sessions",
-        body,
-        checkout_token=checkout_token,
-    )
-
-
 async def _handle_submit_payment(payment: PaymentPayloadBody, *, checkout_token: Optional[str]) -> Dict[str, Any]:
     """Proxy submit_payment to Agent API (/agent/v1/payments)."""
     # 将简单的 payment_method 字符串映射为 Agent Payment API 的结构化字段
@@ -11551,7 +11499,6 @@ async def invoke_shop_operation(
     - list_review_entrypoints
     - resolve_review_intent
     - create_order       (demo-only)
-    - create_payment_link (guest hosted checkout → /agent/v2/payments/checkout-sessions; no charge)
     - submit_payment     (demo-only)
     - find_similar_products
     """
@@ -12119,13 +12066,6 @@ async def invoke_shop_operation(
             payload.order,
             checkout_token=checkout_token,
             request_metadata=normalized_metadata,
-        )
-
-    if operation == "create_payment_link":
-        payment_link_payload = CreatePaymentLinkPayload(**request.payload)
-        return await _handle_create_payment_link(
-            payment_link_payload,
-            checkout_token=checkout_token,
         )
 
     if operation == "find_products_multi":
