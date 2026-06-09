@@ -43,6 +43,10 @@ _OPERATION_CATEGORY: Dict[str, str] = {
     "agent_sku_match_live": "execution",
     "agent_demand_test": "execution",
     "agent_bd_report": "execution",
+    # Provider-aware citation operator: LLM-drafted content (reddit reply, owned FAQ, ...).
+    "agent_citation_draft": "execution",
+    # Provider-aware citation operator: grounded probes fanned across providers per scan.
+    "agent_citation_scan": "execution",
 }
 
 
