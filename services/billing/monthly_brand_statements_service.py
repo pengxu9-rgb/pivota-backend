@@ -55,13 +55,12 @@ async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
 
     # Consumption is metered by the WIRED debit path
     # (merchant_credit_balance_service.debit -> agent_center_usage_events), not
-    # the legacy credit_ledger that _credit_consumption_events reads — nothing
-    # writes consumption to credit_ledger, so reading it here always reported 0.
-    # Read the balance system (the source of truth) so /current-period reflects
-    # real audit/agent usage. NOTE: the dormant statement-assembly path
-    # (assemble_for_month) still reads credit_ledger; repoint it the same way
-    # when it is brought online (report-only — overage is already charged inline
-    # by the debit path, so statements must not bill a second time).
+    # the legacy credit_ledger — nothing writes consumption to credit_ledger, so
+    # reading it here always reported 0. Read the balance system (the source of
+    # truth) so /current-period reflects real audit/agent usage. The statement
+    # mirror (assemble_for_month) reads the same source; it is report-only —
+    # overage is already charged inline by the debit path, so statements must
+    # not bill a second time.
     consumed_credits = await _period_consumed_credits_from_usage(
         merchant_id=merchant_id,
         period_start=period_start,
@@ -199,13 +198,18 @@ async def assemble_for_month(merchant_id: str, calendar_month: date) -> int:
         if existing and _row_text(existing, "status") in {"frozen", "invoiced"}:
             return int(_row_get(existing, "id"))
 
-        credit_events = await _credit_consumption_events(
+        # Consumption is metered by the wired debit path into the balance system
+        # (agent_center_usage_events), not the legacy credit_ledger — nothing
+        # writes consumption to credit_ledger, so reading it produced empty
+        # statements. Read the source of truth, same as current_period_usage_snapshot.
+        credit_events = await _credit_consumption_usage_events(
             merchant_id=merchant_id,
             period_start=calendar_month,
             period_end=period_end,
         )
-        credits_consumed = -sum(
-            int(_row_get(row, "credits_delta") or 0) for row in credit_events
+        credits_consumed = max(
+            0,
+            -sum(int(_row_get(row, "credits_delta") or 0) for row in credit_events),
         )
         subscription = await _latest_active_subscription(
             merchant_id=merchant_id,
@@ -325,6 +329,34 @@ async def freeze(statement_id: int) -> None:
         )
 
 
+async def assemble_and_freeze_report_only(
+    merchant_id: str,
+    calendar_month: date,
+) -> int:
+    """Assemble a merchant's monthly statement and freeze it — REPORT ONLY.
+
+    This is the report mirror of the balance system: it records consumption /
+    overage revenue / GMV into monthly_brand_statements and freezes the row so
+    it shows in GET /api/billing/me/statements and feeds partner settlement.
+
+    It intentionally does NOT invoice or charge: overage is already collected
+    inline by the debit path (merchant_credit_balance_service charges a direct
+    Stripe PaymentIntent at the overage threshold). Wiring the statement-overage
+    invoice (credit_overage_billing.create_overage_invoice / mark_invoiced) on
+    top of that would double-bill, so this path stops at 'frozen'.
+
+    Idempotent: re-running returns the same statement id; an already-frozen
+    statement is left as-is.
+    """
+    statement_id = await assemble_for_month(merchant_id, calendar_month)
+    try:
+        await freeze(statement_id)
+    except StatementAlreadyFrozenError:
+        # Already frozen/invoiced from a prior run — report mirror is idempotent.
+        pass
+    return statement_id
+
+
 async def mark_invoiced(statement_id: int, overage_invoice_id: int | None) -> None:
     """Transition status frozen → invoiced. Sets invoiced_at, overage_invoice_id.
     Raises if status != 'frozen' or overage_invoice_id is invalid. A NULL invoice id is
@@ -360,20 +392,47 @@ async def mark_invoiced(statement_id: int, overage_invoice_id: int | None) -> No
         )
 
 
-async def _credit_consumption_events(
+async def _credit_consumption_usage_events(
     *,
     merchant_id: str,
     period_start: date,
     period_end: date,
 ) -> list[Any]:
+    """Per-operation consumption rows in [period_start, period_end) from the
+    balance system (source of truth), shaped {id, credits_delta}.
+
+    agent_center_usage_events is where the wired debit path
+    (merchant_credit_balance_service) records one row per applied operation:
+      - billing_mode='debit',  event_type='credit_debit_{audit,prompt,execution}'
+      - billing_mode='credit', event_type='credit_grant_{...}'  (failure refunds)
+    credits_delta uses the same sign convention the legacy credit_ledger did — a
+    debit is NEGATIVE, a refund POSITIVE — so callers compute
+    consumed = -sum(credits_delta). Top-ups ('credit_topup') and overage charges
+    ('credit_overage_charge') are NOT consumption and are excluded. Replays don't
+    double-count: a replayed operation re-uses its idempotency_key (UNIQUE) and
+    inserts no new row.
+    """
     rows = await database.fetch_all(
         """
-        SELECT id, credits_delta
-        FROM credit_ledger
+        SELECT id,
+               CASE WHEN billing_mode = 'debit' THEN -quantity ELSE quantity END
+                   AS credits_delta
+        FROM agent_center_usage_events
         WHERE merchant_id = :merchant_id
-          AND occurred_at >= :period_start
-          AND occurred_at < :period_end
-          AND credits_delta < 0
+          AND created_at >= :period_start
+          AND created_at < :period_end
+          AND (
+              (billing_mode = 'debit' AND event_type IN (
+                  'credit_debit_audit',
+                  'credit_debit_prompt',
+                  'credit_debit_execution'
+              ))
+              OR (billing_mode = 'credit' AND event_type IN (
+                  'credit_grant_audit',
+                  'credit_grant_prompt',
+                  'credit_grant_execution'
+              ))
+          )
         ORDER BY id ASC
         """,
         {
@@ -391,49 +450,13 @@ async def _period_consumed_credits_from_usage(
     period_start: date,
     period_end: date,
 ) -> int:
-    """Net credits consumed in [period_start, period_end) from the balance system.
-
-    Source of truth is agent_center_usage_events, where the wired debit path
-    (merchant_credit_balance_service) records one row per applied operation:
-      - billing_mode='debit',  event_type='credit_debit_{audit,prompt,execution}'
-      - billing_mode='credit', event_type='credit_grant_{...}'  (failure refunds)
-    Debits count as consumption; refund credits net it back down. Top-ups
-    ('credit_topup') and overage charges ('credit_overage_charge') are NOT
-    consumption and are excluded. Replays don't double-count: a replayed
-    operation re-uses its idempotency_key and inserts no new row.
-    """
-    row = await database.fetch_one(
-        """
-        SELECT COALESCE(SUM(
-            CASE
-                WHEN billing_mode = 'debit'
-                     AND event_type IN (
-                         'credit_debit_audit',
-                         'credit_debit_prompt',
-                         'credit_debit_execution'
-                     ) THEN quantity
-                WHEN billing_mode = 'credit'
-                     AND event_type IN (
-                         'credit_grant_audit',
-                         'credit_grant_prompt',
-                         'credit_grant_execution'
-                     ) THEN -quantity
-                ELSE 0
-            END
-        ), 0) AS consumed
-        FROM agent_center_usage_events
-        WHERE merchant_id = :merchant_id
-          AND billing_mode IN ('debit', 'credit')
-          AND created_at >= :period_start
-          AND created_at < :period_end
-        """,
-        {
-            "merchant_id": merchant_id,
-            "period_start": period_start,
-            "period_end": period_end,
-        },
+    """Net credits consumed in the period from the balance system (>= 0)."""
+    rows = await _credit_consumption_usage_events(
+        merchant_id=merchant_id,
+        period_start=period_start,
+        period_end=period_end,
     )
-    return max(0, int(_row_get(row, "consumed") or 0))
+    return max(0, -sum(int(_row_get(row, "credits_delta") or 0) for row in rows))
 
 
 async def _latest_active_subscription(
@@ -523,14 +546,16 @@ async def _statement_values(
         subscription_revenue_usd_cents=sub_revenue,
     )
     gross_margin = total_revenue - total_cogs
-    event_ids = [int(_row_get(row, "id")) for row in credit_events]
+    # Balance-system usage-event ids are opaque strings (e.g. "mcb_..."), not the
+    # legacy integer credit_ledger ids — keep them as strings for the hash.
+    event_ids = [str(_row_get(row, "id")) for row in credit_events]
     metadata = {
         "assembly_hash": _assembly_hash(
-            credit_ledger_event_ids=event_ids,
+            event_ids=event_ids,
             subscription_plan_id=subscription_plan_id,
         ),
-        "credit_ledger_event_count": len(event_ids),
-        "credit_ledger_event_ids": event_ids,
+        "usage_event_count": len(event_ids),
+        "usage_event_ids": event_ids,
         "computed_at": "now()",
         "period_start": calendar_month.isoformat(),
         "period_end": period_end.isoformat(),
@@ -618,12 +643,12 @@ def _total_cogs_cents(
 
 def _assembly_hash(
     *,
-    credit_ledger_event_ids: list[int],
+    event_ids: list[str],
     subscription_plan_id: int | None,
 ) -> str:
     payload = json.dumps(
         {
-            "credit_ledger_event_ids": credit_ledger_event_ids,
+            "usage_event_ids": event_ids,
             "subscription_plan_id": subscription_plan_id,
         },
         sort_keys=True,

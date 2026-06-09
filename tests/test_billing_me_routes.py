@@ -69,6 +69,16 @@ class _FakeBillingMeDatabase:
                 ),
             }
 
+        raise AssertionError(f"Unhandled fetch_one query: {query}")
+
+    async def fetch_all(
+        self,
+        query: str,
+        values: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = _normalize_sql(query)
+        params = dict(values or {})
+
         if "from agent_center_usage_events" in sql:
             merchant_id = params["merchant_id"]
             period_start = params["period_start"]
@@ -83,39 +93,20 @@ class _FakeBillingMeDatabase:
                 "credit_grant_prompt",
                 "credit_grant_execution",
             }
-            consumed = 0
-            for ev in self.usage_events:
+            rows = []
+            for idx, ev in enumerate(self.usage_events):
                 if ev["merchant_id"] != merchant_id:
                     continue
                 if not (period_start <= _as_date(ev["created_at"]) < period_end):
                     continue
                 if ev["billing_mode"] == "debit" and ev["event_type"] in debit_types:
-                    consumed += int(ev["quantity"])
+                    delta = -int(ev["quantity"])
                 elif ev["billing_mode"] == "credit" and ev["event_type"] in grant_types:
-                    consumed -= int(ev["quantity"])
-            return {"consumed": consumed}
-
-        raise AssertionError(f"Unhandled fetch_one query: {query}")
-
-    async def fetch_all(
-        self,
-        query: str,
-        values: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        sql = _normalize_sql(query)
-        params = dict(values or {})
-
-        if "from credit_ledger" in sql:
-            merchant_id = params["merchant_id"]
-            period_start = params["period_start"]
-            period_end = params["period_end"]
-            return [
-                {"id": row["id"], "credits_delta": row["credits_delta"]}
-                for row in sorted(self.credit_ledger, key=lambda item: item["id"])
-                if row["merchant_id"] == merchant_id
-                and row["credits_delta"] < 0
-                and period_start <= _as_date(row["occurred_at"]) < period_end
-            ]
+                    delta = int(ev["quantity"])
+                else:
+                    continue
+                rows.append({"id": ev.get("id", f"mcb_{idx:09d}"), "credits_delta": delta})
+            return rows
 
         if "from monthly_brand_statements" in sql:
             merchant_id = params["merchant_id"]

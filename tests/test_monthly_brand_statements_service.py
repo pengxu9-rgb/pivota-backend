@@ -20,14 +20,14 @@ class _FakeStatementsDatabase:
         self.subscription_plans: list[dict[str, Any]] = []
         self.merchants: list[dict[str, Any]] = []
         self.user_subscriptions: list[dict[str, Any]] = []
-        self.credit_ledger: list[dict[str, Any]] = []
+        self.usage_events: list[dict[str, Any]] = []
         self.commerce_attribution_edges: list[dict[str, Any]] = []
         self.monthly_brand_statements: list[dict[str, Any]] = []
         self.invoices: list[dict[str, Any]] = []
         self.billing_run_items: list[dict[str, Any]] = []
         self._next_plan_id = 1
         self._next_subscription_id = 1
-        self._next_credit_ledger_id = 1
+        self._next_usage_event_id = 1
         self._next_statement_id = 1
 
     @asynccontextmanager
@@ -37,17 +37,33 @@ class _FakeStatementsDatabase:
     async def fetch_all(self, query: str, values: dict[str, Any] | None = None):
         sql = _normalize_sql(query)
         params = dict(values or {})
-        if "from credit_ledger" in sql:
+        if "from agent_center_usage_events" in sql:
             merchant_id = params["merchant_id"]
             period_start = params["period_start"]
             period_end = params["period_end"]
-            rows = [
-                row
-                for row in self.credit_ledger
-                if row["merchant_id"] == merchant_id
-                and row["credits_delta"] < 0
-                and period_start <= _as_date(row["occurred_at"]) < period_end
-            ]
+            debit_types = {
+                "credit_debit_audit",
+                "credit_debit_prompt",
+                "credit_debit_execution",
+            }
+            grant_types = {
+                "credit_grant_audit",
+                "credit_grant_prompt",
+                "credit_grant_execution",
+            }
+            rows = []
+            for ev in self.usage_events:
+                if ev["merchant_id"] != merchant_id:
+                    continue
+                if not (period_start <= _as_date(ev["created_at"]) < period_end):
+                    continue
+                if ev["billing_mode"] == "debit" and ev["event_type"] in debit_types:
+                    delta = -int(ev["quantity"])
+                elif ev["billing_mode"] == "credit" and ev["event_type"] in grant_types:
+                    delta = int(ev["quantity"])
+                else:
+                    continue
+                rows.append({"id": ev["id"], "credits_delta": delta})
             return sorted(rows, key=lambda row: row["id"])
         raise AssertionError(f"Unhandled fetch_all query: {query}")
 
@@ -194,23 +210,22 @@ class _FakeStatementsDatabase:
         )
         return subscription_id
 
-    def consume_credits(self, *, merchant_id: str, credits: int, occurred_at: datetime) -> int:
-        ledger_id = self._next_credit_ledger_id
-        self._next_credit_ledger_id += 1
-        self.credit_ledger.append(
+    def consume_credits(self, *, merchant_id: str, credits: int, occurred_at: datetime) -> str:
+        # Consumption is metered to agent_center_usage_events by the wired debit
+        # path, which is what assemble_for_month now reads.
+        event_id = f"mcb_{self._next_usage_event_id:09d}"
+        self._next_usage_event_id += 1
+        self.usage_events.append(
             {
-                "id": ledger_id,
+                "id": event_id,
                 "merchant_id": merchant_id,
-                "operation_type": "operation_commit",
-                "operation_id": f"op_{ledger_id}",
-                "credits_delta": -credits,
-                "balance_after": 0,
-                "occurred_at": occurred_at,
-                "source_type": "operation_commit",
-                "metadata": {},
+                "billing_mode": "debit",
+                "event_type": "credit_debit_audit",
+                "quantity": int(credits),
+                "created_at": occurred_at,
             }
         )
-        return ledger_id
+        return event_id
 
     def add_gmv_edge(
         self,
@@ -313,6 +328,38 @@ def fake_db(monkeypatch: pytest.MonkeyPatch) -> _FakeStatementsDatabase:
     monkeypatch.setattr(statements, "IS_POSTGRES", False)
     monkeypatch.setattr(credit_overage_billing, "database", db)
     return db
+
+
+async def test_assemble_and_freeze_report_only_freezes_without_invoicing(
+    fake_db: _FakeStatementsDatabase,
+) -> None:
+    month = date(2025, 6, 1)
+    merchant_id = "merch_report_only"
+    plan_id = fake_db.add_plan(name="starter", price_cents=9900, allowance=4000)
+    fake_db.add_merchant(merchant_id)
+    fake_db.add_subscription(merchant_id=merchant_id, plan_id=plan_id, month=month)
+    fake_db.consume_credits(
+        merchant_id=merchant_id,
+        credits=5500,
+        occurred_at=datetime(2025, 6, 15, tzinfo=timezone.utc),
+    )
+
+    statement_id = await statements.assemble_and_freeze_report_only(merchant_id, month)
+
+    row = fake_db.statement(statement_id)
+    # Consumption mirrored from the balance system, and the row is frozen (so it
+    # surfaces in the merchant statements list) but NOT invoiced — overage is
+    # already charged inline by the debit path; this path must never bill.
+    assert row["credits_consumed"] == 5500
+    assert row["overage_credits"] == 1500
+    assert row["overage_revenue_usd_cents"] == 1950
+    assert row["status"] == "frozen"
+    assert row["invoiced_at"] is None
+
+    # Idempotent: re-running returns the same id and leaves it frozen.
+    again = await statements.assemble_and_freeze_report_only(merchant_id, month)
+    assert again == statement_id
+    assert fake_db.statement(statement_id)["status"] == "frozen"
 
 
 async def test_starter_brand_normal_usage_brief_9_1(fake_db: _FakeStatementsDatabase) -> None:
