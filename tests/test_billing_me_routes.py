@@ -723,10 +723,12 @@ class _FakeSessions:
         self.fail_for = fail_for
         self.error = error
         self.customers_seen: list[str] = []
+        self.params_seen: list[dict] = []
 
     def create(self, params, opts):
         cust = params["customer"]
         self.customers_seen.append(cust)
+        self.params_seen.append(params)
         if cust == self.fail_for:
             raise self.error
         return _SObj(id="cs_new", url="https://stripe.test/cs_new")
@@ -792,6 +794,8 @@ def test_checkout_recreates_customer_when_stored_customer_missing(monkeypatch) -
     assert fake.v1.customers.created == 1                       # recreated exactly once
     assert persisted["id"] == "cus_new"                        # new id persisted → self-heals
     assert fake.v1.checkout.sessions.customers_seen == ["cus_stale", "cus_new"]  # failed, then retried
+    # promo-code field enabled on every session payload (free-test support)
+    assert all(p.get("allow_promotion_codes") is True for p in fake.v1.checkout.sessions.params_seen)
 
 
 def test_checkout_does_not_swallow_unrelated_stripe_errors(monkeypatch) -> None:
