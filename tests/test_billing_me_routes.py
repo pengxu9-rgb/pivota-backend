@@ -724,11 +724,13 @@ class _FakeSessions:
         self.error = error
         self.customers_seen: list[str] = []
         self.params_seen: list[dict] = []
+        self.keys_seen: list[str] = []
 
     def create(self, params, opts):
         cust = params["customer"]
         self.customers_seen.append(cust)
         self.params_seen.append(params)
+        self.keys_seen.append((opts or {}).get("idempotency_key"))
         if cust == self.fail_for:
             raise self.error
         return _SObj(id="cs_new", url="https://stripe.test/cs_new")
@@ -796,6 +798,29 @@ def test_checkout_recreates_customer_when_stored_customer_missing(monkeypatch) -
     assert fake.v1.checkout.sessions.customers_seen == ["cus_stale", "cus_new"]  # failed, then retried
     # promo-code field enabled on every session payload (free-test support)
     assert all(p.get("allow_promotion_codes") is True for p in fake.v1.checkout.sessions.params_seen)
+    # recreate path must use a DIFFERENT idempotency key (payload-derived), so
+    # the retry with the new customer never collides with the failed first key.
+    keys = fake.v1.checkout.sessions.keys_seen
+    assert keys[0] != keys[1] and all(keys)
+
+
+def test_checkout_idempotency_key_varies_with_urls(monkeypatch) -> None:
+    # Same merchant/price but different success/cancel URLs must produce
+    # different idempotency keys — otherwise Stripe raises IdempotencyError.
+    fake = _FakeStripeClient(fail_for=None, error=_mk_err("never"))  # never fails
+    _patch_checkout_deps(monkeypatch, fake)
+    merchant = {"merchant_id": "merch_1", "contact_email": "m@example.com", "status": "approved"}
+
+    asyncio.run(module.create_billing_checkout_session(
+        body=module.CheckoutSessionRequest(price_id="price_x", success_url="https://a/s", cancel_url="https://a/c"),
+        merchant=merchant,
+    ))
+    asyncio.run(module.create_billing_checkout_session(
+        body=module.CheckoutSessionRequest(price_id="price_x", success_url="https://b/s", cancel_url="https://b/c"),
+        merchant=merchant,
+    ))
+    k1, k2 = fake.v1.checkout.sessions.keys_seen
+    assert k1 and k2 and k1 != k2
 
 
 def test_checkout_does_not_swallow_unrelated_stripe_errors(monkeypatch) -> None:
