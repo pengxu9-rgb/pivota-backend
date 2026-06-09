@@ -15,6 +15,7 @@ from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     evaluate_psp_readiness,
     fetch_active_merchant_psps,
+    normalize_psp_environment,
 )
 from utils.logger import logger
 from utils.transient_errors import is_asyncpg_busy_error
@@ -153,13 +154,40 @@ class MultiPSPOrchestrator:
         restrict_to_preferred_psps: bool = False,
         canonical_psp_required: bool = False,
         enforce_live_readiness: bool = False,
+        restrict_environment: Optional[str] = None,
     ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
         """
         Create payment intent with automatic PSP failover
-        
+
+        restrict_environment: when set to "test" (or "live"), HARD-restrict candidate PSPs to that
+        environment, classified by the runtime secret-key prefix (the stronger signal — a row holding
+        sk_live_ is treated as live even if its environment column says "test"). This is the safety guarantee
+        for the test-PSP probe: with restrict_environment="test", a LIVE row is structurally impossible to
+        select, so the probe can never charge real money. If no row matches, the candidate list is empty and
+        we FAIL CLOSED ("No PSP configured") rather than falling back to a non-matching (e.g. live) row.
+
         Returns: (success, payment_intent, error, psp_used)
         """
         await self.load_psp_configs(canonical_only=canonical_psp_required)
+
+        # SAFETY-CRITICAL environment restriction (applied BEFORE preferred reorder so it is authoritative).
+        # NOTE: preferred_psps/restrict_to_preferred_psps filter by PROVIDER NAME only and would still admit a
+        # live row of that provider; this filters by the actual key ENVIRONMENT, which is what the charge uses.
+        if restrict_environment:
+            target_env = str(restrict_environment).strip().lower()
+            self.psp_configs = [
+                cfg
+                for cfg in self.psp_configs
+                if normalize_psp_environment(cfg.psp_type, cfg.secret_key or cfg.api_key, cfg.environment)
+                == target_env
+            ]
+            if not self.psp_configs:
+                logger.warning(
+                    "[MultiPSP] restrict_environment=%s left NO candidate PSP for merchant %s — failing closed",
+                    target_env,
+                    self.merchant_id,
+                )
+                return False, None, f"No {target_env}-environment PSP configured for merchant", "none"
 
         # Reorder configs based on preferred_psps (from routing UI) if provided
         if preferred_psps:
@@ -431,6 +459,7 @@ async def create_payment_with_failover(
     restrict_to_preferred_psps: bool = False,
     canonical_psp_required: bool = False,
     enforce_live_readiness: bool = False,
+    restrict_environment: Optional[str] = None,
 ) -> Tuple[bool, Optional[PaymentIntent], Optional[str], str]:
     """
     Convenience function to create payment with multi-PSP support
@@ -452,4 +481,5 @@ async def create_payment_with_failover(
         restrict_to_preferred_psps=restrict_to_preferred_psps,
         canonical_psp_required=canonical_psp_required,
         enforce_live_readiness=enforce_live_readiness,
+        restrict_environment=restrict_environment,
     )

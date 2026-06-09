@@ -743,6 +743,28 @@ async def create_payment(
         if requested_psp_mode == "stripe_checkout":
             preferred_psps = ["stripe"]
 
+        # TEST-PSP PROBE (default OFF) — the hosted-checkout buyer-pay path normally enforces live readiness.
+        # For an order EXPLICITLY flagged for the test-PSP probe, relax live enforcement AND hard-restrict the
+        # charge to the merchant's TEST-environment PSP so a live row can never be charged. The decision reuses
+        # the SAME server-side triple-gate as the create-order path — _resolve_order_live_readiness_requirement
+        # returns False only when {ALLOW_TEST_PSP_PROBE on} + {merchant in TEST_PSP_PROBE_MERCHANTS} +
+        # {allow_test_psp_surfaces/enforce_live_readiness=false in order metadata}. For every normal order it
+        # returns True → enforce_live_readiness stays True and restrict_environment stays None (unchanged
+        # behavior). Local import avoids a module-level circular import with routes.order_routes.
+        from routes.order_routes import _resolve_order_live_readiness_requirement
+
+        enforce_live_readiness_flag = _resolve_order_live_readiness_requirement(
+            order_metadata, merchant_id=merchant_id
+        )
+        restrict_payment_environment = None if enforce_live_readiness_flag else "test"
+        if restrict_payment_environment:
+            logger.warning(
+                "[AgentPayments] TEST-PSP probe active for order %s (merchant %s): live readiness relaxed, "
+                "charge HARD-restricted to test-environment PSP (no live charge possible).",
+                request.order_id,
+                merchant_id,
+            )
+
         # Use MultiPSPOrchestrator for real payment creation with failover
         try:
             from mvp.governance import governance
@@ -791,7 +813,8 @@ async def create_payment(
                     preferred_psps=preferred_psps,
                     restrict_to_preferred_psps=bool(auth_first_manual_capture or requested_psp_mode),
                     canonical_psp_required=True,
-                    enforce_live_readiness=True,
+                    enforce_live_readiness=enforce_live_readiness_flag,
+                    restrict_environment=restrict_payment_environment,
                 ),
                 timeout=AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
             )
