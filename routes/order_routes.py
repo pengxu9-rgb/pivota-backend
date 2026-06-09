@@ -4276,7 +4276,18 @@ async def create_new_order(
             if defer_order_payment_surface:
                 success, payment_intent, error, psp_used = True, None, None, psp_type
             else:
-                success, payment_intent, error, psp_used = await create_payment_with_failover(
+                # BUG-3 fix: bound the interactive form-load latency. This call synchronously creates the
+                # Stripe PaymentIntent that gates the checkout page's payment form; a slow/hung PSP request
+                # (Stripe read timeout is 20s) and sequential multi-PSP failover (the merchant has several PSP
+                # rows) could otherwise stack to ~30s before the form renders. Cap it and fail fast as a
+                # retryable payment-init error — the `not success` branch below degrades gracefully (logs +
+                # platform-checkout fallback; the order is still created). On timeout the underlying call may
+                # still create an UNCONFIRMED PaymentIntent in the background — harmless, no money is captured
+                # until confirmation.
+                _order_payment_init_timeout = max(
+                    2.0, float(os.getenv("ORDER_PAYMENT_INIT_TIMEOUT_SECONDS", "8") or "8")
+                )
+                _pay_coro = create_payment_with_failover(
                     merchant_id=order_request.merchant_id,
                     amount=total,
                     currency=order_request.currency,
@@ -4316,6 +4327,22 @@ async def create_new_order(
                     canonical_psp_required=True,
                     enforce_live_readiness=enforce_live_readiness,
                 )
+                try:
+                    success, payment_intent, error, psp_used = await asyncio.wait_for(
+                        _pay_coro, timeout=_order_payment_init_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[OrderRoutes] create_payment_with_failover exceeded %.1fs for order %s — failing fast (retryable)",
+                        _order_payment_init_timeout,
+                        order_id,
+                    )
+                    success, payment_intent, error, psp_used = (
+                        False,
+                        None,
+                        "payment_initiation_timeout",
+                        psp_type,
+                    )
             logger.info(
                 "[OrderRoutes][PERF] step=create_payment_with_failover duration_ms=%d order=%s",
                 int((time.perf_counter() - _t) * 1000),
