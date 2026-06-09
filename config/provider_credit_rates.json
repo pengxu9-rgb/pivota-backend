@@ -1,6 +1,7 @@
 {
   "credit_to_usd": 0.01,
-  "provider_cost_fraction": 0.65,
+  "flat_multiple": 1.2,
+  "pricing_note": "Customer price = provider COGS (tokens x model price + grounding) x flat_multiple, converted to credits at credit_to_usd. flat_multiple=1.2 => 20% markup over COGS. Supersedes the legacy provider_cost_fraction=0.65 (~1.538x markup).",
   "rounding_decimal_places": 1,
   "representative_probe": {
     "input_tokens": 2000,
@@ -26,9 +27,9 @@
       "default_grounded": true,
       "prompt_fraction": 1.0,
       "input_cost_usd_per_1m_tokens": 5.00,
-      "output_cost_usd_per_1m_tokens": 20.00,
+      "output_cost_usd_per_1m_tokens": 30.00,
       "grounding_cost_usd_per_call": 0.0150,
-      "notes": "Conservative list-based interactive audit rate: ~5.4 credits/probe. Future shared-system-prompt caching plus batch/flex can drop this toward ~3.0 credits/probe once implemented."
+      "notes": "gpt-5.5 real list price $5/$30 per 1M (in/out) confirmed Jun 2026. Cached input ($0.50/1M) and batch/flex ($2.50/$15) can lower this once implemented."
     },
     "claude": {
       "aliases": ["anthropic_claude_sonnet_grounded"],

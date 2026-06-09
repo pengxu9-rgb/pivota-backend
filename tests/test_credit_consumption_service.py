@@ -23,7 +23,8 @@ def test_estimate_probe_credits_matches_audit_pricing():
     from routes.audit_runs_routes import _audit_metering
 
     # The probe set the audit path builds for 1 SKU / 1 prompt, gemini+chatgpt,
-    # deepseek verify @ 0.25 sample == the live-verified 12-credit scenario.
+    # deepseek verify @ 0.25 sample. At flat_multiple=1.2 (gpt-5.5 output $30)
+    # this is 10 credits (was 12 at the legacy 1.538x markup).
     audit_credits, _ = _audit_metering(
         sku_count=1,
         prompts_per_sku=1,
@@ -31,7 +32,7 @@ def test_estimate_probe_credits_matches_audit_pricing():
         verify_providers=["deepseek"],
         verify_sample={"positive_fraction": 0.25, "max_per_sku": None},
     )
-    assert audit_credits == 12
+    assert audit_credits == 10
 
 
 def test_estimate_zero_and_negative_probes_are_ignored():
