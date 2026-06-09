@@ -1030,6 +1030,44 @@ async def require_verified_payment_method(merchant_id: str) -> None:
     await _verified_default_payment_method_for_direct_merchant(merchant_id)
 
 
+async def _fallback_payment_method_id(stripe_customer_id: str) -> str:
+    """Find a chargeable card when the customer has no
+    invoice_settings.default_payment_method.
+
+    Checkout in subscription mode attaches the card to the subscription (and the
+    customer) but does not reliably set the customer-level default PM, which the
+    off-session audit/overage charge path reads. Fall back to the active
+    subscription's default PM, then any attached card, so a merchant who paid for
+    a subscription can still be charged off-session. Returns a PM id or ''.
+    """
+    try:
+        subs = await asyncio.to_thread(
+            stripe_client.v1.subscriptions.list,
+            {"customer": stripe_customer_id, "status": "active", "limit": 3},
+        )
+    except Exception as exc:
+        if _is_stripe_error(exc):
+            return ""
+        raise
+    for sub in _stripe_object_to_dict(subs).get("data", []) or []:
+        pm = sub.get("default_payment_method") if isinstance(sub, dict) else None
+        pm_id = _stripe_id(pm) if pm else ""
+        if pm_id:
+            return pm_id
+
+    try:
+        pms = await asyncio.to_thread(
+            stripe_client.v1.payment_methods.list,
+            {"customer": stripe_customer_id, "type": "card", "limit": 1},
+        )
+    except Exception as exc:
+        if _is_stripe_error(exc):
+            return ""
+        raise
+    data = _stripe_object_to_dict(pms).get("data", []) or []
+    return _stripe_id(data[0]) if data else ""
+
+
 async def _verified_default_payment_method_for_direct_merchant(
     merchant_id: str,
 ) -> tuple[str, str]:
@@ -1060,6 +1098,11 @@ async def _verified_default_payment_method_for_direct_merchant(
         if isinstance(invoice_settings, dict)
         else None
     )
+    if not default_payment_method:
+        # No customer-level default PM (common after Checkout subscription mode).
+        # Fall back to the subscription's default PM / an attached card before
+        # giving up, so paid merchants aren't blocked from off-session charges.
+        default_payment_method = await _fallback_payment_method_id(stripe_customer_id)
     if not default_payment_method:
         raise MissingVerifiedPaymentMethodError(
             merchant_id,

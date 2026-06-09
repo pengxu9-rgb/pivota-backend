@@ -971,6 +971,87 @@ async def test_require_verified_payment_method_maps_stripe_error(monkeypatch):
     assert err.value.reason == "stripe_unavailable"
 
 
+@pytest.mark.asyncio
+async def test_require_verified_payment_method_falls_back_to_subscription_pm(monkeypatch):
+    """No customer-level default PM -> use the active subscription's default PM."""
+    from services import merchant_credit_balance_service as svc
+
+    async def resolver(*_args, **_kwargs):
+        return "cus_123"
+
+    class _Customers:
+        def retrieve(self, customer_id):
+            return {"id": customer_id, "invoice_settings": {"default_payment_method": None}}
+
+    class _Subscriptions:
+        def list(self, params=None, options=None):
+            assert params["customer"] == "cus_123"
+            return {"data": [{"default_payment_method": "pm_sub"}]}
+
+    class _PaymentMethods:
+        def retrieve(self, payment_method_id):
+            assert payment_method_id == "pm_sub"
+            return {
+                "id": payment_method_id,
+                "type": "card",
+                "customer": "cus_123",
+                "card": {"exp_month": 12, "exp_year": datetime.now(timezone.utc).year + 1},
+            }
+
+        def list(self, params=None, options=None):  # pragma: no cover - sub PM wins first
+            raise AssertionError("attached-card fallback should not run when a sub PM exists")
+
+    class _V1:
+        customers = _Customers()
+        subscriptions = _Subscriptions()
+        payment_methods = _PaymentMethods()
+
+    class _StripeClient:
+        v1 = _V1()
+
+    monkeypatch.setattr(svc, "resolve_merchant_stripe_customer_id", resolver)
+    monkeypatch.setattr(svc, "stripe_client", _StripeClient())
+
+    customer_id, pm_id = await svc._verified_default_payment_method_for_direct_merchant("merch-A")
+    assert (customer_id, pm_id) == ("cus_123", "pm_sub")
+
+
+@pytest.mark.asyncio
+async def test_require_verified_payment_method_no_pm_anywhere_raises(monkeypatch):
+    """No default PM, no subscription PM, no attached card -> no_default_pm."""
+    from services import merchant_credit_balance_service as svc
+
+    async def resolver(*_args, **_kwargs):
+        return "cus_123"
+
+    class _Customers:
+        def retrieve(self, customer_id):
+            return {"id": customer_id, "invoice_settings": {"default_payment_method": None}}
+
+    class _Subscriptions:
+        def list(self, params=None, options=None):
+            return {"data": []}
+
+    class _PaymentMethods:
+        def list(self, params=None, options=None):
+            return {"data": []}
+
+    class _V1:
+        customers = _Customers()
+        subscriptions = _Subscriptions()
+        payment_methods = _PaymentMethods()
+
+    class _StripeClient:
+        v1 = _V1()
+
+    monkeypatch.setattr(svc, "resolve_merchant_stripe_customer_id", resolver)
+    monkeypatch.setattr(svc, "stripe_client", _StripeClient())
+
+    with pytest.raises(svc.MissingVerifiedPaymentMethodError) as err:
+        await svc.require_verified_payment_method("merch-A")
+    assert err.value.reason == "no_default_pm"
+
+
 def test_credits_for_probe_uses_seeded_provider_config():
     from services.provider_credit_rates import credits_for_probe
 
