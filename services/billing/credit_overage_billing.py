@@ -148,40 +148,12 @@ async def _locked_statement(statement_id: int) -> Any:
 
 
 async def _stripe_customer_id_for_merchant(merchant_id: str) -> str:
-    # Read MUST mirror how checkout persists the id: the merchants row carrying
-    # the customer id may be keyed by the onboarding contact_email rather than
-    # this merchant_id (the two layers can diverge). Resolve merchant_id first,
-    # then fall back to the contact_email row that actually has a customer id.
-    row = await database.fetch_one(
-        """
-        SELECT stripe_customer_id
-        FROM merchants
-        WHERE merchant_id = :merchant_id
-          AND stripe_customer_id IS NOT NULL
-          AND stripe_customer_id <> ''
-        LIMIT 1
-        """,
-        {"merchant_id": merchant_id},
-    )
-    stripe_customer_id = _row_text(row, "stripe_customer_id") if row else ""
-    if not stripe_customer_id:
-        from db.merchant_onboarding import get_merchant_onboarding
+    # Shared resolver: merchant_id-first, onboarding contact_email fallback.
+    # See billing_routes.resolve_merchant_stripe_customer_id for why the
+    # merchants/merchant_onboarding link is unreliable.
+    from routes.billing_routes import resolve_merchant_stripe_customer_id
 
-        onboarding = await get_merchant_onboarding(merchant_id)
-        contact_email = _row_text(onboarding, "contact_email") if onboarding else ""
-        if contact_email:
-            row = await database.fetch_one(
-                """
-                SELECT stripe_customer_id
-                FROM merchants
-                WHERE LOWER(contact_email) = LOWER(:contact_email)
-                  AND stripe_customer_id IS NOT NULL
-                  AND stripe_customer_id <> ''
-                LIMIT 1
-                """,
-                {"contact_email": contact_email},
-            )
-            stripe_customer_id = _row_text(row, "stripe_customer_id") if row else ""
+    stripe_customer_id = await resolve_merchant_stripe_customer_id(database, merchant_id)
     if not stripe_customer_id:
         raise CreditOverageBillingError(
             f"Merchant {merchant_id} has no Stripe customer for overage invoicing"

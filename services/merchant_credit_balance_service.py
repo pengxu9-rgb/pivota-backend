@@ -24,8 +24,8 @@ from core.billing_constants import overage_revenue_cents
 from db.database import database
 from routes.billing_routes import (
     _as_text as _billing_as_text,
-    _fetch_merchant_billing_row,
     _stripe_object_to_dict,
+    resolve_merchant_stripe_customer_id,
     stripe_client,
 )
 
@@ -965,49 +965,10 @@ async def credit(
 
 
 async def _stripe_customer_id_for_direct_merchant(merchant_id: str) -> str:
-    """Resolve the merchant's Stripe customer id, mirroring how checkout stores it.
-
-    Checkout persists `merchants.stripe_customer_id` via a permissive
-    `(merchant_id OR contact_email)` match (see billing_routes
-    `_update_merchant_stripe_customer_id`), because the `merchants` row is
-    provisioned by a different layer than `merchant_onboarding` and its
-    `merchant_id` can be NULL/divergent while `contact_email` matches. A
-    strict `merchant_id`-only read then misses the row the id was written to,
-    surfacing as `missing_stripe_customer` at the paid-audit gate and breaking
-    overage billing (which resolves the same way). Resolve `merchant_id` first,
-    then fall back to the onboarding `contact_email` so reads match writes.
-    """
-    billing_row = await _fetch_merchant_billing_row(
-        database,
-        merchant_id=merchant_id,
-        contact_email=None,
-        stripe_customer_id=None,
-    )
-    customer_id = _billing_as_text((billing_row or {}).get("stripe_customer_id"))
-    if customer_id:
-        return customer_id
-
-    # Fallback: the merchants row carrying the customer id may be keyed by the
-    # onboarding contact_email rather than this merchant_id. Target a row that
-    # actually has a customer id to avoid re-selecting the empty merchant_id row.
-    from db.merchant_onboarding import get_merchant_onboarding
-
-    onboarding = await get_merchant_onboarding(merchant_id)
-    contact_email = _billing_as_text((onboarding or {}).get("contact_email"))
-    if not contact_email:
-        return ""
-    row = await database.fetch_one(
-        """
-        SELECT stripe_customer_id
-          FROM merchants
-         WHERE LOWER(contact_email) = LOWER(:contact_email)
-           AND stripe_customer_id IS NOT NULL
-           AND stripe_customer_id <> ''
-         LIMIT 1
-        """,
-        {"contact_email": contact_email},
-    )
-    return _billing_as_text(_row_to_dict(row).get("stripe_customer_id")) if row else ""
+    """Resolve the merchant's Stripe customer id via the shared billing resolver
+    (merchant_id-first, onboarding contact_email fallback). See
+    billing_routes.resolve_merchant_stripe_customer_id for why the fork exists."""
+    return await resolve_merchant_stripe_customer_id(database, merchant_id)
 
 
 def _stripe_id(value: Any) -> str:
