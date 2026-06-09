@@ -1055,6 +1055,7 @@ async def test_require_verified_payment_method_no_pm_anywhere_raises(monkeypatch
 def test_credits_for_probe_uses_seeded_provider_config():
     from services.provider_credit_rates import credits_for_probe
 
-    assert credits_for_probe("gemini", grounded=True) == pytest.approx(5.7)
-    assert credits_for_probe("chatgpt", grounded=True) == pytest.approx(5.4)
+    # Pricing: COGS x flat_multiple(1.2) / credit_to_usd(0.01); gpt-5.5 output $30.
+    assert credits_for_probe("gemini", grounded=True) == pytest.approx(4.4)
+    assert credits_for_probe("chatgpt", grounded=True) == pytest.approx(4.8)
     assert credits_for_probe("deepseek", grounded=False) == pytest.approx(0.1)

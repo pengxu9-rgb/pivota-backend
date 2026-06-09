@@ -106,24 +106,34 @@ def credits_for_probe(
 ) -> float:
     """Convert a provider probe's COGS into abstract Pivota credits.
 
-    Formula from the committed pricing model:
-    credits_per_probe = provider_cost_usd / (credit_to_usd *
-    provider_cost_fraction). Both conversion constants come from config.
+    Pricing model: customer price = COGS_usd * flat_multiple, billed in credits
+    at credit_to_usd. So credits = COGS_usd * flat_multiple / credit_to_usd.
+    flat_multiple is the markup over provider cost (1.2 => 20% over COGS).
+
+    Back-compat: if `flat_multiple` is absent, fall back to the legacy
+    `provider_cost_fraction` form (multiple = 1 / provider_cost_fraction).
     """
     config = load_provider_credit_config()
-    denominator = (
-        _decimal(config.get("credit_to_usd"))
-        * _decimal(config.get("provider_cost_fraction"))
-    )
-    if denominator <= 0:
-        raise ValueError("credit conversion denominator must be > 0")
+    credit_to_usd = _decimal(config.get("credit_to_usd"))
+    if credit_to_usd <= 0:
+        raise ValueError("credit_to_usd must be > 0")
+
+    if config.get("flat_multiple") is not None:
+        multiple = _decimal(config.get("flat_multiple"))
+    else:
+        fraction = _decimal(config.get("provider_cost_fraction"))
+        if fraction <= 0:
+            raise ValueError("provider_cost_fraction must be > 0")
+        multiple = Decimal("1") / fraction
+    if multiple <= 0:
+        raise ValueError("flat_multiple must be > 0")
 
     credits = provider_probe_cost_usd(
         provider,
         grounded=grounded,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-    ) / denominator
+    ) * multiple / credit_to_usd
     places = int(config.get("rounding_decimal_places", 1))
     quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
     rounded = credits.quantize(quant, rounding=ROUND_HALF_UP)
