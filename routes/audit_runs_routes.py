@@ -70,11 +70,10 @@ from services.coverage_profiles import (
     resolve_provider_models,
 )
 from services.provider_credit_rates import (
-    credits_for_probe,
     provider_default_grounded,
-    provider_probe_cost_usd,
     provider_prompt_fraction,
 )
+from services.credit_consumption_service import estimate_probe_credits
 from utils.auth import get_current_merchant
 
 logger = logging.getLogger(__name__)
@@ -528,47 +527,33 @@ def _audit_metering(
     verify_providers: Optional[List[str]] = None,
     verify_sample: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, Decimal]:
+    # Build the provider-probe set, then price it through the shared per-probe
+    # estimator (credit_consumption_service) so audit and any future metered
+    # workflow bill identically per probe. Model overrides intentionally do not
+    # alter audit credits yet — ChatGPT stays on the single conservative
+    # provider rate (~5.4 credits/probe) until per-model rate mapping becomes a
+    # separate productized follow-up.
     total_prompts = int(sku_count) * int(prompts_per_sku)
-    credits_total = Decimal("0")
-    usd_cogs_total = Decimal("0")
+    probes: List[Tuple[str, int, bool]] = []
     for provider in providers:
         fraction = provider_prompt_fraction(provider)
         probe_count = int(math.ceil(float(Decimal(total_prompts) * fraction)))
         if probe_count <= 0:
             continue
-        grounded = provider_default_grounded(provider)
-        # Model overrides intentionally do not alter audit credits yet.
-        # ChatGPT stays on the single conservative provider rate (~5.4
-        # credits/probe) until per-model rate mapping becomes a separate
-        # productized follow-up.
-        per_probe_credits = Decimal(str(credits_for_probe(
-            provider,
-            grounded=grounded,
-        )))
-        credits_total += per_probe_credits * probe_count
-        usd_cogs_total += (
-            provider_probe_cost_usd(provider, grounded=grounded)
-            * Decimal(probe_count)
-        )
+        probes.append((provider, probe_count, provider_default_grounded(provider)))
+
     verify_count_per_sku = _verify_probe_count_per_sku(
         prompts_per_sku=prompts_per_sku,
         verify_sample=verify_sample,
     )
     verify_probe_count = int(sku_count) * verify_count_per_sku
-    for provider in _normalize_nonempty(verify_providers):
-        if verify_probe_count <= 0:
-            continue
-        grounded = provider_default_grounded(provider)
-        per_probe_credits = Decimal(str(credits_for_probe(
-            provider,
-            grounded=grounded,
-        )))
-        credits_total += per_probe_credits * verify_probe_count
-        usd_cogs_total += (
-            provider_probe_cost_usd(provider, grounded=grounded)
-            * Decimal(verify_probe_count)
-        )
-    return int(math.ceil(float(credits_total))), usd_cogs_total
+    if verify_probe_count > 0:
+        for provider in _normalize_nonempty(verify_providers):
+            probes.append(
+                (provider, verify_probe_count, provider_default_grounded(provider))
+            )
+
+    return estimate_probe_credits(probes)
 
 
 def _balance_public_shape(balance: Dict[str, Any]) -> Dict[str, Any]:
