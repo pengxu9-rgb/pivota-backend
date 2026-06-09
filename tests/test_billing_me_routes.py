@@ -19,6 +19,7 @@ class _FakeBillingMeDatabase:
     def __init__(self) -> None:
         self.subscriptions: list[dict[str, Any]] = []
         self.credit_ledger: list[dict[str, Any]] = []
+        self.usage_events: list[dict[str, Any]] = []
         self.monthly_brand_statements: list[dict[str, Any]] = []
         self.last_statement_limit: int | None = None
 
@@ -67,6 +68,32 @@ class _FakeBillingMeDatabase:
                     "subscription_revenue_usd_cents", 0
                 ),
             }
+
+        if "from agent_center_usage_events" in sql:
+            merchant_id = params["merchant_id"]
+            period_start = params["period_start"]
+            period_end = params["period_end"]
+            debit_types = {
+                "credit_debit_audit",
+                "credit_debit_prompt",
+                "credit_debit_execution",
+            }
+            grant_types = {
+                "credit_grant_audit",
+                "credit_grant_prompt",
+                "credit_grant_execution",
+            }
+            consumed = 0
+            for ev in self.usage_events:
+                if ev["merchant_id"] != merchant_id:
+                    continue
+                if not (period_start <= _as_date(ev["created_at"]) < period_end):
+                    continue
+                if ev["billing_mode"] == "debit" and ev["event_type"] in debit_types:
+                    consumed += int(ev["quantity"])
+                elif ev["billing_mode"] == "credit" and ev["event_type"] in grant_types:
+                    consumed -= int(ev["quantity"])
+            return {"consumed": consumed}
 
         raise AssertionError(f"Unhandled fetch_one query: {query}")
 
@@ -133,13 +160,35 @@ class _FakeBillingMeDatabase:
         merchant_id: str = "merch_1",
         credits: int,
         occurred_at: date = date(2026, 5, 15),
+        event_type: str = "credit_debit_audit",
     ) -> None:
-        self.credit_ledger.append(
+        # Consumption is metered to agent_center_usage_events by the wired debit
+        # path, which is what current_period_usage_snapshot reads.
+        self.usage_events.append(
             {
-                "id": len(self.credit_ledger) + 1,
                 "merchant_id": merchant_id,
-                "credits_delta": -int(credits),
-                "occurred_at": occurred_at,
+                "billing_mode": "debit",
+                "event_type": event_type,
+                "quantity": int(credits),
+                "created_at": occurred_at,
+            }
+        )
+
+    def add_credit_refund(
+        self,
+        *,
+        merchant_id: str = "merch_1",
+        credits: int,
+        occurred_at: date = date(2026, 5, 15),
+        event_type: str = "credit_grant_audit",
+    ) -> None:
+        self.usage_events.append(
+            {
+                "merchant_id": merchant_id,
+                "billing_mode": "credit",
+                "event_type": event_type,
+                "quantity": int(credits),
+                "created_at": occurred_at,
             }
         )
 
@@ -277,6 +326,46 @@ def test_current_period_in_overage_returns_overage_count_and_total(
     assert body["consumed_credits"] == 5500
     assert body["overage_count"] == 1500
     assert body["overage_total_usd_cents"] == 1950
+    assert body["in_overage"] is True
+
+
+def test_current_period_nets_refunds_and_ignores_topups_and_overage_charges(
+    fake_db: _FakeBillingMeDatabase,
+) -> None:
+    fake_db.add_subscription()  # allowance 4000
+    fake_db.add_credit_use(credits=5500)  # audit debits
+    fake_db.add_credit_use(credits=200, event_type="credit_debit_prompt")
+    fake_db.add_credit_refund(credits=700)  # failed-audit refund nets consumption down
+    # Non-consumption events that must be excluded from consumed_credits:
+    fake_db.usage_events.append(
+        {
+            "merchant_id": "merch_1",
+            "billing_mode": "credit",
+            "event_type": "credit_topup",  # purchased credits, not consumption
+            "quantity": 10000,
+            "created_at": date(2026, 5, 10),
+        }
+    )
+    fake_db.usage_events.append(
+        {
+            "merchant_id": "merch_1",
+            "billing_mode": "debit",
+            "event_type": "credit_overage_charge",  # billing event, not consumption
+            "quantity": 2000,
+            "created_at": date(2026, 5, 10),
+        }
+    )
+    client, app = _build_client()
+    try:
+        response = client.get("/api/billing/me/current-period")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    # 5500 + 200 - 700 = 5000; topup/overage-charge rows ignored.
+    assert body["consumed_credits"] == 5000
+    assert body["overage_count"] == 1000
     assert body["in_overage"] is True
 
 
