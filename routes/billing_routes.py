@@ -349,6 +349,9 @@ async def create_billing_checkout_session(
             "success_url": success_url,
             "cancel_url": cancel_url,
             "metadata": metadata,
+            # Show the "Add promotion code" field on hosted Checkout. Additive:
+            # nothing is discounted unless the buyer enters a valid code.
+            "allow_promotion_codes": True,
         }
 
     try:
