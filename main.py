@@ -142,6 +142,9 @@ from routes.admin_migrations import router as admin_migrations_router
 from routes.admin_apply_agent_center_migration import (
     router as admin_apply_agent_center_migration_router,
 )
+from routes.admin_apply_citation_operator import (
+    router as admin_apply_citation_operator_router,
+)
 from routes.agent_center_demand_test_routes import (
     router as agent_center_demand_test_router,
 )
@@ -775,6 +778,7 @@ app.include_router(mcp_oauth_as_router)  # MCP OAuth Authorization Server (retur
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(admin_apply_agent_center_migration_router)  # Agent Center V1 migration apply/verify
+app.include_router(admin_apply_citation_operator_router)  # Citation-operator migrations 146-148 apply/verify
 app.include_router(agent_center_demand_test_router)  # Agent Center: Demand Test Agent V1 (internal pilot)
 app.include_router(agent_center_sku_match_router)  # Agent Center: SKU Match Agent V1 (internal pilot)
 app.include_router(agent_center_admin_router)  # Agent Center: stuck-run inspection / force-reset (admin-only)
