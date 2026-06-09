@@ -1,17 +1,35 @@
-"""Regression tests for Stripe-customer-id read/write symmetry.
+"""Tests for the shared Stripe-customer-id resolver.
 
-Checkout persists `merchants.stripe_customer_id` via a permissive
-`(merchant_id OR contact_email)` match, so the row carrying the id can be keyed
-by the onboarding contact_email while its `merchant_id` is NULL/divergent. The
-paid-audit gate and overage billing previously read with a strict `merchant_id`
-match and missed that row, surfacing as `missing_stripe_customer`. These tests
-pin the merchant_id-first, contact_email-fallback resolution.
+`merchants.merchant_id` is not a code-maintained link to the `merch_` identity
+(which lives in `merchant_onboarding`), and checkout persists
+`stripe_customer_id` via a permissive `(merchant_id OR contact_email)` match. A
+strict `merchant_id`-only read can miss the row the id landed on, surfacing as
+`missing_stripe_customer` at the paid-audit gate and breaking overage billing.
+
+`billing_routes.resolve_merchant_stripe_customer_id` is the single resolver:
+merchant_id first, then the onboarding contact_email row that actually carries a
+customer id. These tests pin that behavior and that the credit-balance reader
+delegates to it.
 """
 
 from __future__ import annotations
 
-import db.merchant_onboarding as merchant_onboarding_module
+import routes.billing_routes as billing
 import services.merchant_credit_balance_service as mcb
+
+
+class _FakeDB:
+    """Minimal db stub exposing fetch_one for the email-fallback query."""
+
+    def __init__(self, email_customer_id: str | None = None) -> None:
+        self.email_customer_id = email_customer_id
+        self.fetch_one_calls = 0
+
+    async def fetch_one(self, query, params=None):
+        self.fetch_one_calls += 1
+        if self.email_customer_id is None:
+            return None
+        return {"stripe_customer_id": self.email_customer_id}
 
 
 async def test_direct_merchant_id_hit_skips_fallback(monkeypatch):
@@ -20,19 +38,16 @@ async def test_direct_merchant_id_hit_skips_fallback(monkeypatch):
     async def fake_fetch_billing_row(*_args, **_kwargs):
         return {"stripe_customer_id": "cus_direct"}
 
-    async def fail_fetch_one(*_args, **_kwargs):  # pragma: no cover - must not run
-        raise AssertionError("fallback query should not run on a direct hit")
-
     async def fail_onboarding(*_args, **_kwargs):  # pragma: no cover - must not run
         raise AssertionError("onboarding lookup should not run on a direct hit")
 
-    monkeypatch.setattr(mcb, "_fetch_merchant_billing_row", fake_fetch_billing_row)
-    monkeypatch.setattr(mcb.database, "fetch_one", fail_fetch_one)
-    monkeypatch.setattr(
-        merchant_onboarding_module, "get_merchant_onboarding", fail_onboarding
-    )
+    monkeypatch.setattr(billing, "_fetch_merchant_billing_row", fake_fetch_billing_row)
+    monkeypatch.setattr(billing, "get_merchant_onboarding", fail_onboarding)
+    db = _FakeDB()
 
-    assert await mcb._stripe_customer_id_for_direct_merchant("merch_x") == "cus_direct"
+    result = await billing.resolve_merchant_stripe_customer_id(db, "merch_x")
+    assert result == "cus_direct"
+    assert db.fetch_one_calls == 0  # no email fallback query
 
 
 async def test_email_fallback_when_merchant_id_row_has_no_customer(monkeypatch):
@@ -45,21 +60,17 @@ async def test_email_fallback_when_merchant_id_row_has_no_customer(monkeypatch):
         assert merchant_id == "merch_x"
         return {"contact_email": "Peng@Chydan.com"}
 
-    async def fake_fetch_one(query, params):
-        assert params["contact_email"] == "Peng@Chydan.com"
-        return {"stripe_customer_id": "cus_email"}
+    monkeypatch.setattr(billing, "_fetch_merchant_billing_row", fake_fetch_billing_row)
+    monkeypatch.setattr(billing, "get_merchant_onboarding", fake_onboarding)
+    db = _FakeDB(email_customer_id="cus_email")
 
-    monkeypatch.setattr(mcb, "_fetch_merchant_billing_row", fake_fetch_billing_row)
-    monkeypatch.setattr(
-        merchant_onboarding_module, "get_merchant_onboarding", fake_onboarding
-    )
-    monkeypatch.setattr(mcb.database, "fetch_one", fake_fetch_one)
-
-    assert await mcb._stripe_customer_id_for_direct_merchant("merch_x") == "cus_email"
+    result = await billing.resolve_merchant_stripe_customer_id(db, "merch_x")
+    assert result == "cus_email"
+    assert db.fetch_one_calls == 1
 
 
 async def test_returns_empty_when_no_customer_anywhere(monkeypatch):
-    """No id on either the merchant_id row or the contact_email row → empty."""
+    """No id on either the merchant_id row or the contact_email row -> empty."""
 
     async def fake_fetch_billing_row(*_args, **_kwargs):
         return {}
@@ -67,20 +78,16 @@ async def test_returns_empty_when_no_customer_anywhere(monkeypatch):
     async def fake_onboarding(_merchant_id):
         return {"contact_email": "peng@chydan.com"}
 
-    async def fake_fetch_one(_query, _params):
-        return None
+    monkeypatch.setattr(billing, "_fetch_merchant_billing_row", fake_fetch_billing_row)
+    monkeypatch.setattr(billing, "get_merchant_onboarding", fake_onboarding)
+    db = _FakeDB(email_customer_id=None)
 
-    monkeypatch.setattr(mcb, "_fetch_merchant_billing_row", fake_fetch_billing_row)
-    monkeypatch.setattr(
-        merchant_onboarding_module, "get_merchant_onboarding", fake_onboarding
-    )
-    monkeypatch.setattr(mcb.database, "fetch_one", fake_fetch_one)
-
-    assert await mcb._stripe_customer_id_for_direct_merchant("merch_x") == ""
+    result = await billing.resolve_merchant_stripe_customer_id(db, "merch_x")
+    assert result == ""
 
 
-async def test_no_contact_email_returns_empty(monkeypatch):
-    """No onboarding contact_email means no fallback target → empty."""
+async def test_no_onboarding_row_returns_empty(monkeypatch):
+    """Crawled agent_seed:: merchants have no onboarding row -> no fallback, empty."""
 
     async def fake_fetch_billing_row(*_args, **_kwargs):
         return {}
@@ -88,13 +95,21 @@ async def test_no_contact_email_returns_empty(monkeypatch):
     async def fake_onboarding(_merchant_id):
         return None
 
-    async def fail_fetch_one(*_args, **_kwargs):  # pragma: no cover - must not run
-        raise AssertionError("fallback query should not run without a contact_email")
+    monkeypatch.setattr(billing, "_fetch_merchant_billing_row", fake_fetch_billing_row)
+    monkeypatch.setattr(billing, "get_merchant_onboarding", fake_onboarding)
+    db = _FakeDB(email_customer_id="cus_should_not_be_used")
 
-    monkeypatch.setattr(mcb, "_fetch_merchant_billing_row", fake_fetch_billing_row)
-    monkeypatch.setattr(
-        merchant_onboarding_module, "get_merchant_onboarding", fake_onboarding
-    )
-    monkeypatch.setattr(mcb.database, "fetch_one", fail_fetch_one)
+    result = await billing.resolve_merchant_stripe_customer_id(db, "agent_seed::acme")
+    assert result == ""
+    assert db.fetch_one_calls == 0  # no email -> no fallback query
 
-    assert await mcb._stripe_customer_id_for_direct_merchant("merch_x") == ""
+
+async def test_credit_balance_reader_delegates_to_shared_resolver(monkeypatch):
+    """merchant_credit_balance_service resolves via the shared billing resolver."""
+
+    async def fake_resolver(db, merchant_id):
+        assert merchant_id == "merch_x"
+        return "cus_delegated"
+
+    monkeypatch.setattr(mcb, "resolve_merchant_stripe_customer_id", fake_resolver)
+    assert await mcb._stripe_customer_id_for_direct_merchant("merch_x") == "cus_delegated"

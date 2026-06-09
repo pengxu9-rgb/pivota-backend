@@ -839,10 +839,10 @@ async def test_free_tier_insufficient_balance_does_not_attempt_overage(monkeypat
 async def test_require_verified_payment_method_raises_typed_error_without_customer(monkeypatch):
     from services import merchant_credit_balance_service as svc
 
-    async def no_billing_row(*_args, **_kwargs):
-        return None
+    async def no_customer(*_args, **_kwargs):
+        return ""
 
-    monkeypatch.setattr(svc, "_fetch_merchant_billing_row", no_billing_row)
+    monkeypatch.setattr(svc, "resolve_merchant_stripe_customer_id", no_customer)
 
     with pytest.raises(svc.MissingVerifiedPaymentMethodError) as err:
         await svc.require_verified_payment_method("merch-A")
@@ -856,7 +856,7 @@ async def test_require_verified_payment_method_accepts_default_card(monkeypatch)
     from services import merchant_credit_balance_service as svc
 
     async def billing_row(*_args, **_kwargs):
-        return {"stripe_customer_id": "cus_123"}
+        return "cus_123"
 
     class _Customers:
         def retrieve(self, customer_id):
@@ -888,7 +888,7 @@ async def test_require_verified_payment_method_accepts_default_card(monkeypatch)
     class _StripeClient:
         v1 = _V1()
 
-    monkeypatch.setattr(svc, "_fetch_merchant_billing_row", billing_row)
+    monkeypatch.setattr(svc, "resolve_merchant_stripe_customer_id", billing_row)
     monkeypatch.setattr(svc, "stripe_client", _StripeClient())
 
     await svc.require_verified_payment_method("merch-A")
@@ -899,7 +899,7 @@ async def test_require_verified_payment_method_rejects_expired_card(monkeypatch)
     from services import merchant_credit_balance_service as svc
 
     async def billing_row(*_args, **_kwargs):
-        return {"stripe_customer_id": "cus_123"}
+        return "cus_123"
 
     class _Customers:
         def retrieve(self, customer_id):
@@ -929,7 +929,7 @@ async def test_require_verified_payment_method_rejects_expired_card(monkeypatch)
     class _StripeClient:
         v1 = _V1()
 
-    monkeypatch.setattr(svc, "_fetch_merchant_billing_row", billing_row)
+    monkeypatch.setattr(svc, "resolve_merchant_stripe_customer_id", billing_row)
     monkeypatch.setattr(svc, "stripe_client", _StripeClient())
 
     with pytest.raises(svc.MissingVerifiedPaymentMethodError) as err:
@@ -943,7 +943,7 @@ async def test_require_verified_payment_method_maps_stripe_error(monkeypatch):
     from services import merchant_credit_balance_service as svc
 
     async def billing_row(*_args, **_kwargs):
-        return {"stripe_customer_id": "cus_123"}
+        return "cus_123"
 
     StripeError = type("StripeError", (Exception,), {})
 
@@ -962,7 +962,7 @@ async def test_require_verified_payment_method_maps_stripe_error(monkeypatch):
     class _StripeClient:
         v1 = _V1()
 
-    monkeypatch.setattr(svc, "_fetch_merchant_billing_row", billing_row)
+    monkeypatch.setattr(svc, "resolve_merchant_stripe_customer_id", billing_row)
     monkeypatch.setattr(svc, "stripe_client", _StripeClient())
 
     with pytest.raises(svc.MissingVerifiedPaymentMethodError) as err:

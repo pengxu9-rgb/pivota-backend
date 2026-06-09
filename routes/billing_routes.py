@@ -1255,6 +1255,54 @@ async def _fetch_merchant_billing_row(
     return dict(row) if row else None
 
 
+async def resolve_merchant_stripe_customer_id(
+    db: Database,
+    merchant_id: str,
+) -> str:
+    """Single source of truth: resolve a `merch_` id to its Stripe customer id.
+
+    `merchants.merchant_id` is NOT a code-maintained link — no path populates it,
+    and the row is provisioned separately from `merchant_onboarding` (which owns
+    the `merch_` identity + contact_email). Checkout persists
+    `stripe_customer_id` via a permissive `(merchant_id OR contact_email)` match,
+    so a strict `merchant_id`-only read can miss the row the id landed on,
+    surfacing as `missing_stripe_customer` at the paid-audit gate and breaking
+    overage billing. Resolve `merchant_id` first, then fall back to the
+    onboarding `contact_email` — the only reliable cross-link — targeting a row
+    that actually carries a customer id.
+
+    Integrated merchants only: crawled `agent_seed::` catalog merchants have no
+    `merchant_onboarding` row, so this returns '' for them (correct — they are
+    not billing entities).
+    """
+    billing_row = await _fetch_merchant_billing_row(
+        db,
+        merchant_id=merchant_id,
+        contact_email=None,
+        stripe_customer_id=None,
+    )
+    customer_id = _as_text((billing_row or {}).get("stripe_customer_id"))
+    if customer_id:
+        return customer_id
+
+    onboarding = await get_merchant_onboarding(merchant_id)
+    contact_email = _as_text((onboarding or {}).get("contact_email")) if onboarding else ""
+    if not contact_email:
+        return ""
+    row = await db.fetch_one(
+        """
+        SELECT stripe_customer_id
+        FROM merchants
+        WHERE LOWER(contact_email) = LOWER(:contact_email)
+          AND stripe_customer_id IS NOT NULL
+          AND stripe_customer_id <> ''
+        LIMIT 1
+        """,
+        {"contact_email": contact_email},
+    )
+    return _as_text(dict(row).get("stripe_customer_id")) if row else ""
+
+
 async def _update_merchant_stripe_customer_id(
     db: Database,
     *,
