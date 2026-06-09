@@ -53,13 +53,19 @@ async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
             "in_overage": False,
         }
 
-    credit_events = await _credit_consumption_events(
+    # Consumption is metered by the WIRED debit path
+    # (merchant_credit_balance_service.debit -> agent_center_usage_events), not
+    # the legacy credit_ledger that _credit_consumption_events reads — nothing
+    # writes consumption to credit_ledger, so reading it here always reported 0.
+    # Read the balance system (the source of truth) so /current-period reflects
+    # real audit/agent usage. NOTE: the dormant statement-assembly path
+    # (assemble_for_month) still reads credit_ledger; repoint it the same way
+    # when it is brought online (report-only — overage is already charged inline
+    # by the debit path, so statements must not bill a second time).
+    consumed_credits = await _period_consumed_credits_from_usage(
         merchant_id=merchant_id,
         period_start=period_start,
         period_end=period_end,
-    )
-    consumed_credits = -sum(
-        int(_row_get(row, "credits_delta") or 0) for row in credit_events
     )
     allowance_credits = int(_row_get(subscription, "monthly_credit_allowance") or 0)
     overage_count = max(0, consumed_credits - allowance_credits)
@@ -377,6 +383,57 @@ async def _credit_consumption_events(
         },
     )
     return list(rows or [])
+
+
+async def _period_consumed_credits_from_usage(
+    *,
+    merchant_id: str,
+    period_start: date,
+    period_end: date,
+) -> int:
+    """Net credits consumed in [period_start, period_end) from the balance system.
+
+    Source of truth is agent_center_usage_events, where the wired debit path
+    (merchant_credit_balance_service) records one row per applied operation:
+      - billing_mode='debit',  event_type='credit_debit_{audit,prompt,execution}'
+      - billing_mode='credit', event_type='credit_grant_{...}'  (failure refunds)
+    Debits count as consumption; refund credits net it back down. Top-ups
+    ('credit_topup') and overage charges ('credit_overage_charge') are NOT
+    consumption and are excluded. Replays don't double-count: a replayed
+    operation re-uses its idempotency_key and inserts no new row.
+    """
+    row = await database.fetch_one(
+        """
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN billing_mode = 'debit'
+                     AND event_type IN (
+                         'credit_debit_audit',
+                         'credit_debit_prompt',
+                         'credit_debit_execution'
+                     ) THEN quantity
+                WHEN billing_mode = 'credit'
+                     AND event_type IN (
+                         'credit_grant_audit',
+                         'credit_grant_prompt',
+                         'credit_grant_execution'
+                     ) THEN -quantity
+                ELSE 0
+            END
+        ), 0) AS consumed
+        FROM agent_center_usage_events
+        WHERE merchant_id = :merchant_id
+          AND billing_mode IN ('debit', 'credit')
+          AND created_at >= :period_start
+          AND created_at < :period_end
+        """,
+        {
+            "merchant_id": merchant_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    )
+    return max(0, int(_row_get(row, "consumed") or 0))
 
 
 async def _latest_active_subscription(
