@@ -8,6 +8,7 @@ merchant commerce payment webhooks.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -335,10 +336,6 @@ async def create_billing_checkout_session(
         )
 
     metadata = {"merchant_id": merchant_id, "price_id": price_id}
-    # Daily idempotency bucket: rapid retries of "subscribe" return the same
-    # session; a fresh attempt the next UTC day creates a new one (Stripe
-    # checkout sessions expire after 24h anyway). Coarser than per-second
-    # so transient network retries dedupe naturally.
     idempotency_bucket = datetime.now(timezone.utc).date().isoformat()
 
     def _session_payload(customer_id: str) -> Dict[str, Any]:
@@ -354,11 +351,22 @@ async def create_billing_checkout_session(
             "allow_promotion_codes": True,
         }
 
+    # Derive the idempotency key from the exact payload. Identical "subscribe"
+    # requests dedupe to one session; ANY difference (success/cancel_url,
+    # customer after a recreate, price) yields a distinct key — so we never hit
+    # Stripe's "keys for idempotent requests can only be used with the same
+    # parameters" error (IdempotencyError) that a coarse per-day key caused.
+    def _session_idempotency_key(payload: Dict[str, Any]) -> str:
+        blob = json.dumps(payload, sort_keys=True, default=str)
+        digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:40]
+        return f"checkout_session:{merchant_id}:{digest}"
+
+    payload = _session_payload(stripe_customer_id)
     try:
         session = await asyncio.to_thread(
             stripe_client.v1.checkout.sessions.create,
-            _session_payload(stripe_customer_id),
-            {"idempotency_key": f"checkout_session:{merchant_id}:{price_id}:{idempotency_bucket}"},
+            payload,
+            {"idempotency_key": _session_idempotency_key(payload)},
         )
     except Exception as exc:
         # The stored Stripe customer can be invalid for the current account —
@@ -380,10 +388,11 @@ async def create_billing_checkout_session(
             contact_email=contact_email,
             idempotency_key=f"merchant_customer:{merchant_id}:{idempotency_bucket}",
         )
+        payload = _session_payload(stripe_customer_id)
         session = await asyncio.to_thread(
             stripe_client.v1.checkout.sessions.create,
-            _session_payload(stripe_customer_id),
-            {"idempotency_key": f"checkout_session:{merchant_id}:{price_id}:{idempotency_bucket}:recreated"},
+            payload,
+            {"idempotency_key": _session_idempotency_key(payload)},
         )
 
     session_id = _as_text(getattr(session, "id", None) or _stripe_object_to_dict(session).get("id"))
