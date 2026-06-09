@@ -103,3 +103,77 @@ async def test_refund_credits_back(monkeypatch):
     assert out["credits"] == 7
     assert captured["category"] == "execution"
     assert captured["source_event_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_meter_free_tier_is_preview_only(monkeypatch):
+    async def not_paid(*_a, **_k):
+        return False
+    monkeypatch.setattr(ccs, "merchant_is_paid_tier", not_paid)
+
+    out = await ccs.meter_agent_workflow(
+        "m", "agent_demand_test", provider="gemini", units=2, idempotency_key="k",
+    )
+    assert out["billing_mode"] == "preview_only"
+    assert out["reason"] == "not_paid_tier"
+
+
+@pytest.mark.asyncio
+async def test_meter_paid_priceable_provider_meters(monkeypatch):
+    captured = {}
+
+    async def paid(*_a, **_k):
+        return True
+
+    async def fake_consume(merchant_id, operation_type, idempotency_key, **kw):
+        captured.update(
+            merchant_id=merchant_id, operation_type=operation_type,
+            idempotency_key=idempotency_key, **kw,
+        )
+        return {"credits": kw.get("credits"), "replay": False}
+
+    monkeypatch.setattr(ccs, "merchant_is_paid_tier", paid)
+    monkeypatch.setattr(ccs, "consume", fake_consume)
+
+    out = await ccs.meter_agent_workflow(
+        "m", "agent_demand_test", provider="gemini", units=2, idempotency_key="k",
+    )
+    assert out["billing_mode"] == "metered"
+    assert out["credits"] > 0
+    assert captured["operation_type"] == "agent_demand_test"
+    assert captured["idempotency_key"] == "k"
+
+
+@pytest.mark.asyncio
+async def test_meter_non_priceable_provider_is_preview_only(monkeypatch):
+    async def paid(*_a, **_k):
+        return True
+
+    async def fail_consume(*_a, **_k):  # pragma: no cover - must not run
+        raise AssertionError("internal/merchant_platform must not debit")
+
+    monkeypatch.setattr(ccs, "merchant_is_paid_tier", paid)
+    monkeypatch.setattr(ccs, "consume", fail_consume)
+
+    out = await ccs.meter_agent_workflow(
+        "m", "agent_sku_match", provider="internal", units=10, idempotency_key="k",
+    )
+    assert out["billing_mode"] == "preview_only"
+    assert out["reason"] == "provider_not_priceable"
+
+
+@pytest.mark.asyncio
+async def test_meter_zero_units_is_preview_only(monkeypatch):
+    async def paid(*_a, **_k):
+        return True
+
+    async def fail_consume(*_a, **_k):  # pragma: no cover - must not run
+        raise AssertionError("zero-cost run must not debit")
+
+    monkeypatch.setattr(ccs, "merchant_is_paid_tier", paid)
+    monkeypatch.setattr(ccs, "consume", fail_consume)
+
+    out = await ccs.meter_agent_workflow(
+        "m", "agent_demand_test", provider="gemini", units=0, idempotency_key="k",
+    )
+    assert out["billing_mode"] == "preview_only"

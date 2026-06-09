@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
 from services import agent_center_service as ac
+from services import credit_consumption_service
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +420,16 @@ async def run_sku_match_live(scan_target_id: str) -> Dict[str, Any]:
     # the same scan_target isn't double-counted if a merchant runs both
     # modes back-to-back. (We currently only run one mode per scan_target,
     # but make the key unambiguous anyway.)
+    # Meter the run (V2). sku_match_live reads the merchant's live platform
+    # (provider="merchant_platform"), not an LLM probe, so it is not priceable
+    # per-probe and stays preview_only until a flat price is defined.
+    meter = await credit_consumption_service.meter_agent_workflow(
+        merchant_id,
+        "agent_sku_match_live",
+        provider="merchant_platform",
+        units=len(live_products),
+        idempotency_key=f"sku_match_live:{scan_target_id}:v1",
+    )
     usage_event = await ac.record_usage_event(
         idempotency_key=f"sku_match_live:{scan_target_id}:v1",
         merchant_id=merchant_id,
@@ -429,7 +440,7 @@ async def run_sku_match_live(scan_target_id: str) -> Dict[str, Any]:
         event_type="sku_match_live_credit",
         provider="merchant_platform",
         scan_mode="sku_match",
-        billing_mode="preview_only",
+        billing_mode=meter["billing_mode"],
         billing_status="not_invoiced",
         quantity=len(live_products),
         payload={

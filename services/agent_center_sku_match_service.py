@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from db.database import database
 from services import agent_center_service as ac
+from services import credit_consumption_service
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +289,18 @@ async def run_sku_match(scan_target_id: str) -> Dict[str, Any]:
                 findings.append({**f, "product_entity_id": entity_id})
         products_by_status["checked"] += 1
 
-    # 3. Record usage event (idempotent).
+    # 3. Meter the run (V2). sku_match is an internal deterministic check
+    # (provider="internal"), which is not priceable per-probe, so this stays
+    # preview_only until a flat price is defined; the gate is wired uniformly.
+    meter = await credit_consumption_service.meter_agent_workflow(
+        merchant_id,
+        "agent_sku_match",
+        provider="internal",
+        units=products_by_status["checked"],
+        idempotency_key=f"sku_match:{scan_target_id}:v1",
+    )
+
+    # 4. Record usage event (idempotent).
     usage_event = await ac.record_usage_event(
         idempotency_key=f"sku_match:{scan_target_id}:v1",
         merchant_id=merchant_id,
@@ -299,7 +311,7 @@ async def run_sku_match(scan_target_id: str) -> Dict[str, Any]:
         event_type="sku_match_credit",
         provider="internal",
         scan_mode=SKU_MATCH_SCAN_MODE,
-        billing_mode="preview_only",
+        billing_mode=meter["billing_mode"],
         billing_status="not_invoiced",
         quantity=products_by_status["checked"],
         payload={

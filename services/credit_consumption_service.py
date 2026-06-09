@@ -13,14 +13,20 @@ per-probe model (provider_credit_rates); the audit cost path shares
 
 from __future__ import annotations
 
+import logging
 import math
 from decimal import Decimal
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
+from db.database import database
 from services import merchant_credit_balance_service as _mcb
 from services.provider_credit_rates import (
     credits_for_probe,
+    provider_default_grounded,
     provider_probe_cost_usd,
+    provider_rate_entry,
 )
 
 # (provider, probe_count, grounded)
@@ -143,3 +149,85 @@ async def refund(
         "operation_type": operation_type,
         "credit": result,
     }
+
+
+async def merchant_is_paid_tier(merchant_id: str, *, conn: Any = None) -> bool:
+    """True if the merchant has an active subscription on a credit-bearing plan.
+
+    Read-only (does not create a balance row), so it's safe to call for the many
+    cold-start / prospect merchant_ids that agent BD scans run against. Those
+    have no subscription and resolve to False.
+    """
+    target = conn or database
+    try:
+        row = await target.fetch_one(
+            """
+            SELECT 1
+            FROM user_subscriptions us
+            JOIN subscription_plans sp ON sp.id = us.plan_id
+            WHERE us.merchant_id = :merchant_id
+              AND us.status IN ('active', 'trialing')
+              AND sp.status = 'active'
+              AND COALESCE(sp.monthly_credit_allowance, 0) > 0
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id},
+        )
+    except Exception:
+        # Fail safe: if we can't determine paid status, do NOT meter (never
+        # wrongly charge, never crash the workflow). Logged for visibility.
+        logger.warning(
+            "merchant_is_paid_tier lookup failed for %s; treating as not-metered",
+            merchant_id,
+            exc_info=True,
+        )
+        return False
+    return row is not None
+
+
+async def meter_agent_workflow(
+    merchant_id: str,
+    operation_type: str,
+    *,
+    provider: str,
+    units: int,
+    idempotency_key: str,
+    conn: Any = None,
+) -> Dict[str, Any]:
+    """Meter one agent-workflow run, returning the billing_mode to record.
+
+    Gating (V2 metering, eligible merchants only):
+      - Only paid-tier merchants are metered; free-tier / cold-start prospects
+        stay `preview_only` (and are never debited — free-tier debit would raise).
+      - Only LLM-probe workflows have a priceable provider; internal /
+        merchant_platform workflows (sku_match, sku_match_live) are not priceable
+        and stay `preview_only` until a flat price is defined.
+    When metered, debits via consume() (per-probe pricing) after the work has
+    completed; returns {"billing_mode": "metered"|"preview_only", "credits", ...}.
+    """
+    # Priceability first (no DB): internal / merchant_platform workflows have no
+    # per-probe cost, so they short-circuit to preview_only without a tier query.
+    try:
+        provider_rate_entry(provider)
+    except ValueError:
+        return {"billing_mode": "preview_only", "credits": 0, "reason": "provider_not_priceable"}
+
+    if not await merchant_is_paid_tier(merchant_id, conn=conn):
+        return {"billing_mode": "preview_only", "credits": 0, "reason": "not_paid_tier"}
+
+    credits, usd_cogs = estimate_probe_credits(
+        [(provider, int(units), provider_default_grounded(provider))]
+    )
+    if credits <= 0:
+        return {"billing_mode": "preview_only", "credits": 0, "reason": "zero_cost"}
+
+    result = await consume(
+        merchant_id,
+        operation_type,
+        idempotency_key,
+        credits=credits,
+        usd_cogs=usd_cogs,
+        conn=conn,
+    )
+    return {"billing_mode": "metered", "credits": credits, "consume": result}
+
