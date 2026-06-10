@@ -195,6 +195,64 @@ def test_strong_quotes_both_scores_and_cited_ratio():
     assert "7 of 10" in explanation
 
 
+def test_strong_with_strong_category_keeps_at_goal_copy():
+    # Branded strong + category strong (gap < 25) → original "at goal state"
+    # framing; no category-gap caveat.
+    _, explanation = verdict_for(
+        visibility_score=85,
+        attribution_score=70,
+        category_visibility_score=80,
+        evidence=_evidence(
+            attribution_runs_total=10, merchant_cited_runs=7,
+            category_score=80,
+        ),
+    )
+    assert "at goal state" in explanation
+    assert "post-discovery" in explanation
+    assert "category-discovery gap" not in explanation
+
+
+def test_strong_with_weak_category_names_the_category_gap():
+    # BB Lab shape: visibility 67 / attribution 100 / category 33. STRONG on
+    # branded buyer-intent, but a 34-pt category-discovery gap must surface in
+    # the explanation — NOT "remaining leverage is post-discovery" — so the
+    # top-line verdict agrees with next_best_action's category_discovery_gap.
+    label, explanation = verdict_for(
+        visibility_score=67,
+        attribution_score=100,
+        category_visibility_score=33,
+        evidence=_evidence(
+            attribution_runs_total=3, merchant_cited_runs=3,
+            category_score=33,
+        ),
+    )
+    assert label == VERDICT_STRONG
+    assert "category visibility is 33/100" in explanation
+    assert "category-discovery gap is the primary open lever" in explanation
+    # The over-claiming "post-discovery only" line must be gone.
+    assert "post-discovery" not in explanation
+    # Branded scores still quoted.
+    assert "67/100" in explanation
+    assert "100/100" in explanation
+
+
+def test_strong_with_measured_zero_category_triggers_gap_copy():
+    # Ownist shape: visibility 100 / attribution 67 / category 0 (brand absent
+    # from EVERY category query). A measured 0 must trigger the category-gap
+    # copy — the worst case, not silently swallowed as "unmeasured".
+    _, explanation = verdict_for(
+        visibility_score=100,
+        attribution_score=67,
+        category_visibility_score=0,
+        evidence=_evidence(
+            attribution_runs_total=3, merchant_cited_runs=2,
+            category_score=0,
+        ),
+    )
+    assert "category visibility is 0/100" in explanation
+    assert "post-discovery" not in explanation
+
+
 # -----------------------------------------------------------------
 # PARTIAL tier — fallthrough
 # -----------------------------------------------------------------
