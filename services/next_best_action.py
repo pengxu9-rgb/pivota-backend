@@ -1938,8 +1938,19 @@ def _prescription_for_gap(
                     "compare-to, who it's for, and the proof behind it."
                 ),
                 (
-                    f"Pitch the sites AI cites for these ({source_or_cited}) on why "
-                    f"you belong next to {competitor_phrase}."
+                    # Same guard as why_this_first above: only name competitors
+                    # when we actually have them, else competitor_phrase falls
+                    # back to the noun "no repeated named competitors" and the
+                    # verb slot reads broken ("...belong next to no repeated...").
+                    (
+                        f"Pitch the sites AI cites for these ({source_or_cited}) "
+                        f"on why you belong next to {competitor_phrase}."
+                    )
+                    if _has_competitors else
+                    (
+                        f"Pitch the sites AI cites for these ({source_or_cited}) "
+                        "on why you belong in the category answer."
+                    )
                 ),
             ],
             pivota_path=(

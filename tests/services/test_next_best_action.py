@@ -331,6 +331,29 @@ def test_category_discovery_gap_without_failed_queries_reads_grammatically():
     _assert_70_30(nba)
 
 
+def test_category_discovery_gap_without_competitors_or_failed_queries_is_grammatical():
+    # category_discovery_gap has no competitor requirement, so it can fire with
+    # neither named competitors nor failed-query examples. Neither why_this_first
+    # nor self_serve_actions may leak a fallback noun-phrase into a verb slot
+    # ("...belong next to no repeated named competitors").
+    mv = _merchant_view(
+        verdict="STRONG",
+        visibility=67,
+        attribution=100,
+        category_visibility=33,
+        cited_hosts=[{"host": "nymag.com", "type": "editorial", "times_cited": 1}],
+        competitors=[],
+        failed_queries=[],
+    )
+    nba = build_next_best_action(merchant_view=mv)
+    assert nba["primary_gap"] == PRIMARY_CATEGORY_DISCOVERY
+    blob = nba["why_this_first"] + " " + " ".join(nba["self_serve_actions"])
+    assert "no repeated named competitors" not in blob
+    assert "no failed-query examples" not in blob
+    assert "belong in the category answer" in " ".join(nba["self_serve_actions"])
+    _assert_70_30(nba)
+
+
 def test_competitor_source_reuses_outreach_hints_and_playbook_secondary():
     playbook_action = {
         "severity": "high",
