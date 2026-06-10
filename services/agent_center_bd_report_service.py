@@ -1406,6 +1406,12 @@ def _explain_verdict(
                 ". We did not verify whether those sources mention "
                 "your brand or products."
             )
+        # The clauses above end inconsistently (the "did not cite a merchant
+        # URL" branch has no trailing period), which produced run-ons like
+        # "...did not cite a merchant URL The actions below...". Normalize the
+        # sentence boundary before appending the closer.
+        if not base.endswith("."):
+            base += "."
         base += (
             " The actions below show which gap is bigger; close that "
             "one first."
@@ -8086,11 +8092,11 @@ _INDUSTRY_CONTEXT_BY_CATEGORY: Dict[str, Dict[str, Any]] = {
         "blurb": (
             "AI shopping is ~11% of D2C wellness / supplements traffic and "
             "growing ~36% YoY — among the fastest-growing verticals. "
-            "Consumers ask AI assistants comparison questions (\"vs AG1\", "
-            "\"best greens powder under $50\", ingredient deep-dives) before "
-            "buying daily-use supplements; brands without grounded "
-            "attribution lose the comparison-shopping funnel to retailer "
-            "and editorial roundups."
+            "Consumers ask AI assistants comparison questions (\"is it worth "
+            "it\", \"best option under $X\", ingredient and efficacy "
+            "deep-dives) before buying daily-use supplements; brands without "
+            "grounded attribution lose the comparison-shopping funnel to "
+            "retailer and editorial roundups."
         ),
     },
     "food_bev": {

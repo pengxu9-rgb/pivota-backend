@@ -308,6 +308,29 @@ def test_category_discovery_gap_prescribes_content_and_publisher_inclusion():
     _assert_70_30(nba)
 
 
+def test_category_discovery_gap_without_failed_queries_reads_grammatically():
+    # BB Lab shape: branded-strong (vis 67 / attr 100) with a category gap
+    # (category 33) and named competitors, but NO failed-query examples. The
+    # why_this_first must NOT render the templating bug
+    # "no failed-query examples went to <competitors>".
+    mv = _merchant_view(
+        verdict="STRONG",
+        visibility=67,
+        attribution=100,
+        category_visibility=33,
+        cited_hosts=[{"host": "iherb.com", "type": "retailer", "times_cited": 2}],
+        competitors=["Ancient + Brave", "Dose & Co", "Vital Proteins"],
+        failed_queries=[],
+    )
+    nba = build_next_best_action(merchant_view=mv)
+    assert nba["primary_gap"] == PRIMARY_CATEGORY_DISCOVERY
+    why = nba["why_this_first"]
+    assert "no failed-query examples" not in why
+    assert "instead of you" in why
+    assert "Ancient + Brave" in why
+    _assert_70_30(nba)
+
+
 def test_competitor_source_reuses_outreach_hints_and_playbook_secondary():
     playbook_action = {
         "severity": "high",

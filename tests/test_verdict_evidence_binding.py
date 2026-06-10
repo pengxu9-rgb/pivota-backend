@@ -279,6 +279,25 @@ def test_partial_quotes_scores_and_failed_query_sample():
     assert "best night cream" in explanation
 
 
+def test_partial_did_not_cite_branch_is_not_a_runon():
+    # When the "did not cite a merchant URL" branch fires with no retailer
+    # phrase and no failed-query sample, the clause must end with a period
+    # before the closing sentence — not run on as "...merchant URL The actions".
+    label, explanation = verdict_for(
+        visibility_score=50,
+        attribution_score=40,
+        evidence=_evidence(
+            attribution_runs_total=3,
+            merchant_cited_runs=0,
+            top_retailers=[],
+            failed_attribution_query_sample=[],
+        ),
+    )
+    assert label == VERDICT_PARTIAL
+    assert "did not cite a merchant URL." in explanation
+    assert "merchant URL The" not in explanation
+
+
 # -----------------------------------------------------------------
 # Backward compatibility: evidence=None falls back to generic prose
 # (calibration-prefix unit tests rely on this; merchant audit always
