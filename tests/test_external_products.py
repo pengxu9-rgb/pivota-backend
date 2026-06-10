@@ -7870,6 +7870,71 @@ async def test_shop_gateway_find_products_multi_generic_default_web_filters_part
 
 
 @pytest.mark.asyncio
+async def test_shop_gateway_find_products_multi_generic_default_agent_source_filters_off_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1659: the agent/MCP surface (search_catalog over /mcp) sends NO metadata.source, so source_normalized
+    # is empty. The generic-default precision gate must still apply on that surface — otherwise the
+    # OR-over-terms lexical recall leaks off-domain products: e.g. "paula choice" returning a dog harness
+    # whose DESCRIPTION merely contains the common word "choice" (no "paula" anywhere on it).
+    import routes.agent_shop_gateway as agent_shop_gateway_module
+
+    cache_rows = [
+        _generic_default_cache_row(
+            product_id="prod_harness",
+            title="Comfy Dog Harness for Small to Medium Dogs",
+            product_type="Pet Supplies",
+            description="The perfect choice for hassle-free daily walks.",  # 'choice' only in description
+        ),
+        _generic_default_cache_row(
+            product_id="prod_paula",
+            title="Paula's Choice Skin Perfecting 2% BHA Liquid Exfoliant",
+            product_type="Exfoliant",
+            description="Leave-on exfoliant.",
+        ),
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM merchant_onboarding" in q:
+            return [{"merchant_id": "merch_generic_1", "business_name": "Generic Merchant"}]
+        if "FROM external_product_seeds" in q or "FROM orders" in q:
+            return []
+        if "FROM products_cache" in q:
+            return list(cache_rows)
+        return []
+
+    monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
+    monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
+
+    payload = agent_shop_gateway_module.FindProductsMultiPayload(
+        search=agent_shop_gateway_module.MultiSearchFilters(
+            query="paula choice",
+            page=1,
+            limit=10,
+            in_stock_only=True,
+        ),
+        metadata=agent_shop_gateway_module.RequestMetadata(source=""),  # MCP/agent sends no source
+    )
+    result = await agent_shop_gateway_module._handle_find_products_multi(
+        payload,
+        {"source": ""},
+        agent_shop_gateway_module.BackgroundTasks(),
+    )
+
+    metadata = result.get("metadata") or {}
+    assert metadata.get("query_semantic_class") == "default"
+    # The fix: the precision gate is now enabled for the empty-source agent/MCP surface.
+    assert metadata.get("generic_default_precision_gate_enabled") is True
+    product_ids = [p.get("product_id") for p in (result.get("products") or [])]
+    # Dog harness (only 'choice' in description, no 'paula') is filtered out.
+    assert "prod_harness" not in product_ids
+    # Real "Paula's Choice" item (both terms in title) is kept.
+    assert "prod_paula" in product_ids
+
+
+@pytest.mark.asyncio
 async def test_shop_gateway_find_products_multi_generic_default_ui_keeps_high_coverage_exact_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
