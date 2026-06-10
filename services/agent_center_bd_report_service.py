@@ -1333,6 +1333,41 @@ def _explain_verdict(
         )
 
     if label == VERDICT_STRONG:
+        # Branded buyer-intent (visibility + attribution) is at goal, but a
+        # materially weaker category-visibility score means shoppers who search
+        # the CATEGORY rather than the brand still don't surface the product.
+        # Mirror classify_primary_gap()'s category_discovery_gap trigger
+        # (visibility >= 50 and visibility - category >= 25) exactly, so the
+        # top-line verdict never claims "remaining leverage is post-discovery"
+        # while next_best_action is prescribing category discovery as the
+        # primary open gap. (Without this, STRONG read "both at goal state" for
+        # BB Lab cat=33 / Ownist cat=0 — directly contradicting the report's
+        # own recommendation.)
+        category_discovery_gap = (
+            cat_score is not None
+            and visibility_score >= 50
+            and (visibility_score - int(cat_score)) >= 25
+        )
+        if category_discovery_gap:
+            lead = (
+                f"AI agents cite your URL in {cited} of {runs_total} "
+                if has_evidence
+                else "AI agents reliably surface this product for "
+            )
+            ratio_clause = (
+                f"buyer-intent queries (visibility {visibility_score}/100, "
+                f"attribution {attribution_score}/100) — "
+                if has_evidence
+                else "branded buyer-intent queries AND cite your URL — "
+            )
+            return (
+                lead + ratio_clause
+                + "branded discovery and attribution are at goal state. But "
+                f"category visibility is {int(cat_score)}/100: shoppers who "
+                "search the category rather than your brand still don't surface "
+                "your product. Closing that category-discovery gap is the "
+                "primary open lever — see the recommended actions below."
+            )
         if has_evidence:
             return (
                 f"AI agents cite your URL in {cited} of {runs_total} "
@@ -8378,7 +8413,7 @@ def _generate_action_items(
     runs_with_any_citation: int,
     visibility_score: int = 0,
     attribution_score: int = 0,
-    category_visibility_score: int = 0,
+    category_visibility_score: Optional[int] = None,
     category_retailer_hosts: Optional[List[Dict[str, Any]]] = None,
     category_competitor_brands: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
@@ -8608,6 +8643,39 @@ def _generate_action_items(
                 if top_retailer_hosts
                 else None
             ),
+        })
+    elif verdict_label == VERDICT_STRONG and (
+        category_visibility_score is not None
+        and visibility_score >= 50
+        and (visibility_score - int(category_visibility_score)) >= 25
+    ):
+        # Branded buyer-intent is solved, but category discovery lags — the
+        # primary lever is winning category (non-branded) queries, NOT just
+        # maintenance. Keep this consistent with next_best_action's
+        # category_discovery_gap so the action list doesn't say "coast" while
+        # the headline prescription says "close the category gap".
+        items.append({
+            **_score(
+                base="high",
+                has_named_competitors=_has_named_competitors_any,
+            ),
+            "title": "Win category (non-branded) discovery, not just branded search",
+            "body": (
+                f"AI agents cite your URL in {merchant_cited_runs} of "
+                f"{attribution_runs_total} branded buyer-intent queries "
+                f"(visibility {visibility_score}/100, attribution "
+                f"{attribution_score}/100) — branded discovery and attribution "
+                f"are at goal state. But category visibility is "
+                f"{int(category_visibility_score)}/100: shoppers who search the "
+                f"category rather than your brand don't surface your product. "
+                f"Add category + comparison content and earn cites in the "
+                f"sources AI grounds those answers in."
+            ),
+            "evidence": {
+                "merchant_cited_runs": merchant_cited_runs,
+                "queries_tested": attribution_runs_total,
+                "category_visibility_score": int(category_visibility_score),
+            },
         })
     elif verdict_label == VERDICT_STRONG:
         items.append({
@@ -10013,6 +10081,25 @@ def _build_visibility_plain_summary(
         return base
 
     if verdict_label == VERDICT_STRONG:
+        # Category-aware: when branded buyer-intent is solved but category
+        # discovery lags (mirrors classify_primary_gap + _explain_verdict),
+        # don't claim a clean "at goal state" — name the open category gap so
+        # the headline agrees with next_best_action.
+        _cat = category_visibility_score
+        if (
+            _cat is not None
+            and visibility_score >= 50
+            and (visibility_score - int(_cat)) >= 25
+        ):
+            return (
+                f"Mostly. AI agents reliably surface your product AND cite "
+                f"your URL when shoppers search your brand "
+                f"({merchant_cited_runs} of {attribution_runs_total} "
+                f"buyer-intent queries) — branded discovery and attribution "
+                f"are at goal state. But category visibility is {int(_cat)}/100: "
+                f"shoppers who search the category, not your name, still don't "
+                f"surface you. That's the open gap."
+            )
         return (
             f"Yes. AI agents reliably surface your product AND cite "
             f"your URL as the buying path "
@@ -10855,10 +10942,12 @@ def build_structured_report(
         visibility_score=visibility_score,
         attribution_score=attribution_score,
         # Q-P1-6 PR-6: scorer needs this to compute score_gap_pct.
-        # `category_score` is Optional[int]; coerce to 0 when None
-        # (probe didn't run) — the scorer treats 0 as "no measured
-        # category visibility" and falls back to base passthrough.
-        category_visibility_score=(category_score or 0),
+        # `category_score` is Optional[int]; pass it through as-is so a
+        # MEASURED 0 (brand absent from every category query, e.g. Ownist)
+        # is distinguishable from "probe didn't run" (None). The score_gap_pct
+        # logic treats both None and 0 as falsy (base passthrough), unchanged;
+        # only the category-discovery action item needs the distinction.
+        category_visibility_score=category_score,
         category_retailer_hosts=category_retailer_hosts,
         category_competitor_brands=category_competitor_brands,
     )
