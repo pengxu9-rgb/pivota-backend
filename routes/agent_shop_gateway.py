@@ -6134,10 +6134,25 @@ def _filter_external_seed_wrappers(
         if not isinstance(product, dict):
             filtered.append(wrapper)
             continue
-        if product.get("attached_product_key") or product.get("attached_variant_id"):
-            continue
+        # An attached seed (resolved to a canonical pg/sig) IS the merchant offer for that product. Drop it
+        # only when the same product is ALSO being served internally in THIS result — i.e. real dedup against
+        # an internal id or a colliding internal offer (same title/price/vendor). Otherwise the seed is the
+        # only representation of that offer and must surface. Previously attached seeds were dropped
+        # unconditionally, which collapsed legitimate beauty offers to near-zero on the keyless/agent path
+        # where no internal offer is served. (#1659 recall)
         external_id = product.get("product_id") or product.get("external_product_id")
         if external_id and str(external_id) in internal_ids:
+            continue
+        # Soft dedup: only drop when this is a FULL offer-key collision with a served internal offer (all of
+        # the seed's offer keys present), i.e. a true internal twin. A partial overlap (e.g. same title/price
+        # but no vendor match) keeps the seed, preserving the existing soft-prune contract.
+        seed_offer_keys = _build_offer_keys(
+            product.get("title") or "",
+            product.get("price"),
+            product.get("currency") or "USD",
+            product.get("vendor") or product.get("brand"),
+        )
+        if seed_offer_keys and seed_offer_keys.issubset(offer_keys):
             continue
         filtered.append(wrapper)
     return filtered
@@ -7903,6 +7918,11 @@ async def _handle_find_products_multi(
     )
     active_ingredient_labels = [str(group["ingredient_id"]) for group in active_ingredient_intents]
     non_strict_beauty_text_recall_enabled = query_semantic_class == "beauty" and not strict_serving_mode
+    # Ingredient text-recall is allowed for ALL beauty queries, including the strict agent/MCP surface. A
+    # generic discovery query like "vitamin c serum" should match serums that name the ingredient in their
+    # text and rank structured-evidence products higher — not hard-zero when structured ingredient_ids are
+    # absent. Scoped to the ingredient gate only (does not widen the broader non_strict recall). (#1659)
+    beauty_ingredient_text_recall_enabled = query_semantic_class == "beauty"
     expanded_shopping_beauty_prefetch = False
     # Apply the generic-default precision gate to ANY default-class generic query with no structured
     # intents, regardless of source or serving mode. The OR-over-terms lexical recall otherwise leaks
@@ -9533,7 +9553,11 @@ async def _handle_find_products_multi(
                 for label in product_visible_attributes.get("product_category", [])
                 if label in _SKINCARE_INGREDIENT_CATEGORY_LABELS
             }
-            category_anchor_blob = beauty_text_blob if non_strict_beauty_text_recall_enabled else pet_accessory_blob
+            category_anchor_blob = (
+                blob_for_filters
+                if (non_strict_beauty_text_recall_enabled or beauty_ingredient_text_recall_enabled)
+                else pet_accessory_blob
+            )
             if not product_skin_care_categories:
                 for label in _SKINCARE_INGREDIENT_CATEGORY_LABELS:
                     if _normalized_intent_term_match(category_anchor_blob, label):
@@ -9547,8 +9571,8 @@ async def _handle_find_products_multi(
                 matched = ingredient_id in product_ingredient_ids
                 if (
                     not matched
-                    and non_strict_beauty_text_recall_enabled
-                    and _ingredient_alias_matches_text(beauty_text_blob, ingredient_id)
+                    and beauty_ingredient_text_recall_enabled
+                    and _ingredient_alias_matches_text(blob_for_filters, ingredient_id)
                 ):
                     matched = True
                     non_strict_beauty_text_recall_used = True

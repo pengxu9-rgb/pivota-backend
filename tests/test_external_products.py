@@ -5378,9 +5378,15 @@ async def test_shop_gateway_find_products_multi_requires_structured_ingredient_m
 
 
 @pytest.mark.asyncio
-async def test_shop_gateway_find_products_multi_fails_closed_without_structured_ingredient_evidence(
+async def test_shop_gateway_find_products_multi_text_recall_surfaces_description_only_ingredient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # #1659 policy change (soft / text-relevance): a beauty ingredient query is no longer a hard must-have
+    # gate that fails closed when structured ingredient_ids are absent. A serum that names the ingredient in
+    # its text ("Niacinamide-powered" in the description) now surfaces for "niacinamide serum" via the beauty
+    # ingredient text-recall, even on the strict agent_api surface. Structured-evidence products still rank
+    # higher; the strict precision gate still rejects external seeds lacking a surface anchor (covered by the
+    # hyaluronic/retinol rejection tests).
     import routes.agent_shop_gateway as agent_shop_gateway_module
 
     async def fake_fetch_all(query: str, values=None):
@@ -5437,11 +5443,14 @@ async def test_shop_gateway_find_products_multi_fails_closed_without_structured_
         agent_shop_gateway_module.BackgroundTasks(),
     )
 
-    assert result.get("total") == 0
+    assert result.get("total") == 1
+    product_ids = [p.get("product_id") for p in (result.get("products") or [])]
+    assert "prod_serum_plain" in product_ids
     metadata = result.get("metadata") or {}
     assert metadata.get("visible_category_intents") == ["serum"]
     assert metadata.get("ingredient_intents") == ["niacinamide"]
-    assert metadata.get("matched_ingredient_ids") == []
+    # Now matched via text-recall (was [] under the old fail-closed policy).
+    assert metadata.get("matched_ingredient_ids") == ["niacinamide"]
     assert metadata.get("strict_constraint_query") is True
     assert metadata.get("strict_constraint_reason") == "ingredient"
 

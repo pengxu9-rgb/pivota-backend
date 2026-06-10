@@ -39,6 +39,9 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from services.beauty_external_ranking import (
+    normalize_external_seed_structured_ingredient_ids,
+)
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.pdp_lifecycle import compute_lifecycle_stage
@@ -473,6 +476,18 @@ def _build_sku_insert(
     merchant-sync rows."""
     sku_key = derive_sku_key(product_key)
     strong_identifier = extract_strong_identifier(pdp_payload.get("strong_identity"))
+    # Infer ingredient ids from the PDP name + summary (the enrichment pdp_payload carries no structured
+    # ingredient field). Previously hardcoded [] which dropped ingredient evidence at migration, so
+    # ingredient-constrained beauty search returned nothing. (#1659)
+    _ingredient_text = " ".join(
+        [
+            str(pdp_payload.get("product_name") or ""),
+            str(pdp_payload.get("attribute_summary") or ""),
+        ]
+    ).strip()
+    sku_ingredient_ids = normalize_external_seed_structured_ingredient_ids(
+        {"title": _ingredient_text}, {}
+    )
     sku_payload = {"agent_version": AGENT_VERSION}
     if strong_identifier is not None:
         sku_payload["strong_identifier_kind"] = strong_identifier.kind
@@ -498,7 +513,7 @@ def _build_sku_insert(
         "image_url": image_url or None,
         "visible_attributes": json.dumps({}),
         "visible_option_labels": json.dumps([]),
-        "ingredient_ids": json.dumps([]),
+        "ingredient_ids": json.dumps(sku_ingredient_ids),
         "sku_payload": json.dumps(sku_payload),
         "readiness_tier": OFFER_READINESS_TIER,
     }
