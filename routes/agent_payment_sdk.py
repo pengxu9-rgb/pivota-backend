@@ -862,48 +862,17 @@ async def create_payment(
             ),
         )
         
-        # 8. Update order payment status.
-        # If the PSP ALREADY reports the charge succeeded (synchronous confirmation — common for Stripe
-        # Checkout-session / non-3DS flows), finalize the order to PAID immediately via the SAME idempotent
-        # finalizer the webhook uses. This removes the single-point dependency on a Stripe webhook that
-        # stranded a real captured charge in the live test (order stuck at awaiting_payment). The finalizer
-        # guards terminal states, so a later webhook for the same PI is a harmless no-op. For non-terminal
-        # statuses (requires_action / processing) we record 'processing' and let the webhook finalize.
-        if status == "succeeded":
-            from services.psp_payment_finalizer import finalize_payment_success
-            from db.orders import mark_order_paid
-            from db.products import log_order_event
-
-            fresh_order = await _with_asyncpg_busy_retry(
-                "reload order before sync finalization",
-                lambda: get_order(request.order_id),
-            ) or order
-            await _with_asyncpg_busy_retry(
-                "synchronous payment finalization",
-                lambda: finalize_payment_success(
-                    fresh_order,
-                    psp=psp_used,
-                    payment_reference=payment_intent.id,
-                    transaction_id=payment_intent.id,
-                    amount_minor=getattr(payment_intent, "amount", None),
-                    currency=currency,
-                    source_event="payment_confirmed_sync",
-                    update_payment_info_fn=update_payment_info,
-                    mark_order_paid_fn=mark_order_paid,
-                    log_order_event_fn=log_order_event,
-                ),
-            )
-        else:
-            await _with_asyncpg_busy_retry(
-                "order payment info update",
-                lambda: update_payment_info(
-                    order_id=request.order_id,
-                    payment_intent_id=payment_intent.id,
-                    client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
-                    payment_status="processing",
-                    psp_used=psp_used,
-                ),
-            )
+        # 8. Update order payment status
+        await _with_asyncpg_busy_retry(
+            "order payment info update",
+            lambda: update_payment_info(
+                order_id=request.order_id,
+                payment_intent_id=payment_intent.id,
+                client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
+                payment_status="processing",
+                psp_used=psp_used,
+            ),
+        )
 
         # PCS v0.2-b (best-effort): internal payment fact for reducer replay (no PII).
         try:
