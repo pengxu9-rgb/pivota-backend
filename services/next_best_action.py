@@ -1893,12 +1893,39 @@ def _prescription_for_gap(
         source_or_cited = (
             source_phrase if source_phrase != "no named editorial hosts" else cited_phrase
         )
+        # Build the "you're losing the answer to X" clause without the
+        # "{failed_query_phrase} went to {competitor_phrase}" templating bug:
+        # when there are no failed-query examples the phrase falls back to the
+        # noun "no failed-query examples", which read as "no failed-query
+        # examples went to <competitors>". Branch on what evidence we actually
+        # have so the sentence is always grammatical.
+        _has_failed = bool(_query_examples(evidence.get("failed_query_examples")))
+        _has_competitors = bool(_as_str_list(evidence.get("competitors_named")))
+        if _has_failed and _has_competitors:
+            _losing_clause = (
+                f"Category questions like {failed_query_phrase} surfaced "
+                f"{competitor_phrase} instead of you."
+            )
+        elif _has_competitors:
+            _losing_clause = (
+                f"Those category questions surface {competitor_phrase} "
+                "instead of you."
+            )
+        elif _has_failed:
+            _losing_clause = (
+                f"Category questions like {failed_query_phrase} aren't "
+                "surfacing your product."
+            )
+        else:
+            _losing_clause = (
+                "Those category questions aren't surfacing your product."
+            )
         return _base_payload(
             primary_gap=primary_gap,
             headline="Shoppers who know you find you — new shoppers don't.",
             why_this_first=(
                 "When people search the category instead of your name, you're not "
-                f"in the answer. {failed_query_phrase} went to {competitor_phrase}. "
+                f"in the answer. {_losing_clause} "
                 "That's where you're losing new buyers."
             ),
             first_move=(
@@ -1911,8 +1938,19 @@ def _prescription_for_gap(
                     "compare-to, who it's for, and the proof behind it."
                 ),
                 (
-                    f"Pitch the sites AI cites for these ({source_or_cited}) on why "
-                    f"you belong next to {competitor_phrase}."
+                    # Same guard as why_this_first above: only name competitors
+                    # when we actually have them, else competitor_phrase falls
+                    # back to the noun "no repeated named competitors" and the
+                    # verb slot reads broken ("...belong next to no repeated...").
+                    (
+                        f"Pitch the sites AI cites for these ({source_or_cited}) "
+                        f"on why you belong next to {competitor_phrase}."
+                    )
+                    if _has_competitors else
+                    (
+                        f"Pitch the sites AI cites for these ({source_or_cited}) "
+                        "on why you belong in the category answer."
+                    )
                 ),
             ],
             pivota_path=(
