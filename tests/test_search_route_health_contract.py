@@ -79,6 +79,32 @@ def test_gateway_external_seed_dedupe_softens_in_prune_mode():
         agent_shop_gateway.SEARCH_EXTERNAL_HARD_RULE_PRUNE = original
 
 
+def test_gateway_attached_seed_surfaces_when_not_internally_served():
+    # #1659: an attached seed (resolved to a canonical pg/sig) IS the merchant offer and must surface when
+    # the canonical product is NOT being served internally — it was previously dropped unconditionally,
+    # collapsing legitimate beauty offers to near-zero on the keyless/agent path.
+    attached = {
+        "product": {
+            "product_id": "ext-attached-1",
+            "attached_product_key": "merch|shopify|sku-123",
+            "title": "Paula's Choice 2% BHA Exfoliant",
+            "price": 35.0,
+            "currency": "USD",
+            "vendor": "Paula's Choice",
+        }
+    }
+    # No internal offer keys / ids served → the attached seed is kept (it's the only representation).
+    kept = agent_shop_gateway._filter_external_seed_wrappers([attached], set(), set())
+    assert len(kept) == 1
+
+    # Full offer-key collision with a served internal twin → deduped (dropped).
+    twin_keys = agent_shop_gateway._build_offer_keys(
+        "Paula's Choice 2% BHA Exfoliant", 35.0, "USD", "Paula's Choice"
+    )
+    deduped = agent_shop_gateway._filter_external_seed_wrappers([attached], twin_keys, set())
+    assert len(deduped) == 0
+
+
 def test_gateway_fragrance_retry_query_never_noop_for_perfume():
     retry_query = agent_shop_gateway._build_fragrance_semantic_retry_query("perfume")
     assert isinstance(retry_query, str)

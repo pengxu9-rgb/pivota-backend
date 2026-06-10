@@ -177,6 +177,7 @@ async def _upsert_sku(row: Dict[str, Any]) -> None:
         ON CONFLICT (sku_key) DO UPDATE SET
           title = EXCLUDED.title,
           image_url = EXCLUDED.image_url,
+          ingredient_ids = EXCLUDED.ingredient_ids,
           sku_payload = EXCLUDED.sku_payload,
           readiness_tier = EXCLUDED.readiness_tier,
           updated_at = NOW()

@@ -318,6 +318,7 @@ async def _do_ingest(args: argparse.Namespace) -> int:
                       barcode = EXCLUDED.barcode,
                       title = EXCLUDED.title,
                       image_url = EXCLUDED.image_url,
+                      ingredient_ids = EXCLUDED.ingredient_ids,
                       sku_payload = EXCLUDED.sku_payload,
                       readiness_tier = EXCLUDED.readiness_tier,
                       updated_at = NOW()

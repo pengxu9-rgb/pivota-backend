@@ -36,6 +36,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database
+from services.beauty_external_ranking import (
+    normalize_external_seed_structured_ingredient_ids,
+)
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.pdp_category_classifier import (
@@ -346,6 +349,16 @@ async def _upsert_canonical_sku_for_mirror_row(
     redirect-flow (offer_mode='redirect') hands the user off to the
     merchant's storefront for selection."""
     sku_key = _derive_mirror_sku_key(product_key)
+    # Propagate the seed's ingredient evidence into the canonical SKU. Seeds carry structured ingredient ids
+    # (seed_data.reviewed_ingredient_ids / canonical_ingredient_ids / platform_metadata) and/or a title we can
+    # infer from; previously this was hardcoded to [] which dropped all ingredient data at migration and made
+    # ingredient-constrained beauty search (e.g. "vitamin c serum") return nothing. (#1659)
+    seed_data_for_ingredients = row_dict.get("seed_data")
+    if not isinstance(seed_data_for_ingredients, dict):
+        seed_data_for_ingredients = {}
+    mirror_ingredient_ids = normalize_external_seed_structured_ingredient_ids(
+        row_dict, seed_data_for_ingredients
+    )
     sku_payload = {
         "synthetic_canonical_variant": True,
         "source": "external_product_seeds_mirror_v1",
@@ -372,6 +385,7 @@ async def _upsert_canonical_sku_for_mirror_row(
           title = EXCLUDED.title,
           image_url = EXCLUDED.image_url,
           currency = EXCLUDED.currency,
+          ingredient_ids = EXCLUDED.ingredient_ids,
           sku_payload = EXCLUDED.sku_payload,
           readiness_tier = EXCLUDED.readiness_tier,
           updated_at = NOW()
@@ -398,7 +412,7 @@ async def _upsert_canonical_sku_for_mirror_row(
             "image_url": row_dict.get("image_url"),
             "visible_attributes": json.dumps({}, ensure_ascii=False),
             "visible_option_labels": json.dumps([], ensure_ascii=False),
-            "ingredient_ids": json.dumps([], ensure_ascii=False),
+            "ingredient_ids": json.dumps(mirror_ingredient_ids, ensure_ascii=False),
             "sku_payload": json.dumps(sku_payload, ensure_ascii=False, default=_json_default),
             "readiness_tier": READINESS_TIER,
         },
