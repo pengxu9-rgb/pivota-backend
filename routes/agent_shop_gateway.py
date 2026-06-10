@@ -11446,66 +11446,6 @@ async def _handle_create_order(
     return await _proxy_agent_api("POST", "/agent/v1/orders/create", body, checkout_token=checkout_token)
 
 
-async def _reuse_order_from_checkout_intent(checkout_token: Optional[str]) -> Optional[Dict[str, Any]]:
-    """BUG-2 fix: when the hosted checkout page's create_order call carries a checkout_token whose intent is
-    ALREADY order-backed (created by create_payment_link or an order-resume), return a create-order-shaped
-    response for that EXISTING order instead of minting a DUPLICATE. Without this, the page recreated the
-    order from the token's items at pay-time (a second order), orphaning the create_payment_link order and
-    splitting the payment/webhook correlation across two order ids.
-
-    Best-effort: any decode/lookup failure, a missing/non-payable order, or no order-backed intent → returns
-    None, and the caller falls through to normal order creation. Only reuses an order that is still payable.
-    """
-    token = (checkout_token or "").strip()
-    if not token:
-        return None
-    try:
-        from routes.buyer_api import verify_checkout_token
-        from db.orders import get_order
-
-        payload = verify_checkout_token(token)
-        intent_id = str((payload or {}).get("intent_id") or "").strip()
-        if not intent_id:
-            return None
-        row = await database.fetch_one(
-            "SELECT order_id FROM checkout_intents WHERE intent_id = :intent_id LIMIT 1",
-            {"intent_id": intent_id},
-        )
-        order_id = str((dict(row).get("order_id") if row else "") or "").strip()
-        if not order_id:
-            return None
-        order = await get_order(order_id)
-        if not order:
-            return None
-        status = str(order.get("status") or "").strip().lower()
-        payment_status = str(order.get("payment_status") or "").strip().lower()
-        # Never resume a terminal order — fall through to a fresh create instead.
-        if status == "cancelled" or payment_status in {"paid", "succeeded", "completed", "refunded"}:
-            return None
-        logger.info(
-            "[ShopGateway] create_order reusing existing order %s from checkout intent %s (no duplicate minted)",
-            order_id,
-            intent_id,
-        )
-        return {
-            "status": "success",
-            "order_id": order_id,
-            "merchant_id": order.get("merchant_id"),
-            "total": str(order.get("total") or "0"),
-            "total_amount": float(order.get("total") or 0),
-            "currency": order.get("currency") or "USD",
-            "payment": {
-                "psp": order.get("psp_used"),
-                "client_secret": order.get("client_secret"),
-                "payment_intent_id": order.get("payment_intent_id"),
-            },
-            "reused_existing_order": True,
-        }
-    except Exception as exc:  # never block order creation on a reuse attempt
-        logger.warning("[ShopGateway] checkout-intent order reuse skipped: %s", str(exc)[:200])
-        return None
-
-
 async def _handle_create_payment_link(
     payload: "CreatePaymentLinkPayload",
     *,
@@ -12174,11 +12114,6 @@ async def invoke_shop_operation(
                 pass
 
     if operation == "create_order":
-        # BUG-2: if this create_order is the hosted checkout page paying against an already-order-backed
-        # checkout intent, reuse that order instead of minting a duplicate. Falls through on any miss.
-        reused_order = await _reuse_order_from_checkout_intent(checkout_token)
-        if reused_order is not None:
-            return reused_order
         payload = CreateOrderPayload(**request.payload)
         return await _handle_create_order(
             payload.order,
