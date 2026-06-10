@@ -7904,17 +7904,15 @@ async def _handle_find_products_multi(
     active_ingredient_labels = [str(group["ingredient_id"]) for group in active_ingredient_intents]
     non_strict_beauty_text_recall_enabled = query_semantic_class == "beauty" and not strict_serving_mode
     expanded_shopping_beauty_prefetch = False
+    # Apply the generic-default precision gate to ANY default-class generic query with no structured
+    # intents, regardless of source or serving mode. The OR-over-terms lexical recall otherwise leaks
+    # off-domain products (e.g. "paula choice" → dog harnesses whose description merely contains "choice"),
+    # which is wrong on every surface — including the strict agent/MCP commerce surface (find_products →
+    # find_products_multi fallback), which previously skipped the gate via `not strict_serving_mode` and the
+    # UI-only source allowlist. The gate requires ≥0.6 term coverage over title/type/vendor/sku/tags (not
+    # description), so single-term and genuinely-matching queries are unaffected. #1659.
     generic_default_precision_gate_enabled = bool(
-        not strict_serving_mode
-        and query_semantic_class == "default"
-        and (
-            source_normalized in _GENERIC_DEFAULT_PRECISION_GATE_SOURCES
-            # The agent/MCP commerce surface (e.g. search_catalog over /mcp) sends no metadata.source, so
-            # source_normalized is empty. It is a free-text search surface that needs the same precision as
-            # the UI surfaces: without this, the OR-over-terms lexical recall leaks off-domain products
-            # (e.g. "paula choice" returns dog harnesses whose description merely contains "choice"). #1659.
-            or not source_normalized
-        )
+        query_semantic_class == "default"
         and not active_visible_category_intents
         and not active_visible_attribute_intents
         and not active_visible_option_intents
