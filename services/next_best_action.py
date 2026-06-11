@@ -36,6 +36,7 @@ PRIMARY_CATEGORY_DISCOVERY = "category_discovery_gap"
 PRIMARY_COMPETITOR_SOURCE = "competitor_source_gap"
 PRIMARY_FIRST_PARTY_DEFENSE = "first_party_defense"
 
+PRIMARY_SKU_GET_INDEXED = "get_indexed"
 PRIMARY_SKU_OPEN_LANE_CAPTURE = "open_lane_capture"
 PRIMARY_SKU_SUBSTITUTION_LEAK = "substitution_leak"
 PRIMARY_SKU_CONTENT_REVISION_GAP = "content_revision_gap"
@@ -275,6 +276,34 @@ async def attach_sku_strategic_brief(
     return out
 
 
+def _sku_not_indexed(
+    primary_gaps: List[Mapping[str, Any]],
+    scores: Mapping[str, Any],
+) -> bool:
+    """True when the SKU isn't live/serving in the AI shopping surface.
+
+    Indexing is the prerequisite for every other move: an un-indexed SKU
+    can't be cited no matter how good the page is. Detected from the
+    routability `serving_eligibility` bucket scoring zero (serving_eligible is
+    False), with a fallback to the merchant-safe primary-gap signal.
+    """
+    routability = _as_mapping(scores.get("routability"))
+    breakdown = _as_mapping(routability.get("breakdown"))
+    serving = _as_mapping(breakdown.get("serving_eligibility"))
+    if serving:
+        max_points = int(serving.get("max") or 0)
+        points = int(serving.get("points") or 0)
+        if max_points > 0 and points == 0:
+            return True
+    # Fallback (breakdown absent): a full serving_eligibility gap surfaced.
+    for gap in primary_gaps:
+        if str(gap.get("bucket") or "") == "serving_eligibility":
+            max_points = int(gap.get("max") or 0)
+            if max_points > 0 and int(gap.get("gap") or 0) >= max_points:
+                return True
+    return False
+
+
 def _classify_sku_primary_gap(
     *,
     opportunity: Mapping[str, Any],
@@ -282,6 +311,11 @@ def _classify_sku_primary_gap(
     scores: Mapping[str, Any],
     identity: Mapping[str, Any],
 ) -> str:
+    # Indexing comes first — an un-indexed SKU can't be cited regardless of
+    # page quality or open lanes, so this gates every other primary move.
+    if _sku_not_indexed(primary_gaps, scores):
+        return PRIMARY_SKU_GET_INDEXED
+
     if _sku_top_open_lane(opportunity):
         return PRIMARY_SKU_OPEN_LANE_CAPTURE
 
@@ -365,6 +399,38 @@ def _sku_prescription_for_gap(
     merchant_path = _as_mapping(evidence.get("merchant_path"))
     sideways_wedge = _as_mapping(evidence.get("sideways_wedge"))
     first_pivota_path = _sku_pivota_path(sku_title)
+
+    if primary_gap == PRIMARY_SKU_GET_INDEXED:
+        return _base_payload(
+            primary_gap=primary_gap,
+            headline=f"Get {sku_title} indexed so AI can find it.",
+            why_this_first=(
+                f"{sku_title} isn't live in the AI shopping surface yet, so assistants "
+                "can't see or recommend it. Until it's indexed, nothing else you do to "
+                "the page can move your visibility — this is the first step."
+            ),
+            first_move=(
+                f"Get {sku_title} live and crawlable: confirm it's published, in your "
+                "sitemap, and has a canonical product page AI can reach."
+            ),
+            self_serve_actions=[
+                (
+                    "Confirm the product is published (not hidden or draft) and its page "
+                    "returns a clean, fast, crawlable URL."
+                ),
+                (
+                    "Make sure it's in your sitemap and the page shows the core product "
+                    "facts — title, price, availability, and a clear description."
+                ),
+            ],
+            pivota_path=(
+                f"Pivota submits {sku_title}'s canonical page for indexing and tracks it "
+                "to live, then re-audits to measure real AI visibility — you don't need "
+                "to do anything to start."
+            ),
+            evidence_used=evidence,
+            cta=_sku_cta("Get this product indexed"),
+        )
 
     if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
         query = _sku_query_phrase(top_lane.get("query"))
@@ -2203,6 +2269,12 @@ def _evidence_read_for_gap(
         summary = "The tested surface is healthy; the job is to defend it and watch drift."
         return {"summary": summary, "chips": chips}
 
+    if primary_gap == PRIMARY_SKU_GET_INDEXED:
+        return {
+            "summary": "This product isn't live in the AI shopping surface yet — get it indexed first.",
+            "chips": sku_score_chips,
+        }
+
     if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
         lane = _as_mapping(evidence.get("top_open_lane"))
         summary = f"Open lane found: {_sku_query_phrase(lane.get('query') or '')}."
@@ -2327,6 +2399,11 @@ def _tracking_metrics_for_gap(
             "First-party citation rate on the protected prompt set.",
             "New retailer, marketplace, or competitor hosts entering the top cited list.",
             "Citation movement after major PDP, catalog, or theme changes.",
+        ]
+    if primary_gap == PRIMARY_SKU_GET_INDEXED:
+        return [
+            "The product page becomes reachable and indexed in the AI shopping surface.",
+            "Re-audit shows the SKU moving from blocked to scored once it's live.",
         ]
     if primary_gap == PRIMARY_SKU_OPEN_LANE_CAPTURE:
         return [

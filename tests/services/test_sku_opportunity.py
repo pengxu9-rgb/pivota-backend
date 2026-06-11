@@ -42,6 +42,14 @@ def _bb_lab_sku_ctx() -> Dict[str, Any]:
         "merchant_id": "m-1",
         "product_key": "prod-bblab",
         "content_key": "ck-bblab",
+        # Serving-eligible: this fixture exercises the open-lane-capture path,
+        # which only applies once the SKU is indexed. Without this the SKU is
+        # un-indexed and (correctly) classified get_indexed instead.
+        "index_pipeline_state": {
+            "serving_eligible": True,
+            "pipeline_stage": "public_indexed",
+            "identity_resolved": True,
+        },
         "product": product,
         "sku": {
             "sku_key": "sku-bblab",
