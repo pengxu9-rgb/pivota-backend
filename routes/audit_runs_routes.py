@@ -764,20 +764,34 @@ async def _build_preview(
     }
 
 
+def _resolve_audit_merchant_id(body_merchant_id: str, auth_merchant_id: str) -> str:
+    """Resolve the body's merchant_id against the authenticated merchant.
+
+    The merchant AI-Readiness portal sends the sentinel ``'self'`` (it
+    documents that the backend attaches the real merchant_id server-side);
+    resolve it to the authenticated merchant. Any other value must match the
+    authenticated merchant exactly — cross-tenant submission stays forbidden.
+    """
+    if body_merchant_id == "self":
+        return auth_merchant_id
+    if body_merchant_id != auth_merchant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "merchant_id in body must match the authenticated "
+                "merchant — cross-tenant audit submission is not permitted."
+            ),
+        )
+    return body_merchant_id
+
+
 @router.post("/preview")
 async def preview_audit_run(
     body: AuditPreviewRequest,
     auth_merchant_id: str = Depends(get_current_merchant),
 ) -> Dict[str, Any]:
     """Pure pre-flight cost/credit preview for SKU audit v3."""
-    if body.merchant_id != auth_merchant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "merchant_id in body must match the authenticated "
-                "merchant."
-            ),
-        )
+    body.merchant_id = _resolve_audit_merchant_id(body.merchant_id, auth_merchant_id)
     sku_keys = await _resolve_preview_sku_keys(
         merchant_id=body.merchant_id,
         scope=body.scope,
@@ -825,15 +839,7 @@ async def create_audit_run(
                 "which this endpoint does not yet support."
             ),
         )
-    if body.merchant_id != auth_merchant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "merchant_id in body must match the authenticated "
-                "merchant — cross-tenant audit submission is not "
-                "permitted."
-            ),
-        )
+    body.merchant_id = _resolve_audit_merchant_id(body.merchant_id, auth_merchant_id)
 
     # Portal-ref resolution: the merchant AI-Readiness page selects products
     # and sends `platform:source_product_id` composites as `sku_keys` (it
