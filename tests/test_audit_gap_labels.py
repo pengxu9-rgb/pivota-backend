@@ -15,7 +15,7 @@ These tests make that leak un-regressible:
 
 from __future__ import annotations
 
-import re
+import json
 
 import pytest
 
@@ -111,14 +111,14 @@ def test_primary_gaps_emit_label_why_not_reason():
         assert gap.get("dimension") and gap.get("bucket")
 
 
-def test_sanitizer_strips_breakdown_internals_only():
+def test_sanitizer_drops_breakdowns_keeps_scores():
     report = {
         "per_sku_reports": [
             {
                 "sku_key": "sku_1",
                 "scores": {
                     "identity": {
-                        "score": 0,
+                        "score": 30,
                         "breakdown": {
                             "content_key": {
                                 "points": 0,
@@ -130,15 +130,37 @@ def test_sanitizer_strips_breakdown_internals_only():
                         },
                     }
                 },
+                "citation_by_provider": {
+                    "gemini": {
+                        "score": 12,
+                        "prompts": 40,
+                        "breakdown": {
+                            "product_quality_score": {"points": 0, "max": 25},
+                        },
+                    }
+                },
                 # a `reason` OUTSIDE a breakdown must be left untouched
                 "next_best_action": {"reason": "merchant-facing why"},
             }
         ]
     }
     clean = sanitize_report_for_merchant(report)
-    bd = clean["per_sku_reports"][0]["scores"]["identity"]["breakdown"]
-    assert "missing_inputs" not in bd
-    assert "reason" not in bd["content_key"]
+    sku = clean["per_sku_reports"][0]
+    # breakdown blocks dropped entirely (bucket keys + reason + missing_inputs)
+    assert "breakdown" not in sku["scores"]["identity"]
+    assert "breakdown" not in sku["citation_by_provider"]["gemini"]
+    # scores and provider score/prompts preserved
+    assert sku["scores"]["identity"]["score"] == 30
+    assert sku["citation_by_provider"]["gemini"]["score"] == 12
+    assert sku["citation_by_provider"]["gemini"]["prompts"] == 40
     # non-breakdown reason preserved; original object not mutated
-    assert clean["per_sku_reports"][0]["next_best_action"]["reason"] == "merchant-facing why"
-    assert "missing_inputs" in report["per_sku_reports"][0]["scores"]["identity"]["breakdown"]
+    assert sku["next_best_action"]["reason"] == "merchant-facing why"
+    assert "breakdown" in report["per_sku_reports"][0]["scores"]["identity"]
+
+    # No internal scoring vocabulary anywhere in the merchant payload.
+    blob = json.dumps(clean).lower()
+    for banned in (
+        "product_quality_score", "content_key", "missing_inputs",
+        "divergent content_key", "serving_eligible",
+    ):
+        assert banned not in blob, f"leaked {banned!r} in merchant payload"

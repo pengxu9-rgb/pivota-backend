@@ -4250,44 +4250,40 @@ def _primary_gaps(scores: Dict[str, Any], cap: int = 3) -> List[Dict[str, Any]]:
     return gaps[:cap]
 
 
-def _strip_breakdown_internals(node: Any) -> None:
-    """In-place: drop internal scoring vocabulary from any `breakdown` dict.
+def _strip_score_breakdowns(node: Any) -> None:
+    """In-place: drop every `breakdown` block from the payload.
 
-    `breakdown.missing_inputs` and per-bucket `reason` are internal scoring
-    detail (schema names like "catalog_products.content_key", phrases like
-    "divergent content_key collision"). They are never rendered, but they ride
-    in the response payload. This scrubs them wherever a `breakdown` appears
-    (per_product[].scores.*, per_sku_reports[].scores.*), at any nesting depth.
-    Operates only inside `breakdown` dicts, so unrelated `reason` fields
-    elsewhere in the payload are untouched.
+    A score `breakdown` is pure internal scoring vocabulary — its bucket keys
+    ("product_quality_score", "collision_audit"), `reason` strings ("divergent
+    content_key collision"), and `missing_inputs` schema names ("catalog_products
+    .content_key") are all internal. None of it is rendered (the UI shows the
+    dimension `score` only and the merchant-safe `primary_gaps`). It appears
+    under per-SKU `scores.<dimension>.breakdown` and `citation_by_provider.
+    <provider>.breakdown`; this removes it wherever the key appears, at any
+    depth. The dimension `score` and provider `score`/`prompts` are preserved.
     """
     if isinstance(node, dict):
-        for key, value in node.items():
-            if key == "breakdown" and isinstance(value, dict):
-                value.pop("missing_inputs", None)
-                for bucket_detail in value.values():
-                    if isinstance(bucket_detail, dict):
-                        bucket_detail.pop("reason", None)
-            else:
-                _strip_breakdown_internals(value)
+        node.pop("breakdown", None)
+        for value in node.values():
+            _strip_score_breakdowns(value)
     elif isinstance(node, list):
         for item in node:
-            _strip_breakdown_internals(item)
+            _strip_score_breakdowns(item)
 
 
 def sanitize_report_for_merchant(report: Any) -> Any:
     """Return a merchant-safe deep copy of an assembled audit report.
 
-    Strips internal scoring vocabulary (`breakdown.missing_inputs`, per-bucket
-    `reason`) from the response only. The stored report_jsonb and all
-    server-side consumers (playbook engine, next_best_action, strategic_brief)
-    run on the intact report during worker assembly and are unaffected. Safe to
-    call on the full per_sku payload, the brand_report, or None.
+    Drops internal score `breakdown` blocks from the response only. The stored
+    report_jsonb and all server-side consumers (playbook engine,
+    next_best_action, strategic_brief, re-audit delta) run on the intact report
+    during worker assembly and are unaffected. Safe on the full per_sku payload,
+    the brand_report, or None.
     """
     if not isinstance(report, (dict, list)):
         return report
     clone = copy.deepcopy(report)
-    _strip_breakdown_internals(clone)
+    _strip_score_breakdowns(clone)
     return clone
 
 
