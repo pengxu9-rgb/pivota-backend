@@ -15,7 +15,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
 
 from db.database import database
@@ -124,6 +124,39 @@ async def debug_merchant_catalog(
         "products_cache_by_platform": [_row_to_dict(r) for r in cache_counts or []],
         "shopify_import_tasks": tasks_out,
     }
+
+
+@router.post("/merchant/{merchant_id}/reconcile-catalog", response_model=Dict[str, Any])
+async def reconcile_merchant_catalog(
+    merchant_id: str = Path(..., description="Internal merchant ID"),
+    platform: Optional[str] = Query(
+        None, description="Limit to one platform (e.g. shopify). Omit for all."
+    ),
+    limit: int = Query(
+        500, ge=1, le=2000,
+        description="Max products to ingest this call (bounds LLM-bearing fan-out).",
+    ),
+    dry_run: bool = Query(
+        False, description="When true, only report the diff; no writes."
+    ),
+    _: None = Depends(require_admin_key),
+) -> Dict[str, Any]:
+    """Backfill `catalog_products` from `products_cache` for a merchant.
+
+    Heals the gap where a product is visible on the front-end
+    (GET /merchant/products) but missing from `catalog_products`, which makes
+    the AI Commerce Readiness audit (POST /api/audits) return 404 missing_refs
+    for a product the merchant can see. Idempotent; safe to re-run.
+    """
+    from services.catalog_reconcile_service import reconcile_catalog_from_cache
+
+    report = await reconcile_catalog_from_cache(
+        merchant_id=merchant_id,
+        platform=platform,
+        limit=limit,
+        dry_run=dry_run,
+    )
+    return {"ok": True, **report}
 
 
 @router.post("/merchant/{merchant_id}/reconcile-store-counts", response_model=Dict[str, Any])
