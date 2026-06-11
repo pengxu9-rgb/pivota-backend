@@ -89,7 +89,13 @@ def classify_query_semantic_class(query: Optional[str]) -> str:
         r"beauty|skincare|skin care|cosmetic|cosmetics|makeup|"
         r"serum|toner|moisturizer|moisturiser|cleanser|"
         r"sunscreen|sun screen|sunblock|spf|"
-        r"foundation|lipstick|blush|gloss"
+        r"foundation|lipstick|blush|gloss|"
+        # Additional unambiguous beauty categories that were falling through to "default"
+        # and getting their external-seed recall blocked (semantic_class_blocked) → 0 results
+        # despite real eligible supply (e.g. "nail polish", "lip balm").
+        r"nail polish|lip balm|lip liner|mascara|eyeliner|eye liner|concealer|"
+        r"bronzer|eyeshadow|eye shadow|setting spray|cuticle oil|ampoule|"
+        r"body wash|body lotion|hair mask|shampoo|deodorant"
         r")\b",
         q,
     ):
