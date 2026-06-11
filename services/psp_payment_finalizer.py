@@ -130,9 +130,30 @@ def _is_terminal_paid_state(order: Dict[str, Any]) -> bool:
 def _is_terminal_failure_state(order: Dict[str, Any]) -> bool:
     payment_status = _payment_status_lower(order)
     status = _order_status_lower(order)
-    if payment_status in {"payment_failed", "partially_refunded", "refunded", "cancelled"}:
+    # A successfully-paid order is also terminal for the FAILURE path: a stale or
+    # mis-correlated payment_intent.payment_failed event must NEVER demote a paid
+    # order back to payment_failed (the inverse of the charge-stuck incident).
+    if payment_status in {
+        "payment_failed",
+        "paid",
+        "completed",
+        "succeeded",
+        "success",
+        "settled",
+        "partially_refunded",
+        "refunded",
+        "cancelled",
+    }:
         return True
-    return status in {"payment_failed", "partially_refunded", "refunded", "cancelled"}
+    return status in {
+        "payment_failed",
+        "paid",
+        "completed",
+        "fulfilled",
+        "partially_refunded",
+        "refunded",
+        "cancelled",
+    }
 
 
 def _blocks_payment_success_recovery(order: Dict[str, Any]) -> bool:
@@ -223,7 +244,24 @@ async def finalize_payment_success(
             psp_used=psp,
         )
 
-    await mark_order_paid_fn(order_id)
+    # `mark_order_paid` now performs an ATOMIC conditional transition and returns
+    # True only if THIS call flipped a non-terminal order to paid. When two
+    # finalizers race (webhook + sync confirm, or webhook + reconcile sweep),
+    # exactly one observes transitioned=True. Callers gate one-time side effects
+    # (Shopify order creation, merchant payment.completed webhook) on this so a
+    # concurrent finalize cannot double-fulfill. Recovery of a paid-but-
+    # unfulfilled order is handled by the reconcile sweep, not by re-finalizing.
+    transitioned = bool(await mark_order_paid_fn(order_id))
+    if not transitioned:
+        # Someone else won the paid transition between our in-memory guard above
+        # and this atomic update. Treat as already-settled, suppress duplicate
+        # side effects.
+        return {
+            "applied": False,
+            "transitioned": False,
+            "reason": "already_settled_concurrent",
+            "order_id": order_id,
+        }
     try:
         await stamp_gross_attributed_gmv(
             order_id,
@@ -251,6 +289,7 @@ async def finalize_payment_success(
 
     return {
         "applied": True,
+        "transitioned": True,
         "order_id": order_id,
         "merchant_id": merchant_id,
         "payment_reference": resolved_payment_reference,

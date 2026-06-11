@@ -453,6 +453,23 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # Pending-payment reconcile sweep: safety net behind the Stripe webhook.
+        # Re-checks orders still awaiting_payment but already carrying a PSP
+        # reference and finalizes the ones the PSP says actually succeeded, so a
+        # missing/mis-correlated webhook can't strand a real charge. 5min keeps
+        # recovery latency low without hammering the PSP API.
+        from services.payment_reconcile import run_payment_reconcile_tick
+        scheduler.add_job(
+            run_payment_reconcile_tick,
+            "interval",
+            seconds=300,
+            id="payment_reconcile_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+        )
+
         scheduler.start()
         _SCHEDULER = scheduler
         logger.info(
@@ -472,7 +489,8 @@ async def start_scheduler() -> None:
             "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
             "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
-            "+ catalog_row_trust_backfill (6h, ACTIVE)"
+            "+ catalog_row_trust_backfill (6h, ACTIVE) "
+            "+ payment_reconcile_tick (5min, ACTIVE)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

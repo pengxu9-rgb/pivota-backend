@@ -31,6 +31,32 @@ _STRIPE_MAX_NETWORK_RETRIES = max(
 )
 
 
+# Smallest-currency-unit conversion. Most currencies are 2-decimal (×100), but
+# zero-decimal currencies (JPY, KRW, …) are ×1 and three-decimal currencies
+# (BHD, KWD, …) are ×1000. Hardcoding ×100 overcharges JPY/KRW by 100× and
+# undercharges BHD/KWD by 10× — see the matching table in webhook_routes.
+_ZERO_DECIMAL_CURRENCIES = {
+    "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga",
+    "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf",
+}
+_THREE_DECIMAL_CURRENCIES = {"bhd", "jod", "kwd", "omr", "tnd"}
+
+
+def _minor_unit_factor(currency: Optional[str]) -> int:
+    c = (currency or "").strip().lower()
+    if c in _ZERO_DECIMAL_CURRENCIES:
+        return 1
+    if c in _THREE_DECIMAL_CURRENCIES:
+        return 1000
+    return 100
+
+
+def _to_minor_units(amount: Any, currency: Optional[str]) -> int:
+    """Convert a major-unit amount to the PSP's smallest currency unit."""
+    factor = _minor_unit_factor(currency)
+    return int((Decimal(str(amount)) * Decimal(factor)).to_integral_value())
+
+
 class PaymentIntent:
     """统一的支付意图对象"""
     def __init__(
@@ -280,7 +306,7 @@ class StripeAdapter(PSPAdapter):
                                 "quantity": 1,
                                 "price_data": {
                                     "currency": currency.lower(),
-                                    "unit_amount": int(amount * 100),
+                                    "unit_amount": _to_minor_units(amount, currency),
                                     "product_data": {
                                         # 尽量给一个可读名称，避免为空
                                         "name": metadata.get("description")
@@ -303,7 +329,7 @@ class StripeAdapter(PSPAdapter):
                     PaymentIntent(
                         id=session.id,
                         client_secret=None,
-                        amount=int(amount * 100),
+                        amount=_to_minor_units(amount, currency),
                         currency=currency,
                         status="requires_action",
                         psp_type="stripe_checkout",
@@ -317,7 +343,7 @@ class StripeAdapter(PSPAdapter):
             # 默认：PaymentIntent + client_secret（传统前端使用）
             redirect_policy = self._resolve_redirect_policy(metadata)
             payment_payload = {
-                "amount": int(amount * 100),  # Stripe 使用分为单位
+                "amount": _to_minor_units(amount, currency),  # Stripe 使用分为单位
                 "currency": currency.lower(),
                 "metadata": metadata,
                 "automatic_payment_methods": {
@@ -379,7 +405,7 @@ class StripeAdapter(PSPAdapter):
 
             capture_data: Dict[str, Any] = {}
             if amount:
-                capture_data["amount_to_capture"] = int(amount * 100)
+                capture_data["amount_to_capture"] = _to_minor_units(amount, currency)
 
             request_options = None
             if idempotency_key:
@@ -575,7 +601,7 @@ class StripeAdapter(PSPAdapter):
 
             refund_data = {"payment_intent": payment_intent_ref}
             if amount:
-                refund_data["amount"] = int(amount * 100)
+                refund_data["amount"] = _to_minor_units(amount, currency)
             if reason:
                 # Stripe only accepts a small enum for `reason`.
                 # Keep caller-provided human text as metadata instead of failing the refund.
@@ -708,7 +734,7 @@ class AdyenAdapter(PSPAdapter):
             # Use sessions API for redirect flow (like Stripe)
             payload = {
                 "amount": {
-                    "value": int(amount * 100),
+                    "value": _to_minor_units(amount, currency),
                     "currency": currency
                 },
                 "reference": metadata.get("order_id", "ORDER"),
@@ -753,7 +779,7 @@ class AdyenAdapter(PSPAdapter):
                         PaymentIntent(
                             id=f"adyen_session_{session_id}",
                             client_secret=session_data,  # Adyen session data for frontend
-                            amount=int(amount * 100),
+                            amount=_to_minor_units(amount, currency),
                             currency=currency,
                             status="requires_action",
                             psp_type="adyen",
@@ -848,7 +874,7 @@ class AdyenAdapter(PSPAdapter):
             if amount is None or not currency:
                 return False, None, "Adyen capture requires amount and currency"
             payload["amount"] = {
-                "value": int(amount * 100),
+                "value": _to_minor_units(amount, currency),
                 "currency": str(currency).upper(),
             }
 

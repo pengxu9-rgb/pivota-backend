@@ -4568,95 +4568,10 @@ async def create_new_order(
                     order_id,
                 )
             # MultiPSPOrchestrator logs each PSP attempt; no aggregated update here.
-            _t = time.perf_counter()
-            await log_order_event(
-                event_type="payment_intent_failed",
-                order_id=order_id,
-                merchant_id=order_request.merchant_id,
-                total_amount=float(total),
-                currency=order_request.currency,
-                metadata={"error": error, "psp_type": final_psp},
-            )
-            logger.info(
-                "[OrderRoutes][PERF] step=log_order_event.payment_intent_failed.payment_exception duration_ms=%d order=%s",
-                int((time.perf_counter() - _t) * 1000),
-                order_id,
-            )
-        except Exception as e:
-            logger.error(f"Payment intent creation error: {e}")
-            if _order_allows_platform_checkout_fallback(order_metadata):
-                fallback_checkout_url = None
-                try:
-                    if isinstance(pricing_quote_meta, dict):
-                        fallback_checkout_url = pricing_quote_meta.get("checkout_url")
-                except Exception:
-                    fallback_checkout_url = None
-
-                platform_checkout = None
-                if not fallback_checkout_url:
-                    _t = time.perf_counter()
-                    platform_checkout = await _get_platform_checkout_fallback_url_best_effort(
-                        merchant_id=order_request.merchant_id,
-                        items=order_request.items,
-                        discount_codes=order_request.discount_codes,
-                    )
-                    logger.info(
-                        "[OrderRoutes][PERF] step=_get_platform_checkout_fallback_url_best_effort.payment_exception_secondary duration_ms=%d order=%s",
-                        int((time.perf_counter() - _t) * 1000),
-                        order_id,
-                    )
-
-                if (
-                    not explicit_preferred_provider
-                    and (fallback_checkout_url or platform_checkout)
-                    and not payment_action
-                ):
-                    psp_type = "checkout"
-                    client_secret = str(fallback_checkout_url or (platform_checkout or {}).get("url"))
-                    payment_action = {
-                        "type": "redirect_url",
-                        "url": str(fallback_checkout_url or (platform_checkout or {}).get("url")),
-                        "raw": {
-                            "reason": "psp_error",
-                            "error": str(e),
-                            **({"platform": platform_checkout.get("platform"), "method": platform_checkout.get("method")} if platform_checkout else {}),
-                        },
-                    }
-                    _t = time.perf_counter()
-                    await log_order_event(
-                        event_type="payment_fallback_platform_checkout",
-                        order_id=order_id,
-                        merchant_id=order_request.merchant_id,
-                        total_amount=float(total),
-                        currency=order_request.currency,
-                        metadata={"checkout_url": str(fallback_checkout_url or (platform_checkout or {}).get("url"))},
-                    )
-                    logger.info(
-                        "[OrderRoutes][PERF] step=log_order_event.payment_fallback_platform_checkout.payment_exception_secondary duration_ms=%d order=%s",
-                        int((time.perf_counter() - _t) * 1000),
-                        order_id,
-                    )
-            elif _platform_checkout_fallback_enabled():
-                _t = time.perf_counter()
-                await _log_fallback_pollution_attempt_best_effort(
-                    order_id=order_id,
-                    merchant_id=order_request.merchant_id,
-                    total=total,
-                    currency=order_request.currency,
-                    metadata=order_metadata,
-                    reason="psp_error",
-                    source="create_new_order.payment_exception_secondary",
-                )
-                logger.info(
-                    "[OrderRoutes][PERF] step=_log_fallback_pollution_attempt_best_effort.payment_exception_secondary duration_ms=%d order=%s",
-                    int((time.perf_counter() - _t) * 1000),
-                    order_id,
-                )
-            else:
-                logger.warning(
-                    "[OrderRoutes] platform checkout fallback disabled after PSP error; keeping failure visible for order %s",
-                    order_id,
-                )
+            # NOTE: `error`/`final_psp` are only bound if create_payment_with_failover
+            # returned. This handler also catches exceptions raised BEFORE that call
+            # (e.g. an asyncpg-busy error re-raised from load_psp_configs), where
+            # those names would be unbound — so log only the exception itself.
             _t = time.perf_counter()
             await log_order_event(
                 event_type="payment_intent_error",

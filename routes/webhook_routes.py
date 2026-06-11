@@ -7,7 +7,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 import stripe
 import os
@@ -204,13 +204,28 @@ def _can_apply_stripe_payment_failure(order: Optional[Dict[str, Any]]) -> bool:
 
     payment_status = _stripe_payment_status_lower(order)
     status = _stripe_order_status_lower(order)
+    # A paid/settled order must never be demoted to payment_failed by a stale or
+    # mis-correlated payment_intent.payment_failed event (e.g. a failed event for
+    # an earlier abandoned PI that shares this order's metadata.order_id).
     if payment_status in {
+        "paid",
+        "completed",
+        "succeeded",
+        "success",
+        "settled",
         "partially_refunded",
         "refunded",
         "cancelled",
     }:
         return False
-    if status in {"partially_refunded", "refunded", "cancelled"}:
+    if status in {
+        "paid",
+        "completed",
+        "fulfilled",
+        "partially_refunded",
+        "refunded",
+        "cancelled",
+    }:
         return False
     try:
         if Decimal(str(order.get("total_refunded") or "0")) > Decimal("0"):
@@ -259,18 +274,84 @@ async def _persist_stripe_refund_observability(
     await update_order(order_id, {"metadata": metadata})
 
 
+async def _stripe_psp_owner_merchant_id(psp_id: Optional[str]) -> Optional[str]:
+    """Return the merchant_id that owns this Stripe psp_id, or None."""
+    if not psp_id:
+        return None
+    try:
+        from db.database import database
+
+        row = await database.fetch_one(
+            "SELECT merchant_id FROM merchant_psps WHERE psp_id = :psp_id AND provider = 'stripe' LIMIT 1",
+            {"psp_id": psp_id},
+        )
+        if row:
+            return str(row["merchant_id"] or "").strip() or None
+    except Exception as exc:
+        logger.warning("Failed to load owner merchant for psp_id=%s: %s", psp_id, exc)
+    return None
+
+
+def _order_belongs_to_psp_owner(order: Dict[str, Any], psp_owner_merchant_id: Optional[str]) -> bool:
+    """Cross-tenant guard: the resolved order must belong to the merchant that
+    owns the webhook endpoint's psp_id. Skipped when psp_owner is unknown (bare
+    /stripe endpoint authenticated by the platform-wide secret)."""
+    if not psp_owner_merchant_id:
+        return True
+    return str(order.get("merchant_id") or "").strip() == psp_owner_merchant_id
+
+
 async def _resolve_stripe_order_for_payment_event(
     *,
     payment_intent_id: Optional[str],
     payment_meta: Optional[Dict[str, Any]],
+    allow_repoint: bool = False,
+    psp_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Resolve the order a Stripe payment event belongs to.
+
+    Lookup order: (1) by stored payment_intent_id, then (2) by the PI's
+    metadata.order_id hint.
+
+    `allow_repoint` controls whether, on the metadata-hint path, we overwrite the
+    order's stored payment_intent_id with the event's PI. This is needed for the
+    hosted-checkout success path (the order stores a `cs_…` Checkout Session id,
+    while payment_intent.succeeded carries the `pi_…`). It is DANGEROUS on the
+    failure path: a stale payment_intent.payment_failed for an abandoned PI would
+    repoint a paid order off its real PI. So callers pass allow_repoint=True ONLY
+    for success/capture events, never for failure events.
+
+    `psp_id` (the webhook endpoint owner) enforces a cross-tenant guard: a
+    merchant who knows their own endpoint secret cannot drive state on another
+    merchant's order by forging metadata.order_id. A mismatch resolves to None
+    (treated as unmatched) so the caller does not mutate the foreign order.
+    """
+    psp_owner = await _stripe_psp_owner_merchant_id(psp_id)
+
+    def _scoped(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if order is None:
+            return None
+        if not _order_belongs_to_psp_owner(order, psp_owner):
+            logger.error(
+                {
+                    "alert": "stripe_webhook_cross_tenant_blocked",
+                    "psp_id": psp_id,
+                    "psp_owner_merchant_id": psp_owner,
+                    "order_id": order.get("order_id"),
+                    "order_merchant_id": order.get("merchant_id"),
+                    "payment_intent_id": payment_intent_id,
+                }
+            )
+            return None
+        return order
+
     query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
     from db.database import database
 
     if payment_intent_id:
         result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
         if result:
-            return _db_row_to_dict(result)
+            return _scoped(_db_row_to_dict(result))
 
     order_hint = ""
     if isinstance(payment_meta, dict):
@@ -282,9 +363,11 @@ async def _resolve_stripe_order_for_payment_event(
     if not order:
         return None
     order = _db_row_to_dict(order)
+    if _scoped(order) is None:
+        return None
 
     current_payment_intent_id = str(order.get("payment_intent_id") or "").strip()
-    if payment_intent_id and current_payment_intent_id != payment_intent_id:
+    if allow_repoint and payment_intent_id and current_payment_intent_id != payment_intent_id:
         try:
             await update_order(
                 order_hint,
@@ -295,7 +378,7 @@ async def _resolve_stripe_order_for_payment_event(
             )
             refreshed = await get_order(order_hint)
             if refreshed:
-                return refreshed
+                return _scoped(_db_row_to_dict(refreshed))
         except Exception:
             pass
 
@@ -661,6 +744,78 @@ async def _emit_stripe_merchant_webhook_best_effort(
         )
 
 
+def _stripe_event_payment_matches_order(
+    order: Dict[str, Any], data: Dict[str, Any]
+) -> Tuple[bool, Optional[str]]:
+    """Verify the signed Stripe event's charged amount + currency match the order.
+
+    The event is signature-verified, so its amount/currency ARE the real charge.
+    We must still confirm the charge corresponds to THIS order's total before
+    marking it paid + fulfilling — otherwise a PI carrying the right
+    metadata.order_id but a different amount (e.g. a $1 charge against a $500
+    order) would fulfill at the wrong price. Returns (ok, reason_if_not).
+    """
+    order_currency = str(order.get("currency") or "").strip().lower()
+    event_currency = str(data.get("currency") or "").strip().lower()
+    if order_currency and event_currency and order_currency != event_currency:
+        return False, f"currency_mismatch:order={order_currency},event={event_currency}"
+
+    # Prefer amount_received (actually captured); fall back to amount (intended).
+    observed_minor = data.get("amount_received")
+    if observed_minor is None:
+        observed_minor = data.get("amount")
+    if observed_minor is None:
+        return False, "event_amount_missing"
+
+    order_total = order.get("total")
+    if order_total is None:
+        return False, "order_total_missing"
+
+    try:
+        factor = _stripe_minor_unit_factor(event_currency or order_currency)
+        expected_minor = (Decimal(str(order_total)) * factor).to_integral_value()
+        observed = Decimal(str(observed_minor))
+    except Exception as exc:  # noqa: BLE001
+        return False, f"amount_parse_error:{exc}"
+
+    if observed != expected_minor:
+        return (
+            False,
+            f"amount_mismatch:expected_minor={expected_minor},observed_minor={observed}",
+        )
+    return True, None
+
+
+async def _flag_unmatched_stripe_payment_event(
+    *,
+    event_id: Optional[str],
+    event_type: Optional[str],
+    payment_intent_id: Optional[str],
+    payment_meta: Optional[Dict[str, Any]],
+    reason: str,
+) -> None:
+    """A signed payment SUCCESS event resolved to no order (or failed integrity
+    verification). This is the charge-stuck failure mode: a real charge with no
+    finalizable order. Record the event as 'unmatched' (NOT 'processed', so it is
+    never silently swept under the rug) and emit a loud alert. The periodic
+    reconcile sweep is the recovery net once the order materializes."""
+    meta_order_id = None
+    if isinstance(payment_meta, dict):
+        meta_order_id = str(payment_meta.get("order_id") or "").strip() or None
+    logger.error(
+        {
+            "alert": "stripe_payment_event_unmatched",
+            "event_type": event_type,
+            "event_id": event_id,
+            "payment_intent_id": payment_intent_id,
+            "metadata_order_id": meta_order_id,
+            "reason": reason,
+            "impact": "charge may have succeeded with no finalizable order; reconcile sweep will retry",
+        }
+    )
+    await _mark_stripe_webhook_event_status_best_effort(event_id, "unmatched", reason)
+
+
 # ============================================================================
 # Stripe Webhooks
 # ============================================================================
@@ -710,27 +865,19 @@ async def handle_stripe_webhook(
                 )
                 raise HTTPException(status_code=400, detail="Invalid signature")
         else:
-            # No Stripe webhook secret configured for this psp_id. In
-            # production this is a hard failure — refuse to fail-open.
-            # In dev/staging, log a warning and accept the unsigned payload
-            # (existing behaviour) so local testing keeps working.
-            is_prod = (
-                os.getenv("ENVIRONMENT", "").lower() == "production"
-                or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
-            )
-            if is_prod:
-                logger.error(
-                    "Stripe webhook secret not configured for psp_id=%s in production "
-                    "— rejecting unsigned event",
-                    psp_id,
-                )
-                raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
-            logger.warning(
-                "Stripe webhook signature verification skipped for psp_id=%s "
-                "(no secret candidates; permitted only in non-production)",
+            # No Stripe webhook secret configured for this psp_id. We REFUSE to
+            # fail open in ANY environment. Accepting unsigned payloads in
+            # dev/staging used to be the convenience escape hatch, but staging
+            # shares the production Postgres (single-DB tenancy), so an unsigned
+            # event accepted on staging mutates real production orders. Configure
+            # STRIPE_WEBHOOK_SECRET (or the per-psp webhook_endpoint_secret) for
+            # every deployment, including local, to exercise this path.
+            logger.error(
+                "Stripe webhook secret not configured for psp_id=%s — rejecting "
+                "unsigned event (signature is mandatory in all environments)",
                 psp_id,
             )
-            event = json.loads(payload)
+            raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
         event = _stripe_object_to_dict(event)
         if not isinstance(event, dict):
             logger.error("Invalid Stripe webhook event shape: %s", type(event).__name__)
@@ -749,6 +896,22 @@ async def handle_stripe_webhook(
         
         logger.info(f"Received Stripe webhook: {event_type}")
 
+        # Livemode gate: in production, refuse test-mode events. A test-mode
+        # endpoint secret (per-psp or platform) that happens to verify must not
+        # be able to mutate live orders. `livemode` is part of the signed event.
+        is_prod_env = (
+            os.getenv("ENVIRONMENT", "").lower() == "production"
+            or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+        )
+        event_livemode = event.get("livemode")
+        if is_prod_env and event_livemode is False:
+            logger.warning(
+                "Ignoring test-mode Stripe webhook (livemode=false) in production: type=%s id=%s",
+                event_type,
+                event.get("id"),
+            )
+            return {"status": "ignored", "event": event_type, "reason": "test_mode_event_in_production"}
+
         stripe_webhook_event_id = _stripe_webhook_event_id(event, payload, event_type)
         is_duplicate = await _record_stripe_webhook_event_best_effort(
             event_id=stripe_webhook_event_id,
@@ -766,65 +929,97 @@ async def handle_stripe_webhook(
             # 支付成功
             payment_intent_id = data.get("id")
             payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
+            # allow_repoint=True: hosted-checkout orders store the cs_ session id;
+            # the success event carries the pi_, so capturing it is correct here.
             result = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                allow_repoint=True,
+                psp_id=psp_id,
             )
-            
-            if result:
-                order_id = result["order_id"]
-                merchant_id = result["merchant_id"]
-                finalization = await _finalize_stripe_payment_success(
-                    result,
+
+            if not result:
+                # Signed success event with NO finalizable order (orphaned
+                # metadata.order_id, cross-tenant block, or order not yet
+                # committed). Do NOT mark 'processed' and swallow it — flag it.
+                await _flag_unmatched_stripe_payment_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
                     payment_intent_id=payment_intent_id,
-                    data=data,
+                    payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                    reason="no_order_resolved",
                 )
-                if finalization.get("applied"):
-                    logger.info(f"Order {order_id} marked as paid via webhook")
-                    await _emit_stripe_merchant_webhook_best_effort(
-                        result,
-                        event_type="payment.completed",
-                        payment_intent_id=payment_intent_id,
-                        amount_minor=data.get("amount"),
-                        currency=data.get("currency"),
-                    )
+                return {"status": "unmatched", "event": event_type}
 
-                    # PCS: freeze order snapshot evidence (best-effort; does not block payment success)
-                    try:
-                        await create_order_snapshot_evidence_pack(order_id, triggered_by="stripe_webhook")
-                    except Exception as e:
-                        logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
+            # Integrity: the signed charge amount/currency must match the order.
+            amount_ok, amount_reason = _stripe_event_payment_matches_order(result, data)
+            if not amount_ok:
+                await _flag_unmatched_stripe_payment_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=payment_intent_id,
+                    payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                    reason=amount_reason or "amount_verification_failed",
+                )
+                return {"status": "unmatched", "event": event_type, "reason": amount_reason}
 
-                    order_metadata = result.get("metadata") or {}
-                    if not isinstance(order_metadata, dict):
-                        order_metadata = {}
-                    skip_platform_order_creation = (
-                        _stripe_metadata_flag(order_metadata.get("skip_platform_order_creation"))
-                        or _stripe_metadata_flag(order_metadata.get("ops_canary"))
-                        or _stripe_metadata_flag((payment_meta or {}).get("skip_platform_order_creation"))
-                        or _stripe_metadata_flag((payment_meta or {}).get("ops_canary"))
-                    )
+            order_id = result["order_id"]
+            merchant_id = result["merchant_id"]
+            finalization = await _finalize_stripe_payment_success(
+                result,
+                payment_intent_id=payment_intent_id,
+                data=data,
+            )
+            # Gate one-time side effects on `transitioned`: only the finalizer call
+            # that actually flipped this order to paid (atomic in mark_order_paid)
+            # fulfills + notifies the merchant, so a concurrent finalize (sync
+            # confirm / reconcile sweep) cannot double-fulfill.
+            if finalization.get("transitioned"):
+                logger.info(f"Order {order_id} marked as paid via webhook")
+                await _emit_stripe_merchant_webhook_best_effort(
+                    result,
+                    event_type="payment.completed",
+                    payment_intent_id=payment_intent_id,
+                    amount_minor=data.get("amount"),
+                    currency=data.get("currency"),
+                )
 
-                    if not skip_platform_order_creation:
-                        # 触发 Shopify 订单创建
-                        from routes.order_routes import create_shopify_order
+                # PCS: freeze order snapshot evidence (best-effort; does not block payment success)
+                try:
+                    await create_order_snapshot_evidence_pack(order_id, triggered_by="stripe_webhook")
+                except Exception as e:
+                    logger.warning(f"PCS evidence snapshot failed for {order_id}: {e}")
 
-                        store_info = await get_primary_store(merchant_id)
-                        if store_info and store_info.get("platform") == "shopify":
-                            logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
-                            try:
-                                success = await create_shopify_order(order_id)
-                                if success:
-                                    logger.info(f"✅ Shopify order created via webhook for {order_id}")
-                                else:
-                                    logger.error(f"❌ Shopify order creation failed for {order_id}")
-                            except Exception as shop_err:
-                                logger.error(f"❌ Shopify order creation error: {shop_err}")
-                else:
-                    logger.info(
-                        "Stripe payment success replay skipped for order %s due to settled or terminal state",
-                        order_id,
-                    )
+                order_metadata = result.get("metadata") or {}
+                if not isinstance(order_metadata, dict):
+                    order_metadata = {}
+                skip_platform_order_creation = (
+                    _stripe_metadata_flag(order_metadata.get("skip_platform_order_creation"))
+                    or _stripe_metadata_flag(order_metadata.get("ops_canary"))
+                    or _stripe_metadata_flag((payment_meta or {}).get("skip_platform_order_creation"))
+                    or _stripe_metadata_flag((payment_meta or {}).get("ops_canary"))
+                )
+
+                if not skip_platform_order_creation:
+                    # 触发 Shopify 订单创建
+                    from routes.order_routes import create_shopify_order
+
+                    store_info = await get_primary_store(merchant_id)
+                    if store_info and store_info.get("platform") == "shopify":
+                        logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
+                        try:
+                            success = await create_shopify_order(order_id)
+                            if success:
+                                logger.info(f"✅ Shopify order created via webhook for {order_id}")
+                            else:
+                                logger.error(f"❌ Shopify order creation failed for {order_id}")
+                        except Exception as shop_err:
+                            logger.error(f"❌ Shopify order creation error: {shop_err}")
+            else:
+                logger.info(
+                    "Stripe payment success replay skipped for order %s due to settled or terminal state",
+                    order_id,
+                )
 
         elif event_type == "payment_intent.amount_capturable_updated":
             payment_intent_id = data.get("id")
@@ -832,6 +1027,8 @@ async def handle_stripe_webhook(
             result = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                allow_repoint=True,
+                psp_id=psp_id,
             )
             if result:
                 from routes.order_routes import finalize_authorized_payment_order
@@ -868,6 +1065,8 @@ async def handle_stripe_webhook(
                 result = await _resolve_stripe_order_for_payment_event(
                     payment_intent_id=session_id,
                     payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                    allow_repoint=True,
+                    psp_id=psp_id,
                 )
             else:
                 result = None
@@ -899,11 +1098,15 @@ async def handle_stripe_webhook(
                 else "Unknown error"
             )
             payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
+            # allow_repoint stays False: a stale/abandoned failed PI must never
+            # repoint (and then demote) a paid order via metadata.order_id.
             result = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                allow_repoint=False,
+                psp_id=psp_id,
             )
-            
+
             if result:
                 order_id = result["order_id"]
                 finalization = await _finalize_stripe_payment_failure(
@@ -1708,18 +1911,49 @@ async def handle_shopify_webhook(
             result = await database.fetch_one(query, {"shopify_order_id": shopify_order_id})
 
             if result:
+                result = _db_row_to_dict(result)
                 order_id = result["order_id"]
-                await update_order_status(order_id, "cancelled")
-                await log_order_event(
-                    event_type="order_cancelled_webhook",
-                    order_id=order_id,
-                    merchant_id=merchant_id,
-                    metadata={
-                        "shopify_order_id": shopify_order_id,
-                        "cancel_reason": cancel_reason
-                    }
+                existing_payment_status = str(result.get("payment_status") or "").strip().lower()
+                existing_status = str(result.get("status") or "").strip().lower()
+                # Guard: do NOT blindly cancel a paid/shipped/fulfilled/refunded
+                # order on a Shopify orders/cancelled webhook. Cancelling a paid
+                # order here would silently strand a real charge. Only cancel
+                # orders that have not yet reached a paid/terminal state.
+                protected = (
+                    existing_payment_status in {"paid", "completed", "succeeded", "settled", "refunded", "partially_refunded"}
+                    or existing_status in {"paid", "completed", "fulfilled", "shipped", "refunded", "partially_refunded", "cancelled"}
                 )
-                logger.info(f"Order {order_id} cancelled via webhook: {cancel_reason}")
+                if protected:
+                    logger.warning(
+                        "Shopify orders/cancelled webhook ignored for order %s in protected state "
+                        "(payment_status=%s status=%s); not auto-cancelling a settled order",
+                        order_id,
+                        existing_payment_status,
+                        existing_status,
+                    )
+                    await log_order_event(
+                        event_type="order_cancel_webhook_ignored_protected_state",
+                        order_id=order_id,
+                        merchant_id=merchant_id,
+                        metadata={
+                            "shopify_order_id": shopify_order_id,
+                            "cancel_reason": cancel_reason,
+                            "payment_status": existing_payment_status,
+                            "status": existing_status,
+                        },
+                    )
+                else:
+                    await update_order_status(order_id, "cancelled")
+                    await log_order_event(
+                        event_type="order_cancelled_webhook",
+                        order_id=order_id,
+                        merchant_id=merchant_id,
+                        metadata={
+                            "shopify_order_id": shopify_order_id,
+                            "cancel_reason": cancel_reason
+                        }
+                    )
+                    logger.info(f"Order {order_id} cancelled via webhook: {cancel_reason}")
 
         elif topic == "orders/updated":
             # 订单更新

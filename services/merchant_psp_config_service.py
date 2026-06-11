@@ -570,9 +570,24 @@ async def fetch_active_runtime_merchant_psp(
     db_client = database_override or database
 
     psp_id_value = str(psp_id or "").strip()
+    provider_value = str(provider or "").strip().lower()
     if psp_id_value:
+        # When a provider hint is supplied (e.g. derived from psp_used / the
+        # pi_ payment reference, which reflect the PSP that ACTUALLY charged),
+        # require the stored psp_id to match it. Otherwise a stale psp_id left
+        # over from pre-payment selection — after failover switched providers —
+        # would resolve confirm/capture/refund against the wrong adapter. A
+        # provider mismatch falls through to provider-based resolution below.
+        psp_id_params: Dict[str, Any] = {
+            "merchant_id": merchant_value,
+            "psp_id": psp_id_value,
+        }
+        psp_id_provider_clause = ""
+        if provider_value:
+            psp_id_provider_clause = "AND LOWER(provider) = :provider"
+            psp_id_params["provider"] = provider_value
         row = await db_client.fetch_one(
-            """
+            f"""
             SELECT psp_id, merchant_id, provider, name, api_key, account_id, secret_key,
                    capabilities, status, connected_at, environment, provider_config,
                    validation_status, validation_error, last_validated_at,
@@ -581,12 +596,10 @@ async def fetch_active_runtime_merchant_psp(
             WHERE merchant_id = :merchant_id
               AND psp_id = :psp_id
               AND status = 'active'
+              {psp_id_provider_clause}
             LIMIT 1
             """,
-            {
-                "merchant_id": merchant_value,
-                "psp_id": psp_id_value,
-            },
+            psp_id_params,
         )
         if row:
             return dict(row)
