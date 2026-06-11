@@ -236,6 +236,7 @@ from routes.employee_kb_monitoring import router as employee_kb_monitoring_route
 from routes.employee_agents_management import router as employee_agents_management_router
 from routes.employee_agents_simple import router as employee_agents_simple_router
 from routes.admin_psp_integrity import router as admin_psp_integrity_router
+from routes.admin_orphan_orders import router as admin_orphan_orders_router
 from routes.admin_run_migration import router as admin_run_migration_router
 from routes.admin_run_migration_081 import router as admin_run_migration_081_router
 from routes.admin_run_migration_082 import router as admin_run_migration_082_router
@@ -896,6 +897,7 @@ app.include_router(agent_bank_router)  # Agent bank info
 app.include_router(merchant_agent_bank_router)  # Merchant view agent bank info
 
 app.include_router(admin_psp_integrity_router)  # PSP data integrity management
+app.include_router(admin_orphan_orders_router)  # Janitorial: cancel orphaned never-paid hosted-link drafts
 app.include_router(admin_run_migration_router)  # Database migrations via API
 app.include_router(admin_run_migration_081_router)  # Run migration 081 - Seed content lock/proposals
 app.include_router(admin_run_migration_082_router)  # Run migration 082 - seed_data_proposals.status += 'no_change'
