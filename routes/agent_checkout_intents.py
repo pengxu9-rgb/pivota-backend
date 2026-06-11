@@ -798,6 +798,47 @@ async def create_checkout_intent(
     }
 
 
+async def _resolve_merchant_stripe_config(merchant_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve the merchant's Stripe PUBLISHABLE config for the checkout UI.
+
+    Returns {publishable_key, stripe_account, environment} for the merchant's active Stripe row (prefer a
+    live-classified row). Only the PUBLISHABLE key is returned — it is browser-safe by design (it is the key
+    the checkout page initializes Stripe.js with). Surfaced on /prefill so the card form can mount on page
+    load, before the quote/order, instead of waiting for the order-create response to carry the key. NEVER
+    returns a secret key. Best-effort: any failure returns None and the page falls back to the order-create
+    response for the key.
+    """
+    mid = str(merchant_id or "").strip()
+    if not mid:
+        return None
+    try:
+        from services.merchant_psp_config_service import (
+            fetch_active_merchant_psps,
+            normalize_psp_environment,
+            _extract_public_key,
+        )
+
+        rows = await fetch_active_merchant_psps(merchant_id=mid, provider="stripe")
+    except Exception:
+        return None
+    if not rows:
+        return None
+
+    def _env(r: Dict[str, Any]) -> str:
+        key_for_env = r.get("runtime_secret_key") or r.get("secret_key") or r.get("api_key")
+        return normalize_psp_environment("stripe", key_for_env, r.get("environment"))
+
+    chosen = next((r for r in rows if _env(r) == "live"), None) or rows[0]
+    pk = _extract_public_key(chosen.get("provider_config"))
+    if not pk:
+        return None
+    return {
+        "publishable_key": pk,
+        "stripe_account": (str(chosen.get("account_id") or "").strip() or None),
+        "environment": _env(chosen),
+    }
+
+
 @router.get("/prefill")
 async def get_checkout_prefill(
     request: Request,
@@ -975,4 +1016,23 @@ async def get_checkout_prefill(
         if isinstance(buyer_prefill.get("shipping_address"), dict):
             merged["shipping_address"] = buyer_prefill["shipping_address"]
 
-    return {"prefill": _minimize_prefill_response(merged)}
+    # Surface the merchant's Stripe PUBLISHABLE config so the checkout page can mount the card form on load
+    # (before the quote/order), instead of waiting for the order-create response to carry the key. Publishable
+    # key only — browser-safe. Best-effort: never blocks prefill.
+    stripe_config: Optional[Dict[str, Any]] = None
+    try:
+        merchant_ids = payload.get("merchant_ids")
+        first_merchant = (
+            str(merchant_ids[0]).strip()
+            if isinstance(merchant_ids, list) and merchant_ids
+            else ""
+        )
+        if first_merchant:
+            stripe_config = await _resolve_merchant_stripe_config(first_merchant)
+    except Exception:
+        stripe_config = None
+
+    return {
+        "prefill": _minimize_prefill_response(merged),
+        **({"stripe_config": stripe_config} if stripe_config else {}),
+    }
