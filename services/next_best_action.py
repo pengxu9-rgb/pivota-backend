@@ -313,6 +313,10 @@ def _classify_sku_primary_gap(
 ) -> str:
     # Indexing comes first — an un-indexed SKU can't be cited regardless of
     # page quality or open lanes, so this gates every other primary move.
+    # NOTE: this is the per-SKU (v3) surface's get-indexed path. The legacy
+    # brand-report path surfaces the same intent via the `get_indexed`
+    # playbook in audit_playbook_engine (select_playbooks); the two engines
+    # serve different report surfaces.
     if _sku_not_indexed(primary_gaps, scores):
         return PRIMARY_SKU_GET_INDEXED
 

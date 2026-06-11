@@ -4251,7 +4251,8 @@ def _primary_gaps(scores: Dict[str, Any], cap: int = 3) -> List[Dict[str, Any]]:
 
 
 def _strip_score_breakdowns(node: Any) -> None:
-    """In-place: drop every `breakdown` block from the payload.
+    """In-place: drop the internal scoring `breakdown` block from score and
+    per-provider entries.
 
     A score `breakdown` is pure internal scoring vocabulary — its bucket keys
     ("product_quality_score", "collision_audit"), `reason` strings ("divergent
@@ -4259,11 +4260,15 @@ def _strip_score_breakdowns(node: Any) -> None:
     .content_key") are all internal. None of it is rendered (the UI shows the
     dimension `score` only and the merchant-safe `primary_gaps`). It appears
     under per-SKU `scores.<dimension>.breakdown` and `citation_by_provider.
-    <provider>.breakdown`; this removes it wherever the key appears, at any
-    depth. The dimension `score` and provider `score`/`prompts` are preserved.
+    <provider>.breakdown` — both of which are dicts carrying a sibling `score`.
+
+    Scoped to dicts that carry a `score` (rather than any key literally named
+    `breakdown`) so a future, unrelated merchant-facing `breakdown` field can't
+    be stripped by accident. Recurses to any depth.
     """
     if isinstance(node, dict):
-        node.pop("breakdown", None)
+        if "score" in node:
+            node.pop("breakdown", None)
         for value in node.values():
             _strip_score_breakdowns(value)
     elif isinstance(node, list):
