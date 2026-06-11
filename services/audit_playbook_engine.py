@@ -46,6 +46,11 @@ _PLAYBOOK_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
+# Priority for the get-indexed gateway action: ranks above every other
+# content_revision action. Large but finite so it stays JSONB-serializable
+# (float('inf') would break json/asyncpg serialization of report_jsonb).
+_BLOCKED_GATEWAY_PRIORITY = 1e9
+
 
 def _load_playbooks() -> Dict[str, Dict[str, Any]]:
     """Lazy-load the playbook registry on first call. Returns an empty
@@ -335,11 +340,24 @@ def _content_gap_candidates(per_sku_report: Dict[str, Any]) -> List[Dict[str, An
             "reason": reason,
         })
 
+    # Blocked / un-indexed SKUs: the #1 step is getting indexed. Emit this
+    # gateway candidate first and unconditionally so a blocked SKU never
+    # dead-ends without a next step. A blocked SKU has no probe evidence, so
+    # this candidate is also exempt from the evidence-run-id gate downstream.
+    if str(per_sku_report.get("band") or "") == "blocked":
+        _add(
+            "routability",
+            "blocked_sku_gateway",
+            "This product isn't indexed yet, so AI can't find it.",
+        )
+
     for gap in per_sku_report.get("primary_gaps") or []:
         dimension = gap.get("dimension")
         bucket = gap.get("bucket")
         if dimension and bucket:
-            _add(str(dimension), str(bucket), gap.get("reason"))
+            # `why` is the merchant-safe gap copy (raw `reason` was internal
+            # scoring vocabulary and is no longer emitted in primary_gaps).
+            _add(str(dimension), str(bucket), gap.get("why"))
 
     content_score = _score_for_dimension(per_sku_report, "content_richness")
     if content_score is None or content_score >= 70:
@@ -562,12 +580,20 @@ def _select_content_revision_actions(
                 render_pb.setdefault("playbook_id", pid)
                 action = render_content_revision_action(render_pb, sku_ctx, enriched_report)
                 # Hard lesson: no merchant-facing content-revision
-                # recommendation without a traceable probe evidence id.
-                if not action.get("evidence_run_ids"):
+                # recommendation without a traceable probe evidence id —
+                # EXCEPT the get-indexed gateway, which fires precisely
+                # because the SKU couldn't be probed (it isn't indexed yet).
+                is_blocked_gateway = bucket == "blocked_sku_gateway"
+                if not action.get("evidence_run_ids") and not is_blocked_gateway:
                     continue
                 action["failing_dimension"] = dimension
                 action["failing_bucket"] = bucket
-                action["priority_score"] = _priority_for_content_action(enriched_report, str(bucket))
+                if is_blocked_gateway:
+                    # Always the merchant's first step — rank above every
+                    # other content action. Finite sentinel (JSONB-safe).
+                    action["priority_score"] = _BLOCKED_GATEWAY_PRIORITY
+                else:
+                    action["priority_score"] = _priority_for_content_action(enriched_report, str(bucket))
                 if reason:
                     action["evidence"]["gap_reason"] = reason
                 actions.append(action)

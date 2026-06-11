@@ -269,6 +269,21 @@
         "concrete_next_step": "Pivota drafts a header/summary rewrite from failing prompts; merchant approves brand voice; Pivota publishes to title_override and summary_short."
       }
     },
+    "get_indexed": {
+      "playbook_id": "get_indexed",
+      "lever": "content_revision",
+      "triggers": {"failing_dimension": "routability", "failing_bucket": "blocked_sku_gateway"},
+      "owner": "pivota",
+      "estimated_days": [7, 21],
+      "severity": "critical",
+      "concrete_next_step": "Pivota submits this product's canonical page for indexing and tracks it to live — you don't need to do anything to start.",
+      "template": {
+        "title": "Get {{sku_title}} indexed so AI can find it",
+        "what": "This product isn't live in the AI shopping surface yet, so assistants can't see or recommend it. Until it's indexed, the visibility measures can't move — this is the first step, before any content work.",
+        "evidence": "",
+        "concrete_next_step": "Pivota submits this product's canonical page for indexing and tracks it to live — you don't need to do anything to start. Once it's indexed we'll re-audit to measure real AI visibility."
+      }
+    },
     "generic_unclassified": {
       "applies_when": {"type": "unclassified"},
       "title_template": "Investigate {host}",
