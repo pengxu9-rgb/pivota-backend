@@ -69,6 +69,7 @@ from services.agent_center_bd_report_service import (
     apply_buyer_path_verdict_to_brand_report,
     run_brand_report,
     run_wedge_hero_sku_intelligence,
+    sanitize_report_for_merchant,
 )
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
@@ -477,7 +478,7 @@ async def _run_async_pipeline_compat(
 
     # COMPLETED — reshape into the legacy response.
     return {
-        "brand_report": row.get("report_jsonb"),
+        "brand_report": sanitize_report_for_merchant(row.get("report_jsonb")),
         # P1-1: rate-limit check now runs before the via branch, so
         # async-compat callers get the same quota visibility the
         # sync arm has always emitted.
@@ -956,7 +957,7 @@ async def run_merchant_self_audit(
         )
 
     return {
-        "brand_report": brand_report,
+        "brand_report": sanitize_report_for_merchant(brand_report),
         "rate_limit_remaining": remaining,
         "executors": executor_summary,
         "tasks": tasks_summary,
@@ -1345,7 +1346,7 @@ async def get_merchant_url_audit(
     run_status = row.get("status") or "running"
     if run_status == "succeeded":
         # report_jsonb holds the full result payload assembled by the runner.
-        return row.get("report_jsonb") or {
+        return sanitize_report_for_merchant(row.get("report_jsonb")) or {
             "status": "succeeded", "run_id": run_id, "brand_report": None,
         }
     if run_status == "failed":

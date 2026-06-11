@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -1422,6 +1423,49 @@ def _explain_verdict(
         "moderate; neither pattern is consistent across the queries "
         "tested. The action items below show which gap is bigger."
     )
+
+
+# Brand-level states for the per-SKU audit. "scored" is the normal path
+# (a real citation median exists). The other two are honest "we can't compute
+# a citation verdict yet" states — they must NOT collapse to a bottom-tier
+# "invisible" verdict (the pre-fix bug: verdict_for(int(None or 0)) → invisible).
+BRAND_STATE_SCORED = "scored"
+BRAND_STATE_BLOCKED_PRE_INDEX = "blocked_pre_index"
+BRAND_STATE_INSUFFICIENT_SIGNAL = "insufficient_signal"
+
+_BRAND_VERDICT_BLOCKED_PRE_INDEX = (
+    "Not yet visible to AI",
+    "Your products aren't indexed in the AI shopping surface yet, so assistants "
+    "can't find or recommend them. That's expected this early — getting them "
+    "indexed is the first step, and it's the top action below.",
+)
+_BRAND_VERDICT_INSUFFICIENT_SIGNAL = (
+    "Not enough signal yet",
+    "We couldn't measure how often AI cites your products in this run. Re-run the "
+    "audit once your products are live and indexed to get a representative read.",
+)
+
+
+def _per_sku_brand_verdict(
+    median_citation: Optional[int],
+    total_skus: int,
+    blocked_count: int,
+) -> Tuple[str, str, str]:
+    """Honest brand-level verdict for the per-SKU audit.
+
+    Returns (brand_state, label, explanation). When there's no citation signal
+    at all (median is None — typically every SKU is blocked / not yet indexed),
+    do NOT pass 0 into verdict_for: that emits a false bottom-tier "invisible"
+    verdict with no path forward. Tell the merchant the truth instead.
+    """
+    if median_citation is None:
+        if total_skus > 0 and blocked_count >= total_skus:
+            label, explanation = _BRAND_VERDICT_BLOCKED_PRE_INDEX
+            return BRAND_STATE_BLOCKED_PRE_INDEX, label, explanation
+        label, explanation = _BRAND_VERDICT_INSUFFICIENT_SIGNAL
+        return BRAND_STATE_INSUFFICIENT_SIGNAL, label, explanation
+    label, explanation = verdict_for(int(median_citation), int(median_citation))
+    return BRAND_STATE_SCORED, label, explanation
 
 
 def verdict_for(
@@ -3603,6 +3647,66 @@ def build_citation_by_provider(
     return out
 
 
+def _provider_cited_sku(provider_entry: Dict[str, Any]) -> bool:
+    """True when this provider actually surfaced the SKU — cited as the source
+    or mentioned by name. Reads the citation breakdown numerators; a non-zero
+    first-party or SKU-mention count is a real "the model surfaced you" signal
+    (vs. a bare score that can be lifted by answer-quality alone)."""
+    if not isinstance(provider_entry, dict) or provider_entry.get("status") == "probe_failed":
+        return False
+    breakdown = provider_entry.get("breakdown") or {}
+    for bucket in ("first_party_rate", "sku_mention_rate"):
+        detail = breakdown.get(bucket)
+        if isinstance(detail, dict) and int(detail.get("numerator") or 0) > 0:
+            return True
+    return False
+
+
+def _models_cited_for_sku(citation_by_provider: Dict[str, Any]) -> Dict[str, int]:
+    """Cross-model signal: in how many of the models that ran did this SKU get
+    cited/mentioned. `of` counts providers that actually probed (excludes
+    probe_failed)."""
+    providers = [
+        entry for entry in (citation_by_provider or {}).values()
+        if isinstance(entry, dict) and entry.get("status") != "probe_failed"
+    ]
+    cited = sum(1 for entry in providers if _provider_cited_sku(entry))
+    return {"cited": cited, "of": len(providers)}
+
+
+def _brand_citation_by_provider(per_sku_reports: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Brand-level per-model rollup, derived from the per-SKU
+    citation_by_provider that already rode in each report. No new LLM calls.
+    Per provider: median/p25/p75 citation across SKUs, SKUs scored, SKUs the
+    model cited, total prompts. With only Gemini running today this is a single
+    entry; it's the surface that lights up as more providers are enabled."""
+    by_provider: Dict[str, Dict[str, List[Any]]] = {}
+    for report in per_sku_reports or []:
+        cbp = (report or {}).get("citation_by_provider") or {}
+        for provider, entry in cbp.items():
+            if not isinstance(entry, dict) or entry.get("status") == "probe_failed":
+                continue
+            acc = by_provider.setdefault(provider, {"scores": [], "skus_cited": 0, "prompts": 0})
+            score = entry.get("score")
+            if score is not None:
+                acc["scores"].append(int(score))
+            if _provider_cited_sku(entry):
+                acc["skus_cited"] += 1
+            acc["prompts"] += int(entry.get("prompts") or 0)
+    out: Dict[str, Dict[str, Any]] = {}
+    for provider, acc in by_provider.items():
+        scores = acc["scores"]
+        out[provider] = {
+            "median": _percentile(scores, 0.5),
+            "p25": _percentile(scores, 0.25),
+            "p75": _percentile(scores, 0.75),
+            "skus_scored": len(scores),
+            "skus_cited": acc["skus_cited"],
+            "prompts": acc["prompts"],
+        }
+    return out
+
+
 async def _fetch_one_dict(query: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     from db.database import database
     try:
@@ -3995,6 +4099,129 @@ def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
     return out
 
 
+# Merchant-safe display copy for every scoring bucket emitted by the
+# compute_*_score functions. The raw bucket keys and `missing` schema names
+# (e.g. "product_quality_score", "catalog_products.content_key") are INTERNAL
+# scoring vocabulary and must never reach a merchant. _primary_gaps() and the
+# next-best-action gap chip read from this table; the coverage-guard test
+# (tests/test_audit_gap_labels.py) asserts every emitted bucket has an entry so
+# a new bucket can never silently leak its raw key. Keep copy free of internal
+# jargon: no "/100", no schema dots/underscores, no metric names.
+_GAP_DISPLAY: Dict[Tuple[str, str], Dict[str, str]] = {
+    # identity
+    ("identity", "content_key"): {
+        "label": "Stable product identity",
+        "why": "AI needs a consistent fingerprint to recognize this product across the web.",
+    },
+    ("identity", "pivota_signature"): {
+        "label": "Canonical product page",
+        "why": "A single trusted page gives AI one place to cite for this product.",
+    },
+    ("identity", "identity_resolution"): {
+        "label": "Resolved product identity",
+        "why": "This product isn't fully matched to one canonical entity yet, so AI can confuse it with others.",
+    },
+    ("identity", "variant_identity"): {
+        "label": "Clear variant details",
+        "why": "Each size, shade, or option needs its own identifiers so AI recommends the exact one a shopper wants.",
+    },
+    ("identity", "title_brand_category"): {
+        "label": "Clear title, brand, and category",
+        "why": "AI relies on an unambiguous name, brand, and category to match this product to shopper questions.",
+    },
+    ("identity", "collision_audit"): {
+        "label": "Distinct product identity",
+        "why": "This product shares an identity fingerprint with another listing, so models can confuse the two.",
+    },
+    # content_richness
+    ("content_richness", "product_quality_score"): {
+        "label": "Richer product detail",
+        "why": "The product description is thin where shoppers and AI ask the most questions.",
+    },
+    ("content_richness", "enrichment_coverage"): {
+        "label": "Complete product story",
+        "why": "Key selling details — summary, highlights, who it's for, when to use it — are missing or incomplete.",
+    },
+    ("content_richness", "vertical_structure"): {
+        "label": "Category-specific details",
+        "why": "Shoppers in this category expect specifics (ingredients, materials, or specs) that aren't fully covered yet.",
+    },
+    ("content_richness", "model_readiness"): {
+        "label": "AI-ready content",
+        "why": "The product content isn't yet structured the way AI assistants prefer to read and cite it.",
+    },
+    ("content_richness", "safety_claims"): {
+        "label": "Substantiated claims",
+        "why": "Product claims need supporting detail or clear usage guidance before AI will repeat them.",
+    },
+    ("content_richness", "freshness_raw_pdp"): {
+        "label": "Up-to-date product page",
+        "why": "The core product page is missing fresh detail or imagery that AI looks for.",
+    },
+    # routability
+    ("routability", "serving_eligibility"): {
+        "label": "Discoverable by AI",
+        "why": "This product isn't live in the AI shopping surface yet, so assistants can't recommend it.",
+    },
+    ("routability", "offer_orderability"): {
+        "label": "Buyable offer",
+        "why": "There's no clear, in-stock, orderable offer for AI to hand a shopper to checkout.",
+    },
+    ("routability", "price_currency_confidence"): {
+        "label": "Reliable price and currency",
+        "why": "Price or currency detail is incomplete, so AI can't quote this product confidently.",
+    },
+    ("routability", "merchant_trust_state"): {
+        "label": "Verified store status",
+        "why": "Store verification or sync status isn't fully established, which limits how confidently AI surfaces you.",
+    },
+    ("routability", "policy_jurisdiction"): {
+        "label": "Shipping and policy clarity",
+        "why": "Shipping coverage and store policies aren't fully specified for the markets AI serves.",
+    },
+    ("routability", "variant_route_integrity"): {
+        "label": "Correct variant checkout",
+        "why": "The selected option doesn't cleanly map to a specific buyable offer.",
+    },
+    # citation
+    ("citation", "first_party_rate"): {
+        "label": "Cited as the source",
+        "why": "When AI answers shopper questions in this category, it rarely points to you as the source.",
+    },
+    ("citation", "sku_mention_rate"): {
+        "label": "Mentioned by name",
+        "why": "AI seldom mentions this specific product when shoppers ask category questions.",
+    },
+    ("citation", "authority_near_variant_rate"): {
+        "label": "Backed by trusted sources",
+        "why": "Few authoritative sources discuss this product near the queries that matter, so AI has little to cite.",
+    },
+    ("citation", "answer_quality_rate"): {
+        "label": "Strong answer coverage",
+        "why": "When this product does come up, the answers AI gives are thin or low-confidence.",
+    },
+}
+
+
+def _humanize_bucket(bucket: str) -> str:
+    """Last-resort merchant-safe label for an unmapped bucket.
+
+    Every known bucket lives in _GAP_DISPLAY (enforced by the coverage-guard
+    test). This fallback only guarantees a brand-new bucket can never leak a
+    raw snake_case key: it strips schema dots and Title-Cases the tail.
+    """
+    tail = str(bucket or "").split(".")[-1]
+    words = [w for w in tail.replace("_", " ").split() if w]
+    return " ".join(w.capitalize() for w in words) or "Product readiness"
+
+
+def _gap_display(dimension: str, bucket: str) -> Dict[str, str]:
+    entry = _GAP_DISPLAY.get((dimension, bucket))
+    if entry:
+        return entry
+    return {"label": _humanize_bucket(bucket), "why": ""}
+
+
 def _primary_gaps(scores: Dict[str, Any], cap: int = 3) -> List[Dict[str, Any]]:
     gaps: List[Dict[str, Any]] = []
     for dimension, payload in scores.items():
@@ -4007,16 +4234,61 @@ def _primary_gaps(scores: Dict[str, Any], cap: int = 3) -> List[Dict[str, Any]]:
             gap = max(0, max_points - points)
             if gap <= 0:
                 continue
+            display = _gap_display(str(dimension), str(bucket))
             gaps.append({
                 "dimension": dimension,
                 "bucket": bucket,
                 "points": points,
                 "max": max_points,
                 "gap": gap,
-                "reason": detail.get("reason"),
+                # Merchant-safe copy. The raw breakdown `reason` is internal
+                # scoring vocabulary and is intentionally NOT surfaced here.
+                "label": display["label"],
+                "why": display["why"],
             })
     gaps.sort(key=lambda g: (-g["gap"], g["dimension"], g["bucket"]))
     return gaps[:cap]
+
+
+def _strip_breakdown_internals(node: Any) -> None:
+    """In-place: drop internal scoring vocabulary from any `breakdown` dict.
+
+    `breakdown.missing_inputs` and per-bucket `reason` are internal scoring
+    detail (schema names like "catalog_products.content_key", phrases like
+    "divergent content_key collision"). They are never rendered, but they ride
+    in the response payload. This scrubs them wherever a `breakdown` appears
+    (per_product[].scores.*, per_sku_reports[].scores.*), at any nesting depth.
+    Operates only inside `breakdown` dicts, so unrelated `reason` fields
+    elsewhere in the payload are untouched.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "breakdown" and isinstance(value, dict):
+                value.pop("missing_inputs", None)
+                for bucket_detail in value.values():
+                    if isinstance(bucket_detail, dict):
+                        bucket_detail.pop("reason", None)
+            else:
+                _strip_breakdown_internals(value)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_breakdown_internals(item)
+
+
+def sanitize_report_for_merchant(report: Any) -> Any:
+    """Return a merchant-safe deep copy of an assembled audit report.
+
+    Strips internal scoring vocabulary (`breakdown.missing_inputs`, per-bucket
+    `reason`) from the response only. The stored report_jsonb and all
+    server-side consumers (playbook engine, next_best_action, strategic_brief)
+    run on the intact report during worker assembly and are unaffected. Safe to
+    call on the full per_sku payload, the brand_report, or None.
+    """
+    if not isinstance(report, (dict, list)):
+        return report
+    clone = copy.deepcopy(report)
+    _strip_breakdown_internals(clone)
+    return clone
 
 
 def _band_for_score(score: Optional[int]) -> str:
@@ -4147,6 +4419,15 @@ async def build_per_sku_report(
         audit_run_id=audit_run_id,
     )
 
+    # Suppress per-provider citation when the SKU has no resolvable product
+    # (same guard as before); models_cited is derived from the same value so
+    # the two never disagree.
+    _sku_citation_by_provider = (
+        citation_by_provider
+        if not (sku_ctx.get("missing_inputs") and not product.get("product_key"))
+        else {}
+    )
+
     report = {
         "sku_key": sku_key,
         "product_key": sku_ctx.get("product_key") or product.get("product_key"),
@@ -4158,11 +4439,8 @@ async def build_per_sku_report(
         # "enrich before trusting", not "invisible".
         "identity": identity,
         "scores": scores,
-        "citation_by_provider": (
-            citation_by_provider
-            if not (sku_ctx.get("missing_inputs") and not product.get("product_key"))
-            else {}
-        ),
+        "citation_by_provider": _sku_citation_by_provider,
+        "models_cited": _models_cited_for_sku(_sku_citation_by_provider),
         "deliverability": deliverability,
         "band": _sku_band(scores),
         "primary_gaps": primary_gaps,
@@ -4346,6 +4624,10 @@ def build_brand_rollup(
         },
         "blocked_skus": blocked,
         "priority_queue": priority_queue[:25],
+        # Per-model brand rollup, derived from each SKU's citation_by_provider
+        # (no new LLM calls). Single entry today (Gemini); the surface fills in
+        # as more providers are enabled.
+        "citation_by_provider": _brand_citation_by_provider(per_sku_reports),
     }
 
 
@@ -7100,10 +7382,17 @@ async def run_brand_report(
             .get("citation", {})
             .get("median")
         )
-        legacy_label, _legacy_explanation = verdict_for(
-            int(median_citation or 0),
-            int(median_citation or 0),
+        # Honest brand verdict — see _per_sku_brand_verdict. A blocked /
+        # pre-index brand must NOT collapse to a false "invisible" verdict;
+        # the get-indexed action becomes step 1 below.
+        brand_state, legacy_label, brand_verdict_explanation = _per_sku_brand_verdict(
+            median_citation,
+            len(per_sku_reports),
+            len(brand_rollup.get("blocked_skus") or []),
         )
+        brand_rollup["brand_state"] = brand_state
+        brand_rollup["brand_verdict_label"] = legacy_label
+        brand_rollup["brand_verdict_explanation"] = brand_verdict_explanation
         cost_summary = await _cost_summary_for_per_sku_audit(
             audit_run_id,
             probe_runs_by_sku,
@@ -7127,6 +7416,9 @@ async def run_brand_report(
             "brand_rollup": brand_rollup,
             "verify_summary": _rollup_verify_summaries(per_sku_reports),
             "authority_map": authority_map,
+            "brand_state": brand_state,
+            "brand_verdict_label": legacy_label,
+            "brand_verdict_explanation": brand_verdict_explanation,
             "legacy_verdict": legacy_label,
             "cost_summary": cost_summary,
         }

@@ -52,6 +52,7 @@ from db.merchant_audit_runs import (
     recent_runs_for_merchant,
 )
 from routes.merchant_audit_routes import _check_audit_rate_limit
+from services.agent_center_bd_report_service import sanitize_report_for_merchant
 from services.idempotency import compute_audit_idempotency_key
 from services.merchant_audit_readiness import assess_merchant_audit_readiness
 from services.merchant_credit_balance_service import (
@@ -1275,9 +1276,13 @@ async def get_audit_run(
                     ),
                 },
             )
-        return _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+        return sanitize_report_for_merchant(
+            _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+        )
 
-    return AuditRunDetail(**_strip_brand_facing_internal_money(dict(row)))
+    return AuditRunDetail(
+        **sanitize_report_for_merchant(_strip_brand_facing_internal_money(dict(row)))
+    )
 
 
 @router.post(

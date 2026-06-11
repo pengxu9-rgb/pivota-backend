@@ -723,7 +723,11 @@ def _sku_gap_chip(gap: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         "points": gap.get("points"),
         "max": gap.get("max"),
         "gap": gap.get("gap"),
-        "reason": gap.get("reason"),
+        # Merchant-safe copy from _GAP_DISPLAY. The raw scoring `reason` is
+        # internal vocabulary and must not ride into the merchant-facing
+        # next-best-action evidence.
+        "label": gap.get("label"),
+        "why": gap.get("why"),
     }
 
 

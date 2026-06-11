@@ -769,3 +769,82 @@ def test_content_revision_actions_always_have_evidence_run_ids():
     assert content_actions
     for action in content_actions:
         assert action["evidence_run_ids"], action
+
+
+# --- get-indexed gateway for blocked SKUs (P0-2) -------------------------
+
+
+def _blocked_per_sku_report():
+    """A blocked / un-indexed SKU: band=blocked, no probe evidence at all
+    (it couldn't be probed because it isn't indexed yet)."""
+    return {
+        "sku_key": "sku-blocked-1",
+        "product_key": "prod-blocked-1",
+        "sku_title": "Unindexed Night Cream 50ml",
+        "impact_proxy": 8,
+        "band": "blocked",
+        "scores": {
+            "identity": {"score": 30, "breakdown": {}},
+            "content_richness": {"score": 20, "breakdown": {}},
+            "routability": {"score": 10, "breakdown": {}},
+            "citation": {"score": None, "breakdown": {}},
+        },
+        "primary_gaps": [],
+        "failing_prompts": [],
+        "verbatim_grounding_evidence": [],
+    }
+
+
+def test_get_indexed_action_emitted_for_blocked_sku():
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[_blocked_per_sku_report()],
+    )
+    get_indexed = [a for a in actions if a.get("playbook_step_id") == "get_indexed"]
+    assert get_indexed, "blocked SKU must surface the get_indexed action"
+    action = get_indexed[0]
+    assert action["lever"] == "content_revision"
+    assert action["owner"] == "pivota"
+    assert action["severity"] == "critical"
+    assert "Unindexed Night Cream 50ml" in action["title"]
+
+
+def test_get_indexed_exempt_from_evidence_run_id_gate():
+    # A blocked SKU has no probe evidence; the gateway must NOT be dropped by
+    # the no-evidence-run-id guard that applies to normal content actions.
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[_blocked_per_sku_report()],
+    )
+    action = [a for a in actions if a.get("playbook_step_id") == "get_indexed"][0]
+    assert action.get("evidence_run_ids") in (None, [], ()), action.get("evidence_run_ids")
+
+
+def test_get_indexed_ranked_first_among_content_actions():
+    from services.audit_playbook_engine import select_playbooks
+    blocked = _blocked_per_sku_report()
+    content_gap = _per_sku_report_for_content_revision()
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[content_gap, blocked],
+    )
+    content_actions = [a for a in actions if a.get("lever") == "content_revision"]
+    assert content_actions
+    assert content_actions[0]["playbook_step_id"] == "get_indexed", [
+        a.get("playbook_step_id") for a in content_actions
+    ]
+
+
+def test_non_blocked_sku_gets_no_get_indexed_action():
+    from services.audit_playbook_engine import select_playbooks
+    actions = select_playbooks(
+        cited_hosts_detailed=[],
+        failed_queries_detailed=[],
+        per_sku_reports=[_per_sku_report_for_content_revision()],
+    )
+    assert not [a for a in actions if a.get("playbook_step_id") == "get_indexed"]
