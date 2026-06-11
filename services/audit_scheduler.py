@@ -457,7 +457,9 @@ async def start_scheduler() -> None:
         # Re-checks orders still awaiting_payment but already carrying a PSP
         # reference and finalizes the ones the PSP says actually succeeded, so a
         # missing/mis-correlated webhook can't strand a real charge. 5min keeps
-        # recovery latency low without hammering the PSP API.
+        # recovery latency low without hammering the PSP API. The tick is DORMANT
+        # unless PAYMENT_RECONCILE_SWEEP_ENABLED is set — it auto-finalizes
+        # payments, and staging shares the prod DB, so enable deliberately.
         from services.payment_reconcile import run_payment_reconcile_tick
         scheduler.add_job(
             run_payment_reconcile_tick,
@@ -490,7 +492,7 @@ async def start_scheduler() -> None:
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
             "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
             "+ catalog_row_trust_backfill (6h, ACTIVE) "
-            "+ payment_reconcile_tick (5min, ACTIVE)"
+            "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED)"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

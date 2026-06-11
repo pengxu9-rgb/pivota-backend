@@ -22,9 +22,23 @@ It is deliberately conservative:
   never double-fulfill an order the webhook already settled.
 """
 
+import os
 from typing import Any, Dict, Optional
 
 from utils.logger import logger
+
+
+def _reconcile_sweep_enabled() -> bool:
+    """The sweep auto-finalizes payments + creates merchant orders, so it is
+    OFF by default and must be deliberately enabled for controlled rollout.
+    Important under single-DB tenancy (staging shares the prod Postgres): a
+    staging deploy must not silently reconcile prod orders."""
+    return str(os.getenv("PAYMENT_RECONCILE_SWEEP_ENABLED", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 # How long after creation before we consider an order "stuck" (give the
 # synchronous confirm / webhook a chance first).
@@ -167,7 +181,10 @@ async def reconcile_pending_payments(
 
 
 async def run_payment_reconcile_tick() -> None:
-    """Scheduler entrypoint (best-effort; never raises)."""
+    """Scheduler entrypoint (best-effort; never raises). Dormant unless
+    PAYMENT_RECONCILE_SWEEP_ENABLED is set."""
+    if not _reconcile_sweep_enabled():
+        return
     try:
         await reconcile_pending_payments()
     except Exception as exc:  # noqa: BLE001
