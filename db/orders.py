@@ -605,16 +605,37 @@ async def update_payment_info(
 
 
 async def mark_order_paid(order_id: str) -> bool:
-    """标记订单已支付"""
-    now = datetime.now()
-    query = (
-        orders.update()
-        .where(orders.c.order_id == order_id)
-        .values(status="paid", payment_status="paid", paid_at=now, updated_at=now)
-    )
+    """标记订单已支付.
 
-    result = await database.execute(query)
-    ok = result is not None and result > 0
+    ATOMIC, idempotent paid transition. Only flips an order to paid from a
+    non-terminal state, and uses RETURNING (not the UPDATE rowcount, which is
+    unreliable under the `databases`/asyncpg driver) to report whether THIS call
+    performed the transition. Concurrent finalizers (webhook + sync confirm +
+    reconcile sweep) therefore serialize: exactly one observes a True return and
+    proceeds to one-time side effects (Shopify order, GMV stamp, merchant
+    webhook). Returns False when the order was already paid/refunded/cancelled or
+    does not exist.
+    """
+    now = datetime.now()
+    row = await database.fetch_one(
+        """
+        UPDATE orders
+        SET status = 'paid',
+            payment_status = 'paid',
+            paid_at = :now,
+            updated_at = :now
+        WHERE order_id = :order_id
+          AND COALESCE(LOWER(payment_status), '') NOT IN (
+              'paid', 'refunded', 'partially_refunded', 'cancelled'
+          )
+          AND COALESCE(LOWER(status), '') NOT IN (
+              'paid', 'refunded', 'partially_refunded', 'cancelled', 'fulfilled'
+          )
+        RETURNING order_id
+        """,
+        {"order_id": order_id, "now": now},
+    )
+    ok = row is not None
 
     # Best-effort: converge `payments.status` for this order so customer-facing APIs
     # don't show stale "processing" after the PSP webhook confirms payment.

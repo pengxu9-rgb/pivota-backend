@@ -101,6 +101,15 @@ class PaymentRequest(BaseModel):
     return_url: Optional[str] = Field(None, description="URL for 3DS redirect callback")
     idempotency_key: Optional[str] = Field(None, description="Prevent duplicate payments")
     save_payment_method: bool = Field(False, description="Save for future use")
+    expected_amount: Optional[float] = Field(
+        None, description="Client-expected order total (major units) for drift detection"
+    )
+    currency: Optional[str] = Field(
+        None, description="Client-expected currency for drift detection"
+    )
+    quote_id: Optional[str] = Field(
+        None, description="Quote id the client priced against (telemetry / drift detection)"
+    )
 
 class NextAction(BaseModel):
     """Next action for 3DS or additional verification"""
@@ -422,7 +431,42 @@ async def create_payment(
         if order_total is None:
             raise HTTPException(status_code=400, detail="Order total not found")
         order_total = float(order_total)
-        
+
+        # Drift guard: if the client priced against a known amount/currency (from
+        # the live quote), refuse to charge when it no longer matches the order
+        # total — e.g. the delivery option changed the total after the
+        # PaymentIntent was prepared. The checkout SPA recognizes QUOTE_MISMATCH
+        # and refreshes the quote + retries.
+        if request.expected_amount is not None:
+            try:
+                amount_drift = abs(float(request.expected_amount) - order_total) > 0.01
+            except (TypeError, ValueError):
+                amount_drift = False
+            if amount_drift:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "QUOTE_MISMATCH",
+                        "message": "Order total changed since the amount was quoted; refresh and retry.",
+                        "order_id": request.order_id,
+                        "expected_amount": float(request.expected_amount),
+                        "order_total": order_total,
+                    },
+                )
+        if request.currency:
+            order_currency = str(order.get("currency") or "").strip().upper()
+            if order_currency and request.currency.strip().upper() != order_currency:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "QUOTE_MISMATCH",
+                        "message": "Order currency changed since the amount was quoted; refresh and retry.",
+                        "order_id": request.order_id,
+                        "expected_currency": request.currency.strip().upper(),
+                        "order_currency": order_currency,
+                    },
+                )
+
         # 2. Verify agent has access to merchant
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
