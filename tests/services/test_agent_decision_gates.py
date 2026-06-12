@@ -30,7 +30,17 @@ _FULL_SKINCARE_ROW = {
     "category_kind": "skincare",
     "provenance_claim_count": 1,
     "evidence_review_state": "reviewed",
-    "has_skin_concern": True,
+    "has_category_concern": True,
+    "has_key_actives": True,
+}
+
+# A haircare row that passes the category-attributes gate.
+_FULL_HAIRCARE_ROW = {
+    "has_us_offer": True,
+    "category_kind": "haircare",
+    "provenance_claim_count": 1,
+    "evidence_review_state": "reviewed",
+    "has_category_concern": True,
     "has_key_actives": True,
 }
 
@@ -112,7 +122,7 @@ def test_skincare_passes_with_concern_and_actives():
 
 
 def test_skincare_blocks_without_skin_concern():
-    row = {**_FULL_SKINCARE_ROW, "has_skin_concern": False}
+    row = {**_FULL_SKINCARE_ROW, "has_category_concern": False}
     result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True)
     assert result is not None and result[0] == BLOCKER_MISSING_CATEGORY_ATTRS
     assert "skin concern" in result[1]
@@ -125,8 +135,32 @@ def test_skincare_blocks_without_key_actives():
     assert "key actives" in result[1]
 
 
-def test_non_skincare_has_no_attribute_gate():
-    # A supplement with no skincare signals must NOT block on category attributes.
+def test_haircare_passes_with_concern_and_actives():
+    assert (
+        evaluate_agent_decision_gates(
+            _FULL_HAIRCARE_ROW, gates_enabled=True, evidence_gates=True
+        )
+        is None
+    )
+
+
+def test_haircare_blocks_without_hair_concern():
+    row = {**_FULL_HAIRCARE_ROW, "has_category_concern": False}
+    result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True)
+    assert result is not None and result[0] == BLOCKER_MISSING_CATEGORY_ATTRS
+    assert "hair concern" in result[1]
+
+
+def test_haircare_blocks_without_key_ingredients():
+    row = {**_FULL_HAIRCARE_ROW, "has_key_actives": False}
+    result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True)
+    assert result is not None and result[0] == BLOCKER_MISSING_CATEGORY_ATTRS
+    assert "key ingredients" in result[1]
+
+
+def test_non_gated_category_has_no_attribute_gate():
+    # A supplement with no skincare/haircare signals must NOT block on category
+    # attributes (its module hasn't shipped an attribute gate yet).
     assert (
         evaluate_agent_decision_gates(_FULL_ROW, gates_enabled=True, evidence_gates=True)
         is None

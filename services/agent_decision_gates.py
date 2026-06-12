@@ -26,7 +26,11 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional, Tuple
 
-from services.claim_safety import CATEGORY_SKINCARE, required_disclaimers_for_category
+from services.claim_safety import (
+    CATEGORY_HAIRCARE,
+    CATEGORY_SKINCARE,
+    required_disclaimers_for_category,
+)
 
 BLOCKER_NO_US_OFFER = "no_us_offer"
 BLOCKER_NO_PROVENANCE_CLAIM = "no_provenance_claim"
@@ -106,13 +110,27 @@ def _category_attributes_gap(
     category_kind: Optional[str], row: Dict[str, Any]
 ) -> Optional[str]:
     """Return a reason string when a category's required attributes are absent,
-    or None when present (or the category has no attribute gate yet)."""
+    or None when present (or the category has no attribute gate yet).
+
+    Skincare and haircare are both decision-grade only with the structured fit
+    signals an agent matches on -- a category concern AND key ingredients (the
+    same two underlying columns; only the wording differs). Other categories
+    stay non-blocking until their modules ship."""
     if category_kind == CATEGORY_SKINCARE:
-        missing = []
-        if not row.get("has_skin_concern"):
-            missing.append("skin concern")
-        if not row.get("has_key_actives"):
-            missing.append("key actives")
-        if missing:
-            return f"skincare record is missing required attributes: {', '.join(missing)}"
+        return _concern_and_actives_gap("skincare", "skin concern", "key actives", row)
+    if category_kind == CATEGORY_HAIRCARE:
+        return _concern_and_actives_gap("haircare", "hair concern", "key ingredients", row)
+    return None
+
+
+def _concern_and_actives_gap(
+    label: str, concern_name: str, actives_name: str, row: Dict[str, Any]
+) -> Optional[str]:
+    missing = []
+    if not row.get("has_category_concern"):
+        missing.append(concern_name)
+    if not row.get("has_key_actives"):
+        missing.append(actives_name)
+    if missing:
+        return f"{label} record is missing required attributes: {', '.join(missing)}"
     return None
