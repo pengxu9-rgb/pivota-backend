@@ -54,14 +54,35 @@ def _canned_report():
 
 @pytest.fixture
 def client(monkeypatch):
-    state = {"used": 0}
+    # balance defaults to plenty of credits on a paid tier so the metered path
+    # (used >= free limit) succeeds unless a test overrides it.
+    state = {"used": 0, "balance": {"credits": 100000, "plan_tier": "growth"}}
     started: list = []
     completed: list = []
     brand_calls: list = []
     sku_intel_calls: list = []
+    credit_ops: list = []
 
     async def fake_count(*, merchant_id, subject_type):
         return state["used"]
+
+    async def fake_get_balance(merchant_id):
+        return state["balance"]
+
+    import services.credit_consumption_service as _ccs_mod
+
+    async def fake_consume(merchant_id, operation_type, idempotency_key, *,
+                           probes=None, credits=None, usd_cogs=None, conn=None):
+        credit_ops.append({"kind": "consume", "merchant_id": merchant_id,
+                           "op": operation_type, "credits": credits,
+                           "key": idempotency_key})
+        return {"credits": credits, "category": "audit"}
+
+    async def fake_refund(merchant_id, operation_type, credits, source_event_id, *,
+                          usd_cogs=0, conn=None):
+        credit_ops.append({"kind": "refund", "credits": credits,
+                           "key": source_event_id})
+        return {"credits": credits}
 
     async def fake_onboarding(merchant_id):
         return {"store_url": "https://merch.example", "business_name": "Merch"}
@@ -133,6 +154,9 @@ def client(monkeypatch):
     monkeypatch.setattr(atc, "audit_telemetry", fake_telemetry)
     monkeypatch.setattr(mar, "_FREE_URL_AUDITS_PER_MERCHANT", 2)
     monkeypatch.setattr(mar, "_WEDGE_MAX_RUNS", 2)
+    monkeypatch.setattr(mar, "get_balance", fake_get_balance)
+    monkeypatch.setattr(_ccs_mod, "consume", fake_consume)
+    monkeypatch.setattr(_ccs_mod, "refund", fake_refund)
 
     app = FastAPI()
     app.include_router(mar.router)
@@ -141,6 +165,7 @@ def client(monkeypatch):
     c.state, c.started, c.completed, c.brand_calls, c.sku_intel_calls = (
         state, started, completed, brand_calls, sku_intel_calls,
     )
+    c.credit_ops = credit_ops
     return c
 
 
@@ -238,12 +263,50 @@ def test_post_vendor_fallback_when_absent(client, monkeypatch):
     ]
 
 
-def test_free_cap_blocks_at_limit(client):
+def test_over_free_limit_meters_credits_instead_of_blocking(client):
+    # The bug fix: a credited merchant past the free cap is METERED, not 402'd.
     client.state["used"] = 2
+    client.state["balance"] = {"credits": 100000, "plan_tier": "growth"}
+    res = client.post(_URL, json=_BODY)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "running"
+    assert body["billing_mode"] == "credits"
+    assert body["credits_charged"] > 0
+    # Free count is NOT consumed by a credit-metered run.
+    assert body["free_audits_used"] == 2
+    assert body["free_audits_remaining"] == 0
+    # Exactly one debit, idempotent on the run id; no refund (run launched).
+    consumes = [o for o in client.credit_ops if o["kind"] == "consume"]
+    assert len(consumes) == 1
+    assert consumes[0]["op"] == "audit"
+    assert consumes[0]["key"] == "url_wedge:run-url-1"
+    assert consumes[0]["credits"] == body["credits_charged"]
+    assert not [o for o in client.credit_ops if o["kind"] == "refund"]
+
+
+def test_over_free_limit_insufficient_credits_free_tier_402(client):
+    # Free-tier merchant with no credits past the cap still gets a clear 402.
+    client.state["used"] = 2
+    client.state["balance"] = {"credits": 0, "plan_tier": "free"}
     res = client.post(_URL, json=_BODY)
     assert res.status_code == 402
-    assert res.json()["detail"]["code"] == "free_audit_limit_reached"
-    assert client.started == []  # blocked before any fetch/record work
+    detail = res.json()["detail"]
+    assert detail["code"] == "insufficient_credits"
+    assert detail["required"] > 0
+    assert detail["available"] == 0
+    assert client.started == []  # blocked before any run is recorded
+    assert not client.credit_ops  # nothing debited
+
+
+def test_paid_tier_over_free_proceeds_even_if_balance_low(client):
+    # Paid tier may run on overage even when the live balance reads low.
+    client.state["used"] = 5
+    client.state["balance"] = {"credits": 0, "plan_tier": "growth"}
+    res = client.post(_URL, json=_BODY)
+    assert res.status_code == 200
+    assert res.json()["billing_mode"] == "credits"
+    assert [o for o in client.credit_ops if o["kind"] == "consume"]
 
 
 def test_cap_lifted_when_disabled(client, monkeypatch):
