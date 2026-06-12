@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
 from services.catalog_identity import normalize_gtin
+from services.title_normalization import normalize_display_title
 
 # Top-N offers stored per row. Schema docstring (mig 085) says <=5;
 # matches the AggregateOffer behavior on the frontend.
@@ -589,6 +590,9 @@ def assemble_row(
     title = coalesce_first(canonical.get("title"))
     if not title:
         return None
+    # Clean storefront noise (bundle tags, legal-entity seller prefix) before
+    # this title reaches the agent surface; keeps size/pack info intact.
+    title = normalize_display_title(title)
 
     seed_data = (external_seed or {}).get("seed_data") or {}
     if isinstance(seed_data, str):
