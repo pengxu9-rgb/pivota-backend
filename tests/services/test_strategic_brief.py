@@ -1636,11 +1636,15 @@ async def test_attach_sku_strategic_brief_preserves_deterministic_fields_on_succ
     assert attached["headline"] == nba["headline"]
     assert attached["first_move"] == nba["first_move"]
     assert attached["strategic_brief"] == _grounded_brief()
+    assert attached["brief_status"] == "ok"
     assert "strategic_brief" not in nba
+    assert "brief_status" not in nba
 
 
 @pytest.mark.asyncio
-async def test_attach_sku_strategic_brief_leaves_nba_unchanged_on_failure(monkeypatch):
+async def test_attach_sku_strategic_brief_leaves_nba_unchanged_when_feature_disabled(monkeypatch):
+    monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", False)
+
     async def fake_generate(evidence, **kwargs):
         return None
 
@@ -1661,8 +1665,84 @@ async def test_attach_sku_strategic_brief_leaves_nba_unchanged_on_failure(monkey
         sku_title="BB Lab Good Night Collagen",
     )
 
+    # Feature off: the brief is an opt-in enrichment, so a missing brief is not
+    # a diagnosable failure — leave the deterministic NBA untouched.
     assert attached == nba
     assert "strategic_brief" not in attached
+    assert "brief_status" not in attached
+
+
+@pytest.mark.asyncio
+async def test_attach_sku_strategic_brief_marks_unavailable_when_enabled_and_no_brief(monkeypatch):
+    # The silent-failure regression: feature ON, but no brief produced (e.g.
+    # grounding rejected every attempt). It must surface a diagnosable status
+    # instead of silently dropping to generic NBA boilerplate.
+    monkeypatch.setattr(strategic_brief.settings, "strategic_brief_enabled", True)
+
+    async def fake_generate(evidence, **kwargs):
+        return None
+
+    monkeypatch.setattr(strategic_brief, "generate_sku_strategic_brief", fake_generate)
+    nba = {
+        "primary_gap": "open_lane_capture",
+        "headline": "Own the answer.",
+        "first_move": "Add the lane.",
+    }
+
+    attached = await attach_sku_strategic_brief(
+        nba,
+        opportunity=_opportunity(),
+        attribute_graph=_attribute_graph(),
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+    assert attached["primary_gap"] == nba["primary_gap"]
+    assert attached["brief_status"] == "unavailable"
+    assert "strategic_brief" not in attached
+
+
+def _low_signal_evidence() -> Dict[str, Any]:
+    """A not-yet-visible SKU: real product facts, but no probes/citations/lanes
+    so buyer_path_opportunities comes out empty."""
+    return strategic_brief.assemble_sku_brief_evidence(
+        opportunity={
+            "intent_ladder": {},
+            "per_prompt": [],
+            "top_open_lanes": [],
+            "substitution_alert": {"present": False},
+            "demand_state_summary": "no AI answer exposure detected",
+        },
+        attribute_graph=_attribute_graph(),
+        primary_gaps=[],
+        scores={},
+        identity=_identity(),
+        sku_title="BB Lab Good Night Collagen",
+    )
+
+
+def test_deterministic_brief_low_signal_sku_is_grounded_and_not_boilerplate():
+    evidence = _low_signal_evidence()
+    assert not evidence["buyer_path_opportunities"]
+
+    brief = strategic_brief._deterministic_brief(evidence)
+    # No longer None for a low-signal SKU — this was THE silent fall-through.
+    assert brief is not None
+    assert strategic_brief._has_required_shape(brief)
+    # Grounding-safe by construction, so it survives the same gate that the
+    # lane-driven brief runs (no fabricated competitor/domain/lane/stat).
+    assert strategic_brief._grounding_failures(brief, evidence) == []
+    assert strategic_brief.validate_grounding(brief, evidence) is True
+    assert strategic_brief._validated_deterministic_brief(evidence) is not None
+
+    # Specific to THIS product, not the name-swapped generic boilerplate: it
+    # names the actual SKU and prescribes the honest get-indexed/get-cited play.
+    blob = json.dumps(brief).lower()
+    assert "bb lab good night collagen" in blob
+    assert "surface in ai shopping answers" in blob
+    _assert_no_overpromise_payload(brief)
 
 
 def test_deterministic_brief_caps_overall_controller_phrase_to_top_three():
