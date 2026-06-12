@@ -1568,6 +1568,43 @@ async def get_merchant_audit_history(
     }
 
 
+@router.get("/outcomes")
+async def get_merchant_outcomes_endpoint(
+    window: str = "all_time",
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """This merchant's transaction OUTCOMES — what actually happened after agents routed
+    buyers here: orders that completed payment, the refund rate (only once enough orders
+    exist to be meaningful), and attributed GMV. The proprietary trust signal.
+
+    Honest by construction: `refund_rate` is null and `min_sample_met` is false until the
+    merchant has at least the minimum number of transacted orders — we never imply a return
+    rate from a handful of sales. Counts and GMV are always real.
+
+    `window`: 'all_time' (default) or 'trailing_90d'.
+    """
+    if window not in ("all_time", "trailing_90d"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="window must be 'all_time' or 'trailing_90d'",
+        )
+    from services.outcome_aggregation_service import get_merchant_outcomes
+
+    row = await get_merchant_outcomes(merchant_id, window_key=window)
+    if not row:
+        # No transacted orders yet — return an explicit zero-state, not an error.
+        return {
+            "merchant_id": merchant_id,
+            "window": window,
+            "has_outcomes": False,
+            "outcomes": {
+                "transacted_count": 0, "paid_count": 0, "refunded_count": 0,
+                "refund_rate": None, "gmv_cents": 0, "min_sample_met": False,
+            },
+        }
+    return {"merchant_id": merchant_id, "window": window, "has_outcomes": True, "outcomes": row}
+
+
 @router.get("/funnel")
 async def get_merchant_funnel(
     channel: Optional[str] = None,
