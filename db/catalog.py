@@ -224,6 +224,12 @@ catalog_offers = Table(
     Column("readiness_tier", String(32), nullable=False, server_default="commerce_ready"),
     Column("offer_mode", String(32), nullable=False, server_default="merchant_checkout"),
     Column("channel", String(64), nullable=False, server_default="default"),
+    # Agent-decision-grade offer fields (mig 149). offer_type is
+    # brand_direct | retailer | NULL ("unknown"); see services.offer_classification.
+    Column("offer_type", String(16), nullable=True),
+    Column("market", String(8), nullable=False, server_default="US"),
+    Column("is_first_party", Boolean, nullable=False, server_default="false"),
+    Column("why_buy_direct", Text, nullable=True),
     Column("availability", String(32), nullable=False, server_default="unknown"),
     Column("inventory_quantity", Integer, nullable=True),
     Column("currency", String(16), nullable=True),
