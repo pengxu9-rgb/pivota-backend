@@ -1627,6 +1627,58 @@ async def get_merchant_funnel(
     return funnel
 
 
+@router.get("/serving-status")
+async def get_serving_status(
+    sku_keys: Optional[str] = None,
+    limit: int = 200,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Per-SKU AI-agent visibility (serving-eligibility) for this merchant.
+
+    The merchant's catalog can be fully synced yet 0% discoverable by shopping
+    agents (blocked at no_image / low_quality / etc.); the audit alone doesn't
+    say so. This endpoint makes that visible — and, when a product is blocked,
+    gives a PLAIN-ENGLISH reason (never the internal blocker_code / metric names).
+
+    Query params:
+      - `sku_keys`: optional comma-separated `platform:source_product_id`
+        composites (or bare product_keys). When given, returns status for those
+        SKUs (unknown refs are reported, not 404'd). When omitted, returns a
+        blocked-and-pending-first page of the catalog (capped by `limit`).
+      - `limit`: cap on the returned list when `sku_keys` is omitted (max 1000).
+
+    The `summary` is always computed over the merchant's FULL catalog, so the
+    portal can render "X of Y SKUs agent-visible" regardless of the list slice.
+
+    Response:
+      {
+        "merchant_id": str,
+        "summary": {"total": int, "eligible": int, "blocked": int, "pending": int},
+        "skus": [
+          {"sku_key", "product_key", "title", "agent_visible": bool,
+           "serving_eligible": bool|null, "blocker_code": str|null,
+           "blocker_reason": str|null}, ...
+        ]
+      }
+    """
+    from services.serving_status_service import (
+        get_serving_summary,
+        list_serving_status,
+        serving_status_for_sku_keys,
+    )
+
+    capped_limit = max(1, min(int(limit or 200), 1000))
+    summary = await get_serving_summary(merchant_id)
+    if sku_keys:
+        # Bound per-request work: a merchant could pass thousands of comma-
+        # separated refs. Cap to the same ceiling as the catalog-wide list.
+        refs = [s for s in sku_keys.split(",") if s.strip()][:1000]
+        skus = await serving_status_for_sku_keys(merchant_id, refs)
+    else:
+        skus = await list_serving_status(merchant_id, limit=capped_limit)
+    return {"merchant_id": merchant_id, "summary": summary, "skus": skus}
+
+
 # ---------------------------------------------------------------------------
 # PR-6: human task queue endpoints
 # ---------------------------------------------------------------------------
