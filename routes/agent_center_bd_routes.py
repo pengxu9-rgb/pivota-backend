@@ -147,8 +147,10 @@ def _raise_mock_rejection(mock_reports: list, route_name: str) -> None:
             "message": (
                 f"Audit pipeline upstream returned synthetic fallback "
                 f"data ({first_reason!s}); refusing to render BD-facing "
-                f"prose. Check that PIVOTA_AGENT_INTERNAL_API_KEY and "
-                f"the upstream's GEMINI_API_KEY are configured. "
+                f"prose. Check that the probe-auth secret "
+                f"(PROMOTIONS_ADMIN_KEY — preferred; or AGENT_API_KEY / "
+                f"PIVOTA_AGENT_INTERNAL_API_KEY) and the upstream's "
+                f"GEMINI_API_KEY are configured. "
                 f"Re-run the audit once the upstream is real."
             ),
         },

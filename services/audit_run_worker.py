@@ -121,6 +121,43 @@ async def process_one_audit_run() -> bool:
         )
 
 
+def _all_per_sku_probes_failed(
+    probe_runs_by_sku: Dict[str, Any],
+) -> bool:
+    """True when the producer collected ZERO grounded evidence and at least one
+    probe explicitly failed — e.g. the probe-auth key is missing on this worker.
+
+    A successful probe returns raw_runs (one per query, even with no citation);
+    a failed probe returns status='probe_failed' with 0 raw_runs. So
+    "0 raw_runs total AND something failed" means every probe failed and the
+    audit has nothing real to score — it must NOT finalize as a 'succeeded'
+    empty audit that reads to the merchant as 'invisible in AI'.
+    """
+    saw_failure = False
+    total_raw_runs = 0
+    saw_any_payload = False
+    for payloads in (probe_runs_by_sku or {}).values():
+        for payload in payloads or []:
+            if not isinstance(payload, dict):
+                continue
+            saw_any_payload = True
+            total_raw_runs += len(payload.get("raw_runs") or [])
+            if str(payload.get("status") or "").lower() == "probe_failed":
+                saw_failure = True
+    return saw_any_payload and saw_failure and total_raw_runs == 0
+
+
+def _first_probe_failure_reason(probe_runs_by_sku: Dict[str, Any]) -> str:
+    for payloads in (probe_runs_by_sku or {}).values():
+        for payload in payloads or []:
+            if not isinstance(payload, dict):
+                continue
+            err = str(payload.get("error") or "").strip()
+            if err:
+                return err[:300]
+    return "all grounded probes failed"
+
+
 async def _process_one_audit_run_inner(
     *,
     run_id: str,
@@ -408,6 +445,45 @@ async def _process_one_audit_run_inner(
                             },
                         },
                     )
+                    # Honesty gate: if EVERY probe failed (e.g. the probe-auth
+                    # key is missing on this worker), there is zero grounded
+                    # evidence. Do NOT finalize a 'succeeded' empty audit that
+                    # reads as "merchant invisible" — fail loudly + refund the
+                    # debited credits, like the mock-fallback guard below.
+                    if _all_per_sku_probes_failed(probe_runs_by_sku):
+                        reason = _first_probe_failure_reason(probe_runs_by_sku)
+                        await mar.transition_stage(
+                            run_id=run_id,
+                            from_stage=mar.STAGE_PROBING,
+                            to_stage=mar.STAGE_FAILED,
+                            worker_id=WORKER_ID,
+                            error_jsonb={
+                                "code": "probe_infra_failure",
+                                "stage": "probing",
+                                "message": (
+                                    "All grounded probes failed — no AI-citation "
+                                    "evidence collected, so this audit is not "
+                                    "finalized as complete (a zero result here "
+                                    "would falsely read as 'invisible in AI'). "
+                                    "Most likely the probe-auth secret "
+                                    "(PROMOTIONS_ADMIN_KEY) is unset on this "
+                                    "worker. Re-run once it's configured."
+                                ),
+                                "reason": reason,
+                            },
+                        )
+                        await _refund_launch_debits(
+                            merchant_id=merchant_id,
+                            run_id=run_id,
+                            launch_options=launch_options,
+                            reason="probe_infra_failure",
+                        )
+                        logger.error(
+                            "audit_run_worker: all per-SKU probes failed "
+                            "run_id=%s merchant=%s reason=%s",
+                            run_id, merchant_id, reason,
+                        )
+                        return True
                     brand_report = await run_brand_report(
                         merchant_name=str(merchant_name),
                         merchant_domain=merchant_domain,
