@@ -40,6 +40,7 @@ from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
 from services.catalog_identity import make_content_key
+from services.category_kind import resolve_category_kind
 from services.fashion_field_extractor import (
     EXTRACTION_SOURCE_LLM,
     batch_extract_fashion_fields,
@@ -1022,6 +1023,14 @@ async def ingest_standard_products(
                     "category_path": _cat_path,
                     "category_label_source": _cat_source,
                     "category_confidence": _cat_confidence,
+                    # Durable category_kind (mig 151): skincare/haircare from the
+                    # path, supplement from conservative ingestible detection.
+                    "category_kind": resolve_category_kind(
+                        _cat_path,
+                        product.product_type,
+                        product.title,
+                        _tags_for_ingest,
+                    ),
                     # Phase O-5b (#3): merchant-published fashion fields
                     # (Shopify metafields / admin-injected). Only set when
                     # actually populated — NULL stays NULL so the LLM
