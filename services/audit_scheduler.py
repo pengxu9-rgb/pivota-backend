@@ -43,12 +43,40 @@ the API. The audit endpoints still work; only the cron is degraded.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 _SCHEDULER = None  # type: Optional[object]
+
+
+def _queue_worker_enabled() -> bool:
+    """Whether THIS process should drain the shared async-run queues
+    (audit / executor / verification worker ticks + their lease reapers).
+
+    Production and staging SHARE one Postgres (single-DB tenancy by design), and
+    these workers claim work by polling the shared tables with NO environment
+    filter. So a staging service running them POACHES production-enqueued runs it
+    can't complete — it lacks prod secrets (e.g. PROMOTIONS_ADMIN_KEY) and may run
+    older code — then silently fails them (0 probes, "succeeded" empty audit).
+    Gate the drainers so only the production worker claims the shared queue.
+
+    Fail-safe toward ENABLED: only disable when this is clearly a staging/preview
+    service, or AUDIT_WORKER_ENABLED is explicitly false — so a detection miss
+    can never accidentally stop the PRODUCTION worker (worst case = no change).
+    """
+    override = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
+    if override:
+        return override in ("1", "true", "yes", "on")
+    service = (os.getenv("RAILWAY_SERVICE_NAME") or "").lower()
+    env = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower()
+    if "staging" in service or "preview" in service:
+        return False
+    if env in ("staging", "preview", "development", "dev"):
+        return False
+    return True
 
 
 def get_scheduler():
@@ -75,6 +103,18 @@ async def start_scheduler() -> None:
 
     try:
         scheduler = AsyncIOScheduler(timezone="UTC")
+        # Only the production worker drains the SHARED async-run queues; a
+        # staging service on the same DB must not poach prod-enqueued runs.
+        worker_enabled = _queue_worker_enabled()
+        if not worker_enabled:
+            logger.warning(
+                "audit_scheduler: shared-queue worker ticks DISABLED on this "
+                "service (RAILWAY_SERVICE_NAME=%r RAILWAY_ENVIRONMENT=%r) — it "
+                "will NOT drain prod audit/executor/verification queues. Set "
+                "AUDIT_WORKER_ENABLED=true to override.",
+                os.getenv("RAILWAY_SERVICE_NAME"),
+                os.getenv("RAILWAY_ENVIRONMENT"),
+            )
         # Register the daily check that picks up due merchants. Hour
         # chosen to land off-peak (most merchants in US/EU; 03:00 UTC
         # = 23:00 EDT / 04:00 CET).
@@ -114,26 +154,27 @@ async def start_scheduler() -> None:
             run_audit_worker_tick,
             run_stale_lease_reaper_tick,
         )
-        scheduler.add_job(
-            run_audit_worker_tick,
-            "interval",
-            seconds=10,
-            id="audit_run_worker_tick",
-            replace_existing=True,
-            # Don't queue up multiple ticks if one runs long; one
-            # tick already drains MAX_RUNS_PER_TICK runs.
-            coalesce=True,
-            max_instances=1,
-        )
-        scheduler.add_job(
-            run_stale_lease_reaper_tick,
-            "interval",
-            seconds=60,
-            id="audit_run_lease_reaper",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
+        if worker_enabled:
+            scheduler.add_job(
+                run_audit_worker_tick,
+                "interval",
+                seconds=10,
+                id="audit_run_worker_tick",
+                replace_existing=True,
+                # Don't queue up multiple ticks if one runs long; one
+                # tick already drains MAX_RUNS_PER_TICK runs.
+                coalesce=True,
+                max_instances=1,
+            )
+            scheduler.add_job(
+                run_stale_lease_reaper_tick,
+                "interval",
+                seconds=60,
+                id="audit_run_lease_reaper",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
 
         # P3.2: drive queued executor_runs through the durable work
         # queue. No production traffic flows here until P3.3 migrates
@@ -144,24 +185,25 @@ async def start_scheduler() -> None:
             run_executor_worker_tick,
             run_executor_lease_reaper_tick,
         )
-        scheduler.add_job(
-            run_executor_worker_tick,
-            "interval",
-            seconds=5,
-            id="executor_run_worker_tick",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-        scheduler.add_job(
-            run_executor_lease_reaper_tick,
-            "interval",
-            seconds=60,
-            id="executor_run_lease_reaper",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
+        if worker_enabled:
+            scheduler.add_job(
+                run_executor_worker_tick,
+                "interval",
+                seconds=5,
+                id="executor_run_worker_tick",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            scheduler.add_job(
+                run_executor_lease_reaper_tick,
+                "interval",
+                seconds=60,
+                id="executor_run_lease_reaper",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
 
         # P5.2: drive verification_runs through the durable queue.
         # P5.3: import services.verifiers to trigger register_verifier
@@ -181,24 +223,25 @@ async def start_scheduler() -> None:
                 "audit_scheduler: verifier registration failed: %s",
                 exc,
             )
-        scheduler.add_job(
-            run_verification_worker_tick,
-            "interval",
-            seconds=30,
-            id="verification_run_worker_tick",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-        scheduler.add_job(
-            run_verification_lease_reaper_tick,
-            "interval",
-            seconds=60,
-            id="verification_run_lease_reaper",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
+        if worker_enabled:
+            scheduler.add_job(
+                run_verification_worker_tick,
+                "interval",
+                seconds=30,
+                id="verification_run_worker_tick",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            scheduler.add_job(
+                run_verification_lease_reaper_tick,
+                "interval",
+                seconds=60,
+                id="verification_run_lease_reaper",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
 
         # External crawl/backfill sessions write external_product_seeds first.
         # This catch-up materializes only missing catalog mirrors in small
