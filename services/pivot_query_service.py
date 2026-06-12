@@ -34,6 +34,12 @@ from services.claim_safety import (
     normalize_claims,
     required_disclaimers_for_category,
 )
+from services.skincare_attributes import (
+    detect_fragrance_free,
+    extract_format,
+    extract_spf_value,
+    merge_concentration_into_actives,
+)
 from services.offer_classification import (
     OFFER_TYPE_RETAILER,
     classify_offer_type,
@@ -294,9 +300,11 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         await database.fetch_one(
             """
             SELECT bpp.taxonomy_json, bpp.concerns_json, bpp.claims_json,
-                   bpp.routine_phase, bpp.benefits_json,
+                   bpp.routine_phase, bpp.benefits_json, bpp.profile_payload,
                    bpp.evidence_profile, bpp.required_disclaimers,
-                   cp.category_kind
+                   cp.category_kind,
+                   cp.title AS cp_title, cp.product_type AS cp_product_type,
+                   cp.category_path AS cp_category_path
             FROM beauty_product_profiles bpp
             LEFT JOIN catalog_products cp ON cp.product_key = bpp.product_key
             WHERE bpp.product_key = :product_key
@@ -308,7 +316,8 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
     ingredient_row = _row_dict(
         await database.fetch_one(
             """
-            SELECT raw_inci, normalized_ingredients_json, active_ingredients_json
+            SELECT raw_inci, normalized_ingredients_json, active_ingredients_json,
+                   concentration_notes_json
             FROM beauty_sku_ingredients
             WHERE sku_key = :sku_key
             LIMIT 1
@@ -390,6 +399,28 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
     if not required_disclaimers:
         required_disclaimers = required_disclaimers_for_category(category_kind)
 
+    # Structured skincare attributes: prefer authored profile_payload values,
+    # else derive format/spf/fragrance_free from product text.
+    profile_payload = _json_dict(profile.get("profile_payload"))
+    cp_title = profile.get("cp_title")
+    cp_product_type = profile.get("cp_product_type")
+    cp_category_path = profile.get("cp_category_path")
+    skincare_format = (str(profile_payload.get("format") or "").strip() or None) or extract_format(
+        cp_title, cp_product_type, cp_category_path
+    )
+    texture = str(profile_payload.get("texture") or "").strip() or None
+    spf_value = profile_payload.get("spf_value")
+    if not isinstance(spf_value, int):
+        spf_value = extract_spf_value(cp_title, cp_product_type)
+    fragrance_free = bool(profile_payload.get("fragrance_free")) or detect_fragrance_free(
+        cp_title, cp_product_type
+    )
+    sensitive_safe = bool(profile_payload.get("sensitive_safe"))
+    active_ingredients = merge_concentration_into_actives(
+        [item for item in _json_list(ingredient_row.get("active_ingredients_json")) if isinstance(item, dict)],
+        _json_list(ingredient_row.get("concentration_notes_json")),
+    )
+
     payload = BeautyVerticalPayload(
         category_kind=category_kind,
         taxonomy=_json_dict(profile.get("taxonomy_json")),
@@ -397,10 +428,15 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         claims=[str(item or "").strip() for item in _json_list(profile.get("claims_json")) if str(item or "").strip()],
         evidence_profile=evidence_profile,
         required_disclaimers=required_disclaimers,
+        skincare_format=skincare_format,
+        texture=texture,
+        spf_value=spf_value,
+        fragrance_free=fragrance_free,
+        sensitive_safe=sensitive_safe,
         routine_phase=profile.get("routine_phase"),
         benefits=[str(item or "").strip() for item in _json_list(profile.get("benefits_json")) if str(item or "").strip()],
         ingredients=[str(item or "").strip() for item in _json_list(ingredient_row.get("normalized_ingredients_json")) if str(item or "").strip()],
-        active_ingredients=[item for item in _json_list(ingredient_row.get("active_ingredients_json")) if isinstance(item, dict)],
+        active_ingredients=active_ingredients,
         how_to_use=str(usage_row.get("how_to_use_text") or "").strip() or None,
         usage_steps=[str(item or "").strip() for item in _json_list(usage_row.get("steps_json")) if str(item or "").strip()],
         shades=shade_rows,

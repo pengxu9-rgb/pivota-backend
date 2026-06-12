@@ -164,6 +164,14 @@ class BeautyVerticalPayload(BaseModel):
     # Durable category_kind (skincare/haircare/supplement) the record resolves
     # to; drives claim-safety + which disclaimers are required. See mig 151.
     category_kind: Optional[str] = None
+    # Structured skincare attributes (mig-free; profile_payload + text-derived).
+    # skincare_format e.g. serum/cream/sheet mask/sunscreen; spf_value for
+    # sunscreens; fragrance_free/sensitive_safe for sensitive-skin fit.
+    skincare_format: Optional[str] = None
+    texture: Optional[str] = None
+    spf_value: Optional[int] = None
+    fragrance_free: bool = False
+    sensitive_safe: bool = False
     taxonomy: Dict[str, Any] = Field(default_factory=dict)
     concerns: List[str] = Field(default_factory=list)
     claims: List[str] = Field(default_factory=list)
