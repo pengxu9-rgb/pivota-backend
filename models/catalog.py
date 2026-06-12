@@ -161,6 +161,9 @@ class EvidenceProfile(BaseModel):
 
 
 class BeautyVerticalPayload(BaseModel):
+    # Durable category_kind (skincare/haircare/supplement) the record resolves
+    # to; drives claim-safety + which disclaimers are required. See mig 151.
+    category_kind: Optional[str] = None
     taxonomy: Dict[str, Any] = Field(default_factory=dict)
     concerns: List[str] = Field(default_factory=list)
     claims: List[str] = Field(default_factory=list)

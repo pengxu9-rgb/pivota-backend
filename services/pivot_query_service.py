@@ -30,7 +30,10 @@ from models.catalog import (
     SkuNode,
 )
 from services.catalog_sync_service import store_catalog_quote_snapshot
-from services.claim_safety import normalize_claims
+from services.claim_safety import (
+    normalize_claims,
+    required_disclaimers_for_category,
+)
 from services.offer_classification import (
     OFFER_TYPE_RETAILER,
     classify_offer_type,
@@ -290,10 +293,13 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
     profile = _row_dict(
         await database.fetch_one(
             """
-            SELECT taxonomy_json, concerns_json, claims_json, routine_phase, benefits_json,
-                   evidence_profile, required_disclaimers
-            FROM beauty_product_profiles
-            WHERE product_key = :product_key
+            SELECT bpp.taxonomy_json, bpp.concerns_json, bpp.claims_json,
+                   bpp.routine_phase, bpp.benefits_json,
+                   bpp.evidence_profile, bpp.required_disclaimers,
+                   cp.category_kind
+            FROM beauty_product_profiles bpp
+            LEFT JOIN catalog_products cp ON cp.product_key = bpp.product_key
+            WHERE bpp.product_key = :product_key
             LIMIT 1
             """,
             {"product_key": product_key},
@@ -372,13 +378,20 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         if evidence_raw
         else None
     )
+    category_kind = (profile.get("category_kind") or "").strip() or None
     required_disclaimers = [
         RequiredDisclaimer(**item)
         for item in _json_list(profile.get("required_disclaimers"))
         if isinstance(item, dict) and item.get("code") and item.get("text")
     ]
+    # Fall back to the category's mandatory disclaimers (e.g. the FDA/DSHEA
+    # supplement disclaimer) when none were explicitly authored, so a required
+    # disclaimer is never silently missing from the agent surface.
+    if not required_disclaimers:
+        required_disclaimers = required_disclaimers_for_category(category_kind)
 
     payload = BeautyVerticalPayload(
+        category_kind=category_kind,
         taxonomy=_json_dict(profile.get("taxonomy_json")),
         concerns=[str(item or "").strip() for item in _json_list(profile.get("concerns_json")) if str(item or "").strip()],
         claims=[str(item or "").strip() for item in _json_list(profile.get("claims_json")) if str(item or "").strip()],

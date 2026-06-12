@@ -26,6 +26,8 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional, Tuple
 
+from services.claim_safety import required_disclaimers_for_category
+
 BLOCKER_NO_US_OFFER = "no_us_offer"
 BLOCKER_NO_PROVENANCE_CLAIM = "no_provenance_claim"
 BLOCKER_MISSING_DISCLAIMERS = "missing_disclaimers"
@@ -76,14 +78,15 @@ def evaluate_agent_decision_gates(
                 BLOCKER_NO_PROVENANCE_CLAIM,
                 "evidence_profile has no provenance-backed claim",
             )
-        # Absence defaults to "present" so a missing signal never blocks; the
-        # authoring writer sets these explicitly to False when a disclaimer is
-        # required but absent.
-        if row.get("required_disclaimers_present", True) is False:
-            return (
-                BLOCKER_MISSING_DISCLAIMERS,
-                "a required disclaimer for this category is absent",
-            )
+        # Only categories that mandate a disclaimer (e.g. supplements -> the
+        # FDA/DSHEA disclaimer) gate on it. Absence of the signal defaults to
+        # "present" so it never blocks until the authoring writer sets it False.
+        if required_disclaimers_for_category(row.get("category_kind")):
+            if row.get("required_disclaimers_present", True) is False:
+                return (
+                    BLOCKER_MISSING_DISCLAIMERS,
+                    "a required disclaimer for this category is absent",
+                )
         if str(row.get("evidence_review_state") or "") != "reviewed":
             return (
                 BLOCKER_UNREVIEWED_EVIDENCE,
