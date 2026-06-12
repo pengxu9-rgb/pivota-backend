@@ -185,7 +185,17 @@ def extract_order_decision_linkage(metadata: Any) -> Dict[str, Optional[str]]:
     with conservative fallbacks. Pure + side-effect-free so it is safe to call
     from the money-path webhook. Returns null fields when absent — the caller
     decides whether enough linkage exists to record a funnel link.
+
+    The order row's `metadata` JSONB may arrive as a dict OR as a raw JSON
+    string depending on the DB driver's JSONB codec, so a string is parsed here
+    (the same hazard the order-creation path guards against). A value that is
+    neither a dict nor parseable degrades to empty linkage, never raises.
     """
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:  # noqa: BLE001
+            metadata = {}
     node = _decision_layer_node(metadata)
     meta = metadata if isinstance(metadata, dict) else {}
     return {

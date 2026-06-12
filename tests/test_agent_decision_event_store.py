@@ -101,6 +101,17 @@ def test_extract_order_decision_linkage_reads_decision_layer() -> None:
     }
 
 
+def test_extract_order_decision_linkage_parses_json_string_metadata() -> None:
+    # The order row's metadata JSONB can arrive as a raw JSON string depending on
+    # the DB driver — linkage must still resolve, not silently null out.
+    raw = '{"decision_layer": {"decision_id": "dec-9", "checkout_decision_id": "chk-9"}}'
+    linkage = store.extract_order_decision_linkage(raw)
+    assert linkage["decision_id"] == "dec-9"
+    assert linkage["checkout_decision_id"] == "chk-9"
+    # Unparseable string degrades to empty, never raises.
+    assert store.extract_order_decision_linkage("not json")["decision_id"] is None
+
+
 def test_extract_order_decision_linkage_handles_missing_and_partial() -> None:
     # Non-dict / empty → all-null linkage, no raise.
     assert store.extract_order_decision_linkage(None) == {

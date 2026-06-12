@@ -1001,11 +1001,15 @@ async def handle_stripe_webhook(
                                 linkage.get("decision_id"),
                                 linkage.get("checkout_decision_id"),
                             )
+                        # Only the decision links + merchant_id are written here.
+                        # content_key / catalog_offer_id are deliberately omitted:
+                        # they're ON DELETE RESTRICT FKs and a stale value would
+                        # abort the whole link row, dropping an otherwise-valid
+                        # decision join. They're recoverable downstream via the
+                        # checkout_decisions / agent_decision_candidates rows.
                         link_kwargs = {
                             "decision_id": linkage.get("decision_id"),
                             "checkout_decision_id": linkage.get("checkout_decision_id"),
-                            "content_key": linkage.get("content_key"),
-                            "catalog_offer_id": linkage.get("catalog_offer_id"),
                             "merchant_id": merchant_id,
                         }
                         if linkage.get("protocol"):
