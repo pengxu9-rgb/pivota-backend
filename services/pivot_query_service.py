@@ -12,9 +12,11 @@ from typing import Any, Dict, Iterable, List, Optional
 from db.database import database
 from models.catalog import (
     BeautyVerticalPayload,
+    EvidenceProfile,
     IncentiveNode,
     MerchantNode,
     OfferNode,
+    RequiredDisclaimer,
     PivotOffersResolveRequest,
     PivotOffersResolveResponse,
     PivotPaymentContext,
@@ -28,6 +30,7 @@ from models.catalog import (
     SkuNode,
 )
 from services.catalog_sync_service import store_catalog_quote_snapshot
+from services.claim_safety import normalize_claims
 from services.offer_classification import (
     OFFER_TYPE_RETAILER,
     classify_offer_type,
@@ -287,7 +290,8 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
     profile = _row_dict(
         await database.fetch_one(
             """
-            SELECT taxonomy_json, concerns_json, claims_json, routine_phase, benefits_json
+            SELECT taxonomy_json, concerns_json, claims_json, routine_phase, benefits_json,
+                   evidence_profile, required_disclaimers
             FROM beauty_product_profiles
             WHERE product_key = :product_key
             LIMIT 1
@@ -359,10 +363,27 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         )
     ]
 
+    evidence_raw = _json_dict(profile.get("evidence_profile"))
+    evidence_profile = (
+        EvidenceProfile(
+            claims=normalize_claims(evidence_raw.get("claims")),
+            review_state=str(evidence_raw.get("review_state") or "observed"),
+        )
+        if evidence_raw
+        else None
+    )
+    required_disclaimers = [
+        RequiredDisclaimer(**item)
+        for item in _json_list(profile.get("required_disclaimers"))
+        if isinstance(item, dict) and item.get("code") and item.get("text")
+    ]
+
     payload = BeautyVerticalPayload(
         taxonomy=_json_dict(profile.get("taxonomy_json")),
         concerns=[str(item or "").strip() for item in _json_list(profile.get("concerns_json")) if str(item or "").strip()],
         claims=[str(item or "").strip() for item in _json_list(profile.get("claims_json")) if str(item or "").strip()],
+        evidence_profile=evidence_profile,
+        required_disclaimers=required_disclaimers,
         routine_phase=profile.get("routine_phase"),
         benefits=[str(item or "").strip() for item in _json_list(profile.get("benefits_json")) if str(item or "").strip()],
         ingredients=[str(item or "").strip() for item in _json_list(ingredient_row.get("normalized_ingredients_json")) if str(item or "").strip()],

@@ -131,6 +131,35 @@ class IncentiveNode(BaseModel):
     source_system: Optional[str] = None
 
 
+class ProductClaim(BaseModel):
+    """A single benefit claim with its provenance. claim_text is what's asserted;
+    the rest trace it to a source so an agent can cite it claim-safely. See
+    services.claim_safety for the substantiation/source vocabularies."""
+
+    claim_text: str
+    source_ref: Optional[str] = None
+    source_type: Optional[str] = None
+    evidence_grade: Optional[str] = None
+    substantiation_status: str = "unverified"
+
+
+class RequiredDisclaimer(BaseModel):
+    """A disclaimer that must accompany a product (e.g. the FDA/DSHEA supplement
+    disclaimer). code is a stable key; applies_to is the category_kind."""
+
+    code: str
+    text: str
+    applies_to: Optional[str] = None
+
+
+class EvidenceProfile(BaseModel):
+    """Structured evidence for a product: its provenance-backed claims plus the
+    review state of that evidence as a whole."""
+
+    claims: List[ProductClaim] = Field(default_factory=list)
+    review_state: str = "observed"
+
+
 class BeautyVerticalPayload(BaseModel):
     taxonomy: Dict[str, Any] = Field(default_factory=dict)
     concerns: List[str] = Field(default_factory=list)
@@ -144,6 +173,10 @@ class BeautyVerticalPayload(BaseModel):
     shades: List[Dict[str, Any]] = Field(default_factory=list)
     tutorials: List[Dict[str, Any]] = Field(default_factory=list)
     compatibility_rules: List[Dict[str, Any]] = Field(default_factory=list)
+    # Provenance-backed evidence + any required disclaimers (data contract,
+    # Evidence/provenance layer; mig 150). None/empty until authored.
+    evidence_profile: Optional[EvidenceProfile] = None
+    required_disclaimers: List[RequiredDisclaimer] = Field(default_factory=list)
 
 
 class MerchantNode(BaseModel):
