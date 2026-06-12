@@ -773,3 +773,44 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     params["size_guide"] = to_jsonb(row.get("size_guide"))
     params["refreshed_by_proposal_id"] = row.get("refreshed_by_proposal_id")
     return params
+
+
+async def refresh_agent_pdp_view_for_content_key(
+    content_key: str,
+    *,
+    refresh_source: str,
+    db: Any = None,
+) -> bool:
+    """Rebuild + upsert the denormalized agent_pdp_view row for a content_key.
+
+    Canonical fetch→assemble→upsert orchestration (previously inlined in the
+    backfill script, the seed writer, and fashion authoring). Pure of any
+    serving-eligibility recompute — the caller owns that, so a caller that
+    already recomputes right after (e.g. catalog_sync) does not double-fire.
+
+    Returns True when a row was upserted, False when there was nothing to
+    build (no catalog rows / too thin a row to be useful — no title). Raises
+    on DB errors so callers can decide isolation; the catalog_sync caller
+    wraps this best-effort so a stale PDP cache never breaks ingest.
+    """
+    read_db = db or database
+    products = await fetch_products_for_key(content_key, db=read_db)
+    if not products:
+        return False
+    product_keys = [p["product_key"] for p in products if p.get("product_key")]
+    skus = await fetch_skus_for_keys(product_keys, db=read_db)
+    offers = await fetch_offers_for_keys(product_keys, db=read_db)
+    external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
+
+    row = assemble_row(
+        content_key=content_key,
+        products=products,
+        skus=skus,
+        offers=offers,
+        external_seed=external_seed,
+        refresh_source=refresh_source,
+    )
+    if row is None:
+        return False
+    await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
+    return True
