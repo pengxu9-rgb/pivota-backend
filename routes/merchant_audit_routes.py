@@ -830,9 +830,11 @@ async def run_merchant_self_audit(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 "Audit pipeline upstream returned synthetic fallback data; "
-                "refusing to render merchant-facing prose. Check that "
-                "PIVOTA_AGENT_INTERNAL_API_KEY and the upstream's GEMINI_API_KEY "
-                "are configured. Re-run the audit once the upstream is real."
+                "refusing to render merchant-facing prose. Check that the "
+                "probe-auth secret (PROMOTIONS_ADMIN_KEY — preferred; or "
+                "AGENT_API_KEY / PIVOTA_AGENT_INTERNAL_API_KEY) and the "
+                "upstream's GEMINI_API_KEY are configured. Re-run the audit "
+                "once the upstream is real."
             ),
         )
 

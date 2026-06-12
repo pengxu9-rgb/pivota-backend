@@ -436,16 +436,24 @@ async def probe(
             # Without this, callers that don't explicitly opt in to
             # mock would silently render audit/report prose against
             # synthetic data — fabricating user-facing content.
+            # Name ALL accepted env vars (and the preferred one) — the key is
+            # resolved from a priority chain in config.settings, so naming only
+            # the legacy candidate sends operators to set the wrong var.
             raise AgentCenterLlmClientError(
-                "PIVOTA_AGENT_INTERNAL_API_KEY is not configured; "
-                "refusing to fall back to local mock data. Pass "
+                "No PIVOTA-Agent internal API key is configured — set "
+                "PROMOTIONS_ADMIN_KEY (preferred; or AGENT_API_KEY / "
+                "PIVOTA_AGENT_INTERNAL_API_KEY) on this service so audit "
+                "probes can authenticate to the grounded-search gateway. "
+                "Refusing to fall back to local mock data. Pass "
                 "allow_local_mock=True only if your caller explicitly "
                 "handles synthetic responses (e.g., the demand-test "
                 "runner marking results as stub_complete)."
             )
         logger.error(
-            "PIVOTA_AGENT_INTERNAL_API_KEY not configured; using local "
-            "mock for scan_target=%s scan_mode=%s (allow_local_mock=True)",
+            "No PIVOTA-Agent internal API key configured (set "
+            "PROMOTIONS_ADMIN_KEY / AGENT_API_KEY / "
+            "PIVOTA_AGENT_INTERNAL_API_KEY); using local mock for "
+            "scan_target=%s scan_mode=%s (allow_local_mock=True)",
             scan_target_id,
             scan_mode,
         )
