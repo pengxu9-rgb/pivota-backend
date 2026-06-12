@@ -172,6 +172,16 @@ class BeautyVerticalPayload(BaseModel):
     spf_value: Optional[int] = None
     fragrance_free: bool = False
     sensitive_safe: bool = False
+    # Structured haircare attributes (mig-free; profile_payload + text-derived).
+    # haircare_format e.g. shampoo/conditioner/treatment/hair serum; sulfate_free
+    # / silicone_free formulation flags; vegan_status / cruelty_free_status are
+    # "verified" (recognized certifying authority) or "claimed" (bare marketing
+    # tag) or None -- the niche-new cert-trust signal for Anuko's positioning.
+    haircare_format: Optional[str] = None
+    sulfate_free: bool = False
+    silicone_free: bool = False
+    vegan_status: Optional[str] = None
+    cruelty_free_status: Optional[str] = None
     taxonomy: Dict[str, Any] = Field(default_factory=dict)
     concerns: List[str] = Field(default_factory=list)
     claims: List[str] = Field(default_factory=list)
