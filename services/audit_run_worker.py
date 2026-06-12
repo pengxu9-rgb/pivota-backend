@@ -389,6 +389,9 @@ async def _process_one_audit_run_inner(
                         providers=launch_options.get("providers"),
                         model_overrides=launch_options.get("model_overrides"),
                         prompts_per_sku=prompts_per_sku,
+                        # Merchant-input prompt slots (debited as prompt credits
+                        # at enqueue). Probe them so they aren't billed-but-dropped.
+                        custom_prompts=launch_options.get("custom_prompts"),
                     )
                     await mar.record_partial_result(
                         run_id=run_id,

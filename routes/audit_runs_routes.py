@@ -1067,6 +1067,10 @@ async def create_audit_run(
                         if payload.get("model_is_override")
                     },
                     "prompts_per_sku": int(body.prompts_per_sku),
+                    # Merchant-input prompt slots are debited as prompt credits
+                    # above; persist them here so the worker actually PROBES them
+                    # (they were billed-but-never-probed before this).
+                    "custom_prompts": _normalize_nonempty(body.custom_prompts),
                     "estimated_audit_credits": int(audit_required),
                     "estimated_prompt_credits": int(prompt_required),
                     "debited": [

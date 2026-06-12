@@ -5741,12 +5741,22 @@ async def _probe_per_sku_ctx(
     provider_model_metadata: Mapping[str, Any],
     prompts_per_sku: int,
     audit_run_id: Optional[str],
+    custom_prompts: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Run the normalized per-SKU audit probe loop for an already-built ctx."""
     safe_ctx = sku_ctx if isinstance(sku_ctx, dict) else {}
     sku_key = str(safe_ctx.get("sku_key") or "").strip() or "sku"
     target_prompts = max(1, int(prompts_per_sku or 0))
     query_records = _build_per_sku_audit_query_records(safe_ctx, target_prompts)
+    # Append merchant-input prompt slots so they're actually probed (deduped
+    # against the auto set). axis="custom" keeps them identifiable downstream.
+    if custom_prompts:
+        existing = {str(r.get("query") or "").strip().lower() for r in query_records}
+        for prompt in custom_prompts:
+            text = str(prompt or "").strip()
+            if text and text.lower() not in existing:
+                query_records.append({"query": text, "axis": "custom"})
+                existing.add(text.lower())
     query_specs = [
         (str(record.get("query") or ""), str(record.get("axis") or "intent"))
         for record in query_records
@@ -7198,6 +7208,7 @@ async def run_per_sku_audit_probe_fanout(
     providers: Optional[List[str]] = None,
     model_overrides: Optional[Mapping[str, Any]] = None,
     prompts_per_sku: Optional[int] = None,
+    custom_prompts: Optional[List[str]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run and shape v3 per-SKU citation probes before report assembly.
 
@@ -7205,6 +7216,11 @@ async def run_per_sku_audit_probe_fanout(
     `prompts_per_sku` per provider, so this producer chunks the deterministic
     prompt set into upstream-safe batches and returns the normalized
     `per_sku_audit` payload that `load_per_sku_probe_runs` already reads.
+
+    `custom_prompts` are merchant-input prompt slots (billed as prompt credits).
+    They're brand-level, so they're probed ONCE (attached to the first SKU) to
+    avoid an N-SKU × providers multiplier (see feedback_llm_call_multipliers),
+    while still actually running — they were billed-but-never-probed before.
     """
     if not merchant_id or not str(merchant_id).strip():
         raise ValueError("merchant_id is required for per-SKU probe fan-out")
@@ -7219,8 +7235,11 @@ async def run_per_sku_audit_probe_fanout(
     )
     sku_keys = await _sku_keys_for_per_sku_mode(products, str(merchant_id))
     target_prompts = max(1, int(prompts_per_sku or 40))
+    clean_custom = [
+        str(p).strip() for p in (custom_prompts or []) if str(p or "").strip()
+    ]
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for sku_key in sku_keys:
+    for idx, sku_key in enumerate(sku_keys):
         sku_ctx = await load_sku_context(sku_key, str(merchant_id))
         out[sku_key] = await _probe_per_sku_ctx(
             sku_ctx=sku_ctx,
@@ -7229,6 +7248,8 @@ async def run_per_sku_audit_probe_fanout(
             provider_model_metadata=provider_model_metadata,
             prompts_per_sku=target_prompts,
             audit_run_id=audit_run_id,
+            # Brand-level merchant prompts run once, on the first SKU only.
+            custom_prompts=clean_custom if idx == 0 else None,
         )
     return out
 

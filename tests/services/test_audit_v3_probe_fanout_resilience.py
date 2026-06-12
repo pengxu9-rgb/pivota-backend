@@ -186,3 +186,75 @@ async def test_fanout_matches_shared_probe_per_sku_ctx(monkeypatch) -> None:
     assert fanout[SKU_KEY][0]["provider"] == "gemini"
     assert fanout[SKU_KEY][0]["runs_count"] == 4
     assert len(calls) == 2
+
+
+async def test_custom_prompts_are_probed_not_billed_and_dropped(monkeypatch) -> None:
+    """Regression: merchant-input custom_prompts (billed as prompt credits) must
+    actually be PROBED. They were billed-but-never-probed — the worker never read
+    them. They run once (first SKU) to avoid an N-SKU × providers multiplier."""
+    calls = _install(monkeypatch, fail_on=set())
+    custom = [
+        "best Korean collagen for glowing skin",
+        "collagen before bed for skin repair",
+    ]
+    out = await bd.run_per_sku_audit_probe_fanout(
+        merchant_id=MERCHANT,
+        audit_run_id="run_custom_test",
+        products=[{"product_key": "p1"}],
+        coverage_profile="pilot_gemini",
+        prompts_per_sku=PROMPTS,
+        custom_prompts=custom,
+    )
+
+    probed: set = set()
+    for c in calls:
+        probed.update(c["queries"])
+    for cp in custom:
+        assert cp in probed, f"custom prompt was NOT probed: {cp!r}"
+
+    # And they land in the persisted probe runs the report reads.
+    probed_runs = {r.get("query") for r in bd._flatten_probe_runs(out[SKU_KEY])}
+    assert all(cp in probed_runs for cp in custom)
+
+
+async def test_custom_prompts_run_once_on_first_sku_only(monkeypatch) -> None:
+    """Multi-SKU audit: brand-level custom_prompts run ONCE (first SKU), not per
+    SKU — otherwise N SKUs × M prompts × providers multiplies LLM calls."""
+    sku_a, sku_b = "p1::v::a", "p1::v::b"
+
+    async def _fake_sku_keys(products, merchant_id):
+        return [sku_a, sku_b]
+
+    async def _fake_load_ctx(sku_key, merchant_id):
+        c = _sku_ctx()
+        c["sku_key"] = sku_key
+        return c
+
+    seen: dict = {}
+
+    async def _fake_probe(*, scan_mode, scan_target_id, merchant_id, store_id,
+                          context, provider, max_runs, model=None,
+                          model_is_override=False):
+        # probe_run_id = "{run}:{sku_key}:{provider}:per_sku:{chunk}" and sku_key
+        # itself contains ':' — strip the known prefix/suffix to recover it.
+        body = scan_target_id[len("run_multi:"):].rsplit(":per_sku:", 1)[0]
+        sk = body.rsplit(":", 1)[0]  # drop trailing ":{provider}"
+        seen.setdefault(sk, []).extend(context.get("queries") or [])
+        return {"provider": provider,
+                "raw_runs": [{"query": q} for q in context.get("queries") or []]}
+
+    monkeypatch.setattr(bd, "_sku_keys_for_per_sku_mode", _fake_sku_keys)
+    monkeypatch.setattr(bd, "load_sku_context", _fake_load_ctx)
+    monkeypatch.setattr(bd.llm_client, "probe", _fake_probe)
+
+    await bd.run_per_sku_audit_probe_fanout(
+        merchant_id=MERCHANT,
+        audit_run_id="run_multi",
+        products=[{"product_key": "p1"}],
+        coverage_profile="pilot_gemini",
+        prompts_per_sku=PROMPTS,
+        custom_prompts=["my niche lane prompt"],
+    )
+
+    assert "my niche lane prompt" in seen.get(sku_a, [])
+    assert "my niche lane prompt" not in seen.get(sku_b, [])
