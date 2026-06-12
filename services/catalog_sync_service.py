@@ -1444,6 +1444,31 @@ async def ingest_standard_products(
                 )
 
         if content_key:
+            # Build the denormalized agent_pdp_view row from the catalog rows we
+            # just wrote, BEFORE recompute. Without this, a freshly-synced internal
+            # merchant product has no APV row yet (APV was historically only built
+            # on seed writes / agent-context requests), so recompute below blocks it
+            # at no_seed / no_image even though title+image+description are present
+            # on catalog_products. Best-effort: agent_pdp_view is a cache, so a build
+            # failure here must never break the source-of-truth ingest commit.
+            try:
+                from services.agent_pdp_view_assembler import (
+                    refresh_agent_pdp_view_for_content_key,
+                )
+
+                await refresh_agent_pdp_view_for_content_key(
+                    content_key,
+                    refresh_source="catalog_sync",
+                    db=database,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning({
+                    "event": "agent_pdp_view_build_failed",
+                    "site": "ingest_standard_products",
+                    "content_key": content_key,
+                    "error": str(exc),
+                })
+
             try:
                 from services.index_pipeline_state_service import recompute_serving_eligibility
 
