@@ -112,8 +112,8 @@ async def _quality_meta(db: Any, eligible: int) -> Dict[str, Any]:
     )
     age = await _scalar(
         db,
-        "SELECT EXTRACT(EPOCH FROM (now() - percentile_cont(0.5) WITHIN GROUP "
-        "(ORDER BY last_consolidated_at)))::bigint / 86400 "
+        "SELECT (percentile_cont(0.5) WITHIN GROUP "
+        "(ORDER BY EXTRACT(EPOCH FROM (now() - last_consolidated_at))))::bigint / 86400 "
         "FROM index_pipeline_state WHERE serving_eligible IS TRUE",
     )
     return _signal("quality_meta", "Quality / freshness metadata",
@@ -167,8 +167,8 @@ async def _intel(db: Any, eligible: int) -> Dict[str, Any]:
     entries = await _scalar(db, "SELECT count(*) FROM aurora_product_intel_kb")
     age = await _scalar(
         db,
-        "SELECT EXTRACT(EPOCH FROM (now() - percentile_cont(0.5) WITHIN GROUP "
-        "(ORDER BY updated_at)))::bigint / 86400 FROM aurora_product_intel_kb",
+        "SELECT (percentile_cont(0.5) WITHIN GROUP "
+        "(ORDER BY EXTRACT(EPOCH FROM (now() - updated_at))))::bigint / 86400 FROM aurora_product_intel_kb",
     )
     return _signal(
         "intel", "Why / fit / evidence (intel KB)",
@@ -187,8 +187,8 @@ async def _outcomes(db: Any, eligible: int) -> Dict[str, Any]:
     )
     age = await _scalar(
         db,
-        "SELECT EXTRACT(EPOCH FROM (now() - percentile_cont(0.5) WITHIN GROUP "
-        "(ORDER BY created_at)))::bigint / 86400 FROM agent_decision_funnel_links",
+        "SELECT (percentile_cont(0.5) WITHIN GROUP "
+        "(ORDER BY EXTRACT(EPOCH FROM (now() - created_at))))::bigint / 86400 FROM agent_decision_funnel_links",
     )
     return _signal(
         "outcomes", "Outcomes (rail_transacted joins)",

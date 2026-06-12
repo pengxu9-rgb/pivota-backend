@@ -127,7 +127,9 @@ def _parse_args() -> argparse.Namespace:
 
 async def _run(args: argparse.Namespace) -> int:
     limit_clause = f"LIMIT {int(args.limit)}" if args.limit else ""
-    sql = SELECT_CANDIDATES_SQL.format(limit_clause=limit_clause)
+    # NB: the SQL contains literal `{decision_layer,decision_id}` JSONB-path braces,
+    # so str.format() would choke on them — substitute the one placeholder directly.
+    sql = SELECT_CANDIDATES_SQL.replace("{limit_clause}", limit_clause)
 
     await database.connect()
     try:

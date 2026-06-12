@@ -35,7 +35,7 @@ async def test_scorecard_aggregates_and_computes_pct() -> None:
         ("co.suppressed_at IS NULL", 20),  # offers
         ("catalog_row_trust", 10),                                              # trust
         ("FROM index_pipeline_state WHERE serving_eligible IS TRUE AND content_quality_score", 80),
-        ("percentile_cont(0.5) WITHIN GROUP (ORDER BY last_consolidated_at)", 3),
+        ("ORDER BY EXTRACT(EPOCH FROM (now() - last_consolidated_at))", 3),
         ("SELECT count(*) FROM index_pipeline_state WHERE serving_eligible IS TRUE", 100),
         ("SELECT count(*) FROM index_pipeline_state", 250),
         ("count(DISTINCT anchor_ref)", 46),
