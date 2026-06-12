@@ -62,3 +62,53 @@ def test_explicit_override_disables_on_prod(monkeypatch):
 def test_override_truthiness(monkeypatch, val, expected):
     _set(monkeypatch, AUDIT_WORKER_ENABLED=val)
     assert _queue_worker_enabled() is expected
+
+
+# --- integration: start_scheduler registers nothing on staging ---------------
+import pytest as _pytest
+
+
+class _RecordingScheduler:
+    def __init__(self, *a, **k):
+        self.jobs = []
+
+    def add_job(self, func, *a, **k):
+        self.jobs.append(k.get("id"))
+
+    def start(self):
+        pass
+
+    def get_jobs(self):
+        return list(self.jobs)
+
+
+async def _run_start(monkeypatch, **env):
+    import services.audit_scheduler as sched
+    for k in _ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(sched, "_SCHEDULER", None)
+    rec = _RecordingScheduler()
+    monkeypatch.setattr(
+        "apscheduler.schedulers.asyncio.AsyncIOScheduler",
+        lambda *a, **k: rec,
+    )
+    await sched.start_scheduler()
+    return rec
+
+
+@_pytest.mark.asyncio
+async def test_start_scheduler_registers_no_jobs_on_staging(monkeypatch):
+    rec = await _run_start(monkeypatch, RAILWAY_SERVICE_NAME="web-staging")
+    assert rec.jobs == [], f"staging must register NO jobs, got {rec.jobs}"
+
+
+@_pytest.mark.asyncio
+async def test_start_scheduler_registers_jobs_on_prod(monkeypatch):
+    rec = await _run_start(monkeypatch, RAILWAY_SERVICE_NAME="web")
+    # crons AND drainers register on the prod worker.
+    assert "daily_audit_check" in rec.jobs
+    assert "audit_run_worker_tick" in rec.jobs
+    assert "partner_settlement_monthly" in rec.jobs
+    assert len(rec.jobs) > 8
