@@ -69,6 +69,9 @@ catalog_products = Table(
     Column("category_path", String(255), nullable=True),
     Column("category_confidence", Float, nullable=True),
     Column("category_label_source", String(32), nullable=True),
+    # Durable category_kind in {skincare, haircare, supplement} (mig 151).
+    # Drives claim-safety / disclaimers / serving-gate; see services.category_kind.
+    Column("category_kind", String(16), nullable=True),
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
