@@ -129,6 +129,50 @@ async def test_per_sku_expansion_resolves_real_variant_keys(monkeypatch, tmp_pat
         await db.disconnect()
 
 
+async def test_per_sku_expansion_rolls_box_count_variants_up_to_one(monkeypatch, tmp_path) -> None:
+    """Audit P2 variant-dedup: box-count variants share a product_key, so the
+    per-SKU expansion must collapse them to ONE representative SKU (not N
+    identical reports + N× grounded probes). Runs the REAL expansion against a
+    seeded SQLite catalog — proving the dedup is portable (no Postgres-only
+    DISTINCT ON)."""
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'audit_variant_dedup.db'}")
+    await db.connect()
+    try:
+        await db.execute(_create_table_sql(catalog_products))
+        await db.execute(_create_table_sql(catalog_skus))
+        await db.execute(
+            "INSERT INTO catalog_products "
+            "(product_key, merchant_id, platform, source_product_id, title, brand, "
+            " product_type, canonical_url) "
+            "VALUES (:pk, :m, :plat, :spid, :title, :brand, :ptype, :url)",
+            {"pk": PRODUCT_KEY, "m": MERCHANT, "plat": "shopify", "spid": "sp1",
+             "title": TITLE, "brand": "Ownist", "ptype": "serum", "url": CANONICAL_URL},
+        )
+        # Four box-count variants under the same product_key.
+        for vid in ("var1", "var2", "var3", "var4"):
+            await db.execute(
+                "INSERT INTO catalog_skus "
+                "(sku_key, product_key, merchant_id, platform, source_product_id, "
+                " source_variant_id, title) "
+                "VALUES (:sk, :pk, :m, :plat, :spid, :svid, :title)",
+                {"sk": f"{PRODUCT_KEY}::v::{vid}", "pk": PRODUCT_KEY, "m": MERCHANT,
+                 "plat": "shopify", "spid": "sp1", "svid": vid,
+                 "title": f"{TITLE} ({vid})"},
+            )
+        _bind(monkeypatch, db)
+
+        from services.agent_center_bd_report_service import _sku_keys_for_per_sku_mode
+
+        # Pass the product (no sku_key) so the catalog_skus expansion path runs.
+        sku_keys = await _sku_keys_for_per_sku_mode(
+            [{"product_key": PRODUCT_KEY}], MERCHANT,
+        )
+        # Four variants collapse to one stable representative (first by sku_key).
+        assert sku_keys == [f"{PRODUCT_KEY}::v::var1"]
+    finally:
+        await db.disconnect()
+
+
 async def test_load_sku_context_resolves_on_real_sku_key(monkeypatch, tmp_path) -> None:
     """load_sku_context resolves real catalog_skus rows -> no blocked dimensions."""
     db = await _make_seeded_db(tmp_path)

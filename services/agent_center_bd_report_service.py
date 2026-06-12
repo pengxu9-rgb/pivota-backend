@@ -2171,6 +2171,64 @@ def compute_identity_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, Any]
     return _finish_breakdown(breakdown, missing)
 
 
+def _raw_pdp_content_fraction(
+    product: Dict[str, Any],
+    sku_ctx: Dict[str, Any],
+    enrichment: Dict[str, Any],
+) -> float:
+    """Honest 0..1 measure of the REAL merchant PDP's content richness.
+
+    Reads only first-party listing fields (description, image, structured
+    facts/specs, bullets, price) — NOT Pivota enrichment artifacts. Used as the
+    fallback when product_quality_snapshot is absent (fresh ingests), so a
+    content-rich but not-yet-enriched PDP isn't scored as "thin" and pushed a
+    "build a PDP you already have" recommendation. The real gap for these SKUs
+    is Pivota enrichment / getting cited, which the `missing` field still flags.
+    """
+    payload = _json_obj(product.get("product_payload"))
+    fraction = 0.0
+
+    description = str(product.get("description") or enrichment.get("description_markdown") or "").strip()
+    desc_len = len(description)
+    if desc_len >= 600:
+        fraction += 0.30
+    elif desc_len >= 300:
+        fraction += 0.20
+    elif desc_len >= 120:
+        fraction += 0.10
+
+    if _nonempty(product.get("title")):
+        fraction += 0.10
+
+    if _nonempty(product.get("image_url") or sku_ctx.get("image_url")):
+        fraction += 0.15
+
+    sku = _get_sku(sku_ctx or {})
+    has_structured = (
+        _nonempty(payload.get("facts") or payload.get("structured_facts") or payload.get("specs")
+                  or payload.get("ingredients") or payload.get("fashion_meta") or payload.get("electronics_meta"))
+        or _nonempty(_json_obj(sku.get("visible_attributes")))
+        or any(isinstance(r, dict) for r in _json_list(sku_ctx.get("catalog_field_facts")))
+    )
+    if has_structured:
+        fraction += 0.20
+
+    bullets = _json_list(product.get("bullet_points") or payload.get("bullet_points"))
+    if any(_nonempty(b) for b in bullets) or _nonempty(payload.get("usage") or product.get("usage_scenarios")):
+        fraction += 0.10
+
+    offers = _get_offers(sku_ctx or {})
+    has_price = any(
+        _as_number(o.get("merchant_effective_price")) is not None
+        or _as_number(o.get("estimated_best_price")) is not None
+        for o in offers
+    )
+    if has_price:
+        fraction += 0.15
+
+    return min(1.0, fraction)
+
+
 def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     """Spec A.2 content-richness score. Pure: reads normalized SKU context."""
     product = _get_product(sku_ctx or {})
@@ -2180,13 +2238,34 @@ def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[s
     breakdown: Dict[str, Any] = {}
     missing: List[str] = []
 
+    # Raw-PDP fallback: product_quality_score and model_readiness historically
+    # came ONLY from Pivota's product_quality_snapshot, scoring 0 for any fresh
+    # ingest — so a real brand PDP with a 1200-char description scored ~18/100
+    # and got a "build a PDP" recommendation for a page it already has. When the
+    # Pivota snapshot is absent, score the merchant's RAW content directly; keep
+    # `missing` pointing at the enrichment artifact so the recommendation still
+    # targets the real gap (get Pivota-enriched / cited), not "publish a PDP."
+    raw_pdp_fraction = _raw_pdp_content_fraction(product, sku_ctx or {}, enrichment)
+
     quality_value = quality.get("content_quality_score", sku_ctx.get("content_quality_score"))
-    quality_points = _points_from_percent(quality_value, 25)
+    if quality_value is not None:
+        quality_points = _points_from_percent(quality_value, 25)
+        quality_reason = f"content quality normalized to {quality_points}/25"
+        quality_missing = None
+    else:
+        quality_points = int(round(25 * raw_pdp_fraction))
+        quality_reason = (
+            f"raw PDP content scored {quality_points}/25 (Pivota enrichment score pending)"
+            if quality_points
+            else "data unavailable"
+        )
+        # Even when raw content is rich, the enrichment artifact is the real gap.
+        quality_missing = ["product_quality_snapshot.content_quality_score"]
     _add_bucket(
         breakdown, missing, "product_quality_score",
         quality_points, 25,
-        f"content quality normalized to {quality_points}/25" if quality_value is not None else "data unavailable",
-        missing=None if quality_value is not None else ["product_quality_snapshot.content_quality_score"],
+        quality_reason,
+        missing=quality_missing,
     )
 
     bullets = _json_list(enrichment.get("bullet_points") or product.get("bullet_points"))
@@ -2266,12 +2345,26 @@ def compute_content_richness_score(sku_ctx: Dict[str, Any]) -> Tuple[int, Dict[s
     )
 
     readiness_value = quality.get("model_readiness_score", sku_ctx.get("model_readiness_score"))
-    readiness_points = _points_from_percent(readiness_value, 15)
+    if readiness_value is not None:
+        readiness_points = _points_from_percent(readiness_value, 15)
+        readiness_reason = f"model readiness normalized to {readiness_points}/15"
+        readiness_missing = None
+    else:
+        # Same raw-PDP fallback as product_quality_score: a content-complete
+        # listing carries the fields a model needs even before Pivota computes a
+        # readiness score. Keep `missing` flagging the Pivota artifact.
+        readiness_points = int(round(15 * raw_pdp_fraction))
+        readiness_reason = (
+            f"raw PDP model-readiness proxy {readiness_points}/15 (Pivota readiness score pending)"
+            if readiness_points
+            else "data unavailable"
+        )
+        readiness_missing = ["product_quality_snapshot.model_readiness_score"]
     _add_bucket(
         breakdown, missing, "model_readiness",
         readiness_points, 15,
-        f"model readiness normalized to {readiness_points}/15" if readiness_value is not None else "data unavailable",
-        missing=None if readiness_value is not None else ["product_quality_snapshot.model_readiness_score"],
+        readiness_reason,
+        missing=readiness_missing,
     )
 
     blocking_flags = _has_blocking_safety_flag(enrichment.get("llm_safety_flags"))
@@ -3927,11 +4020,22 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         """,
         {"merchant_id": merchant_id},
     )
+    # The `merchants` table has NO `merchant_id` column (verified against live
+    # schema), so the old `WHERE merchant_id = :merchant_id` read raised an
+    # undefined-column error that _fetch_one_dict swallowed to {} on every
+    # audit — under-scoring merchant_trust_state and policy_jurisdiction. The
+    # `merch_` identity lives in merchant_onboarding; the only reliable link to
+    # the merchants row is the shared contact_email (mirrors billing_routes
+    # _resolve_merchant_id_from_customer_id, which joins on LOWER(contact_email)).
     merchant = await _fetch_one_dict(
         """
-        SELECT *
-          FROM merchants
-         WHERE merchant_id = :merchant_id
+        SELECT m.*
+          FROM merchants m
+          JOIN merchant_onboarding mo
+            ON LOWER(m.contact_email) = LOWER(mo.contact_email)
+         WHERE mo.merchant_id = :merchant_id
+           AND m.contact_email IS NOT NULL
+           AND m.contact_email <> ''
          LIMIT 1
         """,
         {"merchant_id": merchant_id},
@@ -4897,19 +5001,39 @@ async def _sku_keys_for_per_sku_mode(
         return keys
     placeholders = ", ".join(f":pk{i}" for i, _ in enumerate(product_keys))
     values = {"merchant_id": merchant_id, **{f"pk{i}": pk for i, pk in enumerate(product_keys)}}
+    # Roll variants up to ONE representative SKU per product (box-count / size
+    # variants share a product_key, and merchant rows of the same canonical PDP
+    # share a content_key). Probing every variant produced N identical reports
+    # and N× the grounded LLM probes for the same recommendation. Dedupe by the
+    # canonical identity (content_key, falling back to product_key) in Python —
+    # NOT via Postgres-only DISTINCT ON, since the audit test suite runs on
+    # SQLite. The deterministic ORDER BY picks a stable representative.
     rows = await _fetch_all_dicts(
         f"""
-        SELECT sku_key
-          FROM catalog_skus
-         WHERE merchant_id = :merchant_id
-           AND product_key IN ({placeholders})
-         ORDER BY product_key, sku_key
+        SELECT cs.sku_key, cs.product_key, cp.content_key
+          FROM catalog_skus cs
+          LEFT JOIN catalog_products cp
+            ON cp.product_key = cs.product_key
+         WHERE cs.merchant_id = :merchant_id
+           AND cs.product_key IN ({placeholders})
+         ORDER BY cs.product_key, cs.sku_key
         """,
         values,
     )
+    seen_identity: set = set()
     for row in rows:
-        sku_key = row.get("sku_key")
-        if sku_key and sku_key not in keys:
+        sku_key = (row.get("sku_key") or "").strip()
+        if not sku_key:
+            continue
+        identity = (
+            str(row.get("content_key") or "").strip()
+            or str(row.get("product_key") or "").strip()
+            or sku_key
+        )
+        if identity in seen_identity:
+            continue
+        seen_identity.add(identity)
+        if sku_key not in keys:
             keys.append(sku_key)
     return keys
 
@@ -5628,8 +5752,19 @@ async def _probe_per_sku_ctx(
         for record in query_records
     ]
     query_metadata = _query_metadata_from_records(query_records)
+    provider_ids = list((coverage or {}).get("providers") or [])
+    # Diagnose the "low prompts_per_sku -> 0 probes" anomaly: query-building
+    # always yields >=1 spec for prompts_per_sku>=1 (proven by test), so a zero
+    # probe count can only come from an empty provider set or an empty spec list.
+    # Make either cause loud instead of silently persisting zero llm_probe_runs.
+    if not query_specs or not provider_ids:
+        logger.warning(
+            "per-sku probe will run 0 times for sku_key=%s: prompts_per_sku=%s "
+            "query_specs=%d providers=%d",
+            sku_key, target_prompts, len(query_specs), len(provider_ids),
+        )
     out: List[Dict[str, Any]] = []
-    for provider_id in list((coverage or {}).get("providers") or []):
+    for provider_id in provider_ids:
         model_info = provider_model_metadata.get(provider_id) or {}
         consecutive_failures = 0
         for chunk_idx, chunk in enumerate(_chunk_query_specs(query_specs), start=1):

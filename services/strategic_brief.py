@@ -1569,6 +1569,85 @@ def _deterministic_wedge_decision(sideways_wedge: Mapping[str, Any]) -> str:
     )
 
 
+def _low_signal_brief(evidence: Mapping[str, Any]) -> Dict[str, Any]:
+    """Grounding-safe brief for SKUs with no buyer-path evidence yet.
+
+    A not-yet-visible SKU has no probes, citations, competitors, or lanes, so the
+    allowed-grounding set is sparse and any evidence-keyed brief (LLM or the lane-
+    driven deterministic path) gets rejected — historically yielding None and a
+    silent fall-through to the generic NBA boilerplate.
+
+    This brief is built ONLY from product facts that are already in the allowed-
+    grounding set (title, merchant page label/destination, evidenced attributes)
+    plus generic, non-named guidance. It names no competitor, domain, search lane,
+    statistic, or safety-sensitive claim, so it passes validate_grounding by
+    construction (see _allowed_grounding: product.title and merchant_path.* are
+    add_term'd, attributes feed _brief_angle_terms). The honest call for an
+    invisible SKU is to make its own page exist, be specific, and become citable
+    before any conversion play — never fabricated specifics.
+    """
+    product = _as_mapping(evidence.get("product"))
+    title = _clean_str(product.get("title")) or "this SKU"
+    merchant_path = _as_mapping(product.get("merchant_path"))
+    page_label = _clean_str(merchant_path.get("page_label")) or "the merchant-controlled page"
+    destination = _clean_str(merchant_path.get("destination")) or "the merchant-controlled website"
+    attributes = _as_mapping(product.get("attributes"))
+    angle_terms = _brief_angle_terms(attributes)
+
+    first_moves = [
+        (
+            f"Make {page_label} the complete, specific canonical page for {title}: "
+            "full description, images, specs, price, and availability in plain page text."
+        ),
+        (
+            f"State {angle_terms} in plain text on {page_label}, and add product, offer, "
+            "review, and FAQ schema so the page is more retrievable and extractable."
+        ),
+        (
+            f"Build verified reviews and proof on {page_label} so {destination} reads as the "
+            "most authoritative source for this product."
+        ),
+        (
+            f"Re-audit {title} after the page is live and complete, and verify whether it has "
+            "started to surface in AI shopping answers before treating any lane as lost."
+        ),
+    ]
+    self_serve = [
+        f"Make {page_label} complete and specific for {title} with full text, images, and schema.",
+        "Keep product facts, price, stock, and availability fresh and consistent.",
+        "Re-audit after the page is live to verify whether it surfaces in AI shopping answers.",
+    ]
+    return {
+        "position": (
+            f"{title} is not yet surfacing in AI shopping answers, so there is no grounded "
+            "demand or competitive read to act on yet."
+        ),
+        "core_decision": (
+            f"Make {page_label} the complete, specific, citable canonical page for {title} first; "
+            "getting the product retrievable and extractable comes before any conversion play."
+        ),
+        "why_you_lose": (
+            f"AI's answers do not yet reference {title}, which suggests {destination} is not yet a "
+            "retrievable, extractable, authoritative source AI shopping assistants can cite for "
+            "this product."
+        ),
+        "your_angle": (
+            f"Use the evidenced product angle — {angle_terms} — as the reason {page_label} deserves "
+            "to be cited and bought from once it is complete and specific."
+        ),
+        "traffic_strategy": [],
+        "substitution_play": None,
+        "first_moves": first_moves,
+        "diy_vs_pivota": {
+            "self_serve": self_serve,
+            "pivota": (
+                "Pivota makes the canonical page more citable, buyable, and agent-checkout ready, "
+                "then monitors whether this product starts to surface in AI shopping answers."
+            ),
+        },
+    }
+
+
 def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     product = _as_mapping(evidence.get("product"))
     title = _clean_str(product.get("title")) or "this SKU"
@@ -1580,7 +1659,10 @@ def _deterministic_brief(evidence: Mapping[str, Any]) -> Optional[Dict[str, Any]
         if isinstance(item, Mapping) and _clean_str(item.get("query"))
     ]
     if not opportunities:
-        return None
+        # No lane/buyer-path evidence (not-yet-visible SKU): fall back to the
+        # grounding-safe low-signal brief instead of returning None, which used
+        # to silently drop the per-SKU brief to generic NBA boilerplate.
+        return _low_signal_brief(evidence)
     lead = opportunities[0]
     query = _clean_str(lead.get("query"))
     controllers = _unique_host_roles(

@@ -248,6 +248,7 @@ async def attach_sku_strategic_brief(
 
     out = dict(next_best_action or {})
     try:
+        from config.settings import settings
         from services.strategic_brief import (
             assemble_sku_brief_evidence,
             generate_sku_strategic_brief,
@@ -268,11 +269,24 @@ async def attach_sku_strategic_brief(
             provider=provider,
             model=model,
         )
+        brief_enabled = bool(getattr(settings, "strategic_brief_enabled", False))
     except Exception:
         logger.warning("strategic brief attach failed; using deterministic NBA", exc_info=True)
+        # Surface the failure so a missing per-SKU brief is diagnosable rather
+        # than a silent fall-through to generic NBA boilerplate.
+        out["brief_status"] = "unavailable"
         return out
     if brief:
         out["strategic_brief"] = brief
+        out["brief_status"] = "ok"
+    elif brief_enabled:
+        # Feature is on but no brief was produced (e.g. grounding rejected every
+        # attempt). Make it visible instead of silently dropping to boilerplate.
+        out["brief_status"] = "unavailable"
+        logger.warning(
+            "strategic brief unavailable for sku_title=%r despite feature enabled",
+            sku_title,
+        )
     return out
 
 

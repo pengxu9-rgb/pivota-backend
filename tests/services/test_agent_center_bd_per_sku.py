@@ -310,9 +310,44 @@ def test_content_richness_score_good_partial_missing():
     partial["product"]["image_url"] = None
     partial["product"]["freshness_json"] = {}
     score, breakdown = compute_content_richness_score(partial)
+    # Missing Pivota enrichment still drags the score down, but the bucket now
+    # reflects whatever RAW content survives (title, attributes, priced offer)
+    # instead of a flat 0 — and still flags the Pivota artifact as the real gap.
     assert 0 <= score < 60
-    assert breakdown["product_quality_score"]["reason"] == "data unavailable"
+    assert "product_quality_snapshot.content_quality_score" in breakdown["missing_inputs"]
     assert breakdown["safety_claims"]["points"] == 0
+
+
+def test_content_richness_scores_raw_pdp_when_pivota_enrichment_absent():
+    """Audit regression: a content-rich brand PDP (long description, image,
+    specs, priced offer) with NO Pivota enrichment must NOT be scored as thin.
+    Previously product_quality_score (25) + model_readiness (15) came only from
+    product_quality_snapshot, so fresh ingests scored ~18/100 and got a
+    "build a PDP you already have" recommendation."""
+    from services.agent_center_bd_report_service import compute_content_richness_score
+
+    ctx = _base_sku_ctx()
+    # Strip every Pivota enrichment artifact — simulate a fresh ingest.
+    ctx["product_quality_snapshot"] = {}
+    ctx["product_enrichment"] = {}
+    ctx["product"]["description"] = (
+        "A dermatologist-tested brightening serum with niacinamide, a lightweight "
+        "daily-use texture, and a clinically informed formulation. "
+    ) * 6  # ~600+ chars of REAL merchant content
+
+    score, breakdown = compute_content_richness_score(ctx)
+
+    pq = breakdown["product_quality_score"]
+    mr = breakdown["model_readiness"]
+    # Raw content now earns real points instead of 0.
+    assert pq["points"] > 0, pq
+    assert mr["points"] > 0, mr
+    # But the recommendation target stays honest: the gap is Pivota enrichment,
+    # not "go write a description" — the merchant already has one.
+    assert "product_quality_snapshot.content_quality_score" in breakdown["missing_inputs"]
+    assert "product_quality_snapshot.model_readiness_score" in breakdown["missing_inputs"]
+    # A content-rich-but-unenriched PDP clears the old ~18 floor decisively.
+    assert score > 40, (score, breakdown)
 
 
 def test_routability_score_good_and_missing_offer_data():
@@ -458,6 +493,32 @@ def test_citation_score_weighted_formula_and_missing_runs():
     assert breakdown["total"] is None
     assert breakdown["no_probes"] is True
     assert breakdown["first_party_rate"]["reason"] == "no probes ran for this SKU"
+
+
+def test_per_sku_query_records_never_empty_for_any_prompts_per_sku():
+    """Audit P2: the 'low prompts_per_sku -> 0 probes' anomaly is NOT in query
+    building — prove >=1 query (and thus >=1 chunk) for prompts_per_sku>=1 across
+    a rich product, a thin fresh-ingest, and a bare-variant-label SKU. A zero
+    probe count can therefore only come from an empty provider set / producer not
+    running, which _probe_per_sku_ctx now logs loudly."""
+    from services.agent_center_bd_report_service import (
+        _build_per_sku_audit_query_records,
+        _chunk_query_specs,
+    )
+
+    contexts = {
+        "rich": {"sku_key": "s1", "product": {"title": "Triple Shine Grape", "brand": "Ownist",
+                 "product_type": "collagen", "attributes_raw": {"flavor": "grape", "format": "powder"}}},
+        "thin": {"sku_key": "s2", "product": {"title": "White Collagen", "product_type": "supplement"}},
+        "bare": {"sku_key": "s3", "sku": {"title": "14 Servings, 2-Week Routine"}, "product": {}},
+    }
+    for name, ctx in contexts.items():
+        for n in (1, 2, 3, 5, 40):
+            records = _build_per_sku_audit_query_records(ctx, n)
+            assert len(records) >= 1, (name, n, records)
+            assert len(records) <= n, (name, n, len(records))
+            specs = [(r["query"], r["axis"]) for r in records]
+            assert len(_chunk_query_specs(specs)) >= 1, (name, n)
 
 
 def test_deepseek_verify_deweights_only_answer_quality():
