@@ -466,6 +466,22 @@ _ELIGIBILITY_COLUMNS = f"""
           AND co.market = 'US'
         LIMIT 1
     )                           AS has_us_offer,
+    (
+        SELECT TRUE
+        FROM beauty_product_profiles bpp
+        WHERE bpp.product_key = cp.product_key
+          AND jsonb_typeof(bpp.concerns_json) = 'array'
+          AND jsonb_array_length(bpp.concerns_json) > 0
+        LIMIT 1
+    )                           AS has_skin_concern,
+    (
+        SELECT TRUE
+        FROM beauty_sku_ingredients bsi
+        WHERE bsi.product_key = cp.product_key
+          AND jsonb_typeof(bsi.active_ingredients_json) = 'array'
+          AND jsonb_array_length(bsi.active_ingredients_json) > 0
+        LIMIT 1
+    )                           AS has_key_actives,
 {_HAS_OFFER_SNAPSHOT_COLUMN},
     pgm.product_group_id
 """
@@ -637,11 +653,13 @@ SELECT
           AND co.suppressed_at IS NULL
           AND co.list_price > 0
     ) AS has_price,
-    -- SQLite (test) path: column-independent placeholder. The real US-offer
-    -- signal (catalog_offers.market) is computed on the Postgres path; the
-    -- agent-decision gate is flag-off in tests, and its logic is covered by the
-    -- agent_decision_gates unit tests.
+    -- SQLite (test) path: column-independent placeholders. The real signals
+    -- (catalog_offers.market; beauty concerns/actives) are computed on the
+    -- Postgres path; the agent-decision gate is flag-off in tests, and its logic
+    -- is covered by the agent_decision_gates unit tests.
     0 AS has_us_offer,
+    NULL AS has_skin_concern,
+    NULL AS has_key_actives,
     EXISTS (
         SELECT 1
         FROM external_offer_snapshots eos

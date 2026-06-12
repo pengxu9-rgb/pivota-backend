@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from services.agent_decision_gates import (
+    BLOCKER_MISSING_CATEGORY_ATTRS,
     BLOCKER_MISSING_DISCLAIMERS,
     BLOCKER_NO_PROVENANCE_CLAIM,
     BLOCKER_NO_US_OFFER,
@@ -14,13 +15,23 @@ from services.agent_decision_gates import (
 )
 
 # A row that passes every active gate (US offer + reviewed, substantiated evidence).
+# Supplement -> mandates a disclaimer, has no skincare attribute gate.
 _FULL_ROW = {
     "has_us_offer": True,
-    "category_kind": "supplement",  # a category that mandates a disclaimer
+    "category_kind": "supplement",
     "provenance_claim_count": 2,
     "required_disclaimers_present": True,
     "evidence_review_state": "reviewed",
-    "category_attributes_present": True,
+}
+
+# A skincare row that passes the category-attributes gate.
+_FULL_SKINCARE_ROW = {
+    "has_us_offer": True,
+    "category_kind": "skincare",
+    "provenance_claim_count": 1,
+    "evidence_review_state": "reviewed",
+    "has_skin_concern": True,
+    "has_key_actives": True,
 }
 
 
@@ -60,8 +71,9 @@ def test_evidence_gates_block_when_disclaimer_explicitly_absent():
 
 
 def test_disclaimer_gate_skipped_for_category_without_a_mandate():
-    # Skincare mandates no disclaimer, so an absent disclaimer must NOT block.
-    row = {**_FULL_ROW, "category_kind": "skincare", "required_disclaimers_present": False}
+    # Skincare mandates no disclaimer, so an absent disclaimer must NOT block
+    # (the skincare attribute signals are present, isolating disclaimer behavior).
+    row = {**_FULL_SKINCARE_ROW, "required_disclaimers_present": False}
     assert (
         evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True) is None
     )
@@ -86,5 +98,36 @@ def test_missing_signals_default_present_so_only_real_gaps_block():
     row = {"has_us_offer": True, "evidence_review_state": "reviewed", "provenance_claim_count": 1}
     assert (
         evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True)
+        is None
+    )
+
+
+def test_skincare_passes_with_concern_and_actives():
+    assert (
+        evaluate_agent_decision_gates(
+            _FULL_SKINCARE_ROW, gates_enabled=True, evidence_gates=True
+        )
+        is None
+    )
+
+
+def test_skincare_blocks_without_skin_concern():
+    row = {**_FULL_SKINCARE_ROW, "has_skin_concern": False}
+    result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True)
+    assert result is not None and result[0] == BLOCKER_MISSING_CATEGORY_ATTRS
+    assert "skin concern" in result[1]
+
+
+def test_skincare_blocks_without_key_actives():
+    row = {**_FULL_SKINCARE_ROW, "has_key_actives": False}
+    result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True)
+    assert result is not None and result[0] == BLOCKER_MISSING_CATEGORY_ATTRS
+    assert "key actives" in result[1]
+
+
+def test_non_skincare_has_no_attribute_gate():
+    # A supplement with no skincare signals must NOT block on category attributes.
+    assert (
+        evaluate_agent_decision_gates(_FULL_ROW, gates_enabled=True, evidence_gates=True)
         is None
     )

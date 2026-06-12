@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional, Tuple
 
-from services.claim_safety import required_disclaimers_for_category
+from services.claim_safety import CATEGORY_SKINCARE, required_disclaimers_for_category
 
 BLOCKER_NO_US_OFFER = "no_us_offer"
 BLOCKER_NO_PROVENANCE_CLAIM = "no_provenance_claim"
@@ -92,12 +92,27 @@ def evaluate_agent_decision_gates(
                 BLOCKER_UNREVIEWED_EVIDENCE,
                 "evidence_profile.review_state is not 'reviewed'",
             )
-        # Category-module attributes: stub -- non-blocking until the per-category
-        # modules ship and populate this signal.
-        if row.get("category_attributes_present", True) is False:
-            return (
-                BLOCKER_MISSING_CATEGORY_ATTRS,
-                "category-module attributes are not present",
-            )
+        # Category-module attributes: skincare requires the structured fit
+        # signals an agent matches on (skin concern + key actives). Other
+        # categories stay non-blocking until their modules ship.
+        attrs_gap = _category_attributes_gap(row.get("category_kind"), row)
+        if attrs_gap is not None:
+            return (BLOCKER_MISSING_CATEGORY_ATTRS, attrs_gap)
 
+    return None
+
+
+def _category_attributes_gap(
+    category_kind: Optional[str], row: Dict[str, Any]
+) -> Optional[str]:
+    """Return a reason string when a category's required attributes are absent,
+    or None when present (or the category has no attribute gate yet)."""
+    if category_kind == CATEGORY_SKINCARE:
+        missing = []
+        if not row.get("has_skin_concern"):
+            missing.append("skin concern")
+        if not row.get("has_key_actives"):
+            missing.append("key actives")
+        if missing:
+            return f"skincare record is missing required attributes: {', '.join(missing)}"
     return None
