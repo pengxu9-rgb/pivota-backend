@@ -478,6 +478,10 @@ beauty_product_profiles = Table(
     Column("routine_phase", String(64), nullable=True),
     Column("benefits_json", JSONB_TYPE, nullable=True),
     Column("profile_payload", JSONB_TYPE, nullable=True),
+    # Provenance-backed evidence + required disclaimers (mig 150). evidence_profile
+    # holds {claims:[ProductClaim], review_state}; see services.claim_safety.
+    Column("evidence_profile", JSONB_TYPE, nullable=True),
+    Column("required_disclaimers", JSONB_TYPE, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
 )
