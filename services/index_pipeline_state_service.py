@@ -466,6 +466,9 @@ _ELIGIBILITY_COLUMNS = f"""
           AND co.market = 'US'
         LIMIT 1
     )                           AS has_us_offer,
+    -- Category concern list (skin concern for skincare, hair concern for
+    -- haircare); both read the shared concerns_json. The category-attributes
+    -- gate selects which category_kind this blocks for.
     (
         SELECT TRUE
         FROM beauty_product_profiles bpp
@@ -473,7 +476,7 @@ _ELIGIBILITY_COLUMNS = f"""
           AND jsonb_typeof(bpp.concerns_json) = 'array'
           AND jsonb_array_length(bpp.concerns_json) > 0
         LIMIT 1
-    )                           AS has_skin_concern,
+    )                           AS has_category_concern,
     (
         SELECT TRUE
         FROM beauty_sku_ingredients bsi
@@ -658,7 +661,7 @@ SELECT
     -- Postgres path; the agent-decision gate is flag-off in tests, and its logic
     -- is covered by the agent_decision_gates unit tests.
     0 AS has_us_offer,
-    NULL AS has_skin_concern,
+    NULL AS has_category_concern,
     NULL AS has_key_actives,
     EXISTS (
         SELECT 1
