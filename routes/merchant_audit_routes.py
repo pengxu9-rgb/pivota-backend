@@ -1670,7 +1670,9 @@ async def get_serving_status(
     capped_limit = max(1, min(int(limit or 200), 1000))
     summary = await get_serving_summary(merchant_id)
     if sku_keys:
-        refs = [s for s in sku_keys.split(",") if s.strip()]
+        # Bound per-request work: a merchant could pass thousands of comma-
+        # separated refs. Cap to the same ceiling as the catalog-wide list.
+        refs = [s for s in sku_keys.split(",") if s.strip()][:1000]
         skus = await serving_status_for_sku_keys(merchant_id, refs)
     else:
         skus = await list_serving_status(merchant_id, limit=capped_limit)
