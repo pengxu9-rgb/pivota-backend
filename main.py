@@ -117,6 +117,7 @@ from routes.merchant_onboarding_routes import router as merchant_onboarding_rout
 from routes.platform_onboarding_routes import router as platform_onboarding_router
 from routes.merchant_dashboard_routes import router as merchant_dashboard_router  # Original with fallback - STABLE
 from routes.admin_catalog_debug import router as admin_catalog_debug_router
+from routes.admin_signal_scorecard import router as admin_signal_scorecard_router
 from routes.merchant_analytics_routes import router as merchant_analytics_router
 from routes.citation_operator_routes import router as citation_operator_router
 from routes.pivot_routes import router as pivot_router
@@ -917,6 +918,7 @@ else:
     logger.info("⚠️ Platform Onboarding v2 is disabled (feature flag is false)")
 app.include_router(merchant_dashboard_router)  # Merchant dashboard API
 app.include_router(admin_catalog_debug_router)  # Internal catalog debug
+app.include_router(admin_signal_scorecard_router)  # Internal controlled-signal scorecard
 app.include_router(merchant_analytics_router)  # Merchant analytics (trends)
 app.include_router(citation_operator_router)  # Provider-aware AI-citation operator (merchant-facing)
 app.include_router(pivot_router)  # Pivot catalog query and quote APIs
