@@ -162,6 +162,47 @@ async def record_funnel_link(
     return link_id
 
 
+def _decision_layer_node(metadata: Any) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    node = metadata.get("decision_layer")
+    return node if isinstance(node, dict) else {}
+
+
+def _first_nonempty(*values: Any) -> Optional[str]:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def extract_order_decision_linkage(metadata: Any) -> Dict[str, Optional[str]]:
+    """Pull decision-layer linkage out of an order's stored metadata.
+
+    Reads the `decision_layer` block that ``agent_api`` persists onto the order
+    at creation time (``decision_layer.{decision_id, checkout_decision_id}``),
+    with conservative fallbacks. Pure + side-effect-free so it is safe to call
+    from the money-path webhook. Returns null fields when absent — the caller
+    decides whether enough linkage exists to record a funnel link.
+    """
+    node = _decision_layer_node(metadata)
+    meta = metadata if isinstance(metadata, dict) else {}
+    return {
+        "decision_id": _first_nonempty(
+            node.get("decision_id"), node.get("agent_decision_id"), meta.get("decision_id")
+        ),
+        "checkout_decision_id": _first_nonempty(
+            node.get("checkout_decision_id"), meta.get("checkout_decision_id")
+        ),
+        "content_key": _first_nonempty(node.get("content_key"), meta.get("content_key")),
+        "catalog_offer_id": _first_nonempty(
+            node.get("catalog_offer_id"), meta.get("catalog_offer_id"), meta.get("offer_id")
+        ),
+        "protocol": _first_nonempty(node.get("protocol"), meta.get("protocol")),
+    }
+
+
 async def _flush_loop(queue: asyncio.Queue[Tuple[str, Dict[str, Any]]]) -> None:
     while True:
         op, payload = await queue.get()
