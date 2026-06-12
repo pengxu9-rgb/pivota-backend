@@ -435,6 +435,7 @@ _ELIGIBILITY_COLUMNS = f"""
     cp.pdp_scope,
     cp.sync_status,
     cp.canonical_url,
+    cp.category_kind,
     pqs.content_quality_score,
     pqs.model_readiness_score,
     pqs.conversion_potential_score,
@@ -561,6 +562,9 @@ SELECT
     cp.pdp_scope,
     cp.sync_status,
     cp.canonical_url,
+    -- SQLite (test) path: placeholder; durable category_kind is read on the
+    -- Postgres path. The category-aware disclaimer gate is flag-off in tests.
+    NULL AS category_kind,
     (
         SELECT pqs.content_quality_score
         FROM product_quality_snapshot pqs

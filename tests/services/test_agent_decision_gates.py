@@ -16,6 +16,7 @@ from services.agent_decision_gates import (
 # A row that passes every active gate (US offer + reviewed, substantiated evidence).
 _FULL_ROW = {
     "has_us_offer": True,
+    "category_kind": "supplement",  # a category that mandates a disclaimer
     "provenance_claim_count": 2,
     "required_disclaimers_present": True,
     "evidence_review_state": "reviewed",
@@ -52,9 +53,18 @@ def test_evidence_gates_block_without_provenance_claim():
 
 
 def test_evidence_gates_block_when_disclaimer_explicitly_absent():
+    # Supplement mandates the FDA disclaimer; explicitly-absent -> block.
     row = {**_FULL_ROW, "required_disclaimers_present": False}
     result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True)
     assert result is not None and result[0] == BLOCKER_MISSING_DISCLAIMERS
+
+
+def test_disclaimer_gate_skipped_for_category_without_a_mandate():
+    # Skincare mandates no disclaimer, so an absent disclaimer must NOT block.
+    row = {**_FULL_ROW, "category_kind": "skincare", "required_disclaimers_present": False}
+    assert (
+        evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=True) is None
+    )
 
 
 def test_evidence_gates_block_when_evidence_unreviewed():
