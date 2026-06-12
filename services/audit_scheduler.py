@@ -115,11 +115,22 @@ async def start_scheduler() -> None:
                 os.getenv("RAILWAY_SERVICE_NAME"),
                 os.getenv("RAILWAY_ENVIRONMENT"),
             )
+
+        def _add_job(*args, **kwargs):
+            # Register a scheduled job ONLY on the production worker. Prod+staging
+            # share one Postgres, so a staging service must NOT double-fire these
+            # singleton prod crons (daily audit check, settlement, billing,
+            # reconcile, backfills) or drain the shared queues. Gates everything
+            # uniformly — the explicit `if worker_enabled:` blocks below are now
+            # redundant but harmless.
+            if worker_enabled:
+                scheduler.add_job(*args, **kwargs)
+
         # Register the daily check that picks up due merchants. Hour
         # chosen to land off-peak (most merchants in US/EU; 03:00 UTC
         # = 23:00 EDT / 04:00 CET).
         from jobs.scheduled_audit_job import run_scheduled_audits
-        scheduler.add_job(
+        _add_job(
             run_scheduled_audits,
             "cron",
             hour=3,
@@ -135,7 +146,7 @@ async def start_scheduler() -> None:
         # domain_extractor_baselines. Offset 1h from daily_audit_check
         # to avoid Postgres query contention.
         from jobs.nightly_index_health_job import run_nightly_index_health
-        scheduler.add_job(
+        _add_job(
             run_nightly_index_health,
             "cron",
             hour=4,
@@ -155,7 +166,7 @@ async def start_scheduler() -> None:
             run_stale_lease_reaper_tick,
         )
         if worker_enabled:
-            scheduler.add_job(
+            _add_job(
                 run_audit_worker_tick,
                 "interval",
                 seconds=10,
@@ -166,7 +177,7 @@ async def start_scheduler() -> None:
                 coalesce=True,
                 max_instances=1,
             )
-            scheduler.add_job(
+            _add_job(
                 run_stale_lease_reaper_tick,
                 "interval",
                 seconds=60,
@@ -186,7 +197,7 @@ async def start_scheduler() -> None:
             run_executor_lease_reaper_tick,
         )
         if worker_enabled:
-            scheduler.add_job(
+            _add_job(
                 run_executor_worker_tick,
                 "interval",
                 seconds=5,
@@ -195,7 +206,7 @@ async def start_scheduler() -> None:
                 coalesce=True,
                 max_instances=1,
             )
-            scheduler.add_job(
+            _add_job(
                 run_executor_lease_reaper_tick,
                 "interval",
                 seconds=60,
@@ -224,7 +235,7 @@ async def start_scheduler() -> None:
                 exc,
             )
         if worker_enabled:
-            scheduler.add_job(
+            _add_job(
                 run_verification_worker_tick,
                 "interval",
                 seconds=30,
@@ -233,7 +244,7 @@ async def start_scheduler() -> None:
                 coalesce=True,
                 max_instances=1,
             )
-            scheduler.add_job(
+            _add_job(
                 run_verification_lease_reaper_tick,
                 "interval",
                 seconds=60,
@@ -250,7 +261,7 @@ async def start_scheduler() -> None:
         from jobs.external_seed_catalog_materialization_job import (
             run_external_seed_catalog_materialization_tick,
         )
-        scheduler.add_job(
+        _add_job(
             run_external_seed_catalog_materialization_tick,
             "interval",
             minutes=15,
@@ -350,7 +361,7 @@ async def start_scheduler() -> None:
         # T5 — credit reservation reaper, every 5 minutes (ACTIVE).
         # No-op when no reservations are outstanding (current state in
         # production), so safe to run continuously from Stage 1 onward.
-        scheduler.add_job(
+        _add_job(
             expire_stale_reservations,
             "interval",
             minutes=5,
@@ -368,7 +379,7 @@ async def start_scheduler() -> None:
         # hiccups). Without this, an unstamped paid edge is invisible to
         # T6 forever. 2-minute grace + 24h window are encoded in the
         # job's SQL query.
-        scheduler.add_job(
+        _add_job(
             run_stamp_attribution_reaper_tick,
             "interval",
             minutes=5,
@@ -382,7 +393,7 @@ async def start_scheduler() -> None:
         # T6 — GMV aggregation, daily at 02:00 UTC (ACTIVE).
         # Aggregates the previous UTC day's stamped attribution edges into
         # gmv_attribution_daily. Output feeds T7's monthly invoice run.
-        scheduler.add_job(
+        _add_job(
             _run_gmv_aggregation_yesterday,
             "cron",
             hour=2,
@@ -397,7 +408,7 @@ async def start_scheduler() -> None:
         # T7 — invoice generation, monthly on day 2 03:00 UTC (PAUSED).
         # Registered paused so Stage 4 promotion is `scheduler.resume_job(
         # "invoice_generation_monthly")` — no code change, no redeploy.
-        scheduler.add_job(
+        _add_job(
             _run_billing_cycle_previous_month,
             "cron",
             day=2,
@@ -414,7 +425,7 @@ async def start_scheduler() -> None:
         # T8 — partner settlement, monthly on day 3 04:00 UTC (PAUSED).
         # Day after T7 so the invoice cycle has finalized. Same paused
         # pattern as T7 — Stage 4 resume call enables.
-        scheduler.add_job(
+        _add_job(
             _run_partner_settlement_latest,
             "cron",
             day=3,
@@ -431,7 +442,7 @@ async def start_scheduler() -> None:
         # PR #8 — settlement file generation, monthly on day 5 02:00 UTC.
         # Generates DB-only settlement_files rows for the previous calendar
         # month. Safe in staging because no external call is made.
-        scheduler.add_job(
+        _add_job(
             _generate_prior_month_for_all_partners,
             "cron",
             day=5,
@@ -448,7 +459,7 @@ async def start_scheduler() -> None:
         # Registered in-process alongside the audit scheduler; the service
         # itself gates real Stripe transfers to production unless an explicit
         # staging override env var is set.
-        scheduler.add_job(
+        _add_job(
             _transfer_prior_month_for_all_partners,
             "cron",
             day=10,
@@ -468,7 +479,7 @@ async def start_scheduler() -> None:
         from jobs.catalog_row_trust_backfill_cron import (
             run_catalog_row_trust_backfill_tick,
         )
-        scheduler.add_job(
+        _add_job(
             run_catalog_row_trust_backfill_tick,
             "interval",
             hours=6,
@@ -486,7 +497,7 @@ async def start_scheduler() -> None:
         from services.product_quality_backfill_service import (
             process_next_quality_backfill_job,
         )
-        scheduler.add_job(
+        _add_job(
             process_next_quality_backfill_job,
             "interval",
             seconds=30,
@@ -504,7 +515,7 @@ async def start_scheduler() -> None:
         # unless PAYMENT_RECONCILE_SWEEP_ENABLED is set — it auto-finalizes
         # payments, and staging shares the prod DB, so enable deliberately.
         from services.payment_reconcile import run_payment_reconcile_tick
-        scheduler.add_job(
+        _add_job(
             run_payment_reconcile_tick,
             "interval",
             seconds=300,
