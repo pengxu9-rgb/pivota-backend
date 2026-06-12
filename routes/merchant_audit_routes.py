@@ -74,6 +74,7 @@ from services.agent_center_bd_report_service import (
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.merchant_audit_readiness import assess_merchant_audit_readiness
+from services.merchant_credit_balance_service import get_balance
 from utils.auth import get_current_merchant
 from utils.logger import logger
 
@@ -1170,24 +1171,16 @@ async def run_merchant_url_audit(
     """
     from services.bd_cold_start_service import fetch_curated_audit_product
 
-    # 1. Free-allowance cap (cost control) — before any fetch or LLM call.
+    # 1. Free-allowance: the first N URL audits per merchant run free. Beyond
+    #    that we do NOT hard-block a merchant who can pay — we METER the audit
+    #    against their credit balance (the credit pre-flight + debit happens
+    #    after products resolve, below). A credited merchant must not be locked
+    #    out of a feature they can afford; the hard 402 only fires for a
+    #    free-tier merchant with no credits to cover the run.
     used = await count_runs_for_merchant_by_subject(
         merchant_id=merchant_id, subject_type="merchant_url",
     )
-    if _FREE_URL_AUDITS_PER_MERCHANT > 0 and used >= _FREE_URL_AUDITS_PER_MERCHANT:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "code": "free_audit_limit_reached",
-                "message": (
-                    f"You've used your {_FREE_URL_AUDITS_PER_MERCHANT} free URL "
-                    "audits. Connect your store for the full per-SKU audit, or "
-                    "upgrade to keep auditing by URL."
-                ),
-                "free_audits_allowed": _FREE_URL_AUDITS_PER_MERCHANT,
-                "free_audits_used": used,
-            },
-        )
+    over_free = _FREE_URL_AUDITS_PER_MERCHANT > 0 and used >= _FREE_URL_AUDITS_PER_MERCHANT
 
     # 2. Fetch each merchant-provided product URL into a clean audit product.
     #    We audit exactly what the merchant chose — no discovery, no guessing.
@@ -1215,6 +1208,42 @@ async def run_merchant_url_audit(
                 "unresolved": unresolved,
             },
         )
+
+    # 2b. Credit metering once the free allowance is used up. Price the wedge
+    #     with the shared per-probe model (the background run fans Gemini
+    #     grounded probes, _WEDGE_MAX_RUNS per RESOLVED product) so it bills
+    #     identically to the audit cost path. Pre-flight the balance here so a
+    #     short merchant gets a clear 402 BEFORE we record/launch the run; the
+    #     actual debit happens once the run_id exists (idempotent on it).
+    metered_credits = 0
+    metered_cogs: Any = 0
+    if over_free:
+        from services.credit_consumption_service import estimate_probe_credits
+
+        wedge_probe_count = len(audit_products) * max(1, _WEDGE_MAX_RUNS)
+        metered_credits, metered_cogs = estimate_probe_credits(
+            [("gemini", wedge_probe_count, True)]
+        )
+        balance = await get_balance(merchant_id)
+        available = int(balance.get("credits") or 0)
+        paid_tier = str(balance.get("plan_tier") or "free").lower() != "free"
+        if metered_credits > available and not paid_tier:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "code": "insufficient_credits",
+                    "message": (
+                        f"You've used your {_FREE_URL_AUDITS_PER_MERCHANT} free "
+                        f"URL audits. This audit needs {metered_credits} credits "
+                        f"and you have {available}. Top up credits, or connect "
+                        "your store for the full per-SKU audit."
+                    ),
+                    "required": metered_credits,
+                    "available": available,
+                    "free_audits_allowed": _FREE_URL_AUDITS_PER_MERCHANT,
+                    "free_audits_used": used,
+                },
+            )
 
     # 3. Resolve brand context: explicit brand/website, else onboarding, else
     #    derive from the fetched product vendors / the site domain.
@@ -1299,24 +1328,78 @@ async def run_merchant_url_audit(
             _FREE_URL_AUDITS_PER_MERCHANT
             if _FREE_URL_AUDITS_PER_MERCHANT > 0 else None
         ),
-        "free_audits_used": used + 1,
+        # A credit-metered run doesn't consume a free slot.
+        "free_audits_used": used if over_free else used + 1,
         "free_audits_remaining": (
-            max(0, _FREE_URL_AUDITS_PER_MERCHANT - (used + 1))
-            if _FREE_URL_AUDITS_PER_MERCHANT > 0 else None
+            None if _FREE_URL_AUDITS_PER_MERCHANT <= 0
+            else 0 if over_free
+            else max(0, _FREE_URL_AUDITS_PER_MERCHANT - (used + 1))
         ),
+        "billing_mode": "credits" if over_free else "free",
+        "credits_charged": metered_credits if over_free else 0,
     }
 
-    # 6. Kick the audit off in the background; the client polls for the result.
-    _schedule_wedge_audit(
-        _run_wedge_audit_background(
-            run_id=run_id,
-            merchant_id=merchant_id,
-            merchant_name=merchant_name,
-            merchant_domain=merchant_domain,
-            audit_products=audit_products,
-            base_payload=base_payload,
+    # 6a. Debit credits for a metered run (idempotent on run_id; the free path
+    #     debits nothing). Done after the run is recorded so the debit shares
+    #     the run id; if scheduling the work then fails, we refund (below).
+    if over_free and metered_credits > 0:
+        from services import credit_consumption_service as _ccs
+        try:
+            await _ccs.consume(
+                merchant_id,
+                "audit",
+                idempotency_key=f"url_wedge:{run_id}",
+                credits=metered_credits,
+                usd_cogs=metered_cogs,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface as payment error
+            logger.warning(
+                "url-wedge credit debit failed merchant_id=%s run_id=%s: %s",
+                merchant_id, run_id, exc,
+            )
+            await record_audit_run_completed(
+                run_id=run_id, status="failed",
+                error_message="credit_debit_failed",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "code": "credit_debit_failed",
+                    "message": "Could not debit credits for this audit. Re-try.",
+                },
+            ) from exc
+
+    # 6b. Kick the audit off in the background; the client polls for the result.
+    try:
+        _schedule_wedge_audit(
+            _run_wedge_audit_background(
+                run_id=run_id,
+                merchant_id=merchant_id,
+                merchant_name=merchant_name,
+                merchant_domain=merchant_domain,
+                audit_products=audit_products,
+                base_payload=base_payload,
+            )
         )
-    )
+    except Exception:
+        # Couldn't even launch the work — refund the metered debit so the
+        # merchant isn't charged for an audit that never ran.
+        if over_free and metered_credits > 0:
+            from services import credit_consumption_service as _ccs
+            try:
+                await _ccs.refund(
+                    merchant_id, "audit", metered_credits,
+                    source_event_id=f"url_wedge_refund:{run_id}",
+                    usd_cogs=metered_cogs,
+                )
+            except Exception:  # noqa: BLE001 - best-effort refund
+                logger.warning(
+                    "url-wedge refund failed run_id=%s", run_id, exc_info=True,
+                )
+        await record_audit_run_completed(
+            run_id=run_id, status="failed", error_message="schedule_failed",
+        )
+        raise
 
     return {"status": "running", "run_id": run_id, "brand_report": None, **base_payload}
 
