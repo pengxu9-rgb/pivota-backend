@@ -5004,25 +5004,36 @@ async def _sku_keys_for_per_sku_mode(
     # Roll variants up to ONE representative SKU per product (box-count / size
     # variants share a product_key, and merchant rows of the same canonical PDP
     # share a content_key). Probing every variant produced N identical reports
-    # and N× the grounded LLM probes for the same recommendation. DISTINCT ON the
-    # canonical identity (content_key, falling back to product_key) collapses
-    # them; the deterministic ORDER BY picks a stable representative.
+    # and N× the grounded LLM probes for the same recommendation. Dedupe by the
+    # canonical identity (content_key, falling back to product_key) in Python —
+    # NOT via Postgres-only DISTINCT ON, since the audit test suite runs on
+    # SQLite. The deterministic ORDER BY picks a stable representative.
     rows = await _fetch_all_dicts(
         f"""
-        SELECT DISTINCT ON (COALESCE(cp.content_key, cs.product_key))
-               cs.sku_key
+        SELECT cs.sku_key, cs.product_key, cp.content_key
           FROM catalog_skus cs
           LEFT JOIN catalog_products cp
             ON cp.product_key = cs.product_key
          WHERE cs.merchant_id = :merchant_id
            AND cs.product_key IN ({placeholders})
-         ORDER BY COALESCE(cp.content_key, cs.product_key), cs.product_key, cs.sku_key
+         ORDER BY cs.product_key, cs.sku_key
         """,
         values,
     )
+    seen_identity: set = set()
     for row in rows:
-        sku_key = row.get("sku_key")
-        if sku_key and sku_key not in keys:
+        sku_key = (row.get("sku_key") or "").strip()
+        if not sku_key:
+            continue
+        identity = (
+            str(row.get("content_key") or "").strip()
+            or str(row.get("product_key") or "").strip()
+            or sku_key
+        )
+        if identity in seen_identity:
+            continue
+        seen_identity.add(identity)
+        if sku_key not in keys:
             keys.append(sku_key)
     return keys
 
