@@ -31,9 +31,11 @@ from models.catalog import (
 )
 from services.catalog_sync_service import store_catalog_quote_snapshot
 from services.claim_safety import (
+    CATEGORY_HAIRCARE,
     normalize_claims,
     required_disclaimers_for_category,
 )
+from services import haircare_attributes
 from services.skincare_attributes import (
     detect_fragrance_free,
     extract_format,
@@ -421,6 +423,35 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         _json_list(ingredient_row.get("concentration_notes_json")),
     )
 
+    # Structured haircare attributes (haircare records only): format +
+    # sulfate/silicone-free flags from text, and VERIFIED-vs-claimed vegan /
+    # cruelty-free cert status -- the niche-new, load-bearing signal (a bare
+    # lifestyle tag only "claims"; a recognized authority "verifies").
+    haircare_format = None
+    sulfate_free = False
+    silicone_free = False
+    vegan_status = None
+    cruelty_free_status = None
+    if category_kind == CATEGORY_HAIRCARE:
+        haircare_format = (
+            str(profile_payload.get("format") or "").strip() or None
+        ) or haircare_attributes.extract_format(cp_title, cp_product_type, cp_category_path)
+        sulfate_free = bool(profile_payload.get("sulfate_free")) or haircare_attributes.detect_sulfate_free(
+            cp_title, cp_product_type
+        )
+        silicone_free = bool(profile_payload.get("silicone_free")) or haircare_attributes.detect_silicone_free(
+            cp_title, cp_product_type
+        )
+        certifications = profile_payload.get("certifications")
+        vegan_status = haircare_attributes.classify_vegan(certifications, cp_title, cp_product_type)
+        if vegan_status is None and bool(profile_payload.get("vegan")):
+            vegan_status = haircare_attributes.CERT_CLAIMED
+        cruelty_free_status = haircare_attributes.classify_cruelty_free(
+            certifications, cp_title, cp_product_type
+        )
+        if cruelty_free_status is None and bool(profile_payload.get("cruelty_free")):
+            cruelty_free_status = haircare_attributes.CERT_CLAIMED
+
     payload = BeautyVerticalPayload(
         category_kind=category_kind,
         taxonomy=_json_dict(profile.get("taxonomy_json")),
@@ -433,6 +464,11 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         spf_value=spf_value,
         fragrance_free=fragrance_free,
         sensitive_safe=sensitive_safe,
+        haircare_format=haircare_format,
+        sulfate_free=sulfate_free,
+        silicone_free=silicone_free,
+        vegan_status=vegan_status,
+        cruelty_free_status=cruelty_free_status,
         routine_phase=profile.get("routine_phase"),
         benefits=[str(item or "").strip() for item in _json_list(profile.get("benefits_json")) if str(item or "").strip()],
         ingredients=[str(item or "").strip() for item in _json_list(ingredient_row.get("normalized_ingredients_json")) if str(item or "").strip()],
