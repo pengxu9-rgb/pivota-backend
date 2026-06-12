@@ -30,6 +30,12 @@ BLOCKER_CODE_TO_REASON: Dict[str, str] = {
     "entity_unresolved": "We're still matching this product to a catalog identity. This usually resolves on its own shortly.",
     "seed_audit_fail": "We found unresolved issues with this product's listing data. Review the product details and re-sync.",
     "extractor_regression": "We're temporarily unable to read products from this store reliably. No action needed — we're on it.",
+    # Agent-decision-grade gates (PR4).
+    "no_us_offer": "This product has no US-market offer. Add US pricing and availability so shopping agents can recommend it to US shoppers.",
+    "no_provenance_claim": "This product's benefit claims aren't backed by a cited source yet. Add sourced claims so shopping agents can justify recommending it.",
+    "missing_disclaimers": "This product is missing a required disclaimer (for example, the FDA supplement disclaimer). Add it so shopping agents can list it.",
+    "unreviewed_evidence": "This product's claims and evidence are still being reviewed. This usually resolves on its own shortly.",
+    "missing_category_attributes": "This product is missing key category details shoppers expect. Add the relevant attributes for its category, then re-sync.",
 }
 
 # A null index_pipeline_state row (never classified yet) is "pending", not blocked.

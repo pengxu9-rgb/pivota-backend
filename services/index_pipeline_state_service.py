@@ -18,6 +18,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from db.database import database
+from services.agent_decision_gates import (
+    agent_decision_gates_enabled,
+    evaluate_agent_decision_gates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +295,13 @@ def _classify_product(
     elif domain_has_regression:
         blocker_code = "extractor_regression"
         blocker_detail = f"domain {domain!r} has regression alert in domain_extractor_baselines"
+    elif agent_decision_gates_enabled():
+        # Additive agent-decision-grade gates (PR4), only after all PDP gates
+        # pass. Flag-gated, so default behavior is unchanged. Picked up by the
+        # serving_eligible formula below via blocker_code == "none".
+        _adg = evaluate_agent_decision_gates(row)
+        if _adg is not None:
+            blocker_code, blocker_detail = _adg
 
     # --- Serving eligibility (all criteria must pass) ---
     serving_eligible = (
@@ -445,6 +456,15 @@ _ELIGIBILITY_COLUMNS = f"""
           AND co.list_price > 0
         LIMIT 1
     )                           AS has_price,
+    (
+        SELECT TRUE
+        FROM catalog_offers co
+        WHERE co.product_key = cp.product_key
+          AND co.suppressed_at IS NULL
+          AND co.list_price > 0
+          AND co.market = 'US'
+        LIMIT 1
+    )                           AS has_us_offer,
 {_HAS_OFFER_SNAPSHOT_COLUMN},
     pgm.product_group_id
 """
@@ -613,6 +633,11 @@ SELECT
           AND co.suppressed_at IS NULL
           AND co.list_price > 0
     ) AS has_price,
+    -- SQLite (test) path: column-independent placeholder. The real US-offer
+    -- signal (catalog_offers.market) is computed on the Postgres path; the
+    -- agent-decision gate is flag-off in tests, and its logic is covered by the
+    -- agent_decision_gates unit tests.
+    0 AS has_us_offer,
     EXISTS (
         SELECT 1
         FROM external_offer_snapshots eos
