@@ -451,9 +451,13 @@ def test_citation_score_weighted_formula_and_missing_runs():
     assert breakdown["first_party_rate"]["denominator"] == 2
     assert breakdown["answer_quality_rate"]["points"] == 5
 
+    # No probes ran → score is None (no signal), NOT a measured 0. A 0 here
+    # falsely reads as "measured, brand never cited" → false INVISIBLE verdict.
     score, breakdown = compute_citation_score(_base_sku_ctx(), [])
-    assert score == 0
-    assert breakdown["first_party_rate"]["reason"] == "data unavailable"
+    assert score is None
+    assert breakdown["total"] is None
+    assert breakdown["no_probes"] is True
+    assert breakdown["first_party_rate"]["reason"] == "no probes ran for this SKU"
 
 
 def test_deepseek_verify_deweights_only_answer_quality():

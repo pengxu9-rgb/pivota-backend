@@ -48,7 +48,12 @@ _BANNED = (
 
 
 def _buckets(breakdown):
-    return [k for k in breakdown if k not in ("total", "missing_inputs")]
+    # Mirror _primary_gaps: only dict-valued entries are scoring buckets
+    # (skips "total", "missing_inputs", and markers like "no_probes").
+    return [
+        k for k, v in breakdown.items()
+        if k not in ("total", "missing_inputs") and isinstance(v, dict)
+    ]
 
 
 def _all_emitted_buckets():
