@@ -21,7 +21,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from services.claim_safety import CATEGORY_SKINCARE, required_disclaimers_for_category
+from services.claim_safety import (
+    CATEGORY_HAIRCARE,
+    CATEGORY_SKINCARE,
+    required_disclaimers_for_category,
+)
+from services.haircare_attributes import CERT_VERIFIED
 
 PASS = "pass"
 PARTIAL = "partial"
@@ -72,13 +77,27 @@ def _score_find(rec: Dict[str, Any]) -> DimensionScore:
     ck = rec.get("category_kind")
     has_concern = bool(rec.get("concerns"))
     has_actives = bool(rec.get("active_ingredients"))
-    has_format = bool(rec.get("skincare_format"))
     if ck == CATEGORY_SKINCARE:
         checks = [
             ("category_kind", bool(ck), True),
             ("skin concern", has_concern, True),
             ("key actives", has_actives, True),
-            ("format", has_format, False),
+            ("format", bool(rec.get("skincare_format")), False),
+        ]
+    elif ck == CATEGORY_HAIRCARE:
+        # A VERIFIED vegan/cruelty-free cert is a Pivota-only fit signal: native
+        # can copy a bare "vegan" word from a title but cannot verify it against
+        # a certifying authority, so only "verified" counts here.
+        verified_cert = (
+            rec.get("vegan_status") == CERT_VERIFIED
+            or rec.get("cruelty_free_status") == CERT_VERIFIED
+        )
+        checks = [
+            ("category_kind", bool(ck), True),
+            ("hair concern", has_concern, True),
+            ("key ingredients", has_actives, True),
+            ("format", bool(rec.get("haircare_format")), False),
+            ("verified vegan/cruelty-free cert", verified_cert, False),
         ]
     else:
         checks = [
@@ -207,11 +226,16 @@ def native_baseline_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "category_kind": record.get("category_kind"),
         # format is title-derivable, so native can have it; structured fit is not.
         "skincare_format": record.get("skincare_format"),
+        "haircare_format": record.get("haircare_format"),
         "concerns": [],
         "active_ingredients": [],
         "evidence_claims": [],
         "required_disclaimers": [],
         "alternatives": [],
+        # Native can copy a bare "vegan" word from a title but cannot VERIFY a
+        # cert against a certifying authority -> no verified cert trust.
+        "vegan_status": None,
+        "cruelty_free_status": None,
         "best_us_offer": native_offer,
     }
 
@@ -260,6 +284,26 @@ def compare_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def compare_records_by_category(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-category Pivota-vs-native comparison: bucket records by category_kind
+    and summarize each, plus an overall roll-up.
+
+    This is the per-category eval the cohort needs -- the 4-brand/3-category
+    cohort (skincare / haircare / supplement) is heterogeneous, so a single flat
+    rate hides where each category module's differentiated data pays off. Each
+    bucket reuses compare_records, so the per-dimension advantage is reported
+    category by category.
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for record in records:
+        ck = record.get("category_kind") or "uncategorized"
+        buckets.setdefault(ck, []).append(record)
+    return {
+        "overall": compare_records(records),
+        "by_category": {ck: compare_records(rows) for ck, rows in sorted(buckets.items())},
+    }
+
+
 def eval_record_from_payload(
     beauty_payload: Optional[Dict[str, Any]],
     best_us_offer: Optional[Dict[str, Any]] = None,
@@ -275,6 +319,12 @@ def eval_record_from_payload(
         "concerns": payload.get("concerns") or [],
         "active_ingredients": payload.get("active_ingredients") or [],
         "skincare_format": payload.get("skincare_format"),
+        # Haircare attributes (present only on haircare records).
+        "haircare_format": payload.get("haircare_format"),
+        "sulfate_free": bool(payload.get("sulfate_free")),
+        "silicone_free": bool(payload.get("silicone_free")),
+        "vegan_status": payload.get("vegan_status"),
+        "cruelty_free_status": payload.get("cruelty_free_status"),
         "evidence_claims": claims or [],
         "required_disclaimers": payload.get("required_disclaimers") or [],
         "alternatives": alternatives or [],

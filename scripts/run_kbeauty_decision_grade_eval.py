@@ -59,12 +59,29 @@ def _per_sku_row(product_key: str, comparison: Dict[str, Any]) -> Dict[str, Any]
     native = comparison["native"]
     return {
         "product_key": product_key,
+        "category_kind": pivota.category_kind or "uncategorized",
         "pivota_overall": pivota.overall,
         "native_overall": native.overall,
         "overall_advantage": comparison["overall_advantage"],
         "pivota_decision_grade": pivota.is_decision_grade,
         "pivota_dimensions": {d.dimension: d.status for d in pivota.dimensions},
         "gaps": {d.dimension: d.gaps for d in pivota.dimensions if d.gaps},
+    }
+
+
+def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pivota-vs-native roll-up over a set of scored per-SKU rows."""
+    n = len(rows)
+    return {
+        "n": n,
+        "pivota_decision_grade_rate": (
+            round(sum(1 for r in rows if r["pivota_decision_grade"]) / n, 2) if n else 0.0
+        ),
+        "pivota_overall_avg": round(sum(r["pivota_overall"] for r in rows) / n, 2) if n else 0.0,
+        "native_overall_avg": round(sum(r["native_overall"] for r in rows) / n, 2) if n else 0.0,
+        "avg_overall_advantage": (
+            round(sum(r["overall_advantage"] for r in rows) / n, 2) if n else 0.0
+        ),
     }
 
 
@@ -83,21 +100,14 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
         await _disconnect_if_needed(db, was_connected)
 
     scored = [r for r in per_sku if "error" not in r]
-    n = len(scored)
-    dims = ["find", "justify", "compare", "trust", "buy"]
-    aggregate = {
-        "n": n,
-        "errors": len(per_sku) - n,
-        "pivota_decision_grade_rate": (
-            round(sum(1 for r in scored if r["pivota_decision_grade"]) / n, 2) if n else 0.0
-        ),
-        "pivota_overall_avg": round(sum(r["pivota_overall"] for r in scored) / n, 2) if n else 0.0,
-        "native_overall_avg": round(sum(r["native_overall"] for r in scored) / n, 2) if n else 0.0,
-        "avg_overall_advantage": (
-            round(sum(r["overall_advantage"] for r in scored) / n, 2) if n else 0.0
-        ),
+    aggregate = {**_aggregate(scored), "errors": len(per_sku) - len(scored)}
+    # Per-category breakdown: the cohort spans skincare / haircare / supplement,
+    # so a flat rate hides where each category module's data pays off.
+    categories = sorted({r["category_kind"] for r in scored})
+    by_category = {
+        ck: _aggregate([r for r in scored if r["category_kind"] == ck]) for ck in categories
     }
-    return {"aggregate": aggregate, "per_sku": per_sku}
+    return {"aggregate": aggregate, "by_category": by_category, "per_sku": per_sku}
 
 
 def _parse_args() -> argparse.Namespace:
