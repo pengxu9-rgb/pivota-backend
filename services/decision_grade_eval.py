@@ -176,3 +176,107 @@ def score_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "by_dimension_avg": by_dimension,
         "scores": scores,
     }
+
+
+# ---------------------------------------------------------------------------
+# Native baseline + Pivota-vs-native comparison
+# ---------------------------------------------------------------------------
+# The "native" baseline is what a frontier model surfaces from commodity catalog
+# retrieval WITHOUT Pivota's decision substrate: a catalog card + a retailer
+# link. It can read a format from the title, but it has no VERIFIED structured
+# fit (skin concern / key actives), no cited provenance, no required disclaimers,
+# no structured alternatives, and no first-party/authenticity trust. Projecting a
+# Pivota record down to that baseline and scoring both on the same rubric makes
+# the differentiated-data advantage measurable per SKU.
+
+_DIM_NAMES = ("find", "justify", "compare", "trust", "buy")
+
+
+def native_baseline_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a Pivota record onto what native catalog retrieval would have."""
+    offer = record.get("best_us_offer") or {}
+    native_offer: Optional[Dict[str, Any]] = None
+    if offer:
+        # A retailer link, stripped of the verified first-party/authenticity trust.
+        native_offer = {
+            k: v
+            for k, v in offer.items()
+            if k not in ("is_first_party", "authenticity", "official_source")
+        }
+    return {
+        "category_kind": record.get("category_kind"),
+        # format is title-derivable, so native can have it; structured fit is not.
+        "skincare_format": record.get("skincare_format"),
+        "concerns": [],
+        "active_ingredients": [],
+        "evidence_claims": [],
+        "required_disclaimers": [],
+        "alternatives": [],
+        "best_us_offer": native_offer,
+    }
+
+
+def compare_decision_grade(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Score a record both as Pivota serves it and as native retrieval would,
+    and report the per-dimension advantage."""
+    pivota = score_decision_grade(record)
+    native = score_decision_grade(native_baseline_record(record))
+    deltas = {
+        name: round(
+            (pivota.by_name(name).score if pivota.by_name(name) else 0.0)
+            - (native.by_name(name).score if native.by_name(name) else 0.0),
+            2,
+        )
+        for name in _DIM_NAMES
+    }
+    return {
+        "pivota": pivota,
+        "native": native,
+        "deltas": deltas,
+        "overall_advantage": round(pivota.overall - native.overall, 2),
+    }
+
+
+def compare_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Batch Pivota-vs-native comparison summary for the eval report."""
+    comparisons = [compare_decision_grade(r) for r in records]
+    n = len(comparisons)
+    if not n:
+        return {"n": 0}
+    pivota_grade = sum(1 for c in comparisons if c["pivota"].is_decision_grade)
+    native_grade = sum(1 for c in comparisons if c["native"].is_decision_grade)
+    delta_by_dim = {
+        name: round(sum(c["deltas"][name] for c in comparisons) / n, 2)
+        for name in _DIM_NAMES
+    }
+    return {
+        "n": n,
+        "pivota_decision_grade_rate": round(pivota_grade / n, 2),
+        "native_decision_grade_rate": round(native_grade / n, 2),
+        "pivota_overall_avg": round(sum(c["pivota"].overall for c in comparisons) / n, 2),
+        "native_overall_avg": round(sum(c["native"].overall for c in comparisons) / n, 2),
+        "advantage_by_dimension": delta_by_dim,
+        "comparisons": comparisons,
+    }
+
+
+def eval_record_from_payload(
+    beauty_payload: Optional[Dict[str, Any]],
+    best_us_offer: Optional[Dict[str, Any]] = None,
+    alternatives: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """Map a live assembled BeautyVerticalPayload (+ resolved offer +
+    alternatives) into the normalized eval record the scorer expects."""
+    payload = beauty_payload or {}
+    evidence = payload.get("evidence_profile") or {}
+    claims = evidence.get("claims") if isinstance(evidence, dict) else []
+    return {
+        "category_kind": payload.get("category_kind"),
+        "concerns": payload.get("concerns") or [],
+        "active_ingredients": payload.get("active_ingredients") or [],
+        "skincare_format": payload.get("skincare_format"),
+        "evidence_claims": claims or [],
+        "required_disclaimers": payload.get("required_disclaimers") or [],
+        "alternatives": alternatives or [],
+        "best_us_offer": best_us_offer,
+    }
