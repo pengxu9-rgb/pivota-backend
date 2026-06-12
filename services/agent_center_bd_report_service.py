@@ -3333,8 +3333,11 @@ def compute_citation_score(
     sku_ctx: Dict[str, Any],
     per_sku_probe_runs: Any,
     verify_outputs: Optional[Any] = None,
-) -> Tuple[int, Dict[str, Any]]:
-    """Spec A.4 citation score from Brief 1 per_sku_audit raw_runs."""
+) -> Tuple[Optional[int], Dict[str, Any]]:
+    """Spec A.4 citation score from Brief 1 per_sku_audit raw_runs.
+
+    Returns score None (not 0) when no probes ran — "no signal" vs a measured 0.
+    """
     product = _get_product(sku_ctx or {})
     sku = _get_sku(sku_ctx or {})
     runs = _flatten_probe_runs(per_sku_probe_runs)
@@ -3342,6 +3345,11 @@ def compute_citation_score(
     missing: List[str] = []
     denominator = len(runs)
     if denominator <= 0:
+        # No probes ran for this SKU → we measured NOTHING. Return score None
+        # (not 0) so it reads as "no citation signal", not a real measured zero.
+        # A measured 0 (probes ran, brand never cited) is the genuine INVISIBLE
+        # case and is handled below with denominator > 0. Conflating the two made
+        # an empty run emit a false INVISIBLE brand verdict.
         for name, max_points in (
             ("first_party_rate", 45),
             ("sku_mention_rate", 25),
@@ -3350,11 +3358,14 @@ def compute_citation_score(
         ):
             _add_bucket(
                 breakdown, missing, name, 0, max_points,
-                "data unavailable",
+                "no probes ran for this SKU",
                 missing=["per_sku_audit.raw_runs"],
                 extra={"numerator": 0, "denominator": 0, "rate": 0.0},
             )
-        return _finish_breakdown(breakdown, missing)
+        _total, finished = _finish_breakdown(breakdown, missing)
+        finished["total"] = None
+        finished["no_probes"] = True
+        return None, finished
 
     canonical_url = product.get("canonical_url") or sku_ctx.get("canonical_url")
     pivota_url = product.get("pivota_canonical_url") or sku_ctx.get("pivota_canonical_url")
@@ -3711,7 +3722,14 @@ async def _fetch_one_dict(query: str, values: Dict[str, Any]) -> Optional[Dict[s
     from db.database import database
     try:
         row = await database.fetch_one(query, values)
-    except Exception:
+    except Exception as exc:
+        # Degraded-read fallback (an audit shouldn't crash on one bad read), but
+        # NOT silent — a swallowed schema error here masked the index_pipeline_state
+        # loader bug across every v3 audit. Log so the next one is caught fast.
+        logger.warning(
+            "audit ctx fetch_one failed (returning None): %s | query=%s",
+            exc, " ".join(query.split())[:160],
+        )
         return None
     return _row_dict(row)
 
@@ -3720,7 +3738,11 @@ async def _fetch_all_dicts(query: str, values: Dict[str, Any]) -> List[Dict[str,
     from db.database import database
     try:
         rows = await database.fetch_all(query, values)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "audit ctx fetch_all failed (returning []): %s | query=%s",
+            exc, " ".join(query.split())[:160],
+        )
         return []
     return [d for d in (_row_dict(row) for row in rows or []) if d is not None]
 
@@ -3790,15 +3812,32 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
         {"merchant_id": merchant_id, "platform_product_id": source_product_id},
     )
     group_id = product_group_members[0].get("product_group_id") if product_group_members else None
+    # index_pipeline_state is keyed by content_key (+ carries pivota_signature_id
+    # and product_group_id) — it has NO product_key column. The previous query
+    # referenced product_key, so it raised UndefinedColumnError on every call and
+    # _fetch_one_dict swallowed it → every v3 audit scored with EMPTY index state
+    # (serving_eligibility fell back to pdp_lifecycle_stage). Join on the columns
+    # that actually exist, preferring the exact content_key match.
     index_state = await _fetch_one_dict(
         """
         SELECT *
           FROM index_pipeline_state
-         WHERE product_key = :product_key
+         WHERE content_key = :content_key
+            OR pivota_signature_id = :pivota_signature_id
             OR (merchant_id = :merchant_id AND product_group_id = :product_group_id)
+         ORDER BY CASE
+                    WHEN content_key = :content_key THEN 0
+                    WHEN pivota_signature_id = :pivota_signature_id THEN 1
+                    ELSE 2
+                  END
          LIMIT 1
         """,
-        {"product_key": product_key, "merchant_id": merchant_id, "product_group_id": group_id},
+        {
+            "content_key": product.get("content_key"),
+            "pivota_signature_id": product.get("pivota_signature_id"),
+            "merchant_id": merchant_id,
+            "product_group_id": group_id,
+        },
     ) or {}
     enrichment = await _fetch_one_dict(
         """
