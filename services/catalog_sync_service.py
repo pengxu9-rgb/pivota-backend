@@ -1214,6 +1214,12 @@ async def ingest_standard_products(
                     "readiness_tier": readiness_tier,
                     "offer_mode": offer_mode,
                     "channel": "default",
+                    # Internal merchant storefront = first-party, US-market by
+                    # default (mig 149). offer_type/why_buy_direct stay unset
+                    # here -- brand_direct is only assigned to verified brand
+                    # merchants (see mig 149 backfill / offer_classification).
+                    "is_first_party": True,
+                    "market": "US",
                     "availability": availability,
                     "inventory_quantity": inventory_quantity,
                     "currency": product.currency,

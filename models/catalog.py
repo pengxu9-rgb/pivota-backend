@@ -184,6 +184,14 @@ class OfferNode(BaseModel):
     source_system: Optional[str] = None
     availability: Optional[str] = None
     inventory_quantity: Optional[int] = None
+    # Agent-decision-grade offer fields (data contract, Offers/buy-box layer):
+    # offer_type is brand_direct | retailer | None ("unknown"), market scopes the
+    # offer, is_first_party flags the merchant's own storefront, and
+    # why_buy_direct carries an honest rationale (authored later, NULL until then).
+    offer_type: Optional[str] = None
+    market: str = "US"
+    is_first_party: bool = False
+    why_buy_direct: Optional[str] = None
     pricing: PivotPricing = Field(default_factory=PivotPricing)
     incentives: List[IncentiveNode] = Field(default_factory=list)
     payment_offer_evidence: Dict[str, Any] = Field(default_factory=dict)
@@ -256,3 +264,6 @@ class PivotOffersResolveResponse(BaseModel):
     sku_key: Optional[str] = None
     offers: List[OfferNode] = Field(default_factory=list)
     offers_count: int = 0
+    # The single resolved best US-buyable offer (buy-box), or None when no
+    # offer qualifies. See services.offer_classification.select_best_us_offer.
+    best_us_offer: Optional[OfferNode] = None

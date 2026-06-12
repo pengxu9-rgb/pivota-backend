@@ -28,6 +28,12 @@ from models.catalog import (
     SkuNode,
 )
 from services.catalog_sync_service import store_catalog_quote_snapshot
+from services.offer_classification import (
+    OFFER_TYPE_RETAILER,
+    classify_offer_type,
+    is_first_party_track,
+    select_best_us_offer,
+)
 from services.pdp_category_classifier import category_path_prefix_for_query
 from services.beauty_external_ranking import (
     BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION,
@@ -399,15 +405,30 @@ def _build_canonical_offer_node(
         payment_offer_evidence=payment_offer_evidence or empty_payment_offer_evidence(),
         max_summary_badges=4,
     )
+    catalog_track = str(
+        row.get("offer_catalog_track") or row.get("catalog_track") or "internal_merchant"
+    )
+    # Stored values win; fall back to the deterministic track-based derivation so
+    # rows written before mig 149's backfill still classify correctly.
+    is_first_party = row.get("offer_is_first_party")
+    if is_first_party is None:
+        is_first_party = is_first_party_track(catalog_track)
+    offer_type = row.get("offer_offer_type")
+    if offer_type is None and catalog_track == "external_referral":
+        offer_type = classify_offer_type(catalog_track)
     return OfferNode(
         offer_id=str(row.get("offer_id") or ""),
-        catalog_track=str(row.get("offer_catalog_track") or row.get("catalog_track") or "internal_merchant"),
+        catalog_track=catalog_track,
         truth_tier=str(row.get("offer_truth_tier") or row.get("truth_tier") or "primary"),
         readiness_tier=str(row.get("offer_readiness_tier") or row.get("readiness_tier") or "commerce_ready"),
         offer_mode=str(row.get("offer_mode") or "merchant_checkout"),
         source_system=row.get("offer_source_system") or row.get("source_system"),
         availability=row.get("availability"),
         inventory_quantity=row.get("inventory_quantity"),
+        offer_type=offer_type,
+        market=str(row.get("offer_market") or "US"),
+        is_first_party=bool(is_first_party),
+        why_buy_direct=row.get("offer_why_buy_direct"),
         pricing=PivotPricing(
             currency=row.get("currency"),
             list_price=_to_decimal(row.get("list_price")),
@@ -668,6 +689,10 @@ async def _fetch_canonical_search_rows(
             o.estimated_best_price,
             o.price_confidence,
             o.source_system AS offer_source_system,
+            o.offer_type AS offer_offer_type,
+            o.market AS offer_market,
+            o.is_first_party AS offer_is_first_party,
+            o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload,
             c.rank_score + CASE WHEN o.catalog_track = 'internal_merchant' THEN 10 ELSE 0 END AS rank_score
         FROM candidate_skus c
@@ -726,6 +751,10 @@ async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, 
             o.estimated_best_price,
             o.price_confidence,
             o.source_system AS offer_source_system,
+            o.offer_type AS offer_offer_type,
+            o.market AS offer_market,
+            o.is_first_party AS offer_is_first_party,
+            o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload
         FROM catalog_products p
         JOIN catalog_skus s ON s.product_key = p.product_key
@@ -785,6 +814,10 @@ async def _fetch_canonical_rows_for_sku(sku_key: str) -> List[Dict[str, Any]]:
             o.estimated_best_price,
             o.price_confidence,
             o.source_system AS offer_source_system,
+            o.offer_type AS offer_offer_type,
+            o.market AS offer_market,
+            o.is_first_party AS offer_is_first_party,
+            o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload
         FROM catalog_skus s
         JOIN catalog_products p ON p.product_key = s.product_key
@@ -1012,6 +1045,9 @@ def _build_external_item_from_candidate(
                 source_system="external_product_seeds",
                 availability=candidate.availability or row.get("availability"),
                 inventory_quantity=None,
+                offer_type=OFFER_TYPE_RETAILER,
+                market=str(seed_data.get("market") or row.get("market") or "US"),
+                is_first_party=False,
                 pricing=pricing,
                 incentives=[],
             )
@@ -1285,6 +1321,7 @@ async def resolve_pivot_offers(request: PivotOffersResolveRequest) -> PivotOffer
         sku_key=resolved_sku_key,
         offers=flattened_offers,
         offers_count=len(flattened_offers),
+        best_us_offer=select_best_us_offer(flattened_offers),
     )
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
     if elapsed_ms >= 3000:
