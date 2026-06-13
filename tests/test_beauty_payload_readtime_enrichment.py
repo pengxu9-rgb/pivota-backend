@@ -106,3 +106,26 @@ async def test_uncategorized_product_derives_nothing(monkeypatch) -> None:
     assert payload["category_kind"] is None
     assert payload["concerns"] == []
     assert payload["active_ingredients"] == []
+
+
+async def test_supplement_category_kind_surfaces_without_a_profile_row(monkeypatch) -> None:
+    """The Ownist supplement repro: supplements have no FIT-concern vocabulary, so
+    enrichment never writes a beauty_product_profiles row for them. category_kind
+    must still surface from catalog_products so the decision-grade `find` dimension
+    passes -- before the catalog_products-anchored fix it came back
+    'uncategorized'/find=fail. Concerns stay empty (the supplement concern vocab is
+    intentionally empty pending the supplement module -- we never fabricate one)."""
+    row = _profile_row_cp_only()
+    row["category_kind"] = "supplement"
+    row["cp_title"] = "Triple Collagen Orange"
+    row["cp_product_type"] = "Supplement"
+    row["cp_category_path"] = None
+    row["cp_description"] = "Marine collagen peptides for skin elasticity."
+    _install_db(monkeypatch, profile_row=row)
+    payload = await module._fetch_beauty_vertical_payload(
+        "prod::external_seed::external_seed::ownist-triple-collagen-orange", None
+    )
+    # Non-empty payload: category_kind surfaces even with no bpp row.
+    assert payload["category_kind"] == "supplement"
+    # No supplement concern vocabulary -> no concerns, and we never guess.
+    assert payload["concerns"] == []
