@@ -21,6 +21,8 @@ Then recompute_serving_eligibility(content_key, reason="beauty_enrichment").
 from __future__ import annotations
 
 import json
+import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from db.database import database
@@ -29,12 +31,31 @@ from services.beauty_field_authoring import (
     SOURCE_MERCHANT_AUTHORED,
     SOURCE_MERCHANT_PAYLOAD,
 )
+from services.category_kind import CATEGORY_KINDS
 from services.index_pipeline_state_service import recompute_serving_eligibility
+
+logger = logging.getLogger(__name__)
 
 # Marks an active list written by deterministic enrichment (vs merchant-owned).
 SOURCE_AUTO_ENRICHMENT = "auto_enrichment_v1"
 
+# Flag gating the AUTOMATIC on-sync enrichment trigger. Off by default -- the
+# pipeline stays dark until deliberately enabled (mirrors the kbeauty gate flags).
+# The explicit backfill script runs regardless of this flag.
+AUTO_ENRICHMENT_FLAG = "ENABLE_KBEAUTY_AUTO_ENRICHMENT"
+
 _MERCHANT_OWNED = {SOURCE_MERCHANT_PAYLOAD, SOURCE_MERCHANT_AUTHORED}
+
+
+def auto_enrichment_enabled() -> bool:
+    """True when the on-sync auto-enrichment trigger is enabled (default off)."""
+    return os.getenv(AUTO_ENRICHMENT_FLAG, "false").strip().lower() == "true"
+
+
+def _catalog_product_key(merchant_id: str, platform: str, platform_product_id: str) -> str:
+    """The canonical catalog product_key (matches services.reviews_service /
+    fashion_field_authoring / beauty_field_authoring)."""
+    return f"prod::{merchant_id}::{platform}::{platform_product_id}"
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -73,6 +94,16 @@ async def enrich_and_persist_product(
     if cp is None:
         return {"product_key": product_key, "status": "not_found"}
     cp = dict(cp)
+
+    # Cheap short-circuit: only contract categories enrich. This keeps the
+    # on-sync trigger near-free for the non-beauty products a merchant also syncs
+    # (no further reads, no derivation).
+    if cp.get("category_kind") not in CATEGORY_KINDS:
+        return {
+            "product_key": product_key,
+            "category_kind": cp.get("category_kind"),
+            "status": "skipped_non_beauty",
+        }
 
     sku_rows = [
         dict(r)
@@ -186,3 +217,28 @@ async def enrich_and_persist_product(
         },
         "serving_eligible": recomputed,
     }
+
+
+async def maybe_enrich_synced_product(
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+    *,
+    db: Any = database,
+) -> Optional[Dict[str, Any]]:
+    """On-sync auto-enrichment hook: when the flag is enabled, enrich the just-
+    synced product. Best-effort -- swallows its own errors so it can never break
+    the sync/quality path. Returns None when the flag is off or on failure.
+
+    This is the "instant agent-ready on onboard" wiring: a merchant sync writes
+    catalog_products + beauty_sku_ingredients, this fills the derived structure
+    (fill-empty, ownership-safe) right after, and serving eligibility recomputes.
+    """
+    if not auto_enrichment_enabled():
+        return None
+    product_key = _catalog_product_key(merchant_id, platform, platform_product_id)
+    try:
+        return await enrich_and_persist_product(product_key, db=db)
+    except Exception:  # noqa: BLE001 -- never let enrichment break the caller
+        logger.exception("auto-enrichment failed for %s", product_key)
+        return None
