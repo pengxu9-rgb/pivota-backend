@@ -105,12 +105,21 @@ def test_never_overwrites_existing_or_merchant_owned(monkeypatch):
              "active_ingredients_json": [],  # empty BUT merchant-owned -> hands off
              "concentration_notes_json": None, "source_system": "merchant_authored"},
         ],
-        profile={"concerns_json": ["dryness"]},  # existing concerns -> skip
+        # existing concerns + authored evidence -> both skipped (never overwrite).
+        profile={
+            "concerns_json": ["dryness"],
+            "evidence_profile": {
+                "claims": [{"claim_text": "Authored", "source_ref": "x",
+                            "substantiation_status": "substantiated"}],
+                "review_state": "reviewed",
+            },
+        },
     )
     res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
 
     assert res["written"]["concerns"] is False
     assert res["written"]["actives_skus"] == []
+    assert res["written"]["evidence_claims"] is False
     assert res["serving_eligible"] is None  # nothing written -> no recompute
     assert db.executed == []
     assert calls == []
@@ -211,3 +220,90 @@ def test_backfill_drive_aggregates(monkeypatch):
     assert report["concerns_filled"] == 1
     assert report["actives_filled"] == 1
     assert report["serving_eligible_after"] == 1
+
+
+# --- (B) INCI -> substantiated claims for the `justify` dimension --------------
+
+def test_inci_actives_emit_substantiated_claims_into_evidence(monkeypatch):
+    import json as _json
+    calls = []
+    _patch_recompute(monkeypatch, calls)
+    db = FakeDB(
+        cp=_CP,
+        skus=[{"sku_key": "s1",
+               "raw_inci": "Water, Niacinamide, Centella Asiatica Extract",
+               "active_ingredients_json": [], "concentration_notes_json": None,
+               "source_system": "shopify_products_sync"}],
+        profile={"concerns_json": [], "evidence_profile": None},
+    )
+    res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
+
+    assert any("Niacinamide" in c for c in res["derived"]["substantiated_claims"])
+    assert res["written"]["evidence_claims"] is True
+    ev_writes = [p for q, p in db.executed if "evidence_profile" in q]
+    assert ev_writes, "expected an evidence_profile write"
+    assert ev_writes[0]["mid"] == "merch_test"  # merchant-scoped row
+    payload = _json.loads(ev_writes[0]["evidence"])
+    assert payload["claims"][0]["substantiation_status"] == "substantiated"
+    assert payload["claims"][0]["source_ref"] == "INCI"
+
+
+def test_text_source_actives_do_not_earn_substantiated_claims(monkeypatch):
+    """No INCI -> actives from text -> NOT substantiated -> no evidence write."""
+    calls = []
+    _patch_recompute(monkeypatch, calls)
+    db = FakeDB(
+        cp=_CP,  # description mentions niacinamide
+        skus=[{"sku_key": "s1", "raw_inci": None,
+               "active_ingredients_json": [], "concentration_notes_json": None,
+               "source_system": "shopify_products_sync"}],
+        profile={"concerns_json": [], "evidence_profile": None},
+    )
+    res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
+
+    assert res["derived"]["active_source"] == "text"
+    assert res["derived"]["substantiated_claims"] == []
+    assert res["written"]["evidence_claims"] is False
+    assert not any("evidence_profile" in q for q, _ in db.executed)
+
+
+def test_evidence_skipped_when_merchant_id_missing(monkeypatch):
+    calls = []
+    _patch_recompute(monkeypatch, calls)
+    db = FakeDB(
+        cp={**_CP, "merchant_id": None},
+        skus=[{"sku_key": "s1", "raw_inci": "Water, Niacinamide",
+               "active_ingredients_json": [], "concentration_notes_json": None,
+               "source_system": "shopify_products_sync"}],
+        profile={"concerns_json": [], "evidence_profile": None},
+    )
+    res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
+    assert res["written"]["evidence_claims"] is False
+    assert not any("evidence_profile" in q for q, _ in db.executed)
+
+
+def test_dry_run_reports_evidence_without_writing(monkeypatch):
+    calls = []
+    _patch_recompute(monkeypatch, calls)
+    db = FakeDB(
+        cp=_CP,
+        skus=[{"sku_key": "s1", "raw_inci": "Water, Niacinamide",
+               "active_ingredients_json": [], "concentration_notes_json": None,
+               "source_system": "shopify_products_sync"}],
+        profile={"concerns_json": [], "evidence_profile": None},
+    )
+    res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db, dry_run=True))
+    assert res["written"]["evidence_claims"] is True
+    assert db.executed == []  # nothing written under dry_run
+
+
+def test_inci_claims_helper_is_strict_on_source():
+    actives = [
+        {"label": "Retinol", "source": "inci"},
+        {"label": "Niacinamide", "source": "text"},  # excluded (not verified)
+        {"label": "Retinol", "source": "inci"},  # dup -> deduped
+        {"label": "", "source": "inci"},  # empty -> skipped
+    ]
+    claims = persist._inci_substantiated_claims(actives)
+    assert [c["claim_text"] for c in claims] == ["Contains Retinol"]
+    assert claims[0]["substantiation_status"] == "substantiated"
