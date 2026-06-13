@@ -59,6 +59,39 @@ def test_drive_aggregates_pivota_vs_native(monkeypatch):
     assert report["per_sku"][0]["pivota_decision_grade"] is True
 
 
+def test_drive_breaks_down_by_category(monkeypatch):
+    async def _payload_by_key(product_key, sku_key):
+        if product_key == "hair1":
+            return {
+                "category_kind": "haircare",
+                "concerns": ["color-treated"],
+                "active_ingredients": [{"label": "Rice Protein"}],
+                "haircare_format": "shampoo",
+                "vegan_status": "verified",
+                "cruelty_free_status": "verified",
+                "evidence_profile": {
+                    "claims": [
+                        {"claim_text": "strengthens", "source_ref": "s1", "substantiation_status": "substantiated"}
+                    ]
+                },
+                "required_disclaimers": [],
+            }
+        return await _fake_payload(product_key, sku_key)
+
+    monkeypatch.setattr(runner, "_fetch_beauty_vertical_payload", _payload_by_key)
+    monkeypatch.setattr(runner, "resolve_pivot_offers", _fake_offers)
+    fake_db = types.SimpleNamespace(is_connected=True)
+    args = types.SimpleNamespace(product_keys=["pk1", "hair1"])
+
+    report = asyncio.run(runner._drive(args, db=fake_db))
+
+    assert set(report["by_category"]) == {"skincare", "haircare"}
+    assert report["by_category"]["skincare"]["n"] == 1
+    assert report["by_category"]["haircare"]["n"] == 1
+    assert report["by_category"]["haircare"]["avg_overall_advantage"] > 0
+    assert report["aggregate"]["n"] == 2
+
+
 def test_drive_captures_per_sku_errors(monkeypatch):
     async def _boom(product_key, sku_key):
         raise RuntimeError("no such product")
