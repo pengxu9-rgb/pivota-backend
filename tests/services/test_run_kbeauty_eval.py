@@ -46,8 +46,13 @@ async def _fake_resolve(product_key, *, db=None):
     return f"{product_key}::sku"
 
 
+async def _fake_alternatives(product_key, category_kind, *, db=None):
+    return []
+
+
 def test_drive_aggregates_pivota_vs_native(monkeypatch):
     monkeypatch.setattr(runner, "_resolve_representative_sku_key", _fake_resolve)
+    monkeypatch.setattr(runner, "_resolve_alternatives", _fake_alternatives)
     monkeypatch.setattr(runner, "_fetch_beauty_vertical_payload", _fake_payload)
     monkeypatch.setattr(runner, "resolve_pivot_offers", _fake_offers)
     fake_db = types.SimpleNamespace(is_connected=True)
@@ -84,6 +89,7 @@ def test_drive_breaks_down_by_category(monkeypatch):
         return await _fake_payload(product_key, sku_key)
 
     monkeypatch.setattr(runner, "_resolve_representative_sku_key", _fake_resolve)
+    monkeypatch.setattr(runner, "_resolve_alternatives", _fake_alternatives)
     monkeypatch.setattr(runner, "_fetch_beauty_vertical_payload", _payload_by_key)
     monkeypatch.setattr(runner, "resolve_pivot_offers", _fake_offers)
     fake_db = types.SimpleNamespace(is_connected=True)
@@ -103,6 +109,7 @@ def test_drive_captures_per_sku_errors(monkeypatch):
         raise RuntimeError("no such product")
 
     monkeypatch.setattr(runner, "_resolve_representative_sku_key", _fake_resolve)
+    monkeypatch.setattr(runner, "_resolve_alternatives", _fake_alternatives)
     monkeypatch.setattr(runner, "_fetch_beauty_vertical_payload", _boom)
     monkeypatch.setattr(runner, "resolve_pivot_offers", _fake_offers)
     fake_db = types.SimpleNamespace(is_connected=True)
@@ -153,9 +160,33 @@ def test_assemble_record_passes_resolved_sku_key_into_payload(monkeypatch):
         }
 
     monkeypatch.setattr(runner, "_resolve_representative_sku_key", _fake_resolve)
+    monkeypatch.setattr(runner, "_resolve_alternatives", _fake_alternatives)
     monkeypatch.setattr(runner, "_fetch_beauty_vertical_payload", _capturing_payload)
     monkeypatch.setattr(runner, "resolve_pivot_offers", _fake_offers)
 
     rec = asyncio.run(runner._assemble_record("pk1", db=types.SimpleNamespace()))
     assert captured["sku_key"] == "pk1::sku"  # resolved, not None
     assert rec["active_ingredients"] == [{"label": "Niacinamide"}]
+
+
+def test_resolve_alternatives_same_category_different_brand():
+    class _DB:
+        def __init__(self, rows):
+            self._rows = rows
+            self.params = None
+
+        async def fetch_all(self, query, params):
+            self.params = params
+            assert "beauty_sku_ingredients" in query
+            assert "category_kind" in query
+            return self._rows
+
+    db = _DB([{"product_key": "pk2", "title": "Other Collagen", "brand": "BrandB"}])
+    alts = asyncio.run(runner._resolve_alternatives("pk1", "supplement", db=db))
+    assert alts == [{"product_key": "pk2", "title": "Other Collagen", "brand": "BrandB"}]
+    assert db.params == {"category_kind": "supplement", "product_key": "pk1"}
+
+    # No category_kind -> empty, and no query is issued.
+    no_cat_db = _DB([{"product_key": "pkX"}])
+    assert asyncio.run(runner._resolve_alternatives("pk1", None, db=no_cat_db)) == []
+    assert no_cat_db.params is None

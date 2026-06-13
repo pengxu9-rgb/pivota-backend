@@ -70,12 +70,46 @@ async def _resolve_representative_sku_key(product_key: str, *, db: Any = databas
     return str(sku_key) if sku_key else None
 
 
+async def _resolve_alternatives(
+    product_key: str, category_kind: Optional[str], *, db: Any = database
+) -> List[Dict[str, Any]]:
+    """Same-category, DIFFERENT-BRAND products that carry structured actives --
+    the real cross-brand comparison set.
+
+    The `compare` dimension is supply-gated: it can only unlock once a category
+    holds more than one brand whose ingredient structure is comparable. We
+    require the alternative to itself carry a non-empty active_ingredients_json
+    (i.e. it is structured, not a shell) and a different brand, so this returns
+    a non-empty set exactly when an honest cross-brand comparison exists -- which
+    is precisely the structure native catalog retrieval lacks. Empty (compare
+    stays gated) until a second structured brand lands in the category."""
+    if not category_kind:
+        return []
+    rows = await db.fetch_all(
+        """
+        SELECT DISTINCT cp.product_key, cp.title, cp.brand
+        FROM catalog_products cp
+        JOIN beauty_sku_ingredients bsi ON bsi.product_key = cp.product_key
+        WHERE cp.category_kind = :category_kind
+          AND cp.product_key <> :product_key
+          AND bsi.active_ingredients_json IS NOT NULL
+          AND jsonb_array_length(bsi.active_ingredients_json) > 0
+          AND lower(coalesce(cp.brand, '')) <> coalesce(
+                (SELECT lower(brand) FROM catalog_products WHERE product_key = :product_key), '')
+        LIMIT 8
+        """,
+        {"category_kind": category_kind, "product_key": product_key},
+    )
+    return [dict(r) for r in rows]
+
+
 async def _assemble_record(product_key: str, *, db: Any = database) -> Dict[str, Any]:
     sku_key = await _resolve_representative_sku_key(product_key, db=db)
     payload = await _fetch_beauty_vertical_payload(product_key, sku_key)
     offers = await resolve_pivot_offers(PivotOffersResolveRequest(product_key=product_key))
     best = offers.best_us_offer.model_dump() if offers.best_us_offer else None
-    return eval_record_from_payload(payload, best_us_offer=best, alternatives=[])
+    alternatives = await _resolve_alternatives(product_key, payload.get("category_kind"), db=db)
+    return eval_record_from_payload(payload, best_us_offer=best, alternatives=alternatives)
 
 
 def _per_sku_row(product_key: str, comparison: Dict[str, Any]) -> Dict[str, Any]:
