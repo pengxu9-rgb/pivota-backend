@@ -32,6 +32,7 @@ from services.beauty_field_authoring import (
     SOURCE_MERCHANT_PAYLOAD,
 )
 from services.category_kind import CATEGORY_KINDS
+from services.claim_safety import REVIEW_OBSERVED, SUBSTANTIATION_SUBSTANTIATED
 from services.index_pipeline_state_service import recompute_serving_eligibility
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,53 @@ def _as_list(value: Any) -> List[Any]:
         except Exception:
             return []
     return []
+
+
+def _evidence_has_claims(value: Any) -> bool:
+    """True when an evidence_profile already carries ≥1 claim (so auto-enrichment
+    must not clobber it -- same fill-only-when-empty rule as concerns/actives)."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return False
+    if isinstance(value, dict):
+        claims = value.get("claims")
+        return isinstance(claims, list) and len(claims) > 0
+    return False
+
+
+def _inci_substantiated_claims(actives: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Provenance-backed ingredient-presence claims from INCI-VERIFIED actives.
+
+    Claim-safety (strictest): ONLY `source="inci"` actives become `substantiated`
+    -- the INCI ingredient list is the authoritative source for ingredient
+    *identity* (it does NOT substantiate efficacy; "contains retinol" is identity,
+    "reduces wrinkles" is a drug/efficacy claim handled elsewhere). A text-derived
+    active is ingredient-PRESENT, not verified, so it never earns `substantiated`
+    here -- that distinction is what keeps marketing copy from masquerading as
+    evidence. This is the `justify` dimension's provenance-backed-claim signal.
+    """
+    claims: List[Dict[str, Any]] = []
+    seen: set = set()
+    for active in actives or []:
+        if not isinstance(active, dict) or active.get("source") != "inci":
+            continue
+        label = str(active.get("label") or "").strip()
+        key = label.lower()
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        claims.append(
+            {
+                "claim_text": f"Contains {label}",
+                "source_ref": "INCI",
+                "source_type": "inci",
+                "evidence_grade": "ingredient_list",
+                "substantiation_status": SUBSTANTIATION_SUBSTANTIATED,
+            }
+        )
+    return claims
 
 
 async def enrich_and_persist_product(
@@ -117,10 +165,12 @@ async def enrich_and_persist_product(
         )
     ]
     profile = await db.fetch_one(
-        "SELECT concerns_json FROM beauty_product_profiles WHERE product_key = :pk LIMIT 1",
+        "SELECT concerns_json, evidence_profile FROM beauty_product_profiles WHERE product_key = :pk LIMIT 1",
         {"pk": product_key},
     )
-    stored_concerns = _as_list(dict(profile).get("concerns_json")) if profile else []
+    profile_dict = dict(profile) if profile else {}
+    stored_concerns = _as_list(profile_dict.get("concerns_json"))
+    stored_evidence = profile_dict.get("evidence_profile")
 
     # Use a representative INCI / concentration from any SKU that carries it.
     raw_inci = next((r.get("raw_inci") for r in sku_rows if r.get("raw_inci")), None)
@@ -188,8 +238,36 @@ async def enrich_and_persist_product(
                 )
             actives_written_skus.append(row["sku_key"])
 
+    # evidence: substantiated ingredient-presence claims from INCI-verified
+    # actives -> beauty_product_profiles.evidence_profile, fill-only-when-empty.
+    # This is the `justify` dimension's provenance-backed-claim signal. Empty when
+    # there is no INCI (text-derived actives never earn `substantiated`). Needs
+    # merchant_id for the same merchant-scoped-row reason as concerns.
+    inci_claims = _inci_substantiated_claims(derived_actives)
+    wrote_evidence = False
+    can_write_evidence = bool(
+        inci_claims and not _evidence_has_claims(stored_evidence) and merchant_id
+    )
+    if can_write_evidence and not dry_run:
+        evidence_payload = {"claims": inci_claims, "review_state": REVIEW_OBSERVED}
+        await db.execute(
+            """
+            INSERT INTO beauty_product_profiles (product_key, merchant_id, evidence_profile, updated_at)
+            VALUES (:pk, :mid, CAST(:evidence AS jsonb), NOW())
+            ON CONFLICT (product_key) DO UPDATE SET
+              evidence_profile = EXCLUDED.evidence_profile,
+              updated_at = NOW()
+            WHERE beauty_product_profiles.evidence_profile IS NULL
+               OR jsonb_typeof(beauty_product_profiles.evidence_profile -> 'claims') IS DISTINCT FROM 'array'
+               OR jsonb_array_length(beauty_product_profiles.evidence_profile -> 'claims') = 0
+            """,
+            {"pk": product_key, "mid": merchant_id, "evidence": json.dumps(evidence_payload)},
+        )
+        wrote_evidence = True
+    would_write_evidence = can_write_evidence
+
     recomputed: Optional[bool] = None
-    if (wrote_concerns or actives_written_skus) and not dry_run:
+    if (wrote_concerns or actives_written_skus or wrote_evidence) and not dry_run:
         recomputed = await recompute_serving_eligibility(
             cp["content_key"], reason="beauty_enrichment"
         )
@@ -204,6 +282,7 @@ async def enrich_and_persist_product(
             "active_ingredients": [a.get("label") for a in derived_actives],
             "active_source": enriched.get("provenance", {}).get("active_ingredients"),
             "concerns": derived_concerns,
+            "substantiated_claims": [c["claim_text"] for c in inci_claims],
         },
         "written": {
             "concerns": (would_write_concerns if dry_run else wrote_concerns),
@@ -214,6 +293,7 @@ async def enrich_and_persist_product(
                 if dry_run and derived_actives
                 else actives_written_skus
             ),
+            "evidence_claims": (would_write_evidence if dry_run else wrote_evidence),
         },
         "serving_eligible": recomputed,
     }
