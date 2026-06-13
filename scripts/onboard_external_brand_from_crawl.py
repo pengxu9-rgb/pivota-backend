@@ -11,8 +11,8 @@ Per product it does:
   2. run the external_seed -> catalog_products mirror
   3. set category_kind + mark the brand-direct offer first-party
   4. INCI + enrichment via the SHARED crawled-INCI ingest
-     (scripts.ingest_crawled_inci._drive, #855) -- one upsert-raw_inci +
-     enrich_and_persist implementation for both crawl tools, so they don't drift
+     (services.crawled_inci_ingest) -- one upsert-raw_inci + enrich_and_persist
+     implementation for both crawl tools, so they don't drift
   5. make_external_seed_servable: attached_product_key back-link + quality
      snapshot + agent_pdp_view refresh + recompute eligibility
 
@@ -39,8 +39,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database
-from scripts.ingest_crawled_inci import _drive as ingest_crawled_inci_items
 from scripts.mirror_external_seeds_to_catalog_products import _apply as mirror_apply
+from services.crawled_inci_ingest import ingest_crawled_inci_items
 from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,

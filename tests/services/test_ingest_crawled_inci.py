@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts import ingest_crawled_inci as ing
+from services import crawled_inci_ingest as csi
 
 
 def test_merchant_id_from_product_key():
@@ -24,7 +25,8 @@ def test_drive_upserts_and_enriches_each_item(monkeypatch):
         return {"derived": {"active_source": "inci", "substantiated_claims": ["Contains Niacinamide"]},
                 "written": {"actives_skus": [pk + "::s"], "evidence_claims": True}}
 
-    monkeypatch.setattr(ing, "enrich_and_persist_product", _fake_persist)
+    # _drive delegates to the shared service; patch where enrich is actually called.
+    monkeypatch.setattr(csi, "enrich_and_persist_product", _fake_persist)
 
     class FakeDB:
         is_connected = True
@@ -52,7 +54,8 @@ def test_dry_run_writes_nothing(monkeypatch):
         return {"derived": {"active_source": "inci", "substantiated_claims": []},
                 "written": {"actives_skus": [], "evidence_claims": False}}
 
-    monkeypatch.setattr(ing, "enrich_and_persist_product", _fake_persist)
+    # _drive delegates to the shared service; patch where enrich is actually called.
+    monkeypatch.setattr(csi, "enrich_and_persist_product", _fake_persist)
 
     executed = []
 
