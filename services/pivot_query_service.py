@@ -36,6 +36,7 @@ from services.claim_safety import (
     required_disclaimers_for_category,
 )
 from services import haircare_attributes
+from services.beauty_enrichment import extract_key_actives, infer_concerns
 from services.skincare_attributes import (
     detect_fragrance_free,
     extract_format,
@@ -306,10 +307,18 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
                    bpp.evidence_profile, bpp.required_disclaimers,
                    cp.category_kind,
                    cp.title AS cp_title, cp.product_type AS cp_product_type,
-                   cp.category_path AS cp_category_path
-            FROM beauty_product_profiles bpp
-            LEFT JOIN catalog_products cp ON cp.product_key = bpp.product_key
-            WHERE bpp.product_key = :product_key
+                   cp.category_path AS cp_category_path,
+                   cp.description AS cp_description
+            -- Anchor on catalog_products, NOT beauty_product_profiles: the
+            -- durable category_kind (+ title/type/path the attribute derivers
+            -- read) lives on cp, and 2,195 of 2,198 categorized products have NO
+            -- bpp row. Gating on bpp dropped the whole payload -> category_kind
+            -- never reached the agent record (the decision-grade `find`
+            -- dimension could never pass). LEFT JOIN keeps the authored bpp
+            -- enrichment when it exists.
+            FROM catalog_products cp
+            LEFT JOIN beauty_product_profiles bpp ON bpp.product_key = cp.product_key
+            WHERE cp.product_key = :product_key
             LIMIT 1
             """,
             {"product_key": product_key},
@@ -407,6 +416,7 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
     cp_title = profile.get("cp_title")
     cp_product_type = profile.get("cp_product_type")
     cp_category_path = profile.get("cp_category_path")
+    cp_description = profile.get("cp_description")
     skincare_format = (str(profile_payload.get("format") or "").strip() or None) or extract_format(
         cp_title, cp_product_type, cp_category_path
     )
@@ -422,6 +432,19 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         [item for item in _json_list(ingredient_row.get("active_ingredients_json")) if isinstance(item, dict)],
         _json_list(ingredient_row.get("concentration_notes_json")),
     )
+    # Read-time fallback (same deterministic, no-LLM derivation as the format /
+    # concern fields above): when no structured ingredient row exists, identify
+    # curated key actives from the INCI (authoritative -> source="inci") or, with
+    # no INCI, the product text (source="text"). This is the `find` dimension's
+    # "key actives" signal for the ~2,195 categorized-but-unprofiled products.
+    if not active_ingredients and category_kind:
+        active_ingredients = extract_key_actives(
+            ingredient_row.get("raw_inci"),
+            concentration_notes=ingredient_row.get("concentration_notes_json"),
+            fallback_text=" ".join(
+                str(t or "") for t in (cp_title, cp_product_type, cp_description)
+            ),
+        )
 
     # Structured haircare attributes (haircare records only): format +
     # sulfate/silicone-free flags from text, and VERIFIED-vs-claimed vegan /
@@ -452,10 +475,24 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
         if cruelty_free_status is None and bool(profile_payload.get("cruelty_free")):
             cruelty_free_status = haircare_attributes.CERT_CLAIMED
 
+    # Concerns: prefer authored bpp concerns_json, else deterministically infer
+    # from the product text (same read-time derivation pattern as
+    # skincare_format above). This is the `find` dimension's fit signal; without
+    # it, the 2,195 categorized-but-unprofiled products carry a category_kind but
+    # no fit attributes, so `find` still fails. Vocab match against real title /
+    # type text -- not fabrication.
+    concerns = [
+        str(item or "").strip()
+        for item in _json_list(profile.get("concerns_json"))
+        if str(item or "").strip()
+    ]
+    if not concerns and category_kind:
+        concerns = infer_concerns(category_kind, cp_title, cp_product_type, cp_category_path)
+
     payload = BeautyVerticalPayload(
         category_kind=category_kind,
         taxonomy=_json_dict(profile.get("taxonomy_json")),
-        concerns=[str(item or "").strip() for item in _json_list(profile.get("concerns_json")) if str(item or "").strip()],
+        concerns=concerns,
         claims=[str(item or "").strip() for item in _json_list(profile.get("claims_json")) if str(item or "").strip()],
         evidence_profile=evidence_profile,
         required_disclaimers=required_disclaimers,
