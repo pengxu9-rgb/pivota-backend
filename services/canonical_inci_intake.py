@@ -46,6 +46,7 @@ _SOURCE_RANK = {
     "shopify_products_sync": 1,
     "products_cache": 1,
     "auto_enrichment_v1": 1,
+    "pdp_crawl": 1,  # a crawled PDP listing (services.crawled_inci_ingest) -> listing tier
 }
 
 
