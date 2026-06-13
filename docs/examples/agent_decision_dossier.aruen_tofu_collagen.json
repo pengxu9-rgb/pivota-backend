@@ -1,0 +1,118 @@
+{
+  "$schema": "pivota.agent_decision_dossier/v1",
+  "pivota_id": "sig_42edfffb0998c8e528926e26e82a7945",
+  "pivota_url": "https://agent.pivota.cc/products/sig_42edfffb0998c8e528926e26e82a7945",
+  "as_of": "2026-06-13",
+
+  "headline_for_agent": "The real firming driver is fermented soy isoflavones (phytoestrogens that up-regulate procollagen) — NOT the 'collagen' in the name, which is a surface hydrator. A vegan, gradual, retinol-alternative firming cream best for mature / elasticity-focused skin; under-hydrates very dry skin. 4.7/5 (114 reviews). Brand-direct US, $22.99.",
+
+  "differentiator": {
+    "thesis": "A vegan, fermented-soy route to firmness rooted in Korean fermented-soy heritage — distinct from the usual peptide / retinol / animal-collagen firming creams.",
+    "why_this_ingredient_not_others": "Fermented soy milk delivers bioavailable isoflavone aglycones (genistein, daidzein) — phytoestrogens with a real collagen-preserving mechanism — as a plant-based alternative to retinoids and estrogen. The brand leans on 68-80% fermented soymilk as the base, not a token extract.",
+    "honest_call": "'Tofu Collagen' is a naming hook. The hydrolyzed collagen molecule is too large to penetrate to fibroblasts — it hydrates the surface. The actual firming comes from the isoflavones + adenosine, not the collagen.",
+    "confidence": "high (mechanism well-characterized; naming caveat is established dermatology)"
+  },
+
+  "claims_graded": [
+    {
+      "claim": "Helps firm and improve the look of elasticity",
+      "drivers": ["fermented soy isoflavones (genistein/daidzein)", "adenosine", "plant amino-acid proteins"],
+      "mechanism": "isoflavones up-regulate type-I procollagen in dermal fibroblasts and inhibit the MMPs that degrade collagen (via TIMP); adenosine supports the look of smoothness",
+      "evidence_type": "peer_reviewed_mechanism",
+      "confidence": "moderate",
+      "caveat": "strongest measured effect is in mature / estrogen-deficient skin; effect is gradual (weeks)",
+      "sources": ["https://pmc.ncbi.nlm.nih.gov/articles/PMC3312494/", "https://onlinelibrary.wiley.com/doi/full/10.1002/ptr.6538", "https://pmc.ncbi.nlm.nih.gov/articles/PMC2705153/"]
+    },
+    {
+      "claim": "It's a 'collagen' cream that builds collagen",
+      "evidence_type": "marketing_vs_reality",
+      "confidence_claim_is_true": "low",
+      "honest_finding": "Topical hydrolyzed collagen does not reach the dermis to build collagen; it is a surface humectant / film-former. The benefit is hydration, not collagen synthesis.",
+      "sources": ["dermatology consensus on topical collagen molecular size"]
+    },
+    {
+      "claim": "Hydrates and plumps",
+      "drivers": ["glycerin", "glyceryl glucoside", "hydrolyzed collagen", "fermented soymilk"],
+      "evidence_type": "ingredient_function",
+      "confidence": "high"
+    },
+    {
+      "claim": "Brightens / evens tone and supports the barrier",
+      "drivers": ["niacinamide (label ~2%)", "Lactobacillus ferment (postbiotic)"],
+      "evidence_type": "ingredient_function",
+      "confidence": "high"
+    }
+  ],
+
+  "technology_origin": {
+    "what": "Lactic-acid-bacteria fermentation of soy milk (the brand cites 68-80% fermented soymilk base).",
+    "why_it_matters": "Fermentation converts isoflavone glucosides into the bioavailable aglycone forms (active genistein/daidzein) and adds peptides, free amino acids and postbiotics — so 'fermented' is a real bioactivity story, not a buzzword.",
+    "heritage": "Applies Korea's fermented-soy tradition (doenjang / cheonggukjang) to skincare — the K-beauty fermentation lineage that also gave the category galactomyces and rice ferments.",
+    "evidence_type": "peer_reviewed_mechanism",
+    "confidence": "moderate-high",
+    "sources": ["https://pubmed.ncbi.nlm.nih.gov/30035387/", "https://pmc.ncbi.nlm.nih.gov/articles/PMC11647071/"]
+  },
+
+  "honest_assessment": {
+    "benefits": [
+      "Firmness/elasticity via a genuine isoflavone mechanism (not just 'collagen')",
+      "Postbiotic + niacinamide barrier and tone support",
+      "Vegan, gentle, fragrance-light — a plant-based retinol alternative",
+      "Bouncy jelly texture that layers well"
+    ],
+    "limitations": [
+      "Firming evidence is strongest for mature / estrogen-deficient skin — younger skin will see less",
+      "Jelly texture under-hydrates very dry skin or harsh winter (the most consistent review complaint)",
+      "Results are gradual (weeks), not overnight",
+      "The 'collagen' branding overstates what the collagen ingredient actually does"
+    ],
+    "tradeoff": "Gentle, vegan, slow-and-steady firming vs. faster but harsher retinoids."
+  },
+
+  "fit": {
+    "great_for": ["mature skin / loss of firmness", "elasticity + hydration seekers", "vegan / clean-beauty preference", "retinol-alternative seekers", "normal to combination skin"],
+    "skip_if": ["soy allergy (soy-derived actives)", "pregnant or nursing (phytoestrogen precaution — topical risk low but commonly avoided)", "very dry skin needing rich occlusion", "want fast, dramatic results"],
+    "routine": "moisturizer step, AM/PM, before SPF; pairs with a richer occlusive in winter for dry skin"
+  },
+
+  "real_world_outcomes": {
+    "rating": 4.7,
+    "review_count": 114,
+    "review_provenance": "aggregated from real reviews (brand site, Amazon, social) — NOT brand-curated testimonials",
+    "consistent_positives": ["visible firmness with regular use", "bouncy texture that 'fills' micro-lines", "lightweight, non-greasy"],
+    "consistent_negatives": ["not hydrating enough for very dry skin / winter", "gradual, not immediate"],
+    "pivota_transaction_outcomes": {"repurchase_rate": null, "return_rate": null, "note": "accrues per-SKU as Pivota transacts — the uncopyable layer"},
+    "sources": ["https://www.review-rating.com/en/product/aruen-fermented-tofu-collagen-jelly-990469", "https://www.amazon.com/aruen-Fermented-Collagen-Jelly-Cream/dp/B0DTH8W4VN"]
+  },
+
+  "brand_trust": {
+    "brand": "Aruen",
+    "positioning": "indie, tofu-based clean K-beauty & wellness",
+    "origin_story": "founder-led; framed as 'life-adaptive' skincare born from burnout (founder's note on aruen.us)",
+    "availability_us": ["aruen.us (brand-direct)", "Amazon"],
+    "trust_level": "moderate",
+    "caveats": ["young / indie brand with a limited long-term track record", "claims are credible *with* the limitations above"],
+    "authenticity": "record + INCI sourced from the brand-official site; brand-direct offer ⇒ low counterfeit risk",
+    "sources": ["https://aruen.us/"]
+  },
+
+  "ingredients": {
+    "inci_verified": true,
+    "source": {"type": "brand_official", "url": "https://aruen.us/products/tofu-collagen-dual-firming-jelly-cream", "sourced_at": "2026-06-13"},
+    "key_actives": ["fermented soy isoflavones (Glycine Soja, Lactobacillus/Soymilk Ferment)", "Hydrolyzed Collagen", "Niacinamide", "Adenosine", "plant proteins (pea/lentil/mung bean)", "Glyceryl Glucoside"]
+  },
+
+  "buy": {
+    "best_offer": {"seller": "Aruen (brand-direct)", "offer_type": "brand_direct", "market": "US", "price": "22.99", "currency": "USD", "size": "50ml", "url": "https://aruen.us/products/tofu-collagen-dual-firming-jelly-cream", "first_party": true}
+  },
+
+  "provenance_and_confidence": {
+    "_why": "So the agent knows how far to lean on each statement — and can cite Pivota.",
+    "ingredients": "brand_official",
+    "claims": "each graded by evidence_type (clinical / peer_reviewed_mechanism / ingredient_function / traditional_use / marketing_vs_reality) + confidence",
+    "science": "peer-reviewed dermatology, cited inline",
+    "outcomes": "aggregated real reviews; Pivota transaction outcomes accrue over time",
+    "neutrality": "Pivota's assessment — including the limitations and the marketing-vs-reality call — is independent of any brand or merchant payment",
+    "freshness": "2026-06-13; refreshes as reviews and science update"
+  }
+}
