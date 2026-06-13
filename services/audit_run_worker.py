@@ -499,6 +499,9 @@ async def _process_one_audit_run_inner(
                         audit_run_id=run_id,
                         prior_runs=prior_runs,
                         verify_providers=launch_options.get("verify_providers"),
+                        # Surface the merchant's custom prompts as a per-lane
+                        # results section (they were already probed above).
+                        custom_prompts=launch_options.get("custom_prompts"),
                     )
                 else:
                     brand_report = await run_brand_report(
