@@ -105,14 +105,45 @@ brand          ─▶ brand dossier (from Brand KB)
 - Confidence calibration + an audit trail for every graded claim.
 - How outcomes (Tier 2) feed back to re-grade claims as real data accrues.
 
-## Action items
+## Reconciliation: this EXTENDS Pivota Insights, it does not replace it
 
-1. [ ] Ratify the `agent_decision_dossier/v1` shape (the example is the straw man).
-2. [ ] Build the **Ingredient Intelligence KB** schema + seed the cohort's hero
-   actives (soy isoflavones, niacinamide, adenosine, snail mucin, centella, …)
-   with graded, cited mechanism + contraindications + marketing-vs-reality notes.
-3. [ ] Build the per-product **synthesis pipeline** (INCI × KB → graded claims),
-   LLM-drafted + adversarially reviewed + claim-safety screened.
-4. [ ] Build **review synthesis** (multi-source ingest → consistent-signal extraction
-   with provenance).
-5. [ ] Build the **Brand Intelligence KB**; assemble the dossier; serve on the PDP.
+This was first drafted in a vacuum. The structure largely **already exists** as
+**Pivota Insights** (`pivota.product_intel.v1`) — the served contract lives in
+`pivota-agent-ui/src/features/pdp/types.ts`, the producer in
+`PIVOTA-Agent/src/pdpProductIntel.js` (+ `auroraBff/`), persisted in
+`aurora_product_intel_kb` (per product) — and the per-ingredient KB exists too
+(`aurora_ingredient_research_kb`). The right move is to **extend the missing
+dossier dimensions and wire up what's already built**, in those surfaces.
+
+Mapping the dossier → existing Pivota Insights fields:
+
+| Dossier dimension | Pivota Insights today | Action |
+|---|---|---|
+| headline / differentiator | `product_intel_core.what_it_is`, `why_it_stands_out[].{headline,body,evidence_strength}` | **extend** — add *why this ingredient not others* + mechanism |
+| graded claims | per-FIELD `confidence` + `evidence_profile` (`seller_only…community_supported`) | **add** — per-CLAIM grading incl. a `marketing_vs_reality` type |
+| honest pros / cons | `community_signals.{top_loves,top_complaints,mixed_feedback}`, `watchouts[]` | **extend** — explicit `not_for` / contraindications |
+| who-for / who-skip | `best_for[]`, `community_signals.best_fit_users[]` | **add** — `not_fit_users[]` / skip-if |
+| real-world outcomes | `community_signals` (reviews/creator/editorial synthesis) ✅ strong | reuse; add Pivota transaction outcomes |
+| technology / origin | `why_it_stands_out` (partial) | **extend** via the ingredient KB |
+| brand trust | not in product_intel (`catalog_row_trust` exists separately) | **connect** |
+| ingredient intelligence | `aurora_ingredient_research_kb` EXISTS (46 rows, usage/safety; Gemini; TTL) but **not integrated/served** | **integrate + enrich** (mechanism + graded evidence + marketing-vs-reality) |
+| provenance + confidence | `provenance.field_sources`, `confidence{overall,fields}`, evidence `_meta` ✅ | reuse |
+
+## Action items (corrected — extend/integrate, don't rebuild)
+
+1. [ ] Treat **`pivota.product_intel.v1` as the home**; the dossier example is a
+   straw man for the *extensions*, not a new contract.
+2. [ ] **Integrate the existing `aurora_ingredient_research_kb`** into
+   `product_intel_core` (it's built but unserved) — and **enrich** it from
+   usage/safety into curated, graded *mechanism + evidence + marketing-vs-reality*
+   for the cohort's hero actives (soy isoflavones, niacinamide, adenosine, …).
+3. [ ] **Add per-CLAIM grading**: an `evidence_claims[]` block on
+   `product_intel_core` with `{claim, drivers, evidence_type (incl.
+   marketing_vs_reality), confidence, source_refs[]}`.
+4. [ ] **Extend honest-fit fields**: `not_for[]` / contraindications +
+   `not_fit_users[]` (inverse of `best_for`/`best_fit_users`).
+5. [ ] **Connect brand trust** (`catalog_row_trust` → a `brand_trust` block).
+6. [ ] These changes land in **PIVOTA-Agent** (`pdpProductIntel.js` / `auroraBff`)
+   + **pivota-agent-ui** types/rendering + the aurora KBs — NOT the pivota-backend
+   canonical-sourcing engine, which is the Tier-0 facts feed. Coordinate with
+   whoever owns the product_intel surface before extending it.
