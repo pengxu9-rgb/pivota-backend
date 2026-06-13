@@ -30,13 +30,26 @@ from services.beauty_enrichment import parse_inci
 
 # An "Ingredients" / "INCI" section label, optionally "Full ingredients:".
 _INGREDIENTS_LABEL_RE = re.compile(
-    r"(?:full\s+|key\s+)?(?:ingredients?|inci|ingredient\s+list|composition)\s*[:\-—]\s*",
+    # The separator is optional: brand PDPs use "Ingredients: <list>", but many
+    # (Shopify accordions) render a bare "INGREDIENTS" header then the list.
+    r"\b(?:full\s+|key\s+)?(?:ingredients?|inci|ingredient\s+list|composition)\b\s*[:\-—]?\s*",
     re.IGNORECASE,
 )
+# UI / nav tokens that may follow an ingredient list in a scraped page -- they
+# end the INCI run (they are not ingredients).
+_UI_STOPWORD_RE = re.compile(
+    r"^(?:add\s+to\s+cart|buy\s+now|reviews?|subscribe|share|tweet|pin\s+it|"
+    r"quantity|sold\s+out|shipping|returns?|description|how\s+to\s+use|"
+    r"directions|home|shop|menu|search|account|cart|sign\s+in|log\s+in)\b",
+    re.IGNORECASE,
+)
+# A single INCI ingredient token: starts with a letter, only ingredient-ish chars.
+_INCI_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 ()\-'./%*&+]*$")
 # Where an ingredient list stops: a blank line or the next PDP section.
 _SECTION_END_RE = re.compile(
     r"\n\s*\n|(?:\b(?:how\s+to\s+use|directions|warnings?|caution|about|description|"
-    r"benefits|suitable\s+for|size|reviews?)\b)",
+    r"benefits|suitable\s+for|size|reviews?|add\s+to\s+cart|add\s+to\s+bag|"
+    r"buy\s+now|sold\s+out|quantity|checkout|you\s+may\s+also\s+like)\b)",
     re.IGNORECASE,
 )
 # INCI anchor words -- a real ingredient list almost always contains one of these.
@@ -64,16 +77,38 @@ def _strip_html(text: str) -> str:
     return text
 
 
+def _is_inci_token(tok: str) -> bool:
+    t = tok.strip()
+    return bool(2 <= len(t) <= 60 and _INCI_TOKEN_RE.match(t) and not _UI_STOPWORD_RE.match(t))
+
+
+def _leading_inci_run(tokens: List[str]) -> List[str]:
+    """The leading consecutive run of INCI-looking tokens -- stops at the first
+    non-ingredient (page/UI text that followed the list in a scraped accordion)."""
+    run: List[str] = []
+    for tok in tokens:
+        if _is_inci_token(tok):
+            run.append(tok)
+        else:
+            break
+    return run
+
+
 def _clean_and_validate_inci(candidate: Optional[str]) -> Optional[str]:
-    """Validate a raw candidate really is an INCI list (enough comma tokens AND
-    an anchor ingredient), and return it re-joined as a clean comma list, or
-    None. Shared by the PDP extractor and the structured-source adapters."""
+    """Validate a raw candidate really is an INCI list and return it as a clean
+    comma list, or None. Takes the LEADING run of ingredient-looking tokens (so
+    trailing page/UI text after a scraped accordion list is dropped), then
+    requires >=4 tokens AND an anchor ingredient. Shared by the PDP extractor and
+    the structured-source adapters."""
     if not candidate:
         return None
-    tokens = parse_inci(candidate)
-    if len(tokens) < 4 or not _INCI_ANCHOR_RE.search(candidate):
+    run = _leading_inci_run(parse_inci(candidate))
+    if len(run) < 4:
         return None
-    return ", ".join(tokens[:_MAX_INGREDIENTS])
+    joined = ", ".join(run[:_MAX_INGREDIENTS])
+    if not _INCI_ANCHOR_RE.search(joined):
+        return None
+    return joined
 
 
 def extract_inci_from_text(text: Optional[str]) -> Optional[str]:
@@ -86,11 +121,14 @@ def extract_inci_from_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
     cleaned = _strip_html(text)
-    match = _INGREDIENTS_LABEL_RE.search(cleaned)
-    if not match:
-        return None
-    after = _SECTION_END_RE.split(cleaned[match.end():], maxsplit=1)[0]
-    return _clean_and_validate_inci(after)
+    # Try each "Ingredients"/"INCI" occurrence -- the first is often a nav link or
+    # heading; the one that precedes the real list is what validates.
+    for match in _INGREDIENTS_LABEL_RE.finditer(cleaned):
+        after = _SECTION_END_RE.split(cleaned[match.end():], maxsplit=1)[0]
+        inci = _clean_and_validate_inci(after)
+        if inci:
+            return inci
+    return None
 
 
 def extract_inci_from_openbeautyfacts(json_text: Optional[str]) -> Optional[str]:
