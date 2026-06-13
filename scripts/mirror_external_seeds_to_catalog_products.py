@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -41,6 +42,11 @@ from services.beauty_external_ranking import (
 )
 from services.catalog_identity import make_content_key
 from services.catalog_sync_service import make_pivota_canonical_fields
+from services.external_seed_servability import (
+    backlink_seed_to_product,
+    build_servable_quality_payload,
+    make_external_seed_servable,
+)
 from services.pdp_category_classifier import (
     fold_category_from_variants,
     resolve_path_from_row,
@@ -69,6 +75,17 @@ SKU_SUFFIX = "::canonical"
 OFFER_ID_PREFIX = "offer:external_seed:"
 OFFER_MODE = "redirect"
 PRICE_CONFIDENCE_AT_MIRROR = Decimal("0.6")
+
+# Also produce the serving-layer artifacts (quality snapshot + agent_pdp_view)
+# for each mirrored seed so external-seed products land servable, not just
+# indexed. The cheap attached_product_key back-link runs unconditionally (it
+# fixes a real `no_seed` gap); the heavier quality+APV pass is flag-gated so it
+# dark-launches and the scheduled mirror's load/behavior is opt-in.
+MAKE_SERVABLE_ENV = "EXTERNAL_SEED_MIRROR_MAKE_SERVABLE"
+
+
+def _make_servable_enabled() -> bool:
+    return str(os.getenv(MAKE_SERVABLE_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _derive_mirror_sku_key(product_key: str) -> str:
@@ -1067,6 +1084,37 @@ async def _apply(limit: int) -> int:
                 # via the same idempotent ON CONFLICT path.
                 print(
                     f"WARNING: chain write failed for product_key={product_key_for_chain}: {exc!r}",
+                    file=sys.stderr,
+                )
+
+        # Serving-layer artifacts so the mirrored row lands servable, not just
+        # indexed. The attached_product_key back-link is unconditional (fixes the
+        # `no_seed` gap — the mirror creates the product but never linked the
+        # seed); the heavier quality-snapshot + agent_pdp_view pass dark-launches
+        # behind MAKE_SERVABLE_ENV. Best-effort: never roll back the identity row.
+        if product_key_for_chain:
+            seed_id = str(row_dict.get("id") or "")
+            try:
+                if seed_id and not row_dict.get("attached_product_key"):
+                    await backlink_seed_to_product(seed_id, product_key_for_chain)
+                if seed_id and _make_servable_enabled():
+                    await make_external_seed_servable(
+                        product_key=product_key_for_chain,
+                        seed_id=seed_id,
+                        source_product_id=str(row_dict.get("external_product_id") or ""),
+                        quality_payload=build_servable_quality_payload(
+                            title=row_dict.get("title"),
+                            description=row_dict.get("mirrored_description"),
+                            price=row_dict.get("price_amount"),
+                            image_url=row_dict.get("image_url"),
+                            brand=row_dict.get("mirrored_brand"),
+                            product_type=row_dict.get("mirrored_product_type"),
+                        ),
+                        reason="external_seed_mirror",
+                    )
+            except Exception as exc:
+                print(
+                    f"WARNING: servability step failed for product_key={product_key_for_chain}: {exc!r}",
                     file=sys.stderr,
                 )
     return inserted
