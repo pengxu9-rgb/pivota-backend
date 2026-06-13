@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from db.database import database
 from models.catalog import PivotOffersResolveRequest
@@ -47,8 +47,32 @@ async def _disconnect_if_needed(db: Any, was_connected: bool) -> None:
             await disconnect()
 
 
-async def _assemble_record(product_key: str) -> Dict[str, Any]:
-    payload = await _fetch_beauty_vertical_payload(product_key, None)
+async def _resolve_representative_sku_key(product_key: str, *, db: Any = database) -> Optional[str]:
+    """Resolve a SKU that carries this product's ingredient data.
+
+    The beauty payload fetch HARD-GATES its beauty_sku_ingredients query on
+    sku_key: passing None silently drops active_ingredients, so the eval's
+    `find` dimension (which requires key actives / key ingredients) could never
+    pass. Resolve the SKU that actually holds the ingredient row so the live
+    record is assembled the way it is served. None when the product has no
+    ingredient data (then there is genuinely nothing to load)."""
+    row = await db.fetch_one(
+        """
+        SELECT sku_key
+        FROM beauty_sku_ingredients
+        WHERE product_key = :product_key
+          AND sku_key IS NOT NULL
+        LIMIT 1
+        """,
+        {"product_key": product_key},
+    )
+    sku_key = dict(row).get("sku_key") if row else None
+    return str(sku_key) if sku_key else None
+
+
+async def _assemble_record(product_key: str, *, db: Any = database) -> Dict[str, Any]:
+    sku_key = await _resolve_representative_sku_key(product_key, db=db)
+    payload = await _fetch_beauty_vertical_payload(product_key, sku_key)
     offers = await resolve_pivot_offers(PivotOffersResolveRequest(product_key=product_key))
     best = offers.best_us_offer.model_dump() if offers.best_us_offer else None
     return eval_record_from_payload(payload, best_us_offer=best, alternatives=[])
@@ -91,7 +115,7 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
         per_sku: List[Dict[str, Any]] = []
         for product_key in args.product_keys:
             try:
-                record = await _assemble_record(product_key)
+                record = await _assemble_record(product_key, db=db)
                 comparison = compare_decision_grade(record)
                 per_sku.append(_per_sku_row(product_key, comparison))
             except Exception as exc:  # noqa: BLE001 -- surface, don't abort the batch
