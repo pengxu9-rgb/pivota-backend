@@ -30,6 +30,8 @@ def test_ingest_upserts_with_source_system_and_enriches(monkeypatch):
         is_connected = True
         async def execute(self, q, p=None):
             executed.append(p)
+        async def fetch_one(self, q, p=None):
+            return None  # no existing row -> writable
 
     items = [
         {"product_key": "prod::external_seed::external_seed::a", "sku_key": "a::canonical", "raw_inci": "Water, Niacinamide"},
@@ -62,8 +64,46 @@ def test_ingest_dry_run_writes_nothing(monkeypatch):
         is_connected = True
         async def execute(self, q, p=None):
             executed.append(p)
+        async def fetch_one(self, q, p=None):
+            return None
 
     items = [{"product_key": "prod::external_seed::external_seed::a", "sku_key": "a::canonical", "raw_inci": "Water"}]
     report = asyncio.run(csi.ingest_crawled_inci_items(items, dry_run=True, db=FakeDB()))
     assert executed == []
     assert report["inci_written"] == 0
+
+
+def test_ingest_respects_source_precedence(monkeypatch):
+    """A pdp_crawl item must not overwrite a higher-authority (brand_official) row,
+    and must write over an equal/lower one."""
+    executed = []
+    enriched = []
+
+    async def _fake_persist(pk, *, db=None, dry_run=False):
+        enriched.append(pk)
+        return {"derived": {}, "written": {}}
+
+    monkeypatch.setattr(csi, "enrich_and_persist_product", _fake_persist)
+
+    class FakeDB:
+        is_connected = True
+        def __init__(self, existing_source):
+            self._existing = existing_source
+        async def fetch_one(self, q, p=None):
+            return {"source_system": self._existing}
+        async def execute(self, q, p=None):
+            executed.append(p)
+
+    item = [{"product_key": "prod::external_seed::external_seed::a", "sku_key": "a::canonical", "raw_inci": "Water, Niacinamide"}]
+
+    # brand_official (rank 3) outranks pdp_crawl (rank 1) -> skipped, no write, no enrich
+    report = asyncio.run(csi.ingest_crawled_inci_items(item, dry_run=False, db=FakeDB("brand_official")))
+    assert report["skipped_outranked"] == 1
+    assert report["inci_written"] == 0
+    assert executed == [] and enriched == []
+
+    # reseller_listing (rank 1) == pdp_crawl (rank 1) -> writes (same-rank refresh)
+    report = asyncio.run(csi.ingest_crawled_inci_items(item, dry_run=False, db=FakeDB("reseller_listing")))
+    assert report["skipped_outranked"] == 0
+    assert report["inci_written"] == 1
+    assert executed and enriched == ["prod::external_seed::external_seed::a"]

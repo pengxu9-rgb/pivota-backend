@@ -31,6 +31,7 @@ def test_drive_upserts_and_enriches_each_item(monkeypatch):
     class FakeDB:
         is_connected = True
         async def execute(self, q, p=None): executed.append(p)
+        async def fetch_one(self, q, p=None): return None  # no existing row -> writable
 
     items = [
         {"product_key": "prod::external_seed::external_seed::ext_1", "sku_key": "sk1", "raw_inci": "Water, Niacinamide"},
@@ -62,6 +63,7 @@ def test_dry_run_writes_nothing(monkeypatch):
     class FakeDB:
         is_connected = True
         async def execute(self, q, p=None): executed.append(p)
+        async def fetch_one(self, q, p=None): return None  # no existing row -> writable
 
     items = [{"product_key": "prod::external_seed::external_seed::ext_1", "sku_key": "sk1", "raw_inci": "Water, Niacinamide"}]
     report = asyncio.run(ing._drive(items, dry_run=True, db=FakeDB()))

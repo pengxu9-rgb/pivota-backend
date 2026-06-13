@@ -5,10 +5,12 @@ Single implementation behind both crawl entry points:
   - scripts.ingest_crawled_inci          (add INCI to products that already exist)
   - scripts.onboard_external_brand_from_crawl (onboard new external-seed brands)
 
-Per item: UPSERT raw_inci into beauty_sku_ingredients (fill-only-when-empty, so
-idempotent and never clobbering a merchant/verified row), then
+Per item: UPSERT raw_inci into beauty_sku_ingredients gated by ADR-001 source
+precedence (canonical_inci_intake.may_write -- a crawled PDP is listing-tier, so
+it never downgrades brand-official / supplier / merchant-authored INCI), then
 enrich_and_persist_product -> INCI-verified actives + concerns + substantiated
-"Contains {X}" claims. Items with empty / "NO INGREDIENT..." INCI are skipped.
+"Contains {X}" claims. Items with empty / "NO INGREDIENT..." INCI are skipped;
+items outranked by an existing higher-authority source are skipped_outranked.
 dry_run writes nothing.
 """
 
@@ -18,9 +20,13 @@ from typing import Any, Dict, List
 
 from db.database import database
 from services.beauty_enrichment_persist import enrich_and_persist_product
+from services.canonical_inci_intake import may_write
 
 DEFAULT_SOURCE_SYSTEM = "pdp_crawl"
 
+# Precedence is enforced in Python via canonical_inci_intake.may_write (ADR-001
+# source ladder), so the UPSERT itself is unconditional -- the WHERE-guard would
+# be a second, drifting copy of the precedence rule.
 _UPSERT = """
     INSERT INTO beauty_sku_ingredients
         (sku_key, product_key, merchant_id, raw_inci, source_system, created_at, updated_at)
@@ -29,8 +35,6 @@ _UPSERT = """
         raw_inci = EXCLUDED.raw_inci,
         source_system = EXCLUDED.source_system,
         updated_at = NOW()
-    WHERE beauty_sku_ingredients.raw_inci IS NULL
-       OR length(trim(beauty_sku_ingredients.raw_inci)) = 0
 """
 
 
@@ -60,7 +64,7 @@ async def ingest_crawled_inci_items(
         await db.connect()
     report: Dict[str, Any] = {
         "n": 0, "inci_written": 0, "actives_filled": 0, "claims_written": 0,
-        "skipped": 0, "items": [],
+        "skipped": 0, "skipped_outranked": 0, "items": [],
     }
     try:
         for it in items:
@@ -71,6 +75,17 @@ async def ingest_crawled_inci_items(
             if not (pk and sk) or _is_skippable_inci(inci):
                 report["skipped"] += 1
                 report["items"].append({"product_key": pk, "status": "skipped_no_inci"})
+                continue
+            # ADR-001 source precedence: never downgrade a higher-authority INCI
+            # source. A higher-ranked row already owns this sku (and was enriched
+            # by its own path), so skip both the write and the enrich.
+            existing = await db.fetch_one(
+                "SELECT source_system FROM beauty_sku_ingredients WHERE sku_key = :sk", {"sk": sk})
+            existing_source = dict(existing).get("source_system") if existing else None
+            if not may_write(source_system, existing_source):
+                report["skipped_outranked"] += 1
+                report["items"].append({"product_key": pk, "status": "skipped_outranked",
+                                        "existing_source": existing_source})
                 continue
             if not dry_run:
                 await db.execute(
