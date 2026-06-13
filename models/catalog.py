@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CatalogSyncJobCreateRequest(BaseModel):
@@ -227,6 +227,33 @@ class SkuNode(BaseModel):
     visible_attributes: Dict[str, List[str]] = Field(default_factory=dict)
     visible_option_labels: List[str] = Field(default_factory=list)
     ingredient_ids: List[str] = Field(default_factory=list)
+
+    @field_validator("visible_attributes", mode="before")
+    @classmethod
+    def _coerce_visible_attributes(cls, value: Any) -> Dict[str, List[str]]:
+        """Coerce attribute values to lists.
+
+        Upstream producers are inconsistent: external_seed records and the
+        variant promoter (services/catalog_variant_promoter.py keys this as
+        Dict[str, str]) emit a scalar label (e.g. {"Format": "Garden Gift Set"}),
+        while the contract is Dict[str, List[str]]. Strict validation rejected
+        the scalar shape and dropped the whole SkuNode — silently erroring SKUs
+        out of the pivot/eval assembly. Normalize scalars to single-element
+        lists rather than failing."""
+        if not isinstance(value, dict):
+            return {}
+        out: Dict[str, List[str]] = {}
+        for key, val in value.items():
+            label = str(key)
+            if val is None:
+                out[label] = []
+            elif isinstance(val, str):
+                out[label] = [val] if val.strip() else []
+            elif isinstance(val, (list, tuple, set)):
+                out[label] = [str(x) for x in val if x is not None and str(x).strip()]
+            else:
+                out[label] = [str(val)]
+        return out
 
 
 class OfferNode(BaseModel):
