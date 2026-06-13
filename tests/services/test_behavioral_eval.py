@@ -88,3 +88,63 @@ def test_cohort_aggregation():
 
 def test_empty_cohort():
     assert be.compare_behavioral_cohort([], _fake_judge)["n"] == 0
+
+
+# --- multi-model judge (panel consensus) --------------------------------------
+
+def _judge_yes_all(prompt):
+    return '{"fit":true,"justify":true,"trust":true,"recommend":true,"notes":""}'
+
+def _judge_strict(prompt):
+    # only says yes when the card actually has substantiated claims + official source
+    card = prompt.split("PRODUCT RECORD:\n", 1)[-1]
+    j = "status: substantiated" in card
+    t = "official brand source" in card or "first-party" in card
+    f = "(none provided)" not in card.split("key active")[0]
+    return ('{"fit":%s,"justify":%s,"trust":%s,"recommend":%s,"notes":""}'
+            % (str(f).lower(), str(j).lower(), str(t).lower(), str(f and j and t).lower()))
+
+def _judge_no_all(prompt):
+    return '{"fit":false,"justify":false,"trust":false,"recommend":false,"notes":""}'
+
+
+def test_consensus_is_per_axis_majority():
+    # 2 of 3 judges say yes on every axis for the Pivota card -> consensus yes.
+    judges = {"a": _judge_yes_all, "b": _judge_strict, "c": _judge_no_all}
+    res = be.compare_behavioral_multi("brightening serum for dull skin", _pivota_record(), judges)
+    # pivota: a=yes-all(4), strict=4 (has claims+official), c=0 -> majority yes all 4 axes
+    assert res["pivota"]["score"] == 4
+    assert res["pivota"]["consensus"]["justify"] is True
+    # native: a=4, strict=0 (no claims/official), c=0 -> only 1/3 yes -> NO majority
+    assert res["native"]["score"] == 0
+    assert res["consensus_score_lift"] == 4
+    assert set(res["judges"]) == {"a", "b", "c"}
+
+
+def test_agreement_reports_unanimity():
+    judges = {"a": _judge_yes_all, "b": _judge_yes_all}
+    res = be.compare_behavioral_multi("q", _pivota_record(), judges)
+    assert res["pivota"]["agreement"] == 1.0  # both judges identical -> unanimous
+    judges2 = {"a": _judge_yes_all, "b": _judge_no_all}
+    res2 = be.compare_behavioral_multi("q", _pivota_record(), judges2)
+    assert res2["pivota"]["agreement"] == 0.5  # split on every axis
+
+
+def test_per_judge_lift_breakdown():
+    judges = {"yes": _judge_yes_all, "strict": _judge_strict}
+    res = be.compare_behavioral_multi("q", _pivota_record(), judges)
+    # yes-judge: pivota4 - native4 = 0 (it always says yes, no discrimination)
+    assert res["per_judge_lift"]["yes"] == 0
+    # strict judge: pivota4 - native0 = 4 (discriminates on real data)
+    assert res["per_judge_lift"]["strict"] == 4
+
+
+def test_multi_cohort_aggregation():
+    judges = {"a": _judge_strict, "b": _judge_strict}
+    items = [{"query": "q", "record": _pivota_record()} for _ in range(3)]
+    agg = be.compare_behavioral_multi_cohort(items, judges)
+    assert agg["n"] == 3
+    assert agg["avg_pivota_consensus_score"] == 4.0
+    assert agg["avg_native_consensus_score"] == 0.0
+    assert agg["avg_consensus_lift"] == 4.0
+    assert agg["avg_pivota_agreement"] == 1.0

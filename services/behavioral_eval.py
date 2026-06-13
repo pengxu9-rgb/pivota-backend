@@ -169,3 +169,81 @@ def compare_behavioral_cohort(
         "native_recommend_rate": round(sum(1 for r in rows if r["native_recommends"]) / n, 3),
         "rows": rows,
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-model judging. A single judge (e.g. Claude-only) can be biased; running
+# the SAME prompt through several frontier models (ChatGPT + Gemini + Claude --
+# Perplexity is out, project_skip_perplexity_for_multillm) and taking a per-axis
+# MAJORITY consensus turns a suggestive signal into a defensible one, and the
+# inter-judge AGREEMENT score reports how robust each verdict is. judges is a dict
+# {model_name: judge_fn}; each judge_fn is the model's completion call (wired by
+# the runner / a keyed env / a Codex job -- not here).
+# ---------------------------------------------------------------------------
+
+def _consensus(verdicts: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-axis majority across judges + agreement (1.0 = unanimous per axis)."""
+    names = list(verdicts.keys())
+    k = len(names) or 1
+    out: Dict[str, Any] = {}
+    agreements: List[float] = []
+    for axis in _AXES:
+        yes = sum(1 for n in names if verdicts[n].get(axis))
+        out[axis] = yes * 2 > k  # strict majority
+        agreements.append(max(yes, k - yes) / k)
+    out["score"] = sum(1 for axis in _AXES if out[axis])
+    out["agreement"] = round(sum(agreements) / len(_AXES), 3) if _AXES else 1.0
+    return out
+
+
+def score_card_multi(
+    query: str, record: Dict[str, Any], judges: Dict[str, JudgeFn]
+) -> Dict[str, Dict[str, Any]]:
+    """Run the SAME actionability prompt through every judge; return per-judge verdicts."""
+    prompt = actionability_prompt(query, build_context_card(record))
+    return {name: parse_actionability(fn(prompt)) for name, fn in judges.items()}
+
+
+def compare_behavioral_multi(
+    query: str, record: Dict[str, Any], judges: Dict[str, JudgeFn]
+) -> Dict[str, Any]:
+    """Pivota vs native, judged by a panel; per-judge verdicts + majority consensus."""
+    pv = score_card_multi(query, record, judges)
+    nv = score_card_multi(query, native_baseline_record(record), judges)
+    pc, nc = _consensus(pv), _consensus(nv)
+    return {
+        "query": query,
+        "judges": list(judges.keys()),
+        "pivota": {
+            "per_judge": {n: pv[n]["score"] for n in pv},
+            "consensus": {a: pc[a] for a in _AXES},
+            "score": pc["score"],
+            "agreement": pc["agreement"],
+        },
+        "native": {
+            "per_judge": {n: nv[n]["score"] for n in nv},
+            "consensus": {a: nc[a] for a in _AXES},
+            "score": nc["score"],
+            "agreement": nc["agreement"],
+        },
+        "consensus_score_lift": pc["score"] - nc["score"],
+        "per_judge_lift": {n: pv[n]["score"] - nv[n]["score"] for n in pv},
+    }
+
+
+def compare_behavioral_multi_cohort(
+    items: List[Dict[str, Any]], judges: Dict[str, JudgeFn]
+) -> Dict[str, Any]:
+    rows = [compare_behavioral_multi(it["query"], it["record"], judges) for it in items or []]
+    n = len(rows)
+    if not n:
+        return {"n": 0, "judges": list(judges.keys()), "rows": []}
+    return {
+        "n": n,
+        "judges": list(judges.keys()),
+        "avg_pivota_consensus_score": round(sum(r["pivota"]["score"] for r in rows) / n, 3),
+        "avg_native_consensus_score": round(sum(r["native"]["score"] for r in rows) / n, 3),
+        "avg_consensus_lift": round(sum(r["consensus_score_lift"] for r in rows) / n, 3),
+        "avg_pivota_agreement": round(sum(r["pivota"]["agreement"] for r in rows) / n, 3),
+        "rows": rows,
+    }
