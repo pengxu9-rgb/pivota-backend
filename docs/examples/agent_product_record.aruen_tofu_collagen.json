@@ -1,0 +1,112 @@
+{
+  "$schema": "pivota.agent_product_record/v1",
+  "pivota_id": "sig_42edfffb0998c8e528926e26e82a7945",
+  "pivota_url": "https://agent.pivota.cc/products/sig_42edfffb0998c8e528926e26e82a7945",
+  "as_of": "2026-06-13",
+  "summary_for_agent": "Aruen Tofu Collagen Dual-Firming Jelly Cream — a vegan K-beauty gel moisturizer for firmness/elasticity and hydration. Verified actives: niacinamide, hydrolyzed collagen, soy (tofu) isoflavones, adenosine. US-buyable brand-direct at $22.99. Every claim below is grounded in the verified ingredient list; no medical/efficacy claims.",
+
+  "identity": {
+    "title": "Tofu Collagen Dual-Firming Jelly Cream",
+    "brand": "Aruen",
+    "brand_origin": "South Korea (K-beauty)",
+    "category_kind": "skincare",
+    "subcategory": "moisturizer",
+    "format": "jelly cream (gel-cream)",
+    "country_of_sale": "US"
+  },
+
+  "find": {
+    "_comment": "How an agent matches this to a shopper's need.",
+    "skin_concerns": ["firmness / elasticity", "hydration / plumping", "dullness / uneven tone"],
+    "skin_types": ["normal", "dry", "combination", "mature / firmness-focused"],
+    "routine_step": "moisturizer (AM/PM, before SPF)",
+    "texture": "lightweight jelly / gel-cream",
+    "vegan": true,
+    "cruelty_free": true
+  },
+
+  "ingredients": {
+    "_comment": "The canonical, verified asset. Sourced from the brand, shared across every seller.",
+    "inci_full": [
+      "Lactobacillus/Soymilk Ferment Filtrate", "Glycerin", "Butylene Glycol", "1,2-Hexanediol",
+      "Caprylic/Capric Triglyceride", "Niacinamide", "PEG-240/HDI Copolymer Bis-Decyltetradeceth-20 Ether",
+      "Water", "Vigna Radiata (Mung Bean) Seed Extract", "Hydrolyzed Collagen",
+      "Lactobacillus/Soybean Ferment Extract", "Lens Esculenta (Lentil) Fruit Extract",
+      "Pisum Sativum (Pea) Seed Extract", "Glycine Soja (Soybean) Seed Extract",
+      "Hydrogenated Polyisobutene", "Glyceryl Glucoside", "Sodium Acrylate/Sodium Acryloyldimethyl Taurate Copolymer",
+      "Hydroxyacetophenone", "Propanediol", "Isohexadecane", "Ethylhexylglycerin", "Xanthan Gum",
+      "Polysorbate 80", "Adenosine", "Trisodium Ethylenediamine Disuccinate"
+    ],
+    "key_actives": [
+      {"name": "Soy / Tofu complex", "inci": ["Glycine Soja (Soybean) Seed Extract", "Lactobacillus/Soymilk Ferment Filtrate", "Lactobacillus/Soybean Ferment Extract"], "role": "firming & elasticity (soy isoflavones / phytoestrogens), antioxidant", "verified": true},
+      {"name": "Hydrolyzed Collagen", "inci": ["Hydrolyzed Collagen"], "role": "hydration, plumping, smoothness", "verified": true},
+      {"name": "Niacinamide", "inci": ["Niacinamide"], "role": "brightening, even tone, barrier support", "verified": true},
+      {"name": "Adenosine", "inci": ["Adenosine"], "role": "firmness / smoothing the look of fine lines", "verified": true},
+      {"name": "Plant amino-acid proteins", "inci": ["Pisum Sativum (Pea) Seed Extract", "Lens Esculenta (Lentil) Fruit Extract", "Vigna Radiata (Mung Bean) Seed Extract"], "role": "conditioning / firmness support", "verified": true},
+      {"name": "Glyceryl Glucoside + Glycerin", "inci": ["Glyceryl Glucoside", "Glycerin"], "role": "humectant hydration", "verified": true}
+    ],
+    "fragrance_free": true,
+    "essential_oil_free": true
+  },
+
+  "justify": {
+    "_comment": "Cited, claim-safe benefit claims. Each is grounded in a verified ingredient mechanism — never asserted bare. No drug/medical claims.",
+    "claims": [
+      {"claim": "Helps firm and improve the look of elasticity", "basis": "soy isoflavones (tofu/soybean ferment) + hydrolyzed collagen + adenosine + plant amino acids", "substantiation": "ingredient_mechanism", "claim_safe": true},
+      {"claim": "Hydrates and helps plump the skin", "basis": "glycerin + glyceryl glucoside + hydrolyzed collagen + soymilk ferment", "substantiation": "ingredient_mechanism", "claim_safe": true},
+      {"claim": "Helps brighten and even the look of skin tone", "basis": "niacinamide", "substantiation": "ingredient_mechanism", "claim_safe": true},
+      {"claim": "Supports the look of a healthy skin barrier", "basis": "niacinamide + Lactobacillus ferment", "substantiation": "ingredient_mechanism", "claim_safe": true}
+    ],
+    "not_claimed": "No anti-aging-disease, wrinkle-removal, or other drug/medical claims — this is a cosmetic. Cosmetic-vs-drug screened.",
+    "review_state": "observed (ingredient-grounded; not a clinical trial of the finished product)"
+  },
+
+  "trust": {
+    "authenticity": "Ingredient list + product record sourced from the brand-official site (aruen.us); not a reseller listing.",
+    "counterfeit_risk": "low — routed to a brand-direct offer",
+    "certifications": [
+      {"type": "vegan", "status": "claimed", "note": "brand-stated; upgrades to 'verified' with a recognized certifying authority"},
+      {"type": "cruelty_free", "status": "claimed", "note": "brand-stated"}
+    ]
+  },
+
+  "buy": {
+    "_comment": "US-buyable, brand-direct prioritized — helping the brand gain US AI-channel share, not just routing to a marketplace.",
+    "best_offer": {
+      "seller": "Aruen (brand-direct)",
+      "offer_type": "brand_direct",
+      "market": "US",
+      "price": "22.99",
+      "currency": "USD",
+      "variant": "1-Pack",
+      "url": "https://aruen.us/products/tofu-collagen-dual-firming-jelly-cream",
+      "first_party": true
+    },
+    "all_offers": ["brand_direct: Aruen — $22.99 USD (US)"]
+  },
+
+  "compare": {
+    "_comment": "Cross-brand alternatives within the category — supply-gated until more K-beauty firming creams are indexed.",
+    "alternatives": [],
+    "alternatives_status": "unlocks as more same-category brands are indexed",
+    "vs_native_retrieval": "A frontier model on its own surfaces a title and maybe a marketplace link. Pivota adds: verified full INCI, ingredient-grounded + claim-safe benefit claims, a brand-direct US offer, and provenance on every field — none of which native retrieval has for a long-tail K-beauty SKU."
+  },
+
+  "outcomes": {
+    "_comment": "The compounding moat — accrues per SKU as Pivota transacts; not yet available for this SKU.",
+    "repurchase_rate": null,
+    "return_rate": null,
+    "satisfaction": null
+  },
+
+  "provenance": {
+    "_comment": "Why an agent can trust each field — every signal is traceable.",
+    "identity": "brand-official + Pivota canonical resolution (content_key)",
+    "ingredients": {"source": "brand_official", "url": "https://aruen.us/products/tofu-collagen-dual-firming-jelly-cream", "sourced_at": "2026-06-13"},
+    "key_actives": "derived from the verified INCI (source=inci)",
+    "claims": "ingredient_mechanism (each claim cites the responsible verified ingredient)",
+    "certifications": "brand-stated (claimed) — pending authority verification",
+    "offer": "brand-direct",
+    "precedence_rule": "brand-official > supplier-provided > reseller listing — a reseller sync can never overwrite this record"
+  }
+}
