@@ -24,6 +24,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional
+from urllib.parse import urlparse
 
 from services.beauty_enrichment import parse_inci
 
@@ -142,19 +143,73 @@ async def resolve_inci_from_openbeautyfacts(
 Fetcher = Callable[[str], Awaitable[Optional[str]]]
 
 
+_SHOPIFY_PRODUCT_PATH_RE = re.compile(r"/products/[^/?#]+", re.IGNORECASE)
+
+
+def shopify_product_json_url(url: Optional[str]) -> Optional[str]:
+    """Map a Shopify PDP URL to its public product-JSON endpoint, or None.
+
+    https://brand.com/products/handle?variant=1 -> https://brand.com/products/handle.json
+    Also collapses a /collections/x/products/handle path to /products/handle.json.
+    The .json endpoint returns structured product data (body_html etc.) even when
+    the rendered PDP loads ingredients via JavaScript -- which a plain GET misses.
+    """
+    if not url:
+        return None
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    match = _SHOPIFY_PRODUCT_PATH_RE.search(parsed.path)
+    if not match or not parsed.netloc:
+        return None
+    handle_path = match.group(0)
+    if not handle_path.endswith(".json"):
+        handle_path = f"{handle_path}.json"
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}{handle_path}"
+
+
+def extract_inci_from_shopify_json(json_text: Optional[str]) -> Optional[str]:
+    """Pull an INCI list from a Shopify product-JSON response. Ingredients live in
+    body_html (the description), so it runs through the HTML-aware text extractor."""
+    if not json_text:
+        return None
+    try:
+        data = json.loads(json_text)
+    except Exception:  # noqa: BLE001
+        return None
+    product = data.get("product") if isinstance(data, dict) else None
+    if not isinstance(product, dict):
+        return None
+    return extract_inci_from_text(product.get("body_html"))
+
+
+async def resolve_inci_from_url(url: str, *, fetch: "Fetcher") -> Optional["ResolvedInci"]:
+    """Resolve INCI from one URL: try the Shopify product-JSON endpoint first
+    (structured, survives JS-rendered PDPs), then the rendered page as fallback."""
+    json_url = shopify_product_json_url(url)
+    if json_url:
+        try:
+            body = await fetch(json_url)
+        except Exception:  # noqa: BLE001
+            body = None
+        inci = extract_inci_from_shopify_json(body)
+        if inci:
+            return ResolvedInci(raw_inci=inci, source_url=json_url)
+    try:
+        text = await fetch(url)
+    except Exception:  # noqa: BLE001
+        return None
+    inci = extract_inci_from_text(text)
+    return ResolvedInci(raw_inci=inci, source_url=url) if inci else None
+
+
 async def resolve_inci_from_urls(urls: List[str], *, fetch: Fetcher) -> Optional[ResolvedInci]:
     """Try candidate authoritative URLs in order; return the first that yields a
-    valid INCI, tagged with the URL it came from."""
+    valid INCI (Shopify product-JSON preferred per URL), tagged with its source."""
     for url in urls:
         if not url:
             continue
-        try:
-            text = await fetch(url)
-        except Exception:  # noqa: BLE001 -- a dead source must not abort resolution
-            continue
-        inci = extract_inci_from_text(text)
-        if inci:
-            return ResolvedInci(raw_inci=inci, source_url=url)
+        resolved = await resolve_inci_from_url(url, fetch=fetch)
+        if resolved:
+            return resolved
     return None
 
 
