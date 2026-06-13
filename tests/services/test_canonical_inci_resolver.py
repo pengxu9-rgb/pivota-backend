@@ -11,10 +11,13 @@ import json
 from services.canonical_inci_resolver import (
     ResolvedInci,
     extract_inci_from_openbeautyfacts,
+    extract_inci_from_shopify_json,
     extract_inci_from_text,
     open_beauty_facts_url,
     resolve_inci_from_openbeautyfacts,
+    resolve_inci_from_url,
     resolve_inci_from_urls,
+    shopify_product_json_url,
 )
 
 
@@ -122,6 +125,47 @@ def test_obf_prefers_english_text_and_rejects_junk():
     # no product / not-found OBF response -> None
     assert extract_inci_from_openbeautyfacts(json.dumps({"status": 0})) is None
     assert extract_inci_from_openbeautyfacts("not json") is None
+
+
+# --- Shopify product-JSON adapter ---------------------------------------------
+
+def test_shopify_product_json_url():
+    assert shopify_product_json_url("https://brand.com/products/glow-serum?variant=1") == \
+        "https://brand.com/products/glow-serum.json"
+    assert shopify_product_json_url("https://brand.com/collections/all/products/handle") == \
+        "https://brand.com/products/handle.json"
+    assert shopify_product_json_url("https://brand.com/products/handle.json") == \
+        "https://brand.com/products/handle.json"
+    assert shopify_product_json_url("https://brand.com/pages/about") is None
+    assert shopify_product_json_url(None) is None
+
+
+def test_extract_inci_from_shopify_json_body_html():
+    body = json.dumps({"product": {
+        "title": "Glow Serum",
+        "body_html": "<p>A glow serum.</p><p>Ingredients: Aqua, Niacinamide, Glycerin, Phenoxyethanol</p>",
+    }})
+    inci = extract_inci_from_shopify_json(body)
+    assert inci is not None and "Niacinamide" in inci
+    assert extract_inci_from_shopify_json(json.dumps({"product": {"body_html": "no list"}})) is None
+    assert extract_inci_from_shopify_json("not json") is None
+
+
+def test_resolve_from_url_prefers_shopify_json_over_rendered_page():
+    json_url = "https://brand.com/products/glow.json"
+    fetch = _fetch({
+        json_url: json.dumps({"product": {"body_html": "Ingredients: Aqua, Niacinamide, Glycerin, Carbomer"}}),
+        "https://brand.com/products/glow": "JS shell, no ingredients here",  # rendered page lacks INCI
+    })
+    res = asyncio.run(resolve_inci_from_url("https://brand.com/products/glow", fetch=fetch))
+    assert res is not None and res.source_url == json_url  # used the .json endpoint
+    assert "Niacinamide" in res.raw_inci
+
+
+def test_resolve_from_url_falls_back_to_html_for_non_shopify():
+    fetch = _fetch({"https://brand.com/p/123": "Ingredients: Water, Glycerin, Niacinamide, Panthenol, Carbomer"})
+    res = asyncio.run(resolve_inci_from_url("https://brand.com/p/123", fetch=fetch))
+    assert res is not None and res.source_url == "https://brand.com/p/123"
 
 
 def test_resolve_from_openbeautyfacts_by_barcode():
