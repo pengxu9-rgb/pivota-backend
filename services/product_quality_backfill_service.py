@@ -14,6 +14,7 @@ from db.product_quality_backfill_jobs import (
     update_quality_backfill_job_progress,
 )
 from db.products import get_cached_products, products_cache
+from services.beauty_enrichment_persist import maybe_enrich_synced_product
 from services.product_quality_service import (
     build_quality_payload_from_cache_row,
     fetch_latest_quality_rows,
@@ -130,6 +131,9 @@ async def _process_claimed_quality_backfill_job(job: Dict[str, Any]) -> Dict[str
                     geo_code="default",
                     payload=payload,
                 )
+                # On-sync auto-enrichment (flag-gated, off by default; best-effort
+                # -- the helper swallows its own errors so it can't fail the job).
+                await maybe_enrich_synced_product(merchant_id, key[0], key[1])
                 processed += 1
             except Exception as exc:
                 failed += 1

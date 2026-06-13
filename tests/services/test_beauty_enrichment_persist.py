@@ -142,6 +142,52 @@ def test_missing_product_returns_not_found(monkeypatch):
     assert res["status"] == "not_found"
 
 
+def test_enrich_skips_non_beauty_early(monkeypatch):
+    _patch_recompute(monkeypatch, [])
+    db = FakeDB(cp={**_CP, "category_kind": None})
+    res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
+    assert res["status"] == "skipped_non_beauty"
+    assert db.executed == []  # no sku/profile reads or writes
+
+
+def test_maybe_enrich_disabled_by_default(monkeypatch):
+    monkeypatch.delenv(persist.AUTO_ENRICHMENT_FLAG, raising=False)
+    called = []
+
+    async def _fake(pk, *, db=None):
+        called.append(pk)
+        return {}
+
+    monkeypatch.setattr(persist, "enrich_and_persist_product", _fake)
+    res = asyncio.run(persist.maybe_enrich_synced_product("m", "shopify", "123"))
+    assert res is None and called == []  # flag off -> never touches enrichment
+
+
+def test_maybe_enrich_enabled_builds_key_and_calls(monkeypatch):
+    monkeypatch.setenv(persist.AUTO_ENRICHMENT_FLAG, "true")
+    called = []
+
+    async def _fake(pk, *, db=None):
+        called.append(pk)
+        return {"status": "ok", "product_key": pk}
+
+    monkeypatch.setattr(persist, "enrich_and_persist_product", _fake)
+    res = asyncio.run(persist.maybe_enrich_synced_product("merch_x", "shopify", "999"))
+    assert called == ["prod::merch_x::shopify::999"]  # canonical product_key
+    assert res["status"] == "ok"
+
+
+def test_maybe_enrich_swallows_errors(monkeypatch):
+    monkeypatch.setenv(persist.AUTO_ENRICHMENT_FLAG, "true")
+
+    async def _boom(pk, *, db=None):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(persist, "enrich_and_persist_product", _boom)
+    # Best-effort: never propagates -> returns None so it can't break the sync.
+    assert asyncio.run(persist.maybe_enrich_synced_product("m", "shopify", "1")) is None
+
+
 def test_backfill_drive_aggregates(monkeypatch):
     from scripts import run_beauty_enrichment_backfill as runner
 
