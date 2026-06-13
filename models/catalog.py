@@ -272,6 +272,13 @@ class OfferNode(BaseModel):
     offer_type: Optional[str] = None
     market: str = "US"
     is_first_party: bool = False
+    # official_source is the authenticity/trust signal distinct from is_first_party
+    # (which means a Pivota merchant's OWN storefront): True when the offer is
+    # served from the BRAND'S OWN official domain (offer source_domain matches the
+    # product's canonical PDP host) — e.g. an official-brand-DTC seed. A retailer
+    # or marketplace mirror is NOT official_source. Lets the decision-grade `trust`
+    # dimension pass on official-brand seeds that are correctly not is_first_party.
+    official_source: bool = False
     why_buy_direct: Optional[str] = None
     pricing: PivotPricing = Field(default_factory=PivotPricing)
     incentives: List[IncentiveNode] = Field(default_factory=list)

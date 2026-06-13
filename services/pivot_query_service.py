@@ -528,6 +528,32 @@ def _estimate_best_price(base_price: Optional[Decimal], incentives: List[Incenti
     return best
 
 
+def _registrable_host(value: Optional[str]) -> Optional[str]:
+    """Lowercased host without scheme / path / leading 'www.' (last two labels)."""
+    if not value:
+        return None
+    host = str(value).strip().lower()
+    host = re.sub(r"^[a-z]+://", "", host).split("/")[0].split("?")[0]
+    host = re.sub(r"^www\.", "", host)
+    if not host:
+        return None
+    labels = host.split(".")
+    return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+
+def _is_official_brand_source(
+    source_domain: Optional[str], canonical_url: Optional[str]
+) -> bool:
+    """True when the offer is served from the brand's OWN official domain — its
+    source_domain matches the canonical PDP host (e.g. an official-brand-DTC seed:
+    a cosrx.com offer on a cosrx.com canonical PDP). A retailer/marketplace mirror
+    has a different source_domain and is NOT official. Conservative: both hosts
+    must be present and registrable-domain equal."""
+    src = _registrable_host(source_domain)
+    canon = _registrable_host(canonical_url)
+    return bool(src and canon and src == canon)
+
+
 def _build_canonical_offer_node(
     row: Dict[str, Any],
     incentives: List[IncentiveNode],
@@ -559,6 +585,14 @@ def _build_canonical_offer_node(
     offer_type = row.get("offer_offer_type")
     if offer_type is None and catalog_track == "external_referral":
         offer_type = classify_offer_type(catalog_track)
+    # official_source: the offer is served from the brand's OWN official domain
+    # (offer source_domain == the product's canonical PDP host). This is the
+    # authenticity/trust signal for official-brand-DTC seeds that are correctly
+    # NOT is_first_party. Stored is_first_party offers are already official.
+    official_source = bool(is_first_party) or _is_official_brand_source(
+        row.get("offer_source_domain") or row.get("source_domain"),
+        row.get("canonical_url"),
+    )
     return OfferNode(
         offer_id=str(row.get("offer_id") or ""),
         catalog_track=catalog_track,
@@ -571,6 +605,7 @@ def _build_canonical_offer_node(
         offer_type=offer_type,
         market=str(row.get("offer_market") or "US"),
         is_first_party=bool(is_first_party),
+        official_source=official_source,
         why_buy_direct=row.get("offer_why_buy_direct"),
         pricing=PivotPricing(
             currency=row.get("currency"),
@@ -835,6 +870,7 @@ async def _fetch_canonical_search_rows(
             o.offer_type AS offer_offer_type,
             o.market AS offer_market,
             o.is_first_party AS offer_is_first_party,
+            o.source_domain AS offer_source_domain,
             o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload,
             c.rank_score + CASE WHEN o.catalog_track = 'internal_merchant' THEN 10 ELSE 0 END AS rank_score
@@ -897,6 +933,7 @@ async def _fetch_canonical_rows_for_product(product_key: str) -> List[Dict[str, 
             o.offer_type AS offer_offer_type,
             o.market AS offer_market,
             o.is_first_party AS offer_is_first_party,
+            o.source_domain AS offer_source_domain,
             o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload
         FROM catalog_products p
@@ -960,6 +997,7 @@ async def _fetch_canonical_rows_for_sku(sku_key: str) -> List[Dict[str, Any]]:
             o.offer_type AS offer_offer_type,
             o.market AS offer_market,
             o.is_first_party AS offer_is_first_party,
+            o.source_domain AS offer_source_domain,
             o.why_buy_direct AS offer_why_buy_direct,
             o.offer_payload
         FROM catalog_skus s
