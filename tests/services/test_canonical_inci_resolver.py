@@ -51,6 +51,31 @@ def test_no_ingredients_label_returns_none():
     assert extract_inci_from_text("This serum brightens and deeply hydrates the skin.") is None
 
 
+def test_bare_ingredients_header_accordion_with_trailing_ui():
+    # Shopify accordion: a bare "INGREDIENTS" header (no colon), the list, then
+    # page/UI text -- the run must stop at the UI text.
+    html = (
+        "<button class='accordion'>INGREDIENTS</button>"
+        "<div class='rte'>Aqua, Niacinamide, Glycerin, Sodium Hyaluronate, Phenoxyethanol</div>"
+        "<button>Add to cart</button><div>Reviews</div>"
+    )
+    inci = extract_inci_from_text(html)
+    assert inci == "Aqua, Niacinamide, Glycerin, Sodium Hyaluronate, Phenoxyethanol"
+
+
+def test_inci_substring_inside_word_not_matched():
+    # "inci" inside "principal" / "incision" must not trigger a match.
+    assert extract_inci_from_text("Our principal incision techniques are gentle and safe.") is None
+
+
+def test_skips_nav_ingredients_link_finds_real_list():
+    html = (
+        "<nav><a href='/pages/ingredients'>Ingredients</a> Shop About</nav>"
+        "<section>Ingredients: Water, Glycerin, Niacinamide, Panthenol, Carbomer</section>"
+    )
+    assert "Niacinamide" in extract_inci_from_text(html)
+
+
 def test_label_followed_by_prose_is_rejected():
     # "Ingredients:" but the body is marketing prose, not a list.
     assert extract_inci_from_text("Ingredients: sourced ethically from the finest Korean botanicals") is None
