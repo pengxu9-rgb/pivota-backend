@@ -32,6 +32,41 @@ def test_resolves_from_beauty_category_path(category_path, expected):
     assert resolve_category_kind(category_path=category_path) == expected
 
 
+@pytest.mark.parametrize(
+    ("category_path", "expected"),
+    [
+        # Exact subcategory-less paths must classify (trailing-slash bug fix).
+        ("beauty/skincare", SKINCARE),
+        ("beauty/skincare/", SKINCARE),
+        ("beauty/haircare", HAIRCARE),
+        ("beauty/haircare/", HAIRCARE),
+        ("BEAUTY/HAIRCARE", HAIRCARE),
+    ],
+)
+def test_resolves_exact_subcategoryless_path(category_path, expected):
+    assert resolve_category_kind(category_path=category_path) == expected
+
+
+def test_explicit_supplement_path_is_supplement():
+    # Ownist "beauty/wellness/beauty-supplements/sets" must not drop to None.
+    assert (
+        resolve_category_kind(category_path="beauty/wellness/beauty-supplements/sets")
+        == SUPPLEMENT
+    )
+    assert resolve_category_kind(category_path="beauty/supplements") == SUPPLEMENT
+
+
+def test_bare_beauty_path_reaches_supplement_text_detection():
+    # A bare "beauty" path no longer blocks supplement text detection (Ownist
+    # "Triple Collagen" jelly sticks: ingestible active + dosage form).
+    assert (
+        resolve_category_kind(category_path="beauty", title="Triple Collagen jelly stick")
+        == SUPPLEMENT
+    )
+    # But a bare path with no ingestible signal is still unknown, not guessed.
+    assert resolve_category_kind(category_path="beauty", title="Velvet Lip Tint") is None
+
+
 def test_supplement_detected_from_form_plus_active():
     # BB Lab "Good Night Collagen 30 sticks": collagen + ingestible form.
     assert (
