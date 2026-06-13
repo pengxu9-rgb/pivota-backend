@@ -4242,6 +4242,178 @@ def _failing_prompts(probe_runs: Any, cap: int = 20) -> List[Dict[str, Any]]:
     return out
 
 
+def _custom_prompt_runs_by_prompt(
+    probe_runs_by_sku: Any,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Group axis="custom" probe runs by their prompt text.
+
+    Custom prompts are probed once (attached to the first SKU — see
+    run_per_sku_audit_probe_fanout), so they live in whichever SKU's probe
+    payload they rode on. Tolerant of either the per-SKU mapping
+    ({sku_key: [probe_payload, ...]}) or a bare probe-payload list.
+    """
+    groups = (
+        probe_runs_by_sku.values()
+        if isinstance(probe_runs_by_sku, dict)
+        else _json_list(probe_runs_by_sku)
+    )
+    by_prompt: Dict[str, List[Dict[str, Any]]] = {}
+    for sku_runs in groups:
+        for run in _flatten_probe_runs(sku_runs):
+            meta = run.get("axis_metadata")
+            axis = (
+                str((meta or {}).get("axis") or "")
+                if isinstance(meta, dict)
+                else str(run.get("axis") or "")
+            ).strip().lower()
+            if axis != "custom":
+                continue
+            prompt = str(run.get("query") or "").strip()
+            if not prompt:
+                continue
+            by_prompt.setdefault(prompt, []).append(run)
+    return by_prompt
+
+
+def _custom_prompt_evidence_excerpt(runs: List[Dict[str, Any]]) -> Optional[str]:
+    for run in runs:
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+        excerpt = (
+            run.get("evidence_excerpt")
+            or parsed.get("evidence_excerpt")
+            or parsed.get("evidence_text")
+            or parsed.get("answer")
+        )
+        text = str(excerpt or "").strip()
+        if text:
+            return text[:600]
+    return None
+
+
+def build_custom_prompt_results(
+    probe_runs_by_sku: Any,
+    custom_prompts: Optional[List[str]] = None,
+    *,
+    merchant_host: Optional[str] = None,
+    merchant_brand: Optional[str] = None,
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
+) -> List[Dict[str, Any]]:
+    """Per-prompt outcomes for the merchant's custom ("Your Prompts") slots.
+
+    The custom prompts a merchant adds to a per-SKU audit are probed once
+    (axis="custom") but the per-SKU scorecard only scores the auto-generated
+    branded/category queries — so those probes ran and persisted without ever
+    being surfaced. This turns them into the open-vs-contested-lane table the
+    feature promises: per prompt → was the brand cited, the sources the AI
+    grounded in, and which competitors it named instead.
+
+    Pure function over the persisted probe runs (no DB, no LLM). "cited" is the
+    brand-grounding signal the rest of the report uses — the merchant's site or
+    brand name appeared as a grounding source for at least one provider run
+    (alias-aware via extract_cited_hosts), never fabricated. `custom_prompts`
+    (the originally-requested slots) is optional; when given, prompts that
+    produced zero runs are surfaced honestly as `no_signal` instead of being
+    silently dropped (same honesty rule as the billed-but-never-probed bug #820
+    closed).
+    """
+    runs_by_prompt = _custom_prompt_runs_by_prompt(probe_runs_by_sku)
+
+    # Preserve the merchant's requested order when we have it; otherwise fall
+    # back to discovery order. Requested-but-unprobed prompts are appended so a
+    # dropped/failed slot reads as "no signal yet", not "absent from the lane".
+    ordered_prompts: List[str] = []
+    seen_prompt_keys: set[str] = set()
+    for prompt in custom_prompts or []:
+        text = str(prompt or "").strip()
+        key = text.lower()
+        if text and key not in seen_prompt_keys:
+            seen_prompt_keys.add(key)
+            ordered_prompts.append(text)
+    for prompt in runs_by_prompt:
+        if prompt.lower() not in seen_prompt_keys:
+            seen_prompt_keys.add(prompt.lower())
+            ordered_prompts.append(prompt)
+
+    results: List[Dict[str, Any]] = []
+    for prompt in ordered_prompts:
+        runs = [
+            run
+            for run in runs_by_prompt.get(prompt, [])
+            if str(run.get("status") or "") != "probe_failed"
+        ]
+        if not runs:
+            results.append({
+                "prompt": prompt,
+                "cited": False,
+                "lane": "no_signal",
+                "runs": 0,
+                "runs_cited": 0,
+                "cited_sources": [],
+                "grounding_sources": [],
+                "competitors": [],
+                "competitors_count": 0,
+                "evidence_excerpt": None,
+            })
+            continue
+
+        competitors, merchant_cited_runs, runs_with_any = extract_cited_hosts(
+            runs,
+            merchant_host=merchant_host,
+            merchant_brand=merchant_brand,
+            merchant_vendors=merchant_vendors,
+        )
+
+        # Distinct sources the AI grounded in, split into "the brand" vs
+        # everyone else. Dedup across this prompt's provider runs by source key.
+        grounding_sources: List[str] = []
+        cited_sources: List[str] = []
+        seen_source_keys: set[str] = set()
+        for run in runs:
+            for src in _identify_run_sources(run):
+                label = str(src.get("label") or "").strip()
+                if not label:
+                    continue
+                key = str(src.get("key") or label.lower())
+                if key in seen_source_keys:
+                    continue
+                seen_source_keys.add(key)
+                grounding_sources.append(label)
+                if _source_matches_merchant(
+                    src,
+                    merchant_host=merchant_host,
+                    merchant_brand=merchant_brand,
+                    merchant_vendors=merchant_vendors,
+                ):
+                    cited_sources.append(label)
+
+        competitor_labels = [label for label, _count in competitors.most_common(8)]
+        cited = merchant_cited_runs > 0
+        if cited:
+            lane = "open" if len(competitor_labels) <= 2 else "contested"
+        elif runs_with_any > 0:
+            # The AI answered with grounded sources but never the brand — the
+            # lane is owned by competitors/retailers.
+            lane = "absent"
+        else:
+            # Probes ran but returned no grounding at all (thin/no demand).
+            lane = "no_signal"
+
+        results.append({
+            "prompt": prompt,
+            "cited": cited,
+            "lane": lane,
+            "runs": len(runs),
+            "runs_cited": merchant_cited_runs,
+            "cited_sources": cited_sources[:8],
+            "grounding_sources": grounding_sources[:12],
+            "competitors": competitor_labels,
+            "competitors_count": len(competitors),
+            "evidence_excerpt": _custom_prompt_evidence_excerpt(runs),
+        })
+
+    return results
+
+
 # Merchant-safe display copy for every scoring bucket emitted by the
 # compute_*_score functions. The raw bucket keys and `missing` schema names
 # (e.g. "product_quality_score", "catalog_products.content_key") are INTERNAL
@@ -7489,6 +7661,7 @@ async def run_brand_report(
     merchant_id: Optional[str] = None,
     audit_run_id: Optional[str] = None,
     verify_providers: Optional[List[str]] = None,
+    custom_prompts: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run BD probes against up to 5 products of one merchant and
     aggregate into a brand-level report.
@@ -7594,6 +7767,23 @@ async def run_brand_report(
             probe_runs_by_sku,
             provider_model_metadata,
         )
+        # Surface the merchant's custom ("Your Prompts") slots as an
+        # open-vs-contested-lane table. They were probed (axis="custom") but the
+        # per-SKU scorecard only scores the auto-generated queries, so without
+        # this they ran + billed without ever being shown (the same silent-drop
+        # family #820 closed at the probe layer).
+        custom_prompt_results = build_custom_prompt_results(
+            probe_runs_by_sku,
+            custom_prompts,
+            merchant_host=normalize_host(merchant_domain) or (
+                (merchant_domain or "").strip() or None
+            ),
+            merchant_brand=merchant_name,
+            merchant_vendors=_merchant_identity_tuple(
+                merchant_name,
+                *[p.get("vendor") for p in products if isinstance(p, dict)],
+            ),
+        )
         return {
             "audit_run_id": audit_run_id,
             "merchant_id": str(merchant_id),
@@ -7610,6 +7800,7 @@ async def run_brand_report(
             "model_is_override": _any_model_override(provider_model_metadata),
             "per_sku_reports": per_sku_reports,
             "brand_rollup": brand_rollup,
+            "custom_prompts": custom_prompt_results,
             "verify_summary": _rollup_verify_summaries(per_sku_reports),
             "authority_map": authority_map,
             "brand_state": brand_state,
