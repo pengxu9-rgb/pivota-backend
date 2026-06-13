@@ -4628,6 +4628,134 @@ def _sku_band(scores: Dict[str, Any]) -> str:
     return _band_for_score(min(values) if values else None)
 
 
+# Merchant-facing band + dimension copy. Mirrors _GAP_DISPLAY: the band enum
+# ("agent_ready"/"ready"/"partial"/"blocked") and the four dimension keys are
+# INTERNAL vocabulary that must never reach a merchant as a raw token. The
+# per-SKU report emits, per dimension, {band, band_label, meaning,
+# dimension_label, question} derived from this table so the threshold lives in
+# ONE place (here + _band_for_score) and the frontend can stop re-deriving
+# bands from a duplicated color ramp (dimensionScoreColor) that disagreed with
+# the backend. The coverage-guard test (tests/test_audit_dimension_meaning.py)
+# asserts every (dimension, band) pair has copy so a new band/dimension can't
+# ship without it. Keep copy jargon-free: no "/100", no schema underscores, no
+# metric names, never the literal word "score".
+_BAND_DISPLAY: Dict[str, Dict[str, str]] = {
+    "agent_ready": {
+        "label": "Agent-ready",
+        "meaning": "AI can confidently find, understand, and recommend this.",
+    },
+    "ready": {
+        "label": "Ready",
+        "meaning": "AI can find and use this; only minor gaps remain.",
+    },
+    "partial": {
+        "label": "Needs work",
+        "meaning": "AI can sometimes use this, but key details are missing.",
+    },
+    "blocked": {
+        "label": "Not yet visible",
+        "meaning": "AI can't reliably find or recommend this yet.",
+    },
+    # Distinct from "blocked": the dimension was never measured (no resolvable
+    # product / unaudited SKU), not measured-and-failing. Different copy.
+    "unscored": {
+        "label": "Not measured",
+        "meaning": "This wasn't measured in this audit.",
+    },
+}
+
+# The four scored dimensions: merchant-safe label + the one-line question the
+# dimension answers (rendered as the per-dimension tooltip / sub-label).
+_DIMENSION_DISPLAY: Dict[str, Dict[str, str]] = {
+    "identity": {
+        "label": "Identity",
+        "question": "Can AI tell exactly which product this is?",
+    },
+    "content_richness": {
+        "label": "Content",
+        "question": "Does the listing answer what shoppers ask?",
+    },
+    "routability": {
+        "label": "Routability",
+        "question": "Can AI hand a shopper a buyable offer?",
+    },
+    "citation": {
+        "label": "Citation",
+        "question": "Does AI actually recommend you?",
+    },
+}
+
+# (dimension, band) -> one-line meaning specialized to the dimension. Falls back
+# to the generic _BAND_DISPLAY meaning if a pair is missing, but the coverage
+# guard requires every (dimension, band) for the four real bands.
+_DIMENSION_BAND_MEANING: Dict[Tuple[str, str], str] = {
+    ("identity", "agent_ready"): "AI can pinpoint exactly which product this is.",
+    ("identity", "ready"): "AI can identify this product, with only minor ambiguity.",
+    ("identity", "partial"): "AI can sometimes identify this, but may confuse it with similar products.",
+    ("identity", "blocked"): "AI can't reliably tell which product this is.",
+    ("content_richness", "agent_ready"): "The listing answers what shoppers and AI ask.",
+    ("content_richness", "ready"): "The listing covers most shopper questions; a few details are thin.",
+    ("content_richness", "partial"): "The listing answers some questions but leaves clear gaps.",
+    ("content_richness", "blocked"): "The listing is too thin for AI to describe this product.",
+    ("routability", "agent_ready"): "AI can hand a shopper a buyable offer for this product.",
+    ("routability", "ready"): "AI can route shoppers to an offer, with only minor gaps.",
+    ("routability", "partial"): "AI can sometimes route to an offer, but price, stock, or eligibility is unclear.",
+    ("routability", "blocked"): "AI has no buyable offer to route a shopper to.",
+    ("citation", "agent_ready"): "AI actively recommends this product when shoppers ask.",
+    ("citation", "ready"): "AI recommends this product in most relevant answers.",
+    ("citation", "partial"): "AI mentions this product occasionally, but rarely as the answer.",
+    ("citation", "blocked"): "AI doesn't recommend this product yet.",
+}
+
+
+def _dimension_band(score: Optional[int]) -> str:
+    """Per-dimension band. Distinguishes 'not measured' (None) from 'blocked'
+    (measured but failing) so the merchant sees the right copy. Thresholds are
+    inherited from _band_for_score so banding lives in exactly one place."""
+    if score is None:
+        return "unscored"
+    return _band_for_score(score)
+
+
+def _dimension_display(dimension: str, score: Optional[int]) -> Dict[str, str]:
+    """Merchant-safe {band, band_label, meaning, dimension_label, question} for
+    one dimension at a given score."""
+    band = _dimension_band(score)
+    band_copy = _BAND_DISPLAY.get(band, _BAND_DISPLAY["blocked"])
+    dim_copy = _DIMENSION_DISPLAY.get(
+        dimension,
+        {"label": str(dimension).replace("_", " ").title(), "question": ""},
+    )
+    if band == "unscored":
+        meaning = _BAND_DISPLAY["unscored"]["meaning"]
+    else:
+        meaning = _DIMENSION_BAND_MEANING.get((dimension, band)) or band_copy["meaning"]
+    return {
+        "band": band,
+        "band_label": band_copy["label"],
+        "meaning": meaning,
+        "dimension_label": dim_copy["label"],
+        "question": dim_copy["question"],
+    }
+
+
+def _band_display(band: str) -> Dict[str, str]:
+    """Merchant-safe {band, label, meaning} for a SKU-level (or rollup) band."""
+    copy_ = _BAND_DISPLAY.get(band, _BAND_DISPLAY["blocked"])
+    return {"band": band, "label": copy_["label"], "meaning": copy_["meaning"]}
+
+
+def _attach_dimension_display(scores: Dict[str, Any]) -> None:
+    """In-place: add merchant-safe display copy to each dimension payload in
+    `scores`. Additive — leaves `score` and `breakdown` untouched, so it is safe
+    to call after the server-side consumers (next_best_action, strategic_brief)
+    have already run on the raw scores."""
+    for dimension, payload in scores.items():
+        if not isinstance(payload, dict):
+            continue
+        payload.update(_dimension_display(str(dimension), payload.get("score")))
+
+
 def _impact_proxy_from_context(sku_ctx: Dict[str, Any]) -> float:
     offers = _get_offers(sku_ctx or {})
     prices = [
@@ -4744,6 +4872,12 @@ async def build_per_sku_report(
         else {}
     )
 
+    # Attach merchant-safe band + meaning to each dimension AFTER the
+    # server-side consumers (next_best_action, strategic_brief) have run on the
+    # raw scores. Additive string fields only — score/breakdown are untouched.
+    _attach_dimension_display(scores)
+    sku_band = _sku_band(scores)
+
     report = {
         "sku_key": sku_key,
         "product_key": sku_ctx.get("product_key") or product.get("product_key"),
@@ -4758,7 +4892,10 @@ async def build_per_sku_report(
         "citation_by_provider": _sku_citation_by_provider,
         "models_cited": _models_cited_for_sku(_sku_citation_by_provider),
         "deliverability": deliverability,
-        "band": _sku_band(scores),
+        "band": sku_band,
+        # Merchant-safe label + meaning for the SKU-level band so the frontend
+        # never renders the raw enum (e.g. "band: agent_ready").
+        "band_display": _band_display(sku_band),
         "primary_gaps": primary_gaps,
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
         "axis_coverage": _axis_coverage(probe_runs),
@@ -4791,16 +4928,23 @@ def _percentile(values: List[int], pct: float) -> Optional[int]:
     return int(round(interpolated))
 
 
-def _dimension_distribution(per_sku_reports: List[Dict[str, Any]], dimension: str) -> Dict[str, Optional[int]]:
+def _dimension_distribution(per_sku_reports: List[Dict[str, Any]], dimension: str) -> Dict[str, Any]:
     values = [
         int((r.get("scores") or {}).get(dimension, {}).get("score"))
         for r in per_sku_reports
         if (r.get("scores") or {}).get(dimension, {}).get("score") is not None
     ]
+    median = _percentile(values, 0.5)
+    # Merchant-safe band + meaning for the median so the rollup can render a
+    # band pill + plain-English line instead of the raw "P25 / P75" jargon.
+    display = _dimension_display(dimension, median)
     return {
-        "median": _percentile(values, 0.5),
+        "median": median,
         "p25": _percentile(values, 0.25),
         "p75": _percentile(values, 0.75),
+        "above_count": sum(1 for v in values if median is not None and v >= median),
+        "total_count": len(values),
+        **display,
     }
 
 
