@@ -9,9 +9,10 @@ way to serving_eligible.
 Per product it does:
   1. upsert an external_product_seeds row
   2. run the external_seed -> catalog_products mirror
-  3. set category_kind; author raw_inci (non-merchant source so enrichment fills
-     actives rather than handing off); mark the brand-direct offer first-party
-  4. enrich_and_persist (INCI-verified actives + concerns)
+  3. set category_kind + mark the brand-direct offer first-party
+  4. INCI + enrichment via the SHARED crawled-INCI ingest
+     (scripts.ingest_crawled_inci._drive, #855) -- one upsert-raw_inci +
+     enrich_and_persist implementation for both crawl tools, so they don't drift
   5. make_external_seed_servable: attached_product_key back-link + quality
      snapshot + agent_pdp_view refresh + recompute eligibility
 
@@ -38,15 +39,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database
+from scripts.ingest_crawled_inci import _drive as ingest_crawled_inci_items
 from scripts.mirror_external_seeds_to_catalog_products import _apply as mirror_apply
-from services.beauty_enrichment_persist import enrich_and_persist_product
 from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,
 )
 
 TOOL = "external_brand_crawl"
-SOURCE = "external_seed_crawl_v1"
 
 
 def _seed_id(epid: str) -> str:
@@ -85,25 +85,6 @@ async def _upsert_seed(p: Dict[str, Any]) -> None:
     )
 
 
-async def _author_raw_inci(p: Dict[str, Any]) -> None:
-    if not p.get("raw_inci"):
-        return
-    pk = _product_key(p["external_product_id"])
-    sk = pk + "::canonical"
-    await database.execute(
-        """
-        INSERT INTO beauty_sku_ingredients (sku_key, product_key, merchant_id, raw_inci, source_system, updated_at)
-        VALUES (:sk, :pk, 'external_seed', :inci, :src, NOW())
-        ON CONFLICT (sku_key) DO UPDATE SET
-          raw_inci = EXCLUDED.raw_inci, source_system = EXCLUDED.source_system, updated_at = NOW()
-        WHERE beauty_sku_ingredients.active_ingredients_json IS NULL
-           OR jsonb_typeof(beauty_sku_ingredients.active_ingredients_json) <> 'array'
-           OR jsonb_array_length(beauty_sku_ingredients.active_ingredients_json) = 0
-        """,
-        {"sk": sk, "pk": pk, "inci": p["raw_inci"], "src": SOURCE},
-    )
-
-
 async def _set_category_and_offer(p: Dict[str, Any]) -> None:
     pk = _product_key(p["external_product_id"])
     if p.get("category_kind"):
@@ -127,8 +108,19 @@ async def _onboard(cohort: List[Dict[str, Any]]) -> None:
     print(f"mirror inserted_catalog_products={inserted}")
     for p in cohort:
         await _set_category_and_offer(p)
-        await _author_raw_inci(p)
-        await enrich_and_persist_product(_product_key(p["external_product_id"]))
+    # INCI + enrichment via the shared crawled-INCI ingest (scripts.ingest_crawled_inci,
+    # #855) -- one upsert-raw_inci + enrich_and_persist path for both crawl tools.
+    # category_kind is set above first (enrichment reads it).
+    inci_items = [
+        {
+            "product_key": _product_key(p["external_product_id"]),
+            "sku_key": _product_key(p["external_product_id"]) + "::canonical",
+            "raw_inci": p.get("raw_inci") or "",
+        }
+        for p in cohort
+    ]
+    report = await ingest_crawled_inci_items(inci_items, dry_run=False, db=database)
+    print(f"inci ingest: written={report.get('inci_written')} actives={report.get('actives_filled')} skipped={report.get('skipped')}")
     for p in cohort:
         summary = await make_external_seed_servable(
             product_key=_product_key(p["external_product_id"]),
