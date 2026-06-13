@@ -63,7 +63,7 @@ async def enrich_and_persist_product(
     """
     cp = await db.fetch_one(
         """
-        SELECT content_key, title, description, product_type, category_path, category_kind
+        SELECT content_key, merchant_id, title, description, product_type, category_path, category_kind
         FROM catalog_products
         WHERE product_key = :pk
         LIMIT 1
@@ -113,12 +113,16 @@ async def enrich_and_persist_product(
     wrote_concerns = False
     actives_written_skus: List[str] = []
 
-    # concerns: fill only when the profile carries none.
-    if derived_concerns and not stored_concerns and not dry_run:
+    # concerns: fill only when the profile carries none. beauty_product_profiles
+    # is merchant-scoped (merchant_id NOT NULL), so a new profile row needs the
+    # product's merchant_id (the sentinel "external_seed" for seed content).
+    merchant_id = cp.get("merchant_id")
+    can_write_concerns = bool(derived_concerns and not stored_concerns and merchant_id)
+    if can_write_concerns and not dry_run:
         await db.execute(
             """
-            INSERT INTO beauty_product_profiles (product_key, concerns_json, updated_at)
-            VALUES (:pk, CAST(:concerns AS jsonb), NOW())
+            INSERT INTO beauty_product_profiles (product_key, merchant_id, concerns_json, updated_at)
+            VALUES (:pk, :mid, CAST(:concerns AS jsonb), NOW())
             ON CONFLICT (product_key) DO UPDATE SET
               concerns_json = EXCLUDED.concerns_json,
               updated_at = NOW()
@@ -126,10 +130,10 @@ async def enrich_and_persist_product(
                OR jsonb_typeof(beauty_product_profiles.concerns_json) <> 'array'
                OR jsonb_array_length(beauty_product_profiles.concerns_json) = 0
             """,
-            {"pk": product_key, "concerns": json.dumps(derived_concerns)},
+            {"pk": product_key, "mid": merchant_id, "concerns": json.dumps(derived_concerns)},
         )
         wrote_concerns = True
-    would_write_concerns = bool(derived_concerns and not stored_concerns)
+    would_write_concerns = can_write_concerns
 
     # actives: per SKU, fill only empty + non-merchant-owned rows.
     if derived_actives:

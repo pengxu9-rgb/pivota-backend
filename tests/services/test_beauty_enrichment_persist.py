@@ -43,6 +43,7 @@ def _patch_recompute(monkeypatch, calls):
 
 _CP = {
     "content_key": "ck1",
+    "merchant_id": "merch_test",
     "title": "Centella Hydrating Serum",
     "description": "A soothing serum for dry, sensitive skin with niacinamide.",
     "product_type": "Serum",
@@ -73,6 +74,22 @@ def test_fills_empty_concerns_and_actives_and_recomputes(monkeypatch):
     assert any("INSERT INTO beauty_product_profiles" in q for q, _ in db.executed)
     assert any("UPDATE beauty_sku_ingredients" in q for q, _ in db.executed)
     assert calls == [("ck1", "beauty_enrichment")]
+    # The profile INSERT must carry merchant_id (the column is NOT NULL).
+    profile_write = next(p for q, p in db.executed if "INSERT INTO beauty_product_profiles" in q)
+    assert profile_write["mid"] == "merch_test"
+
+
+def test_concerns_skipped_when_merchant_id_missing(monkeypatch):
+    calls = []
+    _patch_recompute(monkeypatch, calls)
+    db = FakeDB(
+        cp={**_CP, "merchant_id": None},  # merchant-scoped table can't take a null
+        skus=[],
+        profile={"concerns_json": []},
+    )
+    res = asyncio.run(persist.enrich_and_persist_product("pk1", db=db))
+    assert res["written"]["concerns"] is False
+    assert not any("INSERT INTO beauty_product_profiles" in q for q, _ in db.executed)
 
 
 def test_never_overwrites_existing_or_merchant_owned(monkeypatch):
