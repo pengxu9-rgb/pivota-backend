@@ -237,6 +237,41 @@ def _parse_brief_response(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _brief_target_queries(briefs: List[Dict[str, Any]]) -> List[str]:
+    """The real target queries from parsed briefs.
+
+    Reads `target_query` — the key `_parse_brief_response` actually stores. The
+    pre-fix title/body code read `query`, which is never present, so every run
+    fell back to a generic ("category-visibility queries") phrase and an
+    identical count-only title, making distinct runs look like duplicates.
+    """
+    out: List[str] = []
+    for b in briefs or []:
+        if isinstance(b, dict):
+            q = str(b.get("target_query") or "").strip()
+            if q:
+                out.append(q)
+    return out
+
+
+def _content_brief_task_title(briefs: List[Dict[str, Any]]) -> str:
+    """Target-specific task title so each run is scannable and re-audits of the
+    same failing query collapse onto the same (merchant_id, lever, title)
+    identity for supersession instead of stacking generic duplicates."""
+    queries = _brief_target_queries(briefs)
+    n = len(briefs or [])
+    if len(queries) == 1:
+        return f"Content brief: {queries[0]}"
+    if queries:
+        shown = ", ".join(queries[:2])
+        extra = len(queries) - 2
+        return f"{n} content briefs: {shown}" + (f", +{extra} more" if extra > 0 else "")
+    return (
+        f"Write {n} content brief{'s' if n != 1 else ''} "
+        "for failed category-visibility queries"
+    )
+
+
 async def _generate_brief_for_query(
     brand: str,
     query: str,
@@ -372,18 +407,14 @@ class ContentBriefGeneratorAgent(BaseExecutorAgent):
             from services.executor_agents.base import (
                 RESULT_TYPE_HUMAN_TASK_RECOMMENDED,
             )
+            # Read the real target queries (key is "target_query", not
+            # "query") so each run names its queries and re-audits collapse
+            # onto the same task identity for supersession.
+            brief_queries = _brief_target_queries(briefs)
             queries_phrase = ", ".join(
-                f'"{b.get("query", "")}"'
-                for b in briefs[:3]
-                if b.get("query")
-            )
-            if not queries_phrase:
-                queries_phrase = "category-visibility queries"
-            task_title = (
-                f"Write {len(briefs)} content brief"
-                f"{'s' if len(briefs) != 1 else ''} for failed "
-                f"category visibility queries"
-            )
+                f'"{q}"' for q in brief_queries[:3]
+            ) or "category-visibility queries"
+            task_title = _content_brief_task_title(briefs)
             task_body = (
                 f"Pivota's content brief generator produced "
                 f"{len(briefs)} drafted brief"

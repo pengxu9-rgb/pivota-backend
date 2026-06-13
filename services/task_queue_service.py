@@ -630,7 +630,7 @@ async def materialize_task_from_executor(
         evidence=evidence,
     )
 
-    return await record_task_created(
+    new_task_id = await record_task_created(
         merchant_id=merchant_id,
         title=title,
         body=body or "",
@@ -642,6 +642,30 @@ async def materialize_task_from_executor(
         assigned_to_agent=agent_name,
         evidence=evidence,
     )
+
+    # Supersede prior same-identity pending executor tasks so re-audits update
+    # in place instead of stacking duplicate rows. The audit-ladder path
+    # (materialize_tasks_from_audit) already does this; the executor path did
+    # not, so a content_brief run inserted a fresh row every audit cycle. The
+    # identity is (merchant_id, lever, title) + target_host/product_key — with
+    # per-query titles (content_brief now names its real target_query), a
+    # re-audit of the same failing query collapses onto the prior task.
+    # Best-effort: a supersession failure never invalidates the new task.
+    if new_task_id and resolved_parent_audit_run_id:
+        try:
+            await _supersede_prior_pending(
+                merchant_id=merchant_id,
+                new_task_id=new_task_id,
+                action={"title": title, "lever": lever, "evidence": evidence},
+                audit_run_id=resolved_parent_audit_run_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "task_queue: executor supersede raised for task=%s: %s",
+                new_task_id, str(exc)[:200],
+            )
+
+    return new_task_id
 
 
 def _summarize_executor_work(
