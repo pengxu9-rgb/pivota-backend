@@ -4844,6 +4844,7 @@ async def build_per_sku_report(
         identity=identity,
         sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
         merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+        sku_key=sku_key,
     )
     next_best_action = await attach_sku_strategic_brief(
         next_best_action,

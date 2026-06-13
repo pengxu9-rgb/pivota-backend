@@ -94,7 +94,14 @@ def _assert_70_30(nba: Dict[str, Any]) -> None:
     assert isinstance(nba["evidence_chips"], list)
     assert len(nba["tracking_metrics"]) >= 2
     assert nba["how_to_track"] == nba["tracking_metrics"]
-    assert set(nba["cta"]) == {"label", "trust_note"}
+    # Per-SKU CTAs carry an executable action descriptor; brand-report CTAs do
+    # not. target_sku_key is stamped only when sku_key is passed (not by these
+    # fixtures). So validate the shape loosely and the action value when present.
+    from services.next_best_action import SKU_CTA_ACTIONS
+    assert {"label", "trust_note"} <= set(nba["cta"])
+    assert set(nba["cta"]) <= {"label", "trust_note", "action", "target_sku_key"}
+    if "action" in nba["cta"]:
+        assert nba["cta"]["action"] in SKU_CTA_ACTIONS
 
 
 def _sku_identity(unresolved: bool = False) -> Dict[str, Any]:

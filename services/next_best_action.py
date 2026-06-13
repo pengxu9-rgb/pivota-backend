@@ -44,6 +44,25 @@ PRIMARY_SKU_SOURCE_ROUTE_REPAIR = "source_route_repair"
 PRIMARY_SKU_PROTECTED_MONITORING = "protected_monitoring"
 PRIMARY_SKU_INSUFFICIENT_DATA = "insufficient_data"
 
+# Per-SKU CTA action descriptor. Maps the deterministic primary gap to the
+# Pivota-executable action the frontend wires its "have Pivota do it" button to.
+# 'request_indexing' submits the canonical page for indexing (the get-indexed
+# play needs zero merchant effort); 'request_enrichment' drafts/publishes the
+# enriched canonical page via the SKU_OPT_OVERLAY path; 'none' is a
+# merchant-only / monitor move with no one-click Pivota job. The button POSTs
+# to the existing overlay/indexing-approval endpoints with target_sku_key, so
+# the frontend never has to invent routing.
+SKU_CTA_ACTIONS = ("request_enrichment", "request_indexing", "none")
+_SKU_CTA_ACTION: Dict[str, str] = {
+    PRIMARY_SKU_GET_INDEXED: "request_indexing",
+    PRIMARY_SKU_OPEN_LANE_CAPTURE: "request_enrichment",
+    PRIMARY_SKU_SUBSTITUTION_LEAK: "request_enrichment",
+    PRIMARY_SKU_CONTENT_REVISION_GAP: "request_enrichment",
+    PRIMARY_SKU_SOURCE_ROUTE_REPAIR: "request_enrichment",
+    PRIMARY_SKU_INSUFFICIENT_DATA: "request_enrichment",
+    PRIMARY_SKU_PROTECTED_MONITORING: "none",
+}
+
 _VERDICT_VIA_RETAILERS = "VISIBLE VIA RETAILERS"
 _VERDICT_MISATTRIBUTED = "VISIBLE BUT MISATTRIBUTED"
 _VERDICT_CATEGORY_MENTION_NO_FIRST_PARTY = "CATEGORY MENTION, NO FIRST-PARTY"
@@ -188,6 +207,7 @@ def build_sku_next_best_action(
     identity: Optional[Mapping[str, Any]] = None,
     sku_title: Optional[str] = None,
     merchant_host: Optional[str] = None,
+    sku_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a deterministic per-SKU next-best-action prescription."""
 
@@ -222,6 +242,12 @@ def build_sku_next_best_action(
         primary_gaps=gaps,
         failing_prompts=_as_list(failing_prompts),
     )
+    # Stamp the action target so the frontend CTA can POST to the
+    # enrichment/indexing-approval endpoint without inventing routing. The
+    # action itself is set by _base_payload from the primary gap.
+    cta = prescription.get("cta")
+    if sku_key and isinstance(cta, dict):
+        cta["target_sku_key"] = sku_key
     return prescription
 
 
@@ -653,6 +679,9 @@ def _sku_pivota_path(sku_title: str) -> str:
 
 
 def _sku_cta(label: str) -> Dict[str, str]:
+    """Per-SKU CTA. `action` (request_enrichment | request_indexing | none) is
+    added by _base_payload from the primary gap, and `target_sku_key` is stamped
+    by build_sku_next_best_action, so the frontend can wire a real button."""
     return {
         "label": label,
         "trust_note": (
@@ -2171,6 +2200,11 @@ def _base_payload(
         "secondary_moves": [],
         "cta": dict(cta),
     }
+    # Per-SKU prescriptions carry an executable action descriptor on the CTA so
+    # the frontend can wire a real button (target_sku_key is stamped later by
+    # build_sku_next_best_action). Brand-report gaps are left untouched.
+    if primary_gap in _SKU_CTA_ACTION:
+        out["cta"]["action"] = _SKU_CTA_ACTION[primary_gap]
     if prescription_class:
         out["prescription_class"] = prescription_class
     if merchant_path:
