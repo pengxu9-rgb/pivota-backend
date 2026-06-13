@@ -40,6 +40,7 @@ _SOURCE_RANK = {
     INCI_SOURCE_BRAND_OFFICIAL: 3,
     INCI_SOURCE_SUPPLIER: 2,
     "merchant_authored": 2,  # a human merchant typed it -> supplier tier
+    "inci_database": 2,  # a crowdsourced INCI authority (e.g. Open Beauty Facts)
     INCI_SOURCE_RESELLER: 1,
     "merchant_payload": 1,
     "shopify_products_sync": 1,
