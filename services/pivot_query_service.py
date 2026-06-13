@@ -333,7 +333,7 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             SELECT how_to_use_text, steps_json
             FROM beauty_usage_guides
             WHERE product_key = :product_key
-              AND (:sku_key IS NULL OR sku_key = :sku_key)
+              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
             ORDER BY updated_at DESC
             LIMIT 1
             """,
@@ -347,7 +347,7 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             SELECT shade_id, shade_name, shade_code, shade_family, undertone, finish, swatch_refs_json, media_refs_json
             FROM beauty_shades
             WHERE product_key = :product_key
-              AND (:sku_key IS NULL OR sku_key = :sku_key)
+              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
             ORDER BY updated_at DESC, shade_name ASC
             """,
             {"product_key": product_key, "sku_key": sku_key},
@@ -360,7 +360,7 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             SELECT asset_id, asset_type, title, url, thumbnail_url, sort_order
             FROM beauty_content_assets
             WHERE product_key = :product_key
-              AND (:sku_key IS NULL OR sku_key = :sku_key)
+              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
             ORDER BY sort_order ASC, updated_at DESC
             """,
             {"product_key": product_key, "sku_key": sku_key},
@@ -373,7 +373,7 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             SELECT rule_type, subject_ingredients_json, related_ingredients_json, verdict, rationale, evidence_refs_json
             FROM beauty_compatibility_rules
             WHERE product_key = :product_key
-              AND (:sku_key IS NULL OR sku_key = :sku_key)
+              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
             ORDER BY updated_at DESC
             """,
             {"product_key": product_key, "sku_key": sku_key},
