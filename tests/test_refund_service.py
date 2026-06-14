@@ -9,10 +9,17 @@ class FakeDB:
     def __init__(self) -> None:
         self.executed: list[tuple[str, dict]] = []
         self.rows: list[dict] = []
+        self.fetch_one_rows: list[dict | None] = []
 
     async def execute(self, query: str, values=None):
         self.executed.append((str(query), dict(values or {})))
         return None
+
+    async def fetch_one(self, query: str, values=None):
+        self.executed.append((str(query), dict(values or {})))
+        if self.fetch_one_rows:
+            return self.fetch_one_rows.pop(0)
+        return {"refund_id": dict(values or {}).get("refund_id")}
 
     async def fetch_all(self, query: str, values=None):
         return self.rows
@@ -21,20 +28,24 @@ class FakeDB:
 @pytest.mark.asyncio
 async def test_update_refund_success_backfills_platform_refund_id_from_psp_refund_id():
     fake_db = FakeDB()
+    fake_db.fetch_one_rows = [{"refund_id": "REF_ALPHA_1"}]
     service = RefundService(database=fake_db)
 
-    await service._update_refund_success(
+    applied = await service._update_refund_success(
         refund_id="REF_ALPHA_1",
         psp_refund_id="re_alpha_1",
         order_id="ORD_ALPHA_1",
         amount=29.0,
     )
 
+    assert applied is True
     assert len(fake_db.executed) == 2
 
     update_refund_sql, update_refund_values = fake_db.executed[0]
     assert "UPDATE refund_records" in update_refund_sql
     assert "platform_refund_id = COALESCE(platform_refund_id, :psp_refund_id)" in update_refund_sql
+    assert "status != 'completed'" in update_refund_sql
+    assert "RETURNING refund_id" in update_refund_sql
     assert update_refund_values["refund_id"] == "REF_ALPHA_1"
     assert update_refund_values["psp_refund_id"] == "re_alpha_1"
 
@@ -42,6 +53,45 @@ async def test_update_refund_success_backfills_platform_refund_id_from_psp_refun
     assert "UPDATE orders" in update_order_sql
     assert update_order_values["order_id"] == "ORD_ALPHA_1"
     assert update_order_values["amount"] == 29.0
+
+
+@pytest.mark.asyncio
+async def test_update_refund_success_replay_does_not_increment_order_total_again():
+    fake_db = FakeDB()
+    fake_db.fetch_one_rows = [None]
+    service = RefundService(database=fake_db)
+
+    applied = await service._update_refund_success(
+        refund_id="REF_ALPHA_REPLAY",
+        psp_refund_id="re_alpha_replay",
+        order_id="ORD_ALPHA_REPLAY",
+        amount=29.0,
+    )
+
+    assert applied is False
+    assert len(fake_db.executed) == 1
+    update_refund_sql, update_refund_values = fake_db.executed[0]
+    assert "UPDATE refund_records" in update_refund_sql
+    assert update_refund_values["refund_id"] == "REF_ALPHA_REPLAY"
+    assert not any("UPDATE orders" in sql for sql, _ in fake_db.executed)
+
+
+@pytest.mark.asyncio
+async def test_validate_refund_rejects_negative_amount():
+    fake_db = FakeDB()
+    service = RefundService(database=fake_db)
+
+    result = await service._validate_refund(
+        {
+            "order_id": "ORD_NEGATIVE",
+            "payment_status": "paid",
+            "total": "100.00",
+            "created_at": None,
+        },
+        -1,
+    )
+
+    assert result == {"valid": False, "error": "Refund amount must be greater than zero"}
 
 
 @pytest.mark.asyncio

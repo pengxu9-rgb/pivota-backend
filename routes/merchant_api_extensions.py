@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Qu
 from typing import Dict, Any, Optional, List
 from utils.auth import get_current_user
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from db.database import database
 from db.orders import get_order, mark_order_shipped
 from db.products import log_order_event
@@ -571,6 +571,44 @@ class ApproveAfterSalesCaseRequest(BaseModel):
     """Optional override fields for merchant approval."""
     approved_refund_amount: Optional[float] = None
     note: Optional[str] = None
+
+
+def _after_sales_money_decimal(value: Any) -> Optional[Decimal]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _resolve_after_sales_refund_amount(
+    *,
+    order: Dict[str, Any],
+    requested_amount: Any,
+    approved_override: Any,
+) -> Optional[float]:
+    total = _after_sales_money_decimal((order or {}).get("total") or (order or {}).get("total_amount")) or Decimal("0.00")
+    raw_refunded = _after_sales_money_decimal((order or {}).get("total_refunded")) or Decimal("0.00")
+    already_refunded = min(total, max(Decimal("0.00"), raw_refunded))
+    refundable = max(Decimal("0.00"), total - already_refunded)
+    if refundable <= Decimal("0.00"):
+        return None
+
+    candidate = (
+        _after_sales_money_decimal(approved_override)
+        if approved_override is not None
+        else _after_sales_money_decimal(requested_amount)
+        if requested_amount is not None
+        else refundable
+    )
+    if candidate is None or candidate <= Decimal("0.00"):
+        return None
+
+    return float(min(candidate, refundable).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _now_iso() -> str:
@@ -2724,18 +2762,11 @@ async def merchant_approve_after_sales_case_and_refund(
 
     requested_amount = loaded.get("requested_refund_amount")
     approved_override = payload.approved_refund_amount
-    amount = None
-    if approved_override is not None:
-        amount = float(approved_override)
-    elif requested_amount is not None:
-        amount = float(requested_amount)
-    else:
-        try:
-            total = float(order.get("total") or order.get("total_amount") or 0)
-            refunded = float(order.get("total_refunded") or 0)
-            amount = max(0.0, total - refunded)
-        except Exception:
-            amount = None
+    amount = _resolve_after_sales_refund_amount(
+        order=order,
+        requested_amount=requested_amount,
+        approved_override=approved_override,
+    )
 
     if amount is None or amount <= 0:
         raise HTTPException(status_code=400, detail="Refund amount is not refundable")

@@ -123,6 +123,52 @@ async def test_shopify_refund_webhook_overrun_is_ignored(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_shopify_refund_webhook_duplicate_platform_refund_id_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.refund_webhook_routes as refund_webhooks
+    from services.platform_refund_adapter import PlatformRefundEvent
+
+    fake_db = FakeDatabase(
+        {
+            "order_id": "ORD_SHOPIFY_DUP",
+            "merchant_id": "merch_1",
+            "total": Decimal("4.07"),
+            "total_refunded": Decimal("0.00"),
+            "payment_status": "paid",
+            "status": "paid",
+            "payment_method": "shopify",
+            "payment_intent_id": None,
+            "psp_used": "shopify",
+            "metadata": {},
+        },
+        existing_refund={"refund_id": "REF_ALREADY_SEEN"},
+    )
+
+    async def fail_log_order_event(**_kwargs):
+        raise AssertionError("duplicate platform refund must not log a new processed event")
+
+    monkeypatch.setattr(refund_webhooks, "database", fake_db)
+    monkeypatch.setattr(refund_webhooks, "log_order_event", fail_log_order_event)
+
+    result = await refund_webhooks.process_platform_refund(
+        PlatformRefundEvent(
+            platform_type="shopify",
+            platform_order_id="7531638980936",
+            platform_refund_id="shopify_refund_seen",
+            amount=4.07,
+            currency="EUR",
+            raw_event={"id": "shopify_refund_seen", "order_id": "7531638980936"},
+        ),
+        merchant_id="merch_1",
+    )
+
+    assert result["status"] == "duplicate"
+    assert result["refund_id"] == "REF_ALREADY_SEEN"
+    assert fake_db.executes == []
+
+
+@pytest.mark.asyncio
 async def test_shopify_refund_webhook_for_shopify_source_order_updates_order(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.refund_webhook_routes as refund_webhooks
     from services.platform_refund_adapter import PlatformRefundEvent

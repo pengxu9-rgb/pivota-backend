@@ -4,7 +4,7 @@ Handles idempotency, validation, and coordination between DB and PSPs
 """
 import secrets
 from typing import Optional, Dict, Any, Tuple
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 import asyncio
 from databases import Database
@@ -20,6 +20,18 @@ from services.merchant_psp_config_service import (
 )
 from utils.logger import logger
 from config.settings import settings
+
+
+def _refund_money_decimal(value: Any) -> Optional[Decimal]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 class RefundService:
@@ -109,24 +121,25 @@ class RefundService:
                 
                 # 6. Update refund record with result
                 if psp_result["success"]:
-                    await self._update_refund_success(
+                    applied = await self._update_refund_success(
                         refund_id=refund_id,
                         psp_refund_id=psp_result["refund_id"],
                         order_id=order_id,
                         amount=amount
                     )
-                    try:
-                        await attach_refund_to_attribution_edge(
-                            order_id=order_id,
-                            refund_id=refund_id,
-                            amount=amount,
-                        )
-                    except Exception as attribution_exc:
-                        logger.warning(
-                            "Failed to attach refund attribution edge for %s: %s",
-                            refund_id,
-                            attribution_exc,
-                        )
+                    if applied:
+                        try:
+                            await attach_refund_to_attribution_edge(
+                                order_id=order_id,
+                                refund_id=refund_id,
+                                amount=amount,
+                            )
+                        except Exception as attribution_exc:
+                            logger.warning(
+                                "Failed to attach refund attribution edge for %s: %s",
+                                refund_id,
+                                attribution_exc,
+                            )
                     
                     return {
                         "status": "success",
@@ -177,6 +190,13 @@ class RefundService:
     
     async def _validate_refund(self, order: Dict[str, Any], amount: float) -> Dict[str, Any]:
         """Validate refund eligibility"""
+        refund_amount = _refund_money_decimal(amount)
+        if refund_amount is None or refund_amount <= Decimal("0.00"):
+            return {
+                "valid": False,
+                "error": "Refund amount must be greater than zero"
+            }
+
         # Check payment status
         refundable_statuses = ["paid", "completed", "partially_refunded"]
         if order.get("payment_status") not in refundable_statuses:
@@ -189,13 +209,14 @@ class RefundService:
         total_refunded = await self._get_total_refunded(order["order_id"])
         
         # Check if amount exceeds refundable amount
-        order_total = float(order.get("total", 0))
-        remaining = order_total - total_refunded
+        order_total = _refund_money_decimal(order.get("total", 0)) or Decimal("0.00")
+        already_refunded = max(Decimal("0.00"), _refund_money_decimal(total_refunded) or Decimal("0.00"))
+        remaining = max(Decimal("0.00"), order_total - already_refunded)
         
-        if amount > remaining:
+        if refund_amount > remaining:
             return {
                 "valid": False,
-                "error": f"Refund amount ${amount:.2f} exceeds refundable amount ${remaining:.2f}"
+                "error": f"Refund amount ${refund_amount:.2f} exceeds refundable amount ${remaining:.2f}"
             }
         
         # Check time limits (90 days for most PSPs)
@@ -367,9 +388,10 @@ class RefundService:
         psp_refund_id: str,
         order_id: str,
         amount: float
-    ):
+    ) -> bool:
         """Update refund record after successful PSP refund"""
-        # Update refund record
+        # Transition exactly once. Replays of the same PSP/refund webhook must not
+        # increment orders.total_refunded again.
         update_refund = """
         UPDATE refund_records
         SET 
@@ -378,11 +400,15 @@ class RefundService:
             platform_refund_id = COALESCE(platform_refund_id, :psp_refund_id),
             processed_at = NOW()
         WHERE refund_id = :refund_id
+          AND (status IS NULL OR status != 'completed')
+        RETURNING refund_id
         """
-        await self.db.execute(update_refund, {
+        transitioned = await self.db.fetch_one(update_refund, {
             "refund_id": refund_id,
             "psp_refund_id": psp_refund_id
         })
+        if not transitioned:
+            return False
         
         # Update order total_refunded
         update_order = """
@@ -404,6 +430,7 @@ class RefundService:
             "amount": amount,
             "order_id": order_id
         })
+        return True
     
     async def _update_refund_failed(self, refund_id: str, error: str):
         """Update refund record after failed PSP refund"""
