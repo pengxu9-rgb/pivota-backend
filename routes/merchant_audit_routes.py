@@ -1926,6 +1926,7 @@ class _NicheContentBody(BaseModel):
     sku_key: Optional[str] = None
     sku_name: Optional[str] = None
     why_you_fit: Optional[str] = None
+    kind: str = "content"  # content | defend
 
 
 @router.post("/tasks/niche-content")
@@ -1945,31 +1946,44 @@ async def create_niche_content_task(
         record_task_created,
     )
 
-    title = f"Create the answer AI cites for: {q}"
+    is_defend = (body.kind or "").strip().lower() == "defend"
+    lever = "niche_defend" if is_defend else "niche_content"
+    title = (
+        f"Defend the niche: {q}" if is_defend
+        else f"Create the answer AI cites for: {q}"
+    )
     existing = await find_pending_supersede_candidates(
-        merchant_id=merchant_id, lever="niche_content", title=title,
+        merchant_id=merchant_id, lever=lever, title=title,
     )
     if existing:
         return {"status": "exists", "task_id": existing[0].get("task_id"), "title": title}
 
     sku = (body.sku_name or "").strip()
     fit = (body.why_you_fit or "").strip()
-    task_body = (
-        "This is a winnable niche — no brand owns the answer yet"
-        + (f", and {sku} is a strong match" if sku else "")
-        + (f" (you fit: {fit})" if fit else "")
-        + ". Write a focused page section + FAQ answering this query so AI starts "
-        "citing you, then re-run the audit to confirm it landed."
-    )
+    if is_defend:
+        task_body = (
+            "A competitor moved into a niche you'd won"
+            + (f" with {sku}" if sku else "")
+            + ". Strengthen your page section + FAQ for this query (fresher detail, "
+            "proof, reviews) and re-publish, then re-run the audit to win it back."
+        )
+    else:
+        task_body = (
+            "This is a winnable niche — no brand owns the answer yet"
+            + (f", and {sku} is a strong match" if sku else "")
+            + (f" (you fit: {fit})" if fit else "")
+            + ". Write a focused page section + FAQ answering this query so AI starts "
+            "citing you, then re-run the audit to confirm it landed."
+        )
     task_id = await record_task_created(
         merchant_id=merchant_id,
         title=title,
         body=task_body,
-        severity="medium",
-        lever="niche_content",
+        severity="high" if is_defend else "medium",
+        lever=lever,
         assigned_to_agent="niche_targeting",
         evidence={
-            "kind": "niche_content",
+            "kind": lever,
             "query": q,
             "sku_key": body.sku_key,
             "sku_name": body.sku_name,

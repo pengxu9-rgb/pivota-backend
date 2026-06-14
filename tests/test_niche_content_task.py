@@ -52,6 +52,31 @@ async def test_idempotent_returns_existing(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_defend_kind_creates_defend_task(monkeypatch):
+    captured = {}
+
+    async def fake_find(*, merchant_id, lever, title):
+        return []
+
+    async def fake_record(**kw):
+        captured.update(kw)
+        return "task-d"
+
+    monkeypatch.setattr("db.merchant_tasks.find_pending_supersede_candidates", fake_find)
+    monkeypatch.setattr("db.merchant_tasks.record_task_created", fake_record)
+
+    out = await create_niche_content_task(
+        _NicheContentBody(query="vegan collagen", sku_name="Aruen", kind="defend"),
+        merchant_id="m1",
+    )
+    assert out["status"] == "success"
+    assert captured["lever"] == "niche_defend"
+    assert captured["title"].startswith("Defend the niche:")
+    assert captured["severity"] == "high"
+    assert "competitor moved in" in captured["body"]
+
+
+@pytest.mark.asyncio
 async def test_blank_query_rejected():
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
