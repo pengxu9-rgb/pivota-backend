@@ -7888,7 +7888,14 @@ async def _handle_find_products_multi(
     generic_default_precision_gate_enabled = bool(
         not strict_serving_mode
         and query_semantic_class == "default"
-        and source_normalized in _GENERIC_DEFAULT_PRECISION_GATE_SOURCES
+        and (
+            source_normalized in _GENERIC_DEFAULT_PRECISION_GATE_SOURCES
+            # The agent/MCP commerce surface (e.g. search_catalog over /mcp) sends no metadata.source, so
+            # source_normalized is empty. It is a free-text search surface that needs the same precision as
+            # the UI surfaces: without this, the OR-over-terms lexical recall leaks off-domain products
+            # (e.g. "paula choice" returns dog harnesses whose description merely contains "choice"). #1659.
+            or not source_normalized
+        )
         and not active_visible_category_intents
         and not active_visible_attribute_intents
         and not active_visible_option_intents
