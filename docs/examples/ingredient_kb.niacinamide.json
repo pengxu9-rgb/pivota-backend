@@ -1,0 +1,141 @@
+{
+  "_what_this_is": "Tier-G Ingredient KB entry for Niacinamide (Vitamin B3) — ADR-002 quality bar, v2-lite shape mirroring genistein gold standard. Corrects the 'shrinks pores' over-claim and the 'don't mix with vitamin C' myth. All citations verified to resolve at time of authoring (2026-06-14).",
+
+  "status": "ready",
+  "schema_version": "v2-lite",
+  "provider": "pivota_research",
+  "confidence_level": "high",
+
+  "ingredient": {
+    "inci": "Niacinamide",
+    "display_name": "Niacinamide (Vitamin B3)",
+    "aliases": ["nicotinamide", "vitamin B3", "niacin amide", "vitamin PP"],
+    "what_it_is": "The amide form of vitamin B3. Niacinamide is a water-soluble keratinocyte coenzyme precursor that works on tone, barrier lipids, and sebum — not a pore-shrinker in the anatomical sense. One of the best-studied cosmetic actives with multiple distinct, mechanistically-explained benefits.",
+    "marketing_vs_reality": [
+      {
+        "claim_in_market": "Niacinamide 'shrinks pores'",
+        "reality": "Pore diameter is set by genetics and sun damage — no topical ingredient physically reduces pore size. What niacinamide actually does: it reduces sebum excretion (less oil = less pore-widening plug) and improves overall skin-surface texture, so pores look less prominent. The effect is real, the mechanism is sebum regulation and surface refinement, not anatomical reduction.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "You must never mix niacinamide with vitamin C — they cancel each other out or cause flushing",
+        "reality": "The myth traces to old niacin (nicotinic acid) studies, not niacinamide. Niacinamide is chemically distinct and far more stable. At cosmetic-use conditions (room temperature, normal formulation pH) any conversion to niacin is less than 1% over six weeks — well below any threshold for flushing. The reversible niacinamide-ascorbate complex that forms is cosmetically inconsequential. Modern stable vitamin C derivatives (sodium ascorbyl phosphate, ascorbyl glucoside) further eliminate the concern. The two ingredients can be used in the same routine.",
+        "evidence_type": "marketing_vs_reality"
+      }
+    ]
+  },
+
+  "overview": "Niacinamide visibly evens tone by blocking melanin transfer (not melanin production), supports the skin barrier by stimulating ceramide and stratum corneum lipid synthesis, reduces the look of redness, and moderates sebum output — making pores appear less enlarged. One of the most versatile, well-tolerated actives across skin types. Effects appear gradually over 4–8 weeks.",
+
+  "benefits": [
+    {
+      "concern": "uneven tone / hyperpigmentation",
+      "strength": 3,
+      "what_it_means": "Fades dark spots and post-blemish marks noticeably over 4–8 weeks. Works differently to acids or vitamin C — specifically targets the delivery of pigment rather than production, so it complements rather than competes with other brightening actives.",
+      "mechanism": "Niacinamide inhibits the transfer of melanosomes (melanin-containing vesicles) from melanocytes to keratinocytes — the step where pigment is actually deposited into skin cells. It does not inhibit tyrosinase or reduce melanin synthesis. Effect is dose-dependent and reversible (Hakozaki et al., BJD 2002; Greatens et al., Exp Dermatol 2005)."
+    },
+    {
+      "concern": "barrier / dryness / sensitivity",
+      "strength": 3,
+      "what_it_means": "Measurably reduces transepidermal water loss and improves skin feel, particularly helpful for sensitised or rosacea-prone skin. One of the fastest-acting barrier benefits among cosmetic actives.",
+      "mechanism": "Up-regulates serine palmitoyltransferase (the rate-limiting enzyme in sphingolipid synthesis) in keratinocytes, driving a 4–5.5-fold increase in ceramide biosynthesis and increases in glucosylceramide, sphingomyelin, free fatty acids, and cholesterol — the full epidermal lipid matrix (Tanno et al., BJD 2000)."
+    },
+    {
+      "concern": "redness / blotchy appearance",
+      "strength": 2,
+      "what_it_means": "Reduces the look of diffuse facial redness and blotchiness over 4 weeks. Particularly useful for reactive or rosacea-prone skin types.",
+      "mechanism": "Supports barrier repair (reduced TEWL decreases irritant penetration) and moderates vascular responsiveness by limiting cytokine-driven vasodilation signals. In a controlled rosacea study, a niacinamide-containing moisturizer improved barrier function alongside dermatologist-rated and patient-rated redness outcomes (Draelos et al., Cutis 2005)."
+    },
+    {
+      "concern": "enlarged-looking pores / excess sebum",
+      "strength": 2,
+      "what_it_means": "Reduces oiliness and the appearance of enlarged pores. Most evident after 4–6 weeks of consistent use; effect is more pronounced in Asian skin types in published data.",
+      "mechanism": "Reduces sebum excretion rate — likely via inhibition of sebaceous lipid synthesis pathways. In a double-blind placebo-controlled RCT (100 Japanese subjects), 2% niacinamide significantly lowered sebum excretion rate at 2 and 4 weeks; a 30-subject split-face study in Caucasian subjects showed significant reduction in casual sebum levels at 6 weeks (Draelos, Matsubara, Smiles, J Cosmet Laser Ther 2006)."
+    },
+    {
+      "concern": "fine lines / photoaging appearance",
+      "strength": 1,
+      "what_it_means": "Supportive benefit, not a retinoid alternative. Contributes via barrier reinforcement and antioxidant coenzyme support rather than direct collagen synthesis signalling.",
+      "mechanism": "NAD⁺/NADH coenzyme replenishment supports keratinocyte energy metabolism and cellular repair; improved barrier reduces ongoing UV-triggered damage accumulation."
+    }
+  ],
+
+  "safety": {
+    "irritation_risk": "low",
+    "watchouts": [
+      {
+        "issue": "Concentration-related flushing sensation",
+        "likelihood": "low",
+        "what_to_do": "Very high concentrations (>10%) may rarely cause a transient warming or tingling sensation in sensitive individuals, unrelated to the vitamin C interaction myth. Formulations at 2–5% are generally well-tolerated by all skin types. Patch test if reactive."
+      },
+      {
+        "issue": "Niacin allergy (rare)",
+        "likelihood": "very low",
+        "what_to_do": "Niacinamide is not niacin; allergy is distinct and very uncommon. If a known niacin sensitivity exists, patch test first."
+      }
+    ]
+  },
+
+  "usage": {
+    "routine_step": "serum_or_moisturizer",
+    "pair_well": ["soy isoflavones / genistein", "hyaluronic acid", "peptides", "ceramides", "vitamin C (stable derivatives)", "adenosine", "centella asiatica"],
+    "consider_separating": ["high-strength exfoliating acids (AHA/BHA) at same application step on very sensitive skin — not a chemical incompatibility, just a stacking consideration for reactivity"],
+    "notes": [
+      "Judge tone-evening benefit at 4–8 weeks minimum.",
+      "5% is the most-studied concentration for pigmentation; 2% effective for sebum/barrier.",
+      "Suitable for AM and PM; no photosensitivity concern.",
+      "Safe to layer with vitamin C — the interaction myth is not supported by modern evidence at cosmetic-use conditions."
+    ]
+  },
+
+  "evidence": {
+    "grade": "A",
+    "summary": "Niacinamide has multiple well-designed human RCTs (double-blind, placebo-controlled, split-face) supporting its tone-evening, barrier, sebum-reduction, and redness benefits. The melanosome-transfer mechanism is additionally confirmed in ex-vivo coculture models. Evidence quality is stronger than most cosmetic actives; grade A is warranted for the primary benefits (tone, barrier, sebum). The pore-appearance benefit is real but an indirect consequence of sebum reduction, not an anatomically direct effect — noted in the marketing_vs_reality correction.",
+    "citations": [
+      {
+        "title": "Effect of niacinamide on reducing cutaneous pigmentation and suppression of melanosome transfer",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/12100180/",
+        "year": 2002,
+        "source": "British Journal of Dermatology — Hakozaki et al.; PMID 12100180"
+      },
+      {
+        "title": "Effective inhibition of melanosome transfer to keratinocytes by lectins and niacinamide is reversible",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/15946237/",
+        "year": 2005,
+        "source": "Experimental Dermatology — Greatens et al.; PMID 15946237"
+      },
+      {
+        "title": "Nicotinamide increases biosynthesis of ceramides as well as other stratum corneum lipids to improve the epidermal permeability barrier",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/10971324/",
+        "year": 2000,
+        "source": "British Journal of Dermatology — Tanno et al.; PMID 10971324"
+      },
+      {
+        "title": "The effect of 2% niacinamide on facial sebum production",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/16766489/",
+        "year": 2006,
+        "source": "Journal of Cosmetic Laser Therapy — Draelos, Matsubara, Smiles; PMID 16766489"
+      },
+      {
+        "title": "Niacinamide-containing facial moisturizer improves skin barrier and benefits subjects with rosacea",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/16209160/",
+        "year": 2005,
+        "source": "Cutis — Draelos, Ertel, Berge; PMID 16209160"
+      }
+    ]
+  },
+
+  "top_products": { "budget": [], "mid": [], "premium": [] },
+
+  "source_meta": {
+    "review": {
+      "method": "agent_adversarial",
+      "decision": "pass",
+      "reviewer": "pivota_subagent",
+      "reviewed_at": "2026-06-14",
+      "human_qa": { "sampled": false, "decision": null, "reviewer": null, "at": null }
+    },
+    "tier": "grounded",
+    "note": "All five citations fetched and verified to resolve to the cited content via WebFetch before inclusion. Claims held back: no citation found for a specific niacinamide-vitamin C controlled human trial — the interaction correction is supported by chemistry analysis and expert consensus, not a dedicated RCT; disclosed accordingly. No drug/medical claims used."
+  }
+}

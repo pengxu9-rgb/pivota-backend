@@ -1,0 +1,152 @@
+{
+  "_what_this_is": "Tier-G Ingredient KB entry for fermented ferment filtrates/lysates — Galactomyces ferment filtrate, Bifida ferment lysate, Lactobacillus ferment, Saccharomyces ferment ('Pitera'). Hand-authored with adversarial review; every claim has a mechanistic explanation and a VERIFIED resolvable citation. The marketing_vs_reality correction (miracle essence → modest postbiotic humectant with thin clinical evidence) is the core point of this entry.",
+
+  "status": "ready",
+  "schema_version": "v2-lite",
+  "provider": "pivota_research",
+  "confidence_level": "medium",
+
+  "ingredient": {
+    "inci": "Galactomyces Ferment Filtrate / Bifida Ferment Lysate / Lactobacillus Ferment / Saccharomyces Ferment Filtrate",
+    "display_name": "Fermented ferment filtrates (Galactomyces, Bifida, Lactobacillus, Saccharomyces / 'Pitera')",
+    "aliases": [
+      "Galactomyces ferment filtrate",
+      "GFF",
+      "Pitera",
+      "Bifida ferment lysate",
+      "BFL",
+      "Lactobacillus ferment",
+      "Saccharomyces ferment filtrate",
+      "fermentation filtrate",
+      "postbiotic ferment",
+      "yeast ferment filtrate",
+      "probiotic lysate"
+    ],
+    "what_it_is": "Fermentation by-products from yeast (Galactomyces, Saccharomyces) or bacteria (Lactobacillus, Bifidobacterium) used as topical cosmetic ingredients. The fermentation process generates a complex postbiotic broth containing naturally-occurring B vitamins (including niacinamide/B3), amino acids, organic acids (lactic, malic, succinic), and polysaccharides. The filtrate or lysate — not the live organism — is what reaches skin. Best known as the basis of SK-II's 'Pitera' essence and now widely used across K-beauty serums and essences.",
+    "marketing_vs_reality": [
+      {
+        "claim_in_market": "'Miracle essence' / 'Pitera transforms skin' / anti-aging wonder ingredient from sake brewers' young hands",
+        "reality": "The 'sake brewer' origin story is brand folklore, not a controlled observation. What fermentation actually contributes is a postbiotic cocktail of humectants, amino acids, and barrier-supporting metabolites — useful, but modest and not unique to sake yeast. The most-cited 12-month clinical study (wrinkle/spot reversal) was conducted entirely by P&G employees on their own SK-II products with no control group; it shows correlation, not causation, and cannot isolate GFF from the full multi-product regimen.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "'92% Galactomyces' / high-percentage ferment = stronger / clinical-grade results",
+        "reality": "Percentage on a label refers to the concentration of the filtrate in the formula, not the active postbiotic load — the filtrate itself is mostly water. High percentage does not correlate with greater clinical effect; no dose-response study in humans establishes a threshold. These high-percentage claims are a marketing convention, not a clinical standard.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "Contains niacinamide, amino acids, vitamins — acts like a serum full of actives",
+        "reality": "Fermentation does naturally yield niacinamide, amino acids, and organic acids as metabolites — this part is real process chemistry. However, the concentrations of these metabolites within a finished ferment filtrate are not standardized or disclosed; the brightening or barrier benefit may owe as much to added niacinamide listed separately in the formula as to the ferment itself. Don't conflate the ferment with a dedicated niacinamide serum.",
+        "evidence_type": "marketing_vs_reality"
+      }
+    ]
+  },
+
+  "overview": "Fermented ferment filtrates are legitimate postbiotic skin ingredients with a plausible and partly-understood mechanism: GFF activates the aryl hydrocarbon receptor (AHR) in keratinocytes, raising filaggrin and barrier tight-junction proteins, while Bifida lysate upregulates host-defense barrier peptides and antioxidant defenses. The practical payoff — modest improvements in skin texture, redness, and dullness with routine use — is real but unspectacular. Human clinical evidence is thin, often industry-funded, uncontrolled, or involves multi-ingredient formulas that prevent isolating the ferment. Grade C is honest; these are not clinically validated actives in the way retinoids or niacinamide are. Best understood as gentle postbiotic support ingredients, not skin-transforming treatments.",
+
+  "benefits": [
+    {
+      "concern": "skin texture / pore appearance / roughness",
+      "strength": 1,
+      "what_it_means": "May produce a modest smoothing of surface texture and a reduction in perceived pore size with regular use. Effect is gradual and subtle — not comparable to AHA exfoliation or retinoid remodeling.",
+      "mechanism": "GFF activates AHR → upregulates filaggrin (a structural protein that underpins the natural moisturizing factor pool) and barrier-reinforcing tight junction proteins (claudin-1, claudin-4, occludin). Better-organized surface epidermis reads as smoother texture. In small human trials (pore area, roughness, redness over 8 weeks in 47-57 subjects per arm), GFF-containing moisturizers reduced mean facial pore area and roughness vs. baseline."
+    },
+    {
+      "concern": "dullness / uneven tone",
+      "strength": 1,
+      "what_it_means": "Can contribute to a brighter, more even appearance over weeks — the brightening story around galactomyces. Effect is modest and may partly reflect the naturally-occurring niacinamide and organic acids in the filtrate rather than the ferment complex itself.",
+      "mechanism": "GFF filtrate reduces melanin synthesis in human melanocytes in vitro via antioxidant and possible tyrosinase-modulating activity of its fermentation metabolites. Organic acids (lactic, malic) in the filtrate provide gentle surface turnover support. An 8-week RCT in subjects with post-acne hyperpigmentation (skin types IV–V, n=51, with a combination serum — not GFF alone) showed improved lightness scores vs. placebo."
+    },
+    {
+      "concern": "barrier support / sensitivity / redness",
+      "strength": 2,
+      "what_it_means": "The best-supported practical benefit: helps skin feel less reactive and more comfortable. Most applicable for easily irritated, sensitized, or post-treatment skin. Bifida ferment lysate has the strongest single controlled human trial in this set.",
+      "mechanism": "Bifida ferment lysate (from Bifidobacterium) upregulates host-defense barrier peptides (CAMP, hBD-2), barrier differentiation genes (filaggrin, loricrin, involucrin, TGM1), and AQP3 (aquaporin, water transport), while scavenging free radicals. In a 2010 randomized double-blind placebo-controlled trial (66 reactive-skin subjects, 10% bacterial extract vs. placebo, 2 months): significant decrease in skin dryness at day 29, improved resistance to physical/chemical stimuli, and increased strippings needed to disrupt the barrier (improved barrier integrity)."
+    },
+    {
+      "concern": "antioxidant / environmental defense",
+      "strength": 1,
+      "what_it_means": "Supportive antioxidant contribution as part of a broader AM routine — not a replacement for a dedicated antioxidant serum (e.g. vitamin C). Benefit is modest and additive.",
+      "mechanism": "GFF activates NRF2 (nuclear factor erythroid 2-related factor 2), the master antioxidant transcription factor, boosting downstream antioxidant enzymes. Fermentation metabolites including organic acids and polyphenols contribute free-radical scavenging activity in vitro."
+    }
+  ],
+
+  "safety": {
+    "irritation_risk": "low",
+    "watchouts": [
+      {
+        "issue": "Ferment-specific sensitivity",
+        "likelihood": "low",
+        "what_to_do": "A small subset of users report breakouts or irritation, particularly with high-percentage GFF essences. Perform a patch test if new to ferments. Galactomyces and Bifida are different organisms — intolerance to one does not predict intolerance to the other."
+      },
+      {
+        "issue": "Fungal acne (Malassezia folliculitis) risk with yeast-derived filtrates",
+        "likelihood": "very low",
+        "what_to_do": "Galactomyces ferment filtrate is a filtrate (organism removed), not live yeast, and is generally considered safe for fungal-acne-prone skin. However, those with active Malassezia overgrowth or known yeast sensitivity should proceed cautiously and consult a dermatologist."
+      }
+    ]
+  },
+
+  "usage": {
+    "routine_step": "essence_or_serum",
+    "pair_well": ["niacinamide", "hyaluronic acid", "centella asiatica", "panthenol", "ceramides"],
+    "consider_separating": ["high-strength vitamin C (pH incompatibility possible with lactic/malic acid content)"],
+    "notes": [
+      "Essences (toner-weight, high-water ferment formulas) are the traditional K-beauty application format — applied after cleansing on damp skin to support barrier hydration.",
+      "Gradual benefit — judge texture/redness improvement at 4–8 weeks minimum.",
+      "Ferment filtrates work best as part of a layered routine rather than as standalone active treatments.",
+      "The Bifida lysate barrier benefit is most meaningful for reactive, sensitive, or compromised skin; healthy-barrier skin may notice less of a difference."
+    ]
+  },
+
+  "evidence": {
+    "grade": "C",
+    "summary": "Mechanism is well-described in vitro (AHR-filaggrin axis for GFF; barrier gene upregulation for Bifida lysate); human clinical evidence is thin and has significant limitations. The strongest controlled human trial is the 2010 Gueniche RCT (Bifidobacterium longum lysate, 66 subjects, double-blind placebo-controlled) for reactive skin. GFF human studies are generally small, often funded by P&G/SK-II, uncontrolled or multi-ingredient, limiting causal attribution to GFF alone. No independent large RCT for any single ferment filtrate in this set exists in the published literature as of 2026. The 'miracle essence' marketing narrative is unsupported by that standard of evidence.",
+    "citations": [
+      {
+        "title": "Transcriptomic analysis of human keratinocytes treated with Galactomyces ferment filtrate — AHR agonist + barrier/anti-inflammatory gene modulation (in vitro)",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC9409768/",
+        "year": 2022,
+        "source": "Journal of Clinical Medicine (MDPI, PMC open access)"
+      },
+      {
+        "title": "GFF potentiates anti-inflammaging system in keratinocytes — AHR/NRF2 dual activation, filaggrin upregulation, IL-37/IL-33 modulation (in vitro review)",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC9657190/",
+        "year": 2022,
+        "source": "Journal of Clinical Medicine (MDPI, PMC open access)"
+      },
+      {
+        "title": "Daily fluctuation study: GFF-containing antioxidative skin care formula reduces pore area, roughness, redness in young Japanese women — 8-week human trial (n≈47–57 per study arm, two parallel studies)",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC8200969/",
+        "year": 2021,
+        "source": "Journal of Clinical Medicine (MDPI, PMC open access)"
+      },
+      {
+        "title": "Bifidobacterium longum lysate: randomized double-blind placebo-controlled trial (n=66, reactive skin, 10% extract vs. placebo, 2 months) — improved barrier integrity, reduced dryness and skin sensitivity",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/19624730/",
+        "year": 2010,
+        "source": "Experimental Dermatology (Wiley, PubMed indexed)"
+      },
+      {
+        "title": "Probiotic ferment lysate lotion (multi-species Lactobacillus) — self-controlled human study (n=52, 30 days): TEWL ↓26.8%, moisturization ↑26.6%, redness ↓13.8% (no placebo arm — design limitation noted by authors)",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC10558477/",
+        "year": 2023,
+        "source": "Scientific Reports (Nature Publishing Group, PMC open access)"
+      }
+    ]
+  },
+
+  "top_products": { "budget": [], "mid": [], "premium": [] },
+
+  "source_meta": {
+    "review": {
+      "method": "agent_adversarial",
+      "decision": "pass",
+      "reviewer": "pivota_subagent",
+      "reviewed_at": "2026-06-14",
+      "human_qa": { "sampled": false, "decision": null, "reviewer": null, "at": null }
+    },
+    "tier": "grounded",
+    "note": "Hand-authored adversarial entry. Evidence grade C is intentional and load-bearing — the 'miracle essence' marketing correction is the core purpose. All 5 citations fetched and verified to resolve to the stated content before inclusion. The 12-month longitudinal GFF/SK-II study (PMC9917576) was reviewed and deliberately excluded from citations: all 6 authors are P&G employees, no control group, multi-product intervention — the evidence quality does not support inclusion alongside the retained citations. The PMID 39013659 (J Dermatol Sci 2024 letter) was also excluded as the full text was not accessible for verification. Two Wiley paywalled papers (jocd.15831, 2009.00932.x) were cross-verified via search-extracted abstracts and secondary sources rather than full-text fetch, with the 2010 Gueniche RCT (PMID 19624730) confirmed via PubMed abstract and Cochrane Central registration."
+  }
+}

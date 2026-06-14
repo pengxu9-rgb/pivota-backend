@@ -1,0 +1,90 @@
+{
+  "_what_this_is": "Gold-standard Tier-G Ingredient KB entry for soy isoflavones / genistein — the ADR-002 quality bar and the drop-in shape for aurora_ingredient_research_kb.ingredient_profile_json (v2-lite + additive Tier-G fields). Codex backfill of other cohort actives mirrors this; human random-sample QA checks against it.",
+
+  "status": "ready",
+  "schema_version": "v2-lite",
+  "provider": "openai",
+  "confidence_level": "high",
+
+  "ingredient": {
+    "inci": "Glycine Soja (Soybean) Seed Extract",
+    "display_name": "Soy isoflavones (genistein / daidzein)",
+    "aliases": ["genistein", "daidzein", "soy phytoestrogens", "fermented soy", "isoflavones"],
+    "what_it_is": "Plant phytoestrogens from soy. Genistein and daidzein bind estrogen-beta receptors in skin and act as antioxidants — the active firming story behind many 'collagen' and 'tofu' K-beauty creams.",
+    "marketing_vs_reality": [
+      {
+        "claim_in_market": "'Collagen' / 'tofu collagen' cream builds collagen",
+        "reality": "The firming comes from soy isoflavones signaling more procollagen — not from any 'collagen' ingredient. Topical hydrolyzed collagen is too large to penetrate; it only hydrates the surface.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "Plant estrogens are risky / hormonal",
+        "reality": "Topical isoflavones are weak phytoestrogens acting locally; cosmetic use is well-tolerated. Soy allergy and pregnancy are the real caveats, not systemic hormonal effect.",
+        "evidence_type": "marketing_vs_reality"
+      }
+    ]
+  },
+
+  "overview": "Soy isoflavones firm and even tone by raising procollagen and damping collagen-degrading enzymes, with antioxidant support. Strongest in mature / estrogen-deficient skin; gradual over weeks.",
+
+  "benefits": [
+    {
+      "concern": "firmness / elasticity",
+      "strength": 2,
+      "what_it_means": "Helps skin look firmer over weeks. Most evident in mature or post-menopausal skin where natural estrogen support has dropped.",
+      "mechanism": "Genistein/daidzein up-regulate type-I procollagen and inhibit MMP-1/MMP-9 (collagen-degrading enzymes) via estrogen-beta signaling."
+    },
+    {
+      "concern": "uneven tone / dullness",
+      "strength": 2,
+      "what_it_means": "Gradually evens tone and brightens; pairs well with niacinamide for the same goal.",
+      "mechanism": "Genistein inhibits tyrosinase-driven melanogenesis and scavenges free radicals (antioxidant)."
+    },
+    {
+      "concern": "photoaging / fine lines",
+      "strength": 1,
+      "what_it_means": "Supportive, not a retinoid replacement — a gentler antioxidant route for sensitive users.",
+      "mechanism": "Reduces UV-induced oxidative stress and MMP induction in dermal fibroblasts."
+    }
+  ],
+
+  "safety": {
+    "irritation_risk": "low",
+    "watchouts": [
+      { "issue": "Soy allergy", "likelihood": "low", "what_to_do": "Avoid if allergic to soy; patch test first." },
+      { "issue": "Pregnancy / nursing", "likelihood": "low", "what_to_do": "Phytoestrogen — many prefer to avoid as a precaution; defer to a clinician." }
+    ]
+  },
+
+  "usage": {
+    "routine_step": "serum_or_moisturizer",
+    "pair_well": ["niacinamide", "peptides", "hyaluronic acid", "adenosine"],
+    "consider_separating": ["high-strength acids (same routine may sting on sensitive skin)"],
+    "notes": ["Gradual — judge at 8–12 weeks.", "AM use benefits from sunscreen on top (antioxidant supports, does not replace SPF)."]
+  },
+
+  "evidence": {
+    "grade": "B",
+    "summary": "Peer-reviewed mechanism + human/ex-vivo data for isoflavone effects on procollagen, MMPs, and pigmentation. Firming benefit is best-supported in estrogen-deficient skin; cosmetic effect sizes are modest and gradual.",
+    "citations": [
+      { "title": "Genistein aglycone, a soy-derived isoflavone, improves skin changes induced by ovariectomy in rats", "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3312494", "year": 2012, "source": "NIH/PMC" },
+      { "title": "Recent advances in the anti-aging effects of phytoestrogens on collagen, water content, and oxidative stress", "url": "https://onlinelibrary.wiley.com/doi/10.1002/ptr.6538", "year": 2020, "source": "Phytotherapy Research" },
+      { "title": "Effects of Isoflavones on the Skin of Postmenopausal Women: A Pilot Study", "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC2705153", "year": 2009, "source": "NIH/PMC" },
+      { "title": "Bioavailability of Isoflavone Metabolites After Korean Fermented Soybean Paste (Doenjang) Ingestion in Estrogen-Deficient Rats", "url": "https://pubmed.ncbi.nlm.nih.gov/30035387", "year": 2018, "source": "PubMed" }
+    ]
+  },
+
+  "top_products": { "budget": [], "mid": [], "premium": [] },
+
+  "source_meta": {
+    "review": {
+      "method": "agent_adversarial",
+      "decision": "pass",
+      "reviewer": "claude_hand_authored_gold_standard",
+      "reviewed_at": "2026-06-14",
+      "human_qa": { "sampled": false, "decision": null, "reviewer": null, "at": null }
+    },
+    "tier": "grounded",
+    "note": "Gold-standard exemplar. Production entries are codex-drafted then agent-reviewed; this one is hand-authored as the quality bar."
+  }
+}

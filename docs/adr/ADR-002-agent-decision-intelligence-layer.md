@@ -1,7 +1,7 @@
 # ADR-002: Agent decision-intelligence layer (facts → intelligence → outcomes)
 
-**Status:** Proposed
-**Date:** 2026-06-13
+**Status:** Accepted — Tier-G review governance ratified 2026-06-14
+**Date:** 2026-06-13 (governance addendum 2026-06-14)
 **Deciders:** Founder (peng), Claude
 **Builds on:** ADR-001 (canonical record + merchant-as-supplier)
 
@@ -76,6 +76,47 @@ brand          ─▶ brand dossier (from Brand KB)
   brand/merchant payment. No pay-to-rank in the intelligence.
 - **Freshness.** Dossiers refresh as reviews and science update.
 
+### Trust tiers & review governance (ratified 2026-06-14)
+
+Human review does not scale to the long-tail wedge — it concentrates on pilot
+brands and leaves the actual cohort (Aruen, Ownist, BB Lab, …) with *zero*
+served intel. The gate is therefore **tiered, not binary**:
+
+```
+Tier H — human_reviewed   human rewrite/sign-off            serves (today's gate)
+Tier G — grounded         trustworthy BY CONSTRUCTION:      serves (NEW — the cohort path)
+                          verified INCI + cited mechanism +
+                          per-claim grading + claim-safe +
+                          agent adversarial-review pass
+Tier L — ungrounded LLM   drafted, no verified grounding    BLOCKED (no fabrication to agents)
+```
+
+**Per-SKU gate = agent review, not human.** A grounded bundle is assembled
+deterministically (verified INCI × reviewed Ingredient KB × per-claim grading),
+then an **agent adversarially reviews it** (the existing LLM-classify →
+codex-review pattern) — that pass *is* the Tier-G gate. No human in the per-SKU
+loop. Founder, 2026-06-14: *"dispatching an agent to review is good enough
+comparing to humans."*
+
+**Human = sampled QA on the KB, not per-SKU sign-off.** Humans spot-check
+**randomly-selected Ingredient-KB entries** to keep the reusable asset honest —
+statistical quality assurance on the compounding layer, where the leverage is.
+Per-SKU bundles inherit that quality through the deterministic join, so they
+don't need their own human pass. Founder: *"we can always let human check on KB
+randomly selected to verify the quality."*
+
+**Why this is safe:** Tier-G acceptance is *additive* — it never loosens what
+already serves, and ungrounded LLM output (Tier L) stays blocked. A bundle only
+earns `tier: grounded` if `inci_verified ∧ citations_present ∧ per-claim graded ∧
+claim-safe-screened ∧ agent-review = pass`; failing any one drops it to Tier L
+(blocked), not through. Prototype:
+[`examples/product_intel_grounded.aruen_tofu_collagen.json`](../examples/product_intel_grounded.aruen_tofu_collagen.json).
+
+**Gate change:** extend `isHumanReviewedProductIntelBundle`
+(`PIVOTA-Agent/src/pdpProductIntel.js`) from a boolean human-marker check to a
+tier resolver returning `human | grounded | reject`, accepting
+`provenance.tier === 'grounded'` when the construction predicates hold.
+
 ## Options considered
 
 - **A — three-tier dossier with reusable KBs (chosen).** Differentiated, citable,
@@ -147,3 +188,22 @@ Mapping the dossier → existing Pivota Insights fields:
    + **pivota-agent-ui** types/rendering + the aurora KBs — NOT the pivota-backend
    canonical-sourcing engine, which is the Tier-0 facts feed. Coordinate with
    whoever owns the product_intel surface before extending it.
+
+### Tier-G build sequence (governance ratified 2026-06-14)
+
+7. [ ] **Enrich `aurora_ingredient_research_kb` for the cohort's hero actives**
+   (soy isoflavones/genistein, adenosine, niacinamide, centella, …) to ADR-002
+   quality — mechanism + graded evidence (cited) + `marketing_vs_reality` +
+   contraindications. Pipeline: LLM/codex backfill → **agent adversarial review**
+   → store with review provenance. This is the **load-bearing, reusable** step
+   (today's KB is 46 thin/fallback rows; Aruen's differentiating actives are
+   absent). Human **random-sample QA** runs against this table.
+8. [ ] **Grounded generator** — deterministically assemble a
+   `product_intel.v1` bundle from verified INCI × reviewed Ingredient KB ×
+   per-claim grading × claim-safety, stamping `provenance.tier='grounded'`
+   (+ `reviewer_kind='automated_grounded'`, `grounding.{inci_verified,
+   citations_present,claim_safety}`). Each assembled bundle gets the agent
+   adversarial-review pass before it's stamped.
+9. [ ] **Tiered gate** — extend `isHumanReviewedProductIntelBundle` →
+   `human | grounded | reject` (see governance section). Additive; Tier-L stays
+   blocked. Coordinate with the product_intel surface owner (parallel session).

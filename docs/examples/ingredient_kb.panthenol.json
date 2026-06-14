@@ -1,0 +1,135 @@
+{
+  "_what_this_is": "Tier-G Ingredient KB entry for panthenol (provitamin B5 / D-panthenol) — mirrors the genistein gold-standard shape (v2-lite + additive Tier-G fields). Grounded via verified PubMed/PMC citations; agent-adversarial reviewed before status=ready.",
+
+  "status": "ready",
+  "schema_version": "v2-lite",
+  "provider": "pivota_research",
+  "confidence_level": "high",
+
+  "ingredient": {
+    "inci": "Panthenol",
+    "display_name": "Panthenol (Provitamin B5 / D-panthenol)",
+    "aliases": ["dexpanthenol", "D-panthenol", "provitamin B5", "pantothenol", "vitamin B5 alcohol"],
+    "what_it_is": "The alcohol precursor of pantothenic acid (vitamin B5). Applied topically, panthenol penetrates the stratum corneum and oxidizes to pantothenic acid, which feeds into coenzyme A synthesis — essential for fatty acid metabolism and, in skin, for barrier lipid production and keratinocyte homeostasis. It also attracts and holds water as a humectant, reducing transepidermal water loss.",
+    "marketing_vs_reality": [
+      {
+        "claim_in_market": "Panthenol 'deeply repairs' or 'heals' the skin barrier",
+        "reality": "The claims are largely fair in direction but the word 'heals' is medical territory. What the evidence actually shows: topical panthenol measurably reduces TEWL, supports barrier restoration after irritation, and accelerates re-epithelialization in post-procedure contexts. 'Supports the appearance of a healthy barrier' is the cosmetic-safe framing. The scope caveat: panthenol is a supporting humectant-plus-barrier actor, not a resurfacing or firming active. It does not resurface dead skin cells (that's AHA/retinoid territory) and has no demonstrated collagen-firming effect at cosmetic doses.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "B5 is a 'super-hydrator' that holds 1000× its weight in water",
+        "reality": "Panthenol is a proven humectant with clinical skin hydration data at 1–5% concentrations, but the '1000×' figure is marketing amplification borrowed loosely from hyaluronic acid claims. The actual measured benefit is meaningful TEWL reduction and improved stratum corneum hydration — significant and real, but not superhuman.",
+        "evidence_type": "marketing_vs_reality"
+      }
+    ]
+  },
+
+  "overview": "Panthenol is a well-supported, low-hype humectant with a secondary barrier-support role. It attracts and retains water in the stratum corneum, reduces TEWL, and — via conversion to pantothenic acid — contributes to the CoA-dependent lipid synthesis pathways that maintain barrier integrity. Clinical RCT data shows it protects against SLS-induced irritation and speeds post-procedure barrier recovery. Marketing claims are generally honest; the main calibration is that it is a supporting player, not a resurfacing or firming active.",
+
+  "benefits": [
+    {
+      "concern": "hydration / moisture retention",
+      "strength": 3,
+      "what_it_means": "Reliably increases stratum corneum hydration and reduces transepidermal water loss. One of the best-evidenced cosmetic humectants — clinical human data at 1–5% formulations. Skin feels less tight and looks less dehydrated.",
+      "mechanism": "Panthenol is hygroscopic: it absorbs water from the environment and binds it in the stratum corneum, reducing TEWL. Effect measurable at 1% concentration; significant at 5%."
+    },
+    {
+      "concern": "barrier support / irritation appearance",
+      "strength": 2,
+      "what_it_means": "Supports the appearance of an intact skin barrier after minor stressors (surfactant exposure, post-procedure inflammation). Skin looks less red and feels less reactive.",
+      "mechanism": "Converts to pantothenic acid → feeds into coenzyme A → supports fatty acid synthesis in keratinocytes, contributing to barrier lipid replenishment. Also demonstrated to reduce erythema scores in UV-irritation and SLS-challenge models."
+    },
+    {
+      "concern": "soothing / calming appearance",
+      "strength": 2,
+      "what_it_means": "Reduces the look of redness and the feeling of skin sensitivity, particularly after cosmetic procedures or irritant contact. Used clinically in post-procedure and atopic dermatitis contexts.",
+      "mechanism": "Indirect: barrier restoration lowers percutaneous irritant penetration. Also reduces the look of UV-induced redness in vivo, though the precise pathway at cosmetic concentrations is not fully characterized."
+    },
+    {
+      "concern": "skin texture / smoothness",
+      "strength": 1,
+      "what_it_means": "Skin feels softer and smoother due to improved hydration and barrier integrity. A secondary benefit rather than a primary action.",
+      "mechanism": "Adequate hydration in the stratum corneum improves corneocyte packing and surface texture; panthenol's humectant action sustains this through the day."
+    }
+  ],
+
+  "safety": {
+    "irritation_risk": "very_low",
+    "watchouts": [
+      {
+        "issue": "Rare contact sensitization",
+        "likelihood": "very_low",
+        "what_to_do": "Allergic reactions to dexpanthenol are documented but uncommon; patch test if history of unusual product reactions. The Cosmetic Ingredient Review panel concluded panthenol and derivatives are safe at present use concentrations."
+      },
+      {
+        "issue": "Vitamin B5 oral supplement confusion",
+        "likelihood": "informational",
+        "what_to_do": "Topical panthenol in skincare is distinct from high-dose oral B5 supplement regimes discussed online for acne. They are different routes with different evidence bases; do not conflate."
+      }
+    ]
+  },
+
+  "usage": {
+    "routine_step": "serum_or_moisturizer",
+    "pair_well": ["niacinamide", "hyaluronic acid", "ceramides", "centella asiatica", "beta-glucan"],
+    "consider_separating": ["high-strength AHAs or BHAs in the same step (no interaction concern, but layering order matters for pH-sensitive actives)"],
+    "notes": [
+      "Effective across a wide concentration range; most clinical data at 1–5%. Common in K-beauty essences, toners, and moisturizers at 0.5–1%.",
+      "AM and PM compatible — no photosensitivity concern.",
+      "Particularly useful in post-exfoliation, post-procedure, or disrupted-barrier contexts where the barrier-support mechanism is most relevant.",
+      "Gradual cumulative hydration benefit; also provides immediate moisture-feel."
+    ]
+  },
+
+  "evidence": {
+    "grade": "B",
+    "summary": "Panthenol has a solid human clinical evidence base for humectancy and barrier support — multiple controlled trials including double-blind placebo-controlled RCTs showing TEWL reduction and protection against SLS-induced irritation. The mechanism (pantothenic acid → CoA → lipid synthesis) is well-characterized biochemically. Grade B rather than A because: the human RCTs are mostly small (≤25 subjects), measured over short durations (2–4 weeks), and concentration ranges vary across studies. No large independent multicenter RCTs exist. The barrier-support and soothing benefits are real but effect sizes are modest; the redness-calming pathway at purely cosmetic concentrations is plausibly explained but not fully mechanistically isolated in human skin.",
+    "citations": [
+      {
+        "title": "Use of Dexpanthenol for Atopic Dermatitis — Benefits and Recommendations Based on Current Evidence",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC9322723/",
+        "year": 2022,
+        "source": "J Clin Med (PMC full text)"
+      },
+      {
+        "title": "Dexpanthenol in Wound Healing after Medical and Cosmetic Interventions (Postprocedure Wound Healing)",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC7407203/",
+        "year": 2020,
+        "source": "Pharmaceuticals (PMC full text)"
+      },
+      {
+        "title": "Efficacy of dexpanthenol in skin protection against irritation: a double-blind, placebo-controlled study",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/14641355/",
+        "year": 2003,
+        "source": "Contact Dermatitis (PubMed PMID 14641355)"
+      },
+      {
+        "title": "Topical use of dexpanthenol in skin disorders",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/12113650/",
+        "year": 2002,
+        "source": "Am J Clin Dermatol (PubMed PMID 12113650)"
+      },
+      {
+        "title": "Skin moisturizing effects of panthenol-based formulations",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/21982351/",
+        "year": 2011,
+        "source": "J Cosmet Sci (PubMed PMID 21982351)"
+      }
+    ]
+  },
+
+  "top_products": { "budget": [], "mid": [], "premium": [] },
+
+  "source_meta": {
+    "review": {
+      "method": "agent_adversarial",
+      "decision": "pass",
+      "reviewer": "pivota_subagent",
+      "reviewed_at": "2026-06-14",
+      "human_qa": { "sampled": false, "decision": null, "reviewer": null, "at": null }
+    },
+    "tier": "grounded",
+    "note": "Five citations verified via WebFetch before inclusion; all resolve to the claimed content. PMC9322723 and PMC7407203 are full-text PMC articles; PMID 14641355, 12113650, and 21982351 verified via PubMed abstract pages."
+  }
+}
