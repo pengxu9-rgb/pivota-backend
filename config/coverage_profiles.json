@@ -1,5 +1,5 @@
 {
-  "default_profile": "us_shopper",
+  "default_profile": "pilot_gemini",
   "engine_supported_providers": ["mock", "gemini", "chatgpt", "claude", "deepseek"],
   "verify_supported_providers": ["deepseek"],
   "default_verify_sample": {

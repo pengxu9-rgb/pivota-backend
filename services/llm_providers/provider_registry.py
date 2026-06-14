@@ -295,6 +295,67 @@ def _seed_default_providers() -> None:
         },
     ))
 
+    # ChatGPT (OpenAI Responses + web_search_preview, via PIVOTA-Agent upstream).
+    # Premium/paid-tier provider. Registered so probe telemetry computes a real
+    # cost_usd instead of NULL/$0 — before this, get_provider("chatgpt") was None
+    # and every ChatGPT probe recorded $0 even with real tokens. Token rates
+    # mirror config/provider_credit_rates.json; the per-call web_search fee is
+    # priced there (grounding_cost_usd_per_call) and in the gateway estimate.
+    register_provider(LLMProvider(
+        id="chatgpt",
+        display_name="OpenAI ChatGPT Grounded",
+        backend=BACKEND_PIVOTA_AGENT_UPSTREAM,
+        cost_per_1k_input_tokens_usd=0.005,      # $5.00 / 1M input
+        cost_per_1k_output_tokens_usd=0.02,      # $20.00 / 1M output
+        avg_latency_ms_per_probe=14000,
+        rate_limit_per_minute=60,
+        health_status=HEALTH_HEALTHY,
+        capabilities={
+            "grounded_search": "supported",      # web_search_preview tool
+            "structured_json_output": "native",
+            "max_context_tokens": 400_000,
+            "supports_tool_use": True,
+        },
+        # Intentionally empty: ChatGPT is a premium/paid-tier provider, so it
+        # must NOT be auto-selected by the orchestrator (provider="auto"), which
+        # would silently route free/default audits onto an expensive provider.
+        # Empty suitability => suitability_weight==0 => excluded from auto
+        # ranking. It is still fully usable via EXPLICIT selection (coverage
+        # profiles list "chatgpt" directly, bypassing the orchestrator), and
+        # get_provider("chatgpt") still resolves rates for cost telemetry.
+        # Promote these once entitlement-aware auto-selection ships.
+        suitable_for_scan_modes={},
+        model_rates={
+            "chat-latest": {"input_per_1k": 0.005, "output_per_1k": 0.02},
+        },
+    ))
+
+    # Claude (Anthropic Messages + web_search, via PIVOTA-Agent upstream).
+    # Premium/paid-tier provider. Same rationale as ChatGPT above.
+    register_provider(LLMProvider(
+        id="claude",
+        display_name="Anthropic Claude Grounded",
+        backend=BACKEND_PIVOTA_AGENT_UPSTREAM,
+        cost_per_1k_input_tokens_usd=0.003,      # $3.00 / 1M input
+        cost_per_1k_output_tokens_usd=0.015,     # $15.00 / 1M output
+        avg_latency_ms_per_probe=12000,
+        rate_limit_per_minute=60,
+        health_status=HEALTH_HEALTHY,
+        capabilities={
+            "grounded_search": "supported",      # web_search tool
+            "structured_json_output": "native",
+            "max_context_tokens": 200_000,
+            "supports_tool_use": True,
+        },
+        # Empty for the same reason as ChatGPT above: premium/paid-tier, so
+        # excluded from orchestrator auto-selection while remaining explicitly
+        # selectable and cost-visible.
+        suitable_for_scan_modes={},
+        model_rates={
+            "claude-sonnet-4": {"input_per_1k": 0.003, "output_per_1k": 0.015},
+        },
+    ))
+
     # Mock — for tests / dev environments without API keys
     register_provider(LLMProvider(
         id="mock",
