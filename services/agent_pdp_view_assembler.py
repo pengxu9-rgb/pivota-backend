@@ -190,6 +190,45 @@ async def fetch_external_seed_by_id(
     return dict(row) if row else None
 
 
+async def fetch_evidence_for_keys(
+    product_keys: List[str],
+    *,
+    db: Any = None,
+) -> Dict[str, Any]:
+    """Highest-precedence agent-decision-grade evidence for a content_key cluster.
+
+    evidence_profile lives per product_key (beauty_product_profiles), but the
+    canonical record is shared across the merchant rows that resolve to one
+    content_key. Per ADR-001 source precedence (brand-official > supplier >
+    reseller) the canonical evidence is the brand-official one — which for the
+    crawled wedge catalog is the `external_seed` row. So prefer external_seed,
+    then the most-recently-authored, among the rows that actually carry evidence.
+
+    Returns {} when no row in the cluster has authored evidence yet (the agent
+    view column stays NULL — the merchant simply isn't decision-grade yet).
+    """
+    if not product_keys:
+        return {}
+    read_db = db or database
+    row = await read_db.fetch_one(
+        """
+        SELECT evidence_profile, required_disclaimers
+        FROM beauty_product_profiles
+        WHERE product_key = ANY(:keys)
+          AND evidence_profile IS NOT NULL
+        ORDER BY (merchant_id = 'external_seed') DESC, updated_at DESC
+        LIMIT 1
+        """,
+        {"keys": product_keys},
+    )
+    if not row:
+        return {}
+    return {
+        "evidence_profile": row["evidence_profile"],
+        "required_disclaimers": row["required_disclaimers"],
+    }
+
+
 def coalesce_first(*values: Any) -> Any:
     """First non-empty value (string trim aware)."""
     for v in values:
@@ -580,6 +619,7 @@ def assemble_row(
     skus: List[Dict[str, Any]],
     offers: List[Dict[str, Any]],
     external_seed: Optional[Dict[str, Any]],
+    evidence: Optional[Dict[str, Any]] = None,
     refresh_source: str = BACKFILL_REFRESH_SOURCE,
 ) -> Optional[Dict[str, Any]]:
     """Produce the agent_pdp_view row payload from raw source rows.
@@ -665,6 +705,10 @@ def assemble_row(
         "brand": canonical.get("brand"),
         "title": title,
         "description": (description[:5000] if isinstance(description, str) else None),
+        # Agent-decision-grade evidence (provenance-backed claims + required
+        # disclaimers) — highest-precedence across the content_key cluster.
+        "evidence_profile": (evidence or {}).get("evidence_profile"),
+        "required_disclaimers": (evidence or {}).get("required_disclaimers"),
         "image_url": image_url,
         "image_urls": image_urls or None,
         "currency": currency,
@@ -697,7 +741,8 @@ def assemble_row(
 UPSERT_SQL = """
     INSERT INTO agent_pdp_view (
       content_key, pivota_signature_id, product_group_id,
-      brand, title, description, image_url, image_urls,
+      brand, title, description, evidence_profile, required_disclaimers,
+      image_url, image_urls,
       currency, price_min, price_max, offer_count, offers,
       variants, variants_count, gtin13,
       category_path, taxonomy_tags, breadcrumb,
@@ -708,7 +753,9 @@ UPSERT_SQL = """
       refreshed_at, refresh_source, refreshed_by_proposal_id
     ) VALUES (
       :content_key, :pivota_signature_id, :product_group_id,
-      :brand, :title, :description, :image_url, CAST(:image_urls AS jsonb),
+      :brand, :title, :description,
+      CAST(:evidence_profile AS jsonb), CAST(:required_disclaimers AS jsonb),
+      :image_url, CAST(:image_urls AS jsonb),
       :currency, :price_min, :price_max, :offer_count, CAST(:offers AS jsonb),
       CAST(:variants AS jsonb), :variants_count, :gtin13,
       :category_path, CAST(:taxonomy_tags AS jsonb), CAST(:breadcrumb AS jsonb),
@@ -724,6 +771,8 @@ UPSERT_SQL = """
       brand = EXCLUDED.brand,
       title = EXCLUDED.title,
       description = EXCLUDED.description,
+      evidence_profile = EXCLUDED.evidence_profile,
+      required_disclaimers = EXCLUDED.required_disclaimers,
       image_url = EXCLUDED.image_url,
       image_urls = EXCLUDED.image_urls,
       currency = EXCLUDED.currency,
@@ -770,6 +819,8 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     params["variants"] = to_jsonb(row.get("variants"))
     params["taxonomy_tags"] = to_jsonb(row.get("taxonomy_tags"))
     params["breadcrumb"] = to_jsonb(row.get("breadcrumb"))
+    params["evidence_profile"] = to_jsonb(row.get("evidence_profile"))
+    params["required_disclaimers"] = to_jsonb(row.get("required_disclaimers"))
     # size_guide on catalog_products is already a JSONB value (stored as
     # dict by the LLM extractor / authoring path). coalesce_fashion_fields
     # passes it through verbatim. Re-encode for the SQLAlchemy bind. Other
@@ -805,6 +856,7 @@ async def refresh_agent_pdp_view_for_content_key(
     skus = await fetch_skus_for_keys(product_keys, db=read_db)
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
     external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
+    evidence = await fetch_evidence_for_keys(product_keys, db=read_db)
 
     row = assemble_row(
         content_key=content_key,
@@ -812,6 +864,7 @@ async def refresh_agent_pdp_view_for_content_key(
         skus=skus,
         offers=offers,
         external_seed=external_seed,
+        evidence=evidence,
         refresh_source=refresh_source,
     )
     if row is None:
