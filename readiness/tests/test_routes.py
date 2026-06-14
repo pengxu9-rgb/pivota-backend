@@ -38,9 +38,8 @@ def _install_live_source_mocks(monkeypatch, *, psp_enabled: bool):
     async def fake_get_shopify_cfg(_merchant_id: str):
         return fixture["shopify_config"]
 
-    async def fake_get_cached_products(*, merchant_id: str, platform: str, include_expired: bool = False):
+    async def fake_load_runtime_cache_rows(merchant_id: str):
         assert merchant_id == fixture["merchant_id"]
-        assert platform == "shopify"
         rows = deepcopy(fixture["products_cache_rows"])
         now = datetime.now(timezone.utc).replace(microsecond=0)
         rows[0]["cached_at"] = now.isoformat().replace("+00:00", "Z")
@@ -61,7 +60,7 @@ def _install_live_source_mocks(monkeypatch, *, psp_enabled: bool):
     monkeypatch.setattr(shopify_live, "get_merchant_onboarding", fake_get_merchant_onboarding)
     monkeypatch.setattr(shopify_live, "get_primary_store", fake_get_primary_store)
     monkeypatch.setattr(shopify_live, "_get_shopify_config_for_merchant", fake_get_shopify_cfg)
-    monkeypatch.setattr(shopify_live, "get_cached_products", fake_get_cached_products)
+    monkeypatch.setattr(shopify_live, "_load_runtime_cache_rows", fake_load_runtime_cache_rows)
     monkeypatch.setattr(shopify_live, "_fetch_active_psp_config", fake_get_active_psp)
     monkeypatch.setattr(shopify_live, "_fetch_live_products", fake_fetch_live_products)
     monkeypatch.setattr(shopify_live, "load_product_review_summaries", fake_load_product_review_summaries)

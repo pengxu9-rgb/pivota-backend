@@ -67,4 +67,8 @@ for t in "${selected_tests[@]}"; do
   echo " - $t"
 done
 
-python3 -m pytest -q "${selected_tests[@]}" "$@"
+if command -v pytest >/dev/null 2>&1; then
+  pytest -q "${selected_tests[@]}" "$@"
+else
+  python3 -m pytest -q "${selected_tests[@]}" "$@"
+fi
