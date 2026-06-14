@@ -295,8 +295,9 @@ async def test_adyen_webhook_authorisation_success_marks_order_paid_and_syncs_sh
             "payment_status": "pending",
         }
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
         paid_calls.append(order_id)
+        return True
 
     async def fake_update_payment_info(
         order_id: str,
@@ -468,8 +469,9 @@ async def test_adyen_webhook_handles_multiple_notification_items_without_partial
             }
         return None
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
         paid_calls.append(order_id)
+        return True
 
     async def fake_update_payment_info(
         order_id: str,

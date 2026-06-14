@@ -323,8 +323,9 @@ async def test_checkout_webhook_reprocesses_existing_failed_event(
     async def fake_update_payment_info(**kwargs: Any) -> None:
         payment_updates.append(kwargs)
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
         mark_paid_calls.append(order_id)
+        return True
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
@@ -515,8 +516,9 @@ async def test_checkout_webhook_success_marks_paid_and_processed(
     async def fake_update_payment_info(**kwargs: Any) -> None:
         payment_updates.append(kwargs)
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
         mark_paid_calls.append(order_id)
+        return True
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)

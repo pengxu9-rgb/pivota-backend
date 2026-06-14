@@ -355,9 +355,10 @@ async def test_payment_aftercare_canary_checkout_failed_then_reprocess_then_dupl
         state["payment_status"] = kwargs["payment_status"]
         payment_updates.append(kwargs)
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
         state["payment_status"] = "paid"
         mark_paid_calls.append(order_id)
+        return True
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
@@ -1039,6 +1040,10 @@ async def test_payment_aftercare_canary_stripe_payment_failed_then_succeeded_rec
         "payment_intent_id": "pi_aftercare_stripe_recovery",
         "status": "awaiting_payment",
         "payment_status": "awaiting_payment",
+        # Recovery succeeded event carries amount 4520 minor / usd 100 = 45.20;
+        # must match the order total for the integrity guard to finalize.
+        "total": "45.20",
+        "currency": "usd",
         "total_refunded": "0.00",
     }
     status_updates: list[tuple[str, str]] = []
@@ -1077,11 +1082,12 @@ async def test_payment_aftercare_canary_stripe_payment_failed_then_succeeded_rec
         state["payment_status"] = status
         status_updates.append((order_id, status))
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
         assert order_id == state["order_id"]
         state["status"] = "paid"
         state["payment_status"] = "paid"
         paid_calls.append(order_id)
+        return True
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
