@@ -5109,6 +5109,30 @@ async def attach_niche_recurrence(
     return where_you_can_win
 
 
+async def attach_niche_movement(
+    where_you_can_win: Dict[str, Any],
+    *,
+    merchant_id: str,
+    db: Any = None,
+) -> Dict[str, Any]:
+    """Phase 4: attach the re-audit movement (won / holding / lost / still_open /
+    new) to each winnable target, so the merchant sees whether the niches they
+    targeted got won over time. Best-effort. Mutates + returns the dict."""
+    targets = (where_you_can_win or {}).get("targets") or []
+    if not targets or not merchant_id:
+        return where_you_can_win
+    from services.niche_outcomes import niche_movement_for_queries
+
+    keys = [t.get("normalized_query") for t in targets if t.get("normalized_query")]
+    movement = await niche_movement_for_queries(merchant_id, keys, db=db)
+    for t in targets:
+        mv = movement.get(t.get("normalized_query") or "")
+        # surface only meaningful, non-"new" movement (new = no prior to compare)
+        if mv and mv.get("movement") and mv["movement"] != "new":
+            t["movement"] = mv["movement"]
+    return where_you_can_win
+
+
 def build_brand_rollup(
     per_sku_reports: List[Dict[str, Any]],
     merchant_id: str,
@@ -8052,6 +8076,22 @@ async def run_brand_report(
             await attach_niche_recurrence(brand_rollup["where_you_can_win"])
         except Exception:  # noqa: BLE001
             logger.warning("niche recurrence record/attach failed", exc_info=True)
+        # Phase 4: record this audit's per-niche ownership, then attach re-audit
+        # movement (won / holding / lost / still_open) to the targets. Record
+        # FIRST so movement compares this audit (current) vs the prior. Best-effort.
+        try:
+            from services.niche_outcomes import record_niche_outcomes
+
+            await record_niche_outcomes(
+                per_sku_reports=per_sku_reports,
+                merchant_id=str(merchant_id),
+                audit_run_id=audit_run_id,
+            )
+            await attach_niche_movement(
+                brand_rollup["where_you_can_win"], merchant_id=str(merchant_id)
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("niche outcomes record/attach failed", exc_info=True)
         authority_map = build_authority_map(per_sku_reports, probe_runs_by_sku)
         median_citation = (
             (brand_rollup.get("dimensions") or {})
