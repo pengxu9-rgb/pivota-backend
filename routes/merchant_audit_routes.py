@@ -1921,6 +1921,66 @@ async def update_merchant_task(
     return {"task": updated}
 
 
+class _NicheContentBody(BaseModel):
+    query: str = Field(..., min_length=1, max_length=400)
+    sku_key: Optional[str] = None
+    sku_name: Optional[str] = None
+    why_you_fit: Optional[str] = None
+
+
+@router.post("/tasks/niche-content")
+async def create_niche_content_task(
+    body: _NicheContentBody,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    """Phase 3: graduate a winnable-niche 'create the answer' action (from the
+    Where-you-can-win view) into a tracked distribution task in the merchant's
+    queue. Idempotent — a second click on the same niche returns the existing
+    pending task instead of stacking duplicates."""
+    q = (body.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=422, detail="query is required")
+    from db.merchant_tasks import (
+        find_pending_supersede_candidates,
+        record_task_created,
+    )
+
+    title = f"Create the answer AI cites for: {q}"
+    existing = await find_pending_supersede_candidates(
+        merchant_id=merchant_id, lever="niche_content", title=title,
+    )
+    if existing:
+        return {"status": "exists", "task_id": existing[0].get("task_id"), "title": title}
+
+    sku = (body.sku_name or "").strip()
+    fit = (body.why_you_fit or "").strip()
+    task_body = (
+        "This is a winnable niche — no brand owns the answer yet"
+        + (f", and {sku} is a strong match" if sku else "")
+        + (f" (you fit: {fit})" if fit else "")
+        + ". Write a focused page section + FAQ answering this query so AI starts "
+        "citing you, then re-run the audit to confirm it landed."
+    )
+    task_id = await record_task_created(
+        merchant_id=merchant_id,
+        title=title,
+        body=task_body,
+        severity="medium",
+        lever="niche_content",
+        assigned_to_agent="niche_targeting",
+        evidence={
+            "kind": "niche_content",
+            "query": q,
+            "sku_key": body.sku_key,
+            "sku_name": body.sku_name,
+            "why_you_fit": fit or None,
+        },
+    )
+    if not task_id:
+        raise HTTPException(status_code=500, detail="could not create task")
+    return {"status": "success", "task_id": task_id, "title": title}
+
+
 class _TaskDismissBody(BaseModel):
     reason: str = Field(..., min_length=1, max_length=2000)
 
