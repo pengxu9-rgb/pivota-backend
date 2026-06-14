@@ -248,6 +248,14 @@
       "coverage_note": "Affiliate-heavy lifestyle reviews; high volume of category roundups.",
       "outreach_hint": "Editorial pitch — affiliate-driven roundups."
     },
+    "the-independent.com": {
+      "type": "editorial",
+      "subtype": "review_site",
+      "categories": ["beauty", "skincare", "supplements", "wellness", "fashion"],
+      "aliases": ["The Independent", "IndyBest"],
+      "coverage_note": "The Independent's IndyBest vertical runs tested 'best {category}' roundups (skincare, supplements, beauty) that AI grounds in for UK/EU category queries; frequently cited for K-beauty and collagen comparisons.",
+      "outreach_hint": "Editorial pitch to the IndyBest desk — sample-based reviews, UK/EU market angle."
+    },
 
     "amazon.com": {
       "type": "marketplace",
@@ -352,6 +360,22 @@
       "coverage_note": "Wellness + supplements + K-beauty; strong international AI-channel grounding.",
       "outreach_hint": "iHerb wholesale onboarding."
     },
+    "gosupps.com": {
+      "type": "retailer",
+      "subtype": "wellness_retailer",
+      "categories": ["supplements", "health", "wellness", "fitness"],
+      "aliases": ["goSupps", "GoSupps"],
+      "coverage_note": "goSupps is a US online supplements and wellness retailer; AI cites its listings as a buying route for vitamin, collagen, and supplement queries.",
+      "outreach_hint": "Wholesale / reseller onboarding plus accurate, review-backed product listings."
+    },
+    "sayweee.com": {
+      "type": "retailer",
+      "subtype": "mass_market",
+      "categories": ["food_bev", "beauty", "skincare", "kbeauty"],
+      "aliases": ["Weee!", "Sayweee"],
+      "coverage_note": "Weee! is a US-based Asian grocery and lifestyle marketplace that also carries K-beauty and Asian skincare; AI grounds Asian-grocery and K-beauty buying queries through its listings.",
+      "outreach_hint": "Marketplace / wholesale onboarding plus listing optimization (title, attributes, availability)."
+    },
     "boscovs.com": {
       "type": "retailer",
       "subtype": "department_store",
@@ -404,6 +428,22 @@
       "coverage_note": "General-purpose resale + retail marketplace.",
       "outreach_hint": "Generally lower-priority for D2C brand authority — confirm market fit."
     },
+    "musinsa.com": {
+      "type": "marketplace",
+      "subtype": "fashion_marketplace",
+      "categories": ["fashion", "beauty", "skincare", "kbeauty"],
+      "aliases": ["Musinsa"],
+      "coverage_note": "Musinsa is Korea's largest online fashion-and-beauty marketplace; AI routes Korean fashion and K-beauty buying queries through its brand and product listings.",
+      "outreach_hint": "Marketplace onboarding (Korea) plus accurate, review-backed listings; confirm cross-border fulfillment."
+    },
+    "desertcart.com": {
+      "type": "marketplace",
+      "subtype": "mass_market",
+      "categories": ["beauty", "skincare", "supplements", "fashion", "home", "electronics"],
+      "aliases": ["desertcart", "Desertcart"],
+      "coverage_note": "desertcart is an international cross-border marketplace shipping broad-catalog consumer goods to the Middle East and other regions; AI cites its listings as a buying route where direct D2C shipping is limited.",
+      "outreach_hint": "Cross-border marketplace listing — confirm market relevance and margin before prioritizing."
+    },
 
     "thewinners.ae": {
       "type": "retailer",
@@ -420,12 +460,28 @@
       "coverage_note": "K-beauty specialty retailer (international); high AI-channel grounding for K-beauty queries.",
       "outreach_hint": "K-beauty wholesale — Olive Young vendor relations."
     },
+    "oliveyoung.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Olive Young Korea"],
+      "coverage_note": "Olive Young is Korea's dominant domestic K-beauty specialty retailer (the .com domestic storefront alongside the international oliveyoungglobal.com); very high AI-channel grounding for Korean skincare and beauty queries.",
+      "outreach_hint": "K-beauty wholesale — Olive Young vendor relations; coordinate domestic (oliveyoung.com) and global (oliveyoungglobal.com) listings."
+    },
     "skinsort.com": {
       "type": "editorial",
       "subtype": "review_aggregator",
       "categories": ["beauty"],
       "coverage_note": "Skincare ingredient + product database; aggregates reviews + ingredient analysis.",
       "outreach_hint": "Skinsort listing — submission via their database curation process."
+    },
+    "hwahae.com": {
+      "type": "editorial",
+      "subtype": "review_aggregator",
+      "categories": ["beauty", "skincare", "kbeauty"],
+      "aliases": ["Hwahae"],
+      "coverage_note": "Hwahae (화해) is Korea's leading cosmetics review-and-ingredient-analysis platform (the Korean equivalent of Skinsort); AI grounds K-beauty product safety, ingredient, and 'is X good' queries in its crowd-reviewed database.",
+      "outreach_hint": "Editorial / database channel — keep ingredient listings accurate and monitor user reviews; not a paid-placement surface."
     }
   }
 }
