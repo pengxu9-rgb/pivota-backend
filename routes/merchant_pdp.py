@@ -136,6 +136,35 @@ async def submit_product_pdp_contribution(
         raise _map_error(exc)
 
 
+class SupplierEvidenceRequest(BaseModel):
+    # v1: an INCI list (the highest-leverage, fully-verifiable input). Pivota
+    # verifies → substantiates → screens → grades it into provenance-backed,
+    # claim-safe claims on the canonical record. Brand-URL crawl + lab/cert land
+    # in v2 (they queue async). The merchant supplies EVIDENCE, not copy.
+    raw_inci: Optional[str] = None
+
+
+@router.post("/product/{platform}/{platform_product_id}/evidence")
+async def submit_product_evidence(
+    platform: str,
+    platform_product_id: str,
+    body: SupplierEvidenceRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Supplier evidence intake — verify + grade the merchant's evidence into the
+    canonical record and serve it (docs/SUPPLIER_EVIDENCE_INTAKE.md). Keyed to the
+    authed merchant's own product."""
+    merchant_id = _merchant_id(current_user)
+    product_key = f"{merchant_id}|{platform}|{platform_product_id}"
+    try:
+        parse_product_key(product_key)
+        from services.supplier_evidence_intake import ingest_supplier_evidence
+
+        return await ingest_supplier_evidence(product_key, raw_inci=body.raw_inci)
+    except Exception as exc:
+        raise _map_error(exc)
+
+
 class MerchantApproveRequest(BaseModel):
     module_key: str = "copy"
     market: str = DEFAULT_MARKET
