@@ -498,10 +498,17 @@ def test_competitive_pressure_with_fp_peers_hedges_heuristic():
         merchant_attribution_score=10,
     )
     framing = cp.get("framing") or ""
-    # Hedge present — "heuristic" or "may be coincidental" type
-    # acknowledgement.
-    assert "heuristic" in framing.lower(), (
-        f"framing must acknowledge heuristic peer-host match: {framing!r}"
+    # Hedge present — "heuristic" or a "coincidental / not impossible"
+    # type acknowledgement that the peer-host match may be a false
+    # positive. The merchant-facing copy uses the latter wording.
+    framing_lower = framing.lower()
+    assert (
+        "heuristic" in framing_lower
+        or "coincidental" in framing_lower
+        or "not impossible" in framing_lower
+    ), (
+        f"framing must acknowledge the peer-host match could be "
+        f"coincidental: {framing!r}"
     )
     # No "won and you didn't see" type claims.
     for token in COMPETITION_LIES:
