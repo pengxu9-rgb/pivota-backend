@@ -44,13 +44,15 @@ async def ingest_supplier_evidence(
     product_key: str,
     *,
     raw_inci: Optional[str] = None,
+    brand_url: Optional[str] = None,
     db: Any = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Verify + grade a supplier's evidence into the canonical record and serve it.
 
-    v1 accepts an INCI list (the highest-leverage, fully-verifiable input). Returns
-    a step-by-step summary; never raises on a missing/unresolvable product
+    Accepts either an INCI list (pasted) OR a product-page URL we crawl for the
+    INCI (the easier front door — the operator pastes a link). Returns a
+    step-by-step summary; never raises on a missing/unresolvable product
     (status="not_found"). Idempotent and ownership-safe (the underlying pipeline
     is fill-only + precedence-gated).
     """
@@ -63,9 +65,28 @@ async def ingest_supplier_evidence(
         "served": False,
     }
 
+    # Brand-URL front door: crawl the page the supplier points at for its INCI
+    # (Shopify product-JSON preferred, then rendered text). Best-effort — a fetch
+    # miss just means we fall back to whatever INCI was pasted.
+    if (not raw_inci or not str(raw_inci).strip()) and brand_url and str(brand_url).strip():
+        try:
+            from services.canonical_inci_resolver import http_fetch, resolve_inci_from_url
+
+            resolved = await resolve_inci_from_url(str(brand_url).strip(), fetch=http_fetch)
+        except Exception as exc:  # noqa: BLE001
+            resolved = None
+            logger.warning("supplier_evidence_intake: URL crawl failed for %s: %s",
+                           brand_url, str(exc)[:200])
+        if resolved and getattr(resolved, "raw_inci", None):
+            raw_inci = resolved.raw_inci
+            out["steps"]["crawl"] = "ok"
+            out["crawl_source_url"] = resolved.source_url
+        else:
+            out["steps"]["crawl"] = "no_inci_found"
+
     if not raw_inci or not str(raw_inci).strip():
-        # No verifiable evidence supplied — nothing to grade. (Brand-URL crawl +
-        # lab/cert intake land in v2; they queue async rather than write here.)
+        # No verifiable evidence supplied (or the crawl found no INCI). Nothing to
+        # grade. (Lab/cert/community intake land in a later phase.)
         out["status"] = "no_evidence"
         return out
 
