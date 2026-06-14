@@ -157,6 +157,22 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # Outcome aggregation: roll the decision -> order -> paid/refund loop into
+        # per-merchant + per-product outcome metrics (aggregated_outcomes). Daily at
+        # 05:00 UTC (after nightly_index_health). Min-sample-gated, so it surfaces
+        # nothing until real transaction volume exists — a safe no-op pre-launch.
+        from services.outcome_aggregation_service import refresh_all_outcomes
+        scheduler.add_job(
+            refresh_all_outcomes,
+            "cron",
+            hour=5,
+            minute=0,
+            id="outcome_aggregation_daily",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+
         # P2.2: drive queued audit_runs through the async lifecycle.
         # No production traffic flows here until P2.3 ships POST
         # /api/audits, so the tick is a safe no-op until then. 10s
