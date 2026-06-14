@@ -66,6 +66,32 @@ class _FakeSession:
         raise AssertionError(f"unexpected {method} {url}")
 
 
+def test_redact_sensitive_masks_payment_and_checkout_fields() -> None:
+    payload = {
+        "api_key": "sk_live_private",
+        "client_secret": "pi_123_secret_456",
+        "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_secret",
+        "checkoutUrls": ["https://checkout.example/one"],
+        "engine_ref": "gid://shopify/Cart/abc?key=private",
+        "nested": {
+            "x-api-key": "internal-private",
+            "provider_client_secret": "provider-private",
+            "engine_ref": "quote_ref_public",
+        },
+    }
+
+    redacted = module._redact_sensitive(payload)
+
+    assert redacted["api_key"] == "[REDACTED]"
+    assert redacted["client_secret"] == "[REDACTED]"
+    assert redacted["checkout_url"] == "[REDACTED]"
+    assert redacted["checkoutUrls"] == "[REDACTED]"
+    assert redacted["engine_ref"] == "[REDACTED]"
+    assert redacted["nested"]["x-api-key"] == "[REDACTED]"
+    assert redacted["nested"]["provider_client_secret"] == "[REDACTED]"
+    assert redacted["nested"]["engine_ref"] == "quote_ref_public"
+
+
 def _build_args(tmp_path: Path, *, query: str | None = "winona soothing repair serum") -> argparse.Namespace:
     return argparse.Namespace(
         base_url="https://api.example",

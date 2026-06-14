@@ -68,7 +68,18 @@ def _now_slug() -> str:
 
 def _redact_url_query(value: str) -> str:
     lowered = value.lower()
-    if not any(marker in lowered for marker in ("?key=", "&key=", "?token=", "&token=", "access_token=")):
+    if not any(
+        marker in lowered
+        for marker in (
+            "?key=",
+            "&key=",
+            "?token=",
+            "&token=",
+            "access_token=",
+            "checkout_token=",
+            "cart_token=",
+        )
+    ):
         return value
     try:
         parts = urlsplit(value)
@@ -97,8 +108,10 @@ def _redact(value: Any) -> Any:
             key = str(k).lower()
             if any(token in key for token in ("token", "api_key", "authorization", "access_token", "secret")):
                 out[k] = "[redacted]"
-            elif key == "checkout_url" and isinstance(v, str):
+            elif key in {"checkout_url", "checkout_urls"}:
                 out[k] = "[redacted_checkout_url]"
+            elif key == "cart_reference":
+                out[k] = "[redacted_cart_reference]"
             elif key == "engine_ref" and isinstance(v, str) and "cart" in v.lower():
                 out[k] = "[redacted_cart_reference]"
             elif key in {"customer_email", "email"} and isinstance(v, str) and "@" in v:

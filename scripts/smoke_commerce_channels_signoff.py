@@ -118,8 +118,27 @@ def _redact_sensitive(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: Dict[str, Any] = {}
         for key, item in value.items():
-            key_lower = str(key).lower()
-            if key_lower in {"client_secret", "access_token", "refresh_token", "token"} or key_lower.endswith("_secret"):
+            key_lower = str(key).strip().lower()
+            compact_key = key_lower.replace("-", "_")
+            if (
+                compact_key
+                in {
+                    "api_key",
+                    "client_secret",
+                    "access_token",
+                    "refresh_token",
+                    "token",
+                    "x_api_key",
+                }
+                or compact_key.endswith("_api_key")
+                or compact_key.endswith("_secret")
+                or compact_key in {"checkout_url", "checkout_urls", "checkouturl", "checkouturls"}
+                or (
+                    compact_key == "engine_ref"
+                    and isinstance(item, str)
+                    and any(marker in item.lower() for marker in ("cart", "checkout", "token", "key="))
+                )
+            ):
                 redacted[str(key)] = "[REDACTED]"
             else:
                 redacted[str(key)] = _redact_sensitive(item)

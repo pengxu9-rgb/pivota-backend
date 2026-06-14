@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from scripts.validate_shopify_discounts import Scenario, _quote_request
+from scripts.validate_shopify_discounts import Scenario, _quote_request, _redact
 from scripts.preflight_shopify_discounts import _scenario_blocker
 
 
@@ -87,3 +87,27 @@ def test_automatic_and_new_customer_scenarios_can_run_without_codes(monkeypatch)
         )
         is None
     )
+
+
+def test_redact_masks_shopify_discount_sensitive_checkout_and_cart_fields():
+    payload = {
+        "api_key": "shpat_live_secret",
+        "client_secret": "pi_123_secret_456",
+        "checkout_url": "https://shop.example/checkouts/cn/abc?key=keep-private",
+        "checkout_urls": ["https://shop.example/checkouts/cn/def?token=keep-private"],
+        "engine_ref": "gid://shopify/Cart/abc?key=keep-private",
+        "cart_reference": "cart-ref-private",
+        "nested": {
+            "url": "https://shop.example/cart/c/123?checkout_token=tok_private",
+        },
+    }
+
+    redacted = _redact(payload)
+
+    assert redacted["api_key"] == "[redacted]"
+    assert redacted["client_secret"] == "[redacted]"
+    assert redacted["checkout_url"] == "[redacted_checkout_url]"
+    assert redacted["checkout_urls"] == "[redacted_checkout_url]"
+    assert redacted["engine_ref"] == "[redacted_cart_reference]"
+    assert redacted["cart_reference"] == "[redacted_cart_reference]"
+    assert redacted["nested"]["url"] == "https://shop.example/cart/c/123?checkout_token=%5Bredacted%5D"
