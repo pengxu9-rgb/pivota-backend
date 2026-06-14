@@ -40,10 +40,14 @@ def _patch_fetches(
     async def fake_seed(product_keys, *, db: Any = None):
         return None
 
+    async def fake_evidence(product_keys, *, db: Any = None):
+        return {}
+
     monkeypatch.setattr(apv, "fetch_products_for_key", fake_products)
     monkeypatch.setattr(apv, "fetch_skus_for_keys", fake_skus)
     monkeypatch.setattr(apv, "fetch_offers_for_keys", fake_offers)
     monkeypatch.setattr(apv, "fetch_external_seed_for_keys", fake_seed)
+    monkeypatch.setattr(apv, "fetch_evidence_for_keys", fake_evidence)
 
 
 @pytest.mark.asyncio
@@ -70,6 +74,36 @@ async def test_refresh_builds_and_upserts_when_title_present(monkeypatch: pytest
     assert db.executes[0]["sql"] is apv.UPSERT_SQL
     assert db.executes[0]["params"]["content_key"] == "ck-1"
     assert db.executes[0]["params"]["refresh_source"] == "catalog_sync"
+
+
+@pytest.mark.asyncio
+async def test_refresh_projects_evidence_into_agent_pdp_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Graded claims authored on the canonical record must reach the agent view.
+    _patch_fetches(
+        monkeypatch,
+        products=[{
+            "product_key": "pk-1", "merchant_id": "m1", "platform": "shopify",
+            "source_product_id": "sp-1", "title": "Glow Serum",
+            "description": "A long enough description for the agent PDP view row.",
+            "brand": "AuraGlow",
+        }],
+    )
+    profile = {"claims": [{"claim_text": "Helps brighten", "source_type": "ingredient_mechanism",
+                           "substantiation_status": "substantiated"}], "review_state": "observed"}
+    disclaimers = [{"text": "FDA disclaimer"}]
+
+    async def fake_evidence(product_keys, *, db: Any = None):
+        return {"evidence_profile": profile, "required_disclaimers": disclaimers}
+
+    monkeypatch.setattr(apv, "fetch_evidence_for_keys", fake_evidence)
+    db = _FakeDB()
+    built = await apv.refresh_agent_pdp_view_for_content_key("ck-1", refresh_source="catalog_sync", db=db)
+    assert built is True
+    params = db.executes[0]["params"]
+    # JSONB columns are serialized to a JSON string by row_to_upsert_params.
+    assert params["evidence_profile"] == apv.to_jsonb(profile)
+    assert params["required_disclaimers"] == apv.to_jsonb(disclaimers)
+    assert "Helps brighten" in params["evidence_profile"]
 
 
 @pytest.mark.asyncio
