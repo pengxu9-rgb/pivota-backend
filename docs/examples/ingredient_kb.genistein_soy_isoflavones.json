@@ -1,6 +1,8 @@
 {
   "_what_this_is": "Gold-standard Tier-G Ingredient KB entry for soy isoflavones / genistein — the ADR-002 quality bar and the drop-in shape for aurora_ingredient_research_kb.ingredient_profile_json (v2-lite + additive Tier-G fields). Codex backfill of other cohort actives mirrors this; human random-sample QA checks against it.",
 
+  "_alias_note": "Aliases deliberately use the DISCRIMINATING 'glycine soja seed extract' / 'soybean seed extract' forms, NOT the bare 'glycine soja'. The generator strips INCI form-words (oil/seed/extract) to a botanical core, so a bare 'glycine soja' alias would also match 'Glycine Soja (Soybean) Oil' — a bland emollient with negligible isoflavones — and wrongly attribute a firming claim to it. Keep the seed-extract qualifier on the isoflavone alias. (Underscore-prefixed: stripped by the loader, never written to the DB.)",
+
   "status": "ready",
   "schema_version": "v2-lite",
   "provider": "openai",
@@ -9,7 +11,7 @@
   "ingredient": {
     "inci": "Glycine Soja (Soybean) Seed Extract",
     "display_name": "Soy isoflavones (genistein / daidzein)",
-    "aliases": ["genistein", "daidzein", "soy phytoestrogens", "fermented soy", "isoflavones"],
+    "aliases": ["genistein", "daidzein", "soy phytoestrogens", "fermented soy", "isoflavones", "glycine soja seed extract", "soybean seed extract"],
     "what_it_is": "Plant phytoestrogens from soy. Genistein and daidzein bind estrogen-beta receptors in skin and act as antioxidants — the active firming story behind many 'collagen' and 'tofu' K-beauty creams.",
     "marketing_vs_reality": [
       {
@@ -26,6 +28,11 @@
   },
 
   "overview": "Soy isoflavones firm and even tone by raising procollagen and damping collagen-degrading enzymes, with antioxidant support. Strongest in mature / estrogen-deficient skin; gradual over weeks.",
+
+  "efficacy": {
+    "low_dose_active": true,
+    "note": "Genistein/daidzein are bioactive phytoestrogens efficacious at the low concentrations at which Glycine Soja Seed Extract typically appears in an INCI (well below the generic 0.1% hero bar), so INCI position systematically under-represents them. Flagged so the grounded generator features soy as a hero firming driver when it is present in a real formula even when listed low (the Aruen 'Tofu Collagen' case). min_efficacious_ppm intentionally omitted — no primary-source topical threshold confirmed; relaxation is position-based only."
+  },
 
   "benefits": [
     {
