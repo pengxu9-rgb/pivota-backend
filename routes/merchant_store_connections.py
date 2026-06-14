@@ -47,6 +47,9 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
 
 _STOREFRONT_AUTO_CREATE_DENIED_UNTIL: Dict[str, float] = {}
 _STOREFRONT_AUTO_CREATE_DENIED_TTL_SECONDS = 24 * 3600
+_MARKETPLACE_INSTALL_SUCCESS_PATH = "/app/install/success"
+_WIX_OAUTH_TOKEN_URL = "https://www.wixapis.com/oauth2/token"
+_WIX_APP_INSTANCE_URL = "https://www.wixapis.com/apps/v1/instance"
 
 
 class ConnectShopifyRequest(BaseModel):
@@ -230,6 +233,248 @@ def _shopify_webhook_callback_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+def _marketplace_merchant_id(platform: str, identity: str) -> str:
+    digest = hashlib.sha256(f"{platform}:{identity}".encode("utf-8")).hexdigest()[:20]
+    return f"merch_{platform}_{digest}"
+
+
+def _append_query_params(url: str, params: Dict[str, Any]) -> str:
+    clean_params = {
+        key: value
+        for key, value in params.items()
+        if value is not None and str(value).strip() != ""
+    }
+    if not clean_params:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{urlencode(clean_params)}"
+
+
+def _marketplace_install_success_url(platform: str) -> str:
+    platform_key = platform.strip().upper()
+    env_url = (
+        os.getenv(f"{platform_key}_POST_INSTALL_REDIRECT_URL")
+        or os.getenv("MARKETPLACE_POST_INSTALL_REDIRECT_URL")
+        or ""
+    ).strip()
+    if env_url:
+        return env_url
+    return f"{settings.merchant_portal_base_url.rstrip('/')}{_MARKETPLACE_INSTALL_SUCCESS_PATH}"
+
+
+async def _ensure_shopify_oauth_tables() -> None:
+    """
+    Best-effort DDL so app-store install routes work in environments where
+    lightweight startup tasks have not created the OAuth state tables yet.
+    """
+    try:
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopify_oauth_states (
+                state_sha256 VARCHAR(64) PRIMARY KEY,
+                merchant_id VARCHAR(50) NOT NULL,
+                shop_domain VARCHAR(255) NOT NULL,
+                install_source VARCHAR(50),
+                return_to TEXT,
+                host TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                used_at TIMESTAMP WITH TIME ZONE
+            )
+            """
+        )
+        await database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopify_install_tokens (
+                jti_sha256 VARCHAR(64) PRIMARY KEY,
+                merchant_id VARCHAR(50) NOT NULL,
+                shop_domain VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                used_at TIMESTAMP WITH TIME ZONE,
+                used_request_id TEXT
+            )
+            """
+        )
+    except Exception:
+        logger.warning("Shopify OAuth table bootstrap failed", exc_info=True)
+        return
+
+    for ddl in (
+        "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS install_source VARCHAR(50)",
+        "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS return_to TEXT",
+        "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS host TEXT",
+    ):
+        try:
+            await database.execute(ddl)
+        except Exception:
+            # Some local SQLite versions do not support ADD COLUMN IF NOT EXISTS.
+            # Existing deployments with the old schema can still use the legacy JSON callback.
+            logger.debug("Shopify OAuth state schema extension skipped: %s", ddl, exc_info=True)
+
+
+async def _insert_shopify_oauth_state(
+    *,
+    state_sha256: str,
+    merchant_id: str,
+    shop_domain: str,
+    expires_at: datetime,
+    install_source: Optional[str] = None,
+    return_to: Optional[str] = None,
+    host: Optional[str] = None,
+) -> None:
+    await _ensure_shopify_oauth_tables()
+    try:
+        await database.execute(
+            """
+            INSERT INTO shopify_oauth_states
+              (state_sha256, merchant_id, shop_domain, expires_at, install_source, return_to, host)
+            VALUES
+              (:state_sha256, :merchant_id, :shop_domain, :expires_at, :install_source, :return_to, :host)
+            """,
+            {
+                "state_sha256": state_sha256,
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "expires_at": expires_at,
+                "install_source": install_source,
+                "return_to": return_to,
+                "host": host,
+            },
+        )
+    except Exception:
+        logger.warning("Shopify OAuth state insert fell back to legacy schema", exc_info=True)
+        await database.execute(
+            """
+            INSERT INTO shopify_oauth_states (state_sha256, merchant_id, shop_domain, expires_at)
+            VALUES (:state_sha256, :merchant_id, :shop_domain, :expires_at)
+            """,
+            {
+                "state_sha256": state_sha256,
+                "merchant_id": merchant_id,
+                "shop_domain": shop_domain,
+                "expires_at": expires_at,
+            },
+        )
+
+
+async def _lookup_marketplace_merchant_by_store(*, platform: str, domain: str) -> Optional[str]:
+    try:
+        store_row = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_stores
+            WHERE platform = :platform
+              AND lower(domain) = :domain
+            ORDER BY connected_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {"platform": platform, "domain": domain.lower()},
+        )
+        if store_row and store_row.get("merchant_id"):
+            return str(store_row["merchant_id"])
+    except Exception:
+        logger.debug("Marketplace merchant store lookup failed platform=%s domain=%s", platform, domain, exc_info=True)
+
+    try:
+        onboarding_row = await database.fetch_one(
+            """
+            SELECT merchant_id
+            FROM merchant_onboarding
+            WHERE lower(coalesce(mcp_shop_domain, '')) = :domain
+               OR lower(coalesce(store_url, '')) IN (:domain, :https_domain)
+               OR lower(coalesce(website, '')) IN (:domain, :https_domain)
+            ORDER BY created_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            {
+                "domain": domain.lower(),
+                "https_domain": f"https://{domain.lower()}",
+            },
+        )
+        if onboarding_row and onboarding_row.get("merchant_id"):
+            return str(onboarding_row["merchant_id"])
+    except Exception:
+        logger.debug("Marketplace merchant onboarding lookup failed platform=%s domain=%s", platform, domain, exc_info=True)
+
+    return None
+
+
+async def _ensure_marketplace_shell_merchant(
+    *,
+    platform: str,
+    domain: str,
+    display_name: Optional[str] = None,
+    owner_email: Optional[str] = None,
+) -> str:
+    existing_merchant_id = await _lookup_marketplace_merchant_by_store(platform=platform, domain=domain)
+    if existing_merchant_id:
+        return existing_merchant_id
+
+    merchant_id = _marketplace_merchant_id(platform, domain)
+    fallback_name = f"{platform.capitalize()} Store {domain}"
+    digest = hashlib.sha256(f"{platform}:{domain}".encode("utf-8")).hexdigest()[:12]
+    contact_email = (owner_email or "").strip() or f"{platform}-install+{digest}@pivota.invalid"
+
+    await database.execute(
+        """
+        INSERT INTO merchant_onboarding (
+            merchant_id,
+            business_name,
+            store_url,
+            website,
+            region,
+            contact_email,
+            auto_approved,
+            approval_confidence,
+            status,
+            mcp_connected,
+            mcp_platform,
+            mcp_shop_domain,
+            apm_enabled,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            :merchant_id,
+            :business_name,
+            :store_url,
+            :website,
+            :region,
+            :contact_email,
+            FALSE,
+            0.0,
+            'pending_verification',
+            TRUE,
+            :platform,
+            :domain,
+            FALSE,
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (merchant_id) DO UPDATE
+        SET business_name = COALESCE(merchant_onboarding.business_name, EXCLUDED.business_name),
+            store_url = EXCLUDED.store_url,
+            website = EXCLUDED.website,
+            mcp_connected = TRUE,
+            mcp_platform = EXCLUDED.mcp_platform,
+            mcp_shop_domain = EXCLUDED.mcp_shop_domain,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        {
+            "merchant_id": merchant_id,
+            "business_name": (display_name or "").strip() or fallback_name,
+            "store_url": f"https://{domain}",
+            "website": f"https://{domain}",
+            "region": platform,
+            "contact_email": contact_email,
+            "platform": platform,
+            "domain": domain,
+        },
+    )
+    return merchant_id
+
+
 async def _upsert_shopify_store_credentials(
     *,
     merchant_id: str,
@@ -238,6 +483,7 @@ async def _upsert_shopify_store_credentials(
     access_token: str,
     storefront_token: Optional[str],
     webhook_secret: Optional[str] = None,
+    install_source: Optional[str] = None,
 ) -> str:
     existing = await database.fetch_one(
         """
@@ -264,6 +510,8 @@ async def _upsert_shopify_store_credentials(
         token_blob["webhook_secret"] = webhook_secret
     if storefront_token:
         token_blob["storefront_access_token"] = storefront_token
+    if install_source:
+        token_blob["install_source"] = install_source
     # Preserve prior storefront token if we didn't re-create one.
     if not token_blob.get("storefront_access_token"):
         stored = (
@@ -346,34 +594,12 @@ async def shopify_oauth_start(
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
 
-    # Best-effort: ensure table exists (for local/dev environments that skipped startup tasks).
-    try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS shopify_oauth_states (
-                state_sha256 VARCHAR(64) PRIMARY KEY,
-                merchant_id VARCHAR(50) NOT NULL,
-                shop_domain VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                used_at TIMESTAMP WITH TIME ZONE
-            )
-            """
-        )
-    except Exception:
-        pass
-
-    await database.execute(
-        """
-        INSERT INTO shopify_oauth_states (state_sha256, merchant_id, shop_domain, expires_at)
-        VALUES (:state_sha256, :merchant_id, :shop_domain, :expires_at)
-        """,
-        {
-            "state_sha256": state_sha,
-            "merchant_id": target_merchant_id,
-            "shop_domain": shop_domain,
-            "expires_at": expires_at,
-        },
+    await _insert_shopify_oauth_state(
+        state_sha256=state_sha,
+        merchant_id=target_merchant_id,
+        shop_domain=shop_domain,
+        expires_at=expires_at,
+        install_source="merchant_portal",
     )
 
     url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
@@ -436,23 +662,7 @@ async def create_shopify_install_link(
     }
     token = _sign_install_token(payload)
 
-    # Ensure table exists (for dev environments).
-    try:
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS shopify_install_tokens (
-                jti_sha256 VARCHAR(64) PRIMARY KEY,
-                merchant_id VARCHAR(50) NOT NULL,
-                shop_domain VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                used_at TIMESTAMP WITH TIME ZONE,
-                used_request_id TEXT
-            )
-            """
-        )
-    except Exception:
-        pass
+    await _ensure_shopify_oauth_tables()
 
     await database.execute(
         """
@@ -543,17 +753,12 @@ async def shopify_oauth_start_public(
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
 
-    await database.execute(
-        """
-        INSERT INTO shopify_oauth_states (state_sha256, merchant_id, shop_domain, expires_at)
-        VALUES (:state_sha256, :merchant_id, :shop_domain, :expires_at)
-        """,
-        {
-            "state_sha256": state_sha,
-            "merchant_id": merchant_id,
-            "shop_domain": shop_domain,
-            "expires_at": expires_at,
-        },
+    await _insert_shopify_oauth_state(
+        state_sha256=state_sha,
+        merchant_id=merchant_id,
+        shop_domain=shop_domain,
+        expires_at=expires_at,
+        install_source="install_link",
     )
 
     url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
@@ -564,6 +769,59 @@ async def shopify_oauth_start_public(
         "merchant_id": merchant_id,
         "shop_domain": shop_domain,
         "authorization_url": url,
+        "state_sha256_prefix": state_sha[:10],
+        "expires_in_seconds": _SHOPIFY_OAUTH_STATE_TTL_SECONDS,
+    }
+
+
+@router.get("/shopify/app")
+@router.get("/shopify/install")
+async def shopify_app_store_install(
+    request: Request,
+    shop: str = Query(..., description="Shopify-provided shop domain"),
+    host: Optional[str] = Query(None, description="Optional Shopify Admin host parameter"),
+    embedded: Optional[str] = Query(None, description="Optional Shopify embedded app hint"),
+    redirect: bool = Query(True, description="If true, 302 redirect to Shopify OAuth"),
+):
+    """
+    Public Shopify App Store entrypoint.
+
+    Shopify-owned install surfaces call the app URL with `shop=...`; this route
+    must not require a Pivota login or ask the merchant to manually enter a shop
+    domain. It creates/reuses a deterministic shell merchant and starts OAuth.
+    """
+    shop_domain = _validate_myshopify_domain(shop)
+    merchant_id = await _ensure_marketplace_shell_merchant(
+        platform="shopify",
+        domain=shop_domain,
+        display_name=f"Shopify Store {shop_domain}",
+    )
+
+    state = secrets.token_urlsafe(32)
+    state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=_SHOPIFY_OAUTH_STATE_TTL_SECONDS)
+    return_to = _marketplace_install_success_url("shopify")
+
+    await _insert_shopify_oauth_state(
+        state_sha256=state_sha,
+        merchant_id=merchant_id,
+        shop_domain=shop_domain,
+        expires_at=expires_at,
+        install_source="app_store",
+        return_to=return_to,
+        host=(host or "").strip() or None,
+    )
+
+    url = _shopify_oauth_authorize_url(shop_domain=shop_domain, state=state)
+    if redirect:
+        return RedirectResponse(url=url, status_code=302)
+    return {
+        "status": "success",
+        "merchant_id": merchant_id,
+        "shop_domain": shop_domain,
+        "authorization_url": url,
+        "install_source": "app_store",
+        "embedded": embedded,
         "state_sha256_prefix": state_sha[:10],
         "expires_in_seconds": _SHOPIFY_OAUTH_STATE_TTL_SECONDS,
     }
@@ -585,14 +843,25 @@ async def shopify_oauth_callback(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Shopify OAuth signature")
 
     state_sha = hashlib.sha256(state.encode("utf-8")).hexdigest()
-    state_row = await database.fetch_one(
-        """
-        SELECT merchant_id, shop_domain, expires_at, used_at
-        FROM shopify_oauth_states
-        WHERE state_sha256 = :state_sha256
-        """,
-        {"state_sha256": state_sha},
-    )
+    await _ensure_shopify_oauth_tables()
+    try:
+        state_row = await database.fetch_one(
+            """
+            SELECT merchant_id, shop_domain, expires_at, used_at, install_source, return_to, host
+            FROM shopify_oauth_states
+            WHERE state_sha256 = :state_sha256
+            """,
+            {"state_sha256": state_sha},
+        )
+    except Exception:
+        state_row = await database.fetch_one(
+            """
+            SELECT merchant_id, shop_domain, expires_at, used_at
+            FROM shopify_oauth_states
+            WHERE state_sha256 = :state_sha256
+            """,
+            {"state_sha256": state_sha},
+        )
     if not state_row:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state (reason=state_not_found)")
     state_row = dict(state_row)
@@ -604,6 +873,9 @@ async def shopify_oauth_callback(request: Request):
 
     merchant_id = str(state_row["merchant_id"])
     stored_shop_domain = (state_row.get("shop_domain") or "").strip().lower()
+    install_source = str(state_row.get("install_source") or "").strip()
+    return_to = str(state_row.get("return_to") or "").strip()
+    host = str(state_row.get("host") or "").strip()
 
     token_url = f"https://{shop_domain}/admin/oauth/access_token"
     token_payload = {
@@ -667,6 +939,7 @@ async def shopify_oauth_callback(request: Request):
         shop_name=shop_name,
         access_token=access_token,
         storefront_token=storefront_token,
+        install_source=install_source or None,
     )
 
     # Register required webhooks right after OAuth.
@@ -694,15 +967,30 @@ async def shopify_oauth_callback(request: Request):
         webhooks_report = {"attempted": True, "error": "webhook_registration_failed"}
 
     access_token_fp = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:10]
-    return {
+    response_payload = {
         "status": "success",
         "merchant_id": merchant_id,
         "shop_domain": canonical_myshopify_domain,
         "store_id": store_id,
+        "install_source": install_source or None,
         "access_token_sha256_prefix": access_token_fp,
         "storefront_token_present": bool(storefront_token),
         "webhooks": webhooks_report,
     }
+    if return_to or install_source == "app_store":
+        redirect_url = _append_query_params(
+            return_to or _marketplace_install_success_url("shopify"),
+            {
+                "status": "success",
+                "platform": "shopify",
+                "shop": canonical_myshopify_domain,
+                "merchant_id": merchant_id,
+                "store_id": store_id,
+                "host": host,
+            },
+        )
+        return RedirectResponse(url=redirect_url, status_code=302)
+    return response_payload
 
 
 class ShopifySyncRequest(BaseModel):
@@ -821,6 +1109,356 @@ class ShopifyWebhookEventOut(BaseModel):
     chain_hash: str
 
 
+def _wix_app_credentials() -> tuple[str, str]:
+    client_id = (os.getenv("WIX_APP_CLIENT_ID") or os.getenv("WIX_APP_ID") or "").strip()
+    client_secret = (
+        os.getenv("WIX_APP_CLIENT_SECRET")
+        or os.getenv("WIX_APP_SECRET")
+        or os.getenv("WIX_APP_SECRET_KEY")
+        or ""
+    ).strip()
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "error": "wix_oauth_not_configured",
+                "message": "Wix App OAuth requires registered Wix app credentials.",
+                "required_env": ["WIX_APP_CLIENT_ID", "WIX_APP_CLIENT_SECRET"],
+                "env_configured": {
+                    "WIX_APP_CLIENT_ID": bool(client_id),
+                    "WIX_APP_CLIENT_SECRET": bool(client_secret),
+                },
+            },
+        )
+    return client_id, client_secret
+
+
+def _decode_wix_signed_instance(instance: str, app_secret: str) -> Dict[str, Any]:
+    raw = (instance or "").strip()
+    parts = raw.split(".", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=400, detail="Invalid Wix instance parameter")
+    signature_b64, data_b64 = parts
+    expected_sig = hmac.new(app_secret.encode("utf-8"), data_b64.encode("utf-8"), hashlib.sha256).digest()
+    if not hmac.compare_digest(_b64url(expected_sig), signature_b64):
+        raise HTTPException(status_code=401, detail="Invalid Wix instance signature")
+    try:
+        decoded = json.loads(_b64url_decode(data_b64).decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Wix instance payload")
+    if not isinstance(decoded, dict):
+        raise HTTPException(status_code=400, detail="Invalid Wix instance payload type")
+    instance_id = str(decoded.get("instanceId") or decoded.get("instance_id") or "").strip()
+    if not instance_id:
+        raise HTTPException(status_code=400, detail="Wix instance payload missing instanceId")
+    if decoded.get("aid") and not decoded.get("uid"):
+        raise HTTPException(status_code=403, detail="Anonymous Wix app instance cannot connect a store")
+    return decoded
+
+
+def _parse_wix_raw_response_body(data: Dict[str, Any]) -> Dict[str, Any]:
+    body = data.get("body") if isinstance(data, dict) and "body" in data else data
+    if isinstance(body, str):
+        try:
+            parsed = json.loads(body)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return body if isinstance(body, dict) else {}
+
+
+async def _create_wix_app_access_token(*, client_id: str, client_secret: str, instance_id: str) -> Dict[str, Any]:
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "instance_id": instance_id,
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            _WIX_OAUTH_TOKEN_URL,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+    try:
+        data = resp.json() or {}
+    except Exception:
+        data = {}
+    body = _parse_wix_raw_response_body(data if isinstance(data, dict) else {})
+    raw_status_code = data.get("statusCode") if isinstance(data, dict) else None
+    try:
+        wix_status_code = int(raw_status_code) if raw_status_code is not None else resp.status_code
+    except Exception:
+        wix_status_code = resp.status_code
+    if resp.status_code >= 400 or wix_status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "wix_token_exchange_failed",
+                "status_code": resp.status_code,
+                "wix_status_code": wix_status_code,
+                "body": body,
+            },
+        )
+    access_token = str(body.get("access_token") or body.get("accessToken") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Wix token response missing access_token")
+    return body
+
+
+async def _fetch_wix_app_instance(access_token: str) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        resp = await client.get(
+            _WIX_APP_INSTANCE_URL,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        )
+        if resp.status_code == 401:
+            resp = await client.get(
+                _WIX_APP_INSTANCE_URL,
+                headers={"Authorization": access_token, "Content-Type": "application/json"},
+            )
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "wix_app_instance_fetch_failed", "status_code": resp.status_code},
+        )
+    data = resp.json() or {}
+    return data if isinstance(data, dict) else {}
+
+
+async def _ensure_wix_marketplace_shell_merchant(
+    *,
+    instance_id: str,
+    site_id: str,
+    site_url: Optional[str],
+    display_name: Optional[str],
+    owner_email: Optional[str],
+) -> str:
+    lookup_domain = (site_id or instance_id).strip()
+    existing_merchant_id = await _lookup_marketplace_merchant_by_store(platform="wix", domain=lookup_domain)
+    if existing_merchant_id:
+        return existing_merchant_id
+
+    merchant_id = _marketplace_merchant_id("wix", instance_id)
+    digest = hashlib.sha256(f"wix:{instance_id}".encode("utf-8")).hexdigest()[:12]
+    store_url = (site_url or "").strip() or f"https://wix.com/app-instance/{instance_id}"
+    contact_email = (owner_email or "").strip() or f"wix-install+{digest}@pivota.invalid"
+
+    await database.execute(
+        """
+        INSERT INTO merchant_onboarding (
+            merchant_id,
+            business_name,
+            store_url,
+            website,
+            region,
+            contact_email,
+            auto_approved,
+            approval_confidence,
+            status,
+            mcp_connected,
+            mcp_platform,
+            mcp_shop_domain,
+            apm_enabled,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            :merchant_id,
+            :business_name,
+            :store_url,
+            :website,
+            'wix',
+            :contact_email,
+            FALSE,
+            0.0,
+            'pending_verification',
+            TRUE,
+            'wix',
+            :site_id,
+            FALSE,
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (merchant_id) DO UPDATE
+        SET business_name = COALESCE(merchant_onboarding.business_name, EXCLUDED.business_name),
+            store_url = EXCLUDED.store_url,
+            website = EXCLUDED.website,
+            mcp_connected = TRUE,
+            mcp_platform = 'wix',
+            mcp_shop_domain = EXCLUDED.mcp_shop_domain,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        {
+            "merchant_id": merchant_id,
+            "business_name": (display_name or "").strip() or f"Wix Store {lookup_domain}",
+            "store_url": store_url,
+            "website": store_url,
+            "contact_email": contact_email,
+            "site_id": lookup_domain,
+        },
+    )
+    return merchant_id
+
+
+async def _upsert_wix_oauth_store(
+    *,
+    merchant_id: str,
+    site_id: str,
+    instance_id: str,
+    access_token: str,
+    token_payload: Dict[str, Any],
+    display_name: Optional[str],
+    site_url: Optional[str],
+) -> str:
+    domain = (site_id or instance_id).strip()
+    credential_blob: Dict[str, Any] = {
+        "auth_mode": "oauth",
+        "access_token": access_token,
+        "site_id": domain,
+        "instance_id": instance_id,
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    refresh_token = token_payload.get("refresh_token") or token_payload.get("refreshToken")
+    expires_in = token_payload.get("expires_in") or token_payload.get("expiresIn")
+    token_type = token_payload.get("token_type") or token_payload.get("tokenType")
+    if refresh_token:
+        credential_blob["refresh_token"] = refresh_token
+    if expires_in:
+        credential_blob["expires_in"] = expires_in
+    if token_type:
+        credential_blob["token_type"] = token_type
+    if site_url:
+        credential_blob["site_url"] = site_url
+
+    credential_json = json.dumps(credential_blob, ensure_ascii=False)
+    existing_store = await database.fetch_one(
+        """
+        SELECT store_id
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND platform = 'wix'
+          AND domain = :domain
+        """,
+        {"merchant_id": merchant_id, "domain": domain},
+    )
+    if existing_store:
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET name = :name,
+                api_key = :api_key,
+                status = 'active',
+                connected_at = CURRENT_TIMESTAMP,
+                last_sync = CURRENT_TIMESTAMP
+            WHERE store_id = :store_id
+            """,
+            {
+                "store_id": existing_store["store_id"],
+                "name": (display_name or "").strip() or f"Wix Store {domain}",
+                "api_key": credential_json,
+            },
+        )
+        return str(existing_store["store_id"])
+
+    store_id = f"store_{merchant_id[:8]}_{int(datetime.now().timestamp())}"
+    await database.execute(
+        """
+        INSERT INTO merchant_stores
+          (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+        VALUES
+          (:store_id, :merchant_id, 'wix', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
+        """,
+        {
+            "store_id": store_id,
+            "merchant_id": merchant_id,
+            "domain": domain,
+            "name": (display_name or "").strip() or f"Wix Store {domain}",
+            "api_key": credential_json,
+        },
+    )
+    return store_id
+
+
+async def _complete_wix_instance_install(
+    *,
+    instance: str,
+    forced_merchant_id: Optional[str] = None,
+    redirect: bool = True,
+) -> Dict[str, Any] | RedirectResponse:
+    client_id, client_secret = _wix_app_credentials()
+    decoded_instance = _decode_wix_signed_instance(instance, client_secret)
+    instance_id = str(decoded_instance.get("instanceId") or decoded_instance.get("instance_id") or "").strip()
+    token_payload = await _create_wix_app_access_token(
+        client_id=client_id,
+        client_secret=client_secret,
+        instance_id=instance_id,
+    )
+    access_token = str(token_payload.get("access_token") or token_payload.get("accessToken") or "").strip()
+    app_instance = await _fetch_wix_app_instance(access_token)
+    instance_info = app_instance.get("instance") if isinstance(app_instance.get("instance"), dict) else {}
+    site_info = app_instance.get("site") if isinstance(app_instance.get("site"), dict) else {}
+    site_id = str(
+        site_info.get("siteId")
+        or site_info.get("site_id")
+        or decoded_instance.get("siteId")
+        or decoded_instance.get("site_id")
+        or instance_id
+    ).strip()
+    site_url = str(site_info.get("url") or "").strip() or None
+    display_name = str(
+        site_info.get("siteDisplayName")
+        or instance_info.get("appName")
+        or decoded_instance.get("siteDisplayName")
+        or ""
+    ).strip() or None
+    owner_info = site_info.get("ownerInfo") if isinstance(site_info.get("ownerInfo"), dict) else {}
+    owner_email = str(site_info.get("ownerEmail") or owner_info.get("email") or "").strip() or None
+
+    merchant_id = (forced_merchant_id or "").strip()
+    if not merchant_id:
+        merchant_id = await _ensure_wix_marketplace_shell_merchant(
+            instance_id=instance_id,
+            site_id=site_id,
+            site_url=site_url,
+            display_name=display_name,
+            owner_email=owner_email,
+        )
+    store_id = await _upsert_wix_oauth_store(
+        merchant_id=merchant_id,
+        site_id=site_id,
+        instance_id=instance_id,
+        access_token=access_token,
+        token_payload=token_payload,
+        display_name=display_name,
+        site_url=site_url,
+    )
+
+    response_payload = {
+        "status": "success",
+        "platform": "wix",
+        "merchant_id": merchant_id,
+        "site_id": site_id,
+        "instance_id": instance_id,
+        "store_id": store_id,
+        "store_name": display_name,
+    }
+    if redirect:
+        redirect_url = _append_query_params(
+            _marketplace_install_success_url("wix"),
+            {
+                "status": "success",
+                "platform": "wix",
+                "site_id": site_id,
+                "instance_id": instance_id,
+                "merchant_id": merchant_id,
+                "store_id": store_id,
+            },
+        )
+        return RedirectResponse(url=redirect_url, status_code=302)
+    return response_payload
+
+
 class ConnectWixRequest(BaseModel):
     merchant_id: str
     site_id: str
@@ -828,50 +1466,79 @@ class ConnectWixRequest(BaseModel):
     store_name: Optional[str] = None
 
 
+@router.get("/wix/app")
+async def wix_app_market_install(
+    instance: str = Query(..., description="Wix signed app instance query parameter"),
+    redirect: bool = Query(True, description="If true, redirect to the merchant portal install success page"),
+):
+    """
+    Public Wix App Market entrypoint.
+
+    Wix sends a signed `instance` parameter; the backend verifies it, exchanges
+    the instanceId for an app access token, fetches site metadata, and stores an
+    OAuth credential blob compatible with the Wix adapter.
+    """
+    return await _complete_wix_instance_install(instance=instance, redirect=redirect)
+
+
 @router.get("/wix/oauth/start")
-async def wix_oauth_start_stub(
-    merchant_id: str = Query(...),
+async def wix_oauth_start(
+    merchant_id: Optional[str] = Query(None),
+    instance: Optional[str] = Query(None, description="Optional signed Wix instance parameter"),
+    redirect: bool = Query(False),
     current_user: dict = Depends(get_current_user),
 ):
-    """Stub for Wix App OAuth onboarding.
-
-    TODO(PR-10b follow-up): register the Wix app, request Manage Orders
-    permission, exchange the app instance for an access token using
-    WIX_APP_CLIENT_ID / WIX_APP_CLIENT_SECRET, and persist:
-      {"access_token": "<bearer token>", "site_id": "<wix site id>"}
-    in merchant_stores.api_key.
-    """
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != merchant_id:
+    """Start or complete Wix app OAuth onboarding for a logged-in merchant."""
+    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
+    if not target_merchant_id:
+        raise HTTPException(status_code=400, detail="merchant_id is required")
+    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
         raise HTTPException(status_code=403, detail="Can only connect your own store")
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "error": "wix_oauth_not_configured",
-            "message": "Wix App OAuth requires registered Wix app credentials before live onboarding can run.",
-            "required_env": ["WIX_APP_CLIENT_ID", "WIX_APP_CLIENT_SECRET"],
-            "expected_store_credentials": {
-                "access_token": "stored Wix OAuth bearer token",
-                "site_id": "Wix site id",
+
+    if instance:
+        return await _complete_wix_instance_install(
+            instance=instance,
+            forced_merchant_id=target_merchant_id,
+            redirect=redirect,
+        )
+
+    install_url = (os.getenv("WIX_APP_INSTALL_URL") or os.getenv("WIX_APP_MARKET_URL") or "").strip()
+    if not install_url:
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "error": "wix_install_url_not_configured",
+                "message": "Set WIX_APP_INSTALL_URL to let logged-in merchants jump to the Wix App Market install flow.",
+                "required_env": ["WIX_APP_INSTALL_URL"],
             },
-            "env_configured": {
-                "WIX_APP_CLIENT_ID": bool(os.getenv("WIX_APP_CLIENT_ID")),
-                "WIX_APP_CLIENT_SECRET": bool(os.getenv("WIX_APP_CLIENT_SECRET")),
-            },
-        },
-    )
+        )
+    if redirect:
+        return RedirectResponse(url=install_url, status_code=302)
+    return {
+        "status": "success",
+        "merchant_id": target_merchant_id,
+        "authorization_url": install_url,
+        "message": "Open this URL in Wix, install the app, and Wix will return to /integrations/wix/app with a signed instance.",
+    }
 
 
 @router.get("/wix/oauth/callback")
-async def wix_oauth_callback_stub():
-    """Stub callback for the future Wix App OAuth handshake."""
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "error": "wix_oauth_not_configured",
-            "message": "Wix OAuth callback is stubbed until Wix developer app credentials are available.",
-            "required_env": ["WIX_APP_CLIENT_ID", "WIX_APP_CLIENT_SECRET"],
-        },
-    )
+async def wix_oauth_callback(
+    instance: Optional[str] = Query(None, description="Wix signed app instance query parameter"),
+    redirect: bool = Query(True),
+):
+    """Compatibility callback alias for Wix app instance completion."""
+    if not instance:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "wix_instance_required",
+                "message": "Wix app OAuth completion requires the signed instance query parameter.",
+            },
+        )
+    return await _complete_wix_instance_install(instance=instance, redirect=redirect)
 
 
 class ConnectWooCommerceRequest(BaseModel):
