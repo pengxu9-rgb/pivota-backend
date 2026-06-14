@@ -48,6 +48,50 @@ def test_default_providers_seeded_at_import():
     assert "mock" in ids
 
 
+def test_premium_providers_registered_with_cost_rates():
+    """ChatGPT/Claude resolve real per-token rates so probe telemetry records a
+    real cost_usd instead of NULL/$0 (regression: get_provider('chatgpt') was
+    None, so chatgpt audit cost recorded as $0 even with real tokens)."""
+    from services.llm_providers.provider_registry import get_provider
+    for pid, exp_in, exp_out in (("chatgpt", 0.005, 0.02), ("claude", 0.003, 0.015)):
+        p = get_provider(pid)
+        assert p is not None, f"{pid} must be registered for cost telemetry"
+        rates = p.rate_for_model(None)
+        assert rates["input_per_1k"] == exp_in
+        assert rates["output_per_1k"] == exp_out
+
+
+def test_premium_providers_not_auto_selected():
+    """Premium (paid) providers are explicit/opt-in only — the orchestrator must
+    never auto-route a free/default audit onto an expensive provider."""
+    from services.llm_providers.provider_registry import get_provider
+    from services.llm_providers.orchestrator import select_provider
+    modes = (
+        "open_product_visibility_test",
+        "merchant_store_attribution_test",
+        "category_visibility_test",
+    )
+    for pid in ("chatgpt", "claude"):
+        p = get_provider(pid)
+        for mode in modes:
+            assert p.suitability_weight(mode) == 0
+    for mode in modes:
+        assert select_provider(scan_mode=mode) not in ("chatgpt", "claude")
+
+
+def test_default_coverage_profile_is_gemini_only():
+    """Free/default audits run Gemini only; ChatGPT/Claude require an explicit
+    premium profile (paid-tier opt-in)."""
+    from services.coverage_profiles import (
+        default_coverage_profile, resolve_coverage_profile,
+    )
+    assert default_coverage_profile() == "pilot_gemini"
+    resolved = resolve_coverage_profile(coverage_profile=default_coverage_profile())
+    assert "gemini" in resolved["providers"]
+    assert "chatgpt" not in resolved["providers"]
+    assert "claude" not in resolved["providers"]
+
+
 def test_register_provider_replaces_existing():
     from services.llm_providers.provider_registry import (
         LLMProvider, register_provider, get_provider,
