@@ -26,10 +26,14 @@ def reset_caches():
 
 
 def _cited(host: str, type_: str = "editorial", subtype: str = "review_site",
-           applies: bool = True, times_cited: int = 1):
+           applies: bool = True, times_cited: int = 2):
     """Use the REAL classification from the registry by calling
     classify_host. Otherwise pitch_recipient won't be on the entry
-    we pass in."""
+    we pass in.
+
+    Default times_cited=2 clears `select_playbooks`'s min-citation
+    threshold (default 2) — these tests exercise pitch_draft rendering,
+    not the citation gate."""
     from services.cited_host_classifier import classify_host
     out = classify_host(host, merchant_category="sleepwear")
     out["times_cited"] = times_cited
@@ -83,8 +87,9 @@ def test_nymag_action_carries_pitch_draft_with_email_recipient():
     # Body contains merchant name + competitors
     assert "TestSleepwear" in pd["body"]
     assert "Lunya" in pd["body"]
-    # Body has the TODO placeholder for differentiation (merchant fills in)
-    assert "TODO" in pd["body"]
+    # Body has the fill-in placeholder for differentiation (merchant
+    # customizes before sending).
+    assert "Customize before sending" in pd["body"]
 
 
 def test_wirecutter_action_has_no_pitch_draft():
@@ -114,7 +119,7 @@ def test_unregistered_host_emits_action_without_pitch_draft():
     actions = select_playbooks(
         cited_hosts_detailed=[{
             "host": "unregistered-editorial.example",
-            "times_cited": 1,
+            "times_cited": 2,
             "type": "editorial", "subtype": "review_site",
             "categories": ["sleepwear"],
             "coverage_note": "Coverage.",
@@ -187,8 +192,9 @@ def test_pitch_draft_omits_emit_when_no_competitors_named():
 def _registry_entry_for(host: str) -> Dict[str, Any]:
     """Build a test cited_hosts_detailed entry by going through the
     real classify_host (which reads the registry, including
-    pitch_recipient post-fix). Adds times_cited=1."""
+    pitch_recipient post-fix). Adds times_cited=2 so the entry clears
+    `select_playbooks`'s min-citation threshold (default 2)."""
     from services.cited_host_classifier import classify_host
     out = classify_host(host, merchant_category="sleepwear")
-    out["times_cited"] = 1
+    out["times_cited"] = 2
     return out
