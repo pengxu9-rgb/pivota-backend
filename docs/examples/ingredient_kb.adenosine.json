@@ -27,6 +27,12 @@
 
   "overview": "Adenosine reduces the look of fine lines and supports skin firmness by activating A2A receptors on dermal fibroblasts, which promotes collagen I and III production via cAMP and AKT signaling pathways — not through any 'energy' mechanism. Two randomized controlled studies in humans demonstrated significant reductions in periorbital skin roughness (Ra, Rz parameters) after 8 weeks of twice-daily use. Excellent tolerability; the Expert Panel for Cosmetic Ingredient Safety rates it safe at current use concentrations.",
 
+  "efficacy": {
+    "low_dose_active": true,
+    "min_efficacious_ppm": 400,
+    "note": "Adenosine is efficacious at ~0.04% (400 ppm) — the Korean MFDS functional-cosmetic wrinkle level commonly referenced for it — and at that dose sits low in the INCI, so INCI position under-represents it. Flagged low-dose so the grounded generator features it where it naturally appears. min_efficacious_ppm (400) is used ONLY as a disclosed-ppm hero threshold (an internal gating hint), not a published efficacy claim — consistent with source_meta.note, which declines to assert 0.04% as fact in customer-facing copy."
+  },
+
   "benefits": [
     {
       "concern": "fine lines / wrinkles",
