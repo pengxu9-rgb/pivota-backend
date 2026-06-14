@@ -105,6 +105,26 @@ def match_creators(
        audience_size_band, recent_coverage, contact_method,
        contact_url, sample_brief_template, score}
     """
+    return _score_creators(
+        _load_database(),
+        merchant_category=merchant_category,
+        competitor_brands=competitor_brands,
+        audience_size_preference=audience_size_preference,
+        top_n=top_n,
+    )
+
+
+def _score_creators(
+    creators: List[Dict[str, Any]],
+    *,
+    merchant_category: Optional[str],
+    competitor_brands: Optional[List[str]] = None,
+    audience_size_preference: Optional[str] = None,
+    top_n: int = 5,
+) -> List[Dict[str, Any]]:
+    """Score + rank a creator list — the shared core of match_creators (the
+    static JSON directory) and match_creators_with_discovery (JSON + the
+    data-driven discovered_creators table)."""
     if not merchant_category or not str(merchant_category).strip():
         return []
     mc_lower = str(merchant_category).strip().lower()
@@ -115,7 +135,6 @@ def match_creators(
     }
     pref = (audience_size_preference or "").strip().lower()
 
-    creators = _load_database()
     scored: List[Dict[str, Any]] = []
     for c in creators:
         cats = [
@@ -163,6 +182,40 @@ def match_creators(
     for s in scored:
         s.pop("_overlap_count", None)
     return scored[:top_n]
+
+
+async def match_creators_with_discovery(
+    *,
+    merchant_category: Optional[str],
+    competitor_brands: Optional[List[str]] = None,
+    audience_size_preference: Optional[str] = None,
+    top_n: int = 5,
+    db: Any = None,
+) -> List[Dict[str, Any]]:
+    """Match across BOTH the static JSON directory and the data-driven
+    discovered_creators table (Phase 3 creator API). Dedupes by creator_id (the
+    JSON/curated entry wins on conflict). Best-effort on the DB read — degrades
+    to the JSON-only result when the directory table is empty/absent."""
+    json_creators = _load_database()
+    discovered: List[Dict[str, Any]] = []
+    if merchant_category and str(merchant_category).strip():
+        from services.creator_directory import load_creators_for_category
+
+        discovered = await load_creators_for_category(merchant_category, db=db)
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for c in list(json_creators) + list(discovered):
+        if not isinstance(c, dict):
+            continue
+        cid = (c.get("creator_id") or "").strip().lower()
+        if cid and cid not in by_id:
+            by_id[cid] = c
+    return _score_creators(
+        list(by_id.values()),
+        merchant_category=merchant_category,
+        competitor_brands=competitor_brands,
+        audience_size_preference=audience_size_preference,
+        top_n=top_n,
+    )
 
 
 def build_creator_partnership_action(
