@@ -62,6 +62,7 @@ from services.cited_host_classifier import (
     ROLE_COMPETITOR,
     ROLE_RELATIVE_UNCLASSIFIED,
 )
+from services.merchant_narrative_builder import build_merchant_narrative
 from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
@@ -8486,6 +8487,21 @@ async def run_brand_report(
                 *[p.get("vendor") for p in products if isinstance(p, dict)],
             ),
         )
+        brand_verify_summary = _rollup_verify_summaries(per_sku_reports)
+        # Fix 3 — merchant-grade narrative assembled from the Fix 1 resolved
+        # hosts + Fix 2 findability/endorsement split + verify rollup. No
+        # fabrication: degrades to honest "not available" when data is missing.
+        merchant_narrative = build_merchant_narrative(
+            merchant_name=merchant_name,
+            per_sku_reports=per_sku_reports,
+            brand_rollup=brand_rollup,
+            authority_map=authority_map,
+            verify_summary=brand_verify_summary,
+            providers=profile_providers,
+            verify_providers=resolved_verify_providers,
+            pending_engine_support=coverage.get("pending_engine_support") or [],
+            coverage_profile=coverage.get("profile"),
+        )
         return {
             "audit_run_id": audit_run_id,
             "merchant_id": str(merchant_id),
@@ -8503,8 +8519,9 @@ async def run_brand_report(
             "per_sku_reports": per_sku_reports,
             "brand_rollup": brand_rollup,
             "custom_prompts": custom_prompt_results,
-            "verify_summary": _rollup_verify_summaries(per_sku_reports),
+            "verify_summary": brand_verify_summary,
             "authority_map": authority_map,
+            "merchant_narrative": merchant_narrative,
             "brand_state": brand_state,
             "brand_verdict_label": legacy_label,
             "brand_verdict_explanation": brand_verdict_explanation,
