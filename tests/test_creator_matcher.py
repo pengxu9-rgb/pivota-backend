@@ -489,12 +489,20 @@ def test_creator_action_slots_after_integration_actions(patched_database):
         url_source=None,
         merchant_brand="TestBrand",
         merchant_host=None,
+        # Half-integrated state (store connected, PSP missing). The
+        # both-missing shape is the cold-start audit sentinel, which
+        # _build_merchant_view intentionally suppresses so cold BD
+        # audits don't lead with the integration pitch — see
+        # _is_cold_start_audit + test_merchant_view_prepends_integration
+        # _action_when_state_incomplete. Use a non-cold-start state here
+        # so the integration action is actually emitted and we can
+        # assert it slots ahead of creator_partnership.
         integration_state={
-            "store_platform_integrated": False,
+            "store_platform_integrated": True,
             "psp_integrated": False,
             "gsc_integrated": False,
             "fully_integrated": False,
-            "missing_pieces": ["store_platform", "psp"],
+            "missing_pieces": ["psp"],
         },
     )
     actions = mv["actions"]
