@@ -62,6 +62,31 @@ def verify_supported_providers() -> List[str]:
     return providers
 
 
+# Premium (paid-tier) providers. Free accounts may only run Gemini audits;
+# ChatGPT/Claude require an active paid subscription (see services/
+# audit_entitlements.py). Defaults to chatgpt+claude but can be overridden via
+# a `premium_providers` key in config/coverage_profiles.json without a code
+# change. Gemini/DeepSeek are intentionally NOT premium.
+_DEFAULT_PREMIUM_PROVIDERS = ("chatgpt", "claude")
+
+
+def premium_providers() -> List[str]:
+    """The set of providers gated behind a paid subscription."""
+    data = load_coverage_profile_config()
+    configured = _normalize_nonempty(data.get("premium_providers") or [])
+    return configured or list(_DEFAULT_PREMIUM_PROVIDERS)
+
+
+def premium_providers_requested(providers: Iterable[str]) -> List[str]:
+    """Return the premium providers present in `providers` (normalized).
+
+    Empty list => the request uses only free-tier providers and needs no
+    subscription gate.
+    """
+    premium = set(premium_providers())
+    return [p for p in _normalize_nonempty(providers) if p in premium]
+
+
 def default_verify_sample() -> Dict[str, Any]:
     data = load_coverage_profile_config()
     raw = data.get("default_verify_sample") or {}
