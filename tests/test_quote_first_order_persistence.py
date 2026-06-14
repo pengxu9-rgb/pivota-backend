@@ -84,6 +84,12 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
         return {"status": "validated", "engine": "shopify_storefront_cart", "engine_ref": "cart_ref_live"}
 
     async def fake_select_psp(self, *, agent_id: str, merchant_id: str, amount: float, currency: str):
+        captured["select_psp"] = {
+            "agent_id": agent_id,
+            "merchant_id": merchant_id,
+            "amount": amount,
+            "currency": currency,
+        }
         return "stripe", {"route_id": "route_test"}
 
     async def fake_resolve_active_order_psp(_merchant_id: str, _provider_hint):
@@ -100,6 +106,7 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
         return None
 
     async def fake_create_payment_with_failover(*args, **kwargs):
+        captured["payment"] = kwargs
         return False, None, "payment skipped", "stripe"
 
     monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
@@ -123,7 +130,15 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
         customer_email="peng@chydan.com",
         quote_id="q_test",
         discount_codes=["PIVOTA_AUDIT_20260421C_FIXPROD60"],
-        items=[{"product_id": "10064558129449", "variant_id": "53012602618153", "quantity": 1}],
+        items=[
+            {
+                "product_id": "10064558129449",
+                "variant_id": "53012602618153",
+                "quantity": 1,
+                "unit_price": "999.00",
+                "subtotal": "999.00",
+            }
+        ],
         shipping_address={
             "name": "Peng Chydan",
             "address_line1": "1 Market St",
@@ -134,7 +149,7 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
             "country": "US",
             "phone": "",
         },
-        currency="USD",
+        currency="EUR",
         metadata={},
     )
 
@@ -145,6 +160,11 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
     assert order_data["discount_total"] == pytest.approx(0.60)
     assert order_data["shipping_fee"] == pytest.approx(8.00)
     assert order_data["total"] == pytest.approx(9.09)
+    assert order_data["currency"] == "USD"
+    assert captured["select_psp"]["amount"] == pytest.approx(9.09)
+    assert captured["select_psp"]["currency"] == "USD"
+    assert captured["payment"]["amount"] == Decimal("9.09")
+    assert captured["payment"]["currency"] == "USD"
     assert order_data["metadata"]["amounts_source"] == "quote_snapshot"
     assert order_data["metadata"]["pricing_quote"]["quote_id"] == "q_test"
     assert order_data["metadata"]["pricing_quote"]["live_validation"]["status"] == "validated"

@@ -69,6 +69,7 @@ from services.quote_service import (
     parse_decimal_money,
 )
 from services.commerce_execution_policy import (
+    COMMERCE_PATH_LEGACY_ADMIN,
     COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST,
     SURFACE_LEGACY_ADMIN,
     SURFACE_PUBLIC_AGENT_PURCHASE,
@@ -2898,6 +2899,75 @@ def _is_checkout_ui_order_create(metadata: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+_PUBLIC_AGENT_ORDER_SURFACES = {
+    SURFACE_PUBLIC_AGENT_PURCHASE,
+    "agent_api",
+    "agent_checkout",
+    "checkout",
+    "checkout_ui",
+    "public_checkout",
+}
+_PUBLIC_AGENT_ORDER_CREATED_VIA = {
+    "agent_api",
+    "agent_checkout",
+    "checkout_ui",
+    "public_checkout",
+}
+_EXPLICIT_LEGACY_ORDER_VALUES = {
+    SURFACE_LEGACY_ADMIN,
+    COMMERCE_PATH_LEGACY_ADMIN,
+    "admin",
+    "internal_admin",
+    "merchant_admin",
+    "legacy",
+}
+
+
+def _lower_meta_value(metadata: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None:
+            text_value = str(value).strip().lower()
+            if text_value:
+                return text_value
+    return ""
+
+
+def _is_explicit_internal_legacy_order_create(metadata: Optional[Dict[str, Any]]) -> bool:
+    meta = metadata if isinstance(metadata, dict) else {}
+    commerce_path = _lower_meta_value(meta, "commerce_path")
+    commerce_surface = _lower_meta_value(meta, "commerce_surface", "surface")
+    created_via = _lower_meta_value(meta, "created_via", "ui_source")
+    return (
+        commerce_path in _EXPLICIT_LEGACY_ORDER_VALUES
+        or commerce_surface in _EXPLICIT_LEGACY_ORDER_VALUES
+        or created_via in _EXPLICIT_LEGACY_ORDER_VALUES
+    )
+
+
+def _public_agent_quote_required_reason(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    meta = metadata if isinstance(metadata, dict) else {}
+    if _is_explicit_internal_legacy_order_create(meta):
+        return None
+    if _is_checkout_ui_order_create(meta):
+        return "checkout_ui"
+
+    commerce_path = _lower_meta_value(meta, "commerce_path")
+    commerce_surface = _lower_meta_value(meta, "commerce_surface", "surface")
+    created_via = _lower_meta_value(meta, "created_via", "ui_source")
+    validation_authority = _lower_meta_value(meta, "validation_authority")
+
+    if commerce_path == COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST:
+        return "pivota_direct_quote_first"
+    if commerce_surface in _PUBLIC_AGENT_ORDER_SURFACES:
+        return commerce_surface
+    if created_via in _PUBLIC_AGENT_ORDER_CREATED_VIA:
+        return created_via
+    if validation_authority == "pivota_live_quote":
+        return "pivota_live_quote"
+    return None
+
+
 async def _update_order_shopify_sync_metadata_best_effort(
     *,
     order_id: str,
@@ -3444,12 +3514,26 @@ async def create_new_order(
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
 
-        if _is_checkout_ui_order_create(order_request.metadata) and not order_request.quote_id:
+        quote_required_reason = _public_agent_quote_required_reason(order_request.metadata)
+        if quote_required_reason == "checkout_ui" and not order_request.quote_id:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": "CHECKOUT_QUOTE_REQUIRED",
                     "message": "quote_id is required for checkout_ui order creation",
+                },
+            )
+        if quote_required_reason and not order_request.quote_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "QUOTE_REQUIRED_BEFORE_PURCHASE",
+                    "message": "quote_id is required before creating a public/agent checkout order or PSP payment",
+                    "context": {
+                        "reason": quote_required_reason,
+                        "merchant_id": order_request.merchant_id,
+                        "enforcement": "public_agent_checkout_requires_live_quote",
+                    },
                 },
             )
 
