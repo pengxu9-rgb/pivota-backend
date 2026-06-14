@@ -5133,6 +5133,33 @@ async def attach_niche_movement(
     return where_you_can_win
 
 
+async def build_outcomes_summary(merchant_id: str) -> Optional[Dict[str, Any]]:
+    """Phase 4 v2: the transaction-outcomes moat for the brand rollup — orders
+    transacted, and (only once a minimum sample is met, per the schema) refund
+    rate + GMV. Honest: returns None when there are no transactions yet, and
+    never surfaces refund_rate/GMV before min_sample_met. Best-effort."""
+    if not merchant_id:
+        return None
+    try:
+        from services.outcome_aggregation_service import get_merchant_outcomes
+
+        row = await get_merchant_outcomes(str(merchant_id))
+    except Exception:  # noqa: BLE001
+        return None
+    if not row or not int(row.get("transacted_count") or 0):
+        return None  # no outcomes yet — omit the strip rather than show zeros
+    out: Dict[str, Any] = {
+        "transacted_count": int(row.get("transacted_count") or 0),
+        "min_sample_met": bool(row.get("min_sample_met")),
+    }
+    if row.get("min_sample_met"):
+        rr = row.get("refund_rate")
+        out["refund_rate"] = float(rr) if rr is not None else None
+        gmv = row.get("gmv_cents")
+        out["gmv_cents"] = int(gmv) if gmv else None
+    return out
+
+
 def build_brand_rollup(
     per_sku_reports: List[Dict[str, Any]],
     merchant_id: str,
@@ -8092,6 +8119,14 @@ async def run_brand_report(
             )
         except Exception:  # noqa: BLE001
             logger.warning("niche outcomes record/attach failed", exc_info=True)
+        # Phase 4 v2: the transaction-outcomes moat (orders / refund / GMV), honest
+        # + omitted until there are real transactions. Best-effort.
+        try:
+            _outcomes = await build_outcomes_summary(str(merchant_id))
+            if _outcomes:
+                brand_rollup["outcomes"] = _outcomes
+        except Exception:  # noqa: BLE001
+            logger.warning("outcomes summary failed", exc_info=True)
         authority_map = build_authority_map(per_sku_reports, probe_runs_by_sku)
         median_citation = (
             (brand_rollup.get("dimensions") or {})
