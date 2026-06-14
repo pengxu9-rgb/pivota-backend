@@ -4969,6 +4969,103 @@ def _fixability_for(dimension: str, bucket: Optional[str] = None) -> float:
     return 0.5
 
 
+# ownership_state values where the answer is controlled by someone else, so the
+# merchant can't realistically win the head term head-on (a flagship / retailer /
+# marketplace / publisher / forum / competitor owns it).
+_WYCW_LOSING_OWNERSHIP = {
+    "competitor-owned",
+    "retailer-owned",
+    "marketplace-owned",
+    "publisher-owned",
+    "forum-owned",
+}
+# Only tell a merchant to STOP fighting a head term if it actually has demand —
+# abandoning a no-demand term is meaningless.
+_WYCW_SKIP_DEMAND_FLOOR = 0.45
+
+
+def _wycw_why_you_fit(row: Dict[str, Any]) -> Optional[str]:
+    basis = [str(b).strip() for b in (row.get("attribute_basis") or []) if str(b or "").strip()]
+    return ", ".join(basis[:4]) if basis else None
+
+
+def build_where_you_can_win(
+    per_sku_reports: List[Dict[str, Any]],
+    *,
+    max_targets: int = 5,
+    max_skip: int = 5,
+) -> Dict[str, Any]:
+    """Surface the niche-targeting the audit already computes (per-SKU
+    sku_opportunity) as a first-class merchant strategy: the winnable niches to
+    target, and the flagship/retailer-owned head terms to stop fighting.
+
+    A medium/long-tail merchant who competes on the hottest, flagship-owned
+    terms loses; this names the specific niches where their verified attributes
+    win and no one owns the answer yet (open lanes), and the head terms to
+    abandon (controlled by someone else, with what the AI actually said).
+
+    targets = open lanes (winnable: demand + attribute fit + no owner), ranked by
+    opportunity_score. skip = head terms the brand loses to a controller that
+    actually have demand. Both deduped by query (best SKU kept). The per-target
+    action hands off to the create/distribute engine (Phase 3).
+    """
+    targets_by_q: Dict[str, Dict[str, Any]] = {}
+    skip_by_q: Dict[str, Dict[str, Any]] = {}
+    for report in per_sku_reports or []:
+        if not isinstance(report, dict):
+            continue
+        opp = report.get("opportunity") or {}
+        identity = report.get("identity") or {}
+        sku_name = (
+            identity.get("name")
+            or report.get("sku_title")
+            or report.get("sku_key")
+        )
+        for row in opp.get("per_prompt") or []:
+            if not isinstance(row, dict):
+                continue
+            q = str(row.get("normalized_query") or row.get("query") or "").strip().lower()
+            if not q:
+                continue
+            if row.get("open_lane") is True:
+                score = float(row.get("opportunity_score") or 0)
+                prev = targets_by_q.get(q)
+                if prev is None or score > prev["opportunity_score"]:
+                    targets_by_q[q] = {
+                        "query": row.get("query") or q,
+                        "sku": sku_name,
+                        "sku_key": report.get("sku_key"),
+                        "attribute_fit": row.get("attribute_fit"),
+                        "demand_state": row.get("demand_state"),
+                        "opportunity_score": score,
+                        "why_you_fit": _wycw_why_you_fit(row),
+                        "action": "create_answer",
+                    }
+            elif (
+                row.get("ownership_state") in _WYCW_LOSING_OWNERSHIP
+                and float(row.get("demand_signal") or 0) >= _WYCW_SKIP_DEMAND_FLOOR
+            ):
+                demand = float(row.get("demand_signal") or 0)
+                prev = skip_by_q.get(q)
+                if prev is None or demand > prev["demand_signal"]:
+                    ev = row.get("cited_evidence") or {}
+                    owned_by = row.get("who_owns")
+                    skip_by_q[q] = {
+                        "query": row.get("query") or q,
+                        "owned_by": owned_by if isinstance(owned_by, str) else None,
+                        "ownership_state": row.get("ownership_state"),
+                        "demand_signal": demand,
+                        "competitors_named": list(ev.get("competitors_named") or [])[:3],
+                    }
+    targets = sorted(
+        targets_by_q.values(), key=lambda t: -float(t.get("opportunity_score") or 0)
+    )[:max_targets]
+    skip = sorted(
+        skip_by_q.values(), key=lambda s: -float(s.get("demand_signal") or 0)
+    )[:max_skip]
+    return {"targets": targets, "skip": skip, "has_targets": bool(targets)}
+
+
 def build_brand_rollup(
     per_sku_reports: List[Dict[str, Any]],
     merchant_id: str,
@@ -7891,6 +7988,9 @@ async def run_brand_report(
                 )
             )
         brand_rollup = build_brand_rollup(per_sku_reports, str(merchant_id))
+        # Phase 2: surface the niche-targeting the per-SKU opportunity already
+        # computes as a first-class "where you can win" strategy.
+        brand_rollup["where_you_can_win"] = build_where_you_can_win(per_sku_reports)
         authority_map = build_authority_map(per_sku_reports, probe_runs_by_sku)
         median_citation = (
             (brand_rollup.get("dimensions") or {})

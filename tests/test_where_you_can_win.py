@@ -1,0 +1,103 @@
+"""Phase 2: "Where you can win" surfaces the existing per-SKU niche analysis.
+
+A long-tail merchant who fights flagship-owned head terms loses. This deliverable
+names the winnable niches (open lanes — demand + attribute fit + no owner) and the
+head terms to abandon (controlled by a competitor/retailer/marketplace with real
+demand), from the sku_opportunity per_prompt rows the audit already computes.
+"""
+
+from __future__ import annotations
+
+from services.agent_center_bd_report_service import build_where_you_can_win
+
+
+def _report(sku_name, sku_key, rows):
+    return {
+        "sku_key": sku_key,
+        "identity": {"name": sku_name},
+        "opportunity": {"per_prompt": rows},
+    }
+
+
+def test_open_lanes_become_ranked_targets():
+    reports = [
+        _report("Aruen Tofu Collagen", "sku_a", [
+            {"query": "vegan collagen for sleep", "normalized_query": "vegan collagen for sleep",
+             "open_lane": True, "opportunity_score": 71.0, "attribute_fit": 0.9,
+             "demand_state": "open-lane", "attribute_basis": ["vegan", "collagen", "before bed"]},
+            {"query": "best collagen", "normalized_query": "best collagen",
+             "open_lane": False, "ownership_state": "competitor-owned", "demand_signal": 0.8,
+             "who_owns": "bigbrand.com", "cited_evidence": {"competitors_named": ["BigBrand"]}},
+        ]),
+        _report("BB Lab", "sku_b", [
+            {"query": "low molecular collagen stick", "normalized_query": "low molecular collagen stick",
+             "open_lane": True, "opportunity_score": 84.0, "attribute_fit": 0.95,
+             "demand_state": "open-lane", "attribute_basis": ["low molecular", "collagen", "stick"]},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert out["has_targets"] is True
+    # ranked by opportunity_score desc
+    assert [t["query"] for t in out["targets"]] == [
+        "low molecular collagen stick", "vegan collagen for sleep",
+    ]
+    top = out["targets"][0]
+    assert top["sku"] == "BB Lab"
+    assert top["action"] == "create_answer"
+    assert "low molecular" in top["why_you_fit"]
+
+
+def test_head_terms_with_demand_become_skip():
+    reports = [
+        _report("X", "sku_x", [
+            {"query": "best vitamin c serum", "normalized_query": "best vitamin c serum",
+             "open_lane": False, "ownership_state": "retailer-owned", "demand_signal": 0.9,
+             "who_owns": "sephora.com", "cited_evidence": {"competitors_named": ["BrandA", "BrandB"]}},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert out["has_targets"] is False
+    assert len(out["skip"]) == 1
+    s = out["skip"][0]
+    assert s["query"] == "best vitamin c serum"
+    assert s["owned_by"] == "sephora.com"
+    assert s["competitors_named"] == ["BrandA", "BrandB"]
+
+
+def test_no_demand_losing_term_is_not_skip():
+    reports = [
+        _report("X", "sku_x", [
+            {"query": "obscure term", "normalized_query": "obscure term",
+             "open_lane": False, "ownership_state": "competitor-owned", "demand_signal": 0.1,
+             "who_owns": "x.com"},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert out["skip"] == []  # abandoning a no-demand term is meaningless
+
+
+def test_dedupes_same_query_keeps_best():
+    reports = [
+        _report("A", "sku_a", [
+            {"query": "niche q", "normalized_query": "niche q", "open_lane": True,
+             "opportunity_score": 40.0, "attribute_fit": 0.7, "attribute_basis": ["x"]},
+        ]),
+        _report("B", "sku_b", [
+            {"query": "niche q", "normalized_query": "niche q", "open_lane": True,
+             "opportunity_score": 90.0, "attribute_fit": 0.9, "attribute_basis": ["x"]},
+        ]),
+    ]
+    out = build_where_you_can_win(reports)
+    assert len(out["targets"]) == 1
+    assert out["targets"][0]["sku"] == "B"  # higher score wins
+
+
+def test_caps_targets_and_skip():
+    rows = [
+        {"query": f"q{i}", "normalized_query": f"q{i}", "open_lane": True,
+         "opportunity_score": float(i), "attribute_basis": ["x"]}
+        for i in range(10)
+    ]
+    out = build_where_you_can_win([_report("A", "sku_a", rows)], max_targets=3)
+    assert len(out["targets"]) == 3
+    assert out["targets"][0]["query"] == "q9"  # highest score first
