@@ -32,6 +32,26 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
+def _summarize_error_reasons(
+    error_reasons: Any, *, max_len: int = 1000,
+) -> Optional[str]:
+    """Join the gateway's deduped `error_reasons` array into a single
+    error_message string, truncated to the column width (1000 chars in
+    db/llm_probe_runs.py). Defensive against shapes older/odd gateways
+    might emit: a list, a bare string, or nothing.
+
+    Returns a non-empty string when any reason text is present, else a
+    stable "all_runs_failed" sentinel so a downgraded-to-failed row
+    never has a null error_message."""
+    text = ""
+    if isinstance(error_reasons, (list, tuple)):
+        text = "; ".join(str(r).strip() for r in error_reasons if r)
+    elif error_reasons:
+        text = str(error_reasons).strip()
+    text = text or "all_runs_failed"
+    return text[:max_len]
+
+
 async def _record_probe_telemetry(
     *,
     provider: str,
@@ -58,7 +78,8 @@ async def _record_probe_telemetry(
     """
     try:
         from db.llm_probe_runs import (
-            compute_cost_usd, record_probe_run,
+            STATUS_FAILED, STATUS_SUCCEEDED, compute_cost_usd,
+            record_probe_run,
         )
         from services.audit_telemetry_context import (
             current_audit_context,
@@ -71,6 +92,49 @@ async def _record_probe_telemetry(
         input_tokens = None
         output_tokens = None
         cost_usd = None
+        # --- un-metered-ChatGPT-COGS guard --------------------------------
+        # A gateway HTTP-200 carrying a `result` block used to be recorded
+        # as status="succeeded" even when every grounded run inside it
+        # failed (e.g. OpenAI 429 quota-exceeded). Those runs persist 0
+        # tokens / $0, making a fully-failed probe indistinguishable from a
+        # free success. The gateway now surfaces per-run health as
+        # succeeded_runs / failed_runs (both top-level and inside `usage`)
+        # plus a deduped `error_reasons` array. When the caller reported
+        # success but every run actually failed, downgrade to "failed" and
+        # attach the upstream reasons. Older gateway responses lack these
+        # fields → the values stay None → current behaviour is preserved.
+        if status == STATUS_SUCCEEDED and isinstance(result, dict):
+            usage_block = usage if isinstance(usage, dict) else {}
+            succeeded_runs = usage_block.get("succeeded_runs")
+            if succeeded_runs is None:
+                succeeded_runs = result.get("succeeded_runs")
+            failed_runs = usage_block.get("failed_runs")
+            if failed_runs is None:
+                failed_runs = result.get("failed_runs")
+            try:
+                runs_count = int(result.get("runs_count") or 0)
+            except (TypeError, ValueError):
+                runs_count = 0
+            if runs_count > 0 and succeeded_runs == 0:
+                # All runs failed — this is the un-metered-COGS case.
+                status = STATUS_FAILED
+                if not error_message:
+                    error_message = _summarize_error_reasons(
+                        result.get("error_reasons")
+                    )
+            elif (
+                isinstance(failed_runs, int)
+                and 0 < failed_runs < runs_count
+                and result.get("error_reasons")
+            ):
+                # Partial failure: some runs produced real tokens/cost, so
+                # keep status="succeeded" for accurate cost accounting, but
+                # surface the upstream reasons so partial degradation is
+                # visible in telemetry rather than silently dropped.
+                if not error_message:
+                    error_message = _summarize_error_reasons(
+                        result.get("error_reasons")
+                    )
         if isinstance(usage, dict):
             input_tokens = usage.get("input_tokens")
             output_tokens = usage.get("output_tokens")
