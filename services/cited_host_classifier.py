@@ -477,6 +477,122 @@ def classify_cited_hosts(
     return out
 
 
+# Recommend-vs-list axis (Fix 2). Does a citation from this host *type* mean an
+# independent third party recommended the product (an editorial / review /
+# creator source vouched for it on its own merits) — or only that the product is
+# *listed for sale* there (a retailer / marketplace / brand storefront), which
+# proves findability, not endorsement? Keeping these apart stops "your listing
+# is indexed" from being reported as "AI recommends you".
+_RECOMMENDS_HOST_TYPES = frozenset({"editorial", "video"})
+_LISTS_HOST_TYPES = frozenset({"retailer", "marketplace", "brand"})
+
+
+def recommendation_class(host_type: Optional[str]) -> str:
+    """Return ``"recommends"``, ``"lists"`` or ``"unknown"`` for a cited-host
+    ``type`` (as produced by :func:`classify_host`). ``recommends`` is the
+    endorsement signal (editorial / review / creator); ``lists`` is the
+    findability/distribution signal (retailer / marketplace / brand storefront);
+    ``unknown`` covers unclassified / cdn / missing types — counted
+    conservatively as *not* an endorsement."""
+    t = (host_type or "").strip().lower()
+    if t in _RECOMMENDS_HOST_TYPES:
+        return "recommends"
+    if t in _LISTS_HOST_TYPES:
+        return "lists"
+    return "unknown"
+
+
+# Merchant-relative citation roles (Fix 2). The recommend-vs-list axis above is a
+# property of the host *type* alone; a cited host's role is what that citation
+# actually proves *for this merchant*. Two merchant-relative facts the report
+# layer supplies refine the type into a role: whether the host is the merchant's
+# own property (`first_party`) and whether the cited excerpt is centered on a
+# competitor (`is_competitor`). The point of the split is to stop "your own
+# listing is indexed" (findability) from ever reading as "an independent party
+# recommends you" (endorsement).
+ROLE_OWN_DOMAIN = "own_domain"
+ROLE_MARKETPLACE_SELF_LISTING = "marketplace_self_listing"
+ROLE_INDEPENDENT_RETAILER = "independent_retailer"
+ROLE_EDITORIAL_REVIEW = "editorial_review"
+ROLE_CREATOR = "creator"
+ROLE_FORUM = "forum"
+ROLE_COMPETITOR = "competitor"
+ROLE_RELATIVE_UNCLASSIFIED = "unclassified"
+
+# findability = the product is *findable* — its own site + its own product listed
+# on a marketplace/retailer. endorsement = an independent third party
+# *recommended* it (editorial / review / independent retailer / creator /
+# community). competitor + unclassified count toward NEITHER merchant signal:
+# a rival's storefront is not the merchant's distribution, and an unknown host is
+# conservatively not an endorsement.
+_FINDABILITY_ROLES = frozenset({ROLE_OWN_DOMAIN, ROLE_MARKETPLACE_SELF_LISTING})
+_ENDORSEMENT_ROLES = frozenset(
+    {ROLE_INDEPENDENT_RETAILER, ROLE_EDITORIAL_REVIEW, ROLE_CREATOR, ROLE_FORUM}
+)
+
+
+def merchant_relative_role(
+    host_type: Optional[str],
+    *,
+    first_party: bool = False,
+    is_competitor: bool = False,
+) -> str:
+    """Classify a cited host *relative to the merchant* into one of the Fix-2
+    roles (``own_domain | marketplace_self_listing | independent_retailer |
+    editorial_review | creator | forum | competitor | unclassified``).
+
+    ``host_type`` is the folded authority host type the report layer already
+    computes (``editorial`` / ``trade`` / ``creator`` / ``reddit`` / ``retailer``
+    / ``unclassified``). ``first_party`` is True when the host is the merchant's
+    own property; ``is_competitor`` is True when the citation is centered on a
+    different brand's storefront.
+
+    Conservative by design (the no-inflation guardrail): a retailer / marketplace
+    host defaults to ``marketplace_self_listing`` (findability) and is never
+    silently promoted to endorsement; ``independent_retailer`` is a defined role
+    but only assigned when the report layer has a positive recommend-not-list
+    signal (when that signal is unavailable the host stays findability rather than
+    inflating endorsement). An unknown host is ``unclassified``, not endorsement.
+    """
+    if first_party:
+        return ROLE_OWN_DOMAIN
+    if is_competitor:
+        return ROLE_COMPETITOR
+    t = (host_type or "").strip().lower()
+    if t in {"editorial", "trade"}:
+        return ROLE_EDITORIAL_REVIEW
+    if t in {"creator", "video"}:
+        return ROLE_CREATOR
+    if t in {"forum", "reddit"}:
+        return ROLE_FORUM
+    if t in {"retailer", "marketplace", "brand"}:
+        return ROLE_MARKETPLACE_SELF_LISTING
+    return ROLE_RELATIVE_UNCLASSIFIED
+
+
+def role_signal(role: Optional[str]) -> str:
+    """Map a merchant-relative role to its report signal: ``"findability"``,
+    ``"endorsement"`` or ``"neither"`` (competitor / unclassified)."""
+    r = (role or "").strip().lower()
+    if r in _FINDABILITY_ROLES:
+        return "findability"
+    if r in _ENDORSEMENT_ROLES:
+        return "endorsement"
+    return "neither"
+
+
+def is_findability_role(role: Optional[str]) -> bool:
+    """True for roles that prove the product is findable (own site / own listing
+    on a marketplace) — NOT an independent endorsement."""
+    return (role or "").strip().lower() in _FINDABILITY_ROLES
+
+
+def is_endorsement_role(role: Optional[str]) -> bool:
+    """True for roles that are a genuine independent recommendation (editorial /
+    review / independent retailer / creator / community)."""
+    return (role or "").strip().lower() in _ENDORSEMENT_ROLES
+
+
 def reset_registry_cache() -> None:
     """Test hook — drop the in-memory cache so the next lookup
     re-reads from disk. Used by tests that monkeypatch `_REGISTRY_PATH`."""

@@ -38,7 +38,11 @@ from urllib.parse import urlparse
 from services import agent_center_llm_client as llm_client
 from services.audit_delta import build_reaudit_delta
 from services.audit_playbook_engine import select_playbooks
-from services.brand_alias import derive_brand_aliases, text_mentions_brand
+from services.brand_alias import (
+    _registrable_name_from_host,
+    derive_brand_aliases,
+    text_mentions_brand,
+)
 from services.buyer_path_stable_controllers import (
     stable_buyer_path_controller_hosts,
     stable_buyer_path_controllers_for_row,
@@ -48,7 +52,16 @@ from services.buyer_path_controller_quality import (
     aggregate_controller_profile,
     is_canonical_source_vacuum,
 )
-from services.cited_host_classifier import classify_cited_hosts, classify_host
+from services.cited_host_classifier import (
+    classify_cited_hosts,
+    classify_host,
+    is_endorsement_role,
+    is_findability_role,
+    merchant_relative_role,
+    recommendation_class,
+    ROLE_COMPETITOR,
+    ROLE_RELATIVE_UNCLASSIFIED,
+)
 from services.coverage_profiles import (
     resolve_coverage_profile,
     resolve_provider_models,
@@ -4253,6 +4266,38 @@ def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
     return dict(counts)
 
 
+# Fix 2 — query-class tagging. Every probe query carries an `axis` (set in
+# `_build_per_sku_base_query_specs`). Only the `category` axis is a non-branded
+# discovery query ("best <product_type> ...", "top <product_type> for <topic>");
+# every other axis (intent / price / review / comparison / brand / identity /
+# content / custom) names the SKU or brand, i.e. branded/navigational. The two
+# classes must be reported separately: being found on a branded query ("where to
+# buy <my product>") proves nothing about category discovery.
+QUERY_CLASS_BRANDED = "branded_navigational"
+QUERY_CLASS_CATEGORY = "category_discovery"
+_CATEGORY_DISCOVERY_AXES = frozenset({"category"})
+
+
+def _query_class_for_axis(axis: Optional[str]) -> str:
+    a = str(axis or "").strip().lower()
+    return QUERY_CLASS_CATEGORY if a in _CATEGORY_DISCOVERY_AXES else QUERY_CLASS_BRANDED
+
+
+def _run_query_class(run: Dict[str, Any]) -> str:
+    meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+    return _query_class_for_axis(meta.get("axis"))
+
+
+def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
+    """Probe counts split into branded/navigational vs category/discovery, so
+    the report never conflates "found when shoppers name you" with "found when
+    shoppers ask the category question"."""
+    counts = {QUERY_CLASS_BRANDED: 0, QUERY_CLASS_CATEGORY: 0}
+    for run in _flatten_probe_runs(probe_runs):
+        counts[_run_query_class(run)] += 1
+    return counts
+
+
 def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
     evidence: List[Dict[str, Any]] = []
     for run in _flatten_probe_runs(probe_runs):
@@ -4964,6 +5009,7 @@ async def build_per_sku_report(
         "primary_gaps": primary_gaps,
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
         "axis_coverage": _axis_coverage(probe_runs),
+        "query_class_coverage": _query_class_coverage(probe_runs),
         "failing_prompts": failing_prompts,
         "impact_proxy": _impact_proxy_from_context(sku_ctx),
         "provider_models": provider_models,
@@ -5419,6 +5465,123 @@ def _classify_authority_host(host: Optional[str]) -> str:
     return "unclassified"
 
 
+# Fix 2 — listing-vs-endorsement. Each cited host is classified *relative to the
+# merchant* into one of the spec roles (own_domain / marketplace_self_listing /
+# independent_retailer / editorial_review / creator / forum / competitor /
+# unclassified), and those roles fold into two signals:
+#   findability = own_domain + marketplace_self_listing — the product is findable
+#                 (its own site + its own product listed on a marketplace).
+#   endorsement = an independent third party recommended it (editorial / review /
+#                 independent retailer / creator / community).
+# competitor + unclassified count toward neither: a rival's storefront is not the
+# merchant's distribution, and an unknown host is conservatively not an
+# endorsement. The role/signal logic lives in cited_host_classifier
+# (merchant_relative_role / is_findability_role / is_endorsement_role); this
+# module supplies the two merchant-relative facts (first_party, is_competitor).
+CITATION_ROLE_UNCLASSIFIED = ROLE_RELATIVE_UNCLASSIFIED
+
+
+def _host_is_first_party(
+    host: Optional[str],
+    merchant_hosts: frozenset,
+    brand_aliases: Tuple[str, ...],
+) -> bool:
+    """True when a cited host is the merchant's own site — a direct host match,
+    a sub/parent-domain relationship, or a registrable label that equals one of
+    the brand's de-spaced aliases (e.g. brand "BB Lab" -> `bblab.shop`).
+    Exact-label, not substring, so a competitor that merely contains the brand
+    token ("glowrecipe.com" vs brand "Glow") is not mis-tagged as first-party."""
+    if not host:
+        return False
+    h = normalize_host(host) or str(host).strip().lower()
+    if not h:
+        return False
+    for mh in merchant_hosts:
+        if mh and (h == mh or h.endswith(f".{mh}") or mh.endswith(f".{h}")):
+            return True
+    label = _registrable_name_from_host(h)
+    return bool(label) and label in brand_aliases
+
+
+def _host_is_competitor(raw_host_type: Optional[str], first_party: bool) -> bool:
+    """True when a cited host is a competitor's storefront — a brand storefront
+    (classify_host type ``brand``) that is NOT the merchant's own property.
+
+    Precise on purpose: only a brand-typed storefront is flagged, so generic
+    marketplaces/retailers (eBay, Desertcart, Ubuy) that merely carry the
+    merchant's own listing are never mislabelled a competitor, and the merchant's
+    own brand site is excluded via `first_party`. Editorial/forum sources that
+    happen to discuss a competitor are NOT flagged here (no reliable per-host
+    signal) — stated as a limit rather than guessed, per the no-fabrication
+    guardrail."""
+    if first_party:
+        return False
+    return (raw_host_type or "").strip().lower() == "brand"
+
+
+def _citation_role(
+    host_type: Optional[str],
+    first_party: bool,
+    is_competitor: bool = False,
+) -> str:
+    """Classify a cited host relative to the merchant (see
+    :func:`cited_host_classifier.merchant_relative_role`). `host_type` is the
+    folded authority type from `_classify_authority_host`."""
+    return merchant_relative_role(
+        host_type, first_party=first_party, is_competitor=is_competitor
+    )
+
+
+def _citation_signals(host_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Roll a set of cited-host rows into the findability-vs-endorsement split.
+
+      - findability = the merchant's own site + retail/marketplace listings —
+        the product is *findable* (its listings are indexed).
+      - endorsement = independent sources (editorial / trade / creator /
+        community) that recommended it on their own merits.
+      - endorsement_category_hosts = the independent hosts that cited it on a
+        category/discovery query — the only honest "AI recommends you for the
+        category" evidence.
+
+    `surfaced_only_via_own_listing` is the acceptance flag: the SKU was cited,
+    but only through own/retail listings, never independently endorsed — so it
+    must never read as "AI recommends you".
+
+    `competitor_hosts` are surfaced separately and excluded from both signals: a
+    rival's storefront cited for the merchant's category is neither the merchant's
+    own findability nor an endorsement of it.
+    """
+    by_role: Dict[str, int] = {}
+    findability_hosts: List[str] = []
+    endorsement_hosts: List[str] = []
+    endorsement_category_hosts: List[str] = []
+    competitor_hosts: List[str] = []
+    for row in host_rows or []:
+        role = row.get("citation_role") or CITATION_ROLE_UNCLASSIFIED
+        by_role[role] = by_role.get(role, 0) + 1
+        host = row.get("host")
+        if not host:
+            continue
+        if is_findability_role(role):
+            findability_hosts.append(host)
+        elif is_endorsement_role(role):
+            endorsement_hosts.append(host)
+            if row.get("cited_on_category_query"):
+                endorsement_category_hosts.append(host)
+        elif role == ROLE_COMPETITOR:
+            competitor_hosts.append(host)
+    return {
+        "by_role": by_role,
+        "findability_hosts": findability_hosts,
+        "endorsement_hosts": endorsement_hosts,
+        "endorsement_category_hosts": endorsement_category_hosts,
+        "competitor_hosts": competitor_hosts,
+        "has_independent_endorsement": bool(endorsement_hosts),
+        "independently_recommended_for_category": bool(endorsement_category_hosts),
+        "surfaced_only_via_own_listing": bool(findability_hosts) and not endorsement_hosts,
+    }
+
+
 def _reddit_subreddit_from_url(url: str) -> Optional[str]:
     parsed = urlparse(url if "://" in url else f"https://{url}")
     parts = [p for p in (parsed.path or "").split("/") if p]
@@ -5431,7 +5594,24 @@ def _reddit_subreddit_from_url(url: str) -> Optional[str]:
 def build_authority_map(
     per_sku_reports: List[Dict[str, Any]],
     probe_runs_by_sku: Dict[str, Any],
+    *,
+    merchant_host: Optional[str] = None,
+    merchant_brand: Optional[str] = None,
+    merchant_vendors: Optional[Tuple[str, ...]] = None,
 ) -> Dict[str, Any]:
+    # Fix 2 — merchant identity for first-party / own-listing classification.
+    # Cited hosts that are the merchant's own site (or carry the brand's
+    # registrable label) are tagged first_party so "the merchant's own listing
+    # was surfaced" is never conflated with "independently recommended in
+    # category". Omitting identity (legacy callers) is safe: nothing is tagged
+    # first-party and roles fall back to host-type semantics.
+    merchant_hosts = frozenset(h for h in {normalize_host(merchant_host or "")} if h)
+    brand_aliases = derive_brand_aliases(
+        merchant_brand,
+        merchant_host,
+        _clean_identity_tuple(merchant_vendors),
+    )
+
     sku_entries: List[Dict[str, Any]] = []
     host_matrix: Dict[str, Dict[str, Any]] = {}
     for report in per_sku_reports or []:
@@ -5464,13 +5644,29 @@ def build_authority_map(
                 host = _grounding_source_host(source)
                 if not host:
                     continue
+                # Classify once: the folded authority type (host_type) drives the
+                # merchant-relative role + display; the raw classify_host type
+                # drives the recommend-vs-list axis and competitor detection
+                # (only a brand-typed storefront that isn't the merchant counts).
                 host_type = _classify_authority_host(host)
+                raw_host_type = (classify_host(host).get("type") or "").lower()
+                first_party = _host_is_first_party(host, merchant_hosts, brand_aliases)
+                is_competitor = _host_is_competitor(raw_host_type, first_party)
+                citation_role = _citation_role(host_type, first_party, is_competitor)
+                host_recommendation_class = recommendation_class(raw_host_type)
+                query_class = _run_query_class(run)
                 row = host_rows.setdefault(host, {
                     "host": host,
                     "host_type": host_type,
+                    "first_party": first_party,
+                    "is_competitor": is_competitor,
+                    "citation_role": citation_role,
+                    "recommendation_class": host_recommendation_class,
                     "cites_exact_sku": False,
                     "cites_near_variant": False,
                     "cites_category_not_sku": False,
+                    "cited_on_category_query": False,
+                    "cited_on_branded_query": False,
                     "prompts_cited_count": 0,
                     "providers": [],
                     "provider_counts": {},
@@ -5479,6 +5675,10 @@ def build_authority_map(
                     "competitors_named": [],
                     "_queries": set(),
                 })
+                if query_class == QUERY_CLASS_CATEGORY:
+                    row["cited_on_category_query"] = True
+                else:
+                    row["cited_on_branded_query"] = True
                 row["cites_exact_sku"] = bool(row["cites_exact_sku"] or exact)
                 row["cites_near_variant"] = bool(row["cites_near_variant"] or near)
                 row["cites_category_not_sku"] = bool(row["cites_category_not_sku"] or (not exact and not near))
@@ -5502,11 +5702,21 @@ def build_authority_map(
                 matrix = host_matrix.setdefault(host, {
                     "host": host,
                     "host_type": host_type,
+                    "first_party": first_party,
+                    "is_competitor": is_competitor,
+                    "citation_role": citation_role,
+                    "recommendation_class": host_recommendation_class,
+                    "cited_on_category_query": False,
+                    "cited_on_branded_query": False,
                     "skus": set(),
                     "prompts_cited_count": 0,
                     "providers": set(),
                     "provider_counts": defaultdict(int),
                 })
+                if query_class == QUERY_CLASS_CATEGORY:
+                    matrix["cited_on_category_query"] = True
+                else:
+                    matrix["cited_on_branded_query"] = True
                 matrix["skus"].add(sku_key)
                 matrix["prompts_cited_count"] += 1
                 matrix["providers"].add(provider)
@@ -5543,6 +5753,7 @@ def build_authority_map(
             "product_key": report.get("product_key"),
             "content_key": report.get("content_key"),
             "authority_hosts": authority_hosts,
+            "citation_signals": _citation_signals(authority_hosts),
             "reddit": {"subreddits": reddit_subreddits},
         })
 
@@ -5551,13 +5762,44 @@ def build_authority_map(
         matrix_rows.append({
             "host": row["host"],
             "host_type": row["host_type"],
+            "first_party": row.get("first_party", False),
+            "is_competitor": row.get("is_competitor", False),
+            "citation_role": row.get("citation_role", CITATION_ROLE_UNCLASSIFIED),
+            "recommendation_class": row.get("recommendation_class", "unknown"),
+            "cited_on_category_query": bool(row.get("cited_on_category_query")),
+            "cited_on_branded_query": bool(row.get("cited_on_branded_query")),
             "skus": sorted(s for s in row["skus"] if s),
             "prompts_cited_count": row["prompts_cited_count"],
             "providers": sorted(row.get("providers") or []),
             "provider_counts": dict(sorted((row.get("provider_counts") or {}).items())),
         })
     matrix_rows.sort(key=lambda r: r["prompts_cited_count"], reverse=True)
-    return {"skus": sku_entries, "hosts": matrix_rows}
+
+    # Brand-level findability-vs-endorsement rollup. The merchant-facing report
+    # uses ENDORSEMENT (independent third-party recommendation) for category
+    # visibility, and FINDABILITY (own site + retail/marketplace listings) only
+    # as a distribution signal — so "your listings are indexed" is never sold as
+    # "AI recommends you".
+    signals = _citation_signals(matrix_rows)
+    host_attribution_summary = {
+        "distinct_hosts": len(matrix_rows),
+        "by_role": signals["by_role"],
+        "findability_hosts": signals["findability_hosts"],
+        "endorsement_hosts": signals["endorsement_hosts"],
+        "endorsement_category_hosts": signals["endorsement_category_hosts"],
+        "competitor_hosts": signals["competitor_hosts"],
+        "independent_hosts": signals["endorsement_hosts"],  # back-compat alias
+        "has_independent_endorsement": signals["has_independent_endorsement"],
+        "independently_recommended_for_category": signals[
+            "independently_recommended_for_category"
+        ],
+        "surfaced_only_via_own_listing": signals["surfaced_only_via_own_listing"],
+    }
+    return {
+        "skus": sku_entries,
+        "hosts": matrix_rows,
+        "host_attribution_summary": host_attribution_summary,
+    }
 
 
 async def _sku_keys_for_per_sku_mode(
@@ -8194,7 +8436,18 @@ async def run_brand_report(
                 brand_rollup["outcomes"] = _outcomes
         except Exception:  # noqa: BLE001
             logger.warning("outcomes summary failed", exc_info=True)
-        authority_map = build_authority_map(per_sku_reports, probe_runs_by_sku)
+        authority_map = build_authority_map(
+            per_sku_reports,
+            probe_runs_by_sku,
+            merchant_host=normalize_host(merchant_domain or "") or (
+                (merchant_domain or "").strip() or None
+            ),
+            merchant_brand=merchant_name,
+            merchant_vendors=_merchant_identity_tuple(
+                merchant_name,
+                *[p.get("vendor") for p in products if isinstance(p, dict)],
+            ),
+        )
         median_citation = (
             (brand_rollup.get("dimensions") or {})
             .get("citation", {})
