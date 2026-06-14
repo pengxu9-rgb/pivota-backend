@@ -1014,9 +1014,10 @@ def _build_competitive_pressure(
             )
         )
         framing += (
-            " This is real and immediate competitive pressure — every "
-            "retailer-routed query is a customer a peer won and you "
-            "didn't see."
+            " This is real and immediate competitive pressure: for these "
+            "category queries, a peer's own site can be surfaced directly "
+            "by AI agents, while your products still depend on third-party "
+            "listings."
         )
     else:
         # Name THIS audit's actual cited hosts when available. NOTE
