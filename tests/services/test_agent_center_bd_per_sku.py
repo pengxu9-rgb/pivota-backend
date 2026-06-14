@@ -998,3 +998,170 @@ def test_build_authority_map_drops_unresolvable_redirector_no_vertex_leak():
     hosts = {h["host"] for h in authority_map["hosts"]}
     assert "vertexaisearch.cloud.google.com" not in hosts
     assert "allure.com" in hosts
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — listing-vs-endorsement
+# ---------------------------------------------------------------------------
+
+
+def _redir_run(query: str, title: str, axis: str = "intent") -> Dict[str, Any]:
+    """Gemini redirector run with a real domain in `title` and an axis tag, so
+    findability/endorsement and query-class can be exercised together."""
+    return {
+        "query": query,
+        "axis_metadata": {"axis": axis, "source": "auto_generated", "sku_key": "sku-1"},
+        "parsed": {"product_visible": True, "correct_sku": True},
+        "grounding_sources": [
+            {
+                "uri": (
+                    "https://vertexaisearch.cloud.google.com/"
+                    f"grounding-api-redirect/AUZI-{title}"
+                ),
+                "title": title,
+            }
+        ],
+        "url_match": {"in_grounding": False},
+    }
+
+
+def test_recommendation_class_axis():
+    from services.cited_host_classifier import recommendation_class
+
+    assert recommendation_class("editorial") == "recommends"
+    assert recommendation_class("video") == "recommends"
+    assert recommendation_class("retailer") == "lists"
+    assert recommendation_class("marketplace") == "lists"
+    assert recommendation_class("brand") == "lists"
+    assert recommendation_class("unclassified") == "unknown"
+    assert recommendation_class(None) == "unknown"
+
+
+def test_authority_map_separates_findability_from_endorsement():
+    """Fix 2 acceptance: own site + marketplaces (eBay/Desertcart/GoSupps) read
+    as *findability*; an independent editorial that cites on a category query is
+    the only *endorsement* — and is the sole driver of category recommendation."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    probe_runs = [
+        {
+            "provider": "gemini",
+            "probe_run_id": "p",
+            "raw_runs": [
+                _redir_run("where to buy Aruen collagen", "aruen.com", "intent"),
+                _redir_run("Aruen collagen for sale", "ebay.com", "intent"),
+                _redir_run("shop Aruen collagen online", "desertcart.com", "intent"),
+                _redir_run("best price Aruen collagen", "gosupps.com", "price"),
+                _redir_run("best collagen supplement", "goodhousekeeping.com", "category"),
+            ],
+        }
+    ]
+    am = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}],
+        {"sku-1": probe_runs},
+        merchant_host="aruen.com",
+        merchant_brand="Aruen",
+    )
+
+    roles = {h["host"]: h["citation_role"] for h in am["hosts"]}
+    assert roles["aruen.com"] == "first_party"
+    assert roles["ebay.com"] == "retail_marketplace"
+    assert roles["desertcart.com"] == "retail_marketplace"
+    assert roles["gosupps.com"] == "retail_marketplace"
+    assert roles["goodhousekeeping.com"] == "independent"
+
+    # recommend-vs-list axis carried on each host row.
+    rec = {h["host"]: h["recommendation_class"] for h in am["hosts"]}
+    assert rec["ebay.com"] == "lists"
+    assert rec["goodhousekeeping.com"] == "recommends"
+
+    summary = am["host_attribution_summary"]
+    assert summary["by_role"] == {
+        "first_party": 1,
+        "retail_marketplace": 3,
+        "independent": 1,
+        "unclassified": 0,
+    }
+    assert set(summary["findability_hosts"]) == {
+        "aruen.com", "ebay.com", "desertcart.com", "gosupps.com",
+    }
+    assert summary["endorsement_hosts"] == ["goodhousekeeping.com"]
+    # Category recommendation is endorsement-driven (the editorial cited on the
+    # category query), not the indexed own/marketplace listings.
+    assert summary["endorsement_category_hosts"] == ["goodhousekeeping.com"]
+    assert summary["has_independent_endorsement"] is True
+    assert summary["independently_recommended_for_category"] is True
+    assert summary["surfaced_only_via_own_listing"] is False
+
+    sku_signals = am["skus"][0]["citation_signals"]
+    assert sku_signals["endorsement_category_hosts"] == ["goodhousekeeping.com"]
+
+    gh = next(h for h in am["hosts"] if h["host"] == "goodhousekeeping.com")
+    assert gh["cited_on_category_query"] is True
+    ebay = next(h for h in am["hosts"] if h["host"] == "ebay.com")
+    assert ebay["cited_on_category_query"] is False
+
+
+def test_authority_map_own_listing_only_never_reads_as_recommended():
+    """A SKU surfaced only through its own site + a marketplace listing has
+    findability but zero endorsement — it must never read as 'AI recommends
+    you'."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    probe_runs = [
+        {
+            "provider": "gemini",
+            "probe_run_id": "p",
+            "raw_runs": [
+                _redir_run("buy Ownist Triple Shine", "ownist.com", "intent"),
+                _redir_run("Ownist on ebay", "ebay.com", "intent"),
+            ],
+        }
+    ]
+    am = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}],
+        {"sku-1": probe_runs},
+        merchant_host="ownist.com",
+        merchant_brand="Ownist",
+    )
+    sig = am["skus"][0]["citation_signals"]
+    assert sig["has_independent_endorsement"] is False
+    assert sig["independently_recommended_for_category"] is False
+    assert sig["surfaced_only_via_own_listing"] is True
+    assert am["host_attribution_summary"]["surfaced_only_via_own_listing"] is True
+
+
+def test_authority_map_without_merchant_identity_has_no_first_party():
+    """Back-compat: callers that omit merchant identity still get a valid map —
+    nothing is tagged first-party, roles fall back to host-type semantics."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    probe_runs = [
+        {"provider": "gemini", "probe_run_id": "p", "raw_runs": [_redir_run("buy", "ownist.com")]}
+    ]
+    am = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}],
+        {"sku-1": probe_runs},
+    )
+    own = next(h for h in am["hosts"] if h["host"] == "ownist.com")
+    assert own["first_party"] is False
+    assert own["citation_role"] in {"unclassified", "retail_marketplace"}
+
+
+def test_query_class_coverage_splits_branded_from_category():
+    from services.agent_center_bd_report_service import _query_class_coverage
+
+    probe_runs = [
+        {
+            "provider": "gemini",
+            "probe_run_id": "p",
+            "raw_runs": [
+                {"query": "where to buy X", "axis_metadata": {"axis": "intent"}},
+                {"query": "X reviews", "axis_metadata": {"axis": "review"}},
+                {"query": "best supplement", "axis_metadata": {"axis": "category"}},
+                {"query": "buy Brand online", "axis_metadata": {"axis": "brand"}},
+            ],
+        }
+    ]
+    cov = _query_class_coverage(probe_runs)
+    assert cov == {"branded_navigational": 3, "category_discovery": 1}

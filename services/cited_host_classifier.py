@@ -477,6 +477,31 @@ def classify_cited_hosts(
     return out
 
 
+# Recommend-vs-list axis (Fix 2). Does a citation from this host *type* mean an
+# independent third party recommended the product (an editorial / review /
+# creator source vouched for it on its own merits) — or only that the product is
+# *listed for sale* there (a retailer / marketplace / brand storefront), which
+# proves findability, not endorsement? Keeping these apart stops "your listing
+# is indexed" from being reported as "AI recommends you".
+_RECOMMENDS_HOST_TYPES = frozenset({"editorial", "video"})
+_LISTS_HOST_TYPES = frozenset({"retailer", "marketplace", "brand"})
+
+
+def recommendation_class(host_type: Optional[str]) -> str:
+    """Return ``"recommends"``, ``"lists"`` or ``"unknown"`` for a cited-host
+    ``type`` (as produced by :func:`classify_host`). ``recommends`` is the
+    endorsement signal (editorial / review / creator); ``lists`` is the
+    findability/distribution signal (retailer / marketplace / brand storefront);
+    ``unknown`` covers unclassified / cdn / missing types — counted
+    conservatively as *not* an endorsement."""
+    t = (host_type or "").strip().lower()
+    if t in _RECOMMENDS_HOST_TYPES:
+        return "recommends"
+    if t in _LISTS_HOST_TYPES:
+        return "lists"
+    return "unknown"
+
+
 def reset_registry_cache() -> None:
     """Test hook — drop the in-memory cache so the next lookup
     re-reads from disk. Used by tests that monkeypatch `_REGISTRY_PATH`."""
