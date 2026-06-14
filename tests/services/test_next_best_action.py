@@ -922,7 +922,12 @@ def test_sku_nba_bb_lab_sideways_wedge_prefers_halal_before_bed_over_head_pressu
     assert "re-audit halal collagen sticks before bed" in play_blob
     assert "verify whether exposure becomes more citable" in play_blob
     assert '"confidence": "fallback"' not in play_blob
-    assert '"confidence": "inferred"' in play_blob
+    # sayweee.com is now registered in the cited-host registry (a known K-beauty
+    # mass-market retailer), so this lane's controller classifies with registry
+    # confidence rather than the inferred/fallback label it carried while the
+    # host was unknown. The contract that matters here is unchanged: raw
+    # "fallback" is never leaked, and the controller surfaces a real confidence.
+    assert '"confidence": "registry"' in play_blob
     assert "%" not in _nba_strings(nba) and "$" not in _nba_strings(nba)
     _assert_no_overpromise(nba)
 
