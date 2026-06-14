@@ -405,6 +405,14 @@
       "coverage_note": "Visual product discovery; AI-channel grounding weight low compared to editorial.",
       "outreach_hint": "Influencer partnerships — Instagram-first creators."
     },
+    "lemon8-app.com": {
+      "type": "video",
+      "subtype": "social",
+      "categories": ["beauty", "skincare", "fashion", "lifestyle", "food_bev"],
+      "aliases": ["Lemon8"],
+      "coverage_note": "Lemon8 is ByteDance's lifestyle content/social-sharing app (beauty, skincare, fashion); AI surfaces its creator posts as social/UGC evidence — growing but lower grounding weight than editorial.",
+      "outreach_hint": "Creator/influencer partnerships — Lemon8 lifestyle creators; UGC seeding, not direct placement."
+    },
     "reddit.com": {
       "type": "video",
       "subtype": "social",
@@ -444,6 +452,22 @@
       "coverage_note": "desertcart is an international cross-border marketplace shipping broad-catalog consumer goods to the Middle East and other regions; AI cites its listings as a buying route where direct D2C shipping is limited.",
       "outreach_hint": "Cross-border marketplace listing — confirm market relevance and margin before prioritizing."
     },
+    "ubuy.co.in": {
+      "type": "marketplace",
+      "subtype": "cross_border",
+      "categories": ["beauty", "skincare", "supplements", "fashion", "electronics", "home"],
+      "aliases": ["Ubuy", "uBuy"],
+      "coverage_note": "Ubuy is a Kuwait-based cross-border marketplace shipping 100M+ imported products to 180+ countries (incl. .co.in for India); AI cites its listings as an international buying route for K-beauty, supplement, and broad-catalog queries where direct D2C shipping is limited.",
+      "outreach_hint": "Cross-border marketplace listing — confirm regional market relevance and margin before prioritizing."
+    },
+    "mercari.com": {
+      "type": "marketplace",
+      "subtype": "resale",
+      "categories": ["beauty", "skincare", "fashion", "home", "electronics"],
+      "aliases": ["Mercari"],
+      "coverage_note": "Mercari is a US/Japan consumer-to-consumer resale marketplace (new + secondhand); AI surfaces its listings as a buying route but stock is seller-listed and transient — low priority for D2C brand authority.",
+      "outreach_hint": "Resale marketplace — not a brand-controlled channel; monitor for counterfeit/grey-market listings rather than onboard."
+    },
 
     "thewinners.ae": {
       "type": "retailer",
@@ -459,6 +483,14 @@
       "aliases": ["Olive Young", "Olive Young Global"],
       "coverage_note": "K-beauty specialty retailer (international); high AI-channel grounding for K-beauty queries.",
       "outreach_hint": "K-beauty wholesale — Olive Young vendor relations."
+    },
+    "kiwla.com": {
+      "type": "retailer",
+      "subtype": "beauty_retailer",
+      "categories": ["beauty", "skincare", "haircare", "supplements"],
+      "aliases": ["Kiwla"],
+      "coverage_note": "Kiwla is a multi-brand online beauty/skincare/haircare/supplement retailer (India) carrying authentic curated brands; AI cites its listings as a buying route for K-beauty and skincare queries in the India market.",
+      "outreach_hint": "Multi-brand retailer onboarding (India) — confirm market relevance plus accurate, review-backed listings."
     },
     "oliveyoung.com": {
       "type": "retailer",
