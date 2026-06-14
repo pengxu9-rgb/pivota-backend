@@ -9,7 +9,7 @@ the `options` argument, and assert the key shape matches the design.
 
 Key shapes (must stay stable across deploys — Stripe caches keys for 24h):
 - customers.create    →  "merchant_customer:{merchant_id}"
-- checkout.sessions   →  "checkout_session:{merchant_id}:{price_id}:{date_iso}"
+- checkout.sessions   →  "checkout_session:{merchant_id}:{sha256(payload)[:40]}"
 - invoices.create     →  "invoice:{billing_run_id}:{merchant_id}"
 - invoice_items       →  "invoice_item:{billing_run_id}:{gmv_rollup_id}"
 - invoice_items (adj) →  "invoice_item_adj:{dispute_id}:{billing_run_item_id}"
@@ -17,7 +17,6 @@ Key shapes (must stay stable across deploys — Stripe caches keys for 24h):
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -107,11 +106,17 @@ async def test_billing_routes_customer_create_passes_idempotency_key(
         == "merchant_customer:merch_xyz"
     )
 
-    # checkout.sessions.create called once, key includes date bucket.
+    # checkout.sessions.create called once with a payload-derived key.
+    # #776 replaced the coarse per-day key (checkout_session:{merchant}:{price}:{date}),
+    # which tripped Stripe's IdempotencyError when any session param differed within
+    # a day, with checkout_session:{merchant}:{sha256(payload)[:40]} — merchant-scoped
+    # and uniquely keyed to the exact request payload.
     assert len(recorder.sessions_calls) == 1
     session_key = recorder.sessions_calls[0]["options"]["idempotency_key"]
-    today_iso = datetime.now(timezone.utc).date().isoformat()
-    assert session_key == f"checkout_session:merch_xyz:price_test:{today_iso}"
+    prefix = "checkout_session:merch_xyz:"
+    assert session_key.startswith(prefix)
+    digest = session_key[len(prefix):]
+    assert len(digest) == 40 and all(c in "0123456789abcdef" for c in digest)
 
 
 def test_invoice_generation_key_shapes_documented() -> None:

@@ -127,33 +127,42 @@ def _is_terminal_paid_state(order: Dict[str, Any]) -> bool:
     return status in {"paid", "completed", "fulfilled", "partially_refunded", "refunded"}
 
 
-def _is_terminal_failure_state(order: Dict[str, Any]) -> bool:
+# Post-settlement states that block a payment-FAILURE transition under ALL
+# circumstances: the order has already reached a terminal money state, so a
+# (possibly stale or out-of-order) failure event must never move it.
+_FAILURE_TERMINAL_PAYMENT_STATES = frozenset(
+    {"payment_failed", "partially_refunded", "refunded", "cancelled"}
+)
+_FAILURE_TERMINAL_ORDER_STATES = frozenset(
+    {"payment_failed", "partially_refunded", "refunded", "cancelled"}
+)
+# Paid-family states. A stale / mis-correlated failure event (e.g. a late Stripe
+# payment_intent.payment_failed) must NOT demote these back to payment_failed —
+# the inverse of the charge-stuck incident. The EXCEPTION is a genuine capture
+# failure on a two-phase (authorise-then-capture) PSP: AUTHORISATION marks the
+# order paid, but a subsequent CAPTURE_FAILED means the money was never actually
+# captured, so the order MUST be demoted. Callers opt into that demotion via
+# allow_paid_demotion=True (Adyen CAPTURE_FAILED only); the default keeps the
+# paid order protected.
+_FAILURE_TERMINAL_PAID_PAYMENT_STATES = frozenset(
+    {"paid", "completed", "succeeded", "success", "settled"}
+)
+_FAILURE_TERMINAL_PAID_ORDER_STATES = frozenset({"paid", "completed", "fulfilled"})
+
+
+def _is_terminal_failure_state(
+    order: Dict[str, Any], *, allow_paid_demotion: bool = False
+) -> bool:
     payment_status = _payment_status_lower(order)
     status = _order_status_lower(order)
-    # A successfully-paid order is also terminal for the FAILURE path: a stale or
-    # mis-correlated payment_intent.payment_failed event must NEVER demote a paid
-    # order back to payment_failed (the inverse of the charge-stuck incident).
-    if payment_status in {
-        "payment_failed",
-        "paid",
-        "completed",
-        "succeeded",
-        "success",
-        "settled",
-        "partially_refunded",
-        "refunded",
-        "cancelled",
-    }:
+    payment_terminal = set(_FAILURE_TERMINAL_PAYMENT_STATES)
+    order_terminal = set(_FAILURE_TERMINAL_ORDER_STATES)
+    if not allow_paid_demotion:
+        payment_terminal |= _FAILURE_TERMINAL_PAID_PAYMENT_STATES
+        order_terminal |= _FAILURE_TERMINAL_PAID_ORDER_STATES
+    if payment_status in payment_terminal:
         return True
-    return status in {
-        "payment_failed",
-        "paid",
-        "completed",
-        "fulfilled",
-        "partially_refunded",
-        "refunded",
-        "cancelled",
-    }
+    return status in order_terminal
 
 
 def _blocks_payment_success_recovery(order: Dict[str, Any]) -> bool:
@@ -310,6 +319,7 @@ async def finalize_payment_failure(
     error_message: Optional[str] = None,
     source_event: str = "payment_failed_webhook",
     record_generic_failure_metadata: bool = True,
+    allow_paid_demotion: bool = False,
     metadata_extra: Optional[Dict[str, Any]] = None,
     metadata_patch: Optional[Dict[str, Any]] = None,
     update_order_status_fn: AwaitableBoolFn,
@@ -321,7 +331,9 @@ async def finalize_payment_failure(
     order_id = str(order.get("order_id") or "")
     merchant_id = str(order.get("merchant_id") or "")
     existing_metadata = _as_dict(order.get("metadata"))
-    applied = not _is_terminal_failure_state(order)
+    applied = not _is_terminal_failure_state(
+        order, allow_paid_demotion=allow_paid_demotion
+    )
     if applied:
         await _safe_update_order_status(
             update_order_status_fn,

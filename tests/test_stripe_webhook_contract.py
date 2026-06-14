@@ -479,10 +479,18 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
             "order_id": "ORD_STRIPE_SUCCESS",
             "merchant_id": "m_stripe",
             "payment_intent_id": "pi_success_contract",
+            # The signed event's amount (4520 minor) must match the order total
+            # for the integrity guard to finalize. usd factor=100 → 45.20.
+            "total": "45.20",
+            "currency": "usd",
         }
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
+        # mark_order_paid is now an atomic conditional transition returning True
+        # only when THIS call flipped the order to paid. The finalizer gates its
+        # one-time side effects (order event, shopify, merchant webhook) on it.
         paid_calls.append(order_id)
+        return True
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
@@ -627,6 +635,10 @@ async def test_stripe_webhook_payment_intent_succeeded_falls_back_to_order_metad
             "order_id": order_id,
             "merchant_id": "m_stripe",
             "payment_intent_id": None,
+            # Event amount 100 minor / usd factor 100 = 1.00; must match the
+            # order total for the integrity guard to finalize.
+            "total": "1.00",
+            "currency": "usd",
             "metadata": {
                 "ops_canary": True,
                 "skip_platform_order_creation": True,
@@ -637,8 +649,9 @@ async def test_stripe_webhook_payment_intent_succeeded_falls_back_to_order_metad
         order_updates.append((order_id, dict(update_data)))
         return True
 
-    async def fake_mark_order_paid(order_id: str) -> None:
+    async def fake_mark_order_paid(order_id: str) -> bool:
         paid_calls.append(order_id)
+        return True
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         return None
@@ -719,6 +732,11 @@ async def test_stripe_webhook_payment_intent_succeeded_does_not_restore_paid_aft
             "payment_intent_id": "pi_success_replay_refunded",
             "status": "partially_refunded",
             "payment_status": "partially_refunded",
+            # Amount must match (event 4520 minor / usd 100 = 45.20) so the
+            # integrity guard passes and we reach — and correctly stop at — the
+            # refund-settled terminal-state guard rather than bailing earlier.
+            "total": "45.20",
+            "currency": "usd",
             "total_refunded": "12.00",
         }
 

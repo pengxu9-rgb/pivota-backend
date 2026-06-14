@@ -187,6 +187,11 @@ async def _finalize_adyen_payment_failure(order: dict, *, psp_reference: str, no
         error_message=notification.get("reason") or notification.get("eventCode") or "Adyen payment failure",
         source_event=source_event,
         record_generic_failure_metadata=source_event != "capture_failed_webhook",
+        # A CAPTURE_FAILED arrives AFTER AUTHORISATION already marked the order
+        # paid, but the money was never captured — so it must demote the paid
+        # order to payment_failed. Other failure sources keep the paid order
+        # protected (stale-event guard).
+        allow_paid_demotion=source_event == "capture_failed_webhook",
         metadata_extra={
             "event_code": notification.get("eventCode"),
             "original_reference": notification.get("originalReference"),
