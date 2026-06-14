@@ -1,0 +1,114 @@
+{
+  "_what_this_is": "PROTOTYPE of a Tier-G (grounded, not human-reviewed) Pivota Insights bundle for Aruen Tofu Collagen — the product_intel.v1 shape the agent already consumes, produced by grounded synthesis (verified INCI + ingredient mechanism + cited science + per-claim grading), so it can surface to agents WITHOUT per-SKU human review. This is what an agent would get for a long-tail cohort SKU that has no human-reviewed bundle today (it currently gets nothing).",
+
+  "contract_version": "pivota.product_intel.v1",
+  "display_name": "Pivota Insights",
+
+  "product_intel_core": {
+    "what_it_is": {
+      "headline": "Vegan fermented-soy firming gel-cream — the active story is soy isoflavones, not the 'collagen' in the name",
+      "body": "A jelly moisturizer whose firming driver is fermented soy (genistein/daidzein isoflavones) plus adenosine, with niacinamide for tone and a Lactobacillus postbiotic for barrier. Best for mature / elasticity-focused skin; gentle and gradual."
+    },
+
+    "best_for": [
+      { "tag": "firmness_elasticity", "label": "Loss of firmness / elasticity", "confidence": "high" },
+      { "tag": "vegan_clean", "label": "Vegan / clean-beauty preference", "confidence": "high" },
+      { "tag": "retinol_alternative", "label": "Wants a retinol alternative", "confidence": "med" },
+      { "tag": "normal_combination", "label": "Normal–combination skin", "confidence": "med" }
+    ],
+    "not_fit": [
+      { "tag": "soy_allergy", "label": "Soy allergy (soy-derived actives)" },
+      { "tag": "pregnancy_precaution", "label": "Pregnant / nursing (phytoestrogen precaution)" },
+      { "tag": "very_dry", "label": "Very dry skin needing rich occlusion" },
+      { "tag": "wants_fast", "label": "Wants fast / dramatic results" }
+    ],
+
+    "why_it_stands_out": [
+      {
+        "headline": "Fermented soy isoflavones — a real firming mechanism",
+        "body": "Genistein/daidzein up-regulate type-I procollagen and inhibit the MMPs that break collagen down — a plant-based firming route, distinct from a generic peptide cream.",
+        "evidence_strength": "peer_reviewed_mechanism"
+      },
+      {
+        "headline": "Fermented for bioavailability (Korean lineage)",
+        "body": "Lactic-acid fermentation converts isoflavone glucosides into the active aglycone forms and adds postbiotics — the doenjang/cheonggukjang fermented-soy tradition applied to skincare.",
+        "evidence_strength": "peer_reviewed_mechanism"
+      },
+      {
+        "headline": "Niacinamide + adenosine support tone and smoothness",
+        "body": "Niacinamide for even tone and barrier; adenosine for the look of smoothness.",
+        "evidence_strength": "ingredient_function"
+      }
+    ],
+
+    "evidence_claims": [
+      {
+        "claim": "Helps firm and improve the look of elasticity",
+        "drivers": ["fermented soy isoflavones (genistein/daidzein)", "adenosine", "plant amino-acid proteins"],
+        "mechanism": "isoflavones up-regulate procollagen + inhibit MMP collagen breakdown; adenosine supports smoothing",
+        "evidence_type": "peer_reviewed_mechanism",
+        "confidence": "moderate",
+        "caveat": "strongest in mature / estrogen-deficient skin; gradual (weeks)",
+        "source_refs": ["pmc.ncbi.nlm.nih.gov/articles/PMC3312494", "onlinelibrary.wiley.com/doi/10.1002/ptr.6538", "pmc.ncbi.nlm.nih.gov/articles/PMC2705153"]
+      },
+      {
+        "claim": "It's a 'collagen' cream that builds collagen",
+        "evidence_type": "marketing_vs_reality",
+        "confidence_claim_is_true": "low",
+        "finding": "Topical hydrolyzed collagen is too large to reach the dermis; it hydrates the surface, it does not build collagen. The name overstates the collagen ingredient — the firming is isoflavone/adenosine-driven."
+      },
+      {
+        "claim": "Hydrates and plumps",
+        "drivers": ["glycerin", "glyceryl glucoside", "hydrolyzed collagen", "fermented soymilk"],
+        "evidence_type": "ingredient_function",
+        "confidence": "high"
+      },
+      {
+        "claim": "Brightens / evens tone and supports the barrier",
+        "drivers": ["niacinamide", "Lactobacillus ferment (postbiotic)"],
+        "evidence_type": "ingredient_function",
+        "confidence": "high"
+      }
+    ],
+
+    "routine_fit": { "step": "moisturizer", "am_pm": "either", "pairing_notes": ["layer a richer occlusive over it in winter for very dry skin"] },
+    "watchouts": [
+      { "type": "fit", "label": "Under-hydrates very dry skin / harsh winter", "severity": "moderate" },
+      { "type": "expectation", "label": "Gradual — results build over weeks", "severity": "mild" },
+      { "type": "honesty", "label": "'Collagen' branding overstates the collagen ingredient", "severity": "mild" }
+    ],
+    "texture_finish": { "texture": "jelly / gel-cream", "finish": "lightweight, non-greasy" },
+    "quality_state": "eligible",
+    "evidence_profile": "grounded_verified"
+  },
+
+  "evidence_profile": "grounded_verified",
+  "confidence": { "overall": "grounded", "fields": { "why_it_stands_out": "moderate", "evidence_claims": "graded_per_claim", "best_for": "high" } },
+
+  "provenance": {
+    "_why": "This bundle is trustworthy by CONSTRUCTION (verified facts + citations), not by a human spot-check — so it can scale to the long-tail cohort. The tiered gate accepts tier='grounded' below human-reviewed and above ungrounded LLM.",
+    "source": "pivota_grounded_synthesis_v1",
+    "tier": "grounded",
+    "reviewer_kind": "automated_grounded",
+    "review_decision": "grounded_pass",
+    "review_status": "grounded",
+    "generator": "pivota_grounded_v1",
+    "field_sources": {
+      "ingredients": "brand_official_inci",
+      "key_actives": "inci_verified",
+      "why_it_stands_out": "ingredient_mechanism+peer_reviewed_citation",
+      "evidence_claims": "ingredient_mechanism_graded",
+      "community_signals": "absent (no aggregated reviews yet for this SKU)"
+    },
+    "grounding": {
+      "inci_verified": true,
+      "inci_source": "https://aruen.us/products/tofu-collagen-dual-firming-jelly-cream",
+      "claim_safety": "cosmetic-vs-drug screened; no medical/efficacy claims",
+      "citations_present": true
+    }
+  },
+
+  "freshness": { "generated_at": "2026-06-14", "source_version": "grounded_synthesis:v1" },
+
+  "_gate_note": "Today isHumanReviewedProductIntelBundle would REJECT this (no human marker) → the agent gets nothing for Aruen. The proposed tiered gate accepts provenance.tier='grounded' + grounding.inci_verified + citations_present, surfaced at confidence='grounded' with the provenance shown — which is what unlocks the whole long-tail cohort."
+}
