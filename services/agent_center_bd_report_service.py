@@ -5033,6 +5033,7 @@ def build_where_you_can_win(
                 if prev is None or score > prev["opportunity_score"]:
                     targets_by_q[q] = {
                         "query": row.get("query") or q,
+                        "normalized_query": q,
                         "sku": sku_name,
                         "sku_key": report.get("sku_key"),
                         "attribute_fit": row.get("attribute_fit"),
@@ -5063,7 +5064,49 @@ def build_where_you_can_win(
     skip = sorted(
         skip_by_q.values(), key=lambda s: -float(s.get("demand_signal") or 0)
     )[:max_skip]
-    return {"targets": targets, "skip": skip, "has_targets": bool(targets)}
+    # demand_proxies: which ranking signals the operator can choose between.
+    # 'probe' (single-audit probe demand, the default rank) is always available;
+    # 'recurrence' (cross-merchant) is populated by attach_niche_recurrence when
+    # the history table has data; 'community' is a future method.
+    return {
+        "targets": targets,
+        "skip": skip,
+        "has_targets": bool(targets),
+        "demand_proxies": ["probe"],
+        "demand_proxy_default": "probe",
+    }
+
+
+async def attach_niche_recurrence(
+    where_you_can_win: Dict[str, Any],
+    *,
+    db: Any = None,
+) -> Dict[str, Any]:
+    """Attach the cross-merchant recurrence signal to each winnable target so the
+    operator can rank niches by how often they recur across brands (a compounding,
+    proprietary demand proxy) instead of single-audit probe demand. Best-effort —
+    leaves targets unchanged when the history table is empty/absent.
+
+    Mutates + returns `where_you_can_win` for convenience.
+    """
+    targets = (where_you_can_win or {}).get("targets") or []
+    if not targets:
+        return where_you_can_win
+    from services.niche_recurrence import recurrence_for_queries
+
+    keys = [t.get("normalized_query") for t in targets if t.get("normalized_query")]
+    recurrence = await recurrence_for_queries(keys, db=db)
+    any_recurrence = False
+    for t in targets:
+        rec = recurrence.get(t.get("normalized_query") or "")
+        if rec:
+            t["recurrence"] = rec
+            any_recurrence = True
+    if any_recurrence:
+        proxies = where_you_can_win.setdefault("demand_proxies", ["probe"])
+        if "recurrence" not in proxies:
+            proxies.append("recurrence")
+    return where_you_can_win
 
 
 def build_brand_rollup(
@@ -7991,6 +8034,24 @@ async def run_brand_report(
         # Phase 2: surface the niche-targeting the per-SKU opportunity already
         # computes as a first-class "where you can win" strategy.
         brand_rollup["where_you_can_win"] = build_where_you_can_win(per_sku_reports)
+        # Phase 2 v2: record this audit's probed niche queries (compounds the
+        # cross-merchant recurrence demand signal) and attach recurrence to the
+        # winnable targets so the operator can rank by it. Best-effort.
+        try:
+            from services.niche_recurrence import record_niche_queries
+
+            _probed_niche_queries = [
+                row.get("normalized_query") or row.get("query")
+                for _r in per_sku_reports
+                for row in ((_r.get("opportunity") or {}).get("per_prompt") or [])
+                if isinstance(row, dict)
+            ]
+            await record_niche_queries(
+                queries=_probed_niche_queries, merchant_id=str(merchant_id)
+            )
+            await attach_niche_recurrence(brand_rollup["where_you_can_win"])
+        except Exception:  # noqa: BLE001
+            logger.warning("niche recurrence record/attach failed", exc_info=True)
         authority_map = build_authority_map(per_sku_reports, probe_runs_by_sku)
         median_citation = (
             (brand_rollup.get("dimensions") or {})
