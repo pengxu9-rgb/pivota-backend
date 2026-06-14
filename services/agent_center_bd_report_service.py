@@ -357,6 +357,69 @@ def _identify_run_sources(run: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+# A bare-domain string ("oliveyoung.com", "the-independent.com") rather than
+# a human-readable source title ("Olive Young Global"): has a dot, no
+# whitespace, plausible DNS labels. Used to decide whether a grounding-chunk
+# `title` can be taken as the real host verbatim.
+_HOSTLIKE_RE = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+
+
+def _looks_like_host(value: Optional[str]) -> bool:
+    host = normalize_host(value or "")
+    return bool(host) and " " not in host and bool(_HOSTLIKE_RE.match(host))
+
+
+def _grounding_source_host(source: Dict[str, Any]) -> Optional[str]:
+    """Resolve the *real* publisher host for one grounding source dict.
+
+    Gemini grounding wraps every cited URL in a Vertex redirector
+    (`vertexaisearch.cloud.google.com/grounding-api-redirect/<token>`) that
+    hides the destination domain; the structured chunk's `title` carries the
+    real source — almost always the bare domain ("oliveyoung.com", "ebay.com"),
+    occasionally a display name ("Olive Young Global"). Resolution order:
+
+      1. Real (non-redirector) URI host — use it directly (covers the case
+         where probe-time resolution already followed the 302, and any
+         non-Gemini provider that cites a plain URL).
+      2. Redirector URI -> derive the host from `title`:
+         a. title shaped like a domain -> that domain.
+         b. title is a display name -> BD cited-host registry alias lookup -> host.
+      3. Unresolvable -> None, so the citation is dropped from the host rollup
+         rather than mis-attributed to the opaque redirector domain.
+
+    This is the per-source analogue of `_identify_run_sources` (the
+    competitor-extraction path's redirector fix). Without it,
+    `authority_map.hosts` collapses every Gemini citation onto
+    `vertexaisearch.cloud.google.com` (the v3 per-SKU regression: the real
+    hosts live in each chunk's `title`, not the redirector URI host).
+    """
+    if not isinstance(source, dict):
+        return None
+    uri_host = normalize_host(source.get("uri") or "")
+    if uri_host and uri_host not in _VERTEX_REDIRECTOR_HOSTS:
+        return uri_host
+    title = (source.get("title") or "").strip()
+    if not title:
+        return None
+    if _looks_like_host(title):
+        return normalize_host(title)
+    # Display-name title — try the BD cited-host registry alias index, which
+    # maps "Sephora"/"Olive Young Global" to a canonical host. Restrict this to
+    # short, name-like titles: a real source name is a few words ("Beauty of
+    # Joseon Official Store"), whereas a long page headline could match a
+    # registry alias as a coincidental substring and fabricate a cited host
+    # (e.g. "...best collagen for your target audience" -> target.com). The
+    # no-fabrication guardrail makes dropping such a citation the safe default.
+    if len(title.split()) <= 6:
+        resolved = classify_host(title).get("host")
+        if resolved and _looks_like_host(resolved):
+            return resolved
+    return None
+
+
 def _source_matches_merchant(
     source: Dict[str, str],
     *,
@@ -5394,7 +5457,11 @@ def build_authority_map(
                 if not isinstance(source, dict):
                     continue
                 uri = source.get("uri") or ""
-                host = normalize_host(uri)
+                # Resolve the Vertex grounding redirector to the real publisher
+                # host (from the chunk `title`); otherwise every Gemini citation
+                # collapses onto vertexaisearch.cloud.google.com and the merchant
+                # sees one "unclassified" host instead of the real cited sources.
+                host = _grounding_source_host(source)
                 if not host:
                     continue
                 host_type = _classify_authority_host(host)

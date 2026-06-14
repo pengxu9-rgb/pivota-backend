@@ -900,3 +900,101 @@ def test_build_authority_map_classification_and_reddit_shape():
     assert reddit["threads"][0]["sentiment"] is None
     assert reddit["sentiment_proxy"] is None
     assert "chatgpt" in authority_map["hosts"][0]["providers"]
+
+
+def _gemini_redirector_run(query: str, title: str) -> Dict[str, Any]:
+    """A Gemini grounding run whose only source is delivered as a Vertex
+    redirector URI with the REAL publisher domain in `title` — the prod v3
+    per-SKU shape that regressed authority_map onto vertexaisearch."""
+    return {
+        "query": query,
+        "parsed": {"product_visible": True, "correct_sku": True},
+        "grounding_sources": [
+            {
+                "uri": (
+                    "https://vertexaisearch.cloud.google.com/"
+                    f"grounding-api-redirect/AUZIabc-{title}"
+                ),
+                "title": title,
+            }
+        ],
+        "url_match": {"in_grounding": False},
+    }
+
+
+def test_build_authority_map_resolves_gemini_redirector_to_real_host():
+    """Fix 1 regression: every Gemini citation used to collapse onto the Vertex
+    redirector host (`vertexaisearch.cloud.google.com`, host_type unclassified)
+    because build_authority_map keyed off the redirector URI. The real domain in
+    each grounding chunk's `title` must drive the host rollup instead — and each
+    resolved host must classify via the cited-host registry (no vertexaisearch in
+    merchant-facing output)."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    probe_runs = [
+        {
+            "provider": "gemini",
+            "probe_run_id": "probe-redir",
+            "raw_runs": [
+                _gemini_redirector_run("where to buy this serum", "oliveyoung.com"),
+                _gemini_redirector_run("best lash serum", "ebay.com"),
+                _gemini_redirector_run("buy lash serum online", "desertcart.com"),
+                _gemini_redirector_run("editorial roundup", "goodhousekeeping.com"),
+            ],
+        }
+    ]
+    authority_map = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}],
+        {"sku-1": probe_runs},
+    )
+
+    matrix = {h["host"]: h for h in authority_map["hosts"]}
+    # Acceptance: real classified hosts present, zero vertexaisearch.
+    assert "vertexaisearch.cloud.google.com" not in matrix
+    assert {"oliveyoung.com", "ebay.com", "desertcart.com", "goodhousekeeping.com"} <= set(matrix)
+    # Hosts classify via cited_host_classifier (not "unclassified").
+    assert matrix["oliveyoung.com"]["host_type"] == "retailer"
+    assert matrix["ebay.com"]["host_type"] == "retailer"  # marketplace folds to retailer
+    assert matrix["goodhousekeeping.com"]["host_type"] == "editorial"
+    assert matrix["oliveyoung.com"]["provider_counts"] == {"gemini": 1}
+
+    sku_hosts = {h["host"] for h in authority_map["skus"][0]["authority_hosts"]}
+    assert "vertexaisearch.cloud.google.com" not in sku_hosts
+    assert "oliveyoung.com" in sku_hosts
+
+
+def test_build_authority_map_drops_unresolvable_redirector_no_vertex_leak():
+    """A redirector source with no usable title (nothing to resolve to) is
+    dropped, never emitted as `vertexaisearch.cloud.google.com`. A real
+    (non-redirector) URI in the same run still resolves directly."""
+    from services.agent_center_bd_report_service import build_authority_map
+
+    probe_runs = [
+        {
+            "provider": "gemini",
+            "probe_run_id": "probe-mixed",
+            "raw_runs": [
+                {
+                    "query": "best serum",
+                    "parsed": {"product_visible": True},
+                    "grounding_sources": [
+                        # Redirector with empty title -> unresolvable -> dropped.
+                        {
+                            "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIxyz",
+                            "title": "",
+                        },
+                        # Real publisher URI (e.g. probe-time 302 already followed).
+                        {"uri": "https://www.allure.com/best-serums", "title": "Best serums 2026"},
+                    ],
+                    "url_match": {"in_grounding": False},
+                }
+            ],
+        }
+    ]
+    authority_map = build_authority_map(
+        [{"sku_key": "sku-1", "product_key": "prod-1"}],
+        {"sku-1": probe_runs},
+    )
+    hosts = {h["host"] for h in authority_map["hosts"]}
+    assert "vertexaisearch.cloud.google.com" not in hosts
+    assert "allure.com" in hosts
