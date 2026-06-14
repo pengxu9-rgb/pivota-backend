@@ -152,3 +152,70 @@ async def test_finalize_refund_failure_rolls_back_from_explicit_amount_without_r
     assert result["total_refunded"] == Decimal("0")
     assert status_updates[0]["status"] == "paid"
     assert str(status_updates[0]["total_refunded"]) == "0.00"
+
+
+@pytest.mark.asyncio
+async def test_finalize_payment_success_surfaces_funnel_event_ids() -> None:
+    """The paid transition surfaces the conversion log_order_event's funnel_event_ids
+    so the webhook can join the settled sale back to its decision."""
+    from services.psp_payment_finalizer import finalize_payment_success
+
+    async def fake_mark_order_paid(order_id: str):
+        return True
+
+    async def fake_log_order_event(**kwargs):
+        # mirrors db.products.log_order_event → record_from_order_event return shape
+        return ["funnel-evt-1"]
+
+    result = await finalize_payment_success(
+        {
+            "order_id": "ORD_FINALIZER_PAID",
+            "merchant_id": "merch_1",
+            "status": "awaiting_payment",
+            "payment_status": "awaiting_payment",
+            "currency": "USD",
+            "subtotal": "10.00",
+            "metadata": {"decision_layer": {"decision_id": "dec-1"}},
+        },
+        psp="stripe",
+        payment_reference="pi_123",
+        transaction_id="pi_123",
+        amount_minor=1000,
+        currency="USD",
+        mark_order_paid_fn=fake_mark_order_paid,
+        log_order_event_fn=fake_log_order_event,
+    )
+
+    assert result["applied"] is True
+    assert result["funnel_event_ids"] == ["funnel-evt-1"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_payment_success_funnel_event_ids_defaults_empty() -> None:
+    """A None-returning log hook (e.g. no merchant_id) yields [] not None — callers
+    iterate it safely."""
+    from services.psp_payment_finalizer import finalize_payment_success
+
+    async def fake_mark_order_paid(order_id: str):
+        return True
+
+    async def fake_log_order_event(**kwargs):
+        return None
+
+    result = await finalize_payment_success(
+        {
+            "order_id": "ORD_FINALIZER_PAID_2",
+            "merchant_id": "merch_1",
+            "status": "awaiting_payment",
+            "payment_status": "awaiting_payment",
+            "currency": "USD",
+            "metadata": {},
+        },
+        psp="stripe",
+        payment_reference="pi_456",
+        mark_order_paid_fn=fake_mark_order_paid,
+        log_order_event_fn=fake_log_order_event,
+    )
+
+    assert result["applied"] is True
+    assert result["funnel_event_ids"] == []

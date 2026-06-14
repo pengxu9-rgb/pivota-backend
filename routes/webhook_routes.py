@@ -781,6 +781,49 @@ async def handle_stripe_webhook(
                 )
                 if finalization.get("applied"):
                     logger.info(f"Order {order_id} marked as paid via webhook")
+
+                    # Decision-layer outcome join: link the settled sale back to the
+                    # decision that produced it (agent_decision_funnel_links). Best-effort
+                    # and decoupled (record_funnel_link enqueues to an async writer with
+                    # ON CONFLICT (funnel_event_id) DO NOTHING), so it can neither roll
+                    # back the paid commit nor double-write on webhook replay.
+                    try:
+                        from services.agent_decision_event_store import (
+                            extract_order_decision_linkage,
+                            record_funnel_link,
+                        )
+
+                        linkage = extract_order_decision_linkage(result.get("metadata"))
+                        funnel_event_ids = finalization.get("funnel_event_ids") or []
+                        if linkage.get("decision_id") or linkage.get("checkout_decision_id"):
+                            if not funnel_event_ids:
+                                logger.warning(
+                                    "Paid order %s has decision linkage but no funnel_event_id "
+                                    "to join (decision_id=%s checkout_decision_id=%s)",
+                                    order_id,
+                                    linkage.get("decision_id"),
+                                    linkage.get("checkout_decision_id"),
+                                )
+                            link_kwargs = {
+                                "decision_id": linkage.get("decision_id"),
+                                "checkout_decision_id": linkage.get("checkout_decision_id"),
+                                "content_key": linkage.get("content_key"),
+                                "catalog_offer_id": linkage.get("catalog_offer_id"),
+                                "merchant_id": merchant_id,
+                            }
+                            if linkage.get("protocol"):
+                                link_kwargs["protocol"] = linkage["protocol"]
+                            for funnel_event_id in funnel_event_ids:
+                                await record_funnel_link(
+                                    funnel_event_id=funnel_event_id, **link_kwargs
+                                )
+                    except Exception as link_exc:  # noqa: BLE001
+                        logger.warning(
+                            "Decision funnel-link join failed for paid order %s: %s",
+                            order_id,
+                            link_exc,
+                        )
+
                     await _emit_stripe_merchant_webhook_best_effort(
                         result,
                         event_type="payment.completed",

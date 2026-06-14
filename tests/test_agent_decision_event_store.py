@@ -78,3 +78,48 @@ def test_protocol_columns_are_in_insert_specs() -> None:
     assert "protocol" in store._SPEC["decision"][1]
     assert "protocol" in store._SPEC["checkout"][1]
     assert "protocol" in store._SPEC["funnel_link"][1]
+
+
+def test_extract_order_decision_linkage_reads_decision_layer() -> None:
+    linkage = store.extract_order_decision_linkage(
+        {
+            "decision_layer": {
+                "decision_id": "dec-1",
+                "checkout_decision_id": "chk-1",
+                "content_key": "ck-1",
+                "catalog_offer_id": "off-1",
+                "protocol": "ucp_session",
+            }
+        }
+    )
+    assert linkage == {
+        "decision_id": "dec-1",
+        "checkout_decision_id": "chk-1",
+        "content_key": "ck-1",
+        "catalog_offer_id": "off-1",
+        "protocol": "ucp_session",
+    }
+
+
+def test_extract_order_decision_linkage_handles_missing_and_partial() -> None:
+    # Non-dict / empty → all-null linkage, no raise.
+    assert store.extract_order_decision_linkage(None) == {
+        "decision_id": None,
+        "checkout_decision_id": None,
+        "content_key": None,
+        "catalog_offer_id": None,
+        "protocol": None,
+    }
+    # checkout_decision_id present without decision_id (the common agent-order case:
+    # checkout id is always minted, search decision_id only when propagated).
+    partial = store.extract_order_decision_linkage(
+        {"decision_layer": {"checkout_decision_id": "chk-only"}}
+    )
+    assert partial["checkout_decision_id"] == "chk-only"
+    assert partial["decision_id"] is None
+    # Top-level fallbacks + offer_id alias.
+    fallback = store.extract_order_decision_linkage(
+        {"decision_id": "top-dec", "offer_id": "top-off"}
+    )
+    assert fallback["decision_id"] == "top-dec"
+    assert fallback["catalog_offer_id"] == "top-off"

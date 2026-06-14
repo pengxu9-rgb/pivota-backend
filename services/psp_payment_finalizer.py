@@ -236,7 +236,7 @@ async def finalize_payment_success(
             order_id,
             exc,
         )
-    await log_order_event_fn(
+    funnel_event_ids = await log_order_event_fn(
         event_type=source_event,
         order_id=order_id,
         merchant_id=merchant_id,
@@ -255,6 +255,11 @@ async def finalize_payment_success(
         "merchant_id": merchant_id,
         "payment_reference": resolved_payment_reference,
         "metadata": next_metadata,
+        # funnel_event_ids produced by the conversion log_order_event hook, surfaced
+        # so the caller can join the settled sale back to its originating decision
+        # (agent_decision_funnel_links). May be [] if the funnel hook found no
+        # merchant_id / swallowed an error — callers treat it as best-effort.
+        "funnel_event_ids": funnel_event_ids or [],
     }
 
 
