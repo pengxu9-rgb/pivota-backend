@@ -137,11 +137,12 @@ async def submit_product_pdp_contribution(
 
 
 class SupplierEvidenceRequest(BaseModel):
-    # v1: an INCI list (the highest-leverage, fully-verifiable input). Pivota
+    # The merchant supplies EVIDENCE, not copy: an INCI list (pasted) OR a
+    # product-page URL we crawl for the INCI (the easier front door). Pivota
     # verifies → substantiates → screens → grades it into provenance-backed,
-    # claim-safe claims on the canonical record. Brand-URL crawl + lab/cert land
-    # in v2 (they queue async). The merchant supplies EVIDENCE, not copy.
+    # claim-safe claims on the canonical record. Lab/cert/community land later.
     raw_inci: Optional[str] = None
+    brand_url: Optional[str] = None
 
 
 @router.post("/product/{platform}/{platform_product_id}/evidence")
@@ -160,7 +161,9 @@ async def submit_product_evidence(
         parse_product_key(product_key)
         from services.supplier_evidence_intake import ingest_supplier_evidence
 
-        return await ingest_supplier_evidence(product_key, raw_inci=body.raw_inci)
+        return await ingest_supplier_evidence(
+            product_key, raw_inci=body.raw_inci, brand_url=body.brand_url
+        )
     except Exception as exc:
         raise _map_error(exc)
 

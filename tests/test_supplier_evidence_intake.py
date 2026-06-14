@@ -82,6 +82,61 @@ async def test_non_inci_rejected(monkeypatch):
     assert "enrich" not in calls
 
 
+class _Resolved:
+    def __init__(self, raw_inci, source_url="https://brand.example/p"):
+        self.raw_inci = raw_inci
+        self.source_url = source_url
+
+
+def _patch_crawl(monkeypatch, *, raw_inci):
+    import services.canonical_inci_resolver as resolver
+
+    async def fake_resolve(url, *, fetch):
+        return _Resolved(raw_inci) if raw_inci else None
+
+    monkeypatch.setattr(resolver, "resolve_inci_from_url", fake_resolve)
+
+
+@pytest.mark.asyncio
+async def test_brand_url_crawls_inci_then_grades(monkeypatch):
+    calls = _patch(monkeypatch)
+    _patch_crawl(monkeypatch, raw_inci="Water, Niacinamide, Glycerin")
+    out = await sei.ingest_supplier_evidence(
+        "m1|shopify|p1", brand_url="https://brand.example/products/glow",
+    )
+    assert out["steps"]["crawl"] == "ok"
+    assert out["status"] == "ok"
+    assert out["served"] is True
+    # the crawled INCI flowed into the same pipeline (supplier_input precedence)
+    assert calls["inci"]["raw_inci"] == "Water, Niacinamide, Glycerin"
+    assert calls["inci"]["source"] == sei.SUPPLIER_SOURCE
+
+
+@pytest.mark.asyncio
+async def test_brand_url_with_no_inci_found_is_no_evidence(monkeypatch):
+    calls = _patch(monkeypatch)
+    _patch_crawl(monkeypatch, raw_inci=None)
+    out = await sei.ingest_supplier_evidence(
+        "m1|shopify|p1", brand_url="https://brand.example/no-ingredients",
+    )
+    assert out["steps"]["crawl"] == "no_inci_found"
+    assert out["status"] == "no_evidence"
+    assert "inci" not in calls  # never reached the grader
+
+
+@pytest.mark.asyncio
+async def test_pasted_inci_wins_over_url(monkeypatch):
+    calls = _patch(monkeypatch)
+    _patch_crawl(monkeypatch, raw_inci="SHOULD_NOT_BE_USED")
+    out = await sei.ingest_supplier_evidence(
+        "m1|shopify|p1", raw_inci="Water, Niacinamide", brand_url="https://brand.example/p",
+    )
+    assert out["status"] == "ok"
+    # crawl step skipped when INCI is pasted directly
+    assert "crawl" not in out["steps"]
+    assert calls["inci"]["raw_inci"] == "Water, Niacinamide"
+
+
 @pytest.mark.asyncio
 async def test_serve_refresh_failure_is_best_effort(monkeypatch):
     _patch(monkeypatch, refresh_raises=True)
