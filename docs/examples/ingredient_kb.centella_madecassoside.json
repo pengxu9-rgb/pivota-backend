@@ -1,0 +1,138 @@
+{
+  "_what_this_is": "Tier-G Ingredient KB entry for Centella asiatica / madecassoside / asiaticoside ('cica') — built to the ADR-002 quality bar and the genistein gold-standard shape (v2-lite + additive Tier-G fields). Adversarially reviewed: every citation URL verified to resolve before inclusion.",
+
+  "status": "ready",
+  "schema_version": "v2-lite",
+  "provider": "pivota_research",
+  "confidence_level": "high",
+
+  "ingredient": {
+    "inci": "Centella Asiatica Extract",
+    "display_name": "Centella asiatica (madecassoside / asiaticoside / 'cica')",
+    "aliases": [
+      "cica", "gotu kola", "tiger grass", "Indian pennywort",
+      "madecassoside", "asiaticoside", "asiatic acid", "madecassic acid",
+      "Centella asiatica leaf extract", "CICA extract"
+    ],
+    "what_it_is": "A creeping herb native to tropical Southeast and South Asia, used for centuries in Ayurvedic and traditional Chinese medicine. Its four key triterpenoid saponins — madecassoside, asiaticoside, madecassic acid, and asiatic acid — work across complementary pathways: supporting procollagen synthesis, quenching free radicals, and helping skin look visibly calmer and more comfortable. The 'cica' name in K-beauty derives from the French word cicatrisation (scar formation), but in a cosmetic context the relevant story is appearance support and barrier comfort, not medical wound repair.",
+    "marketing_vs_reality": [
+      {
+        "claim_in_market": "'Cica heals wounds' / 'wound-healing cream'",
+        "reality": "The wound-healing and scar-repair research behind 'cica' is largely pharmaceutical-grade clinical work. A leave-on cosmetic formulation operates at far lower concentrations and without occlusion — what it can honestly deliver is supporting the skin's barrier appearance, helping skin look calmer and less reactive, and supplying antioxidant support. 'Heals wounds' is a drug claim; cosmetic-safe language is 'supports the look of a stronger barrier' and 'skin appears calmer'.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "'Anti-inflammatory' cica cream",
+        "reality": "Triterpenoids modulate inflammatory cytokine pathways in cell and animal models, but a cosmetic product cannot make anti-inflammatory drug claims. The honest cosmetic translation: madecassoside and asiaticoside help skin look less red and irritated after exposure to stressors — a look/feel outcome, not a treatment outcome.",
+        "evidence_type": "marketing_vs_reality"
+      }
+    ]
+  },
+
+  "overview": "Centella asiatica's triterpenoids support procollagen synthesis via TGF-β/Smad signaling, scavenge free radicals, enhance barrier-related proteins (filaggrin, involucrin), and help skin look calmer. Best evidence is at grade B — strong mechanism + some human fibroblast and in-vivo data, but large-scale RCT evidence in cosmetic formulations is limited. Traditional-use heritage spans millenia; K-beauty catapulted it to mainstream global status in the 2010s.",
+
+  "benefits": [
+    {
+      "concern": "barrier support / reactive skin",
+      "strength": 2,
+      "what_it_means": "Skin looks and feels more comfortable; helps maintain surface hydration and reduce the appearance of redness after stressors like environmental exposure or new product introduction.",
+      "mechanism": "Madecassoside upregulates filaggrin and involucrin (structural proteins in the stratum corneum) and enhances skin hydration in vitro and in vivo; extract saponins normalize skin-surface pH toward a healthy acid mantle (~pH 5), supporting barrier integrity."
+    },
+    {
+      "concern": "dullness / collagen support / firmness",
+      "strength": 2,
+      "what_it_means": "Over weeks of use, skin may look firmer and more luminous. Not a retinoid-speed result — a gradual procollagen support story.",
+      "mechanism": "Asiaticoside activates type-I procollagen synthesis via TGF-β receptor kinase-independent Smad signaling in dermal fibroblasts. Madecassoside additionally stimulates type-III collagen. In cultured human fibroblasts, both compounds increased type-I collagen secretion by ~25–30%; madecassoside was the only compound to also significantly boost type-III collagen."
+    },
+    {
+      "concern": "antioxidant / photoaging appearance",
+      "strength": 2,
+      "what_it_means": "Supportive daily antioxidant; helps skin look less fatigued after UV or pollution exposure. Combines well with vitamin C or niacinamide for a multi-target approach.",
+      "mechanism": "Centella extract scavenges DPPH free radicals with ~83% inhibition at 1 mg/mL — comparable to grape seed extract and just below vitamin C (88%). Phenolic and flavonoid constituents drive the antioxidant capacity via redox-reduction. Madecassoside also activates autophagy to reduce overall oxidative damage in skin cells."
+    },
+    {
+      "concern": "looks-calmer skin / post-procedure appearance",
+      "strength": 2,
+      "what_it_means": "Skin looks less reactive, less red, and more even-toned — particularly valued after exfoliation routines, retinoid use, or environmental stress.",
+      "mechanism": "Triterpene saponins reduce prostaglandin E2 (PGE2) synthesis and suppress pro-inflammatory cytokines (TNF-α, IL-6, IL-1β) in cell models. The cosmetic appearance outcome is visibly calmer, more even-looking skin — not a treatment of an inflammatory condition."
+    }
+  ],
+
+  "safety": {
+    "irritation_risk": "low",
+    "watchouts": [
+      {
+        "issue": "Rare contact allergy / sensitization",
+        "likelihood": "low",
+        "what_to_do": "Well-tolerated in the vast majority of users, but sensitization to Centella asiatica has been reported in a small number of individuals. Patch-test on new-to-skin barrier-disrupted or eczema-prone skin."
+      },
+      {
+        "issue": "Asiaticoside concentration and photosensitivity",
+        "likelihood": "very low",
+        "what_to_do": "Isolated asiaticoside at high pharmaceutical concentrations has shown mild phototoxic potential in some studies. Cosmetic concentrations are significantly lower; no actionable photosensitivity concern for typical leave-on products, but daytime SPF use is best practice."
+      }
+    ]
+  },
+
+  "usage": {
+    "routine_step": "serum_or_moisturizer",
+    "pair_well": [
+      "niacinamide", "panthenol", "ceramides", "hyaluronic acid",
+      "allantoin", "adenosine", "beta-glucan"
+    ],
+    "consider_separating": [
+      "high-concentration exfoliating acids (AHA/BHA) in same step — use cica as the calming follow-up step, not mixed into the acid"
+    ],
+    "notes": [
+      "Particularly effective as a buffer layer after actives (retinoids, acids) to support the look of a calmer barrier.",
+      "Traditional K-beauty 'cica' positioning: post-procedure and reactive-skin first aid — this is where the performance profile is clearest.",
+      "Gradual collagen-support story — evaluate at 8–12 weeks.",
+      "AM and PM appropriate; no interactions with SPF."
+    ]
+  },
+
+  "evidence": {
+    "grade": "B",
+    "summary": "Strong peer-reviewed mechanistic evidence (TGF-β/Smad collagen pathway, antioxidant DPPH benchmarks, filaggrin/involucrin upregulation) plus human fibroblast in-vitro data and some in-vivo animal data. No large-scale placebo-controlled RCTs specifically in cosmetic formulations at typical use concentrations — hence B not A. Traditional use heritage across Ayurvedic, TCM, and French wound-care traditions is centuries-old and convergent with the mechanistic picture, reinforcing the confidence.",
+    "citations": [
+      {
+        "title": "Therapeutic properties and pharmacological activities of asiaticoside and madecassoside: A review",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC9983323/",
+        "year": 2023,
+        "source": "Journal of Cellular and Molecular Medicine"
+      },
+      {
+        "title": "Triterpene composition and bioactivities of Centella asiatica",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC6259745/",
+        "year": 2011,
+        "source": "Molecules"
+      },
+      {
+        "title": "Topical application of Centella asiatica in wound healing: recent insights into mechanisms and clinical efficacy",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11510310/",
+        "year": 2024,
+        "source": "Pharmaceutics"
+      },
+      {
+        "title": "Comparative activity of asiaticoside and madecassoside on type I and III collagen synthesis by cultured human fibroblasts",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/7741425/",
+        "year": 1995,
+        "source": "Annales Pharmaceutiques Françaises"
+      }
+    ]
+  },
+
+  "top_products": { "budget": [], "mid": [], "premium": [] },
+
+  "source_meta": {
+    "review": {
+      "method": "agent_adversarial",
+      "decision": "pass",
+      "reviewer": "pivota_subagent",
+      "reviewed_at": "2026-06-14",
+      "human_qa": { "sampled": false, "decision": null, "reviewer": null, "at": null }
+    },
+    "tier": "grounded",
+    "note": "All four citation URLs fetched and verified to resolve to substantive content before inclusion. The Pharmacia 2025 article (pensoft.net/167217) was accessed but returned only navigation/metadata — excluded. PMC12283260 (2025) resolved but is in vitro only (HaCaT cells, novel cultivar) — mechanistic support only, not cited as primary evidence. Two marketing_vs_reality corrections address real, widespread over-claims ('heals wounds', 'anti-inflammatory') with honest cosmetic reframes. No drug/medical claims in benefits copy."
+  }
+}

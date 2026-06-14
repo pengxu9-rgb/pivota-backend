@@ -67,10 +67,10 @@
     "grade": "B",
     "summary": "Peer-reviewed mechanism + human/ex-vivo data for isoflavone effects on procollagen, MMPs, and pigmentation. Firming benefit is best-supported in estrogen-deficient skin; cosmetic effect sizes are modest and gradual.",
     "citations": [
-      { "title": "Estrogens and aging skin (procollagen, MMP modulation)", "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3312494", "year": 2012, "source": "Dermatoendocrinol" },
-      { "title": "Genistein in dermatology: photoprotection and anti-aging mechanisms", "url": "https://onlinelibrary.wiley.com/doi/10.1002/ptr.6538", "year": 2020, "source": "Phytotherapy Research" },
-      { "title": "Soy isoflavones and skin: pigmentation and collagen effects", "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC2705153", "year": 2009, "source": "J Nutr / NIH" },
-      { "title": "Fermentation raises isoflavone aglycone bioavailability (glucoside → aglycone)", "url": "https://pubmed.ncbi.nlm.nih.gov/30035387", "year": 2018, "source": "PubMed" }
+      { "title": "Genistein aglycone, a soy-derived isoflavone, improves skin changes induced by ovariectomy in rats", "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3312494", "year": 2012, "source": "NIH/PMC" },
+      { "title": "Recent advances in the anti-aging effects of phytoestrogens on collagen, water content, and oxidative stress", "url": "https://onlinelibrary.wiley.com/doi/10.1002/ptr.6538", "year": 2020, "source": "Phytotherapy Research" },
+      { "title": "Effects of Isoflavones on the Skin of Postmenopausal Women: A Pilot Study", "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC2705153", "year": 2009, "source": "NIH/PMC" },
+      { "title": "Bioavailability of Isoflavone Metabolites After Korean Fermented Soybean Paste (Doenjang) Ingestion in Estrogen-Deficient Rats", "url": "https://pubmed.ncbi.nlm.nih.gov/30035387", "year": 2018, "source": "PubMed" }
     ]
   },
 

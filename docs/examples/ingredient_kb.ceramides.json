@@ -1,0 +1,132 @@
+{
+  "_what_this_is": "Tier-G Ingredient KB entry for skin-identical ceramides (NP/AP/EOP). Mirrors the genistein gold-standard shape (v2-lite + additive Tier-G fields). Citations verified via WebFetch before inclusion.",
+
+  "status": "ready",
+  "schema_version": "v2-lite",
+  "provider": "pivota_research",
+  "confidence_level": "high",
+
+  "ingredient": {
+    "inci": "Ceramide NP / Ceramide AP / Ceramide EOP",
+    "display_name": "Ceramides (skin-identical ceramides, e.g. NP / AP / EOP)",
+    "aliases": ["ceramide", "ceramide 3", "ceramide 6", "ceramide 9", "sphingolipid", "ceramide complex", "phytoceramide", "pseudo-ceramide"],
+    "what_it_is": "Ceramides are long-chain sphingolipids that naturally make up ~50% of the intercellular lipid matrix in the stratum corneum. Skin-identical subtypes NP, AP, and EOP match the structures found in healthy human skin and slot directly into the lamellar bilayers that seal the barrier.",
+    "marketing_vs_reality": [
+      {
+        "claim_in_market": "'Rebuilds the skin barrier'",
+        "reality": "More precisely: topical ceramides replenish intercellular lipid lamellae — restoring the mortar between corneocytes so the barrier looks and feels intact. The word 'rebuild' overstates structural regeneration; what actually happens is lipid replenishment that supports normal barrier appearance and reduces moisture loss.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "'Ceramides alone restore barrier function'",
+        "reality": "Ceramides need cholesterol and free fatty acids present together. Studies show applying any single lipid — or even two-lipid mixtures — delays, rather than aids, barrier recovery. The classic physiologic ratio is ~1:1:1 molar (ceramide:cholesterol:free fatty acid); ceramide-dominant formulations at ~3:1:1 accelerate recovery further, especially in aged skin.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "'Skin-identical' means it works exactly like endogenous ceramide",
+        "reality": "Topically applied ceramides do interact with the stratum corneum lipid matrix and increase orthorhombic (denser) lipid packing, but they do not identically replicate the full biosynthetic pathway. The 'skin-identical' framing is directionally fair — it communicates structural compatibility — but actual incorporation depends on chain length match and formulation vehicle.",
+        "evidence_type": "marketing_vs_reality"
+      }
+    ]
+  },
+
+  "overview": "Ceramides are the scaffolding lipid of the skin barrier — filling the space between dead skin cells with lamellar sheets that limit water loss and keep skin looking plump and comfortable. Depleted ceramides (from aging, eczema-prone genetics, or harsh cleansers) correlate directly with increased transepidermal water loss and tight, flaky skin. Topical replenishment with skin-matched subtypes NP/AP/EOP in formulas that also supply cholesterol and free fatty acids measurably reduces TEWL and improves the feel and appearance of compromised skin within 2–4 weeks.",
+
+  "benefits": [
+    {
+      "concern": "barrier support / water retention",
+      "strength": 3,
+      "what_it_means": "Ceramide-containing moisturizers visibly reduce dryness, flaking, and tight feeling by limiting moisture loss through the stratum corneum. Effect is measurable (TEWL reduction) within 2–4 weeks in compromised skin.",
+      "mechanism": "Replenish intercellular lipid lamellae in the stratum corneum; ceramides with cholesterol and free fatty acids form multilamellar bilayers with orthorhombic lateral packing, reducing transepidermal water loss."
+    },
+    {
+      "concern": "sensitive / reactive skin",
+      "strength": 2,
+      "what_it_means": "Skin with a compromised barrier feels less reactive, less flushed, and more resilient to environmental triggers over consistent use.",
+      "mechanism": "Restoring lamellar integrity reduces penetration of irritants and allergens through the stratum corneum, dampening downstream inflammatory signaling."
+    },
+    {
+      "concern": "dryness / rough texture",
+      "strength": 2,
+      "what_it_means": "Skin surface looks smoother and feels softer; scaling and roughness visibly reduce with regular use in eczema-prone or dry skin types.",
+      "mechanism": "Normalized ceramide profile (especially NP/NS ratio) correlates with improved hydration capacity and smoother surface texture; NP(18) and AP(18) replenishment directly restores stratum corneum ceramide composition."
+    },
+    {
+      "concern": "skin aging / fine lines from dryness",
+      "strength": 1,
+      "what_it_means": "Supportive benefit — well-hydrated skin with an intact barrier looks plumper, and fine dehydration lines appear less pronounced. Does not address intrinsic aging processes.",
+      "mechanism": "Barrier-supported hydration keeps corneocytes turgid; does not stimulate collagen or elastin production."
+    }
+  ],
+
+  "safety": {
+    "irritation_risk": "very low",
+    "watchouts": [
+      { "issue": "Formulation vehicle sensitivity", "likelihood": "low", "what_to_do": "Ceramide products vary widely in other ingredients; any irritation is almost always from co-ingredients (fragrance, preservatives), not the ceramide itself. Patch test if sensitized." },
+      { "issue": "Phytoceramide vs skin-identical ceramide distinction", "likelihood": "low", "what_to_do": "Plant-derived pseudo-ceramides and phytoceramides have similar but not identical structures; for severely compromised barriers, formulations with true skin-identical NP/AP/EOP subtypes have the strongest clinical backing." }
+    ]
+  },
+
+  "usage": {
+    "routine_step": "moisturizer",
+    "pair_well": ["niacinamide", "hyaluronic acid", "panthenol", "cholesterol", "fatty acids (e.g. linoleic acid)", "peptides"],
+    "consider_separating": ["high-strength exfoliating acids (AHA/BHA) — apply ceramide moisturizer after acid step, not simultaneously, to avoid diluting the acid pH window"],
+    "notes": [
+      "Ceramides work best in formulas that also contain cholesterol and free fatty acids — the physiologic triad. Single-ceramide serums are less efficient than balanced multi-lipid moisturizers.",
+      "Judge barrier improvement at 4 weeks minimum; TEWL reduction can be assessed earlier but visible feel improvement is the relevant cosmetic endpoint.",
+      "AM and PM use is appropriate; no photosensitivity concern.",
+      "Effective concentration range in finished products is roughly 0.2–3% ceramides by weight; formulation matrix (lamellar emulsion vs standard o/w) matters as much as dose."
+    ]
+  },
+
+  "evidence": {
+    "grade": "B",
+    "summary": "Strong mechanistic and ex-vivo evidence for ceramide lipid packing and TEWL reduction; multiple human RCTs in eczema-prone and atopic skin showing measurable TEWL reduction and ceramide profile improvement. The ceramide:cholesterol:free-fatty-acid ratio requirement (1:1:1 equimolar baseline; 3:1:1 ceramide-dominant optimal) is well-established via Elias et al. work. Grade B rather than A because cosmetic-formulation RCTs in healthy skin without atopic predisposition are fewer, and effect sizes are meaningful but not dramatic for non-compromised skin.",
+    "citations": [
+      {
+        "title": "Topically Applied Ceramides Interact with the Stratum Corneum Lipid Matrix in Compromised Ex Vivo Skin",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC5801391/",
+        "year": 2018,
+        "source": "Pharmaceutical Research — Berkers, Visscher, Gooris, Bouwstra. Ex-vivo evidence that ceramide-containing formulations increase orthorhombic lateral lipid packing in compromised stratum corneum."
+      },
+      {
+        "title": "The role of ceramides in the disruption of the cutaneous permeability barrier, a common manifestation of skin disorders",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11348431/",
+        "year": 2024,
+        "source": "Journal of Lipid Research — Feingold & Elias. Establishes ~50% ceramide / 25% cholesterol / 15% FFA (wt) = 1:1:1 molar composition; shows inflammatory cytokines suppress ceramide synthase 3, disrupting barrier."
+      },
+      {
+        "title": "The ceramide [NP]/[NS] ratio in the stratum corneum is a potential marker for skin properties and epidermal differentiation",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC7461267/",
+        "year": 2020,
+        "source": "BMC Dermatology — Yokose et al. Ceramide NP/NS ratio distinguishes healthy from AD/psoriasis skin and correlates with TEWL, hydration, and texture in healthy subjects; validates NP as the primary barrier-competent subtype."
+      },
+      {
+        "title": "Optimised emollient mixture for skin barrier repair: Applications to global child health",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC9078150/",
+        "year": 2022,
+        "source": "Journal of Global Health — Elias, Man, Darmstadt. Key reference for the 3:1:1 ceramide:cholesterol:free-fatty-acid optimal molar ratio accelerating barrier recovery; confirms single-lipid or two-lipid mixtures delay rather than aid repair."
+      },
+      {
+        "title": "Topical supplementation with physiological lipids rebalances the stratum corneum ceramide profile and strengthens skin barrier function in adults predisposed to atopic dermatitis",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/40408261/",
+        "year": 2025,
+        "source": "British Journal of Dermatology — Andrew, Williams, Brown, Cork, Danby et al. 28-day RCT (n=58); physiological lipid emulsion vs standard emollient: ceramide NP(18) +24%, AP(18) +19%; TEWL reduced 22% (p<0.001) vs no improvement with standard emollient."
+      }
+    ]
+  },
+
+  "top_products": { "budget": [], "mid": [], "premium": [] },
+
+  "source_meta": {
+    "review": {
+      "method": "agent_adversarial",
+      "decision": "pass",
+      "reviewer": "pivota_subagent",
+      "reviewed_at": "2026-06-14",
+      "human_qa": { "sampled": false, "decision": null, "reviewer": null, "at": null }
+    },
+    "tier": "grounded",
+    "note": "All five citations verified via WebFetch before inclusion — confirmed title, authors, journal, year, and on-topic content at each URL. Excluded: Wiley ICS doi:10.1111/ics.12972 (HTTP 402 paywall); ScienceDirect S0022202X15425643 / JID Elias 1996 optimization PDF (HTTP 403). BJD Oxford URL (193/4/729) and PubMed 40408261 both confirmed as the same Andrew et al. 2025 RCT — PubMed URL used for citation 5. Each citation maps to distinct evidence: PMC5801391=ex-vivo lipid packing; PMC11348431=1:1:1 molar composition + cytokine mechanism; PMC7461267=NP/NS biomarker correlation; PMC9078150=3:1:1 optimal ratio (Elias 2022); PMID40408261=human RCT NP/AP replenishment + TEWL reduction."
+  }
+}

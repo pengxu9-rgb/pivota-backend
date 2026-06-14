@@ -1,0 +1,117 @@
+{
+  "_what_this_is": "Tier-G Ingredient KB entry for hyaluronic acid / sodium hyaluronate — ADR-002 quality bar, v2-lite shape. Corrects two common over-claims: 'plumps from within' (MW-dependent depth, not uniform deep plumping) and the dry-air reverse-draw risk (humectant can pull moisture from deeper skin if not sealed with an occlusive).",
+
+  "status": "ready",
+  "schema_version": "v2-lite",
+  "provider": "pivota_research",
+  "confidence_level": "high",
+
+  "ingredient": {
+    "inci": "Sodium Hyaluronate",
+    "display_name": "Hyaluronic acid / sodium hyaluronate",
+    "aliases": ["HA", "hyaluronan", "hyaluronate", "multi-weight HA", "LMW-HA", "HMW-HA"],
+    "what_it_is": "A glycosaminoglycan naturally present in the skin's extracellular matrix. Used in cosmetics as a humectant — it attracts and temporarily binds water, helping skin look and feel more hydrated and supple. Molecular weight determines depth: high-MW (≥500 kDa) forms a film on the surface; low-MW (≤300 kDa) penetrates into the upper stratum corneum and epidermis.",
+    "marketing_vs_reality": [
+      {
+        "claim_in_market": "'Plumps from within' / 'draws moisture deep into skin'",
+        "reality": "Molecular weight governs how far topical HA actually travels. High-MW HA (≥500 kDa) cannot cross the stratum corneum — it sits on the surface, forms a hydrating film, and reduces transepidermal water loss. Low-MW HA (≤300 kDa) penetrates into the stratum corneum and upper epidermis, not the deep dermis. Neither form reaches the dermis in meaningful quantities through topical application alone. Skin looks more plump and hydrated — that is real and valuable — but the depth narrative is overstated.",
+        "evidence_type": "marketing_vs_reality"
+      },
+      {
+        "claim_in_market": "'Intensely hydrates' in any climate / all skin types",
+        "reality": "HA is a humectant, meaning it draws water by hydrogen bonding. In normal or humid conditions it pulls moisture from ambient air. In dry or low-humidity air (winter, arid climates, heated/air-conditioned rooms), a humectant can draw moisture from the dermis upward and then lose it to the air — actually increasing transepidermal water loss. Clinical literature confirms humectants 'can increase TEWL and exacerbate skin dryness without concomitant use of an occlusive moisturizer.' Skin looks less hydrated, not more. Fix: always layer a sealing step (an occlusive or emollient — e.g. a cream, oil, or ceramide moisturizer) on top.",
+        "evidence_type": "marketing_vs_reality"
+      }
+    ]
+  },
+
+  "overview": "Hyaluronic acid is the gold-standard cosmetic humectant. It makes skin look more plump and feel softer by attracting water to the outer skin layers and (for high-MW forms) reducing water loss through the surface. Effect is immediate and visible but temporary without a sealing layer on top — particularly important in dry environments where an unsealed humectant can paradoxically increase skin dryness.",
+
+  "benefits": [
+    {
+      "concern": "dehydration / dull look",
+      "strength": 3,
+      "what_it_means": "Noticeably plumper, softer skin within hours of application. Effect depends on molecular weight: surface hydration film (HMW) or upper-epidermal water binding (LMW). Requires an occlusive or emollient layer on top to hold water in, especially in low-humidity environments.",
+      "mechanism": "HA is hygroscopic — its abundant hydroxyl groups form hydrogen bonds with water molecules, binding up to 1,000× its own weight in water. HMW-HA (≥500 kDa) is too large to penetrate the stratum corneum; it forms a viscoelastic film on the skin surface that reduces transepidermal water loss and retains surface moisture. LMW-HA (≤300 kDa) permeates the stratum corneum and upper epidermis, binding water directly within those layers."
+    },
+    {
+      "concern": "fine lines (dehydration-related)",
+      "strength": 2,
+      "what_it_means": "Lines and texture caused by dehydration look softer temporarily. Not a structural anti-aging intervention — effect diminishes if hydration drops. Human trials show reduced wrinkle depth with low-MW formulations after 60 days.",
+      "mechanism": "Water retention in the upper skin layers temporarily increases volume and turgor, making superficial dehydration lines look less pronounced. LMW-HA's deeper epidermal penetration correlates with statistically significant wrinkle depth reduction in placebo-controlled trials, likely from intra-epidermal hydration."
+    },
+    {
+      "concern": "barrier support",
+      "strength": 1,
+      "what_it_means": "Supportive only — not a primary barrier repair ingredient. HMW-HA on the skin surface reduces TEWL modestly. Weakest when used alone in dry conditions (see watchouts).",
+      "mechanism": "HMW-HA's surface film acts as a partial physical barrier, slowing water evaporation from the stratum corneum. Does not rebuild the lipid barrier — ceramides and fatty acids do that. In an ex-vivo model, HMW-HA reduced TEWL by 15.6% while LMW-HA actually increased TEWL by 55.5%, underscoring the MW-dependent TEWL effect."
+    }
+  ],
+
+  "safety": {
+    "irritation_risk": "very_low",
+    "watchouts": [
+      {
+        "issue": "Dry or low-humidity environment — can worsen skin dryness if not sealed",
+        "likelihood": "moderate",
+        "what_to_do": "In dry air, heated rooms, or arid climates, always follow HA with a cream, balm, or facial oil containing occlusive or emollient ingredients (shea butter, squalane, petrolatum, ceramides). Without this seal, the humectant draws water upward and loses it to the air, increasing TEWL and leaving skin feeling tighter, not more hydrated."
+      },
+      {
+        "issue": "Allergy / sensitivity",
+        "likelihood": "very_low",
+        "what_to_do": "HA is naturally found in the body and is among the most tolerated cosmetic actives. True allergy is rare. If stinging or redness occurs, check for co-formulated fragrances or alcohols rather than HA itself."
+      }
+    ]
+  },
+
+  "usage": {
+    "routine_step": "serum",
+    "pair_well": ["ceramides", "niacinamide", "peptides", "squalane", "shea butter", "panthenol", "centella asiatica"],
+    "consider_separating": [],
+    "notes": [
+      "Apply to damp (not wet) skin to maximize water-binding capacity — HA draws from available water on the skin surface first.",
+      "Always follow with a moisturizer or oil as the sealing step, especially in winter, air conditioning, or low-humidity climates.",
+      "MW matters: multi-weight HA formulas combining HMW + LMW hit both surface film and upper-epidermal layers simultaneously — a meaningful formulation differentiator.",
+      "Cosmetic effect (looks plumper, more radiant) is real and immediate; it is a hydration effect, not a structural collagen-building effect."
+    ]
+  },
+
+  "evidence": {
+    "grade": "A",
+    "summary": "Strong human RCT evidence for topical HA improving skin hydration and reducing wrinkle depth, plus mechanistically well-characterized MW-dependent penetration confirmed by Raman spectroscopy on human skin. The dry-air humectant draw-from-skin risk is documented in clinical pharmacology literature (StatPearls Moisturizers, PMID 31424755) and mechanistically consistent with ex-vivo TEWL data. Grade A reflects the combination of multiple human RCTs (Pavicic et al., Nobile et al. cited in PMC10078143) plus direct penetration imaging (Essendoubi et al., PMID 25877232). Evidence is for cosmetic hydration and look/feel outcomes — no grade-A evidence for deep-dermal remodeling via topical application.",
+    "citations": [
+      {
+        "title": "Human skin penetration of hyaluronic acid of different molecular weights as probed by Raman spectroscopy",
+        "url": "https://pubmed.ncbi.nlm.nih.gov/25877232/",
+        "year": 2016,
+        "source": "Skin Research and Technology (PMID 25877232, DOI 10.1111/srt.12228)"
+      },
+      {
+        "title": "Benefits of topical hyaluronic acid for skin quality and signs of skin aging: From literature review to clinical evidence",
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC10078143/",
+        "year": 2022,
+        "source": "Dermatologic Therapy (PMID 36200921, PMCID PMC10078143)"
+      },
+      {
+        "title": "Moisturizers (StatPearls) — humectants, TEWL risk in low humidity, occlusive pairing",
+        "url": "https://www.ncbi.nlm.nih.gov/books/NBK545171/",
+        "year": 2024,
+        "source": "StatPearls / NCBI Bookshelf (PMID 31424755, NBK545171). Harwood A, Nassereddin A, Krishnamurthy K."
+      }
+    ]
+  },
+
+  "top_products": { "budget": [], "mid": [], "premium": [] },
+
+  "source_meta": {
+    "review": {
+      "method": "agent_adversarial",
+      "decision": "pass",
+      "reviewer": "pivota_subagent",
+      "reviewed_at": "2026-06-14",
+      "human_qa": { "sampled": false, "decision": null, "reviewer": null, "at": null }
+    },
+    "tier": "grounded",
+    "note": "Three citations verified via WebFetch before inclusion: PMID 25877232 (Raman penetration study, confirmed title/journal/DOI); PMC10078143 (Dermatologic Therapy 2022 review, confirmed PMID 36200921, HA-as-humectant quote verified); NBK545171 (StatPearls Moisturizers, confirmed PMID 31424755, dry-climate TEWL + occlusive pairing quote verified). No unverified citations included."
+  }
+}

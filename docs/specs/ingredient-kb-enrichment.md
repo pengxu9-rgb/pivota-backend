@@ -49,6 +49,15 @@ gate (`confidence_level !== 'low' && ingredient.what_it_is && watchouts.length >
 **plus**, for Tier-G hero actives: `evidence.grade ∈ {A,B,C}` and
 `evidence.citations.length ≥ 1` and `source_meta.review.decision === 'pass'`.
 
+**Field length:** the on-demand producer's `.slice()` caps (what_it_is ≤300,
+overview ≤320, evidence.summary ≤280, what_it_means ≤220) are tuned for terse
+runtime Gemini output. **Curated Tier-G seed entries are the authoritative
+evidence record and may run richer than those caps** — the store's
+`upsertIngredientResearchKbEntry` persists `ingredient_profile_json` verbatim
+(no slicing), and the grounded generator (item 8) is responsible for
+summarizing KB fields down to the `product_intel.v1` contract at assembly time.
+Do **not** blind-truncate a seed entry; summarize at generation instead.
+
 ## Cohort hero actives (priority order)
 
 Drawn from the cohort INCI (Aruen, Ownist, BB Lab, Baie Botanique). Enrich the
